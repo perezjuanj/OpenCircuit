@@ -25,18 +25,27 @@ Validate the spec cheaply before committing to Swift.
       frames. Builds/tests without Xcode via `swift run RingKitVerify`.
 - [ ] Port **per-metric parsers** (blocked: needs decoded metric formats — sleep/
       SpO2/HRV/steps/temp captures are 🔴 in PROTOCOL.md §5).
-- [ ] Xcode project under `ios/`; CoreBluetooth scan/connect to the ring.
-      (blocked: needs full Xcode + iOS SDK; CLT-only can't build CoreBluetooth.)
-- [x] **Metric models + SyncCursor** — `Metrics.swift` (QuantitySample, SleepSegment,
-      MetricKind units per HEALTHKIT_MAPPING.md) and `SyncCursor.swift` (per-metric
-      newest-record bookkeeping, monotonic, Codable), tested.
-- [ ] Local store (SwiftData) — wraps SyncCursor + raw samples (blocked: needs Xcode).
-- [ ] XCTest suite (`OpenRingKitTests`) — written; runs once Xcode is installed.
+- [x] **Xcode app target** — `ios/project.yml` (XcodeGen) generates `OpenRingConn`
+      (bundle `com.openringconn.app`, iOS 17, embeds OpenRingKit, HealthKit + BLE
+      Info.plist keys + `bluetooth-central` background mode). **Compiles** for the
+      iOS simulator (`xcodebuild … CODE_SIGNING_ALLOWED=NO` → BUILD SUCCEEDED).
+- [x] **CoreBluetooth glue** — `BLE/RingScanner.swift` (scan by confirmed name
+      prefix, connect) + `RingSession.swift` (discover notify/write chars by UUID,
+      enable notify, poll live HR via OpenRingKit.Frame, decode 0x15 frames).
+- [x] **HealthKitWriter** — auth + per-type write/units per HEALTHKIT_MAPPING.md.
+- [x] **Metric models + SyncCursor** — `Metrics.swift` + `SyncCursor.swift`, tested.
+- [x] **LocalStore (SwiftData)** — StoredSample/StoredCursor wrapping SyncCursor.
+- [x] **XCTest suite** runs under Xcode: 23 tests, 0 failures.
+- [ ] Port **per-metric parsers** (blocked: metric formats 🔴 in PROTOCOL.md §5).
+- [ ] Run on a real device + ring (BLE needs hardware; simulator can't connect).
 **Exit:** iOS app pulls the same data the desktop client does.
 
-> **Tooling note:** the dev Mac has Swift 6.3 (Command Line Tools) but **not full
-> Xcode**. Pure-Swift logic (codec, analytics) builds/tests now via SwiftPM; the
-> BLE/HealthKit/SwiftData/app-target work needs Xcode + iOS SDK installed first.
+> **Blocked on hardware/decisions (hard stops):** (a) notify/write **characteristic
+> UUIDs are still 🟡** — `openringconn scan` must bind them to the confirmed handles
+> 0x0804/0x0802 before the app can connect; (b) **history/metric record formats are
+> 🔴** (PROTOCOL.md §5) — sync beyond live HR needs captures; (c) running on device
+> needs **code-signing** (Apple Developer account). Compilation verified; functional
+> sync is not.
 
 ## Phase 4 — HealthKit write
 - [ ] Map each metric per `HEALTHKIT_MAPPING.md`; request authorizations.

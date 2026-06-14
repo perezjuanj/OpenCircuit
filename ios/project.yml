@@ -1,0 +1,44 @@
+name: OpenRingConn
+options:
+  bundleIdPrefix: com.openringconn
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  OpenRingKit:
+    path: OpenRingKit
+
+targets:
+  OpenRingConn:
+    type: application
+    platform: iOS
+    sources:
+      - path: OpenRingConn
+    dependencies:
+      - package: OpenRingKit
+        product: OpenRingKit
+    info:
+      path: OpenRingConn/Info.plist
+      properties:
+        UILaunchScreen: {}
+        # HealthKit auth strings (Phase 4) — required or the app crashes on request.
+        NSHealthShareUsageDescription: "OpenRingConn reads health metrics from your RingConn ring to display them."
+        NSHealthUpdateUsageDescription: "OpenRingConn writes your ring's metrics into Apple Health."
+        # BLE (Phase 3) — required to connect to the ring.
+        NSBluetoothAlwaysUsageDescription: "OpenRingConn connects to your RingConn ring over Bluetooth Low Energy."
+        # Background sync while suspended (docs/HANDOFF_MACOS_IOS.md).
+        UIBackgroundModes:
+          - bluetooth-central
+    entitlements:
+      path: OpenRingConn/OpenRingConn.entitlements
+      properties:
+        com.apple.developer.healthkit: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.openringconn.app
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO

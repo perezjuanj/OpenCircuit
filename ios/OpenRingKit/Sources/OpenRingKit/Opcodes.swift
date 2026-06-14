@@ -30,4 +30,12 @@ public enum Transport {
     /// Characteristic UUIDs from Gadgetbridge #4506 (🟡 — confirm via scan).
     public static let notifyCharUUID = "8327ad97-2d87-4a22-a8ce-6dd7971c0437"
     public static let writeCharUUID = "8327ad98-2d87-4a22-a8ce-6dd7971c0437"
+
+    /// Advertised-name prefixes to match while scanning. Observed name is
+    /// "RingConn Gen2-<MAC suffix>" (🟢); kept broad for older variants.
+    public static let namePrefixes = ["RingConn", "Ring"]
+
+    public static func matchesRingName(_ name: String) -> Bool {
+        namePrefixes.contains { name.hasPrefix($0) }
+    }
 }
