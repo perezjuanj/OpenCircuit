@@ -44,9 +44,11 @@ Validate the spec cheaply before committing to Swift.
 - [x] **LocalStore (SwiftData)** — StoredSample/StoredCursor wrapping SyncCursor.
 - [x] **XCTest suite** runs under Xcode: 23 tests, 0 failures.
 - [ ] Port **per-metric parsers** (blocked: metric formats 🔴 in PROTOCOL.md §5).
-- [x] Run on a real device + ring (BLE needs hardware; simulator can't connect) —
-      the app runs on an iPhone.
-**Exit:** iOS app pulls the same data the desktop client does.
+- [x] Run on a real device + ring — **the app pulls live data from the ring** (live HR
+      decoded 68 bpm; history sync runs) once the iPhone is **bonded** to the ring (pair
+      via the official app once; BLE bonds are shared across apps — PROTOCOL.md §0).
+**Exit:** ✅ **MET** — iOS app pulls the same live HR / history the desktop decodes.
+Remaining for end-to-end into Apple Health: the paid-account HealthKit entitlement (Phase 4).
 
 > **Blocked on hardware/decisions (hard stops):** (a) notify/write **characteristic
 > UUIDs are still 🟡** — `openringconn scan` must bind them to the confirmed handles

@@ -32,6 +32,17 @@ command**: `0x02` sync-open (even the known-good real cursor `0c2298c3` that ret
   `listen`/`replay` of data commands will see nothing. Active probing from the Mac is a
   dead end; capture the phone instead.
 
+**Resolved on iOS 🟢 (2026-06-14): bonding unlocks data, and it's shared across apps.**
+Our iPhone app first hit the same wall (live HR poll → only the `81 01` handshake, no
+`0x15` frames). The fix: **bond the iPhone to the ring once** — installing the official
+RingConn iOS app and signing in establishes the device↔ring LE bond. BLE bonds are
+**per device, not per app**, so OpenRingConn then inherits it: `02`/`07`/`95` go through
+and **live HR decoded 68 bpm** + history sync started. The ring supports multiple paired
+phones, so this doesn't disturb the Android pairing.
+> **Operational requirement:** any device running OpenRingConn must already be bonded to
+> the ring (pair via the official app once). This is the make-or-break unknown — answered:
+> offline decode works, *direct ring access* just needs a one-time bond.
+
 ## 1. Connection & GATT layout
 
 > ⚠️ Reported as not fully GATT-compatible. The capture confirms the app drives the
