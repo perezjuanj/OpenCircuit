@@ -127,12 +127,18 @@ final class RingSession: NSObject {
                 try? await Task.sleep(for: .milliseconds(250))
             }
             self?.livePreparing = false
-            // 4. Poll for live samples (~1.4/s). No `d0` here — it re-arms the mode
-            //    switch and kicks HR back to its warm-up sentinel.
+            // 4. Poll for live samples at the ring's OWN cadence (~2 s/sample, confirmed
+            //    in btsnoop_hr.log). The HR windowed average needs undisturbed time to
+            //    settle out of the warm-up sentinel (8); polling faster than the sample
+            //    rate keeps resetting it so byte[2] never climbs. The official app waits
+            //    then polls ~every 2 s, request/response. (SpO2's byte[14] survives fast
+            //    polling, which is why only HR got stuck.) No `d0` here — it re-arms the
+            //    mode switch and also kicks HR back to warm-up.
+            try? await Task.sleep(for: .seconds(2))   // let the ring settle before first poll
             while !Task.isCancelled {
                 guard let self else { return }
                 self.write(Command.poll)
-                try? await Task.sleep(for: .milliseconds(700))
+                try? await Task.sleep(for: .seconds(2))
             }
         }
     }
