@@ -35,10 +35,15 @@ final class RingSession: NSObject {
     /// Experimental Light/Deep/REM/Awake staging (HR+motion heuristic, approximate —
     /// matches stage totals but not architecture; for display, not HealthKit).
     private(set) var stagedSegments: [SleepSegment] = []
-    /// True while 0x4c pages are still arriving for the current sync.
+    /// True while a history sync is in progress.
     private(set) var syncing = false
+    /// User-facing result of the last sync (e.g. "204 epochs"), or an error note.
+    private(set) var syncStatus: String?
 
     private var bulkRecords: [BulkRecord] = []
+    private var syncTask: Task<Void, Never>?
+    private var syncDone = false        // 0x50 end-of-history seen
+    private var syncQuietTicks = 0      // seconds since the last page arrived
 
     private let peripheral: CBPeripheral
     private var notifyChar: CBCharacteristic?
@@ -118,14 +123,45 @@ final class RingSession: NSObject {
     /// The ring streams 0x4c/0x47 pages, drained+decoded in didUpdateValue; results
     /// land in `historySamples` once 0x50 (end-of-history) arrives.
     func syncHistory() {
+        guard syncTask == nil else { return }   // already syncing
+        stopLiveMonitoring()                     // live polling would fight the drain
         bulkRecords.removeAll()
         historySamples.removeAll()
         sleepSegments.removeAll()
         stagedSegments.removeAll()
+        syncDone = false
+        syncQuietTicks = 0
         syncing = true
-        for cmd in [Command.status0, Command.status1, Command.syncAll, Command.fetch] {
-            write(cmd)
+        syncStatus = nil
+        syncTask = Task { [weak self] in
+            // Paced enter so CoreBluetooth doesn't drop writes.
+            for cmd in [Command.status0, Command.status1, Command.syncAll, Command.fetch] {
+                guard let self else { return }
+                self.write(cmd)
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            // Watchdog: finalize on 0x50, or when pages stop (4 s quiet), or a 45 s cap —
+            // so the sync can never hang if the end-marker or a write is lost.
+            for tick in 0 ..< 45 {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self else { return }
+                if self.syncDone || self.syncQuietTicks >= 4 { break }
+                _ = tick
+            }
+            self?.finalizeSync()
         }
+    }
+
+    private func finalizeSync() {
+        guard syncing else { return }
+        historySamples = BulkSleep.samples(from: bulkRecords)
+        sleepSegments = BulkSleep.sleepSegments(from: bulkRecords)
+        stagedSegments = BulkSleep.stagedSegments(from: bulkRecords)
+        syncing = false
+        syncTask = nil
+        syncStatus = bulkRecords.isEmpty
+            ? "No data received — is the ring bonded/awake?"
+            : "Synced \(bulkRecords.count) epochs"
     }
 
     private func write(_ bytes: [UInt8]) {
@@ -168,19 +204,18 @@ extension RingSession: CBPeripheralDelegate {
             // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).
             switch bytes.first {
             case 0x47:
+                if self.syncing { self.syncQuietTicks = 0 }
                 self.write(Command.pageAck47); return   // PPG page — decode TODO (issue #8)
             case 0x4C:
-                if self.syncing { self.bulkRecords += BulkSleep.records(fromPage: bytes) }
+                if self.syncing {
+                    self.bulkRecords += BulkSleep.records(fromPage: bytes)
+                    self.syncQuietTicks = 0
+                }
                 self.write(Command.pageAck4C); return   // always ack to keep draining
             case 0x50:
-                // End-of-history cursor report (§5.5) — note: NO XOR trailer, so it
-                // never reaches Frame.parse. Finalize the sync here.
-                if self.syncing {
-                    self.historySamples = BulkSleep.samples(from: self.bulkRecords)
-                    self.sleepSegments = BulkSleep.sleepSegments(from: self.bulkRecords)
-                    self.stagedSegments = BulkSleep.stagedSegments(from: self.bulkRecords)
-                    self.syncing = false
-                }
+                // End-of-history cursor report (§5.5) — NO XOR trailer, so it never
+                // reaches Frame.parse. Mark done; the sync watchdog finalizes.
+                if self.syncing { self.syncDone = true }
                 return
             default: break
             }

@@ -128,6 +128,10 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .disabled(session?.ready != true || session?.syncing == true)
 
+            if let status = session?.syncStatus, session?.syncing != true {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+
             if let samples = session?.historySamples, !samples.isEmpty {
                 Divider()
                 metricSummary(samples)
