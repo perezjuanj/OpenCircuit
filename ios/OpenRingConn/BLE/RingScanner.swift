@@ -7,11 +7,10 @@ import OpenRingKit
 // (docs/HANDOFF_MACOS_IOS.md) — everything is addressed by characteristic UUID,
 // so RingSession matches the notify/write characteristics by UUID after connect.
 //
-// ⚠️ GAP (PROTOCOL.md §1): the ring is matched by advertised NAME prefix
-// ("RingConn Gen2…", 🟢 confirmed). The characteristic UUIDs we subscribe to are
-// still 🟡 (from Gadgetbridge #4506, not yet confirmed against our own capture).
-// `openringconn scan` must bind the confirmed handles (0x0804/0x0802) to their
-// UUIDs before this can actually connect — flagged, not invented.
+// The ring is matched by advertised NAME prefix ("RingConn Gen2…", 🟢). The
+// notify/write characteristic UUIDs RingSession binds to are now 🟢 confirmed by
+// `openringconn scan` (service 8327ad99; notify 8327ad97 = handle 0x0804; write
+// 8327ad98 = handle 0x0802) — see PROTOCOL.md §1.
 
 @Observable
 @MainActor

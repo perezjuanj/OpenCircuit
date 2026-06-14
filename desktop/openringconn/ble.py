@@ -7,13 +7,17 @@ this file and docs/PROTOCOL.md together.
 Sources: capture FR02.018 (2026-06-13); Gadgetbridge issue #4506.
 """
 
-# Characteristics (🟡 — UUIDs from GB #4506; bind to the handles below via `scan`).
-NOTIFY_CHAR = "8327ad97-2d87-4a22-a8ce-6dd7971c0437"
-WRITE_CHAR = "8327ad98-2d87-4a22-a8ce-6dd7971c0437"
+# Primary data service + characteristics (🟢 confirmed by scan on FR02.018).
+# Value handle = characteristic declaration handle + 1.
+DATA_SERVICE = "8327ad99-2d87-4a22-a8ce-6dd7971c0437"      # handle 0x0800
+NOTIFY_CHAR = "8327ad97-2d87-4a22-a8ce-6dd7971c0437"       # value handle 0x0804
+WRITE_CHAR = "8327ad98-2d87-4a22-a8ce-6dd7971c0437"        # value handle 0x0802
 
-# Services seen in scans (🔴 unverified roles)
-SERVICE_A = "f7bf3564-fb6d-4e53-88a4-5e37e0326063"
-SERVICE_B = "984227f3-34fc-4045-a5d0-2c581f81a153"
+# Secondary service (🔴 role unknown — likely OTA/bulk). NOTE: GB #4506 mislabeled
+# these two as services; scan shows they are *characteristics* inside this service.
+SECONDARY_SERVICE = "1d14d6ee-fd63-4fa1-bfa4-8f47b42119f0"  # handle 0x0900
+SECONDARY_CHAR_A = "f7bf3564-fb6d-4e53-88a4-5e37e0326063"   # 0x0901 write
+SECONDARY_CHAR_B = "984227f3-34fc-4045-a5d0-2c581f81a153"   # 0x0903 write[-no-resp]
 
 # ATT handles (🟢 confirmed from capture). The app drives the ring almost entirely
 # through this notify/command pair, NOT discrete per-metric characteristics.

@@ -27,25 +27,39 @@ access. Offline decoding is viable → the iOS app is unblocked.
 > ring almost entirely through two value handles (`0x0802` write, `0x0804` notify)
 > rather than discrete per-metric characteristics.
 
+### Identity (Device Information Service `0x180a`)
 | Item | Value | Conf. | Source |
 |---|---|---|---|
-| Advertised name | `RingConn Gen2-03AD` (suffix = last 2 MAC bytes) | 🟢 | capture |
-| Manufacturer | `JZ_Tech` | 🟢 | capture |
-| Firmware | `FR02.018` | 🟢 | capture |
-| Serial | `RCA1F252311002B09` | 🟢 | capture |
-| System ID / MAC | `F8:79:99:F7:03:AD` | 🟢 | capture |
-| **Write / command handle** | `0x0802` | 🟢 | capture |
-| **Notify handle (all responses + data)** | `0x0804` | 🟢 | capture |
-| Notify CCCD (enable w/ `01 00`) | `0x0805` | 🟢 | capture |
-| Notify characteristic UUID | `8327ad97-2d87-4a22-a8ce-6dd7971c0437` | 🟡 | GB #4506 |
-| Write characteristic UUID | `8327ad98-2d87-4a22-a8ce-6dd7971c0437` | 🟡 | GB #4506 |
-| Service A | `f7bf3564-fb6d-4e53-88a4-5e37e0326063` | 🔴 | GB #4506 |
-| Service B | `984227f3-34fc-4045-a5d0-2c581f81a153` | 🔴 | GB #4506 |
+| Advertised name (GAP `0x2a00`, val handle `0x0003`) | `RingConn Gen2-03AD` (suffix = last 2 MAC bytes) | 🟢 | capture + scan |
+| Manufacturer (`0x2a29`, val `0x0032`) | `JZ_Tech` | 🟢 | capture + scan |
+| Serial (`0x2a25`, val `0x0034`) | `RCA1F252311002B09` | 🟢 | capture + scan |
+| Firmware (`0x2a26`, val `0x0036`) | `FR02.018` | 🟢 | capture + scan |
+| System ID / MAC (`0x2a23`, val `0x0038`) | `F8:79:99:F7:03:AD` | 🟢 | capture + scan |
+| Hardware rev (`0x2a27`, val `0x003a`) | `00010001` | 🟢 | capture + scan |
 
-> Correction to GB #4506: `0x0804` is **not** live-HR-only and `0x0802` is **not**
-> keepalive-only — they are the general notify/command pair carrying every metric.
-> **Action:** run `openringconn scan` to bind each handle to its UUID (iOS needs
-> UUIDs, not handles) and confirm characteristic properties.
+### Primary data service `8327ad99-2d87-4a22-a8ce-6dd7971c0437` (handle `0x0800`) 🟢
+The ring is driven entirely through this notify/command pair (not per-metric chars).
+iOS addresses by UUID; the value handle = characteristic declaration handle + 1.
+
+| Role | Characteristic UUID | Decl. | **Value** | Props | Conf. |
+|---|---|---|---|---|---|
+| **Write / commands** | `8327ad98-2d87-4a22-a8ce-6dd7971c0437` | `0x0801` | `0x0802` | write | 🟢 |
+| **Notify (all responses + data)** | `8327ad97-2d87-4a22-a8ce-6dd7971c0437` | `0x0803` | `0x0804` | notify | 🟢 |
+| Notify CCCD (enable w/ `01 00`) | `0x2902` | — | `0x0805` | — | 🟢 |
+
+### Secondary service `1d14d6ee-fd63-4fa1-bfa4-8f47b42119f0` (handle `0x0900`) 🔴
+Two **write** characteristics; role unobserved in the capture (likely OTA/firmware
+or bulk transfer). Not used by the main protocol. Decode if needed later.
+
+| Characteristic UUID | Handle | Props |
+|---|---|---|
+| `f7bf3564-fb6d-4e53-88a4-5e37e0326063` | `0x0901` | write |
+| `984227f3-34fc-4045-a5d0-2c581f81a153` | `0x0903` | write, write-without-response |
+
+> Corrections now confirmed by `scan`: (1) GB #4506's char UUIDs were right
+> (🟡→🟢). (2) GB #4506 mislabeled `f7bf3564`/`984227f3` as *services* — they are
+> *characteristics* inside service `1d14d6ee`; the real data service is `8327ad99`.
+> (3) value handle = decl + 1, which ties the scan to the capture's `0x0802`/`0x0804`.
 
 ## 2. Authentication / handshake
 

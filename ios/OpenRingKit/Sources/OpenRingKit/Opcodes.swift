@@ -27,7 +27,9 @@ public enum Transport {
     public static let writeHandle: UInt16 = 0x0802    // all commands
     public static let notifyCCCD: UInt16 = 0x0805     // enable with [0x01, 0x00]
 
-    /// Characteristic UUIDs from Gadgetbridge #4506 (🟡 — confirm via scan).
+    /// Primary data service + characteristic UUIDs (🟢 confirmed by scan, FR02.018).
+    /// Value handle 0x0804 (notify) / 0x0802 (write); service handle 0x0800.
+    public static let dataServiceUUID = "8327ad99-2d87-4a22-a8ce-6dd7971c0437"
     public static let notifyCharUUID = "8327ad97-2d87-4a22-a8ce-6dd7971c0437"
     public static let writeCharUUID = "8327ad98-2d87-4a22-a8ce-6dd7971c0437"
 
