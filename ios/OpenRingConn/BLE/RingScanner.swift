@@ -85,6 +85,7 @@ extension RingScanner: CBCentralManagerDelegate {
                                     didDisconnectPeripheral peripheral: CBPeripheral,
                                     error: Error?) {
         Task { @MainActor in
+            self.session?.stopLiveMonitoring()
             self.session = nil
             self.state = .idle
         }

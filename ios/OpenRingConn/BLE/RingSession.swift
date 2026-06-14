@@ -16,8 +16,12 @@ import OpenRingKit
 final class RingSession: NSObject {
 
     private(set) var liveHR: Int?
+    private(set) var liveSpO2: Int?       // 🟡 from long 0x15 frame byte[14]
+    private(set) var monitoring = false
     private(set) var lastFrame: String?
     private(set) var ready = false
+
+    private var monitorTask: Task<Void, Never>?
 
     /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
     /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
@@ -47,15 +51,26 @@ final class RingSession: NSObject {
         peripheral.discoverServices(nil)
     }
 
-    /// Enter live-HR mode: status → open sync (cursor=all) → live mode → fetch.
-    /// History backlog (47/4c pages) is drained by acking in didUpdateValue.
-    func startLiveHR() {
-        for cmd in Command.liveHRStart { write(cmd) }
+    /// Begin live monitoring: enter live-HR mode, then poll once a second so the ring
+    /// keeps emitting 0x15 samples. Updates `liveHR`/`liveSpO2`. Idempotent.
+    func startLiveMonitoring() {
+        guard monitorTask == nil else { return }
+        monitoring = true
+        for cmd in Command.liveHRStart { write(cmd) }   // status → sync → live mode → fetch
+        monitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                self.write(Command.poll)
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
     }
 
-    /// Poll for one live sample (0x95 → 0x15). Sent verbatim — NOT XOR-encoded.
-    func pollLiveHR() {
-        write(Command.poll)
+    /// Stop the poll loop. HR/SpO2 keep their last value.
+    func stopLiveMonitoring() {
+        monitorTask?.cancel()
+        monitorTask = nil
+        monitoring = false
     }
 
     /// Pull stored history: open the sync session (cursor = everything) and fetch.
@@ -114,8 +129,8 @@ extension RingSession: CBPeripheralDelegate {
             case 0x47:
                 self.write(Command.pageAck47); return   // PPG page — decode TODO (issue #8)
             case 0x4C:
-                self.bulkRecords += BulkSleep.records(fromPage: bytes)
-                self.write(Command.pageAck4C); return
+                if self.syncing { self.bulkRecords += BulkSleep.records(fromPage: bytes) }
+                self.write(Command.pageAck4C); return   // always ack to keep draining
             case 0x50:
                 // End-of-history cursor report (§5.5) — note: NO XOR trailer, so it
                 // never reaches Frame.parse. Finalize the sync here.
@@ -129,9 +144,17 @@ extension RingSession: CBPeripheralDelegate {
             default: break
             }
             guard let frame = Frame.parse(bytes) else { return }   // XOR-validate responses
-            // 0x15 is the live-sample stream (resp of 0x95 poll).
+            // 0x15 = live-sample stream (resp of 0x95 poll). Two shapes:
+            //   short `15 00 <hr> 0a b0`  → HR at byte[2] (🟢)
+            //   long  `15 01 … <spo2> …`  → byte[2]=0; SpO2 at byte[14] (🟡)
+            // Only the short frame carries HR — don't let a long frame zero it out.
             if frame.opcode == Frame.responseID(Opcode.poll) {
-                self.liveHR = LiveHR.decode(bytes)   // 🟡 offset tentative
+                if bytes.count >= 4, bytes[1] == 0x00 {
+                    if let hr = LiveHR.decodeLocked(bytes) { self.liveHR = hr }  // filters warm-up
+                } else if bytes.count >= 15, bytes[1] == 0x01 {
+                    let spo2 = Int(bytes[14])
+                    if (70...100).contains(spo2) { self.liveSpO2 = spo2 }
+                }
             }
         }
     }
