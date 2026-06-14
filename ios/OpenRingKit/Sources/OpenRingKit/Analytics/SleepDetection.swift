@@ -1,12 +1,14 @@
 // Sleep/active period detection — ported from openwhoop-algos/src/activity.rs.
-// Classifies a timeline of gravity-vector readings into Sleep/Active periods by
-// stillness, then `findSleep` extracts the main sleep block. Device-agnostic.
+// Classifies a timeline of stillness readings into Sleep/Active periods, then
+// `findSleep` extracts the main sleep block. Device-agnostic.
 //
-// ⚠️ INPUT GAP (PROTOCOL.md §5, 🔴): this needs a per-reading **gravity vector**
-// (3-axis, in g). RingConn's IMU/accelerometer stream is not yet decoded — the
-// 0x47/0x4c bulk frames in the reference capture are the likely source but their
-// format is unconfirmed. The algorithm is ported and tested; wiring it to real
-// ring data is gated on a capture. Nothing about the device is invented here.
+// Two front-ends feed the same core pipeline:
+//   • detectFromGravity — a 3-axis gravity vector (openwhoop's original input).
+//   • detectFromMotion  — RingConn's 0x4c [10:15] per-30 s motion counts (🟢,
+//     PROTOCOL.md §5.3). On the 2026-06-13 night this recovers the in-bed window
+//     00:33→09:34 vs the app's ~00:32→09:30 (time-in-bed). This is the real wiring.
+// Finer Awake/Light/Deep/REM staging needs an HR-based model (see BulkSleep) and
+// is not part of openwhoop's stillness detection.
 
 import Foundation
 
@@ -18,6 +20,17 @@ public struct GravitySample: Sendable, Equatable {
     public init(time: Date, gravity: SIMD3<Float>?) {
         self.time = time
         self.gravity = gravity
+    }
+}
+
+/// One reading on the motion timeline: a per-30 s movement magnitude (the 0x4c
+/// [10:15] motion count). Unworn/no-measurement samples carry `.greatestFiniteMagnitude`.
+public struct MotionSample: Sendable, Equatable {
+    public let time: Date
+    public let movement: Float
+    public init(time: Date, movement: Float) {
+        self.time = time
+        self.movement = movement
     }
 }
 
@@ -45,6 +58,9 @@ public struct ActivityPeriod: Equatable, Sendable {
     static let gravityWindowMinutes = 15
     static let gravityStillFraction: Float = 0.70
     static let gravityMaxGap: TimeInterval = 20 * 60
+    /// Motion-count stillness threshold for the 0x4c [10:15] channel (🟢 grounded:
+    /// recovers the captured night's in-bed window). Baseline `01` = still.
+    static let motionStillThreshold: Float = 2
 
     private struct Temp { var activity: Activity; var start: Date; var end: Date }
 
@@ -60,7 +76,6 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// Detect Sleep/Active periods from a gravity-vector timeline.
     public static func detectFromGravity(_ history: [GravitySample]) -> [ActivityPeriod] {
         guard history.count >= 2 else { return [] }
-
         // Magnitude of change between consecutive gravity vectors (first = 0).
         // Missing gravity -> treat as max movement (active).
         var deltas: [Float] = [0]
@@ -73,11 +88,31 @@ public struct ActivityPeriod: Equatable, Sendable {
                 deltas.append(.greatestFiniteMagnitude)
             }
         }
+        return detect(times: history.map(\.time), deltas: deltas,
+                      stillThreshold: gravityStillThreshold)
+    }
+
+    /// Detect Sleep/Active periods from RingConn's per-30 s motion counts (the
+    /// 0x4c [10:15] channel; PROTOCOL.md §5.3). `movement` is the motion count
+    /// directly — it already IS a movement magnitude, so it feeds the same core
+    /// as the gravity deltas. Unworn/no-measurement samples should be passed as a
+    /// large value (active) by the caller.
+    public static func detectFromMotion(_ history: [MotionSample]) -> [ActivityPeriod] {
+        guard history.count >= 2 else { return [] }
+        return detect(times: history.map(\.time), deltas: history.map(\.movement),
+                      stillThreshold: motionStillThreshold)
+    }
+
+    /// Shared core: classify a stillness-magnitude timeline into Sleep/Active runs.
+    /// `deltas[i]` < `stillThreshold` => still at sample i. Faithful to activity.rs.
+    private static func detect(times: [Date], deltas: [Float],
+                               stillThreshold: Float) -> [ActivityPeriod] {
+        guard times.count == deltas.count, times.count >= 2 else { return [] }
 
         // Median sample interval (seconds), bounded like openwhoop.
         var diffs: [Int] = []
-        for i in 1 ..< history.count {
-            let d = Int(history[i].time.timeIntervalSince(history[i - 1].time))
+        for i in 1 ..< times.count {
+            let d = Int(times[i].timeIntervalSince(times[i - 1]))
             if d > 0 && d < 300 { diffs.append(d) }
         }
         diffs.sort()
@@ -92,7 +127,7 @@ public struct ActivityPeriod: Equatable, Sendable {
             let start = i >= half ? i - half : 0
             let end = min(i + half + 1, n)
             let window = deltas[start ..< end]
-            let still = window.filter { $0 < gravityStillThreshold }.count
+            let still = window.filter { $0 < stillThreshold }.count
             isSleep[i] = Float(still) / Float(window.count) >= gravityStillFraction
         }
 
@@ -103,10 +138,10 @@ public struct ActivityPeriod: Equatable, Sendable {
             let endOfData = (i == n)
             let classChange = !endOfData && isSleep[i] != isSleep[runStart]
             let gapBreak = !endOfData &&
-                history[i].time.timeIntervalSince(history[i - 1].time) > gravityMaxGap
+                times[i].timeIntervalSince(times[i - 1]) > gravityMaxGap
             if endOfData || classChange || gapBreak {
                 temps.append(Temp(activity: isSleep[runStart] ? .sleep : .active,
-                                  start: history[runStart].time, end: history[i - 1].time))
+                                  start: times[runStart], end: times[i - 1]))
                 if !endOfData { runStart = i }
             }
         }

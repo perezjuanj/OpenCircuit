@@ -44,8 +44,20 @@ struct ContentView: View {
 
                     if let samples = scanner.session?.historySamples, !samples.isEmpty {
                         LabeledContent("Decoded samples", value: "\(samples.count)")
+                    }
+                    if let segs = scanner.session?.sleepSegments, !segs.isEmpty,
+                       let inBed = segs.first(where: { $0.stage == .inBed }) {
+                        LabeledContent("Sleep window",
+                                       value: "\(inBed.start.formatted(date: .omitted, time: .shortened))–\(inBed.end.formatted(date: .omitted, time: .shortened))")
+                    }
+                    if let samples = scanner.session?.historySamples, !samples.isEmpty {
                         Button("Write to Apple Health") {
-                            Task { try? await health.write(samples) }
+                            Task {
+                                try? await health.write(samples)
+                                if let segs = scanner.session?.sleepSegments, !segs.isEmpty {
+                                    try? await health.write(sleep: segs)
+                                }
+                            }
                         }
                         .disabled(!healthAuthorized)
                     }

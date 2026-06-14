@@ -168,5 +168,27 @@ let idleRec = BulkRecord(hex("0c099dbf05000c00120a01010101010000000000000000"))!
 check(idleRec.layout == .idle && BulkSleep.samples(from: [idleRec]).isEmpty,
       "idle template -> no samples")
 
+// Motion-channel sleep detection: active -> still(9h) -> active finds the night.
+func bulkRec(_ c: UInt32, motion: UInt8, sub: UInt8) -> BulkRecord {
+    var b = [UInt8](repeating: 0, count: 23)
+    b[0] = UInt8(c >> 24); b[1] = UInt8((c >> 16) & 0xFF)
+    b[2] = UInt8((c >> 8) & 0xFF); b[3] = UInt8(c & 0xFF)
+    b[8] = sub
+    for k in 0..<5 { b[10 + k] = motion }
+    return BulkRecord(b)!
+}
+var night: [BulkRecord] = []
+var cc: UInt32 = 0x0c220000
+for _ in 0..<20 { night.append(bulkRec(cc, motion: 0x14, sub: 0x12)); cc += 150 }
+for _ in 0..<216 { night.append(bulkRec(cc, motion: 0x01, sub: 0x62)); cc += 150 }
+for _ in 0..<20 { night.append(bulkRec(cc, motion: 0x14, sub: 0x12)); cc += 150 }
+let block = BulkSleep.mainSleep(from: night)
+check(block?.activity == .sleep, "motion detection finds the sleep block")
+check(abs((block?.duration ?? 0) - 216 * 150) < 30 * 60, "sleep block ~9 h")
+check(BulkSleep.sleepSegments(from: night).contains { $0.stage == .inBed },
+      "sleepSegments emits inBed")
+check(BulkSleep.mainSleep(from: night.prefix(20).map { $0 }) == nil,
+      "all-active -> no sleep block")
+
 print(failures == 0 ? "\nALL CHECKS PASSED" : "\n\(failures) CHECK(S) FAILED")
 exit(failures == 0 ? 0 : 1)

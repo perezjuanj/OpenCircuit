@@ -22,6 +22,8 @@ final class RingSession: NSObject {
     /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
     /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
     private(set) var historySamples: [QuantitySample] = []
+    /// Sleep-stage segments computed from the motion channel for the last sync.
+    private(set) var sleepSegments: [SleepSegment] = []
     /// True while 0x4c pages are still arriving for the current sync.
     private(set) var syncing = false
 
@@ -58,6 +60,7 @@ final class RingSession: NSObject {
     func syncHistory() {
         bulkRecords.removeAll()
         historySamples.removeAll()
+        sleepSegments.removeAll()
         syncing = true
         for cmd in [Command.status0, Command.status1, Command.syncAll, Command.fetch] {
             write(cmd)
@@ -113,6 +116,7 @@ extension RingSession: CBPeripheralDelegate {
                 // never reaches Frame.parse. Finalize the sync here.
                 if self.syncing {
                     self.historySamples = BulkSleep.samples(from: self.bulkRecords)
+                    self.sleepSegments = BulkSleep.sleepSegments(from: self.bulkRecords)
                     self.syncing = false
                 }
                 return

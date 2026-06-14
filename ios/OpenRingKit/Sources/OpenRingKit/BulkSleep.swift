@@ -107,6 +107,54 @@ public enum BulkSleep {
         frames.flatMap { records(fromPage: $0) }
     }
 
+    /// Expand 0x4c records into a per-30 s motion timeline (5 sub-samples per
+    /// 150 s epoch from the [10:15] channel) for `SleepDetection.detectFromMotion`.
+    /// Motion counts are passed through directly (baseline `01` = still); callers
+    /// should scope `records` to a worn period (charging data reads as still too).
+    public static func motionTimeline(from records: [BulkRecord],
+                                      epoch: Int = Command.syncEpoch) -> [MotionSample] {
+        var out: [MotionSample] = []
+        out.reserveCapacity(records.count * 5)
+        for r in records {
+            let base = r.date(epoch: epoch)
+            for k in 0 ..< 5 {
+                out.append(MotionSample(time: base.addingTimeInterval(Double(k) * 30),
+                                        movement: Float(r.raw[10 + k])))
+            }
+        }
+        return out
+    }
+
+    /// The main sleep block (in-bed window) detected from the motion channel, or nil.
+    public static func mainSleep(from records: [BulkRecord],
+                                 epoch: Int = Command.syncEpoch) -> ActivityPeriod? {
+        var periods = ActivityPeriod.detectFromMotion(motionTimeline(from: records, epoch: epoch))
+        return ActivityPeriod.findSleep(&periods)
+    }
+
+    /// HealthKit sleep segments for the detected night: an `inBed` span plus
+    /// `asleepCore`/`awake` sub-segments from the stillness detection. Finer
+    /// Light/Deep/REM staging needs an HR-based model (TODO) — the ring doesn't
+    /// send a hypnogram (PROTOCOL.md §5.3), so all "asleep" is reported as core.
+    public static func sleepSegments(from records: [BulkRecord],
+                                     epoch: Int = Command.syncEpoch) -> [SleepSegment] {
+        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: records, epoch: epoch))
+        // Main in-bed block = longest sleep period over the minimum duration (1 h).
+        guard let block = periods
+            .filter({ $0.activity == .sleep })
+            .max(by: { $0.duration < $1.duration }),
+            block.duration > 60 * 60 else { return [] }
+
+        var segs = [SleepSegment(start: block.start, end: block.end, stage: .inBed)]
+        for p in periods where p.start < block.end && p.end > block.start {
+            let s = max(p.start, block.start), e = min(p.end, block.end)
+            if e <= s { continue }
+            segs.append(SleepSegment(start: s, end: e,
+                                     stage: p.activity == .sleep ? .asleepCore : .awake))
+        }
+        return segs
+    }
+
     /// HR / HRV / SpO2 samples from sleep-vitals epochs, with device timestamps.
     /// SpO2 is emitted as a 0…1 fraction (HealthKit oxygenSaturation). HRV is the
     /// ring's RMSSD value written to the SDNN type (unit-compatible; see mapping).

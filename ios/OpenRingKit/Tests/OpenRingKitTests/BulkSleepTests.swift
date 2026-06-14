@@ -77,6 +77,57 @@ final class BulkSleepTests: XCTestCase {
                        Date(timeIntervalSince1970: TimeInterval(Int(0x0c22d5bf) + Command.syncEpoch)))
     }
 
+    /// Build a synthetic 23-byte record: counter, motion byte (×5), subtype [8].
+    func rec(_ counter: UInt32, motion: UInt8, sub: UInt8) -> BulkRecord {
+        var b = [UInt8](repeating: 0, count: 23)
+        b[0] = UInt8(counter >> 24); b[1] = UInt8((counter >> 16) & 0xFF)
+        b[2] = UInt8((counter >> 8) & 0xFF); b[3] = UInt8(counter & 0xFF)
+        b[8] = sub
+        for k in 0..<5 { b[10 + k] = motion }
+        return BulkRecord(b)!
+    }
+
+    func testMotionTimelineExpansion() {
+        let r = BulkRecord(hex(deepSleepRec))!
+        let tl = BulkSleep.motionTimeline(from: [r])
+        XCTAssertEqual(tl.count, 5, "5 sub-samples per 150 s epoch")
+        XCTAssertEqual(tl[1].time.timeIntervalSince(tl[0].time), 30, "30 s spacing")
+        XCTAssertEqual(tl[0].movement, 1, "motion baseline 01 = still")
+    }
+
+    func testSleepDetectionFindsNight() {
+        // 20 active epochs, then ~9 h still (216 epochs @150 s), then 20 active.
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<20 { recs.append(rec(c, motion: 0x14, sub: 0x12)); c += 150 }
+        let onset = c
+        for _ in 0..<216 { recs.append(rec(c, motion: 0x01, sub: 0x62)); c += 150 }
+        let wake = c
+        for _ in 0..<20 { recs.append(rec(c, motion: 0x14, sub: 0x12)); c += 150 }
+
+        let block = BulkSleep.mainSleep(from: recs)
+        XCTAssertNotNil(block)
+        XCTAssertEqual(block?.activity, .sleep)
+        // ~9 h block, boundaries near onset/wake (within the 15-min merge window).
+        XCTAssertEqual(block!.duration, 216 * 150, accuracy: 30 * 60)
+        let segs = BulkSleep.sleepSegments(from: recs)
+        XCTAssertTrue(segs.contains { $0.stage == .inBed }, "emits an inBed span")
+        XCTAssertTrue(segs.contains { $0.stage == .asleepCore }, "emits asleep core")
+        let inBed = segs.first { $0.stage == .inBed }!
+        XCTAssertEqual(inBed.start.timeIntervalSince1970,
+                       Double(Int(onset) + Command.syncEpoch), accuracy: 20 * 60)
+        XCTAssertEqual(inBed.end.timeIntervalSince1970,
+                       Double(Int(wake) + Command.syncEpoch), accuracy: 20 * 60)
+    }
+
+    func testNoSleepWhenAllActive() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<100 { recs.append(rec(c, motion: 0x18, sub: 0x12)); c += 150 }
+        XCTAssertNil(BulkSleep.mainSleep(from: recs))
+        XCTAssertTrue(BulkSleep.sleepSegments(from: recs).isEmpty)
+    }
+
     func testIdleAndStreamSplit() {
         // Idle template record: motion 01×5 + zero payload -> .idle, no samples.
         let idle = BulkRecord(hex("0c099dbf05000c00120a01010101010000000000000000"))!

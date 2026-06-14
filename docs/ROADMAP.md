@@ -66,13 +66,16 @@ Validate the spec cheaply before committing to Swift.
       and **sleep score** to Swift in `OpenRingKit/Analytics/`, with tests mirroring
       openwhoop's own Rust vectors (exact calibration anchors match: strain 21.0 at
       24h@maxHR, stress 10.0 at constant RR).
-- [x] Port **sleep-cycle detection** (activity.rs: gravity-vector stillness →
-      Sleep/Active periods, `findSleep`) to `Analytics/SleepDetection.swift`, with
-      tests mirroring openwhoop's. ⚠️ needs a per-reading **gravity vector** — the
-      ring's IMU stream is 🔴 (likely the 0x47/0x4c bulk frames), so it's algorithm-
-      ready but not yet wired to real data.
-- [ ] Wire analytics to real decoded metrics (blocked: RR-interval availability &
-      sample cadence are 🔴 in PROTOCOL.md §5 — needs a capture).
+- [x] Port **sleep-cycle detection** (activity.rs: stillness → Sleep/Active periods,
+      `findSleep`) to `Analytics/SleepDetection.swift`, with tests mirroring openwhoop's.
+- [x] **Wire sleep detection to real data** — `detectFromMotion` feeds the decoded
+      `0x4c [10:15]` motion channel (no gravity vector needed) into the same core;
+      `BulkSleep.sleepSegments` → `inBed`/`asleepCore`/`awake` for HealthKit, surfaced in
+      RingSession + ContentView. Validated on the 2026-06-13 night: detects in-bed
+      00:33→09:34 vs the app's ~00:32→09:30. Finer Deep/REM staging is a TODO (needs an
+      HR-based model — the ring sends no hypnogram).
+- [ ] Wire **HRV/stress/strain** to real metrics (still gated: those assume per-beat
+      RR intervals; the ring sends per-epoch HRV(ms)/HR, not RR — see note below).
 - [ ] Write derived metrics to HealthKit / app UI (Phase 4 dependency).
 
 > ⚠️ The ported analytics assume per-beat **RR intervals** and ~1 Hz HR (Whoop's
