@@ -51,13 +51,22 @@ final class RingSession: NSObject {
         peripheral.discoverServices(nil)
     }
 
-    /// Begin live monitoring: enter live-HR mode, then poll once a second so the ring
-    /// keeps emitting 0x15 samples. Updates `liveHR`/`liveSpO2`. Idempotent.
+    /// Begin live monitoring: open the session at *now* (so there's no history backlog
+    /// to drain and flood the link), enter HR mode (`d0` → `06 01 00` → fetch), then poll
+    /// `95 00 00` ~1/s. Writes are paced ~300 ms apart so CoreBluetooth doesn't drop them.
+    /// Updates `liveHR`/`liveSpO2`. Idempotent.
     func startLiveMonitoring() {
         guard monitorTask == nil else { return }
         monitoring = true
-        for cmd in Command.liveHRStart { write(cmd) }   // status → sync → live mode → fetch
+        let openNow = Command.syncSince(unixSeconds: Int(Date().timeIntervalSince1970))
+        let enterSeq: [[UInt8]] = [Command.status0, Command.status1, openNow,
+                                   Command.statusQuery, Command.liveHRMode, Command.fetch]
         monitorTask = Task { [weak self] in
+            for cmd in enterSeq {
+                guard let self else { return }
+                self.write(cmd)
+                try? await Task.sleep(for: .milliseconds(300))
+            }
             while !Task.isCancelled {
                 guard let self else { return }
                 self.write(Command.poll)
@@ -149,12 +158,8 @@ extension RingSession: CBPeripheralDelegate {
             //   long  `15 01 … <spo2> …`  → byte[2]=0; SpO2 at byte[14] (🟡)
             // Only the short frame carries HR — don't let a long frame zero it out.
             if frame.opcode == Frame.responseID(Opcode.poll) {
-                if bytes.count >= 4, bytes[1] == 0x00 {
-                    if let hr = LiveHR.decodeLocked(bytes) { self.liveHR = hr }  // filters warm-up
-                } else if bytes.count >= 15, bytes[1] == 0x01 {
-                    let spo2 = Int(bytes[14])
-                    if (70...100).contains(spo2) { self.liveSpO2 = spo2 }
-                }
+                if let hr = LiveHR.decodeLocked(bytes) { self.liveHR = hr }      // short frame, warm-up filtered
+                if let spo2 = LiveHR.decodeSpO2(bytes) { self.liveSpO2 = spo2 }  // long frame, 🟡
             }
         }
     }

@@ -57,6 +57,23 @@ check(LiveHR.decode(hex("15003d0ab092")) == 61, "live HR resting -> 61 bpm (from
 check(LiveHR.decodeLocked(hex("1500080ab0a7")) == nil, "warm-up sentinel (8) filtered by decodeLocked")
 check(LiveHR.decode([]) == nil, "empty HR -> nil")
 
+// --- Live decode against REAL poll frames from the FR02.018 capture ---
+let realHRFrames = ["1500080ab0a7", "1500520ab0fd", "1500540ab0fb", "1500580ab0f7",
+                    "15005a0ab0f5", "15005b0ab0f4", "1500420ab0ed", "15003d0ab092"]
+let decodedHR = realHRFrames.map { LiveHR.decodeLocked(hex($0)) }
+check(decodedHR == [nil, 82, 84, 88, 90, 91, 66, 61], "real HR poll stream -> bpm sequence")
+let hrDisplay = decodedHR.map { hr in hr.map(String.init) ?? "warm-up" }.joined(separator: ", ")
+print("    => live HR from real frames: \(hrDisplay)")
+
+let realSpO2Frames = ["15010000207afb00000024a1c800600098",
+                      "150100001615ac0000001a2c8f00600062",
+                      "15010000102e8000000010be5c00610039"]
+check(realSpO2Frames.allSatisfy { LiveHR.decode(hex($0)) == nil }, "long 15 01 frames yield NO HR (byte[2]=0)")
+let decodedSpO2 = realSpO2Frames.map { LiveHR.decodeSpO2(hex($0)) }
+check(decodedSpO2 == [96, 96, 97], "real SpO2 frames -> byte[14] %")
+print("    => live SpO2 from real frames: \(decodedSpO2.compactMap { $0 })")
+check(LiveHR.decodeSpO2(hex("15005b0ab0f4")) == nil, "short HR frame yields no SpO2")
+
 // --- Metric models + SyncCursor ---
 check(MetricKind.spo2.unit == "fraction", "spo2 unit is fraction (HealthKit 0…1)")
 check(MetricKind.heartRate.unit == "count/min", "heartRate unit count/min")
