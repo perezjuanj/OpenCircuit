@@ -1,0 +1,30 @@
+# Captures may contain personal health data — never commit
+desktop/captures/*
+!desktop/captures/.gitkeep
+*.log
+*.pcap
+*.pcapng
+*.btsnoop
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Data
+*.sqlite
+*.db
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Swift / Xcode (Phase 3+)
+ios/build/
+ios/DerivedData/
+*.xcuserstate

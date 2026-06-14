@@ -1,0 +1,10 @@
+# Normalize line endings to LF in the repo (project moves between Windows and macOS).
+* text=auto eol=lf
+
+# Treat captures and binaries as binary (never normalize).
+*.log binary
+*.pcap binary
+*.pcapng binary
+*.btsnoop binary
+*.sqlite binary
+*.db binary
