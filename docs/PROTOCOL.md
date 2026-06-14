@@ -122,6 +122,16 @@ a few seconds of PPG warm-up; and the ring sleeps/stops advertising seconds afte
 disconnect (wake via charger contact or motion). Metric-specific sync commands
 (sleep/HRV/SpO2/steps/temp) not yet isolated.
 
+> **Open blocker for live-HR-on-demand (🟡).** `02` (session-open) only replies
+> `82` when the ring has **pending data to sync**. `02 00 FFFFFFFF…` returned `82`
+> + history while a backlog existed, but once the backlog is drained it goes silent,
+> so the session never opens and `06`/live never engages. In the reference capture,
+> live HR was entered *while the history session was still open*. To crack
+> live-HR-only cleanly we need a **fresh Android capture of ONLY a manual HR
+> measurement** (no history sync) — that isolates the minimal live-HR entry without
+> the history-session entanglement. Until then, live HR is confirmed by the capture
+> (byte[2] of `0x15`) but not yet reproduced on demand from the Mac.
+
 ## 5. Decoded metric formats
 
 ### Heart rate (live) 🟡
