@@ -19,7 +19,18 @@ below to this FW until re-confirmed on another version.
 plaintext: readable identity strings, monotonic counters, and a checksum that
 validates (§3). No app-layer key exchange or challenge/response precedes data
 access. Offline decoding is viable → the iOS app is unblocked.
-(Link-layer LE encryption, if any, is transparent to CoreBluetooth — irrelevant.)
+
+**BUT data commands are gated behind an LE bond** 🟢 (live test, 2026-06-14). An
+*unbonded* central (macOS bleak) connects, subscribes, and gets replies to the `0x01`
+status handshake (`81 00 …`, `81 01 …`) — but the ring **silently drops every data
+command**: `0x02` sync-open (even the known-good real cursor `0c2298c3` that returns
+`82 00 00 82` on the bonded phone), `0x07` fetch, `0x95` poll — zero response. So:
+- The **bonded phone** (Android btsnoop) is the only way to pull real data; this is why
+  all metric RE here uses phone captures, and why the iPhone app works (iOS bonds).
+- The **desktop `openringconn` workbench can scan/enumerate/handshake but NOT pull data**
+  — CoreBluetooth/bleak can't initiate pairing (`pair()` → NotImplementedError on macOS).
+  `listen`/`replay` of data commands will see nothing. Active probing from the Mac is a
+  dead end; capture the phone instead.
 
 ## 1. Connection & GATT layout
 
@@ -66,8 +77,12 @@ or bulk transfer). Not used by the main protocol. Decode if needed later.
 **No app-layer handshake observed.** After enabling notifications (`0x0805 ← 01 00`)
 the app immediately issues data commands and the ring responds — no token, no
 challenge, no key derived from MAC/serial. History sync uses the same channel as
-live data with no extra auth. (Re-verify on a *fresh pair* capture to be certain a
-one-time bonding step isn't being skipped on an already-bonded phone.)
+live data with no extra *app-layer* auth.
+
+**The skipped step is the LE bond itself** 🟢 (§0, live test): on an already-bonded
+phone the app needs no further auth, but an unbonded central gets only the `0x01`
+handshake — data commands (`0x02`/`0x07`/`0x95`) are silently dropped until the link
+is bonded. So the "no auth" above is conditional on a bonded link.
 
 ## 3. Framing 🟢 (verified live on the Mac)
 
@@ -305,9 +320,13 @@ Each names the single capture that converts a 🟡/🔴 field into a decoded met
 7. **Session nonce source:** correlate `01 01 <nonce>` against prior `0x81`/`0x10`
    fields. *(Not required — nonce is arbitrary; §4.)*
 8. **Skin temp + its transport:** temp is measured only at night yet is absent from a full
-   activity/sleep/PPG sync and from `0x0900` — fetched by a distinct command/screen. Snoop
-   on → open the app's **Temperature/Trends screen** → sync. Ground truth so far: `−0.16`
-   deviation / `96.75 °F`; expect an absolute near `3588`–`3597` (0.01 °C). Unblocks the
+   activity/sleep/PPG sync, from `0x0900`, and from a capture with the Temperature screen
+   open (that screen reads cache, no BLE). **Mac active-probing is ruled out** — data
+   commands need a bond (§0). Remaining lead: a **from-scratch phone resync** — `adb shell
+   am force-stop com.gdjztech.ringconn`, reopen the app so it re-pulls history from cursor
+   0, and btsnoop that; a full resync may issue the temp fetch the incremental syncs skip.
+   Ground truth: `−0.16` deviation / `96.75 °F` (and `96.58 °F`/35.88 °C for 2026-06-13);
+   expect an absolute near `3588`–`3597` (0.01 °C). Unblocks the
    `bodyTemperature`/`appleSleepingWristTemperature` HealthKit write.
 
 ---

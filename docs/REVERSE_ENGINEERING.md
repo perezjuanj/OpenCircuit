@@ -40,6 +40,13 @@ and encrypted-vs-plaintext determination.
 
 ## Track B — Active probing (workbench)
 
+> ⚠️ **The Mac can only handshake, not pull data** (🟢 live test, PROTOCOL.md §0).
+> The ring gates `0x02`/`0x07`/`0x95` data commands behind an LE **bond**. An unbonded
+> CoreBluetooth/bleak central gets `0x01`→`0x81` replies but the ring silently drops
+> every data command, and bleak can't pair on macOS (`pair()` → NotImplementedError).
+> So `scan`/`enumerate`/`listen` work for the handshake, but `replay` of a sync/fetch
+> sees nothing. **For any real data, capture the bonded phone (Track A).**
+
 Once you can see the app's traffic, reproduce it yourself:
 
 ```
