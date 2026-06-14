@@ -27,7 +27,10 @@ Validate the spec cheaply before committing to Swift.
       SpO2/HRV/steps/temp captures are 🔴 in PROTOCOL.md §5).
 - [ ] Xcode project under `ios/`; CoreBluetooth scan/connect to the ring.
       (blocked: needs full Xcode + iOS SDK; CLT-only can't build CoreBluetooth.)
-- [ ] Local store (SwiftData) + per-metric sync cursor; background BLE sync.
+- [x] **Metric models + SyncCursor** — `Metrics.swift` (QuantitySample, SleepSegment,
+      MetricKind units per HEALTHKIT_MAPPING.md) and `SyncCursor.swift` (per-metric
+      newest-record bookkeeping, monotonic, Codable), tested.
+- [ ] Local store (SwiftData) — wraps SyncCursor + raw samples (blocked: needs Xcode).
 - [ ] XCTest suite (`OpenRingKitTests`) — written; runs once Xcode is installed.
 **Exit:** iOS app pulls the same data the desktop client does.
 

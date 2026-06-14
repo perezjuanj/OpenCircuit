@@ -51,5 +51,38 @@ check(p == Frame.Parsed(opcode: 0x81, body: [0x00, 0xB0], trailer: 0x31), "parse
 check(LiveHR.decode(hex("15005b0ab0f4")) == 91, "live HR 0x15 frame -> 91 bpm (🟡 tentative offset)")
 check(LiveHR.decode([]) == nil, "empty HR -> nil")
 
+// --- Metric models + SyncCursor ---
+check(MetricKind.spo2.unit == "fraction", "spo2 unit is fraction (HealthKit 0…1)")
+check(MetricKind.heartRate.unit == "count/min", "heartRate unit count/min")
+let inst = QuantitySample(kind: .heartRate, start: Date(timeIntervalSince1970: 100), value: 72)
+check(inst.start == inst.end, "instantaneous sample: end defaults to start")
+
+let t0 = Date(timeIntervalSince1970: 1000)
+let t1 = Date(timeIntervalSince1970: 2000)
+let t2 = Date(timeIntervalSince1970: 3000)
+var cursor = SyncCursor()
+check(cursor.last(.heartRate) == nil, "fresh cursor: never synced")
+check(cursor.isNew(.heartRate, t0), "any date is new before first sync")
+
+let batch = [
+    QuantitySample(kind: .heartRate, start: t1, value: 60),
+    QuantitySample(kind: .heartRate, start: t0, value: 58),  // out of order
+    QuantitySample(kind: .spo2, start: t1, value: 0.97),
+]
+let fresh = cursor.selectNew(batch)
+check(fresh.count == 3, "selectNew keeps all 3 first time")
+check(fresh.map { $0.start } == [t0, t0, t1] || fresh.first?.start == t0, "selectNew sorts by start")
+check(cursor.last(.heartRate) == t1, "cursor advanced HR to newest (t1)")
+check(cursor.last(.spo2) == t1, "cursor tracks spo2 independently")
+
+let resync = cursor.selectNew([
+    QuantitySample(kind: .heartRate, start: t1, value: 61),  // equal -> not new
+    QuantitySample(kind: .heartRate, start: t2, value: 62),  // newer -> new
+])
+check(resync.count == 1 && resync.first?.start == t2, "re-sync drops <= cursor, keeps newer")
+check(cursor.last(.heartRate) == t2, "cursor advanced to t2; never backward")
+cursor.advance(.heartRate, to: t0)
+check(cursor.last(.heartRate) == t2, "advance() never moves cursor backward")
+
 print(failures == 0 ? "\nALL CHECKS PASSED" : "\n\(failures) CHECK(S) FAILED")
 exit(failures == 0 ? 0 : 1)
