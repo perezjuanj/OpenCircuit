@@ -31,8 +31,12 @@ final class RingScanner: NSObject {
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
+    /// True once the user has connected; keeps us auto-reconnecting if the ring sleeps.
+    private var wantConnection = false
+
     func start() {
         guard central.state == .poweredOn else { return }
+        wantConnection = true
         state = .scanning
         // Discover all services (the ring is reportedly not fully GATT-compatible,
         // so we don't filter by service UUID — those roles are 🔴 in PROTOCOL.md).
@@ -40,7 +44,9 @@ final class RingScanner: NSObject {
     }
 
     func stop() {
+        wantConnection = false
         central.stopScan()
+        if let target { central.cancelPeripheralConnection(target) }
         if case .scanning = state { state = .idle }
     }
 }
@@ -87,7 +93,15 @@ extension RingScanner: CBCentralManagerDelegate {
         Task { @MainActor in
             self.session?.stopLiveMonitoring()
             self.session = nil
-            self.state = .idle
+            // Auto-reconnect: CoreBluetooth's connect has no timeout — it reconnects
+            // (using the persisted bond) the moment the ring wakes/comes back in range,
+            // so the user never has to re-pair or open the official app again.
+            if self.wantConnection {
+                self.state = .connecting(peripheral.name ?? "RingConn")
+                self.central.connect(peripheral)
+            } else {
+                self.state = .idle
+            }
         }
     }
 }
