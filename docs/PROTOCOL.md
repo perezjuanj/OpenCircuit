@@ -83,10 +83,10 @@ one-time bonding step isn't being skipped on an already-bonded phone.)
   frames by appending an XOR trailer produces invalid bytes the ring ignores.
 - The ring ATT-acks any write but only *acts* on commands whose contents are valid.
 
-Bulk frames (`0x47`/`0x4c`) pack fixed-size records prefixed `0c 09 <counter>`
-(counter += ~0x0384/record). The page is continued by ACKing: a `0x47` page →
-write `c7 00 00`; a `0x4c` page → write `cc 00 00`; the last page carries
-remaining-count byte `0x00`.
+Bulk frames (`0x47`/`0x4c`) pack fixed-size records, each prefixed by delimiter
+`0x0c` + a **3-byte BE counter** in the sync-cursor space (`0x47` steps `+0x0384`,
+`0x4c` steps `+0x96`; see §5.2/§5.3). Continue a page by ACKing: `0x47` → `c7 00 00`,
+`0x4c` → `cc 00 00`; the page header byte[2] counts remaining records, `0x00` on the last.
 
 ## 4. Commands (request → response) 🟢
 
@@ -135,29 +135,93 @@ disconnect (wake via charger contact or motion). Metric-specific sync commands
 
 ## 5. Decoded metric formats
 
-### Heart rate (live) 🟢 CONFIRMED
-`0x95` poll → `0x15` frame: **`15 00 <hr> 0a b0 <xor>`** — **byte[2] = HR in bpm**.
-Confirmed by a targeted HR-only capture (`captures/btsnoop_hr.log`, 00:23): the
-sensor warms up then settles to a stable resting pulse —
-`08`(warm-up) → `66 65 64 63 62 61 61 61 61` — i.e. 61 bpm resting, a textbook
-settle. Bytes [3]=`0a`, [4]=`b0` are constant (status/signal-quality flags, 🟡).
-First sample after entering live mode is a warm-up sentinel (`byte[2]` ≈ 8) — treat
-values below ~30 as "not locked yet". Longer `15 01 …` frames carry extra fields
-(SpO2/perfusion? 🔴).
+Structure below is from parallel structural RE of `captures/btsnoop_hr.log`
+(FW FR02.018): 11× `0x47`, 3× `0x4c`, 6× `0x81`, ~40 `0x10`/`0x87`, 3× `0x50`,
+3 sync-opens. **Structure is 🟢/🟡; semantic VALUES are mostly 🔴 pending
+ground-truth captures (§6).**
 
-### Bulk PPG / waveform (history) 🟡
-`0x47`/`0x4c` frames, `0c 09 <ctr>`-delimited records. `0x47` records hold a
-smoothly-varying ~3-byte field (raw PPG, drifts monotonically); `0x4c` records hold
-a repeating `01 01 01 01 01` pattern (likely accelerometer/activity or stage marks).
+> **Refines §3's bulk-record prefix.** The delimiter is a single byte `0x0c`; the
+> bytes after it are a **3-byte big-endian counter** (the `09`/`0a`/`22` is its high
+> byte — it rolls cleanly `0c 09 ff 9a → 0c 0a 00 30`). This counter shares the
+> **same value space as the `0x02` sync cursor** (§5.6): late records sit at
+> `0c 22 xx xx`, matching cursor `0c 22 98 c3`. The `+0x0384`/record step is the
+> `0x47` rate; `0x4c` steps `+0x96`.
 
-### Status frames 🟡
-`0x10`/`0x50` (`d0 00 00 →`), e.g. `10 4e 02 00 00 00 01 09 01 05 … 10 31 00 ff …` —
-fixed-shape session/record descriptor (counts, cursor). No XOR trailer on the two
-`0x50` variants; treat as a distinct frame class.
+### 5.1 Heart rate (live) 🟢 CONFIRMED
+`0x95` poll → `0x15`: **`15 00 <hr> 0a b0 <xor>`**, byte[2] = HR bpm (61 bpm resting
+in the HR-only capture). First sample is a warm-up sentinel (byte[2] ≈ 8); treat
+< ~30 as "not locked". Longer `15 01 …` frames carry extra fields (SpO2? 🔴).
 
-### (others)
-Document each as decoded: byte offsets, scale/units, timestamp encoding
-(epoch? minutes-since? local vs UTC?), and how multi-record pages are delimited.
+### 5.2 `0x47` — bulk PPG / waveform page (ACK each with `c7 00 00`)
+Page: `[0]`=`0x47` · `[1]`=`00` · **`[2]`=remaining-RECORD countdown** (−5/full page,
+0 on last; e.g. `1c 17 12 0d 08 03 00`) · body = N×**47-byte records** · `[last]`=XOR
+(valid 11/11). 🟢
+Record (47 B): `[0]`=`0x0c` · `[1:4]`=BE counter **+0x0384/rec** (cursor space) 🟢 ·
+`[4:6]`=16-bit field drifting with baseline 🟡 · `[6:9]`=usually `00 00 00`, else
+per-record flag/event 🟡 · `[9:47]`=**38 B ≈ 30 samples × 10-bit BE** (self-consistent
+but unproven; 10-vs-12-bit ambiguous) 🟡. Waveform is flat/settling when idle,
+oscillatory (pulsatile-like) when worn — not globally monotonic.
+
+### 5.3 `0x4c` — bulk activity/sleep page (ACK each with `cc 00 00`)
+Page: `[0]`=`0x4c` · `[1]`=`00` · **`[2]`=remaining-RECORD countdown** (−6/page) ·
+body = 6×**23-byte records** · `[last]`=XOR. 🟢
+Record (23 B): `[0]`=`0x0c` · `[1:4]`=BE counter **+0x96/rec** (cursor space) 🟢 ·
+`[8]`=subtype tag (idle alternates `12/13`) 🟢 · `[10:15]`=baseline `01 01 01 01 01` ·
+`[15:22]`=7-B payload (zero idle, dense when worn) 🟡 · `[22]`=trailer flags (idle
+`12→00`/`13→04`) 🟢. Idle/unworn template: `[4:7]=05 00 0c 00`, `[9]=0a`, `[10:14]=01×5`,
+`[15:21]=00×7` 🟢. Likely the per-epoch sleep/activity stream (role = inference).
+
+### 5.4 `0x10` / `0x87` — fixed 19-byte descriptor
+`0x10` ← `d0 00 00` (also spontaneous ~30–60 s); `0x87` ← `07 00 00`. **Identical
+layout** (only `[0]` respid differs; `0x87` body == `0x10` body) → shared descriptor,
+XOR-valid. `[1]`=per-session marker (`4e`→`5c`; same value in `0x81 01`) 🟡 · `[2]`=
+state enum `01–04` (not a counter) 🟡 · `[6:8]`/`[8:10]`=16-bit A/B with validity
+flag byte (`00`+`fd` cold, `01`+value once data exists) 🟡 · `[15]`=declines over an
+evening but **not plain battery** 🟡 · `[17]`=`ff` idle; **non-`ff` precedes a bulk
+stream → "data follows"** 🟡.
+
+### 5.5 `0x50` — end-of-history cursor report (NO XOR trailer) 🟡
+Spontaneous after the last bulk page. Distinct class: **no XOR trailer** (last byte
+is the low byte of the final cursor). `[0:3]`=`50 00 00`, then 6-byte entries
+`[type=15][sub][cursor:4 BE]` — decodes as a **from/to cursor pair** bracketing the
+synced range, e.g. `50 00 00 | 15 12 0c22aae4 | 15 12 0c22acb5`. A 21-byte variant
+is undecoded 🔴.
+
+### 5.6 `0x02` sync cursor — TIMESTAMP 🟢 CONFIRMED
+Host write `02 00 <cursor:4 BE> <flag:1> 01 00` → `82 00 00 82`.
+**cursor = 4-byte BE seconds since epoch `1577793600` (2019-12-31 12:00:00 UTC)** —
+3 (time,value) pairs + 2 in-frame cross-checks agree to <0.34 s; 1/sec, monotonic;
+same epoch as the record counters. Build current: `floor(unix_utc) − 1577793600`,
+BE, into `02 00 <BE4> 00 01 00`; `FF FF FF FF` = "everything" while backlog exists.
+The 12 h offset vs 2020-01-01 is byte-confirmed but its **cause** (local-tz vs
+firmware epoch vs AM/PM) is unresolved from one timezone 🟡. `flag` byte[6]
+(`00`/`03`) meaning unknown 🟡.
+
+### 5.7 `0x81` — status replies (← `0x01`)
+**`81 00 XX YY`** (← `01 00 00`): `[2]` is the only varying byte, full 8-bit range,
+>100 → **not battery %**; likely a session token 🔴.
+**`81 01 …`** (38 B, ← `01 01 <nonce>`): mostly constant; notable — `[27:32]`=
+`21 49 ac <XX> f4` (4/5 const, device-id-like) · `[34:36]`=16-bit monotonic counter
+≈ 1/sec (30→1475→9045 over 3 sessions) 🟡. The `01 01 <3-B nonce>` arg is per-session
+and **arbitrary** (ring accepts any value — see §4); the constant `21 49 ac _ f4`
+block is a candidate nonce source 🔴.
+
+## 6. Ground-truth captures needed (prioritized)
+
+Each names the single capture that converts a 🟡/🔴 field into a decoded metric.
+1. **`0x47` → real PPG:** app's realtime/exported PPG trace recorded over the *same*
+   window as a btsnoop sync → confirms bit-width, channel, counter time-unit.
+2. **`0x4c` → sleep/HR/HRV/SpO2 epochs:** one fully app-logged night with timestamped
+   per-epoch values + session start/end → map the `+0x96` counter and payload bytes.
+3. **Counter→wall-clock:** two syncs a known gap apart (ring worn) → pins counter units.
+4. **`0x10`/`0x87` `[6:8]`/`[15]`:** sync after a known wear interval + app UI/battery
+   screenshot → maps A/B to record counts and `[15]` to a real quantity.
+5. **`0x81` token vs battery:** repeat `01 00 00` within a session & across battery
+   levels → is `81 00 [2]` a token or battery; disambiguate `81 01 [34:36]`.
+6. **`0x02` epoch cause:** a capture incl. the clock-SET command, or a sync from a
+   phone set to UTC → resolves the 12 h offset.
+7. **Session nonce source:** correlate `01 01 <nonce>` against prior `0x81`/`0x10`
+   fields. *(Not required — nonce is arbitrary; §4.)*
 
 ---
 
