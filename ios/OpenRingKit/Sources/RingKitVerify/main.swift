@@ -144,5 +144,29 @@ check(ActivityPeriod.findSleep(&shortSleep) == nil, "findSleep: ignores <60min s
 var none: [ActivityPeriod] = []
 check(ActivityPeriod.findSleep(&none) == nil, "findSleep: empty -> nil")
 
+// --- Bulk activity/sleep decode (0x4c, PROTOCOL.md §5.3) ---
+// Real, XOR-valid 0x4c page from the 2026-06-13 overnight sync: 6 × 23-byte records.
+let realPage = "4c00260c22a16b55210a7d120a010101010100000402400400000c22a20155000300"
+    + "120a010101010100003c00000d01200c22a297540001005f0a010101010100001101b00f"
+    + "00440c22a32d6027077b120a010101010100402501c02235a00c22a3c351260577120b01"
+    + "0101010108a01000000401300c22a459502d0378120a01010101010160200000040ff0cc"
+let pageRecs = BulkSleep.records(fromPage: hex(realPage))
+check(pageRecs.count == 6, "0x4c page splits into 6 × 23-byte records")
+check(pageRecs[2].layout == .sleepVitals && pageRecs[0].layout == .activity,
+      "record [8] keys layout: sleep-vitals vs activity")
+
+// Deep-sleep epoch confirmed against the app: HR 68 / HRV 77 / SpO2 98.
+let dsr = BulkRecord(hex("0c22d5bf444d057a620a01010101012aa0000090000004"))!
+check(dsr.heartRate == 68, "sleep-vitals [4] -> HR 68 bpm (🟢 app-confirmed)")
+check(dsr.hrvRMSSD == 77, "sleep-vitals [5] -> HRV 77 ms (🟢)")
+check(dsr.spo2Percent == 98, "sleep-vitals [8] -> SpO2 98% (🟢)")
+check(dsr.counter == 0x0c22d5bf, "record [0:4] -> BE counter")
+let dsSamples = BulkSleep.samples(from: [dsr])
+check(dsSamples.count == 3, "sleep-vitals -> HR + HRV + SpO2 samples")
+check(dsSamples.first(where: { $0.kind == .spo2 })?.value == 0.98, "SpO2 emitted as 0…1 fraction")
+let idleRec = BulkRecord(hex("0c099dbf05000c00120a01010101010000000000000000"))!
+check(idleRec.layout == .idle && BulkSleep.samples(from: [idleRec]).isEmpty,
+      "idle template -> no samples")
+
 print(failures == 0 ? "\nALL CHECKS PASSED" : "\n\(failures) CHECK(S) FAILED")
 exit(failures == 0 ? 0 : 1)

@@ -35,6 +35,21 @@ struct ContentView: View {
                     }
                     .disabled(!HealthKitWriter.isAvailable)
                 }
+
+                Section("Sleep & history") {
+                    Button(scanner.session?.syncing == true ? "Syncing…" : "Sync history") {
+                        scanner.session?.syncHistory()
+                    }
+                    .disabled(scanner.session?.ready != true || scanner.session?.syncing == true)
+
+                    if let samples = scanner.session?.historySamples, !samples.isEmpty {
+                        LabeledContent("Decoded samples", value: "\(samples.count)")
+                        Button("Write to Apple Health") {
+                            Task { try? await health.write(samples) }
+                        }
+                        .disabled(!healthAuthorized)
+                    }
+                }
             }
             .navigationTitle("OpenRingConn")
         }

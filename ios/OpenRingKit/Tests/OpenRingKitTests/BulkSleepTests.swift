@@ -1,0 +1,88 @@
+import XCTest
+@testable import OpenRingKit
+
+// Fixtures are REAL 0x4c frames/records pulled from the 2026-06-13 overnight sync
+// (desktop/captures/sleep_sync_btsnoop.log, FR02.018), decoded and aligned to the
+// RingConn app's readout for that night. They mirror desktop/decode_bulk.py so the
+// Swift port is provably byte-identical.
+final class BulkSleepTests: XCTestCase {
+
+    func hex(_ s: String) -> [UInt8] {
+        var out = [UInt8](); var i = s.startIndex
+        while i < s.endIndex {
+            let j = s.index(i, offsetBy: 2)
+            out.append(UInt8(s[i..<j], radix: 16)!); i = j
+        }
+        return out
+    }
+
+    // A real, XOR-valid 0x4c page: header 4c 00 26, then 6 × 23-byte records, then XOR.
+    let realPage = "4c00260c22a16b55210a7d120a010101010100000402400400000c22a20155000300"
+        + "120a010101010100003c00000d01200c22a297540001005f0a010101010100001101b00f"
+        + "00440c22a32d6027077b120a010101010100402501c02235a00c22a3c351260577120b01"
+        + "0101010108a01000000401300c22a459502d0378120a01010101010160200000040ff0cc"
+
+    // A single hand-verified deep-sleep record (counter 0c22d5bf): HR 68, HRV 77, SpO2 98.
+    let deepSleepRec = "0c22d5bf444d057a620a01010101012aa0000090000004"
+
+    func testPageSplitsIntoSixRecords() {
+        let recs = BulkSleep.records(fromPage: hex(realPage))
+        XCTAssertEqual(recs.count, 6, "page body is 138 B = 6 × 23-byte records")
+    }
+
+    func testInvalidPageRejected() {
+        var bad = hex(realPage); bad[bad.count - 1] ^= 0xFF   // break XOR trailer
+        XCTAssertTrue(BulkSleep.records(fromPage: bad).isEmpty, "bad XOR -> no records")
+        XCTAssertTrue(BulkSleep.records(fromPage: hex("8100b031")).isEmpty, "wrong opcode -> none")
+    }
+
+    func testSleepVitalsRecordDecode() {
+        // Deep-sleep epoch confirmed against the app: HR 68 / HRV 77 / SpO2 98.
+        let r = BulkRecord(hex(deepSleepRec))!
+        XCTAssertEqual(r.layout, .sleepVitals)
+        XCTAssertEqual(r.counter, 0x0c22d5bf)
+        XCTAssertEqual(r.heartRate, 68)
+        XCTAssertEqual(r.hrvRMSSD, 77)
+        XCTAssertEqual(r.spo2Percent, 98)
+        XCTAssertEqual(r.motion, [1, 1, 1, 1, 1])
+    }
+
+    func testCounterToWallClock() {
+        // counter = seconds since syncEpoch (PROTOCOL.md §5.6).
+        let r = BulkRecord(hex(deepSleepRec))!
+        XCTAssertEqual(r.date(),
+                       Date(timeIntervalSince1970: TimeInterval(Int(0x0c22d5bf) + Command.syncEpoch)))
+    }
+
+    func testActivityVsSleepLayout() {
+        let recs = BulkSleep.records(fromPage: hex(realPage))
+        // Records [0],[1] are activity epochs ([8]=0x12); record [2] is sleep-vitals ([8]=0x5f).
+        XCTAssertEqual(recs[0].layout, .activity)
+        XCTAssertEqual(recs[2].layout, .sleepVitals)
+        XCTAssertEqual(recs[2].spo2Percent, 0x5f)        // 95 %
+        XCTAssertEqual(recs[2].heartRate, 0x54)          // 84 bpm (waking/active in-bed)
+        XCTAssertNil(recs[2].hrvRMSSD, "HRV byte is 0 here -> no sample")
+        XCTAssertNil(recs[0].heartRate, "activity epoch exposes no HR field")
+    }
+
+    func testSamplesFromSleepVitals() {
+        let r = BulkRecord(hex(deepSleepRec))!
+        let s = BulkSleep.samples(from: [r])
+        XCTAssertEqual(s.count, 3, "HR + HRV + SpO2")
+        let byKind = Dictionary(grouping: s, by: { $0.kind })
+        XCTAssertEqual(byKind[.heartRate]?.first?.value, 68)
+        XCTAssertEqual(byKind[.hrvSDNN]?.first?.value, 77)
+        XCTAssertEqual(byKind[.spo2]?.first?.value, 0.98, "SpO2 emitted as 0…1 fraction")
+        XCTAssertEqual(s.first?.start,
+                       Date(timeIntervalSince1970: TimeInterval(Int(0x0c22d5bf) + Command.syncEpoch)))
+    }
+
+    func testIdleAndStreamSplit() {
+        // Idle template record: motion 01×5 + zero payload -> .idle, no samples.
+        let idle = BulkRecord(hex("0c099dbf05000c00120a01010101010000000000000000"))!
+        XCTAssertEqual(idle.layout, .idle)
+        XCTAssertTrue(BulkSleep.samples(from: [idle]).isEmpty)
+        // Stream split drops a trailing partial chunk.
+        XCTAssertEqual(BulkSleep.records(fromStream: hex(deepSleepRec) + [0xff, 0xff]).count, 1)
+    }
+}

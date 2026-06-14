@@ -5,11 +5,11 @@ import OpenRingKit
 
 // An active link to a connected ring: discovers the notify/write characteristics
 // by UUID, enables notifications, sends commands, and decodes responses through
-// OpenRingKit's confirmed codec. Only spec-supported behavior is implemented:
+// OpenRingKit's confirmed codec. Spec-supported behavior implemented:
 //   • live-HR poll (0x95 → 0x15, LiveHR.decode 🟡)
-// History/metric sync commands exist in the codec, but their RESPONSE record
-// formats are 🔴 (PROTOCOL.md §5) — decoding them is deliberately left as a
-// flagged TODO pending a capture, rather than invented here.
+//   • history sync: drain 0x4c activity/sleep pages → BulkSleep → HR/HRV/SpO2
+//     samples (PROTOCOL.md §5.3, 🟢 fields). 0x47 PPG pages are acked but not yet
+//     decoded (their payload is 🔴 — issue #8).
 
 @Observable
 @MainActor
@@ -18,6 +18,14 @@ final class RingSession: NSObject {
     private(set) var liveHR: Int?
     private(set) var lastFrame: String?
     private(set) var ready = false
+
+    /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
+    /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
+    private(set) var historySamples: [QuantitySample] = []
+    /// True while 0x4c pages are still arriving for the current sync.
+    private(set) var syncing = false
+
+    private var bulkRecords: [BulkRecord] = []
 
     private let peripheral: CBPeripheral
     private var notifyChar: CBCharacteristic?
@@ -42,6 +50,18 @@ final class RingSession: NSObject {
     /// Poll for one live sample (0x95 → 0x15). Sent verbatim — NOT XOR-encoded.
     func pollLiveHR() {
         write(Command.poll)
+    }
+
+    /// Pull stored history: open the sync session (cursor = everything) and fetch.
+    /// The ring streams 0x4c/0x47 pages, drained+decoded in didUpdateValue; results
+    /// land in `historySamples` once 0x50 (end-of-history) arrives.
+    func syncHistory() {
+        bulkRecords.removeAll()
+        historySamples.removeAll()
+        syncing = true
+        for cmd in [Command.status0, Command.status1, Command.syncAll, Command.fetch] {
+            write(cmd)
+        }
     }
 
     private func write(_ bytes: [UInt8]) {
@@ -81,10 +101,21 @@ extension RingSession: CBPeripheralDelegate {
         let bytes = [UInt8](data)
         Task { @MainActor in
             self.lastFrame = data.map { String(format: "%02x", $0) }.joined(separator: " ")
-            // Bulk history pages: ack to continue draining (47→c7, 4c→cc).
+            // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).
             switch bytes.first {
-            case 0x47: self.write(Command.pageAck47); return
-            case 0x4C: self.write(Command.pageAck4C); return
+            case 0x47:
+                self.write(Command.pageAck47); return   // PPG page — decode TODO (issue #8)
+            case 0x4C:
+                self.bulkRecords += BulkSleep.records(fromPage: bytes)
+                self.write(Command.pageAck4C); return
+            case 0x50:
+                // End-of-history cursor report (§5.5) — note: NO XOR trailer, so it
+                // never reaches Frame.parse. Finalize the sync here.
+                if self.syncing {
+                    self.historySamples = BulkSleep.samples(from: self.bulkRecords)
+                    self.syncing = false
+                }
+                return
             default: break
             }
             guard let frame = Frame.parse(bytes) else { return }   // XOR-validate responses
