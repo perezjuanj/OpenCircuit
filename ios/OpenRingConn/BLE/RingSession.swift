@@ -93,18 +93,13 @@ final class RingSession: NSObject {
                 self.write(cmd)
                 try? await Task.sleep(for: .milliseconds(300))
             }
-            var tick = 0
+            // Pure polling only. Do NOT inject `d0` (status query) here to refresh steps:
+            // d0 re-arms the mode switch and kicks the HR session back to its warm-up
+            // sentinel (byte[2]=8), so the reading never climbs. Steps refresh from the
+            // ring's spontaneous 0x10/0x87 frames instead.
             while !Task.isCancelled {
                 guard let self else { return }
                 self.write(Command.poll)
-                // Every ~8 s, re-pull the status descriptor (0x10/0x87) so the step
-                // count refreshes mid-session — otherwise steps only update if the ring
-                // happens to emit one spontaneously. Paced so the write isn't dropped.
-                if tick % 8 == 7 {
-                    try? await Task.sleep(for: .milliseconds(300))
-                    self.write(Command.statusQuery)
-                }
-                tick += 1
                 try? await Task.sleep(for: .seconds(1))
             }
         }
