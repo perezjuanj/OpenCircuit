@@ -42,6 +42,8 @@ struct VitalsTableView: View {
             divider
             row("Resting HR", value: restingHR.map { "\($0) bpm" } ?? "—", time: nil)
             divider
+            row("Steps (today)", value: stepsText, time: session?.steps != nil ? "live" : nil)
+            divider
             row("Respiratory Rate", value: "— (todo)", time: nil)
             divider
             sleepSection
@@ -101,6 +103,13 @@ struct VitalsTableView: View {
         if let c = session?.liveTemperature { return tempString(c) }
         return valueText(.temperature) { tempString($0) }
     }
+    /// Ring's onboard step count — live while connected (the descriptor streams it). It's
+    /// the ring's own count, which can differ from the official app's cloud daily total.
+    private var stepsText: String {
+        guard let s = session?.steps else { return "—" }
+        return "\(s)"
+    }
+
     private func tempString(_ celsius: Double) -> String {
         String(format: "%.1f °C  (%.1f °F)", celsius, celsius * 9 / 5 + 32)
     }
