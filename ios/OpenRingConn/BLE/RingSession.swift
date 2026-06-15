@@ -31,6 +31,7 @@ final class RingSession: NSObject {
     private(set) var liveHRWarmup: Int?
     private(set) var steps: Int?          // ring onboard step count (0x10/0x87 [4:6], §5.4)
     private(set) var liveTemperature: Double?   // skin temp °C (0x10/0x87 [6:8]/[8:10], §5.4)
+    private(set) var batteryPercent: Int?       // ring battery % (0x10/0x87 [1], §5.4 🟢)
     private(set) var liveMode: LiveMode = .hr
     private(set) var monitoring = false
     /// True during the open→drain phase before the live stream starts. The ring won't
@@ -343,6 +344,8 @@ extension RingSession: CBPeripheralDelegate {
                 self.liveTemperature = t.celsius
                 self.persist([QuantitySample(kind: .temperature, start: Date(), value: t.celsius)])
             }
+            // Ring battery % is descriptor byte[1] (§5.4 🟢, ground-truthed).
+            if let b = DeviceStatus.battery(bytes) { self.batteryPercent = b }
             // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).
             switch bytes.first {
             case 0x47:

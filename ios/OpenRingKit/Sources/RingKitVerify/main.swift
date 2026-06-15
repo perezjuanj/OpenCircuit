@@ -103,6 +103,11 @@ check(temp.map { abs($0.fahrenheit - 96.08) < 0.01 } == true, "skin temp -> 96.0
 check(DeviceStatus.skinTemperature(hex("105402000051011f012500000000105400ff96"))?.channelA == 28.7,
       "just-donned ring reads ~28.7 °C (warming curve)")
 check(DeviceStatus.skinTemperature(hex("15005b0ab0f4")) == nil, "non-descriptor frame -> nil temp")
+
+// --- Battery % from the 0x10/0x87 descriptor [1] (real frame, §5.4 🟢) ---
+check(DeviceStatus.battery(hex("104e0300000001630165000000001019 02ffaf".replacingOccurrences(of: " ", with: ""))) == 78,
+      "descriptor [1] 0x4e -> 78% battery (🟢, app-confirmed 76%=0x4c)")
+check(DeviceStatus.battery(hex("15005b0ab0f4")) == nil, "non-descriptor frame -> nil battery")
 check(DeviceStatus.skinTemperature(hex("104e0300000000000000000000001019 02ffaf".replacingOccurrences(of: " ", with: ""))) == nil,
       "zero-temp descriptor -> nil (out of band)")
 

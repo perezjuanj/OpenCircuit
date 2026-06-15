@@ -25,6 +25,15 @@ public enum DeviceStatus {
         return (Int(frame[4]) << 8) | Int(frame[5])
     }
 
+    /// Battery percentage from a 0x10/0x87 descriptor: **byte[1]** (§5.4 🟢, ground-truthed
+    /// 2026-06-15: `0x4c`=76 matched the app's 76% exactly at capture time; the buffer showed
+    /// a clean 92→76 discharge curve). Returns nil if not a descriptor or out of the 1…100 band.
+    public static func battery(_ frame: [UInt8]) -> Int? {
+        guard frame.count >= 19, frame[0] == 0x10 || frame[0] == 0x87 else { return nil }
+        let pct = Int(frame[1])
+        return (1...100).contains(pct) ? pct : nil
+    }
+
     /// Skin temperature from a 0x10/0x87 descriptor: two 0.1 °C big-endian channels at
     /// `[6:8]`/`[8:10]` (§5.4 🟢, ground-truthed 2026-06-15). The descriptor streams live
     /// while connected — temperature is NOT in the 0x4c sleep sync. Returns nil if the

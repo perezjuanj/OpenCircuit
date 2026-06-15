@@ -332,7 +332,9 @@ Baseline `01` = "still", not "unworn".
 ### 5.4 `0x10` / `0x87` — fixed 19-byte descriptor
 `0x10` ← `d0 00 00` (also spontaneous ~30–60 s); `0x87` ← `07 00 00`. **Identical
 layout** (only `[0]` respid differs; `0x87` body == `0x10` body) → shared descriptor,
-XOR-valid. `[1]`=per-session marker (`4e`→`5c`; same value in `0x81 01`) 🟡 · `[2]`=
+XOR-valid. **`[1]`=BATTERY %** 🟢 (ground-truthed 2026-06-15: `0x4c`=76 matched the app's
+76% exactly at capture time; the buffer showed a clean 92→86→85→84→78→77→76 discharge
+curve — it is NOT a per-session marker) · `[2]`=
 state enum `01–04` (not a counter) 🟡 · **`[4:6]`=STEP COUNT (16-bit BE)** 🟢 ·
 **`[6:8]`/`[8:10]`=SKIN TEMPERATURE, two channels, 0.1 °C BE** 🟢 (each prefixed `01`=
 valid; see below) · `[15]`=declines over an evening but **not plain battery** 🟡 ·
