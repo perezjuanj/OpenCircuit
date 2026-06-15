@@ -88,6 +88,10 @@ final class StoredSleepSummary {
     var remMin: Int = 0
     var awakeMin: Int = 0
     var efficiency: Double = 0
+    /// Actual sleep-window clock times (first segment start … last segment end), NOT
+    /// start-of-day — so a night-temp window aligns to real sleep onset/wake, not midnight.
+    var inBedStart: Date = Date.distantPast
+    var inBedEnd: Date = Date.distantPast
     var updatedAt: Date = Date.distantPast
 
     init(
@@ -98,6 +102,8 @@ final class StoredSleepSummary {
         remMin: Int = 0,
         awakeMin: Int = 0,
         efficiency: Double = 0,
+        inBedStart: Date = Date.distantPast,
+        inBedEnd: Date = Date.distantPast,
         updatedAt: Date = Date()
     ) {
         self.night = night
@@ -107,6 +113,8 @@ final class StoredSleepSummary {
         self.remMin = remMin
         self.awakeMin = awakeMin
         self.efficiency = efficiency
+        self.inBedStart = inBedStart
+        self.inBedEnd = inBedEnd
         self.updatedAt = updatedAt
     }
 
@@ -253,7 +261,8 @@ struct LocalStore {
     /// Upsert the nightly sleep summary, keyed by start-of-day of `night`. Re-syncing the
     /// same night overwrites the existing row rather than inserting a duplicate. Does NOT
     /// touch the SyncCursor — gating sleep history for HealthKit stays in `ingestSleep`.
-    func saveSleepSummary(_ summary: SleepStaging.Summary, night: Date) throws {
+    func saveSleepSummary(_ summary: SleepStaging.Summary, night: Date,
+                          inBedStart: Date, inBedEnd: Date) throws {
         let dayStart = Calendar.current.startOfDay(for: night)
         let m = summary.minutes
         let descriptor = FetchDescriptor<StoredSleepSummary>(
@@ -265,6 +274,8 @@ struct LocalStore {
             existing.remMin = m.rem
             existing.awakeMin = m.awake
             existing.efficiency = summary.efficiency
+            existing.inBedStart = inBedStart
+            existing.inBedEnd = inBedEnd
             existing.updatedAt = Date()
         } else {
             context.insert(StoredSleepSummary(
@@ -274,7 +285,9 @@ struct LocalStore {
                 lightMin: m.light,
                 remMin: m.rem,
                 awakeMin: m.awake,
-                efficiency: summary.efficiency
+                efficiency: summary.efficiency,
+                inBedStart: inBedStart,
+                inBedEnd: inBedEnd
             ))
         }
         try context.save()

@@ -172,9 +172,12 @@ final class RingSession: NSObject {
         guard let localStore else { return }
         if !stagedSegments.isEmpty {
             let summary = SleepStaging.summary(stagedSegments)
-            // `night` = start of the sleep window (segments carry the dates; Summary doesn't).
-            let night = stagedSegments.map(\.start).min() ?? Date()
-            try? localStore.saveSleepSummary(summary, night: night)
+            // Real sleep-window clock times (segments carry the dates; Summary doesn't) — so a
+            // night-temp window aligns to actual onset/wake, not midnight. `night` (start-of-day)
+            // remains the upsert key.
+            let start = stagedSegments.map(\.start).min() ?? Date()
+            let end = stagedSegments.map(\.end).max() ?? start
+            try? localStore.saveSleepSummary(summary, night: start, inBedStart: start, inBedEnd: end)
         }
         if let steps { try? localStore.saveDailySteps(steps) }
     }

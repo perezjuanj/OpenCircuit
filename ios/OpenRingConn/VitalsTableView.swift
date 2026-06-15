@@ -158,18 +158,25 @@ struct VitalsTableView: View {
     /// Window: the latest stored sleep summary's span (night..night+inBed) when available,
     /// else local 00:00–06:00 of the most recent date that has temperature samples.
     private var nightTemp: Double? {
-        guard let window = nightWindow,
-              let temps = try? LocalStore(modelContext)
-                  .samples(kind: .temperature, from: window.start, to: window.end) else { return nil }
-        let vals = temps.map(\.value).filter { $0 > 0 }
-        guard !vals.isEmpty else { return nil }
-        return vals.reduce(0, +) / Double(vals.count)
+        guard let window = nightWindow else { return nil }
+        // Filter the already-loaded @Query array in memory — no synchronous fetch in `body`
+        // (that hazard once caused a black-screen launch). #14
+        let tempKind = MetricKind.temperature.rawValue
+        let vals = samples.lazy
+            .filter { $0.kindRaw == tempKind && $0.value > 0
+                      && $0.start >= window.start && $0.start <= window.end }
+            .map(\.value)
+        var sum = 0.0, n = 0
+        for v in vals { sum += v; n += 1 }
+        return n > 0 ? sum / Double(n) : nil
     }
 
     private var nightWindow: (start: Date, end: Date)? {
-        // Prefer the most recent night's actual sleep span.
-        if let s = storedSleep.first, s.asleepMin > 0 {
-            return (s.night, s.night.addingTimeInterval(s.asSummary.inBed))
+        // Prefer the most recent night's ACTUAL sleep span (real onset/wake clock times),
+        // not a midnight-anchored guess — so pre-midnight sleep aligns correctly.
+        if let s = storedSleep.first, s.asleepMin > 0,
+           s.inBedStart > Date.distantPast, s.inBedEnd > s.inBedStart {
+            return (s.inBedStart, s.inBedEnd)
         }
         // Fallback: 00:00–06:00 of the most recent date that has temperature samples.
         guard let lastTemp = latest[.temperature]?.start else { return nil }
