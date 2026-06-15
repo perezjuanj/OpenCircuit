@@ -64,3 +64,4 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openringconn.app.tests
         SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES

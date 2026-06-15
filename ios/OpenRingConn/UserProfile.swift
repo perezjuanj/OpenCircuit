@@ -33,7 +33,7 @@ struct UserProfileSettingsView: View {
 
             Section("Calories") {
                 LabeledContent("BMR", value: "\(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day")
-                LabeledContent("Passive", value: "\(Calories.bmrKcalPerHour(profile: profile), specifier: "%.1f") kcal/hour")
+                LabeledContent("Passive", value: "\(String(format: "%.1f", Calories.bmrKcalPerHour(profile: profile))) kcal/hour")
                 LabeledContent("Max HR", value: "\(maxHR) bpm")
             }
         }
