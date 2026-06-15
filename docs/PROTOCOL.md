@@ -318,17 +318,35 @@ Baseline `01` = "still", not "unworn".
 > repeated across two sessions → likely a derived key, not random. **Conclusion:** Mac-side
 > metric probing (incl. the temp-flag hunt) is gated by the §4 session-open auth — must crack
 > the `01 01` derivation first, OR capture the official app's temp fetch (the app holds valid
-> auth). Temp is confirmed BLE-delivered but absent from the normal sync drain → its fetch is
-> a distinct, not-yet-triggered event.
+> auth). Temp is confirmed BLE-delivered but absent from the normal sync drain.
+> **RESOLVED 2026-06-15 (see §5.4):** temperature is in the `0x10`/`0x87` **descriptor**
+> `[6:8]`/`[8:10]` as 0.1 °C, streamed live while connected — not in the bulk sync. So it
+> needs neither the session-open auth nor active flag-probing; just read the descriptor.
 
 ### 5.4 `0x10` / `0x87` — fixed 19-byte descriptor
 `0x10` ← `d0 00 00` (also spontaneous ~30–60 s); `0x87` ← `07 00 00`. **Identical
 layout** (only `[0]` respid differs; `0x87` body == `0x10` body) → shared descriptor,
 XOR-valid. `[1]`=per-session marker (`4e`→`5c`; same value in `0x81 01`) 🟡 · `[2]`=
-state enum `01–04` (not a counter) 🟡 · **`[4:6]`=STEP COUNT (16-bit BE)** 🟢 · `[6:8]`/
-`[8:10]`=16-bit A/B with validity flag (grow with activity → active-secs/calories? 🟡) ·
-`[15]`=declines over an evening but **not plain battery** 🟡 · `[17]`=`ff` idle;
-**non-`ff` precedes a bulk stream → "data follows"** 🟡.
+state enum `01–04` (not a counter) 🟡 · **`[4:6]`=STEP COUNT (16-bit BE)** 🟢 ·
+**`[6:8]`/`[8:10]`=SKIN TEMPERATURE, two channels, 0.1 °C BE** 🟢 (each prefixed `01`=
+valid; see below) · `[15]`=declines over an evening but **not plain battery** 🟡 ·
+`[17]`=`ff` idle; **non-`ff` precedes a bulk stream → "data follows"** 🟡.
+
+**`[6:8]` / `[8:10]` = skin temperature in 0.1 °C** 🟢 (ground-truthed 2026-06-15,
+`captures/morning_temp_20260615`). Two near-equal 16-bit BE values (e.g. `01 64 01 65` =
+356/357 → **35.6/35.7 °C = 96.1/96.3 °F**); likely skin + reference/object channels. Proof:
+- **Donning curve** — ring put on at 14:04 read **28.7 °C** (cold) and climbed steadily
+  28.7→30→32→**34.5 °C** over ~25 min, cooled when removed, re-warmed on re-don. A thermistor
+  equilibrating on skin; step counts never decrease, so this is not activity. 🟢
+- **App-aligned** — morning value 35.6/35.7 °C sits right on the app's nightly **avg
+  96.40 °F (35.78 °C)** / baseline 96.73 °F; pair difference (~−0.1…−0.2 °C) ≈ the app's
+  deviation **−0.32 °F**. The app samples this **live over the night** (descriptor is sent
+  spontaneously ~30–60 s while connected) to compute avg/baseline/deviation — temp is **NOT**
+  in the `0x4c` sleep sync, which is why value-searches of the drain failed.
+- **Encoding note:** the wire carries the *raw reading* (355–357), not the displayed nightly
+  *average* (358) — earlier exact-358 searches missed it by 1–3 LSB.
+- **Implication:** readable **live, no sync session / nonce needed** — poll `d0 00 00`→`0x10`
+  (or listen for spontaneous descriptors) and parse `[6:8]`/`[8:10]`. Sidesteps the §4 auth wall.
 
 **`[4:6]` = the ring's onboard step count** 🟢 (live test 2026-06-14). After clearing
 the official app and forcing a from-scratch ring re-sync, the app showed **81 steps** and
