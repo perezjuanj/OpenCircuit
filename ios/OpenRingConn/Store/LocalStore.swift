@@ -13,7 +13,10 @@ final class StoredSample {
     var end: Date
     var value: Double
     var rawValue: Double?
-    var isDelta: Bool
+    // Default required so SwiftData can auto-migrate stores written before these
+    // cumulative-counter columns existed (#21) — a new non-optional attribute with no
+    // default fails lightweight migration and traps at ModelContainer init on launch.
+    var isDelta: Bool = false
     var dailyTotal: Double?
 
     init(
