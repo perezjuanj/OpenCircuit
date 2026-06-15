@@ -139,10 +139,24 @@ public enum BulkSleep {
         return out
     }
 
+    /// Restrict `records` to those whose epoch falls within `hint`, or return them
+    /// unchanged when no hint is given. Extension point for the sleep-schedule abstraction:
+    /// the app can pass the user's bedtime→wake window (see ios/OpenRingConn/SleepSchedule)
+    /// so detection ignores stray daytime/charging motion outside the expected night.
+    public static func records(_ records: [BulkRecord],
+                               within hint: DateInterval?,
+                               epoch: Int = Command.syncEpoch) -> [BulkRecord] {
+        guard let hint else { return records }
+        return records.filter { hint.contains($0.date(epoch: epoch)) }
+    }
+
     /// The main sleep block (in-bed window) detected from the motion channel, or nil.
+    /// Pass `within:` to bound detection to the user's scheduled sleep window (optional).
     public static func mainSleep(from records: [BulkRecord],
+                                 within hint: DateInterval? = nil,
                                  epoch: Int = Command.syncEpoch) -> ActivityPeriod? {
-        var periods = ActivityPeriod.detectFromMotion(motionTimeline(from: records, epoch: epoch))
+        let scoped = Self.records(records, within: hint, epoch: epoch)
+        var periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch))
         return ActivityPeriod.findSleep(&periods)
     }
 
@@ -151,8 +165,10 @@ public enum BulkSleep {
     /// Light/Deep/REM staging needs an HR-based model (TODO) — the ring doesn't
     /// send a hypnogram (PROTOCOL.md §5.3), so all "asleep" is reported as core.
     public static func sleepSegments(from records: [BulkRecord],
+                                     within hint: DateInterval? = nil,
                                      epoch: Int = Command.syncEpoch) -> [SleepSegment] {
-        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: records, epoch: epoch))
+        let scoped = Self.records(records, within: hint, epoch: epoch)
+        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch))
         // Main in-bed block = longest sleep period over the minimum duration (1 h).
         guard let block = periods
             .filter({ $0.activity == .sleep })
@@ -182,8 +198,9 @@ public enum BulkSleep {
     /// Light/Deep/REM/Awake staging of the detected sleep block. Thin wrapper over
     /// `SleepStaging.classify` (kept for source compatibility with existing callers).
     public static func stagedSegments(from records: [BulkRecord],
+                                      within hint: DateInterval? = nil,
                                       epoch: Int = Command.syncEpoch) -> [SleepSegment] {
-        SleepStaging.classify(from: records, epoch: epoch)
+        SleepStaging.classify(from: Self.records(records, within: hint, epoch: epoch), epoch: epoch)
     }
 
     /// HR / HRV / SpO2 samples from sleep-vitals epochs, with device timestamps.

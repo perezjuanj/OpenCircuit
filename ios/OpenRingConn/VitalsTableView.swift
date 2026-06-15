@@ -18,6 +18,11 @@ struct VitalsTableView: View {
     /// breakdown). When nil (no live session), `effectiveSleep` falls back to the store.
     var sleep: SleepStaging.Summary?
 
+    /// The user's sleep window (from the manual schedule, or the iOS Sleep schedule once
+    /// HealthKit is authorized) — the preferred bound for the night-temp window. Resolved
+    /// asynchronously into @State (see `.task`), never fetched synchronously in `body`.
+    @State private var scheduleWindow: DateInterval?
+
     /// Prefer the live session summary; fall back to the latest stored night offline.
     private var effectiveSleep: SleepStaging.Summary? {
         if let sleep { return sleep }
@@ -71,6 +76,9 @@ struct VitalsTableView: View {
             sleepSection
         }
         .padding(.vertical, 4)
+        // Resolve the (async) sleep-schedule window once the view appears. The selector
+        // returns the HealthKit window when authorized, else the manual one, else nil.
+        .task { scheduleWindow = await SleepSchedule.current(forNightEndingNear: Date()) }
     }
 
     /// Sleep: total asleep + estimated Deep/Light/REM/Awake breakdown (stages are an
@@ -172,7 +180,10 @@ struct VitalsTableView: View {
     }
 
     private var nightWindow: (start: Date, end: Date)? {
-        // Prefer the most recent night's ACTUAL sleep span (real onset/wake clock times),
+        // Prefer the user's sleep schedule (manual today; the iOS Sleep schedule once
+        // HealthKit is authorized — see SleepSchedule.swift). nil when no schedule is set.
+        if let w = scheduleWindow { return (w.start, w.end) }
+        // Else the most recent night's ACTUAL sleep span (real onset/wake clock times),
         // not a midnight-anchored guess — so pre-midnight sleep aligns correctly.
         if let s = storedSleep.first, s.asleepMin > 0,
            s.inBedStart > Date.distantPast, s.inBedEnd > s.inBedStart {
