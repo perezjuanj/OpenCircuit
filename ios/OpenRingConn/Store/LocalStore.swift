@@ -226,6 +226,18 @@ struct LocalStore {
         return segments
     }
 
+    /// Stored samples of one kind within `[start, end)`, oldest→newest. Used by the
+    /// dashboard to average overnight skin-temperature samples (which only exist while the
+    /// ring was connected) over a night window.
+    func samples(kind: MetricKind, from start: Date, to end: Date) throws -> [QuantitySample] {
+        let kindRaw = kind.rawValue
+        let descriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == kindRaw && $0.start >= start && $0.start < end },
+            sortBy: [SortDescriptor(\.start, order: .forward)]
+        )
+        return try context.fetch(descriptor).compactMap(\.sample)
+    }
+
     func latestSample(kind: MetricKind) throws -> QuantitySample? {
         let kindRaw = kind.rawValue
         var descriptor = FetchDescriptor<StoredSample>(

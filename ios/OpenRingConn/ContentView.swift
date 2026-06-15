@@ -4,6 +4,7 @@ import OpenRingKit
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
     @State private var scanner = RingScanner.shared
     @State private var healthAuthorized = false
     @State private var lastWrite: String?
@@ -11,6 +12,16 @@ struct ContentView: View {
     /// Last HR persisted to the store (from a prior session or a background refresh),
     /// shown on launch before BLE reconnects. #14
     @State private var lastKnownHR: QuantitySample?
+
+    /// Armed when a foreground activation wants a one-shot history sync, fired once the
+    /// link is `ready`. A user "Scan & connect" never sets this, so the auto-refresh can't
+    /// fire on top of a manual connect.
+    @State private var pendingAutoSync = false
+    /// Last time the foreground auto-refresh ran a sync; debounces repeated foregrounds.
+    @State private var lastForegroundSync: Date?
+    /// Minimum spacing between foreground auto-syncs — one bounded refresh per foreground,
+    /// never a loop, and conservative about battery/contention with the official app.
+    private static let autoSyncInterval: TimeInterval = 120
 
     private let health = HealthKitWriter()
 
@@ -46,7 +57,48 @@ struct ContentView: View {
                 // showed a black screen on launch. #14
                 loadLaunchSnapshot()
             }
+            // Foreground auto-refresh: reconnect to the last-known ring and pull fresh data
+            // when the app becomes active, so opening it after a while shows updated vitals
+            // without a manual Scan/Sync.
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { handleForegroundActivation() }
+            }
+            // Fire the armed one-shot sync the moment the (re)connected link is ready.
+            .onChange(of: session?.ready) { _, ready in
+                if ready == true { maybeAutoSyncOnReady() }
+            }
         }
+    }
+
+    // MARK: Foreground auto-refresh
+
+    /// On foreground: reconnect by identifier (no scan) to the saved ring and ARM a single
+    /// debounced history sync for when the link is ready. Conservative: skips entirely if
+    /// there's no saved ring or the user is mid-measurement, and never loops.
+    private func handleForegroundActivation() {
+        guard scanner.hasSavedRing else { return }      // never connected — nothing to do
+        if session?.monitoring == true { return }       // don't interrupt a live measurement
+        scanner.reconnectKnownPeripheral()              // idempotent: no-op if already connected
+        if session?.syncing != true { pendingAutoSync = true }
+        // If the link is already up, kick the sync now; otherwise onChange(ready) will.
+        if session?.ready == true { maybeAutoSyncOnReady() }
+    }
+
+    /// One-shot, debounced history sync once the link is `ready`. Only fires for an armed
+    /// foreground activation (not a user Scan), and not while a sync/live read is running.
+    /// `syncHistory()` is itself bounded (watchdog), and the descriptor stream refreshes
+    /// steps/temp meanwhile — so this is a single bounded refresh, not a poll loop.
+    private func maybeAutoSyncOnReady() {
+        guard pendingAutoSync, let session, session.ready,
+              !session.monitoring, !session.syncing else { return }
+        if let last = lastForegroundSync,
+           Date().timeIntervalSince(last) < Self.autoSyncInterval {
+            pendingAutoSync = false   // too soon — consume the request without syncing
+            return
+        }
+        pendingAutoSync = false
+        lastForegroundSync = Date()
+        session.syncHistory()
     }
 
     // MARK: Connection

@@ -322,9 +322,17 @@ extension RingSession: CBPeripheralDelegate {
         Task { @MainActor in
             self.lastFrame = data.map { String(format: "%02x", $0) }.joined(separator: " ")
             // Ring step count rides the 0x10/0x87 descriptor [4:6] (§5.4). Frames with 0
-            // are interleaved, so take the running max (today's cumulative count).
-            if let s = DeviceStatus.steps(bytes), s > 0 {
+            // are interleaved noise, so take the running max (today's cumulative count).
+            // Surface the count once ANY steps descriptor has arrived — `steps` stays nil
+            // = "no data yet" and becomes 0 (not nil) the moment the ring reports while
+            // connected, so the dashboard shows "0" instead of "—" (the running max keeps
+            // a real count from being clobbered back to 0 by interleaved 0-frames).
+            if let s = DeviceStatus.steps(bytes) {
                 self.steps = max(self.steps ?? 0, s)
+                // Persist the live count so "Steps (today)" survives disconnect (StoredDaily
+                // upsert keeps the per-day max; no-ops on 0). VitalsTableView.effectiveSteps
+                // falls back to today's StoredDaily when not connected.
+                if let steps = self.steps { try? self.localStore?.saveDailySteps(steps) }
             }
             // Skin temperature rides the same 0x10/0x87 descriptor (§5.4). It streams live
             // (~30–60 s) and is NOT in the sleep sync, so capture + persist it here.

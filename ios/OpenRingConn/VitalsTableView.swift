@@ -5,6 +5,7 @@ import OpenRingKit
 /// Persistent vitals dashboard. Reads the latest stored sample per metric (so values
 /// are always visible offline) and prefers the live session reading when connected.
 struct VitalsTableView: View {
+    @Environment(\.modelContext) private var modelContext
     /// Most-recent samples first; we reduce to the latest per kind in `latest`.
     @Query(sort: \StoredSample.start, order: .reverse) private var samples: [StoredSample]
     /// Persisted sleep summaries (latest night first) — the offline fallback for `sleep`.
@@ -56,7 +57,7 @@ struct VitalsTableView: View {
             divider
             row("SpO₂", value: spo2Text, time: timeFor(.spo2, live: session?.liveSpO2 != nil))
             divider
-            row("Skin Temp", value: tempText, time: timeFor(.temperature, live: session?.liveTemperature != nil))
+            skinTempRow
             divider
             row("HRV", value: valueText(.hrvSDNN) { "\(Int($0)) ms" }, time: timeFor(.hrvSDNN))
             divider
@@ -120,9 +121,60 @@ struct VitalsTableView: View {
         if let s = session?.liveSpO2 { return "\(s) %" }
         return valueText(.spo2) { "\(Int(($0 * 100).rounded())) %" }
     }
-    private var tempText: String {
-        if let c = session?.liveTemperature { return tempString(c) }
-        return valueText(.temperature) { tempString($0) }
+    // MARK: Skin temp (overnight headline; daytime live value is noisy, shown only as "now")
+
+    /// Skin Temp row. The headline is the OVERNIGHT average (skin temp is noisy during the
+    /// day from ambient/activity), never the live daytime value. When connected we still
+    /// show the live reading as a small secondary line, clearly labeled "now".
+    private var skinTempRow: some View {
+        HStack {
+            Text("Skin Temp").font(.subheadline).foregroundStyle(.primary)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(nightTemp.map(tempString) ?? "—")
+                    .font(.subheadline.weight(.semibold)).monospacedDigit()
+                if let secondary = skinTempSecondary {
+                    Text(secondary).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    /// Secondary caption under the Skin Temp headline: "overnight" when we have a night
+    /// average, plus the live value as "now …" when actively connected.
+    private var skinTempSecondary: String? {
+        let now = session?.liveTemperature.map { "now \(tempString($0))" }
+        switch (nightTemp != nil, now) {
+        case (true, let now?):  return "overnight · \(now)"
+        case (true, nil):       return "overnight"
+        case (false, let now?): return now
+        case (false, nil):      return nil
+        }
+    }
+
+    /// Average skin temp (°C) over the most recent NIGHT window, or nil if that window has
+    /// no temperature samples (then the headline shows "—", never the noisy daytime value).
+    /// Window: the latest stored sleep summary's span (night..night+inBed) when available,
+    /// else local 00:00–06:00 of the most recent date that has temperature samples.
+    private var nightTemp: Double? {
+        guard let window = nightWindow,
+              let temps = try? LocalStore(modelContext)
+                  .samples(kind: .temperature, from: window.start, to: window.end) else { return nil }
+        let vals = temps.map(\.value).filter { $0 > 0 }
+        guard !vals.isEmpty else { return nil }
+        return vals.reduce(0, +) / Double(vals.count)
+    }
+
+    private var nightWindow: (start: Date, end: Date)? {
+        // Prefer the most recent night's actual sleep span.
+        if let s = storedSleep.first, s.asleepMin > 0 {
+            return (s.night, s.night.addingTimeInterval(s.asSummary.inBed))
+        }
+        // Fallback: 00:00–06:00 of the most recent date that has temperature samples.
+        guard let lastTemp = latest[.temperature]?.start else { return nil }
+        let dayStart = Calendar.current.startOfDay(for: lastTemp)
+        return (dayStart, dayStart.addingTimeInterval(6 * 3600))
     }
     /// Ring's onboard step count — live while connected (the descriptor streams it). It's
     /// the ring's own count, which can differ from the official app's cloud daily total.

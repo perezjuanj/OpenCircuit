@@ -49,6 +49,11 @@ final class RingScanner: NSObject {
         set { UserDefaults.standard.set(newValue, forKey: savedPeripheralKey) }
     }
 
+    /// True when a previously connected ring's identifier is saved, so a no-scan
+    /// reconnect-by-identifier is possible. The foreground auto-refresh uses this to
+    /// decide whether there's anything to reconnect to (vs. requiring a user Scan).
+    var hasSavedRing: Bool { Self.savedPeripheralID != nil }
+
     /// Set when a reconnect was requested before Bluetooth finished powering on; retried
     /// from `centralManagerDidUpdateState` once `.poweredOn` arrives.
     private var reconnectWhenPoweredOn = false
