@@ -31,6 +31,11 @@ struct ContentView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("OpenRingConn")
+            .onAppear {
+                // Wire persistence into the scanner/session so the (currently gated)
+                // epoch-sync decoder can persist Layer-A records once enabled. #24
+                scanner.setLocalStore(LocalStore(modelContext))
+            }
         }
     }
 

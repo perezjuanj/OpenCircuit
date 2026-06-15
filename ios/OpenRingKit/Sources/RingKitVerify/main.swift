@@ -19,6 +19,18 @@ func hex(_ s: String) -> [UInt8] {
     }
     return out
 }
+func makeFrame(opcode: UInt8, body: [UInt8]) -> [UInt8] {
+    let withoutTrailer = [opcode] + body
+    return withoutTrailer + [Frame.xorTrailer(withoutTrailer)]
+}
+func makeEpochRecord(size: Int, counter: UInt32, fill: UInt8 = 0x01) -> [UInt8] {
+    var bytes = [EpochRecord.marker,
+                 UInt8((counter >> 16) & 0xFF),
+                 UInt8((counter >> 8) & 0xFF),
+                 UInt8(counter & 0xFF)]
+    bytes += Array(repeating: fill, count: size - bytes.count)
+    return bytes
+}
 
 // Real validated notify frames from desktop/captures/btsnoop_hci.log.
 let realFrames = [
@@ -82,6 +94,41 @@ check(DeviceStatus.steps(hex("8754020000000157015700000000105800ff66")) == 0,
 check(DeviceStatus.steps(hex("8754030000510138013a00000000105402ff3a")) == 81,
       "step count also in 0x87 descriptor")
 check(DeviceStatus.steps(hex("15005b0ab0f4")) == nil, "non-descriptor frame -> nil steps")
+
+// --- Epoch sync Layer A ---
+var ppgA = makeEpochRecord(size: EpochRecord.ppgRecordSize, counter: 0x000100)
+ppgA.replaceSubrange(9..<47, with: Array(repeating: UInt8(0xAA), count: 38))
+let ppgB = makeEpochRecord(size: EpochRecord.ppgRecordSize, counter: 0x000484)
+let ppgFrame = Data(makeFrame(opcode: EpochRecord.ppgOpcode, body: [0x00, 0x03] + ppgA + ppgB))
+let ppgRecords = EpochRecord.parsePPGPage(ppgFrame, streamHighByte: 0x0c)
+check(ppgRecords.count == 2, "0x47 page splits 47-byte records")
+check(ppgRecords.first?.timestamp == Date(timeIntervalSince1970: TimeInterval(Command.syncEpoch + 0x0c000100)),
+      "record counter maps to sync epoch Date")
+check(ppgRecords.first?.rawPayload == Data(Array(repeating: UInt8(0xAA), count: 38)),
+      "0x47 exposes 38-byte raw PPG payload")
+
+var activity = makeEpochRecord(size: EpochRecord.activityRecordSize, counter: 0x2298c3, fill: 0x00)
+activity[8] = 0x12
+activity.replaceSubrange(15..<22, with: [1, 2, 3, 4, 5, 6, 7])
+let activityFrame = Data(makeFrame(opcode: EpochRecord.activityOpcode, body: [0x00, 0x00] + activity))
+let activityRecords = EpochRecord.parseActivityPage(activityFrame, streamHighByte: 0x0c)
+check(activityRecords.count == 1, "0x4c routes to final activity page")
+check(activityRecords.first?.subtype == 0x12, "0x4c exposes subtype byte[8]")
+check(activityRecords.first?.rawPayload == Data([1, 2, 3, 4, 5, 6, 7]),
+      "0x4c exposes 7-byte raw metric payload")
+
+let cursorReport = Data([0x50, 0x00, 0x00, 0x12, 0x0c, 0x22, 0xaa, 0xe4, 0x0c, 0x22, 0xac, 0xb5])
+if let report = EpochRecord.parseEndOfHistory(cursorReport) {
+    check(report.cursorTo == 0x0c22acb5, "0x50 cursor report decodes no-XOR end cursor")
+} else {
+    check(false, "0x50 routes to cursor report")
+}
+
+var epochSession = EpochSyncSession()
+_ = epochSession.appendActivityPage(activityFrame)
+_ = epochSession.complete(with: cursorReport)
+check(epochSession.placeholderQuantitySamples().count == 1,
+      "epoch metric decoder emits gated zero-value HR placeholders for worn records")
 
 // --- Metric models + SyncCursor ---
 check(MetricKind.spo2.unit == "fraction", "spo2 unit is fraction (HealthKit 0…1)")

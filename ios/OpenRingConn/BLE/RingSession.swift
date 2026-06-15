@@ -10,6 +10,8 @@ import OpenRingKit
 //   • history sync: drain 0x4c activity/sleep pages → BulkSleep → HR/HRV/SpO2
 //     samples (PROTOCOL.md §5.3, 🟢 fields). 0x47 PPG pages are acked but not yet
 //     decoded (their payload is 🔴 — issue #8).
+//   • Layer-A epoch page routing (0x47/0x4c/0x50) also feeds EpochSyncSession in
+//     parallel, gated behind `epochDecodingEnabled` (#24).
 
 @Observable
 @MainActor
@@ -35,6 +37,8 @@ final class RingSession: NSObject {
     /// so the UI shows "preparing" instead of a dead reading.
     private(set) var livePreparing = false
     private(set) var lastFrame: String?
+    private(set) var decodedEpochRecords = 0
+    private(set) var storedMetricSamples = 0
     private(set) var ready = false
 
     private var monitorTask: Task<Void, Never>?
@@ -63,12 +67,16 @@ final class RingSession: NSObject {
     private let peripheral: CBPeripheral
     private var notifyChar: CBCharacteristic?
     private var writeChar: CBCharacteristic?
+    private var localStore: LocalStore?
+    private var syncSession = EpochSyncSession()
+    private let epochDecodingEnabled = false
 
     private let notifyUUID = CBUUID(string: OpenRingKit.Transport.notifyCharUUID)
     private let writeUUID = CBUUID(string: OpenRingKit.Transport.writeCharUUID)
 
-    init(peripheral: CBPeripheral) {
+    init(peripheral: CBPeripheral, localStore: LocalStore? = nil) {
         self.peripheral = peripheral
+        self.localStore = localStore
         super.init()
         peripheral.delegate = self
         peripheral.discoverServices(nil)
@@ -141,6 +149,10 @@ final class RingSession: NSObject {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
+    }
+
+    func setLocalStore(_ localStore: LocalStore) {
+        self.localStore = localStore
     }
 
     /// Start (or switch) live monitoring in a single mode. Guarantees only one metric
@@ -285,19 +297,24 @@ extension RingSession: CBPeripheralDelegate {
             case 0x47:
                 self.drainSawPage = true
                 if self.syncing { self.syncQuietTicks = 0 }
-                self.write(Command.pageAck47); return   // PPG page — decode TODO (issue #8)
+                self.write(Command.pageAck47)
+                self.handlePPGPage(data)   // Layer-A epoch decode, gated (#24)
+                return   // PPG page — BulkSleep decode TODO (issue #8)
             case 0x4C:
                 self.drainSawPage = true
                 if self.syncing || self.livePreparing {   // keep records during a sync OR a live-enter drain
                     self.bulkRecords += BulkSleep.records(fromPage: bytes)
                     self.syncQuietTicks = 0
                 }
-                self.write(Command.pageAck4C); return   // always ack to keep draining
+                self.write(Command.pageAck4C)
+                self.handleActivityPage(data)   // Layer-A epoch decode, gated (#24)
+                return   // always ack to keep draining
             case 0x50:
                 // End-of-history cursor report (§5.5) — NO XOR trailer, so it never
                 // reaches Frame.parse. Mark done; the sync watchdog / live-enter drain finalizes.
                 self.drainDone = true
                 if self.syncing { self.syncDone = true }
+                self.handleEndOfHistory(data)   // finalize epoch session, gated persist (#24)
                 return
             default: break
             }
@@ -317,6 +334,26 @@ extension RingSession: CBPeripheralDelegate {
                 }
                 if let spo2 = LiveHR.decodeSpO2(bytes) { self.liveSpO2 = spo2 }  // long frame, 🟡
             }
+        }
+    }
+
+    private func handleActivityPage(_ data: Data) {
+        decodedEpochRecords += syncSession.appendActivityPage(data).count
+    }
+
+    private func handlePPGPage(_ data: Data) {
+        decodedEpochRecords += syncSession.appendPPGPage(data).count
+    }
+
+    private func handleEndOfHistory(_ data: Data) {
+        guard syncSession.complete(with: data) != nil,
+              epochDecodingEnabled else { return }
+        let samples = syncSession.placeholderQuantitySamples()
+        guard !samples.isEmpty else { return }
+        do {
+            storedMetricSamples += try localStore?.ingest(samples).count ?? 0
+        } catch {
+            // Persistence failures should not interrupt the BLE drain/ACK loop.
         }
     }
 }
