@@ -14,6 +14,15 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             }
             Self.handle(refreshTask)
         }
+
+        // Re-instantiate the CBCentralManager (with its restore identifier) during launch so
+        // iOS can deliver state restoration — including when it relaunches us in the
+        // background because the ring came back in range. Touching `.shared` creates the
+        // central; `reconnectKnownPeripheral` then arms a pending connect-by-identifier to the
+        // last ring (no scan — background scans without a service filter are dropped). (#7)
+        MainActor.assumeIsolated {
+            RingScanner.shared.reconnectKnownPeripheral()
+        }
         return true
     }
 

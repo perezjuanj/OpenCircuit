@@ -17,7 +17,7 @@ struct RingBackgroundSyncService {
     /// if an HR sample was captured (the BGTask success flag).
     @discardableResult
     func syncVitals(timeout: TimeInterval = 20) async throws -> Bool {
-        let scanner = RingScanner()
+        let scanner = RingScanner.shared
         scanner.setLocalStore(store)   // RingSession persists skin temp from the descriptor
         let hr = await scanner.readLiveHeartRate(timeout: timeout)
 

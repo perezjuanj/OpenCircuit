@@ -20,6 +20,13 @@ final class RingScanner: NSObject {
         case poweredOff, unauthorized, scanning, connecting(String), connected(String), idle
     }
 
+    /// Shared instance. State restoration + background relaunch require a SINGLE
+    /// CBCentralManager that's re-created (with the same restore identifier) early in
+    /// every launch — including when iOS relaunches us in the background because the ring
+    /// came back in range. A per-view/per-task manager would either miss restoration or
+    /// collide on the restore identifier, so everything funnels through this one. (#7)
+    static let shared = RingScanner()
+
     private(set) var state: State = .idle
     private(set) var session: RingSession?
 
@@ -27,9 +34,35 @@ final class RingScanner: NSObject {
     private var target: CBPeripheral?
     private var localStore: LocalStore?
 
-    override init() {
+    /// Stable identifier that lets iOS associate the restored Bluetooth state with this
+    /// central across relaunches. Must be constant for the life of the app.
+    private static let restoreIdentifier = "com.openringconn.central.restore"
+
+    /// UserDefaults key holding the last connected peripheral's CoreBluetooth identifier
+    /// (a per-device UUID — NOT the MAC, which iOS never exposes). Lets us reconnect by
+    /// identifier with no scan after a cold launch / background relaunch.
+    private static let savedPeripheralKey = "com.openringconn.ring.peripheralID"
+
+    /// Last connected peripheral's `identifier.uuidString`, persisted across launches.
+    private static var savedPeripheralID: String? {
+        get { UserDefaults.standard.string(forKey: savedPeripheralKey) }
+        set { UserDefaults.standard.set(newValue, forKey: savedPeripheralKey) }
+    }
+
+    /// Set when a reconnect was requested before Bluetooth finished powering on; retried
+    /// from `centralManagerDidUpdateState` once `.poweredOn` arrives.
+    private var reconnectWhenPoweredOn = false
+
+    private override init() {
         super.init()
-        central = CBCentralManager(delegate: self, queue: .main)
+        // Opting into state restoration: iOS preserves this central's connections/pending
+        // connects while the app is suspended and relaunches the app (into the background)
+        // when a relevant BLE event fires — delivered via `willRestoreState`.
+        central = CBCentralManager(
+            delegate: self,
+            queue: .main,
+            options: [CBCentralManagerOptionRestoreIdentifierKey: Self.restoreIdentifier]
+        )
     }
 
     /// True once the user has connected; keeps us auto-reconnecting if the ring sleeps.
@@ -61,6 +94,38 @@ final class RingScanner: NSObject {
         if case .scanning = state { state = .idle }
     }
 
+    /// Reconnect to the last-known ring WITHOUT scanning. `retrievePeripherals` resurfaces a
+    /// peripheral we've connected to before by its CoreBluetooth identifier; `connect` then
+    /// issues a *pending* connect that has no timeout — it completes the moment the ring is in
+    /// range, even from the background. This is the reliable background path: iOS drops
+    /// no-service-filter background scans, but it honours a pending connect-by-identifier and
+    /// will relaunch us (via state restoration) to complete it.
+    ///
+    /// Returns `false` when there's no saved ring to reconnect to (caller falls back to a scan).
+    @discardableResult
+    func reconnectKnownPeripheral() -> Bool {
+        switch state {
+        case .connected, .connecting: return true   // already (re)connecting — nothing to do
+        default: break
+        }
+        guard central.state == .poweredOn else {
+            // Bluetooth not ready yet (common on a cold/background launch). Retry from
+            // centralManagerDidUpdateState once we reach `.poweredOn`.
+            reconnectWhenPoweredOn = true
+            return false
+        }
+        reconnectWhenPoweredOn = false
+        guard let idString = Self.savedPeripheralID,
+              let uuid = UUID(uuidString: idString),
+              let peripheral = central.retrievePeripherals(withIdentifiers: [uuid]).first
+        else { return false }
+        wantConnection = true
+        target = peripheral
+        state = .connecting(peripheral.name ?? "RingConn")
+        central.connect(peripheral)
+        return true
+    }
+
     func setLocalStore(_ localStore: LocalStore) {
         self.localStore = localStore
         session?.setLocalStore(localStore)
@@ -86,7 +151,11 @@ final class RingScanner: NSObject {
     func readLiveHeartRate(timeout: TimeInterval) async -> Int? {
         let deadline = Date().addingTimeInterval(timeout)
         var didStart = false
-        start(services: Self.backgroundScanServices)
+        // Prefer a no-scan reconnect-by-identifier (works in the background); only fall back
+        // to the service-filtered scan if we've never connected to a ring before.
+        if !reconnectKnownPeripheral() {
+            start(services: Self.backgroundScanServices)
+        }
 
         defer { disconnect() }
 
@@ -100,7 +169,9 @@ final class RingScanner: NSObject {
                     return liveHR
                 }
             } else if case .idle = state {
-                start(services: Self.backgroundScanServices)
+                if !reconnectKnownPeripheral() {
+                    start(services: Self.backgroundScanServices)
+                }
             }
             try? await Task.sleep(for: .seconds(1))
         }
@@ -112,12 +183,54 @@ extension RingScanner: CBCentralManagerDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor in
             switch central.state {
-            case .poweredOn: self.state = .idle
+            case .poweredOn:
+                self.state = .idle
+                // A reconnect was requested before Bluetooth was ready (cold/background
+                // launch) — complete it now that the radio is on.
+                if self.reconnectWhenPoweredOn { self.reconnectKnownPeripheral() }
             case .poweredOff: self.state = .poweredOff
             case .unauthorized: self.state = .unauthorized
             default: self.state = .idle
             }
         }
+    }
+
+    /// State restoration entry point. iOS calls this (before `centralManagerDidUpdateState`)
+    /// when it relaunches the app and hands back the central's preserved peripherals — those
+    /// we were connected to or had a pending connect for at suspension. We re-adopt the ring
+    /// as our target and re-attach the session so the link keeps working with no user action.
+    nonisolated func centralManager(_ central: CBCentralManager,
+                                    willRestoreState dict: [String: Any]) {
+        let restored = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        Task { @MainActor in
+            guard let peripheral = self.restoredTarget(from: restored) else { return }
+            self.wantConnection = true
+            self.target = peripheral
+            switch peripheral.state {
+            case .connected:
+                // The link survived the relaunch — rebuild the session now; `didConnect`
+                // won't fire again. RingSession re-discovers services/characteristics.
+                Self.savedPeripheralID = peripheral.identifier.uuidString
+                self.state = .connected(peripheral.name ?? "RingConn")
+                self.session = RingSession(peripheral: peripheral, localStore: self.localStore)
+            case .connecting:
+                // Pending connect still in flight; `didConnect` will complete it.
+                self.state = .connecting(peripheral.name ?? "RingConn")
+            default:
+                // Re-issue the pending connect so we reconnect when the ring is in range.
+                self.state = .connecting(peripheral.name ?? "RingConn")
+                self.central.connect(peripheral)
+            }
+        }
+    }
+
+    /// Pick which restored peripheral to re-adopt: prefer the saved id, else the first.
+    private func restoredTarget(from peripherals: [CBPeripheral]) -> CBPeripheral? {
+        if let id = Self.savedPeripheralID,
+           let match = peripherals.first(where: { $0.identifier.uuidString == id }) {
+            return match
+        }
+        return peripherals.first
     }
 
     nonisolated func centralManager(_ central: CBCentralManager,
@@ -139,6 +252,10 @@ extension RingScanner: CBCentralManagerDelegate {
     nonisolated func centralManager(_ central: CBCentralManager,
                                     didConnect peripheral: CBPeripheral) {
         Task { @MainActor in
+            // Remember this ring so we can reconnect by identifier (no scan) after a
+            // cold launch or background relaunch.
+            self.target = peripheral
+            Self.savedPeripheralID = peripheral.identifier.uuidString
             self.state = .connected(peripheral.name ?? "RingConn")
             self.session = RingSession(peripheral: peripheral, localStore: self.localStore)
         }

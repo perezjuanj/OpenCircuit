@@ -4,7 +4,7 @@ import OpenRingKit
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
-    @State private var scanner = RingScanner()
+    @State private var scanner = RingScanner.shared
     @State private var healthAuthorized = false
     @State private var lastWrite: String?
     @State private var showDebug = false
