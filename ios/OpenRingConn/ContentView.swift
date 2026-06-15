@@ -38,7 +38,11 @@ struct ContentView: View {
                 // Wire persistence into the scanner/session so the (currently gated)
                 // epoch-sync decoder can persist Layer-A records once enabled. #24
                 scanner.setLocalStore(LocalStore(modelContext))
-                // Surface the last persisted HR immediately, before BLE reconnects. #14
+            }
+            .task {
+                // Load the last persisted HR AFTER the first frame renders. Running this
+                // SwiftData fetch synchronously in .onAppear blocked the launch render and
+                // showed a black screen on launch. #14
                 loadLaunchSnapshot()
             }
         }
