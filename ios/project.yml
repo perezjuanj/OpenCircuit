@@ -49,9 +49,10 @@ targets:
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
-        # On-device signing. Xcode fills DEVELOPMENT_TEAM when you pick your team
-        # (or set it here to your 10-char Team ID for CLI builds).
+        # On-device signing. Set here so CLI device builds work after `xcodegen generate`
+        # (which would otherwise drop the team and fail signing). Personal/free team.
         CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 64R56NUZ5P
 
   OpenRingConnTests:
     type: bundle.unit-test
