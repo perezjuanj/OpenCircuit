@@ -286,7 +286,7 @@ struct VitalsTableView: View {
     }
 
     private func tempString(_ celsius: Double) -> String {
-        String(format: "%.1f °C  (%.1f °F)", celsius, celsius * 9 / 5 + 32)
+        String(format: "%.1f °F", celsius * 9 / 5 + 32)
     }
 
     /// Latest stored value for `kind`, formatted, or "—" if none.

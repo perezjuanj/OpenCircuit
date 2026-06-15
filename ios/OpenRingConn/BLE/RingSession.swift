@@ -56,6 +56,12 @@ final class RingSession: NSObject {
     private var keepaliveTask: Task<Void, Never>?
     private var autoMeasureTask: Task<Void, Never>?
 
+    /// Cached nightly sleep window — skin-temp capture is gated to this span (see the
+    /// descriptor handler). Daytime readings are too noisy/unpredictable (activity,
+    /// ambient swings, intermittent skin contact) to trend, so we only persist overnight.
+    private var nightWindow: DateInterval?
+    private var nightWindowRefreshedAt: Date?
+
     /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
     /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
     private(set) var historySamples: [QuantitySample] = []
@@ -186,6 +192,9 @@ final class RingSession: NSObject {
     func startKeepalive() {
         guard keepaliveTask == nil else { return }
         keepaliveTask = Task { [weak self] in
+            // Resolve the night window up front so the first temp frame is gated correctly
+            // (otherwise the very first reading races the reactive refresh and could leak).
+            await self?.refreshNightWindowIfNeeded()
             // Prime a status session so the ring answers fetch with the descriptor.
             for cmd in [Command.status0, Command.status1] {
                 guard let self, !Task.isCancelled else { return }
@@ -271,6 +280,37 @@ final class RingSession: NSObject {
         // Only tear down if WE still own the live read (user didn't take over).
         if autoMeasuring, monitoring, liveMode == mode { stopLiveMonitoring() }
         autoMeasuring = false
+    }
+
+    /// Resolve and cache the nightly sleep window used to gate skin-temp capture. Re-resolves
+    /// at most every 30 min (the window only shifts day-to-day) unless `force` is set — the
+    /// capture site forces a re-resolve on a window miss so it can re-check before dropping a
+    /// sample (a stale/expired window at night-start or after midnight would otherwise silently
+    /// drop up to 30 min of onset data). Prefers the real schedule via `SleepSchedule.current`
+    /// (HealthKit, else manual).
+    func refreshNightWindowIfNeeded(force: Bool = false) async {
+        let stale = nightWindowRefreshedAt.map { Date().timeIntervalSince($0) > 30 * 60 } ?? true
+        guard stale || force else { return }
+        if let w = await SleepSchedule.current(forNightEndingNear: Date()) {
+            nightWindow = w
+        } else if let interval = SleepWindow.interval(
+            // No real schedule (default state: manual schedule disabled AND no HealthKit
+            // entitlement). Fall back to the registered DEFAULT bed/wake times even though the
+            // manual schedule is disabled — this yields a correct CROSS-MIDNIGHT window (e.g.
+            // last night 22:30 → today 06:30). A naive 00:00–06:00 calendar-day slice would
+            // drop all pre-midnight sleep onset (a 23:00→07:00 sleeper never matches), killing
+            // the feature for every default-config user.
+            bedMinutes: SleepScheduleDefaults.defaultBedMinutes,    // 1350 (22:30)
+            wakeMinutes: SleepScheduleDefaults.defaultWakeMinutes,  // 390 (06:30)
+            nightEndingNear: Date()
+        ) {
+            nightWindow = interval
+        } else {
+            // Pure fallback — should never happen with valid (non-degenerate) defaults.
+            let dayStart = Calendar.current.startOfDay(for: Date())
+            nightWindow = DateInterval(start: dayStart, end: dayStart.addingTimeInterval(6 * 3600))
+        }
+        nightWindowRefreshedAt = Date()
     }
 
     /// Persist decoded samples to the local store (the vitals dashboard reads from it, so
@@ -494,10 +534,28 @@ extension RingSession: CBPeripheralDelegate {
                 self.steps = dailyStepsTotal
             }
             // Skin temperature rides the same 0x10/0x87 descriptor (§5.4). It streams live
-            // (~30–60 s) and is NOT in the sleep sync, so capture + persist it here.
+            // (~30–60 s) and is NOT in the sleep sync, so capture + persist it here — but ONLY
+            // during the nightly sleep window. Daytime readings are too noisy/unpredictable
+            // (activity, ambient swings, intermittent skin contact) to be a usable trend, so we
+            // drop them and surface no live value outside the window.
             if let t = DeviceStatus.skinTemperature(bytes) {
-                self.liveTemperature = t.celsius
-                self.persist([QuantitySample(kind: .temperature, start: Date(), value: t.celsius)])
+                // Window-miss guard: if we're outside the cached window (or it's nil), the cache
+                // may simply be stale/expired (night just started, or midnight rolled the window
+                // forward). Force a synchronous re-resolve BEFORE deciding to drop — this whole
+                // block already runs inside the `Task { @MainActor in … }` above, so the await is
+                // safe. Otherwise (we're inside the window) refresh in the background without
+                // blocking the frame. Without the force path, up to 30 min of onset samples are
+                // silently dropped against a stale window.
+                if self.nightWindow?.contains(Date()) != true {
+                    await self.refreshNightWindowIfNeeded(force: true)
+                } else {
+                    Task { await self.refreshNightWindowIfNeeded() }   // background, don't block the frame
+                }
+                let inNightWindow = self.nightWindow?.contains(Date()) ?? false
+                self.liveTemperature = inNightWindow ? t.celsius : nil
+                if inNightWindow {
+                    self.persist([QuantitySample(kind: .temperature, start: Date(), value: t.celsius)])
+                }
             }
             // Ring battery % is descriptor byte[1] (§5.4 🟢, ground-truthed).
             if let b = DeviceStatus.battery(bytes) { self.batteryPercent = b }
