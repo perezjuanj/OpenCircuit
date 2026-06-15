@@ -25,6 +25,7 @@ final class RingScanner: NSObject {
 
     private var central: CBCentralManager!
     private var target: CBPeripheral?
+    private var localStore: LocalStore?
 
     override init() {
         super.init()
@@ -48,6 +49,11 @@ final class RingScanner: NSObject {
         central.stopScan()
         if let target { central.cancelPeripheralConnection(target) }
         if case .scanning = state { state = .idle }
+    }
+
+    func setLocalStore(_ localStore: LocalStore) {
+        self.localStore = localStore
+        session?.setLocalStore(localStore)
     }
 }
 
@@ -83,7 +89,7 @@ extension RingScanner: CBCentralManagerDelegate {
                                     didConnect peripheral: CBPeripheral) {
         Task { @MainActor in
             self.state = .connected(peripheral.name ?? "RingConn")
-            self.session = RingSession(peripheral: peripheral)
+            self.session = RingSession(peripheral: peripheral, localStore: self.localStore)
         }
     }
 
