@@ -54,7 +54,10 @@ final class HealthKitWriter {
     }
 
     func requestAuthorization() async throws {
-        try await store.requestAuthorization(toShare: allTypes, read: [])
+        // Read sleepAnalysis so the iOS Sleep-schedule window (HealthKitSleepSchedule) works
+        // the moment the HealthKit entitlement is enabled — no further auth change needed.
+        // (No effect today: without the entitlement the request is a no-op, so it can't prompt.)
+        try await store.requestAuthorization(toShare: allTypes, read: [HKCategoryType(.sleepAnalysis)])
     }
 
     /// Write scalar samples. Caller filters with SyncCursor first.

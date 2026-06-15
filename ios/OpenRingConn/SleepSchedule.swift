@@ -19,8 +19,10 @@ import OpenRingKit
 //
 // "Flipping the switch" once a paid dev account is approved == enabling the HealthKit
 // entitlement (uncomment the `entitlements:` block in ios/project.yml, re-run
-// `xcodegen generate`) and granting read access. No change is needed in THIS file or its
-// callers: `HealthKitSleepSchedule` simply starts returning data and wins at the selector.
+// `xcodegen generate`) and granting read access at the prompt. `HealthKitWriter.request-
+// Authorization` already requests `sleepAnalysis` READ, so no auth-code change is needed:
+// with the entitlement on, `HealthKitSleepSchedule` starts returning data and wins at the
+// selector — no change in THIS file or its callers.
 
 /// Returns the user's sleep window (bedtime → wake) for the night around `date`.
 protocol SleepScheduleProviding {

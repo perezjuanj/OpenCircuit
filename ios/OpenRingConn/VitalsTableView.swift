@@ -22,6 +22,10 @@ struct VitalsTableView: View {
     /// HealthKit is authorized) — the preferred bound for the night-temp window. Resolved
     /// asynchronously into @State (see `.task`), never fetched synchronously in `body`.
     @State private var scheduleWindow: DateInterval?
+    // Mirror the sleep-schedule settings so the window re-resolves when the user edits them.
+    @AppStorage(SleepScheduleDefaults.enabled) private var sleepEnabled = false
+    @AppStorage(SleepScheduleDefaults.bedMinutes) private var bedMinutes = SleepScheduleDefaults.defaultBedMinutes
+    @AppStorage(SleepScheduleDefaults.wakeMinutes) private var wakeMinutes = SleepScheduleDefaults.defaultWakeMinutes
 
     /// Prefer the live session summary; fall back to the latest stored night offline.
     private var effectiveSleep: SleepStaging.Summary? {
@@ -78,7 +82,9 @@ struct VitalsTableView: View {
         .padding(.vertical, 4)
         // Resolve the (async) sleep-schedule window once the view appears. The selector
         // returns the HealthKit window when authorized, else the manual one, else nil.
-        .task { scheduleWindow = await SleepSchedule.current(forNightEndingNear: Date()) }
+        .task(id: "\(sleepEnabled)-\(bedMinutes)-\(wakeMinutes)") {
+            scheduleWindow = await SleepSchedule.current(forNightEndingNear: Date())
+        }
     }
 
     /// Sleep: total asleep + estimated Deep/Light/REM/Awake breakdown (stages are an
@@ -181,8 +187,11 @@ struct VitalsTableView: View {
 
     private var nightWindow: (start: Date, end: Date)? {
         // Prefer the user's sleep schedule (manual today; the iOS Sleep schedule once
-        // HealthKit is authorized — see SleepSchedule.swift). nil when no schedule is set.
-        if let w = scheduleWindow { return (w.start, w.end) }
+        // HealthKit is authorized — see SleepSchedule.swift), but ONLY once that window has
+        // actually started — otherwise an evening's *upcoming* night (start in the future)
+        // would window the temp average over a range with no samples and blank the headline.
+        // Before tonight's window begins, fall through to last night's completed span.
+        if let w = scheduleWindow, w.start <= Date() { return (w.start, w.end) }
         // Else the most recent night's ACTUAL sleep span (real onset/wake clock times),
         // not a midnight-anchored guess — so pre-midnight sleep aligns correctly.
         if let s = storedSleep.first, s.asleepMin > 0,
