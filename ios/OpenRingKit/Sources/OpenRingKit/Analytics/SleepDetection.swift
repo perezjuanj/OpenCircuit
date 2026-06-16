@@ -7,6 +7,15 @@
 // 0x47/0x4c bulk frames in the reference capture are the likely source but their
 // format is unconfirmed. The algorithm is ported and tested; wiring it to real
 // ring data is gated on a capture. Nothing about the device is invented here.
+//
+// #41 — wear / charging detection (analytics part):
+// `detectFromMotion(_:temperatureSamples:)` is the preferred entry point. It wraps
+// `detectFromGravity` and reclassifies any "still" period where skin temperature
+// indicates the ring is off-wrist / on the charger as .active rather than .sleep.
+//
+// TODO(#41 protocol): also gate on the charging-flag byte from the 0x10/0x87
+// descriptor once the BLE RingSession lane investigates PROTOCOL.md §5.4 [2].
+// That investigation is protocol-blocked — do NOT edit RingSession here.
 
 import Foundation
 
@@ -143,5 +152,93 @@ public struct ActivityPeriod: Equatable, Sendable {
             i += 1
         }
         return merged
+    }
+
+    // MARK: - detectFromMotion (#41 — wear-gated entry point)
+
+    /// Classify Sleep/Active periods from motion + optional skin-temperature samples.
+    ///
+    /// This is the preferred caller-facing entry point over `detectFromGravity` when
+    /// temperature data is available. Any "sleep" period where the ring was not worn
+    /// (skin temperature below the worn threshold) is reclassified as `.active` so
+    /// charger / nightstand epochs do not inflate the sleep score or pollute HealthKit.
+    ///
+    /// If `temperatureSamples` is empty the result is identical to `detectFromGravity`.
+    public static func detectFromMotion(
+        _ history: [GravitySample],
+        temperatureSamples: [TemperatureSample] = []
+    ) -> [ActivityPeriod] {
+        var periods = detectFromGravity(history)
+        guard !temperatureSamples.isEmpty else { return periods }
+
+        periods = periods.map { period in
+            guard period.activity == .sleep else { return period }
+            // Override: if the ring was off-wrist during this still block, it is not sleep.
+            if WearDetection.wornState(during: period, from: temperatureSamples) == .notWorn {
+                return ActivityPeriod(activity: .active, start: period.start, end: period.end)
+            }
+            return period
+        }
+        return periods
+    }
+}
+
+// MARK: - Wear detection (#41)
+
+/// Whether the ring is in skin contact with the wearer.
+public enum WornState: Equatable, Sendable {
+    case worn
+    case notWorn    // off-wrist or on the charger
+}
+
+/// One skin-temperature reading from the ring.
+/// The source is the temperature bytes in the 0x4c records (🔴 positions unconfirmed,
+/// pending PROTOCOL.md §6 item 2 capture). The struct is device-agnostic; callers
+/// supply whichever temperature they decode from the ring.
+public struct TemperatureSample: Equatable, Sendable {
+    public let time: Date
+    public let tempCelsius: Double
+
+    public init(time: Date, tempCelsius: Double) {
+        self.time = time
+        self.tempCelsius = tempCelsius
+    }
+}
+
+/// Temperature-based ring-wear heuristic (#41).
+///
+/// A worn ring sits against the skin and reads ~30–34 °C (🟡 heuristic; no
+/// ground-truth capture yet). Off-wrist or on the charger it drifts toward
+/// ambient (~18–26 °C indoors). The minimum worn threshold of 30 °C is
+/// deliberately conservative: a cold-room wrist might hit 29 °C briefly, but
+/// a charger will always be well below 30 °C after the first few minutes.
+///
+/// TODO(#41 protocol): once the 0x10/0x87 descriptor's charging-flag byte ([2]
+/// state enum, PROTOCOL.md §5.4 🟡) is confirmed, prefer that signal over
+/// temperature for instant detection without warm-up lag. That investigation
+/// belongs to the BLE RingSession lane — do not modify RingSession here.
+public enum WearDetection {
+
+    /// Below this, the ring is assumed off-wrist / charging (🟡 heuristic).
+    public static let minWornTempC: Double = 30.0
+
+    /// Worn state for a single temperature reading.
+    public static func state(tempCelsius: Double) -> WornState {
+        tempCelsius >= minWornTempC ? .worn : .notWorn
+    }
+
+    /// Worn state inferred from temperature samples covering an ActivityPeriod.
+    ///
+    /// Average temperature across samples whose timestamp falls within the period.
+    /// Returns `.worn` if there are no samples in the window (fail-open: do not
+    /// discard data we cannot confirm is bogus).
+    public static func wornState(
+        during period: ActivityPeriod,
+        from samples: [TemperatureSample]
+    ) -> WornState {
+        let inWindow = samples.filter { $0.time >= period.start && $0.time <= period.end }
+        guard !inWindow.isEmpty else { return .worn }
+        let avg = inWindow.map { $0.tempCelsius }.reduce(0.0, +) / Double(inWindow.count)
+        return state(tempCelsius: avg)
     }
 }

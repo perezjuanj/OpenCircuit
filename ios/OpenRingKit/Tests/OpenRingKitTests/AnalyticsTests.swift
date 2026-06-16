@@ -75,11 +75,20 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(Strain(maxHR: 190, restingHR: 60).calculate(bpms: Array(repeating: 190, count: 86400)), 21.0)
     }
 
-    // MARK: Sleep score (sleep.rs)
+    // MARK: Sleep score (#28 fix: graded floating-point ratio, not integer step)
 
-    func testSleepScore() {
+    func testSleepScoreGraded() {
+        // 4h = 50%, 6h = 75%, 8h = 100%, >8h clamped to 100%
+        XCTAssertEqual(SleepScore.score(durationSeconds: 4 * 3600), 50.0)
+        XCTAssertEqual(SleepScore.score(durationSeconds: 6 * 3600), 75.0)
         XCTAssertEqual(SleepScore.score(durationSeconds: 8 * 3600), 100.0)
-        XCTAssertEqual(SleepScore.score(durationSeconds: 4 * 3600), 0.0)  // integer ratio
         XCTAssertEqual(SleepScore.score(durationSeconds: 24 * 3600), 100.0)  // clamped
+        XCTAssertEqual(SleepScore.score(durationSeconds: 0), 0.0)
+    }
+
+    func testSleepScoreConvenienceInit() {
+        let start = Date(timeIntervalSince1970: 0)
+        let end = start.addingTimeInterval(8 * 3600)
+        XCTAssertEqual(SleepScore.score(start: start, end: end), 100.0)
     }
 }
