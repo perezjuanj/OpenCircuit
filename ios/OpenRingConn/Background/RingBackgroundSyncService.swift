@@ -20,6 +20,15 @@ struct RingBackgroundSyncService {
     /// any lock now reaches HealthKit, and the standing reconnect gives repeat chances.)
     static let defaultTimeout: TimeInterval = 28
 
+    /// Budget for the BGProcessingTask path (#45). A processing task gets minutes of runtime
+    /// (vs. the ~30 s app-refresh ceiling), so the optical-HR poll finally has room past its
+    /// ~60 s warm-up to actually lock. We change ONLY the time budget handed to the existing
+    /// capture loop — not the drain/decode logic. The loop is cancellation-aware, so if iOS
+    /// grants less the AppDelegate `expirationHandler` still tears down cleanly. HONEST: iOS
+    /// schedules processing tasks at its discretion (usually overnight on the charger), so this
+    /// makes a real background HR lock LIKELY when it runs, not guaranteed for daytime.
+    static let processingTimeout: TimeInterval = 150
+
     /// One bounded background read so the app already has last night's data on open. The
     /// drain inside `captureForBackground` persists overnight HR/HRV/SpO2 + sleep + steps +
     /// skin temp to the local store (the dashboard's source) — skin temp ONLY during the
@@ -46,6 +55,9 @@ struct RingBackgroundSyncService {
         if HealthKitWriter.isAvailable {
             mirrored = await health.flushToHealth(store: store,
                                                   sleepSegments: capture.sleepSegments).wroteAnything
+            // Record the Health write so ContentView's "Last Health write" reflects the
+            // background path too, not just the manual button (#44).
+            if mirrored { ObservabilityStore().recordHealthWrite() }
         }
         // Success = we captured fresh data OR mirrored previously-pending data to Health, so a
         // run that only flushed a backlog still counts (iOS uses this to keep scheduling us).
