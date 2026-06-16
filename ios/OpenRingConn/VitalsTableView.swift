@@ -131,11 +131,11 @@ struct VitalsTableView: View {
         VStack(alignment: .leading, spacing: 0) {
             measurableRow("Heart Rate", value: hrText, mode: .hr, active: hrActive,
                           time: hrActive && session?.liveHR == nil
-                              ? "measuring…" : timeFor(.heartRate, live: session?.liveHR != nil))
+                              ? "measuring…" : timeFor(.heartRate, live: hrLive))
             divider
             measurableRow("SpO₂", value: spo2Text, mode: .spo2, active: spo2Active,
                           time: spo2Active && session?.liveSpO2 == nil
-                              ? "measuring…" : timeFor(.spo2, live: session?.liveSpO2 != nil))
+                              ? "measuring…" : timeFor(.spo2, live: spo2Live))
             divider
             skinTempRow
             divider
@@ -199,6 +199,11 @@ struct VitalsTableView: View {
     private var hrActive: Bool { session?.monitoring == true && session?.liveMode == .hr }
     private var spo2Active: Bool { session?.monitoring == true && session?.liveMode == .spo2 }
 
+    /// True when the link has gone quiet so a lingering live value must NOT read as "live" (#36).
+    /// A silently-dropped link keeps its last HR/SpO₂/steps/temp until CoreBluetooth fires
+    /// `didDisconnect`; staleness lets us show "Xm ago" instead of a minutes-old value as current.
+    private var liveStale: Bool { session?.liveReadingsStale == true }
+
     /// A vitals row carrying an inline start/stop measure control for an on-demand metric.
     private func measurableRow(_ label: String, value: String, mode: RingSession.LiveMode,
                                active: Bool, time: String?) -> some View {
@@ -242,12 +247,18 @@ struct VitalsTableView: View {
 
     // MARK: value formatting (live overrides stored)
 
+    /// HR/SpO₂ count as "live" only while we're actively measuring that metric AND frames are
+    /// still arriving. A leftover value after monitoring stops, or a silently-dropped link, falls
+    /// back to the stored sample's timestamp instead of a false "live" caption (#36).
+    private var hrLive: Bool { hrActive && session?.liveHR != nil && !liveStale }
+    private var spo2Live: Bool { spo2Active && session?.liveSpO2 != nil && !liveStale }
+
     private var hrText: String {
-        if let hr = session?.liveHR { return "\(hr) bpm" }
+        if hrLive, let hr = session?.liveHR { return "\(hr) bpm" }
         return valueText(.heartRate) { "\(Int($0)) bpm" }
     }
     private var spo2Text: String {
-        if let s = session?.liveSpO2 { return "\(s) %" }
+        if spo2Live, let s = session?.liveSpO2 { return "\(s) %" }
         return valueText(.spo2) { "\(Int(($0 * 100).rounded())) %" }
     }
     // MARK: Skin temp (headline = latest reading; overnight average shown as context)
@@ -282,7 +293,7 @@ struct VitalsTableView: View {
     /// ("live" when connected, else relative time) and the overnight average for context.
     private var skinTempSecondary: String? {
         var parts: [String] = []
-        if session?.liveTemperature != nil {
+        if session?.liveTemperature != nil, !liveStale {
             parts.append("live")
         } else if latestTemp != nil, let s = latest[.temperature] {
             parts.append(Self.rel.localizedString(for: s.start, relativeTo: Date()))
@@ -333,10 +344,11 @@ struct VitalsTableView: View {
         guard let s = effectiveSteps else { return "—" }
         return "\(s)"
     }
-    /// "live" while connected; else the relative time of today's stored count (nil if the
-    /// only stored count is from a prior day — `effectiveSteps` shows "—" then).
+    /// "live" while the descriptor is fresh; else the relative time of today's stored count (nil
+    /// if the only stored count is from a prior day — `effectiveSteps` shows "—" then). A quiet
+    /// link no longer reads as "live" (#36) — it shows when the count was last updated instead.
     private var stepsTime: String? {
-        if session?.steps != nil { return "live" }
+        if session?.steps != nil, !liveStale { return "live" }
         let today = Calendar.current.startOfDay(for: Date())
         guard let d = storedDaily.first, d.day == today, d.steps > 0 else { return nil }
         return Self.rel.localizedString(for: d.updatedAt, relativeTo: Date())

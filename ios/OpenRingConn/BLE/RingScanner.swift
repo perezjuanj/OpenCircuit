@@ -58,6 +58,28 @@ final class RingScanner: NSObject {
     /// from `centralManagerDidUpdateState` once `.poweredOn` arrives.
     private var reconnectWhenPoweredOn = false
 
+    /// Consecutive failed auto-reconnect attempts since the last frame-delivering connect (#35).
+    /// Drives the backoff delay (`ReconnectBackoff`); reset to 0 once a reconnected link proves
+    /// real (`connectStableTask`). A ring on the charger that accepts then drops a connect keeps
+    /// this climbing, so the reconnect cadence stretches instead of hammering the radio.
+    private var reconnectAttempts = 0
+    /// The pending backoff timer: sleeps the computed delay, then re-issues a single standing
+    /// pending connect. Cancelled on connect / user stop so we never stack timers.
+    private var reconnectTask: Task<Void, Never>?
+    /// After a fresh connect, this waits a beat and only resets the backoff if the link SURVIVED
+    /// and delivered a real frame — the "successful data frame" reset signal (#35). Guards the
+    /// connect/reject loop a charging ring produces (resetting on `didConnect` alone would pin
+    /// the backoff at its shortest delay).
+    private var connectStableTask: Task<Void, Never>?
+    /// How long a new link must hold (and send a frame) before we trust it and reset the backoff.
+    private static let connectStablePeriod: TimeInterval = 6
+
+    /// True once enough reconnects have failed that the UI should show a calm "ring unreachable /
+    /// charging — will reconnect automatically" instead of a permanent "Connecting…" (#35). Based
+    /// on elapsed attempts, NOT a decoded charging byte (that descriptor bit is protocol-blocked,
+    /// #41) — we never claim to KNOW the ring is charging.
+    private(set) var reconnectStalled = false
+
     private override init() {
         super.init()
         // Opting into state restoration: iOS preserves this central's connections/pending
@@ -88,18 +110,40 @@ final class RingScanner: NSObject {
     func start(services: [CBUUID]? = nil) {
         guard central.state == .poweredOn else { return }
         wantConnection = true
+        resetReconnectBackoff()   // a fresh user scan starts clean — no lingering backoff/calm state
         state = .scanning
         central.scanForPeripherals(withServices: services)
     }
 
     func stop() {
         wantConnection = false
+        resetReconnectBackoff()   // user stop: cancel any pending backoff reconnect
         // Explicit user stop: forget the ring so we don't silently auto-reconnect on the next
         // launch (reconnect-by-identifier only re-arms while an id is saved). (Reviewer MINOR.)
         Self.savedPeripheralID = nil
         central.stopScan()
         if let target { central.cancelPeripheralConnection(target) }
         if case .scanning = state { state = .idle }
+    }
+
+    /// Tear down the active session (#42): persist its last live reading + captured pages
+    /// (`stopLiveMonitoring`), then cancel EVERY task it owns (`invalidate`), then release it.
+    /// Called everywhere `session` is replaced or dropped — before assigning a new session in
+    /// `didConnect`/`willRestoreState`, and on disconnect — so a stale session's keepalive/
+    /// auto-measure/sync loops can never keep writing to the peripheral behind a newer one.
+    private func teardownSession() {
+        session?.stopLiveMonitoring()
+        session?.invalidate()
+        session = nil
+    }
+
+    /// Cancel any in-flight reconnect backoff and clear the calm state (#35). Used on a fresh
+    /// user scan, a user stop/disconnect, and once a link proves stable.
+    private func resetReconnectBackoff() {
+        reconnectTask?.cancel(); reconnectTask = nil
+        connectStableTask?.cancel(); connectStableTask = nil
+        reconnectAttempts = 0
+        reconnectStalled = false
     }
 
     /// Reconnect to the last-known ring WITHOUT scanning. `retrievePeripherals` resurfaces a
@@ -144,11 +188,12 @@ final class RingScanner: NSObject {
     /// connection and immediately reconnects, looping forever (#14 fix).
     func disconnect() {
         wantConnection = false
+        resetReconnectBackoff()   // user stop: drop any pending backoff reconnect (#35)
         central.stopScan()
         if let target {
             central.cancelPeripheralConnection(target)
         }
-        session = nil
+        teardownSession()         // cancel all of the session's tasks, not just the live poll (#42)
         target = nil
         state = .idle
     }
@@ -160,8 +205,7 @@ final class RingScanner: NSObject {
     /// no-scan pending connect-by-identifier so reconnection stays armed across the next
     /// suspension. (Reviewer MAJOR fix.)
     private func endBackgroundReadRearming() {
-        session?.stopLiveMonitoring()
-        session = nil
+        teardownSession()   // stopLiveMonitoring + cancel keepalive/auto-measure/sync tasks (#42)
         if let target { central.cancelPeripheralConnection(target) }
         target = nil
         state = .idle
@@ -241,9 +285,19 @@ extension RingScanner: CBCentralManagerDelegate {
                 case .connected, .connecting: break
                 default: self.state = .idle
                 }
-                // A reconnect was requested before Bluetooth was ready (cold/background
-                // launch) — complete it now that the radio is on.
-                if self.reconnectWhenPoweredOn { self.reconnectKnownPeripheral() }
+                // A reconnect was requested before Bluetooth was ready (cold/background launch,
+                // or a backoff reconnect that armed while the radio was off) — complete it now.
+                // When we already hold the peripheral object, connect it directly: a backoff sets
+                // state to `.connecting`, which `reconnectKnownPeripheral` treats as "already
+                // connecting" and no-ops — connecting `target` ourselves avoids that stall. (#35)
+                if self.reconnectWhenPoweredOn {
+                    self.reconnectWhenPoweredOn = false
+                    if let target = self.target {
+                        self.central.connect(target)
+                    } else {
+                        self.reconnectKnownPeripheral()
+                    }
+                }
                 // A session restored before the radio was up may have fired its discovery
                 // into the void (chars never matched → never `ready`). Re-kick it now. The
                 // session also self-heals on the first frame it receives (#reconnect).
@@ -271,9 +325,14 @@ extension RingScanner: CBCentralManagerDelegate {
             switch peripheral.state {
             case .connected:
                 // The link survived the relaunch — rebuild the session now; `didConnect`
-                // won't fire again. RingSession re-discovers services/characteristics.
+                // won't fire again. RingSession re-matches characteristics (skipping a full
+                // service re-discovery when they're already present, #42).
                 Self.savedPeripheralID = peripheral.identifier.uuidString
                 self.state = .connected(peripheral.name ?? "RingConn")
+                // Tear down any session that already exists (e.g. a later `didConnect` racing this
+                // restore) before replacing it, so its tasks don't keep writing to the peripheral
+                // behind the new session (#42).
+                self.teardownSession()
                 self.session = RingSession(peripheral: peripheral, localStore: self.localStore)
             case .connecting:
                 // Pending connect still in flight; `didConnect` will complete it.
@@ -323,8 +382,32 @@ extension RingScanner: CBCentralManagerDelegate {
             // cold launch or background relaunch.
             self.target = peripheral
             Self.savedPeripheralID = peripheral.identifier.uuidString
+            // A connect landed — stop any pending backoff timer and clear the calm "unreachable"
+            // note. (We don't reset the attempt COUNT yet: a charging ring can connect then
+            // immediately drop, so the backoff only truly resets once the link proves stable.) #35
+            self.reconnectTask?.cancel(); self.reconnectTask = nil
+            self.reconnectStalled = false
             self.state = .connected(peripheral.name ?? "RingConn")
+            // Tear down any prior session before replacing it so its keepalive/auto-measure/sync
+            // tasks can't keep driving the same peripheral behind the new session (#42).
+            self.teardownSession()
             self.session = RingSession(peripheral: peripheral, localStore: self.localStore)
+            self.armConnectStabilityReset()
+        }
+    }
+
+    /// Arm the backoff reset (#35). Only once a reconnected link has SURVIVED a beat AND delivered
+    /// a real frame (`session.lastFrameAt`) do we trust it and zero the attempt count — so a
+    /// charging ring's connect/reject loop (which never delivers a frame) keeps the backoff
+    /// climbing instead of resetting on every brief connect.
+    private func armConnectStabilityReset() {
+        connectStableTask?.cancel()
+        connectStableTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.connectStablePeriod))
+            guard let self, !Task.isCancelled else { return }
+            if case .connected = self.state, self.session?.lastFrameAt != nil {
+                self.reconnectAttempts = 0
+            }
         }
     }
 
@@ -332,16 +415,44 @@ extension RingScanner: CBCentralManagerDelegate {
                                     didDisconnectPeripheral peripheral: CBPeripheral,
                                     error: Error?) {
         Task { @MainActor in
-            self.session?.stopLiveMonitoring()
-            self.session = nil
-            // Auto-reconnect: CoreBluetooth's connect has no timeout — it reconnects
-            // (using the persisted bond) the moment the ring wakes/comes back in range,
-            // so the user never has to re-pair or open the official app again.
+            self.connectStableTask?.cancel(); self.connectStableTask = nil
+            self.teardownSession()   // cancel ALL of the session's tasks, persisting last reading (#42)
+            // Auto-reconnect: CoreBluetooth's connect has no timeout — it reconnects (using the
+            // persisted bond) the moment the ring wakes/comes back in range, so the user never has
+            // to re-pair or open the official app again. But we no longer re-issue it IMMEDIATELY:
+            // a ring on the charger that drops the link in a loop would keep the radio armed for
+            // hours. Back off with a growing delay instead (#35).
             if self.wantConnection {
-                self.state = .connecting(peripheral.name ?? "RingConn")
-                self.central.connect(peripheral)
+                self.scheduleReconnect(peripheral)
             } else {
                 self.state = .idle
+            }
+        }
+    }
+}
+
+extension RingScanner {
+    /// Schedule a backoff reconnect after a disconnect (#35). Each consecutive failure stretches
+    /// the delay (1 s → 5 s → 30 s cap); a stable, frame-delivering connect resets it. We keep the
+    /// cheap standing pending connect — we just delay re-issuing it and do NOT actively re-scan
+    /// during the wait. After a few failures the UI switches to a calm "unreachable" note.
+    private func scheduleReconnect(_ peripheral: CBPeripheral) {
+        reconnectTask?.cancel()
+        reconnectAttempts += 1
+        let delay = ReconnectBackoff.delay(forAttempt: reconnectAttempts)
+        reconnectStalled = ReconnectBackoff.shouldSurfaceCalmState(attempts: reconnectAttempts)
+        target = peripheral
+        state = .connecting(peripheral.name ?? "RingConn")
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled, self.wantConnection else { return }
+            // Don't fight a link that already came back during the wait.
+            if case .connected = self.state { return }
+            if self.central.state == .poweredOn {
+                self.central.connect(peripheral)   // single standing pending connect (no scan)
+            } else {
+                // Radio not up yet — let the poweredOn handler complete the reconnect-by-identifier.
+                self.reconnectWhenPoweredOn = true
             }
         }
     }

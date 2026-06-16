@@ -140,11 +140,20 @@ struct ContentView: View {
                     Text(hrWarmupText).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                // Ring battery (a device stat, not a body vital) sits with the connection.
+                // Ring battery (a device stat, not a body vital) sits with the connection. When
+                // the link has gone quiet (no frames), gray it and show "as of Xm ago" so a
+                // minutes-old % from a silently-dropped link doesn't read as current (#36).
                 if let b = session?.batteryPercent {
-                    Label("\(b)%", systemImage: batteryIcon(b))
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(b <= 20 ? .red : .secondary)
+                    let stale = session?.liveReadingsStale == true
+                    VStack(alignment: .trailing, spacing: 0) {
+                        Label("\(b)%", systemImage: batteryIcon(b))
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(stale ? AnyShapeStyle(.tertiary)
+                                             : AnyShapeStyle(b <= 20 ? Color.red : Color.secondary))
+                        if let asOf = batteryAsOf {
+                            Text(asOf).font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }
                 }
             }
             if !connected {
@@ -170,6 +179,17 @@ struct ContentView: View {
         if let w = session?.liveHRWarmup { return "Warming up HR… (\(w))" }
         return "Measuring HR…"
     }
+
+    /// "as of Xm ago" for the connection-header battery, shown only once the link has gone quiet
+    /// (#36) — a dropped link can otherwise show a minutes-old battery % as if it were current.
+    private var batteryAsOf: String? {
+        guard session?.liveReadingsStale == true, let at = session?.lastFrameAt else { return nil }
+        return "as of " + Self.rel.localizedString(for: at, relativeTo: Date())
+    }
+
+    private static let rel: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter(); f.unitsStyle = .abbreviated; return f
+    }()
 
     /// SF Symbol for the ring's battery level.
     private func batteryIcon(_ pct: Int) -> String {
@@ -392,7 +412,13 @@ struct ContentView: View {
         case .poweredOff: return "Bluetooth off"
         case .unauthorized: return "Bluetooth not authorized"
         case .scanning: return "Scanning…"
-        case .connecting(let n): return "Connecting to \(n)…"
+        case .connecting(let n):
+            // After repeated failed reconnects (e.g. the ring is on the charger / out of range),
+            // swap the permanent "Connecting…" for a calm note so normal charging doesn't read as
+            // a stuck connection (#35). Heuristic on elapsed attempts — not a charging byte (#41).
+            return scanner.reconnectStalled
+                ? "Ring unreachable or charging — will reconnect automatically"
+                : "Connecting to \(n)…"
         case .connected(let n): return n
         }
     }

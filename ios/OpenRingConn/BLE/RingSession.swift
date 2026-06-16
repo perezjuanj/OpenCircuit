@@ -39,6 +39,11 @@ final class RingSession: NSObject {
     private(set) var liveTemperature: Double?   // skin temp °C (0x10/0x87 [6:8]/[8:10], §5.4)
     private(set) var batteryPercent: Int?       // ring battery % (0x10/0x87 [1], §5.4 🟢)
     private(set) var liveMode: LiveMode = .hr
+    /// Wall-clock time of the most recent frame actually received from the ring (#36). Lets the
+    /// UI detect a silently-dropped link (values stop updating before CoreBluetooth fires
+    /// `didDisconnect`) and stamps the persisted last live reading with when it was REALLY
+    /// measured — not `Date()`, which would push a minutes-old reading into HealthKit "now".
+    private(set) var lastFrameAt: Date?
     private(set) var monitoring = false
     /// True during the open→drain phase before the live stream starts. The ring won't
     /// emit live frames until its history backlog is fully drained, so we surface this
@@ -51,6 +56,21 @@ final class RingSession: NSObject {
     /// True while the periodic auto-measure (not a user tap) is driving a live read, so the
     /// UI can show a subtle "auto-updating" cue instead of reading as a user measurement.
     private(set) var autoMeasuring = false
+
+    /// True when frames have stopped for long enough that the live readings (HR/SpO₂/battery/
+    /// steps/temp) should read as STALE rather than current (#36). A silently-dropped link keeps
+    /// its last values until CoreBluetooth eventually fires `didDisconnect`; this lets the UI
+    /// show "Xm ago" instead of a minutes-old value masquerading as live. Thresholds are mode-
+    /// aware: while monitoring, frames stream ~every 2 s, so a 30 s gap means the stream stalled;
+    /// while idle the only frames are the slow keepalive descriptor (up to ~5 min apart in
+    /// battery saver), so allow a much longer gap before crying stale.
+    var liveReadingsStale: Bool {
+        guard let at = lastFrameAt else { return false }   // no frame yet — nothing to call stale
+        let gap = Date().timeIntervalSince(at)
+        return gap > (monitoring ? Self.liveStaleAfter : Self.idleStaleAfter)
+    }
+    private static let liveStaleAfter: TimeInterval = 30
+    private static let idleStaleAfter: TimeInterval = 360
 
     private var monitorTask: Task<Void, Never>?
     private var keepaliveTask: Task<Void, Never>?
@@ -95,6 +115,7 @@ final class RingSession: NSObject {
     private var syncSession = EpochSyncSession()
     private let epochDecodingEnabled = false
 
+    private let dataServiceUUID = CBUUID(string: OpenRingKit.Transport.dataServiceUUID)
     private let notifyUUID = CBUUID(string: OpenRingKit.Transport.notifyCharUUID)
     private let writeUUID = CBUUID(string: OpenRingKit.Transport.writeCharUUID)
 
@@ -103,7 +124,37 @@ final class RingSession: NSObject {
         self.localStore = localStore
         super.init()
         peripheral.delegate = self
-        peripheral.discoverServices(nil)
+        // Re-discovery guard (#42): on a restored / already-connected peripheral the data service
+        // is usually already discovered, so re-scanning ALL services on every relaunch is wasted
+        // work. If the data service is already present, go straight to (re-)matching its
+        // characteristics — that still re-fires `didDiscoverCharacteristicsFor`, so `ready` lands.
+        // Only fall back to a full `discoverServices` when we've never seen the service.
+        if let dataService = peripheral.services?.first(where: { $0.uuid == dataServiceUUID }) {
+            peripheral.discoverCharacteristics(nil, for: dataService)
+        } else {
+            peripheral.discoverServices(nil)
+        }
+    }
+
+    /// Hard teardown (#42): cancel EVERY task this session owns so a session that's being
+    /// replaced (a second `didConnect`/`willRestoreState`) or torn down on disconnect can't keep
+    /// writing to the SHARED peripheral behind a newer session — which would race the delegate
+    /// routing and leak the keepalive/auto-measure/sync loops. Callers persist the last live
+    /// reading via `stopLiveMonitoring()` BEFORE this where that matters; `invalidate()` itself is
+    /// a pure cancel + detach. Idempotent.
+    func invalidate() {
+        monitorTask?.cancel(); monitorTask = nil
+        keepaliveTask?.cancel(); keepaliveTask = nil
+        autoMeasureTask?.cancel(); autoMeasureTask = nil
+        syncTask?.cancel(); syncTask = nil
+        monitoring = false
+        livePreparing = false
+        syncing = false
+        autoMeasuring = false
+        // Stop CoreBluetooth callbacks routing to a torn-down session. Only clear the delegate if
+        // it's still us — a newer session for the same peripheral reassigns it in its own `init`,
+        // and we must not clobber that.
+        if peripheral.delegate === self { peripheral.delegate = nil }
     }
 
     /// Begin live monitoring. The proven enter sequence (PROTOCOL.md §5.1 / livehr.py) is
@@ -473,11 +524,14 @@ final class RingSession: NSObject {
             persistSleepAndSteps()
             bulkFinalized = true
         }
-        // Persist the last live reading so the dashboard shows it after disconnect.
-        let now = Date()
+        // Persist the last live reading so the dashboard shows it after disconnect. Stamp it with
+        // WHEN the ring last actually sent a frame, not `Date()` (#36): on a silently-dropped link
+        // the last value can be minutes old, and stamping "now" would push a wrong timestamp into
+        // HealthKit. Fall back to now only if we somehow never recorded a frame.
+        let stamp = lastFrameAt ?? Date()
         var last: [QuantitySample] = []
-        if let hr = liveHR { last.append(QuantitySample(kind: .heartRate, start: now, value: Double(hr))) }
-        if let spo2 = liveSpO2 { last.append(QuantitySample(kind: .spo2, start: now, value: Double(spo2) / 100)) }
+        if let hr = liveHR { last.append(QuantitySample(kind: .heartRate, start: stamp, value: Double(hr))) }
+        if let spo2 = liveSpO2 { last.append(QuantitySample(kind: .spo2, start: stamp, value: Double(spo2) / 100)) }
         persist(last)
     }
 
@@ -607,6 +661,7 @@ extension RingSession: CBPeripheralDelegate {
         let bytes = [UInt8](data)
         Task { @MainActor in
             self.lastFrame = data.map { String(format: "%02x", $0) }.joined(separator: " ")
+            self.lastFrameAt = Date()   // freshness anchor for staleness + last-reading timestamp (#36)
             // Frames arriving while the link isn't `ready` mean discovery didn't land on this
             // (restored) reconnect — re-run it so we can ack and the buttons enable. #reconnect
             if !self.ready { self.rediscoverIfNeeded() }
