@@ -153,14 +153,25 @@ final class RingSession: NSObject {
             //    the longer cap so a big overnight backlog is fully captured.
             guard let s0 = self, !Task.isCancelled else { return }
             s0.write(Command.fetch)
-            let drainMaxTicks = quickLiveRead ? 6 : 30   // ×500 ms ⇒ ~3 s quick / ~15 s full backstop
+            // Drain backstop in 500 ms ticks. A quick read starts with a short ~3 s cap so a
+            // silent ring can't starve the HR poll (#45); the overnight path uses the full ~15 s.
+            // The shared quiet-exit (3 quiet ticks ≈ 1.5 s after the last page) ends a real drain.
+            // BUT a quick read must NOT cut off an in-flight backlog: entering live mode while
+            // 0x4c pages are still streaming (!drainDone, no quiet beat yet) leaves HR stuck at
+            // the warm-up sentinel (8). So if the short cap is reached mid-stream, promote it to
+            // the full cap and let the quiet-exit finish the drain — the short cap then only bites
+            // a genuinely silent ring (the common no-backlog case still exits at ~1.5 s, unchanged).
+            var cap = quickLiveRead ? 6 : 30   // ×500 ms ⇒ ~3 s quick / ~15 s full backstop
             var quiet = 0
-            for _ in 0 ..< drainMaxTicks {
+            var tick = 0
+            while tick < cap {
                 try? await Task.sleep(for: .milliseconds(500))
                 guard let self, !Task.isCancelled else { return }
                 if self.drainDone { break }
                 if self.drainSawPage { self.drainSawPage = false; quiet = 0 }
                 else { quiet += 1; if quiet >= 3 { break } }
+                tick += 1
+                if tick >= cap, quiet == 0, cap < 30 { cap = 30 }   // quick read still streaming a backlog → drain it fully (#45)
             }
             // Surface anything drained so overnight sleep/vitals aren't lost — the ring
             // discards delivered pages, so this is the only chance to keep them.
