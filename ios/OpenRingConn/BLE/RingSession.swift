@@ -48,9 +48,13 @@ final class RingSession: NSObject {
     private(set) var decodedEpochRecords = 0
     private(set) var storedMetricSamples = 0
     private(set) var ready = false
+    /// True while the periodic auto-measure (not a user tap) is driving a live read, so the
+    /// UI can show a subtle "auto-updating" cue instead of reading as a user measurement.
+    private(set) var autoMeasuring = false
 
     private var monitorTask: Task<Void, Never>?
     private var keepaliveTask: Task<Void, Never>?
+    private var autoMeasureTask: Task<Void, Never>?
 
     /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
     /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
@@ -78,6 +82,8 @@ final class RingSession: NSObject {
     private let peripheral: CBPeripheral
     private var notifyChar: CBCharacteristic?
     private var writeChar: CBCharacteristic?
+    /// Throttle for the half-open-link recovery (`rediscoverIfNeeded`).
+    private var lastDiscoveryKick: Date?
     private var localStore: LocalStore?
     private var syncSession = EpochSyncSession()
     private let epochDecodingEnabled = false
@@ -194,6 +200,77 @@ final class RingSession: NSObject {
                 try? await Task.sleep(for: .seconds(30))
             }
         }
+    }
+
+    /// UserDefaults key for the periodic auto-measure toggle (default ON — the user opted in).
+    static let autoMeasureEnabledKey = "autoMeasure.enabled"
+    /// How often to auto-measure HR while connected+idle. SpO₂ runs every 3rd cycle (~3×).
+    private static let autoMeasureInterval: TimeInterval = 600   // 10 min
+    /// Delay before the FIRST auto-measure after connecting — short, so opening the app
+    /// refreshes HR within ~a minute rather than waiting a full interval.
+    private static let autoMeasureFirstDelay: TimeInterval = 45
+    private static var autoMeasureEnabled: Bool {
+        // Default true when unset (the user chose "periodic"); a stored false disables it.
+        UserDefaults.standard.object(forKey: autoMeasureEnabledKey) as? Bool ?? true
+    }
+
+    /// Periodic auto-measure — what makes HR/SpO₂ refresh on their own, like the official app
+    /// (the ring measures them ONLY on demand; the idle keepalive carries just temp/steps/
+    /// battery). While connected and idle it briefly enters HR live mode, waits for a converged
+    /// reading, persists it (which the app then mirrors to Health), and returns to idle; SpO₂
+    /// every 3rd cycle. Skips entirely while the user is measuring or a sync is running, and
+    /// respects the `autoMeasure.enabled` toggle. Battery cost is real — hence the toggle.
+    func startAutoMeasure() {
+        guard autoMeasureTask == nil else { return }
+        autoMeasureTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.autoMeasureFirstDelay))
+            while !Task.isCancelled {
+                guard let self else { return }
+                if Self.autoMeasureEnabled, self.idleForAutoMeasure {
+                    // Refresh BOTH every cycle — HR locks in seconds when still; SpO₂ rides
+                    // the same live path. (Was SpO₂ every 3rd cycle, but relaunches reset that
+                    // counter so it rarely fired.) Each is bounded, so a moving hand just times
+                    // out that read rather than blocking the loop.
+                    await self.autoMeasureOnce(mode: .hr, timeout: 90)   // HR can need ~60s of stillness
+                    if self.idleForAutoMeasure {
+                        await self.autoMeasureOnce(mode: .spo2, timeout: 45)
+                    }
+                    try? await Task.sleep(for: .seconds(Self.autoMeasureInterval))
+                } else {
+                    // Disabled, or busy with a user measure / sync — re-check soon rather than
+                    // deferring a full interval (a one-off open-sync shouldn't push the first
+                    // HR out by 10 min).
+                    try? await Task.sleep(for: .seconds(30))
+                }
+            }
+        }
+    }
+
+    /// True only when the link is up and nothing else is using it — never interrupt a user
+    /// measurement, a sync, or the live-enter drain.
+    private var idleForAutoMeasure: Bool {
+        ready && !monitoring && !livePreparing && syncTask == nil
+    }
+
+    /// One bounded auto-measurement: enter `mode`'s live read, wait for a converged value (or
+    /// time out), then stop — which persists the reading and lets ContentView mirror it to
+    /// Health. If the user takes over mid-read (monitoring an unexpected mode), we leave their
+    /// session alone rather than cancelling it.
+    private func autoMeasureOnce(mode: LiveMode, timeout: TimeInterval) async {
+        guard idleForAutoMeasure else { return }
+        autoMeasuring = true
+        startMonitoring(mode: mode)             // sets monitoring=true; drains, enters, polls
+        let deadline = Date().addingTimeInterval(timeout)
+        while !Task.isCancelled && Date() < deadline {
+            if mode == .hr, liveHR != nil { break }
+            if mode == .spo2, liveSpO2 != nil { break }
+            // Bail if a user tap switched the mode out from under us — don't fight them.
+            if !monitoring || liveMode != mode { autoMeasuring = false; return }
+            try? await Task.sleep(for: .seconds(1))
+        }
+        // Only tear down if WE still own the live read (user didn't take over).
+        if autoMeasuring, monitoring, liveMode == mode { stopLiveMonitoring() }
+        autoMeasuring = false
     }
 
     /// Persist decoded samples to the local store (the vitals dashboard reads from it, so
@@ -340,6 +417,22 @@ final class RingSession: NSObject {
         ringLog.debug("→ write \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
         peripheral.writeValue(Data(bytes), for: writeChar, type: .withResponse)
     }
+
+    /// Recover a half-open link. On a restored / already-connected reconnect, the persisted
+    /// notify subscription can deliver frames before THIS session has matched the notify/write
+    /// characteristics — discovery from `init` fires before the central is fully ready and
+    /// silently no-ops, so `ready` is stuck false and page-acks get dropped (the ring then
+    /// stalls waiting for an ack). Re-running discovery once data is actually flowing relands
+    /// the characteristics → `ready` flips true → keepalive/sync resume. Throttled so a burst
+    /// of frames doesn't spam discovery. Safe no-op once ready. (Ground-truthed from a device
+    /// log: "write DROPPED (no writeChar yet)" with no preceding `ready=`.)
+    func rediscoverIfNeeded() {
+        guard !ready else { return }
+        if let last = lastDiscoveryKick, Date().timeIntervalSince(last) < 2 { return }
+        lastDiscoveryKick = Date()
+        ringLog.notice("rediscover: link up but not ready (notify=\(self.notifyChar != nil), write=\(self.writeChar != nil)) — re-running discovery")
+        peripheral.discoverServices(nil)
+    }
 }
 
 extension RingSession: CBPeripheralDelegate {
@@ -363,7 +456,10 @@ extension RingSession: CBPeripheralDelegate {
             }
             self.ready = (self.notifyChar != nil && self.writeChar != nil)
             ringLog.notice("ready=\(self.ready) (notify=\(self.notifyChar != nil), write=\(self.writeChar != nil))")
-            if self.ready { self.startKeepalive() }   // begin continuous descriptor polling (primary tracker)
+            if self.ready {
+                self.startKeepalive()      // continuous descriptor polling (temp/steps/battery)
+                self.startAutoMeasure()    // periodic HR/SpO₂ reads so those refresh on their own
+            }
         }
     }
 
@@ -374,6 +470,9 @@ extension RingSession: CBPeripheralDelegate {
         let bytes = [UInt8](data)
         Task { @MainActor in
             self.lastFrame = data.map { String(format: "%02x", $0) }.joined(separator: " ")
+            // Frames arriving while the link isn't `ready` mean discovery didn't land on this
+            // (restored) reconnect — re-run it so we can ack and the buttons enable. #reconnect
+            if !self.ready { self.rediscoverIfNeeded() }
             // The ring's onboard step counter (descriptor [4:6], §5.4) is a since-handoff DELTA that
             // resets (the official app sums it in local memory). So accumulate observed deltas
             // into a persistent daily total, reset-aware, rather than showing the raw counter
@@ -442,10 +541,17 @@ extension RingSession: CBPeripheralDelegate {
                     self.liveHRWarmup = nil
                     self.liveHRTrend.append(hr)
                     if self.liveHRTrend.count > 12 { self.liveHRTrend.removeFirst() }
+                    ringLog.notice("live HR LOCKED: \(hr) bpm")
                 } else if let raw = LiveHR.decode(bytes) {                       // short frame, still warming up
                     self.liveHRWarmup = raw
+                    ringLog.notice("live HR warmup: byte2=\(raw) (frame \(self.lastFrame ?? "", privacy: .public))")
+                } else if bytes.first == 0x15 {
+                    ringLog.notice("live 0x15 frame (no HR): \(self.lastFrame ?? "", privacy: .public)")
                 }
-                if let spo2 = LiveHR.decodeSpO2(bytes) { self.liveSpO2 = spo2 }  // long frame, 🟡
+                if let spo2 = LiveHR.decodeSpO2(bytes) {                         // long frame, 🟡
+                    self.liveSpO2 = spo2
+                    ringLog.notice("live SpO2: \(spo2)%")
+                }
             }
         }
     }

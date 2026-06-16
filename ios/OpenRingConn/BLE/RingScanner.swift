@@ -239,6 +239,12 @@ extension RingScanner: CBCentralManagerDelegate {
                 // A reconnect was requested before Bluetooth was ready (cold/background
                 // launch) — complete it now that the radio is on.
                 if self.reconnectWhenPoweredOn { self.reconnectKnownPeripheral() }
+                // A session restored before the radio was up may have fired its discovery
+                // into the void (chars never matched → never `ready`). Re-kick it now. The
+                // session also self-heals on the first frame it receives (#reconnect).
+                if let session = self.session, session.ready != true {
+                    session.rediscoverIfNeeded()
+                }
             case .poweredOff: self.state = .poweredOff
             case .unauthorized: self.state = .unauthorized
             default: self.state = .idle

@@ -9,9 +9,6 @@ struct ContentView: View {
     @State private var healthAuthorized = false
     @State private var lastWrite: String?
     @State private var showDebug = false
-    /// Last HR persisted to the store (from a prior session or a background refresh),
-    /// shown on launch before BLE reconnects. #14
-    @State private var lastKnownHR: QuantitySample?
 
     /// Armed when a foreground activation wants a one-shot history sync, fired once the
     /// link is `ready`. A user "Scan & connect" never sets this, so the auto-refresh can't
@@ -36,9 +33,6 @@ struct ContentView: View {
                 VStack(spacing: 16) {
                     connectionCard
                     vitalsCard
-                    hrCard
-                    spo2Card
-                    stepsCard
                     caloriesCard
                     syncCard
                     debugCard
@@ -62,12 +56,10 @@ struct ContentView: View {
                 scanner.setLocalStore(LocalStore(modelContext))
             }
             .task {
-                // Load the last persisted HR AFTER the first frame renders. Running this
-                // SwiftData fetch synchronously in .onAppear blocked the launch render and
-                // showed a black screen on launch. #14
-                loadLaunchSnapshot()
                 // Reflect any prior Health authorization so the UI shows the mirrored state,
                 // and backfill anything the background refresh persisted while we were away.
+                // Runs in `.task` (after first frame), never `.onAppear` — a synchronous store
+                // read there once blocked the launch render into a black screen. #14
                 healthAuthorized = health.isShareAuthorized
                 if healthAuthorized { flushHealth() }
             }
@@ -138,6 +130,9 @@ struct ContentView: View {
                 if session?.syncing == true {
                     ProgressView().controlSize(.small)
                     Text("Updating…").font(.caption).foregroundStyle(.secondary)
+                } else if session?.autoMeasuring == true {
+                    ProgressView().controlSize(.small)
+                    Text("Auto-measuring…").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
                 // Ring battery (a device stat, not a body vital) sits with the connection.
@@ -187,139 +182,10 @@ struct ContentView: View {
         return SleepStaging.summary(segs)
     }
 
-    // MARK: Live — two independent sections, but only one reads at a time
-
-    private func hrActive() -> Bool { session?.monitoring == true && session?.liveMode == .hr }
-    private func spo2Active() -> Bool { session?.monitoring == true && session?.liveMode == .spo2 }
-
-    /// Heart-rate section. Shows its own latest reading; the value persists as the last
-    /// reading whenever SpO₂ has taken the link (ring measures one metric at a time).
-    private var hrCard: some View {
-        card {
-            metricHeader("HEART RATE", icon: "heart.fill", color: .red, active: hrActive())
-            // Fall back to the last persisted reading on launch / before reconnect. #14
-            bigReading(session?.liveHR ?? lastKnownHR.map { Int($0.value) },
-                       unit: "BPM", color: .red, active: hrActive())
-
-            if hrActive() {
-                // Optical HR is a windowed average that climbs over ~20–60 s of stillness,
-                // so show the trend/warm-up rather than one misleading number.
-                if session?.livePreparing == true {
-                    Label("Preparing… syncing the ring's history first",
-                          systemImage: "arrow.triangle.2.circlepath")
-                        .font(.caption2).foregroundStyle(.secondary)
-                } else if let trend = session?.liveHRTrend, trend.count >= 2 {
-                    let lo = trend.min() ?? 0, hi = trend.max() ?? 0
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(trend.map(String.init).joined(separator: "  "))
-                            .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                            .lineLimit(1).minimumScaleFactor(0.6)
-                        Text(lo == hi ? "steady at \(lo) — give it 20–60 s of stillness to settle"
-                                      : "range \(lo)–\(hi) bpm (converging)")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
-                } else if session?.liveHR == nil, let warm = session?.liveHRWarmup {
-                    Label("Warming up… (\(warm)) — hold still, keep the ring snug",
-                          systemImage: "hourglass")
-                        .font(.caption2).foregroundStyle(.orange)
-                } else if session?.liveHR == nil {
-                    Text("Waiting for HR frames… if this never moves, the ring isn't in HR mode.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-            } else if session?.liveHR != nil {
-                Text("Last reading — tap Measure to refresh.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            } else if lastKnownHR != nil {
-                Text("Last synced reading — connect to refresh.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-
-            liveButton(.hr, title: "Measure heart rate", active: hrActive(), color: .red,
-                       icon: "heart.fill")
-        }
-    }
-
-    /// SpO₂ section — same shape, blue. Latest reading persists when HR has the link.
-    private var spo2Card: some View {
-        card {
-            metricHeader("BLOOD OXYGEN", icon: "lungs.fill", color: .blue, active: spo2Active())
-            bigReading(session?.liveSpO2, unit: "%", color: .blue, active: spo2Active())
-
-            if spo2Active() {
-                Text(session?.livePreparing == true ? "Preparing… syncing the ring's history first"
-                     : session?.liveSpO2 == nil ? "Measuring… hold still." : "Measuring — live.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            } else if session?.liveSpO2 != nil {
-                Text("Last reading — tap Measure to refresh.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-
-            liveButton(.spo2, title: "Measure SpO₂", active: spo2Active(), color: .blue,
-                       icon: "lungs.fill")
-        }
-    }
-
-    /// Steps in its own compact card once connected.
-    @ViewBuilder
-    private var stepsCard: some View {
-        if session?.ready == true {
-            card {
-                let steps = session?.steps
-                Label(steps.map { "\($0) steps today" } ?? "Steps: waiting for ring…",
-                      systemImage: "figure.walk")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(steps == nil ? Color.secondary : Color.green)
-                    .contentTransition(.numericText())
-                    .animation(.snappy, value: steps)
-            }
-        }
-    }
-
     /// Calories on the home page (was buried in the profile page). Headline is today's
     /// estimated burn; the reference figures stay as a small secondary line.
     private var caloriesCard: some View {
         card { CaloriesCardView() }
-    }
-
-    private func metricHeader(_ title: String, icon: String, color: Color, active: Bool) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon).foregroundStyle(active ? color : .secondary)
-                .symbolEffect(.pulse, isActive: active)
-            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            Spacer()
-            if active {
-                Text("● MEASURING").font(.caption2.weight(.bold)).foregroundStyle(color)
-            }
-        }
-    }
-
-    private func bigReading(_ value: Int?, unit: String, color: Color, active: Bool) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text(value.map(String.init) ?? "—")
-                .font(.system(size: 56, weight: .bold, design: .rounded))
-                .monospacedDigit().contentTransition(.numericText())
-                .foregroundStyle(active ? color : .primary)
-                .animation(.snappy, value: value)
-            Text(unit).font(.title3.weight(.semibold)).foregroundStyle(.secondary)
-            Spacer()
-        }
-    }
-
-    /// Start/stop control for one metric. Starting one calls `startMonitoring(mode:)`,
-    /// which switches the ring's mode so the other stops reading — preserving the
-    /// "only one at a time" guarantee. Tapping the active one stops entirely.
-    private func liveButton(_ mode: RingSession.LiveMode, title: String,
-                            active: Bool, color: Color, icon: String) -> some View {
-        Button {
-            if active { session?.stopLiveMonitoring() }
-            else { session?.startMonitoring(mode: mode) }
-        } label: {
-            Label(active ? "Stop" : title, systemImage: active ? "stop.fill" : icon)
-                .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.borderedProminent)
-        .tint(active ? color : Color(.systemGray3))
-        .disabled(session?.ready != true || session?.syncing == true)   // no live while syncing
     }
 
     // MARK: Sync + Health
@@ -509,14 +375,6 @@ struct ContentView: View {
         case .connecting(let n): return "Connecting to \(n)…"
         case .connected(let n): return n
         }
-    }
-
-    // MARK: Background-refresh support (#14)
-
-    /// Load the last persisted HR so the UI can show it immediately on launch.
-    private func loadLaunchSnapshot() {
-        guard let snapshot = try? LaunchSnapshot.load(from: LocalStore(modelContext)) else { return }
-        lastKnownHR = snapshot.lastHeartRate
     }
 }
 

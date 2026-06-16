@@ -7,6 +7,9 @@ struct UserProfileSettingsView: View {
     @AppStorage("userProfile.weightKg") private var weightKg = 70.0
     @AppStorage("userProfile.heightCm") private var heightCm = 170.0
     @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
+    // Periodic auto-measure toggle — same UserDefaults key RingSession reads. Default true
+    // (the user opted into periodic measuring); flip off to save ring battery.
+    @AppStorage(RingSession.autoMeasureEnabledKey) private var autoMeasureEnabled = true
 
     // Sleep schedule (manual). Persisted as minutes-since-midnight so it's timezone-free
     // and feeds OpenRingKit's `SleepWindow` math directly. Keys/defaults are shared with
@@ -51,6 +54,14 @@ struct UserProfileSettingsView: View {
                         Text(sex.rawValue.capitalized).tag(sex.rawValue)
                     }
                 }
+            }
+
+            Section("Tracking") {
+                Toggle("Auto-measure HR & SpO₂", isOn: $autoMeasureEnabled)
+                Text("While connected, the ring re-measures heart rate (~every 10 min) and "
+                     + "blood oxygen on its own, so the dashboard stays fresh — like the "
+                     + "official app. Uses more ring battery; turn off to measure only on tap.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Sleep schedule") {

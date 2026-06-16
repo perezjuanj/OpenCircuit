@@ -62,20 +62,24 @@ struct VitalsTableView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            row("Heart Rate", value: hrText, time: timeFor(.heartRate, live: session?.liveHR != nil))
+            measurableRow("Heart Rate", value: hrText, mode: .hr, active: hrActive,
+                          time: hrActive && session?.liveHR == nil
+                              ? "measuring…" : timeFor(.heartRate, live: session?.liveHR != nil))
             divider
-            row("SpO₂", value: spo2Text, time: timeFor(.spo2, live: session?.liveSpO2 != nil))
+            measurableRow("SpO₂", value: spo2Text, mode: .spo2, active: spo2Active,
+                          time: spo2Active && session?.liveSpO2 == nil
+                              ? "measuring…" : timeFor(.spo2, live: session?.liveSpO2 != nil))
             divider
             skinTempRow
             divider
-            row("HRV", value: valueText(.hrvSDNN) { "\(Int($0)) ms" }, time: timeFor(.hrvSDNN))
+            row("HRV", value: valueText(.hrvSDNN) { "\(Int($0)) ms" }, time: nightlyWhen(.hrvSDNN))
             divider
             row("Resting HR", value: restingHR.map { "\($0) bpm" } ?? "—", time: nil)
             divider
             row("Steps (today)", value: stepsText, time: stepsTime)
             divider
             row("Respiratory Rate", value: valueText(.respiratoryRate) { String(format: "%.1f /min", $0) },
-                time: timeFor(.respiratoryRate))
+                time: nightlyWhen(.respiratoryRate))
             divider
             sleepSection
         }
@@ -121,6 +125,50 @@ struct VitalsTableView: View {
             }
         }
         .padding(.vertical, 8)
+    }
+
+    // MARK: On-demand metrics (HR / SpO₂) — an inline Measure control replaces the old big cards
+
+    private var hrActive: Bool { session?.monitoring == true && session?.liveMode == .hr }
+    private var spo2Active: Bool { session?.monitoring == true && session?.liveMode == .spo2 }
+
+    /// A vitals row carrying an inline start/stop measure control for an on-demand metric.
+    private func measurableRow(_ label: String, value: String, mode: RingSession.LiveMode,
+                               active: Bool, time: String?) -> some View {
+        HStack(spacing: 10) {
+            Text(label).font(.subheadline).foregroundStyle(.primary)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(value).font(.subheadline.weight(.semibold)).monospacedDigit()
+                if let time { Text(time).font(.caption2).foregroundStyle(.secondary) }
+            }
+            measureButton(mode, active: active)
+        }
+        .padding(.vertical, 8)
+    }
+
+    /// Small circular start/stop control. Appears only when the ring link is ready; disabled
+    /// while a history sync holds the link. Starting one metric stops the other (the ring
+    /// measures one at a time); tapping the active one stops it.
+    @ViewBuilder
+    private func measureButton(_ mode: RingSession.LiveMode, active: Bool) -> some View {
+        if session?.ready == true {
+            let color: Color = mode == .hr ? .red : .blue
+            let icon = mode == .hr ? "heart.fill" : "lungs.fill"
+            Button {
+                if active { session?.stopLiveMonitoring() }
+                else { session?.startMonitoring(mode: mode) }
+            } label: {
+                Image(systemName: active ? "stop.fill" : icon)
+                    .font(.caption2.weight(.bold))
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(active ? color : Color(.systemGray5)))
+                    .foregroundStyle(active ? .white : color)
+                    .symbolEffect(.pulse, isActive: active)
+            }
+            .buttonStyle(.plain)
+            .disabled(session?.syncing == true)
+        }
     }
 
     private var divider: some View { Divider().opacity(0.4) }
@@ -253,5 +301,24 @@ struct VitalsTableView: View {
         if live { return "live" }
         guard let s = latest[kind] else { return nil }
         return Self.rel.localizedString(for: s.start, relativeTo: Date())
+    }
+
+    private static let nightlyDate: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM d"; return f
+    }()
+    /// Freshness label for NIGHTLY metrics (HRV, Respiratory Rate) — the ring only derives
+    /// these from sleep, so a relative "5h ago" misreads as a stale live value. Show which
+    /// night it's from instead: "last night" for this morning's sleep, else the date.
+    private func nightlyWhen(_ kind: MetricKind) -> String? {
+        guard let s = latest[kind] else { return nil }
+        let cal = Calendar.current
+        let days = cal.dateComponents([.day], from: cal.startOfDay(for: s.start),
+                                      to: cal.startOfDay(for: Date())).day ?? 0
+        switch days {
+        case ..<0: return nil            // future timestamp (shouldn't happen) — omit
+        case 0: return "last night"
+        case 1: return "yesterday"
+        default: return Self.nightlyDate.string(from: s.start)
+        }
     }
 }
