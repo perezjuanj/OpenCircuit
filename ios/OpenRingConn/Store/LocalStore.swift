@@ -162,20 +162,40 @@ struct LocalStore {
 
     init(_ context: ModelContext) { self.context = context }
 
-    /// Rebuild the in-memory SyncCursor from persisted rows. Skips the `hk:`-prefixed
-    /// HealthKit-watermark rows (see `pendingHealthSamples`) — they live in the same table
-    /// but track a separate concern and must not pollute the store-ingest cursor.
+    /// The store-ingest cursor rows (live `@Model` objects, so mutating `.last` updates the
+    /// context). Skips the `hk:`-prefixed HealthKit-watermark rows (see `pendingHealthSamples`)
+    /// — they live in the same table but track a separate concern and must not pollute the
+    /// store-ingest cursor.
+    private func storeCursorRows() throws -> [StoredCursor] {
+        try context.fetch(FetchDescriptor<StoredCursor>())
+            .filter { !$0.kindRaw.hasPrefix(Self.healthCursorPrefix) }
+    }
+
+    /// Rebuild the in-memory SyncCursor from persisted rows.
     func loadCursor() throws -> SyncCursor {
-        let rows = try context.fetch(FetchDescriptor<StoredCursor>())
         var map: [String: Date] = [:]
-        for r in rows where !r.kindRaw.hasPrefix(Self.healthCursorPrefix) { map[r.kindRaw] = r.last }
+        for r in try storeCursorRows() { map[r.kindRaw] = r.last }
         return SyncCursor(lastByKind: map)
     }
 
     /// Persist new samples and advance the cursor in one step.
+    ///
+    /// Ordering matters (#22): the cursor advance is STAGED in memory and only the rows that
+    /// actually moved are written, then samples + cursor commit together in a single
+    /// `context.save()`. On a save failure we roll back, so the persisted cursor never moves
+    /// ahead of un-stored samples — they're retried on the next ingest instead of being lost.
     func ingest(_ samples: [QuantitySample]) throws -> [QuantitySample] {
-        var cursor = try loadCursor()
-        let fresh = cursor.selectNew(samples)
+        // Fetch the cursor rows ONCE and reuse them for both the in-memory cursor and the
+        // post-insert upsert — no per-`MetricKind` fetch loop (#33).
+        let rows = try storeCursorRows()
+        var rowByKind: [String: StoredCursor] = [:]
+        for r in rows { rowByKind[r.kindRaw] = r }
+        let cursor = SyncCursor(lastByKind: rowByKind.mapValues(\.last))
+
+        // Stage the advance — don't touch the persisted cursor until the save commits (#22).
+        let (fresh, advanced) = cursor.selectNewStaged(samples)
+        guard !fresh.isEmpty else { return [] }
+
         var cumulativeStates: [MetricKind: CumulativeMetricState] = [:]
         var cumulativeStateDays: [MetricKind: Date] = [:]
         var ingested: [QuantitySample] = []
@@ -198,6 +218,9 @@ struct LocalStore {
                     ? existing
                     : CumulativeMetricState(previousRawValue: existing.previousRawValue, dailyTotal: 0)
             } else {
+                // First sample of this kind in the batch: the ONLY DB hit for cumulative state.
+                // Subsequent samples of the same kind reuse the in-memory `cumulativeStates`
+                // cache above, so no further per-sample lookups occur this ingest (#33).
                 state = try cumulativeState(for: s.kind, before: s.start)
             }
 
@@ -219,12 +242,45 @@ struct LocalStore {
             // every epoch would massively overcount. Deltas sum back to the daily total in Health.
             ingested.append(deltaSample)
         }
-        for kind in MetricKind.allCases {
-            guard let last = cursor.last(kind) else { continue }
-            upsertCursor(kind: kind.rawValue, last: last)
+        // Persist ONLY the kinds whose cursor actually advanced, reusing the rows already
+        // fetched above — no fetch-per-`MetricKind.allCases` loop (#33).
+        for kind in advanced.advancedKinds(since: cursor) {
+            guard let last = advanced.last(kind) else { continue }
+            if let existing = rowByKind[kind.rawValue] {
+                existing.last = last
+            } else {
+                context.insert(StoredCursor(kindRaw: kind.rawValue, last: last))
+            }
         }
-        try context.save()
+        do {
+            // Samples + cursor advance commit atomically. On failure, roll back the staged
+            // inserts and cursor moves so the next ingest re-stores the same samples (#22).
+            try context.save()
+        } catch {
+            context.rollback()
+            throw error
+        }
         return ingested
+    }
+
+    // MARK: Retention (#32)
+    //
+    // Days of raw `StoredSample` history kept on-device. Older epochs are pruned — the data
+    // already lives in Apple Health — while the rollup tables (`StoredSleepSummary` /
+    // `StoredDaily`) are kept long-term so the offline dashboard still shows past nights/days.
+    static let sampleRetentionDays = 30
+
+    /// Delete raw samples older than the retention window; rollup tables are untouched. Meant to
+    /// run occasionally (e.g. once at launch), NOT per write: with no column index a predicate
+    /// delete scans `start`, so running it on every live sample would reintroduce the unbounded
+    /// scan #32 is removing. The cumulative-counter day chain is unaffected (it only reaches back
+    /// to the current day, far inside the window).
+    func pruneExpiredSamples(olderThan days: Int = LocalStore.sampleRetentionDays,
+                             now: Date = Date()) throws {
+        let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: now) ?? now
+        try context.delete(model: StoredSample.self,
+                           where: #Predicate { $0.start < cutoff })
+        try context.save()
     }
 
     /// Stored samples of one kind within `[start, end)`, oldest→newest. Used by the
