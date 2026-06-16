@@ -34,6 +34,18 @@ public struct MotionSample: Sendable, Equatable {
     }
 }
 
+/// One skin-temperature reading on the wear-detection timeline (#41). Skin temp rides
+/// the 0x10/0x87 descriptor (PROTOCOL.md §5.4), not the 0x4c sleep records, so callers
+/// thread the night's persisted temperature samples in alongside the motion timeline.
+public struct TemperatureSample: Sendable, Equatable {
+    public let time: Date
+    public let celsius: Double
+    public init(time: Date, celsius: Double) {
+        self.time = time
+        self.celsius = celsius
+    }
+}
+
 public enum Activity: Equatable, Sendable { case sleep, active }
 
 public struct ActivityPeriod: Equatable, Sendable {
@@ -61,6 +73,13 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// Motion-count stillness threshold for the 0x4c [10:15] channel (🟢 grounded:
     /// recovers the captured night's in-bed window). Baseline `01` = still.
     static let motionStillThreshold: Float = 2
+
+    /// Minimum skin temperature for the ring to count as WORN (🟡 heuristic, NOT yet
+    /// ground-truthed — validate against a known charging-night capture). A worn Gen-2
+    /// reads ~30–34 °C; off-wrist / on the charger it falls toward room ambient (~20–24 °C).
+    /// 28 °C is a conservative midpoint. Used ONLY to exclude cold "still" blocks from
+    /// sleep (#41), never to add sleep — so a miss costs at worst an unfiltered charger block.
+    public static let wornMinTemperatureC: Double = 28.0
 
     private struct Temp { var activity: Activity; var start: Date; var end: Date }
 
@@ -101,6 +120,31 @@ public struct ActivityPeriod: Equatable, Sendable {
         guard history.count >= 2 else { return [] }
         return detect(times: history.map(\.time), deltas: history.map(\.movement),
                       stillThreshold: motionStillThreshold)
+    }
+
+    /// Sleep/Active detection (motion) with a WEAR GATE (#41): any detected `.sleep` block
+    /// whose median skin temperature indicates the ring was off-wrist / on the charger is
+    /// reclassified `.active`, so a perfectly still ring on the nightstand can't masquerade
+    /// as a night of sleep. A `.sleep` block with no temperature coverage is left as
+    /// detected — absence of data is not evidence of being unworn. `temperatureSamples`
+    /// may be unordered and sparse; only readings inside a block are considered.
+    public static func detectFromMotion(_ history: [MotionSample],
+                                        temperatureSamples: [TemperatureSample],
+                                        wornMinC: Double = wornMinTemperatureC) -> [ActivityPeriod] {
+        let periods = detectFromMotion(history)
+        guard !temperatureSamples.isEmpty else { return periods }
+        return periods.map { p in
+            guard p.activity == .sleep else { return p }
+            let inside = temperatureSamples
+                .filter { $0.time >= p.start && $0.time <= p.end }
+                .map(\.celsius)
+                .sorted()
+            guard !inside.isEmpty else { return p }   // no coverage → trust the motion verdict
+            let median = inside[inside.count / 2]
+            return median < wornMinC
+                ? ActivityPeriod(activity: .active, start: p.start, end: p.end)
+                : p
+        }
     }
 
     /// Shared core: classify a stillness-magnitude timeline into Sleep/Active runs.

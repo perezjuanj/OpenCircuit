@@ -1,10 +1,10 @@
-// Sleep score — ported from openwhoop-algos/src/sleep.rs `sleep_score`.
+// Sleep score — adapted from openwhoop-algos/src/sleep.rs `sleep_score`.
 // Device-agnostic: a function of sleep duration only. 0…100.
 //
-// Faithful to openwhoop, including its INTEGER-division behavior: the ratio
-// duration / 8h is computed in whole units, so e.g. 4h → 0, 8h → 100, and it is
-// clamped to 0…100. (This is openwhoop's current scoring; a finer model is a
-// future Phase 5 refinement, flagged here rather than silently "fixed".)
+// openwhoop computes `duration / 8h` in INTEGER units, which collapses the score to a
+// 0-or-100 step function (anything < 8h → 0, ≥ 8h → 100) — useless as a daily metric:
+// a 7h45m night scores 0 (#28). We compute the ratio in floating point so the score
+// grades linearly with duration and clamps at the 8h ideal: 4h → 50, 6h → 75, 8h+ → 100.
 
 import Foundation
 
@@ -14,8 +14,8 @@ public enum SleepScore {
 
     /// Score from a sleep duration in seconds.
     public static func score(durationSeconds: Int) -> Double {
-        let ratio = durationSeconds / idealDurationSeconds   // integer division, as openwhoop
-        return min(max(Double(ratio) * 100.0, 0.0), 100.0)
+        let ratio = Double(durationSeconds) / Double(idealDurationSeconds)   // #28: graded, not a step
+        return min(max(ratio * 100.0, 0.0), 100.0)
     }
 
     /// Convenience for a start/end span.

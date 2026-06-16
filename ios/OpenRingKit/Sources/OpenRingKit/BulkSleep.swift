@@ -54,15 +54,26 @@ public struct BulkRecord: Equatable {
     }
 
     public var layout: Layout {
-        // A sleep-vitals epoch carries SpO2 in [8] even when motion is at baseline and
-        // the [15:22] payload is zero (common in deep sleep) — so check [8] FIRST, else
-        // those real epochs would be mistaken for the idle/unworn template and their
-        // HR/SpO2 dropped.
-        if (0x57...0x63).contains(raw[8]) { return .sleepVitals }
-        if raw[10..<15] == [1, 1, 1, 1, 1] && raw[15..<22] == [0, 0, 0, 0, 0, 0, 0] {
+        // Decide layout from STRUCTURE, not the SpO2 *value* (#39). The old code returned
+        // .sleepVitals only when [8] ∈ 0x57…0x63 (87–99 %), so a genuine desaturation
+        // (< 87 %, the clinically interesting apnea case) failed that gate, fell through to
+        // .activity, and the WHOLE epoch's HR/HRV/SpO2 was discarded. Decide instead by the
+        // two STRUCTURAL signatures and treat anything else as sleep-vitals:
+        //   • idle/unworn template (🟢 §5.3): [4:8]=05 00 0c 00, [9]=0a, motion 01×5,
+        //     [15:22]=00×7. The FULL template matters: a deep-sleep epoch is also still with
+        //     a zero [15:22] payload, but carries real HR/HRV in [4:8] — so matching only
+        //     "still + zero payload" would mistake deep sleep for idle and drop its vitals.
+        //   • activity/awake epoch (🟢 §5.3): [8] subtype tag 0x12 / 0x13.
+        // A low-SpO2 sleep epoch matches neither → .sleepVitals, so its vitals survive. The
+        // emitted SpO2 is range-guarded in `spo2Percent`, but the band no longer gates layout.
+        if raw[4] == 0x05 && raw[5] == 0x00 && raw[6] == 0x0c && raw[7] == 0x00
+            && raw[9] == 0x0a
+            && raw[10..<15] == [1, 1, 1, 1, 1]
+            && raw[15..<22] == [0, 0, 0, 0, 0, 0, 0] {
             return .idle
         }
-        return .activity
+        if raw[8] == 0x12 || raw[8] == 0x13 { return .activity }
+        return .sleepVitals
     }
 
     /// Heart rate in bpm — `[4]` on a sleep-vitals epoch (🟢). nil otherwise / when 0.
@@ -78,10 +89,14 @@ public struct BulkRecord: Equatable {
         return Int(raw[5])
     }
 
-    /// SpO2 percent — `[8]` on a sleep-vitals epoch (🟢, range 87…99 observed). nil otherwise.
+    /// SpO2 percent — `[8]` on a sleep-vitals epoch (🟢). nil otherwise. Guarded to a
+    /// clinically plausible band (70…100): unlike the old layout gate this admits genuine
+    /// desaturations below the healthy 87…99 range (#39) while rejecting noise. The HR/HRV
+    /// of a sub-70 epoch still decode — only the implausible SpO2 reading is dropped.
     public var spo2Percent: Int? {
         guard layout == .sleepVitals else { return nil }
-        return Int(raw[8])
+        let v = Int(raw[8])
+        return (70...100).contains(v) ? v : nil
     }
 
     /// Respiratory rate in breaths/min — `[7]` on a sleep-vitals epoch, scaled ÷8 (🟢,
@@ -152,11 +167,15 @@ public enum BulkSleep {
 
     /// The main sleep block (in-bed window) detected from the motion channel, or nil.
     /// Pass `within:` to bound detection to the user's scheduled sleep window (optional).
+    /// Pass `temperatures:` (the night's persisted skin-temp samples) to exclude
+    /// off-wrist / charging blocks from sleep (#41); empty = motion-only (unchanged).
     public static func mainSleep(from records: [BulkRecord],
                                  within hint: DateInterval? = nil,
+                                 temperatures: [TemperatureSample] = [],
                                  epoch: Int = Command.syncEpoch) -> ActivityPeriod? {
         let scoped = Self.records(records, within: hint, epoch: epoch)
-        var periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch))
+        var periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
+                                                      temperatureSamples: temperatures)
         return ActivityPeriod.findSleep(&periods)
     }
 
@@ -164,11 +183,14 @@ public enum BulkSleep {
     /// `asleepCore`/`awake` sub-segments from the stillness detection. Finer
     /// Light/Deep/REM staging needs an HR-based model (TODO) — the ring doesn't
     /// send a hypnogram (PROTOCOL.md §5.3), so all "asleep" is reported as core.
+    /// Pass `temperatures:` to drop off-wrist / charging blocks from the night (#41).
     public static func sleepSegments(from records: [BulkRecord],
                                      within hint: DateInterval? = nil,
+                                     temperatures: [TemperatureSample] = [],
                                      epoch: Int = Command.syncEpoch) -> [SleepSegment] {
         let scoped = Self.records(records, within: hint, epoch: epoch)
-        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch))
+        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
+                                                      temperatureSamples: temperatures)
         // Main in-bed block = longest sleep period over the minimum duration (1 h).
         guard let block = periods
             .filter({ $0.activity == .sleep })

@@ -105,8 +105,11 @@ final class AnalyticsTests: XCTestCase {
     // MARK: Sleep score (sleep.rs)
 
     func testSleepScore() {
+        // #28: graded (floating-point ratio), not a 0-or-100 step function.
         XCTAssertEqual(SleepScore.score(durationSeconds: 8 * 3600), 100.0)
-        XCTAssertEqual(SleepScore.score(durationSeconds: 4 * 3600), 0.0)  // integer ratio
-        XCTAssertEqual(SleepScore.score(durationSeconds: 24 * 3600), 100.0)  // clamped
+        XCTAssertEqual(SleepScore.score(durationSeconds: 6 * 3600), 75.0)
+        XCTAssertEqual(SleepScore.score(durationSeconds: 4 * 3600), 50.0)
+        XCTAssertEqual(SleepScore.score(durationSeconds: 0), 0.0)
+        XCTAssertEqual(SleepScore.score(durationSeconds: 24 * 3600), 100.0)  // clamped at the ideal
     }
 }

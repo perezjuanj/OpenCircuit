@@ -173,4 +173,29 @@ final class BulkSleepTests: XCTestCase {
         // Stream split drops a trailing partial chunk.
         XCTAssertEqual(BulkSleep.records(fromStream: hex(deepSleepRec) + [0xff, 0xff]).count, 1)
     }
+
+    // MARK: #39 — desaturations keep their vitals (layout no longer gated on the SpO2 value)
+
+    /// A genuine desaturation epoch (deepSleepRec with SpO2 byte 0x62→0x50 = 80 %, below the
+    /// old 87…99 gate). It must still decode as sleep-vitals so HR/HRV/SpO2 survive — the old
+    /// gate dropped the WHOLE epoch. The HR/HRV bytes are unchanged from the proven fixture.
+    func testLowSpO2EpochKeepsVitals() {
+        let r = BulkRecord(hex("0c22d5bf444d057a500a01010101012aa0000090000004"))!
+        XCTAssertEqual(r.layout, .sleepVitals)
+        XCTAssertEqual(r.heartRate, 68)
+        XCTAssertEqual(r.hrvRMSSD, 77)
+        XCTAssertEqual(r.spo2Percent, 80, "80 % is a plausible desaturation (≥70) — emitted")
+        let kinds = Set(BulkSleep.samples(from: [r]).map(\.kind))
+        XCTAssertTrue(kinds.isSuperset(of: [.heartRate, .hrvSDNN, .spo2]), "all vitals emitted")
+    }
+
+    /// An implausible SpO2 (< 70) is range-guarded out of the emitted sample, but the epoch
+    /// stays sleep-vitals so its HR/HRV are not lost with it (SpO2 byte 0x62→0x30 = 48 %).
+    func testImplausibleSpO2GuardedButHRKept() {
+        let r = BulkRecord(hex("0c22d5bf444d057a300a01010101012aa0000090000004"))!
+        XCTAssertEqual(r.layout, .sleepVitals)
+        XCTAssertNil(r.spo2Percent, "48 % is implausible → dropped")
+        XCTAssertEqual(r.heartRate, 68, "but HR survives")
+        XCTAssertEqual(r.hrvRMSSD, 77)
+    }
 }

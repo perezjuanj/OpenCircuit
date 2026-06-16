@@ -58,4 +58,36 @@ final class SleepDetectionTests: XCTestCase {
         XCTAssertTrue(ActivityPeriod(activity: .active, start: base, end: base.addingTimeInterval(3600)).isActive)
         XCTAssertFalse(ActivityPeriod(activity: .sleep, start: base, end: base.addingTimeInterval(3600)).isActive)
     }
+
+    // MARK: #41 — wear / charging gate
+
+    /// A 4 h still motion block (would detect as sleep) sampled every 5 min.
+    private func stillNight() -> [MotionSample] {
+        (0..<48).map { MotionSample(time: base.addingTimeInterval(Double($0) * 5 * 60), movement: 1) }
+    }
+    private func temps(_ celsius: Double) -> [TemperatureSample] {
+        (0..<48).map { TemperatureSample(time: base.addingTimeInterval(Double($0) * 5 * 60), celsius: celsius) }
+    }
+
+    func testWearGateReclassifiesColdStillBlockAsActive() {
+        let motion = stillNight()
+        XCTAssertEqual(ActivityPeriod.detectFromMotion(motion).first?.activity, .sleep,
+                       "motion-only: a still block reads as sleep")
+        // Same motion, but skin temp ~22 °C (off-wrist / charging) -> no sleep survives.
+        let gated = ActivityPeriod.detectFromMotion(motion, temperatureSamples: temps(22))
+        XCTAssertFalse(gated.contains { $0.activity == .sleep },
+                       "cold (unworn) still block must not count as sleep")
+    }
+
+    func testWearGateKeepsWarmStillBlockAsSleep() {
+        let gated = ActivityPeriod.detectFromMotion(stillNight(), temperatureSamples: temps(32))
+        XCTAssertEqual(gated.first?.activity, .sleep, "worn (32 °C) still block stays sleep")
+    }
+
+    func testWearGateNoTemperatureLeavesDetectionUnchanged() {
+        let motion = stillNight()
+        XCTAssertEqual(ActivityPeriod.detectFromMotion(motion, temperatureSamples: []),
+                       ActivityPeriod.detectFromMotion(motion),
+                       "no temperature coverage -> identical to motion-only (absence ≠ unworn)")
+    }
 }
