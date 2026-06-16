@@ -27,12 +27,17 @@ targets:
         NSHealthUpdateUsageDescription: "OpenRingConn writes your ring's metrics into Apple Health."
         # BLE (Phase 3) — required to connect to the ring.
         NSBluetoothAlwaysUsageDescription: "OpenRingConn connects to your RingConn ring over Bluetooth Low Energy."
-        # Background sync while suspended (docs/HANDOFF_MACOS_IOS.md).
+        # Background sync while suspended (docs/HANDOFF_MACOS_IOS.md). `processing` enables the
+        # BGProcessingTask (longer runtime) so the optical-HR poll can clear its ~60 s warm-up in
+        # the background (#45/#50 follow-up). iOS still runs it at its discretion, so this is
+        # best-effort — not a guarantee of daytime background HR.
         UIBackgroundModes:
           - bluetooth-central
           - fetch
+          - processing
         BGTaskSchedulerPermittedIdentifiers:
           - com.dreamality.openringconn.bgrefresh
+          - com.dreamality.openringconn.bgprocessing
     # HealthKit entitlement enabled (2026-06-15) — signed under the paid Dreamality team
     # (DEVELOPMENT_TEAM below). The App ID com.dreamality.openringconn carries the HealthKit
     # capability in that account; automatic signing registers it on first build.

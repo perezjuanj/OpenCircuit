@@ -10,6 +10,13 @@ struct ContentView: View {
     @State private var lastWrite: String?
     @State private var showDebug = false
 
+    /// Freshness timestamps mirrored from the UserDefaults-backed observability store (#44).
+    /// Held in @State because UserDefaults writes (from the background task / a flush) don't
+    /// publish to SwiftUI — we re-read them on the lifecycle hooks below.
+    @State private var lastSyncAt: Date?
+    @State private var lastHealthWriteAt: Date?
+    private let observability = ObservabilityStore()
+
     /// Armed when a foreground activation wants a one-shot history sync, fired once the
     /// link is `ready`. A user "Scan & connect" never sets this, so the auto-refresh can't
     /// fire on top of a manual connect.
@@ -61,13 +68,19 @@ struct ContentView: View {
                 // Runs in `.task` (after first frame), never `.onAppear` — a synchronous store
                 // read there once blocked the launch render into a black screen. #14
                 healthAuthorized = health.isShareAuthorized
+                if healthAuthorized { observability.markHealthEverAuthorized() }
+                refreshObservability()
                 if healthAuthorized { flushHealth() }
             }
             // Foreground auto-refresh: reconnect to the last-known ring and pull fresh data
             // when the app becomes active, so opening it after a while shows updated vitals
             // without a manual Scan/Sync.
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active { handleForegroundActivation() }
+                if phase == .active {
+                    handleForegroundActivation()
+                    refreshObservability()        // pick up anything a background run wrote
+                    evaluateForegroundAlerts()    // live battery + Health-auth check (#44)
+                }
             }
             // Fire the armed one-shot sync the moment the (re)connected link is ready.
             .onChange(of: session?.ready) { _, ready in
@@ -78,7 +91,10 @@ struct ContentView: View {
             // pending to Health. Each metric is watermark-gated, so this never double-writes
             // and is a no-op until the user has authorized Health.
             .onChange(of: session?.syncing) { _, syncing in
-                if syncing == false { flushHealth() }
+                if syncing == false {
+                    recordForegroundSync()
+                    flushHealth()
+                }
             }
             .onChange(of: session?.monitoring) { _, monitoring in
                 if monitoring == false { flushHealth() }
@@ -115,6 +131,37 @@ struct ContentView: View {
         pendingAutoSync = false
         lastForegroundSync = Date()
         session.syncHistory()
+    }
+
+    // MARK: Observability (#44)
+
+    /// Re-read the persisted freshness timestamps into @State (UserDefaults writes don't publish
+    /// to SwiftUI on their own).
+    private func refreshObservability() {
+        lastSyncAt = observability.lastSuccessfulSync
+        lastHealthWriteAt = observability.lastHealthWrite
+    }
+
+    /// A foreground history sync just finished — record its outcome so "Last successful sync"
+    /// reflects manual/auto foreground refreshes too, not only background runs. Success = the
+    /// session actually received frames on this connection.
+    private func recordForegroundSync() {
+        let gotData = session?.lastFrameAt != nil || (session?.historySamples.isEmpty == false)
+        observability.recordSyncOutcome(kind: .foreground, success: gotData,
+                                        detail: gotData ? "synced from ring" : "no frames received")
+        refreshObservability()
+    }
+
+    /// Foreground alert evaluation with a LIVE battery reading (the background path can't see
+    /// battery once its session is torn down) and a fresh Health-auth probe (so a revocation made
+    /// in Settings while we were away is caught). Latches "ever authorized" so an auth-lost alert
+    /// can be told apart from a user who simply never opted into Health.
+    private func evaluateForegroundAlerts() {
+        let authorized = health.isShareAuthorized
+        healthAuthorized = authorized
+        if authorized { observability.markHealthEverAuthorized() }
+        let battery = session?.batteryPercent
+        Task { await LocalAlertCenter().evaluate(batteryPercent: battery, healthAuthorized: authorized) }
     }
 
     // MARK: Connection
@@ -227,6 +274,32 @@ struct ContentView: View {
 
     // MARK: Sync + Health
 
+    /// Prominent "is this thing actually working?" line (#44): when we last pulled from the ring
+    /// and when we last wrote to Apple Health, tapping through to the full background-activity log.
+    private var freshnessRow: some View {
+        NavigationLink {
+            ActivityLogView()
+        } label: {
+            HStack(spacing: 16) {
+                freshnessStat("Last sync", lastSyncAt)
+                Divider().frame(height: 30)
+                freshnessStat("Health write", lastHealthWriteAt)
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func freshnessStat(_ label: String, _ date: Date?) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Text(date.map { Self.rel.localizedString(for: $0, relativeTo: Date()) } ?? "never")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(date == nil ? .secondary : .primary)
+        }
+    }
+
     private var syncCard: some View {
         card {
             HStack {
@@ -234,6 +307,8 @@ struct ContentView: View {
                 Spacer()
                 if session?.syncing == true { ProgressView() }
             }
+            freshnessRow
+            Divider()
             Button {
                 session?.syncHistory()
             } label: {
@@ -301,6 +376,7 @@ struct ContentView: View {
                     Task {
                         try? await health.requestAuthorization()
                         healthAuthorized = health.isShareAuthorized
+                        if healthAuthorized { observability.markHealthEverAuthorized() }
                         flushHealth()   // backfill everything already in the store
                     }
                 } label: {
@@ -396,6 +472,8 @@ struct ContentView: View {
         Task {
             let r = await health.flushToHealth(store: store, sleepSegments: segments)
             if r.wroteAnything {
+                observability.recordHealthWrite()
+                refreshObservability()
                 lastWrite = "Synced to Health: \(r.samples) samples"
                     + (r.sleepSegments > 0 ? ", \(r.sleepSegments) sleep segs" : "")
                     + (r.steps > 0 ? ", \(r.steps) steps" : "")
