@@ -1,171 +1,266 @@
-// BulkSleep.swift — decoder for 0x4c bulk activity/sleep page records.
+// Bulk activity/sleep decode — the `0x4c` history stream (docs/PROTOCOL.md §5.3).
 //
-// PROTOCOL.md §5.3 (FW FR02.018, 🟢 confirmed structure):
-//   Page:   [0]=0x4c · [1]=0x00 · [2]=remaining-record countdown · body=6×23-byte records · [last]=XOR
-//   Record: [0]=0x0c · [1:4]=BE counter (+0x96/rec in cursor space) · [8]=subtype tag (idle: 0x12/0x13)
-//           · [10:15]=baseline 0x01×5 · [15:22]=7-byte payload (zero idle, dense worn) · [22]=flags
-//   Idle template (🟢): bytes[4:8]=05 00 0c 00, bytes[9]=0x0a, bytes[10:15]=0x01×5, bytes[15:22]=0x00×7
+// Confirmed on FW FR02.018 by aligning captures/sleep_sync_btsnoop.log
+// (2026-06-13 overnight sync) to the RingConn app's own readout for that night
+// (avg HR 68 / HRV 65 ms / SpO2 98 %, low 93 % ~02:30–03:00). The decisive anchor:
+// the decoded SpO2 low-cluster lands at 02:32–03:07, matching the app exactly.
 //
-// Payload semantics (HR, HRV, SpO2 byte positions) are 🔴 unconfirmed — ground-truth
-// capture needed (PROTOCOL.md §6, item 2: "one fully app-logged night"). Nothing
-// here is invented; fields are scaffolded with explicit 🔴 tags and conservative
-// validity guards until captures decode them.
+// A 0x4c page is `[0x4c][0x00][countdown][N × 23-byte record][xor]`. The counter
+// is seconds since `Command.syncEpoch`; records step +0x96 = 150 s, so each record
+// is one 2.5-min epoch. Records align to page boundaries (each page body is a whole
+// number of records — they do not span pages).
 //
-// Fix (#39): layout is determined by the confirmed idle-template check, NOT by
-// whether bytes[9] falls in a SpO2 range. The old approach (checking 87–99 as the
-// layout gate) would silently drop any epoch with SpO2 < 87 — exactly the
-// desaturation events clinically important for sleep-apnea screening.
+// Two record layouts, keyed on byte [8]:
+//   • Sleep-vitals epoch ([8] in 0x57…0x63): [4]=HR bpm 🟢, [5]=HRV/RMSSD ms 🟢,
+//     [8]=SpO2 % 🟢, [10:15]=motion. [6]/[7] unresolved 🟡.
+//   • Activity/awake epoch ([8]=0x12/0x13): activity payload in [15:22] 🟡.
+// Respiratory rate + skin temp are NOT per-epoch (derived/summary). Sleep stages are
+// not on the wire — compute them in Swift (Analytics/SleepDetection), per Phase 5.
+//
+// #39 fix: layout is now keyed on the confirmed 🟢 idle-template check first, NOT
+// on whether raw[8] falls in a SpO2 range. The old SpO2-range gate (0x57–0x63)
+// silently dropped any epoch with SpO2 < 87 — exactly the desaturation events
+// clinically important for sleep-apnea screening. With the idle template check first,
+// every non-idle epoch is provisionally sleepVitals. The activity discriminator
+// (raw[8] == 0x12/0x13 vs SpO2) is 🔴 pending a daytime-activity capture.
+//
+// Do not add behavior that isn't in PROTOCOL.md. New facts go into the spec (and
+// desktop/decode_bulk.py) first, then get ported here.
 
 import Foundation
 
-// MARK: - Layout
+/// One 23-byte record from a `0x4c` bulk activity/sleep page (PROTOCOL.md §5.3).
+public struct BulkRecord: Equatable {
+    /// Bytes per record (🟢).
+    public static let length = 23
+    /// Counter step between consecutive records: 0x96 = 150 s (🟢).
+    public static let epochSeconds = 150
 
-/// Layout of a single 0x4c record.
-/// Discrimination strategy: idle is detected via the confirmed 🟢 idle template;
-/// everything else is provisionally sleepVitals until activityPayload can be
-/// distinguished (pending a capture that isolates activity epochs, 🔴).
-public enum BulkLayout: Equatable, Sendable {
-    /// Unworn / no measurement. Template confirmed 🟢 (PROTOCOL.md §5.3).
-    case idle
-    /// Worn + sleep vitals (HR, HRV, SpO2). Byte positions within payload 🔴.
-    case sleepVitals
-    /// Worn + activity epoch. Not yet distinguishable from sleepVitals (🔴, pending capture).
-    case activityPayload
-    /// Corrupt / length mismatch.
-    case unknown
-}
+    /// The raw 23 bytes.
+    public let raw: [UInt8]
 
-// MARK: - BulkRecord
-
-/// One decoded 23-byte record from a 0x4c bulk sleep/activity page.
-public struct BulkRecord: Equatable, Sendable {
-
-    /// The raw 23-byte record exactly as received (including the 0x0c delimiter).
-    public let bytes: [UInt8]
-
-    /// Classified layout for this record.
-    public let layout: BulkLayout
-
-    // MARK: Initialiser
-
-    /// Parse a 23-byte 0x4c record. Returns nil if the length or delimiter is wrong.
     public init?(_ bytes: [UInt8]) {
-        guard bytes.count == 23, bytes[0] == 0x0c else { return nil }
-        self.bytes = bytes
-        self.layout = BulkRecord.detectLayout(bytes)
+        guard bytes.count == Self.length else { return nil }
+        self.raw = bytes
     }
 
-    // MARK: Layout detection
+    /// `[0:4]` big-endian counter — seconds since `Command.syncEpoch`.
+    public var counter: UInt32 {
+        (UInt32(raw[0]) << 24) | (UInt32(raw[1]) << 16) | (UInt32(raw[2]) << 8) | UInt32(raw[3])
+    }
 
-    /// Determine layout using the idle-template check (🟢), NOT the SpO2 value (#39 fix).
-    private static func detectLayout(_ b: [UInt8]) -> BulkLayout {
-        guard b.count == 23 else { return .unknown }
+    /// Wall-clock time of this epoch (counter + epoch offset).
+    public func date(epoch: Int = Command.syncEpoch) -> Date {
+        Date(timeIntervalSince1970: TimeInterval(Int(counter) + epoch))
+    }
 
-        if isIdleTemplate(b) { return .idle }
+    public enum Layout: Equatable {
+        case idle          // unworn / no measurement: confirmed idle template (🟢)
+        case sleepVitals   // worn epoch; HR/HRV/SpO2 live in [4:9] (🟢 byte positions)
+        /// Reserved for a future daytime-activity capture to distinguish awake/activity
+        /// epochs from sleep-vitals ones. Currently not returned by `layout` (🔴 pending
+        /// PROTOCOL.md §6 — a daytime sync that isolates activity records).
+        case activity
+    }
 
-        // TODO(#39 / 🔴): distinguish .activityPayload from .sleepVitals once a
-        // daytime-activity capture decodes the discriminating bytes. For now every
-        // non-idle record is treated as sleepVitals so desaturation epochs are not
-        // silently discarded.
+    /// Layout classification. (#39 fix)
+    ///
+    /// The idle template is checked FIRST using the confirmed 🟢 byte pattern
+    /// (PROTOCOL.md §5.3). Everything else is provisionally `.sleepVitals` so that
+    /// epochs with SpO2 < 87 (severe desaturation, apnea) are NOT silently dropped.
+    ///
+    /// The previous implementation keyed layout on `raw[8]` being in the SpO2 range
+    /// 0x57–0x63 (87–99). That was wrong: a 75 % epoch during apnea has `raw[8]` =
+    /// 0x4B which fell through to `.activity` and was excluded from HealthKit writes.
+    /// TODO(🔴): distinguish `.activity` from `.sleepVitals` for non-idle epochs once
+    /// a daytime-activity capture decodes the discriminating bytes.
+    public var layout: Layout {
+        // Idle template (🟢, PROTOCOL.md §5.3):
+        //   raw[4:8]=05 00 0c 00, raw[9]=0x0a,
+        //   raw[10:15]=01×5, raw[15:22]=00×7.
+        if raw[4] == 0x05 && raw[5] == 0x00 && raw[6] == 0x0c && raw[7] == 0x00
+            && raw[9] == 0x0a
+            && raw[10..<15] == [1, 1, 1, 1, 1]
+            && raw[15..<22] == [0, 0, 0, 0, 0, 0, 0] { return .idle }
+        // Non-idle: provisionally sleepVitals until a daytime capture confirms a
+        // discriminator. This is safer than dropping desaturation epochs (the pre-#39
+        // behaviour when SpO2 fell below 87 %).
         return .sleepVitals
     }
 
-    /// Idle-template check. All conditions confirmed 🟢 (PROTOCOL.md §5.3).
-    ///
-    /// Template: bytes[4:8]=05 00 0c 00, bytes[9]=0x0a,
-    ///           bytes[10:15]=0x01×5, bytes[15:22]=0x00×7.
-    ///
-    /// Subtype tag bytes[8]=0x12 or 0x13 is characteristic of idle but is NOT
-    /// included as a strict gate here — the payload-zero check is sufficient and
-    /// more robust (the tag could add a future variant without breaking detection).
-    static func isIdleTemplate(_ b: [UInt8]) -> Bool {
-        guard b.count == 23 else { return false }
-        // bytes[4:8] = 05 00 0c 00
-        guard b[4] == 0x05, b[5] == 0x00, b[6] == 0x0c, b[7] == 0x00 else { return false }
-        // bytes[9] = 0x0a
-        guard b[9] == 0x0a else { return false }
-        // bytes[10:15] = 0x01×5
-        guard b[10] == 0x01, b[11] == 0x01, b[12] == 0x01, b[13] == 0x01, b[14] == 0x01 else { return false }
-        // bytes[15:22] = 0x00×7
-        for i in 15..<22 {
-            guard b[i] == 0x00 else { return false }
-        }
-        return true
+    /// Heart rate in bpm — `[4]` on a sleep-vitals epoch (🟢). nil otherwise / when 0.
+    public var heartRate: Int? {
+        guard layout == .sleepVitals, raw[4] > 0 else { return nil }
+        return Int(raw[4])
     }
 
-    // MARK: Metric properties (layout-gated)
-
-    // ⚠️ All byte positions below are 🔴 provisional. The idle template at bytes[9]=0x0a
-    // vs a non-zero value when worn suggests bytes[9] holds SpO2 (fits 87–99 for healthy
-    // sleep, 70–99 pathological). HR and HRV positions in the 7-byte payload [15:22]
-    // are entirely unconfirmed. Treat these as scaffolding until §6 item 2 is captured.
-
-    /// Heart rate in bpm, or nil if not sleepVitals or byte is implausible.
-    /// 🔴 Byte position provisional: bytes[15] (first byte of the 7-B payload).
-    public var heartRateBPM: Int? {
-        guard layout == .sleepVitals else { return nil }
-        let bpm = Int(bytes[15])
-        return (30...250).contains(bpm) ? bpm : nil   // plausible HR band
-    }
-
-    /// HRV (RMSSD, ms), or nil if not sleepVitals or byte is implausible.
-    /// 🔴 Byte position provisional: bytes[16] (second byte of the 7-B payload).
+    /// HRV in ms — `[5]` on a sleep-vitals epoch (🟢). The ring reports RMSSD; HealthKit
+    /// only has SDNN (different statistic, same unit) — see HEALTHKIT_MAPPING.md.
     public var hrvRMSSD: Int? {
-        guard layout == .sleepVitals else { return nil }
-        let ms = Int(bytes[16])
-        return ms > 0 ? ms : nil
+        guard layout == .sleepVitals, raw[5] > 0 else { return nil }
+        return Int(raw[5])
     }
 
-    /// SpO2 in whole-number percent (70–100), or nil if not sleepVitals.
+    /// SpO2 percent — `[8]` on a sleep-vitals epoch (🟢, range 87…99 observed). nil otherwise.
     ///
-    /// 🟡 Byte position: bytes[9] — idle template has 0x0a (10) here; non-idle worn
-    /// records have values consistent with SpO2 (PROTOCOL.md §5.3 idle contrast).
-    ///
-    /// #39 fix: this property's value is GUARDED to 70–100 but the validity band
-    /// does NOT gate layout detection. A 75% SpO2 epoch (apnea event) is still
-    /// recognised as sleepVitals by detectLayout() and returns SpO2 here.
+    /// The value is guarded to the physiologically plausible 70–100 % band. Values below
+    /// 70 are sensor artefacts (ring not settled); above 100 is impossible. This guard
+    /// does NOT affect layout detection (#39): a 75 % epoch is still `.sleepVitals` so the
+    /// epoch's HR/HRV data are not discarded along with the implausible SpO2.
     public var spo2Percent: Int? {
         guard layout == .sleepVitals else { return nil }
-        let raw = Int(bytes[9])
-        // Guard to physiologically plausible SpO2 range (70–100).
-        // Lower bound 70 catches severe desaturation; HealthKit accepts 0…1 fraction
-        // so the caller divides by 100 before writing. Values below 70 or above 100
-        // are sensor artefacts (ring not settled) — return nil rather than a bogus value.
-        return (70...100).contains(raw) ? raw : nil
+        let pct = Int(raw[8])
+        // HealthKit accepts 0…1 fraction; callers divide by 100. Lower bound 70 catches
+        // severe desaturation without rejecting genuine apnea events.
+        return (70...100).contains(pct) ? pct : nil
     }
 
-    // MARK: Sync cursor
-
-    /// Big-endian 3-byte counter from bytes[1:4], in the 0x96-step cursor space.
-    /// 🟢 Structure confirmed; wall-clock mapping requires a §6 item 3 capture.
-    public var counter: UInt32 {
-        UInt32(bytes[1]) << 16 | UInt32(bytes[2]) << 8 | UInt32(bytes[3])
+    /// Respiratory rate in breaths/min — `[7]` on a sleep-vitals epoch, scaled ÷8 (🟢,
+    /// ground-truthed 2026-06-15): per-epoch `[7]/8` matches the RingConn app's nightly
+    /// average 15.1 and its low/high 14.5–16.1 at the p5–p95 of the asleep epochs. (The
+    /// raw field is RR×8; exact divisor ≈8.07, but 8 is the natural 1/8-brpm fixed point.)
+    public var respiratoryRate: Double? {
+        guard layout == .sleepVitals, raw[7] > 0 else { return nil }
+        return Double(raw[7]) / 8.0
     }
+
+    /// `[10:15]` — 5 per-30 s motion/activity counts (🟢 role). `01` baseline = still.
+    public var motion: [UInt8] { Array(raw[10..<15]) }
 }
 
-// MARK: - Page parsing
+/// Reassembles `0x4c` pages into records and maps sleep-vitals epochs to samples.
+public enum BulkSleep {
 
-/// Parse a complete 0x4c page payload (after the 3-byte page header) into records.
-///
-/// `pageBody` should be the bytes between the page header ([0]=0x4c [1]=0x00 [2]=countdown)
-/// and the trailing XOR byte. Each record is 23 bytes; incomplete trailing bytes are ignored.
-///
-/// ⚠️ Charging / off-wrist note (#41):
-/// Idle records dominate when the ring is on the charger — the ring reads as perfectly
-/// still in the gravity stream AND produces idle-layout 0x4c records with zero payload.
-/// Motion-based sleep detection must be gated on wear state (temperature heuristic in
-/// SleepDetection.swift) so charger epochs are not classified as sleep. The per-epoch
-/// idle layout here is a secondary signal; the primary filter lives in WearDetection.
-/// TODO(#41 protocol): also gate on the 0x10/0x87 descriptor charging-flag byte once
-/// the BLE RingSession lane investigates the 0x10/0x87 [2] state enum (PROTOCOL.md §5.4).
-public func parseBulkSleepPage(_ pageBody: [UInt8]) -> [BulkRecord] {
-    let recordSize = 23
-    var records: [BulkRecord] = []
-    var offset = 0
-    while offset + recordSize <= pageBody.count {
-        let slice = Array(pageBody[offset..<(offset + recordSize)])
-        if let rec = BulkRecord(slice) { records.append(rec) }
-        offset += recordSize
+    /// Records carried by ONE 0x4c page frame (full notification incl. opcode + XOR).
+    /// Returns [] if the XOR trailer is invalid or the opcode isn't 0x4c.
+    public static func records(fromPage frame: [UInt8]) -> [BulkRecord] {
+        guard let p = Frame.parse(frame), p.opcode == Frame.responseID(Opcode.page4C) else { return [] }
+        // body = [00][countdown][records…]; records begin at body index 2.
+        return records(fromStream: Array(p.body.dropFirst(2)))
     }
-    return records
+
+    /// Split a raw record stream (no page header/trailer) into whole 23-byte records.
+    /// A trailing partial chunk is dropped.
+    public static func records(fromStream bytes: [UInt8]) -> [BulkRecord] {
+        guard bytes.count >= BulkRecord.length else { return [] }
+        return stride(from: 0, through: bytes.count - BulkRecord.length, by: BulkRecord.length)
+            .compactMap { BulkRecord(Array(bytes[$0 ..< $0 + BulkRecord.length])) }
+    }
+
+    /// Reassemble a multi-page bulk transfer into one ordered record list.
+    public static func records(fromPages frames: [[UInt8]]) -> [BulkRecord] {
+        frames.flatMap { records(fromPage: $0) }
+    }
+
+    /// Expand 0x4c records into a per-30 s motion timeline (5 sub-samples per
+    /// 150 s epoch from the [10:15] channel) for `SleepDetection.detectFromMotion`.
+    /// Motion counts are passed through directly (baseline `01` = still); callers
+    /// should scope `records` to a worn period (charging data reads as still too).
+    public static func motionTimeline(from records: [BulkRecord],
+                                      epoch: Int = Command.syncEpoch) -> [MotionSample] {
+        var out: [MotionSample] = []
+        out.reserveCapacity(records.count * 5)
+        for r in records {
+            let base = r.date(epoch: epoch)
+            for k in 0 ..< 5 {
+                out.append(MotionSample(time: base.addingTimeInterval(Double(k) * 30),
+                                        movement: Float(r.raw[10 + k])))
+            }
+        }
+        return out
+    }
+
+    /// Restrict `records` to those whose epoch falls within `hint`, or return them
+    /// unchanged when no hint is given. Extension point for the sleep-schedule abstraction:
+    /// the app can pass the user's bedtime→wake window (see ios/OpenRingConn/SleepSchedule)
+    /// so detection ignores stray daytime/charging motion outside the expected night.
+    public static func records(_ records: [BulkRecord],
+                               within hint: DateInterval?,
+                               epoch: Int = Command.syncEpoch) -> [BulkRecord] {
+        guard let hint else { return records }
+        return records.filter { hint.contains($0.date(epoch: epoch)) }
+    }
+
+    /// The main sleep block (in-bed window) detected from the motion channel, or nil.
+    /// Pass `within:` to bound detection to the user's scheduled sleep window (optional).
+    /// Pass `temperatureSamples:` to gate out charger / off-wrist still epochs (#41).
+    public static func mainSleep(from records: [BulkRecord],
+                                 within hint: DateInterval? = nil,
+                                 epoch: Int = Command.syncEpoch,
+                                 temperatureSamples: [TemperatureSample] = []) -> ActivityPeriod? {
+        let scoped = Self.records(records, within: hint, epoch: epoch)
+        var periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
+                                                      temperatureSamples: temperatureSamples)
+        return ActivityPeriod.findSleep(&periods)
+    }
+
+    /// HealthKit sleep segments for the detected night: an `inBed` span plus
+    /// `asleepCore`/`awake` sub-segments from the stillness detection. Finer
+    /// Light/Deep/REM staging needs an HR-based model (TODO) — the ring doesn't
+    /// send a hypnogram (PROTOCOL.md §5.3), so all "asleep" is reported as core.
+    /// Pass `temperatureSamples:` to gate out charger / off-wrist still epochs (#41).
+    public static func sleepSegments(from records: [BulkRecord],
+                                     within hint: DateInterval? = nil,
+                                     epoch: Int = Command.syncEpoch,
+                                     temperatureSamples: [TemperatureSample] = []) -> [SleepSegment] {
+        let scoped = Self.records(records, within: hint, epoch: epoch)
+        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
+                                                      temperatureSamples: temperatureSamples)
+        // Main in-bed block = longest sleep period over the minimum duration (1 h).
+        guard let block = periods
+            .filter({ $0.activity == .sleep })
+            .max(by: { $0.duration < $1.duration }),
+            block.duration > 60 * 60 else { return [] }
+
+        var segs = [SleepSegment(start: block.start, end: block.end, stage: .inBed)]
+        for p in periods where p.start < block.end && p.end > block.start {
+            let s = max(p.start, block.start), e = min(p.end, block.end)
+            if e <= s { continue }
+            segs.append(SleepSegment(start: s, end: e,
+                                     stage: p.activity == .sleep ? .asleepCore : .awake))
+        }
+        return segs
+    }
+
+    // MARK: - Light/Deep/REM staging
+    //
+    // ⚠️ APPROXIMATION, NOT VALIDATED PER-EPOCH. The ring sends no hypnogram (§5.3), so
+    // stages are estimated from the per-epoch HR/HRV/motion signals. The model now lives
+    // in `SleepStaging` (Analytics/SleepStaging.swift): HR bands are drawn from the
+    // night's OWN asleep HR distribution, and REM is separated from Light by HR/HRV
+    // variability (not just absolute HR). Validated only against the app's night TOTALS,
+    // never per-segment timing — treat output as approximate stage proportions.
+    // `sleepSegments` (coarse asleep/awake) remains the non-experimental default.
+
+    /// Light/Deep/REM/Awake staging of the detected sleep block. Thin wrapper over
+    /// `SleepStaging.classify` (kept for source compatibility with existing callers).
+    public static func stagedSegments(from records: [BulkRecord],
+                                      within hint: DateInterval? = nil,
+                                      epoch: Int = Command.syncEpoch) -> [SleepSegment] {
+        SleepStaging.classify(from: Self.records(records, within: hint, epoch: epoch), epoch: epoch)
+    }
+
+    /// HR / HRV / SpO2 samples from sleep-vitals epochs, with device timestamps.
+    /// SpO2 is emitted as a 0…1 fraction (HealthKit oxygenSaturation). HRV is the
+    /// ring's RMSSD value written to the SDNN type (unit-compatible; see mapping).
+    public static func samples(from records: [BulkRecord],
+                               epoch: Int = Command.syncEpoch) -> [QuantitySample] {
+        var out: [QuantitySample] = []
+        for r in records where r.layout == .sleepVitals {
+            let t = r.date(epoch: epoch)
+            if let hr = r.heartRate {
+                out.append(QuantitySample(kind: .heartRate, start: t, value: Double(hr)))
+            }
+            if let hrv = r.hrvRMSSD {
+                out.append(QuantitySample(kind: .hrvSDNN, start: t, value: Double(hrv)))
+            }
+            if let spo2 = r.spo2Percent {
+                out.append(QuantitySample(kind: .spo2, start: t, value: Double(spo2) / 100.0))
+            }
+            if let rr = r.respiratoryRate {
+                out.append(QuantitySample(kind: .respiratoryRate, start: t, value: rr))
+            }
+        }
+        return out
+    }
 }

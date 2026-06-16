@@ -30,6 +30,21 @@ public enum MetricKind: String, Codable, CaseIterable, Sendable {
         case .sleep: return "category"
         }
     }
+
+    /// Human-readable label for dashboards.
+    public var displayName: String {
+        switch self {
+        case .heartRate: return "Heart Rate"
+        case .restingHeartRate: return "Resting HR"
+        case .hrvSDNN: return "HRV"
+        case .spo2: return "SpO₂"
+        case .temperature: return "Skin Temp"
+        case .respiratoryRate: return "Respiratory Rate"
+        case .steps: return "Steps"
+        case .activeEnergy: return "Active Energy"
+        case .sleep: return "Sleep"
+        }
+    }
 }
 
 /// A scalar metric sample carrying the device's own timestamps so history
@@ -64,4 +79,6 @@ public struct SleepSegment: Equatable, Codable, Sendable {
         self.end = end
         self.stage = stage
     }
+
+    public var duration: TimeInterval { end.timeIntervalSince(start) }
 }

@@ -168,8 +168,8 @@ body = 6×**23-byte records** · `[last]`=XOR. 🟢
 Record (23 B): `[0]`=`0x0c` · `[1:4]`=BE counter **+0x96/rec** (cursor space) 🟢 ·
 `[8]`=subtype tag (idle alternates `12/13`) 🟢 · `[10:15]`=baseline `01 01 01 01 01` ·
 `[15:22]`=7-B payload (zero idle, dense when worn) 🟡 · `[22]`=trailer flags (idle
-`12→00`/`13→04`) 🟢. Idle/unworn template: `[4:7]=05 00 0c 00`, `[9]=0a`, `[10:14]=01×5`,
-`[15:21]=00×7` 🟢. Likely the per-epoch sleep/activity stream (role = inference).
+`12→00`/`13→04`) 🟢. Idle/unworn template: `[4:8]=05 00 0c 00`, `[9]=0a`, `[10:15]=01×5`,
+`[15:22]=00×7` 🟢. Likely the per-epoch sleep/activity stream (role = inference).
 
 ### 5.4 `0x10` / `0x87` — fixed 19-byte descriptor
 `0x10` ← `d0 00 00` (also spontaneous ~30–60 s); `0x87` ← `07 00 00`. **Identical

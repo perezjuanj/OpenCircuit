@@ -1,12 +1,26 @@
 import XCTest
 @testable import OpenRingKit
 
-// Parity with openwhoop-algos/src/activity.rs unit tests.
+// Parity with openwhoop-algos/src/activity.rs unit tests, plus ring-specific and
+// #41 wear-detection tests.
 final class SleepDetectionTests: XCTestCase {
     let base = Date(timeIntervalSince1970: 1_700_000_000)
+
+    // MARK: - Helpers
+
     func reading(_ minutes: Int, _ g: SIMD3<Float>?) -> GravitySample {
         GravitySample(time: base.addingTimeInterval(Double(minutes) * 60), gravity: g)
     }
+
+    func motion(_ minutes: Int, movement: Float) -> MotionSample {
+        MotionSample(time: base.addingTimeInterval(Double(minutes) * 60), movement: movement)
+    }
+
+    private func tempSample(_ minutes: Int, _ degC: Double) -> TemperatureSample {
+        TemperatureSample(time: base.addingTimeInterval(Double(minutes) * 60), tempCelsius: degC)
+    }
+
+    // MARK: - Core gravity-vector detection (openwhoop parity)
 
     func testEmptyAndSingle() {
         XCTAssertTrue(ActivityPeriod.detectFromGravity([]).isEmpty)
@@ -59,11 +73,25 @@ final class SleepDetectionTests: XCTestCase {
         XCTAssertFalse(ActivityPeriod(activity: .sleep, start: base, end: base.addingTimeInterval(3600)).isActive)
     }
 
-    // MARK: #41 — wear detection (analytics layer)
+    // MARK: - MotionSample path (ring's real data path)
 
-    private func tempSample(_ minutes: Int, _ degC: Double) -> TemperatureSample {
-        TemperatureSample(time: base.addingTimeInterval(Double(minutes) * 60), tempCelsius: degC)
+    func testAllStillMotionIsSleep() {
+        // 120 min of motion count = 1 (baseline still) -> should detect sleep.
+        let h = (0..<120).map { motion($0, movement: 1.0) }
+        let p = ActivityPeriod.detectFromMotion(h)
+        XCTAssertFalse(p.isEmpty)
+        XCTAssertEqual(p.first?.activity, .sleep)
     }
+
+    func testAllMovingMotionIsActive() {
+        // motion count = 20 (elevated) for 120 min -> should detect active.
+        let h = (0..<120).map { motion($0, movement: 20.0) }
+        let p = ActivityPeriod.detectFromMotion(h)
+        XCTAssertFalse(p.isEmpty)
+        XCTAssertEqual(p.first?.activity, .active)
+    }
+
+    // MARK: - #41 — wear detection (gravity path)
 
     func testStillColdEpochNotClassifiedAsSleep() {
         // 2h of perfectly still gravity → would be "sleep" with detectFromGravity.
@@ -91,12 +119,50 @@ final class SleepDetectionTests: XCTestCase {
     }
 
     func testNoTemperatureDataPassesThrough() {
-        // Without temperature samples, detectFromMotion == detectFromGravity (still = sleep).
+        // Without temperature samples, gravity detectFromMotion == detectFromGravity.
         let h = (0..<120).map { reading($0, SIMD3(0, 0, 1)) }
         let viaMotion = ActivityPeriod.detectFromMotion(h, temperatureSamples: [])
         let viaGravity = ActivityPeriod.detectFromGravity(h)
         XCTAssertEqual(viaMotion, viaGravity)
     }
+
+    // MARK: - #41 — wear detection (MotionSample / real ring path)
+
+    func testMotionPathColdEpochNotClassifiedAsSleep() {
+        // 2h of still motion counts (movement=1) + cold temperature → NOT sleep.
+        // This is the real ring data path used by BulkSleep.mainSleep.
+        let h = (0..<120).map { motion($0, movement: 1.0) }
+        let temps = (0..<120).map { tempSample($0, 18.0) }
+
+        let periods = ActivityPeriod.detectFromMotion(h, temperatureSamples: temps)
+        XCTAssertFalse(
+            periods.contains { $0.activity == .sleep },
+            "#41 ring path: still but cold (charger) must not be classified as sleep"
+        )
+    }
+
+    func testMotionPathWarmEpochClassifiedAsSleep() {
+        // Still motion counts + warm temperature (32 °C = worn) → sleep.
+        let h = (0..<120).map { motion($0, movement: 1.0) }
+        let temps = (0..<120).map { tempSample($0, 32.0) }
+
+        let periods = ActivityPeriod.detectFromMotion(h, temperatureSamples: temps)
+        XCTAssertTrue(
+            periods.contains { $0.activity == .sleep },
+            "#41 ring path: still and warm (worn) should be classified as sleep"
+        )
+    }
+
+    func testMotionPathNoTemperaturePassesThrough() {
+        // Without temperature samples, motion detectFromMotion with temps == without temps.
+        let h = (0..<120).map { motion($0, movement: 1.0) }
+        let viaTemped = ActivityPeriod.detectFromMotion(h, temperatureSamples: [])
+        let viaDirect = ActivityPeriod.detectFromMotion(h)
+        XCTAssertEqual(viaTemped, viaDirect,
+            "detectFromMotion([MotionSample], temperatureSamples: []) must equal detectFromMotion([MotionSample])")
+    }
+
+    // MARK: - Wear detection primitives
 
     func testWearDetectionMinWornThreshold() {
         // Exactly at the threshold (30 °C) → worn.

@@ -112,9 +112,9 @@ check(strain.calculate(bpms: Array(repeating: 80, count: 500)) == nil, "too few 
 check(Strain(maxHR: 60, restingHR: 60).calculate(bpms: Array(repeating: 80, count: 600)) == nil,
       "maxHR<=restingHR -> nil")
 
-// Sleep score (integer-ratio model, faithful to openwhoop)
+// Sleep score (#28 fix: floating-point division so 4h yields 50.0, not 0.0)
 check(SleepScore.score(durationSeconds: 8 * 3600) == 100.0, "8h sleep -> 100")
-check(SleepScore.score(durationSeconds: 4 * 3600) == 0.0, "4h sleep -> 0 (integer ratio)")
+check(SleepScore.score(durationSeconds: 4 * 3600) == 50.0, "4h sleep -> 50.0 (#28 fix: floating-point ratio)")
 check(SleepScore.score(durationSeconds: 24 * 3600) == 100.0, "24h sleep -> clamped 100")
 
 // Sleep detection (activity.rs)
@@ -143,6 +143,116 @@ var shortSleep = [ActivityPeriod(activity: .sleep, start: base, end: base.adding
 check(ActivityPeriod.findSleep(&shortSleep) == nil, "findSleep: ignores <60min sleep")
 var none: [ActivityPeriod] = []
 check(ActivityPeriod.findSleep(&none) == nil, "findSleep: empty -> nil")
+
+// --- Bulk activity/sleep decode (0x4c, PROTOCOL.md §5.3) ---
+// Real, XOR-valid 0x4c page from the 2026-06-13 overnight sync: 6 × 23-byte records.
+let realPage = "4c00260c22a16b55210a7d120a010101010100000402400400000c22a20155000300"
+    + "120a010101010100003c00000d01200c22a297540001005f0a010101010100001101b00f"
+    + "00440c22a32d6027077b120a010101010100402501c02235a00c22a3c351260577120b01"
+    + "0101010108a01000000401300c22a459502d0378120a01010101010160200000040ff0cc"
+let pageRecs = BulkSleep.records(fromPage: hex(realPage))
+check(pageRecs.count == 6, "0x4c page splits into 6 × 23-byte records")
+// #39 fix: all non-idle records are .sleepVitals; .activity is no longer returned.
+check(pageRecs[0].layout == .sleepVitals && pageRecs[2].layout == .sleepVitals,
+      "#39 fix: non-idle records are .sleepVitals (not .activity)")
+
+// Deep-sleep epoch confirmed against the app: HR 68 / HRV 77 / SpO2 98.
+let dsr = BulkRecord(hex("0c22d5bf444d057a620a01010101012aa0000090000004"))!
+check(dsr.heartRate == 68, "sleep-vitals [4] -> HR 68 bpm (🟢 app-confirmed)")
+check(dsr.hrvRMSSD == 77, "sleep-vitals [5] -> HRV 77 ms (🟢)")
+check(dsr.spo2Percent == 98, "sleep-vitals [8] -> SpO2 98% (🟢)")
+check(dsr.respiratoryRate == 15.25, "sleep-vitals [7] 0x7a/8 -> RR 15.25 brpm (🟢, app avg 15.1)")
+check(dsr.counter == 0x0c22d5bf, "record [0:4] -> BE counter")
+let dsSamples = BulkSleep.samples(from: [dsr])
+check(dsSamples.count == 4, "sleep-vitals -> HR + HRV + SpO2 + RR samples")
+check(dsSamples.first(where: { $0.kind == .spo2 })?.value == 0.98, "SpO2 emitted as 0…1 fraction")
+check(dsSamples.first(where: { $0.kind == .respiratoryRate })?.value == 15.25, "RR sample emitted")
+let idleRec = BulkRecord(hex("0c099dbf05000c00120a01010101010000000000000000"))!
+check(idleRec.layout == .idle && BulkSleep.samples(from: [idleRec]).isEmpty,
+      "idle template -> no samples")
+
+// Motion-channel sleep detection: active -> still(9h) -> active finds the night.
+func bulkRec(_ c: UInt32, motion: UInt8, sub: UInt8) -> BulkRecord {
+    var b = [UInt8](repeating: 0, count: 23)
+    b[0] = UInt8(c >> 24); b[1] = UInt8((c >> 16) & 0xFF)
+    b[2] = UInt8((c >> 8) & 0xFF); b[3] = UInt8(c & 0xFF)
+    b[8] = sub
+    for k in 0..<5 { b[10 + k] = motion }
+    return BulkRecord(b)!
+}
+var night: [BulkRecord] = []
+var cc: UInt32 = 0x0c220000
+for _ in 0..<20 { night.append(bulkRec(cc, motion: 0x14, sub: 0x12)); cc += 150 }
+for _ in 0..<216 { night.append(bulkRec(cc, motion: 0x01, sub: 0x62)); cc += 150 }
+for _ in 0..<20 { night.append(bulkRec(cc, motion: 0x14, sub: 0x12)); cc += 150 }
+let block = BulkSleep.mainSleep(from: night)
+check(block?.activity == .sleep, "motion detection finds the sleep block")
+check(abs((block?.duration ?? 0) - 216 * 150) < 30 * 60, "sleep block ~9 h")
+check(BulkSleep.sleepSegments(from: night).contains { $0.stage == .inBed },
+      "sleepSegments emits inBed")
+check(BulkSleep.mainSleep(from: night.prefix(20).map { $0 }) == nil,
+      "all-active -> no sleep block")
+
+// Experimental staging: low-HR region -> Deep, high-HR -> REM (sleep-vitals sub 0x62).
+func vrec(_ c: UInt32, motion: UInt8, hr: UInt8) -> BulkRecord {
+    var b = bulkRec(c, motion: motion, sub: 0x62).raw; b[4] = hr; return BulkRecord(b)!
+}
+var staged: [BulkRecord] = []
+var sc: UInt32 = 0x0c220000
+for _ in 0..<20 { staged.append(bulkRec(sc, motion: 0x14, sub: 0x12)); sc += 150 }
+for _ in 0..<60 { staged.append(vrec(sc, motion: 0x01, hr: 72)); sc += 150 }   // REM band
+for _ in 0..<60 { staged.append(vrec(sc, motion: 0x01, hr: 50)); sc += 150 }   // Deep band
+for _ in 0..<60 { staged.append(vrec(sc, motion: 0x01, hr: 60)); sc += 150 }   // Light
+for _ in 0..<20 { staged.append(bulkRec(sc, motion: 0x14, sub: 0x12)); sc += 150 }
+let stages = Set(BulkSleep.stagedSegments(from: staged).map { $0.stage })
+check(stages.contains(.asleepDeep) && stages.contains(.asleepREM) && stages.contains(.asleepCore),
+      "staging separates Deep/REM/Light by HR band (experimental)")
+// Regression: a sleep-vitals epoch with baseline motion + zero payload is NOT idle.
+let zeroPayloadSleep = BulkRecord(hex("0c22cd8b38520973620a01010101010000000000000004"))!
+check(zeroPayloadSleep.layout == .sleepVitals && zeroPayloadSleep.heartRate == 0x38,
+      "zero-payload sleep epoch keeps HR (not mistaken for idle)")
+
+// --- Sleep-stage classifier (SleepStaging, §5.3) ---------------------------------
+// stagedSegments now delegates to SleepStaging.classify; it must produce the same output.
+check(BulkSleep.stagedSegments(from: staged) == SleepStaging.classify(from: staged),
+      "BulkSleep.stagedSegments delegates to SleepStaging.classify")
+
+// Calm flat low HR (still) -> predominantly Deep, no REM.
+var deepNight: [BulkRecord] = []
+var dc: UInt32 = 0x0c220000
+for _ in 0..<12 { deepNight.append(bulkRec(dc, motion: 0x14, sub: 0x12)); dc += 150 }
+for _ in 0..<120 { deepNight.append(vrec(dc, motion: 0x01, hr: 50)); dc += 150 }
+for _ in 0..<12 { deepNight.append(bulkRec(dc, motion: 0x14, sub: 0x12)); dc += 150 }
+let deepSegs = SleepStaging.classify(from: deepNight)
+let deepTotals = SleepStaging.stageTotals(deepSegs)
+let deepAsleep = (deepTotals[.asleepDeep] ?? 0) + (deepTotals[.asleepCore] ?? 0) + (deepTotals[.asleepREM] ?? 0)
+check(deepAsleep > 0 && (deepTotals[.asleepDeep] ?? 0) / deepAsleep > 0.8,
+      "calm flat low HR -> mostly Deep")
+check((deepTotals[.asleepREM] ?? 0) == 0, "calm flat HR -> no REM")
+
+// Constructed multi-cycle night partitions like a tracker: Light ≫ REM > Deep, modest awake.
+func vrecHRV(_ c: UInt32, hr: UInt8, hrv: UInt8) -> BulkRecord {
+    var b = vrec(c, motion: 0x01, hr: hr).raw; b[5] = hrv; return BulkRecord(b)!
+}
+var night2: [BulkRecord] = []
+var nc: UInt32 = 0x0c220000
+for _ in 0..<8 { night2.append(bulkRec(nc, motion: 0x14, sub: 0x12)); nc += 150 }
+for cycle in 0..<5 {
+    for _ in 0..<10 { night2.append(vrecHRV(nc, hr: 56, hrv: 60)); nc += 150 }   // Light
+    for _ in 0..<8  { night2.append(vrecHRV(nc, hr: 50, hrv: 70)); nc += 150 }   // Deep
+    for _ in 0..<8  { night2.append(vrecHRV(nc, hr: 56, hrv: 60)); nc += 150 }   // Light
+    for _ in 0..<10 { night2.append(vrecHRV(nc, hr: 62, hrv: 45)); nc += 150 }   // REM
+    if cycle < 4 { for _ in 0..<2 { night2.append(bulkRec(nc, motion: 0x15, sub: 0x12)); nc += 150 } }
+}
+for _ in 0..<8 { night2.append(bulkRec(nc, motion: 0x14, sub: 0x12)); nc += 150 }
+let s = SleepStaging.summary(SleepStaging.classify(from: night2))
+check(s.deep > 0 && s.rem > 0 && s.light > 0 && s.awake > 0, "constructed night has all 4 stages")
+check(s.light > s.rem && s.rem > s.deep, "architecture sanity: Light ≫ REM > Deep")
+check(abs(s.inBed - (s.totalAsleep + s.awake)) < 150, "inBed ≈ asleep + awake (partition)")
+check(s.efficiency > 0.6 && s.efficiency <= 1.0, "plausible sleep efficiency")
+let m = s.minutes
+print("    => constructed night (min): inBed \(m.inBed), asleep \(m.asleep), "
+      + "awake \(m.awake), light \(m.light), deep \(m.deep), rem \(m.rem), eff \(Int(s.efficiency * 100))%")
 
 print(failures == 0 ? "\nALL CHECKS PASSED" : "\n\(failures) CHECK(S) FAILED")
 exit(failures == 0 ? 0 : 1)
