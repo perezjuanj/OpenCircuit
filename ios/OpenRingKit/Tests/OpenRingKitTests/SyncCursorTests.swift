@@ -37,6 +37,36 @@ final class SyncCursorTests: XCTestCase {
         XCTAssertEqual(c.last(.heartRate), t2)
     }
 
+    func testSelectNewStagedDoesNotMutateUntilApplied() {
+        let c = SyncCursor()
+        let (fresh, advanced) = c.selectNewStaged([
+            QuantitySample(kind: .heartRate, start: t1, value: 60),
+            QuantitySample(kind: .heartRate, start: t0, value: 58),
+        ])
+        XCTAssertEqual(fresh.map(\.start), [t0, t1])     // sorted, both fresh
+        XCTAssertNil(c.last(.heartRate))                 // original cursor untouched
+        XCTAssertEqual(advanced.last(.heartRate), t1)    // advance only on the returned copy
+    }
+
+    func testStagedAdvanceIgnoredLeavesSamplesRetriable() {
+        // Simulate a failed commit: stage the advance but DON'T adopt `advanced`. The original
+        // cursor must still treat the same samples as new so they're retried (#22).
+        let c = SyncCursor()
+        _ = c.selectNewStaged([QuantitySample(kind: .heartRate, start: t1, value: 60)])
+        XCTAssertTrue(c.isNew(.heartRate, t1))
+    }
+
+    func testAdvancedKindsReportsOnlyMovedCursors() {
+        let base = SyncCursor()
+        var moved = base
+        _ = moved.selectNew([
+            QuantitySample(kind: .heartRate, start: t1, value: 60),
+            QuantitySample(kind: .spo2, start: t1, value: 0.97),
+        ])
+        XCTAssertEqual(Set(moved.advancedKinds(since: base)), [.heartRate, .spo2])
+        XCTAssertTrue(moved.advancedKinds(since: moved).isEmpty)   // no diff with self
+    }
+
     func testUnitsMatchHealthKitMapping() {
         XCTAssertEqual(MetricKind.spo2.unit, "fraction")
         XCTAssertEqual(MetricKind.hrvSDNN.unit, "ms")

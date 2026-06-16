@@ -36,4 +36,22 @@ public struct SyncCursor: Equatable, Codable, Sendable {
         for s in fresh { advance(s.kind, to: s.start) }
         return fresh
     }
+
+    /// Non-mutating `selectNew` for callers that must only advance the cursor AFTER a durable
+    /// store commit: returns the to-write subset together with the cursor state to persist
+    /// *once the save succeeds*. Staging the advance means a failed/rolled-back save leaves the
+    /// cursor where it was, so the same decoded samples are retried next time rather than being
+    /// skipped — decoded frames must always end up stored (#22).
+    public func selectNewStaged(_ samples: [QuantitySample]) -> (fresh: [QuantitySample], advanced: SyncCursor) {
+        var advanced = self
+        let fresh = advanced.selectNew(samples)
+        return (fresh, advanced)
+    }
+
+    /// Kinds whose high-water mark differs from `previous` — i.e. the cursors that actually
+    /// moved. Lets the store persist only the changed rows instead of re-writing every kind on
+    /// every ingest (#33).
+    public func advancedKinds(since previous: SyncCursor) -> [MetricKind] {
+        MetricKind.allCases.filter { last($0) != previous.last($0) }
+    }
 }

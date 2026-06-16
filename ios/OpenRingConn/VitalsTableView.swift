@@ -6,12 +6,25 @@ import OpenRingKit
 /// are always visible offline) and prefers the live session reading when connected.
 struct VitalsTableView: View {
     @Environment(\.modelContext) private var modelContext
-    /// Most-recent samples first; we reduce to the latest per kind in `latest`.
-    @Query(sort: \StoredSample.start, order: .reverse) private var samples: [StoredSample]
-    /// Persisted sleep summaries (latest night first) — the offline fallback for `sleep`.
-    @Query(sort: \StoredSleepSummary.night, order: .reverse) private var storedSleep: [StoredSleepSummary]
-    /// Persisted daily rollups (latest day first) — the offline fallback for live steps.
-    @Query(sort: \StoredDaily.day, order: .reverse) private var storedDaily: [StoredDaily]
+    // BOUNDED fetches replace the old unbounded `@Query` that loaded every StoredSample on every
+    // view update (#32). Each "latest" query is `fetchLimit = 1`; the two windowed queries cap
+    // the scan to a recent time slice instead of all history. All filtering done in `body` is
+    // over these already-bounded arrays — never a synchronous fetch (the #14 black-screen hazard).
+    /// Latest stored sample per displayed kind (newest first, capped at 1 each).
+    @Query private var latestHR: [StoredSample]
+    @Query private var latestSpO2: [StoredSample]
+    @Query private var latestTempSample: [StoredSample]
+    @Query private var latestHRV: [StoredSample]
+    @Query private var latestRR: [StoredSample]
+    /// Heart-rate samples over the last 24 h — the window resting HR (the sleep low) scans.
+    @Query private var recentHR: [StoredSample]
+    /// Temperature samples over the last few days — narrowed in memory to the precise night
+    /// window for the overnight average (the exact window depends on async @State).
+    @Query private var recentTemp: [StoredSample]
+    /// Latest persisted sleep summary (capped at 1) — the offline fallback for `sleep`.
+    @Query private var storedSleep: [StoredSleepSummary]
+    /// Latest persisted daily rollup (capped at 1) — the offline fallback for live steps.
+    @Query private var storedDaily: [StoredDaily]
     /// Live session (optional) — its readings override stored ones while connected.
     var session: RingSession?
     /// LIVE sleep summary for the most recent night (total asleep + estimated stage
@@ -26,6 +39,59 @@ struct VitalsTableView: View {
     @AppStorage(SleepScheduleDefaults.enabled) private var sleepEnabled = false
     @AppStorage(SleepScheduleDefaults.bedMinutes) private var bedMinutes = SleepScheduleDefaults.defaultBedMinutes
     @AppStorage(SleepScheduleDefaults.wakeMinutes) private var wakeMinutes = SleepScheduleDefaults.defaultWakeMinutes
+
+    /// Days of temperature history the night-temp window query scans before the precise night
+    /// window is applied in memory — generous enough to cover the most recent night, still tiny
+    /// versus all history.
+    private static let tempWindowDays: TimeInterval = 3
+
+    init(session: RingSession? = nil, sleep: SleepStaging.Summary? = nil) {
+        self.session = session
+        self.sleep = sleep
+
+        // Anchor the time windows to the start of the current hour so the @Query descriptors stay
+        // stable across rapid SwiftUI re-renders (only re-fetching hourly or when data changes),
+        // instead of churning on every render with a millisecond-fresh cutoff.
+        let hourStart = Calendar.current.dateInterval(of: .hour, for: Date())?.start ?? Date()
+        let dayAgo = hourStart.addingTimeInterval(-86_400)
+        let tempLookback = hourStart.addingTimeInterval(-Self.tempWindowDays * 86_400)
+
+        let hr = MetricKind.heartRate.rawValue
+        let spo2 = MetricKind.spo2.rawValue
+        let temp = MetricKind.temperature.rawValue
+        let hrv = MetricKind.hrvSDNN.rawValue
+        let rr = MetricKind.respiratoryRate.rawValue
+
+        _latestHR = Query(Self.latestDescriptor(hr))
+        _latestSpO2 = Query(Self.latestDescriptor(spo2))
+        _latestTempSample = Query(Self.latestDescriptor(temp))
+        _latestHRV = Query(Self.latestDescriptor(hrv))
+        _latestRR = Query(Self.latestDescriptor(rr))
+        _recentHR = Query(FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == hr && $0.start > dayAgo && $0.value > 0 },
+            sortBy: [SortDescriptor(\.start, order: .reverse)]))
+        _recentTemp = Query(FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == temp && $0.start > tempLookback && $0.value > 0 },
+            sortBy: [SortDescriptor(\.start, order: .reverse)]))
+
+        var sleepDesc = FetchDescriptor<StoredSleepSummary>(
+            sortBy: [SortDescriptor(\.night, order: .reverse)])
+        sleepDesc.fetchLimit = 1
+        _storedSleep = Query(sleepDesc)
+        var dailyDesc = FetchDescriptor<StoredDaily>(sortBy: [SortDescriptor(\.day, order: .reverse)])
+        dailyDesc.fetchLimit = 1
+        _storedDaily = Query(dailyDesc)
+    }
+
+    /// Newest-first, single-row descriptor for one metric kind. Predicate shape (`kindRaw` then
+    /// `start`) is index-friendly so it can use a composite index if one is added later. (#32)
+    private static func latestDescriptor(_ kindRaw: String) -> FetchDescriptor<StoredSample> {
+        var d = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == kindRaw },
+            sortBy: [SortDescriptor(\.start, order: .reverse)])
+        d.fetchLimit = 1
+        return d
+    }
 
     /// Prefer the live session summary; fall back to the latest stored night offline.
     private var effectiveSleep: SleepStaging.Summary? {
@@ -42,22 +108,23 @@ struct VitalsTableView: View {
         return storedDaily.first.flatMap { $0.day == today ? $0.steps : nil }
     }
 
+    /// Latest stored sample per displayed kind, assembled from the per-kind `fetchLimit = 1`
+    /// queries (absent kinds stay out of the dict). Replaces the old in-memory reduce over every
+    /// stored row. (#32)
     private var latest: [MetricKind: StoredSample] {
         var out: [MetricKind: StoredSample] = [:]
-        for s in samples {
-            guard let k = MetricKind(rawValue: s.kindRaw), out[k] == nil else { continue }
-            out[k] = s
-        }
+        out[.heartRate] = latestHR.first
+        out[.spo2] = latestSpO2.first
+        out[.temperature] = latestTempSample.first
+        out[.hrvSDNN] = latestHRV.first
+        out[.respiratoryRate] = latestRR.first
         return out
     }
 
-    /// Resting HR ≈ the lowest HR over the last 24 h (sleep low), derived from stored HR.
+    /// Resting HR ≈ the lowest HR over the last 24 h (sleep low). `recentHR` is already the
+    /// bounded 24 h, value-positive HR window, so this is just its min. (#32)
     private var restingHR: Int? {
-        let dayAgo = Date().addingTimeInterval(-86_400)
-        let hrs = samples
-            .filter { $0.kindRaw == MetricKind.heartRate.rawValue && $0.start > dayAgo && $0.value > 0 }
-            .map { $0.value }
-        return hrs.min().map { Int($0) }
+        recentHR.map(\.value).min().map { Int($0) }
     }
 
     var body: some View {
@@ -232,12 +299,10 @@ struct VitalsTableView: View {
     /// else local 00:00–06:00 of the most recent date that has temperature samples.
     private var nightTemp: Double? {
         guard let window = nightWindow else { return nil }
-        // Filter the already-loaded @Query array in memory — no synchronous fetch in `body`
-        // (that hazard once caused a black-screen launch). #14
-        let tempKind = MetricKind.temperature.rawValue
-        let vals = samples.lazy
-            .filter { $0.kindRaw == tempKind && $0.value > 0
-                      && $0.start >= window.start && $0.start <= window.end }
+        // Narrow the already-loaded (bounded) `recentTemp` window to the precise night in memory
+        // — no synchronous fetch in `body` (that hazard once caused a black-screen launch). #14
+        let vals = recentTemp.lazy
+            .filter { $0.start >= window.start && $0.start <= window.end }
             .map(\.value)
         var sum = 0.0, n = 0
         for v in vals { sum += v; n += 1 }
