@@ -26,6 +26,8 @@ public enum LiveHR {
     }
 
     /// SpO2 % from a long SpO2-mode frame `15 01 … <spo2> …` (byte[14]), or nil. 🟡
+    /// Note: single-window measurement, not multi-sample ground-truthed — render with
+    /// "est." caveat in UI to indicate lower confidence (#59).
     public static func decodeSpO2(_ payload: [UInt8]) -> Int? {
         guard payload.count >= 15, payload[0] == 0x15, payload[1] == 0x01 else { return nil }
         let spo2 = Int(payload[14])

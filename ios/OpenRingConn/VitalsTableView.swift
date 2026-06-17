@@ -133,9 +133,7 @@ struct VitalsTableView: View {
                           time: hrActive && session?.liveHR == nil
                               ? "measuring…" : timeFor(.heartRate, live: hrLive))
             divider
-            measurableRow("SpO₂", value: spo2Text, mode: .spo2, active: spo2Active,
-                          time: spo2Active && session?.liveSpO2 == nil
-                              ? "measuring…" : timeFor(.spo2, live: spo2Live))
+            spo2Row
             divider
             skinTempRow
             divider
@@ -178,6 +176,25 @@ struct VitalsTableView: View {
         } else {
             row("Sleep", value: "—", time: nil)
         }
+    }
+
+    /// SpO₂ row with estimate caveat: live SpO₂ is a single-window measurement (🟡),
+    /// not multi-sample ground-truthed. Label it consistently with sleep stages ("est.").
+    @ViewBuilder private var spo2Row: some View {
+        HStack(spacing: 10) {
+            Text("SpO₂").font(.subheadline).foregroundStyle(.primary)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(spo2Text).font(.subheadline.weight(.semibold)).monospacedDigit()
+                Text("est.").font(.caption2).foregroundStyle(.tertiary)
+                if let time = (spo2Active && session?.liveSpO2 == nil
+                    ? "measuring…" : timeFor(.spo2, live: spo2Live)) {
+                    Text(time).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            measureButton(.spo2, active: spo2Active)
+        }
+        .padding(.vertical, 8)
     }
 
     // MARK: rows
