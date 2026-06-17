@@ -121,10 +121,47 @@ struct VitalsTableView: View {
         return out
     }
 
-    /// Resting HR ≈ the lowest HR over the last 24 h (sleep low). `recentHR` is already the
-    /// bounded 24 h, value-positive HR window, so this is just its min. (#32)
+    /// Newest reading per kind from the JUST-SYNCED in-memory batch (`session.historySamples`),
+    /// independent of the store. The sync drain always refreshes this, and it lives on the
+    /// @Observable session so a completed sync re-renders the dashboard immediately — even when
+    /// the cursor dedup (SyncCursor) keeps those overlapping/last-night epochs out of the store
+    /// and the @Query therefore never changes. Without this, the sync card showed HR/HRV/SpO₂ the
+    /// Vitals rows didn't, until a manual (now-timestamped) reading forced a refresh. (#67)
+    private var latestSynced: [MetricKind: (value: Double, start: Date)] {
+        guard let samples = session?.historySamples, !samples.isEmpty else { return [:] }
+        var out: [MetricKind: (value: Double, start: Date)] = [:]
+        for s in samples where s.value > 0 {
+            if let cur = out[s.kind], cur.start >= s.start { continue }
+            out[s.kind] = (s.value, s.start)
+        }
+        return out
+    }
+
+    /// The reading to DISPLAY for a kind: whichever is more recent between the persisted store
+    /// sample and the just-synced in-memory batch (#67). After disconnect `latestSynced` is empty
+    /// so this falls back to the store. Only ever returns a real decoded reading.
+    private func latestReading(_ kind: MetricKind) -> (value: Double, start: Date)? {
+        let stored = latest[kind].map { (value: $0.value, start: $0.start) }
+        switch (stored, latestSynced[kind]) {
+        case let (s?, h?): return h.start > s.start ? h : s
+        case let (s?, nil): return s
+        case let (nil, h?): return h
+        case (nil, nil): return nil
+        }
+    }
+
+    /// Resting HR ≈ the lowest HR over the last 24 h (sleep low). `recentHR` is the bounded 24 h,
+    /// value-positive HR window from the store; the just-synced batch is folded in too so a fresh
+    /// sync lowers it immediately rather than waiting for a manual reading. (#32, #67)
     private var restingHR: Int? {
-        recentHR.map(\.value).min().map { Int($0) }
+        let dayAgo = Date().addingTimeInterval(-86_400)
+        var lows = recentHR.map(\.value)
+        if let samples = session?.historySamples {
+            lows += samples
+                .filter { $0.kind == .heartRate && $0.value > 0 && $0.start > dayAgo }
+                .map(\.value)
+        }
+        return lows.min().map { Int($0) }
     }
 
     // MARK: First-run empty-state (#58)
@@ -139,7 +176,7 @@ struct VitalsTableView: View {
     /// they show the first-run empty state rather than reading as genuinely missing today's value.
     /// (#58)
     private var hasSleepVitals: Bool {
-        latestHRV.first != nil || latestRR.first != nil || storedSleep.first != nil
+        latestReading(.hrvSDNN) != nil || latestReading(.respiratoryRate) != nil || storedSleep.first != nil
     }
 
     var body: some View {
@@ -157,7 +194,7 @@ struct VitalsTableView: View {
             // user understands WHY they're empty, rather than seeing a bare dash with no context.
             // The overnightSyncHint in the sleep section below gives the full explanation. (#58)
             row("HRV", value: valueText(.hrvSDNN) { "\(Int($0)) ms" },
-                time: latestHRV.isEmpty ? "after overnight sync" : nightlyWhen(.hrvSDNN))
+                time: nightlyWhen(.hrvSDNN) ?? "after overnight sync")
             divider
             row("Resting HR", value: restingHR.map { "\($0) bpm" } ?? "—",
                 time: restingHR == nil ? "after overnight sync" : nil)
@@ -165,7 +202,7 @@ struct VitalsTableView: View {
             row("Steps (today)", value: stepsText, time: stepsTime)
             divider
             row("Respiratory Rate", value: valueText(.respiratoryRate) { String(format: "%.1f /min", $0) },
-                time: latestRR.isEmpty ? "after overnight sync" : nightlyWhen(.respiratoryRate))
+                time: nightlyWhen(.respiratoryRate) ?? "after overnight sync")
             divider
             sleepSection
         }
@@ -436,7 +473,7 @@ struct VitalsTableView: View {
 
     /// Latest stored value for `kind`, formatted, or "—" if none.
     private func valueText(_ kind: MetricKind, _ fmt: (Double) -> String) -> String {
-        latest[kind].map { fmt($0.value) } ?? "—"
+        latestReading(kind).map { fmt($0.value) } ?? "—"
     }
 
     private static let rel: RelativeDateTimeFormatter = {
@@ -444,8 +481,8 @@ struct VitalsTableView: View {
     }()
     private func timeFor(_ kind: MetricKind, live: Bool = false) -> String? {
         if live { return "live" }
-        guard let s = latest[kind] else { return nil }
-        return Self.rel.localizedString(for: s.start, relativeTo: Date())
+        guard let r = latestReading(kind) else { return nil }
+        return Self.rel.localizedString(for: r.start, relativeTo: Date())
     }
 
     private static let nightlyDate: DateFormatter = {
@@ -455,15 +492,15 @@ struct VitalsTableView: View {
     /// these from sleep, so a relative "5h ago" misreads as a stale live value. Show which
     /// night it's from instead: "last night" for this morning's sleep, else the date.
     private func nightlyWhen(_ kind: MetricKind) -> String? {
-        guard let s = latest[kind] else { return nil }
+        guard let r = latestReading(kind) else { return nil }
         let cal = Calendar.current
-        let days = cal.dateComponents([.day], from: cal.startOfDay(for: s.start),
+        let days = cal.dateComponents([.day], from: cal.startOfDay(for: r.start),
                                       to: cal.startOfDay(for: Date())).day ?? 0
         switch days {
         case ..<0: return nil            // future timestamp (shouldn't happen) — omit
         case 0: return "last night"
         case 1: return "yesterday"
-        default: return Self.nightlyDate.string(from: s.start)
+        default: return Self.nightlyDate.string(from: r.start)
         }
     }
 }
