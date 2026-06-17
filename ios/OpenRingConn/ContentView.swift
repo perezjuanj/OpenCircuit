@@ -188,10 +188,13 @@ struct ContentView: View {
                 }
                 Spacer()
                 // Ring battery (a device stat, not a body vital) sits with the connection. When
-                // the link has gone quiet (no frames), gray it and show "as of Xm ago" so a
-                // minutes-old % from a silently-dropped link doesn't read as current (#36).
+                // no 0x10/0x87 descriptor has arrived recently, gray it and show "as of Xm ago"
+                // so a minutes-old % doesn't read as current (#36 / #57). Uses the dedicated
+                // battery-freshness window (batteryStale, ~120 s) rather than the broader
+                // liveReadingsStale (360 s) — battery updates only on descriptor frames, not
+                // the 2-s live-HR polls that keep liveReadingsStale fresh during monitoring.
                 if let b = session?.batteryPercent {
-                    let stale = session?.liveReadingsStale == true
+                    let stale = session?.batteryStale == true   // (#57) dedicated battery freshness
                     VStack(alignment: .trailing, spacing: 0) {
                         Label("\(b)%", systemImage: batteryIcon(b))
                             .font(.subheadline.weight(.medium))
@@ -247,10 +250,12 @@ struct ContentView: View {
         return "Measuring HR…"
     }
 
-    /// "as of Xm ago" for the connection-header battery, shown only once the link has gone quiet
-    /// (#36) — a dropped link can otherwise show a minutes-old battery % as if it were current.
+    /// "as of Xm ago" for the connection-header battery, shown once the battery reading goes
+    /// stale (#36 / #57). Anchored to `batteryFetchedAt` (the last 0x10/0x87 descriptor that
+    /// carried a valid %) rather than `lastFrameAt` (any frame), so a 2-s HR poll doesn't
+    /// keep the timestamp artificially fresh while the actual battery reading is minutes old.
     private var batteryAsOf: String? {
-        guard session?.liveReadingsStale == true, let at = session?.lastFrameAt else { return nil }
+        guard session?.batteryStale == true, let at = session?.batteryFetchedAt else { return nil }
         return "as of " + Self.rel.localizedString(for: at, relativeTo: Date())
     }
 
@@ -512,14 +517,24 @@ struct ContentView: View {
         case .unauthorized: return "Bluetooth not authorized"
         case .scanning: return "Scanning…"
         case .connecting(let n):
-            // After repeated failed reconnects (e.g. the ring is on the charger / out of range),
-            // swap the permanent "Connecting…" for a calm note so normal charging doesn't read as
-            // a stuck connection (#35). Heuristic on elapsed attempts — not a charging byte (#41).
-            return scanner.reconnectStalled
-                ? "Ring unreachable or charging — will reconnect automatically"
-                : "Connecting to \(n)…"
+            // After repeated failed reconnects, swap the permanent "Connecting…" for a calm note
+            // (#35). The backoff count is NOT a charging signal — we never claim the ring is
+            // charging from the reconnect count (#41 / #60). "Ring unreachable" is the honest state.
+            // If the last session's battery trend was strictly rising (🟢 proxy), append an honest
+            // "inferred charging" hint — labeled so to avoid overstating certainty (#60).
+            if scanner.reconnectStalled {
+                let chargingHint = lastInferredCharging ? " · inferred charging" : ""
+                return "Ring unreachable\(chargingHint) — reconnecting automatically"
+            }
+            return "Connecting to \(n)…"
         case .connected(let n): return n
         }
+    }
+
+    /// The charging inference from the last session, persisted to UserDefaults before session
+    /// teardown (#60). Readable during the reconnect-backoff window when session == nil.
+    private var lastInferredCharging: Bool {
+        UserDefaults.standard.bool(forKey: "battery.inferredCharging")
     }
 }
 
