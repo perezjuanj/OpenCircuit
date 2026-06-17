@@ -120,6 +120,56 @@ final class RingSession: NSObject {
     /// budget and times out almost immediately (#65). Per-mode budget via `userMeasureBudget`.
     private var userMeasureDeadline: Date?
 
+    // MARK: Battery freshness (#57)
+    //
+    // Battery % is updated ONLY on 0x10/0x87 descriptor frames (DeviceStatus.battery), which
+    // are solicited by the keepalive every 60–300 s. Using the global `lastFrameAt` (refreshed
+    // on every frame, including 2-s live-HR polls) would let the battery show as "live" for up
+    // to 6 minutes (idleStaleAfter) even though the reading is tens of minutes old during a long
+    // monitoring session. A dedicated per-read timestamp + a tighter 120 s window catches a
+    // silently stale reading after roughly 2 night-keepalive intervals.
+
+    /// Wall-clock of the most recent 0x10/0x87 frame that carried a valid battery % (#57).
+    /// Separate from `lastFrameAt` (updated on every frame) — battery freshness is independent
+    /// of live-HR polling.
+    private(set) var batteryFetchedAt: Date?
+
+    /// True when the last battery reading is old enough to display as stale — i.e. no
+    /// 0x10/0x87 descriptor arrived recently (#57). Tighter than `liveReadingsStale`
+    /// (idleStaleAfter 360 s), which covers all readings. Shows "as of Xm ago" in the
+    /// connection-header battery after `batteryStaleAfter` seconds of silence.
+    var batteryStale: Bool {
+        guard batteryPercent != nil else { return false }   // nothing to call stale yet
+        guard let at = batteryFetchedAt else { return false }
+        return Date().timeIntervalSince(at) > Self.batteryStaleAfter
+    }
+    /// ~2× the tightest keepalive interval (night: 60 s). Battery shows "as of Nm ago" when
+    /// no descriptor has arrived in this window. Daytime keepalive (180–300 s) means the battery
+    /// will accurately report as stale between keepalive firings — that IS correct, the reading
+    /// IS a few minutes old.
+    private static let batteryStaleAfter: TimeInterval = 120
+
+    // MARK: Charging inference (#60)
+    //
+    // The ring's charging byte is NOT on the wire in any confirmed field (PROTOCOL.md §5).
+    // A strictly rising battery % across consecutive 0x10/0x87 frames is the best 🟢 proxy.
+    // This window is private; `inferredCharging` is computed from it via the kit's pure function.
+    // The inference is persisted before session teardown (see `invalidate`) so the connection
+    // card can surface a hint during the reconnect backoff when session == nil.
+
+    /// Rolling battery % readings (oldest→newest, capped) for charging inference (#60).
+    private var batteryTrend: [Int] = []
+    private static let batteryTrendCapacity = 4
+
+    /// True when the last few battery readings are strictly rising — suggesting the ring may
+    /// be charging (🟢 proxy). The UI labels this "inferred" to avoid asserting certainty.
+    /// Never derived from the reconnect count (#60).
+    var inferredCharging: Bool { ChargingInference.inferred(from: batteryTrend) }
+
+    /// UserDefaults key for the last-persisted charging inference (#60). Written before session
+    /// teardown so ContentView can read it during the reconnect-backoff window (session == nil).
+    private static let inferredChargingKey = "battery.inferredCharging"
+
     /// True when frames have stopped for long enough that the live readings (HR/SpO₂/battery/
     /// steps/temp) should read as STALE rather than current (#36). A silently-dropped link keeps
     /// its last values until CoreBluetooth eventually fires `didDisconnect`; this lets the UI
@@ -218,6 +268,10 @@ final class RingSession: NSObject {
     /// reading via `stopLiveMonitoring()` BEFORE this where that matters; `invalidate()` itself is
     /// a pure cancel + detach. Idempotent.
     func invalidate() {
+        // Persist the charging inference BEFORE cancelling tasks (#60): the session is about
+        // to be nil-ed by the scanner; ContentView reads from UserDefaults during the
+        // reconnect-backoff window so the hint stays live while reconnecting.
+        UserDefaults.standard.set(inferredCharging, forKey: Self.inferredChargingKey)
         monitorTask?.cancel(); monitorTask = nil
         keepaliveTask?.cancel(); keepaliveTask = nil
         autoMeasureTask?.cancel(); autoMeasureTask = nil
@@ -1014,7 +1068,18 @@ extension RingSession: CBPeripheralDelegate {
                 }
             }
             // Ring battery % is descriptor byte[1] (§5.4 🟢, ground-truthed).
-            if let b = DeviceStatus.battery(bytes) { self.batteryPercent = b }
+            // Also stamps `batteryFetchedAt` (#57) and extends the charging-inference trend (#60).
+            if let b = DeviceStatus.battery(bytes) {
+                self.batteryPercent = b
+                self.batteryFetchedAt = Date()   // dedicated freshness anchor (#57)
+                // Charging inference: rolling window of distinct readings (#60).
+                if self.batteryTrend.last != b {
+                    self.batteryTrend.append(b)
+                    if self.batteryTrend.count > Self.batteryTrendCapacity {
+                        self.batteryTrend.removeFirst()
+                    }
+                }
+            }
             // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).
             switch bytes.first {
             case 0x47:
