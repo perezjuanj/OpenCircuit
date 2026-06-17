@@ -10,6 +10,8 @@ struct ContentView: View {
     @State private var lastWrite: String?
     @State private var showDebug = false
     @State private var showWorkout = false
+    /// Women's health feature gate (#78). Matches the key in UserProfileSettingsView.
+    @AppStorage("userProfile.womensHealthEnabled") private var womensHealthEnabled = false
 
     /// Freshness timestamps mirrored from the UserDefaults-backed observability store (#44).
     /// Held in @State because UserDefaults writes (from the background task / a flush) don't
@@ -46,6 +48,7 @@ struct ContentView: View {
                     caloriesCard
                     card { GoalsCardView() }
                     workoutCard
+                    if womensHealthEnabled { cycleCalendarCard }
                     trendsNavigationCard
                     syncCard
                     debugCard
@@ -387,6 +390,29 @@ struct ContentView: View {
         .sheet(isPresented: $showWorkout) {
             WorkoutView(session: session)
         }
+    }
+
+    /// Cycle calendar nav card — taps through to CycleCalendarView (#78).
+    /// Only rendered when `womensHealthEnabled` (settings toggle). All predictions
+    /// are labeled as estimates in the destination view.
+    private var cycleCalendarCard: some View {
+        NavigationLink {
+            CycleCalendarView()
+        } label: {
+            card {
+                HStack(spacing: 8) {
+                    Image(systemName: "calendar.badge.clock").foregroundStyle(.pink)
+                    Text("CYCLE CALENDAR")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
+                Text("Log periods, view predictions, fertile window (estimates only)")
+                    .font(.subheadline).foregroundStyle(.secondary)
+            }
+        }
+        .buttonStyle(.plain)
     }
 
     /// 7-day trends nav card — taps through to the full TrendsView (#74).

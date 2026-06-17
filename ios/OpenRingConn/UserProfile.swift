@@ -29,6 +29,10 @@ struct UserProfileSettingsView: View {
     @AppStorage(GoalDefaults.workdaySleepMin) private var workdaySleepMin = GoalDefaults.defaultWorkdaySleepMin
     @AppStorage(GoalDefaults.weekendSleepMin) private var weekendSleepMin = GoalDefaults.defaultWeekendSleepMin
 
+    // Women's health toggle (#78). Off by default — users who don't want this feature
+    // never see the cycle calendar card on the dashboard. Shared key with ContentView.
+    @AppStorage("userProfile.womensHealthEnabled") private var womensHealthEnabled = false
+
     // Health-alert thresholds (#73) + skin-temp/fever toggle (#85) + the shared quiet-hours (DND)
     // window. Keys/defaults shared with the notification engine via `HealthAlertDefaults`.
     @AppStorage(HealthAlertDefaults.highHREnabled) private var highHREnabled = true
@@ -148,6 +152,15 @@ struct UserProfileSettingsView: View {
                      + "sensor data only and are not a diagnosis. If you feel unwell, consult a "
                      + "qualified medical professional.")
                     .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            Section("Women's health") {
+                Toggle("Show cycle calendar", isOn: $womensHealthEnabled)
+                Text("Enables period logging, cycle predictions, and a menstrual-flow "
+                     + "write to Apple Health. The feature is hidden by default — only "
+                     + "turn it on if you want it. Predictions are estimates only and "
+                     + "are not a contraception tool or medical advice.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Quiet hours") {

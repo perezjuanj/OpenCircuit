@@ -27,7 +27,7 @@ struct OpenRingConnApp: App {
         static var versionIdentifier = Schema.Version(1, 0, 0)
         static var models: [any PersistentModel.Type] {
             [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
-             StoredNap.self]
+             StoredNap.self, StoredPeriodEntry.self]
         }
     }
 
@@ -52,7 +52,8 @@ struct OpenRingConnApp: App {
     /// are not backed up — they're already in Apple Health. (#40)
     static func makeContainer() -> ModelContainer {
         let schema = Schema([StoredSample.self, StoredCursor.self,
-                             StoredSleepSummary.self, StoredDaily.self, StoredNap.self])
+                             StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
+                             StoredPeriodEntry.self])
         let config = ModelConfiguration(schema: schema)
 
         do {

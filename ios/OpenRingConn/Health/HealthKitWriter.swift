@@ -74,6 +74,10 @@ final class HealthKitWriter {
         // Workout types (#75): HKWorkout + GPS route (workout sessions feature).
         set.insert(HKWorkoutType.workoutType())
         set.insert(HKSeriesType.workoutRoute())
+        // Women's health (#78): user-logged period flow written to Health.
+        // NOTE: temperature is NOT added here — it already ships via the canonical
+        // `.basalBodyTemperature` path (MetricKind.temperature). No triple-write.
+        set.insert(HKCategoryType(.menstrualFlow))
         return set
     }
 
@@ -95,10 +99,11 @@ final class HealthKitWriter {
         var naps = 0
         var distanceM = 0.0         // estimated distance written (#81)
         var exerciseMinutes = 0.0   // estimated exercise minutes written (#82)
+        var menstrualFlowEntries = 0  // user-logged period entries written (#78)
         var wroteAnything: Bool {
             samples > 0 || sleepSegments > 0 || steps > 0
                 || restingDays > 0 || passiveHours > 0 || activeKcal > 0 || naps > 0
-                || distanceM > 0 || exerciseMinutes > 0
+                || distanceM > 0 || exerciseMinutes > 0 || menstrualFlowEntries > 0
         }
     }
 
@@ -127,6 +132,10 @@ final class HealthKitWriter {
         // Naps (#76): each carries its own `healthWritten` flag (NOT the night's `.sleep` cursor),
         // so a daytime nap and the overnight night write independently and never collide.
         result.naps = await flushNaps(store: store)
+
+        // Women's health (#78): write pending user-logged period flow entries to Health.
+        // Gated by each entry's own `healthWritten` flag — independent of all other writes.
+        result.menstrualFlowEntries = await flushMenstrualFlow(localStore: store)
 
         // Profile is used for distance stride + calorie TRIMP — resolved once here so all three
         // derived writes use the same snapshot. Body inputs come from the shared profile defaults;
@@ -188,6 +197,52 @@ final class HealthKitWriter {
             } catch { break }   // stop on first failure; unwritten naps retry next flush
         }
         return written
+    }
+
+    /// Write pending user-logged period flow entries to Apple Health as
+    /// `menstrualFlow` category samples, returning the count written.
+    /// Each entry is gated by its own `healthWritten` flag — independent of
+    /// all other HK writes. One HKCategorySample per period entry spanning
+    /// start…end (or start + 5 days when no end is logged yet).
+    /// `HKMetadataKeyMenstrualCycleStart: true` marks each as the first day
+    /// of a new cycle (period start = cycle start). (#78)
+    private func flushMenstrualFlow(localStore: LocalStore) async -> Int {
+        guard let pending = try? localStore.pendingPeriodEntries(), !pending.isEmpty else { return 0 }
+        var written = 0
+        for entry in pending {
+            do {
+                try await writeMenstrualFlow(entry: entry)
+                try localStore.markPeriodEntryWritten(start: entry.start)
+                written += 1
+            } catch { break }   // stop on first failure; unwritten entries retry next flush
+        }
+        return written
+    }
+
+    /// Write a single `menstrualFlow` category sample for a period entry.
+    private func writeMenstrualFlow(entry: StoredPeriodEntry) async throws {
+        let type = HKCategoryType(.menstrualFlow)
+        // Map app flow level to HKCategoryValueMenstrualFlow.
+        let flowValue: HKCategoryValueMenstrualFlow
+        switch entry.flowLevelRaw {
+        case 1: flowValue = .light
+        case 3: flowValue = .heavy
+        default: flowValue = .medium
+        }
+        // Use logged end date, or start + 5 days as a sensible stand-in when the
+        // user hasn't closed the period yet. HK only stores what the user logged.
+        let endDate = entry.end ?? entry.start.addingTimeInterval(5 * 86_400)
+        let sample = HKCategorySample(
+            type: type,
+            value: flowValue.rawValue,
+            start: entry.start,
+            end: endDate,
+            metadata: [
+                // Mark the first day of the period as the first day of the cycle.
+                HKMetadataKeyMenstrualCycleStart: true,
+            ]
+        )
+        try await store.save(sample)
     }
 
     func requestAuthorization() async throws {
