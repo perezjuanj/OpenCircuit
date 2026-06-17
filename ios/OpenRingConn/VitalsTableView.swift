@@ -129,13 +129,17 @@ struct VitalsTableView: View {
 
     // MARK: First-run empty-state (#58)
 
-    /// True once at least one sleep-vitals sample has been persisted (HRV, RR, sleep summary,
-    /// or a resting-HR window). All four overnight rows (HRV, Resting HR, Respiratory Rate,
-    /// Sleep) depend on this data; when false the rows are in a first-run empty state rather
-    /// than genuinely missing today's reading. (#58)
+    /// True once at least one genuinely sleep-derived sample has been persisted (HRV, RR, or a
+    /// stored sleep summary). Resting HR is deliberately EXCLUDED: it's the min of ANY heart-rate
+    /// sample in the last 24 h, and an on-demand "Measure HR" tap persists a `.heartRate` sample on
+    /// disconnect (RingSession.swift) — so a single daytime reading would otherwise flip this true
+    /// before any overnight sync, suppressing `overnightSyncHint` and reverting the Sleep row to a
+    /// bare "—" WHILE HRV/RR still show "after overnight sync" (a contradictory first-run UI). The
+    /// four overnight rows (HRV, Resting HR, Respiratory Rate, Sleep) reflect this data; when false
+    /// they show the first-run empty state rather than reading as genuinely missing today's value.
+    /// (#58)
     private var hasSleepVitals: Bool {
-        latestHRV.first != nil || latestRR.first != nil
-            || storedSleep.first != nil || restingHR != nil
+        latestHRV.first != nil || latestRR.first != nil || storedSleep.first != nil
     }
 
     var body: some View {
