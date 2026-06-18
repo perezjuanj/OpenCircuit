@@ -249,31 +249,54 @@ Page: `[0]`=`0x47` · `[1]`=`00` · **`[2]`=remaining-RECORD countdown** (−5/f
 0 on last; e.g. `1c 17 12 0d 08 03 00`) · body = N×**47-byte records** · `[last]`=XOR
 (valid 11/11). 🟢
 Record (47 B): `[0]`=`0x0c` · `[1:4]`=BE counter **+0x0384/rec = 900 s** (cursor space) 🟢 ·
-`[4:6]`=16-bit baseline (`[4]`=`02` const, `[5]` drifts) 🟡 · `[6:9]`=usually `00 00 00`,
-else per-record flag/event 🟡 · `[9:47]`=**38 B = 30 × 10-bit big-endian samples**
-(300 bits + 4 zero pad-bits) 🟢.
+`[4:6]`=16-bit BE **optical baseline/DC** (`[4]`∈{`02`,`03`}, **not const**; `[5]` drifts) 🟡 ·
+`[6:9]`=usually `00 00 00`, else per-record flag/quality (`[8]`∈{0,5,10,15,20}) 🟡 ·
+`[9:47]`=**38 B = 30 × 10-bit big-endian samples** (300 bits + 4 zero pad-bits) 🟢.
 
-**Bit-width resolved (10-bit), 2026-06-13 capture.** Decoding `[9:47]` as 10-bit BE
-gives the lowest sample-to-sample jitter of all widths (0.32 vs 0.39–0.42 for 8/12/16)
-and clean pulsatile waveforms on worn records (counter `0c22…`). The 30 samples are
-**two interleaved channels × 15** (even/odd): splitting them lowers jitter further
-(0.13–0.15) and the two tracks are near-identical (e.g. `553/553 → 629/623 → 646/647`)
-— consistent with **red + IR PPG** (the pair SpO2's ratio-of-ratios needs; SpO2 itself
-lands in `0x4c[8]`, §5.3). 🟢
-Cadence: ~80 records span 20 days (very **sparse** — occasional optical snapshots, not a
-continuous trace); 30 samples per 900 s record ≈ 1/channel/min, so this is a
-perfusion/amplitude trend, not pulse-resolution waveform 🟡. Reproduce with
-`desktop/decode_ppg.py`.
+> **2026-06-16 offline RE pass (issue #8, `desktop/analyze_0x47_bitwidth.py`, run over 5
+> captures — `ppg_align`/`walk`/`steps`/`btsnoop_hr`/`sleep_sync`).** These all drain the **same
+> ~21-day history backlog** (counters share `0x0c099faa…`), so they are *sparse stored history*,
+> not a worn realtime window — but the findings below reproduce identically across all five.
 
-**2026-06-16 cross-check (`ppg_align_20260616`, issue #8) — 10-bit holds, but still not
-fiducial.** Decoding the 176 `0x47` records 10-bit BE is flat/low-jitter (smoothness 0.04)
-while 12-bit BE is noise-like (1.12) → consistent with the 10-bit choice above. BUT these
-records are scattered history (176 over ~21 days, not a worn realtime window), so they do
-**not** supply the proof #8 demands: confirming bit-width + channel identity (red/IR) +
-counter time-unit still needs a **realtime PPG capture with finger on/off + a reference HR
-over the same window** — i.e. the physical ring. `desktop/decode_0x47.py` does the mechanical
-decode (both widths → CSV); alignment is the open step. Per the no-fabrication rule, treat
-channel identity as 🟡 (jitter-supported, not fiducial) until that capture lands.
+**Bit-width = 10-bit BE — 🟢 (offline-proven 3 independent ways; was 🟢-but-ambiguous, now firm).**
+Decoding `[9:47]`:
+- **Sample jitter** (mean|Δ|/σ): 10-bit = **0.03–0.04**; 8/12/16-bit = **1.12–1.23** (white-noise ≈ √2).
+  A ~30× gap — only 10-bit yields a smooth physical signal; the others are bit-misalignment noise.
+- **Byte-stream autocorrelation** peaks at **lag 5** (r ≈ +0.5–0.7) with a harmonic at lag 10. A run of
+  near-constant W-bit samples repeats every lcm(8,W)/8 bytes: **10→5 B**, 12→3, 16→2, 8→1. The observed
+  5-byte period (= 4×10-bit = 40 bits) is *structural* proof of 10-bit packing (12/16-bit are ruled out).
+- **Range**: 10-bit values span **0–664** inside the 0–1023 full scale (never rails); 12/16-bit rail to
+  full scale (0–4072 / 0–65154) — the signature of decode noise.
+
+**Channel = ONE smooth optical channel, NOT two interleaved red+IR — ⚠️ the earlier "two interleaved
+channels (red+IR)" claim is RETRACTED.** Sample-domain autocorrelation over the dynamic records:
+**lag-1 (+0.81) ≈ lag-2 (+0.81)**, and only **3 %** of records alternate (lag1<0). A genuine A,B,A,B
+interleave gives lag1 ≪ lag2 with frequent alternation; instead adjacent samples are as correlated as
+2-apart → a single channel. mean(even)−mean(odd) ≈ −0.5 LSB and unstable — no two-channel DC offset.
+The prior "de-interleaving lowers jitter ⇒ 2 channels" was just decimation of a smooth-signal-plus-dither.
+**Which LED this single channel is (red / IR / green) and whether it is AC- or DC-coupled is UNPROVABLE
+offline 🔴** — needs the app's labelled/exported trace.
+
+**Cadence / counter time-unit:** step **+900 s = 15 min per record** 🟢 (161/175 steps = 900; outliers are
+multi-day gaps between sparse bursts). 30 samples per 15-min record. If evenly spread → **1 sample / 30 s
+= 0.033 Hz** 🟡 (exact within-record spacing — even-spread vs a fast burst — is unprovable offline). **Either
+way this is NOT pulse-resolution** 🟢: 0.033 Hz is ~50× below a 0.7–3 Hz pulse, so **no heartbeat is
+recoverable from `0x47`.** Two confirmations: (a) within a record the signal is a slow smooth drift/ramp —
+one record starts with **14 exact `0` samples then ramps monotonically to ~655**, a sensor-on *settling*
+curve (an absolute optical level, not a pulse); (b) the `walk`/`steps` captures carry the **concurrent live
+HR as `0x15`** frames (resting 61–66, rising to **82–88 bpm** on the walk) — a separate product — and that
+HR is nowhere in the 15-min `0x47` trend. So **`0x47` is a sparse perfusion / optical-amplitude trend**
+(one 30-sample snapshot per 15 min), not a fiducial waveform.
+
+**`[4:6]` baseline 🟡:** 16-bit BE, range **650–1192** (`0x028a–0x04a8`), **positively correlated** with the
+per-record sample mean (corr **+0.40…+0.82** across captures; baseline ≈ 1.4× sample-mean) → an
+optically-coupled per-record **DC/baseline (or gain)** field, not a flag. Exact relationship unresolved.
+
+**Issue #8 status — PARTIAL (offline ceiling reached).** Settled offline: bit-width (🟢), record cadence
+(🟢), single-channel + not-pulse-resolution (🟢/🟡). Still requires the app's **exported PPG trace** for
+#8's full acceptance (1:1 alignment): (1) channel IDENTITY — which LED, AC vs DC 🔴; (2) exact within-record
+sample spacing 🟡; (3) absolute physical units. Evidence/decoders: `desktop/analyze_0x47_bitwidth.py`
+(stats) and `desktop/decode_0x47.py` (both widths → CSV).
 
 ### 5.3 `0x4c` — bulk activity/sleep page (ACK each with `cc 00 00`)
 Page: `[0]`=`0x4c` · `[1]`=`00` · **`[2]`=remaining-RECORD countdown** (−6/page) ·
@@ -564,8 +587,13 @@ key exchange to replicate for the bond** — the replicable gate is the `f(chal)
 ## 6. Ground-truth captures needed (prioritized)
 
 Each names the single capture that converts a 🟡/🔴 field into a decoded metric.
-1. **`0x47` → real PPG:** app's realtime/exported PPG trace recorded over the *same*
-   window as a btsnoop sync → confirms bit-width, channel, counter time-unit.
+1. **`0x47` → real PPG (issue #8 — PARTIAL):** offline RE (§5.2, `analyze_0x47_bitwidth.py`) has
+   **settled bit-width = 10-bit BE 🟢, record cadence = 900 s/15 min 🟢, single-channel + not
+   pulse-resolution 🟢/🟡, `[4:6]`=optical DC/baseline 🟡.** Still open and needing the app's
+   **realtime/exported PPG trace over the same btsnoop window**: channel **identity** (which LED;
+   AC vs DC) 🔴, exact within-record sample spacing 🟡, and absolute physical units. (`0x47` is a
+   *sparse 15-min perfusion trend* — live HR rides `0x15`, not this — so finger-on/off alignment
+   needs the app trace, not just a fresh capture.)
 2. ✅ **`0x4c` → sleep/HR/HRV/SpO2 epochs — DECODED.** `captures/sleep_sync_btsnoop.log`
    (2026-06-13 night) aligned to the app's readout: sleep-vitals epoch `[4]`=HR,
    `[5]`=HRV(ms), `[8]`=SpO2(%) confirmed (§5.3); `[10:15]`=motion. Remaining 🟡/🔴:
