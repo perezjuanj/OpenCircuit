@@ -416,18 +416,19 @@ struct SleepCardView: View {
     /// window). SpO₂ is stored 0…1 and surfaced as a whole percent.
     private func overnightAverages(_ night: Night) -> (hr: Int?, hrv: Int?, spo2: Int?)? {
         guard let start = night.inBedStart, let end = night.inBedEnd, end > start else { return nil }
-        let hrKind = MetricKind.heartRate.rawValue
-        let hrvKind = MetricKind.hrvSDNN.rawValue
-        let spo2Kind = MetricKind.spo2.rawValue
-        var hrSum = 0.0, hrN = 0, hrvSum = 0.0, hrvN = 0, spo2Sum = 0.0, spo2N = 0
-        for s in recentVitals where s.start >= start && s.start <= end {
-            if s.kindRaw == hrKind { hrSum += s.value; hrN += 1 }
-            else if s.kindRaw == hrvKind { hrvSum += s.value; hrvN += 1 }
-            else if s.kindRaw == spo2Kind { spo2Sum += s.value; spo2N += 1 }
+        // Shared overnight-mean helper — the SAME computation the Vitals HRV/RR rows use, so the
+        // two surfaces can't disagree (HRV "86 in Vitals vs 64 in Sleep" was a point-vs-mean clash).
+        let window = DateInterval(start: start, end: end)
+        func mean(_ kind: MetricKind) -> Double? {
+            let raw = kind.rawValue
+            let points = recentVitals
+                .filter { $0.kindRaw == raw }
+                .map { OvernightAverages.Point(value: $0.value, start: $0.start) }
+            return OvernightAverages.mean(points, window: window)
         }
-        let hr = hrN > 0 ? Int((hrSum / Double(hrN)).rounded()) : nil
-        let hrv = hrvN > 0 ? Int((hrvSum / Double(hrvN)).rounded()) : nil
-        let spo2 = spo2N > 0 ? Int((spo2Sum / Double(spo2N) * 100).rounded()) : nil
+        let hr = mean(.heartRate).map { Int($0.rounded()) }
+        let hrv = mean(.hrvSDNN).map { Int($0.rounded()) }
+        let spo2 = mean(.spo2).map { Int(($0 * 100).rounded()) }   // SpO₂ stored 0…1, surfaced as %
         return (hr == nil && hrv == nil && spo2 == nil) ? nil : (hr, hrv, spo2)
     }
 

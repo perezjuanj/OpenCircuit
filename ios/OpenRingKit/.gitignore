@@ -2,3 +2,6 @@
 .swiftpm/
 *.xcodeproj
 DerivedData/
+
+# Stray xcodebuild SYMROOT (from a -target build without DerivedData)
+build/

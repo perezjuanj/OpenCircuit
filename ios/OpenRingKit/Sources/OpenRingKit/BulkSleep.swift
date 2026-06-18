@@ -76,10 +76,15 @@ public struct BulkRecord: Equatable {
         return .sleepVitals
     }
 
-    /// Heart rate in bpm — `[4]` on a sleep-vitals epoch (🟢). nil otherwise / when 0.
+    /// Heart rate in bpm — `[4]` on a sleep-vitals epoch (🟢). nil otherwise, when 0, or when the
+    /// byte is outside the physiological band (`LiveHR.validBPM`, 30…220). This band guard is the
+    /// single choke point every history/sleep HR sample flows through: it stops a garbage epoch
+    /// (e.g. byte[4]==4) from becoming a sample, which previously surfaced as an impossible
+    /// "Resting HR 4 bpm" and depressed the sleep score / per-stage HR / Apple Health mirror.
     public var heartRate: Int? {
-        guard layout == .sleepVitals, raw[4] > 0 else { return nil }
-        return Int(raw[4])
+        guard layout == .sleepVitals else { return nil }
+        let hr = Int(raw[4])
+        return LiveHR.validBPM.contains(hr) ? hr : nil
     }
 
     /// HRV in ms — `[5]` on a sleep-vitals epoch (🟢). The ring reports RMSSD; HealthKit

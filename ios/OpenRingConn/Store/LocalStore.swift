@@ -270,6 +270,13 @@ struct LocalStore {
         var ingested: [QuantitySample] = []
 
         for s in fresh {
+            // Single ingest choke point for HR plausibility: drop heart-rate samples outside
+            // LiveHR.validBPM (30…220), including 0-bpm placeholders. This protects EVERY store
+            // consumer and the Apple Health mirror, present and future — covering paths the
+            // sleep-vitals decoder guard doesn't (e.g. EpochSync value-0 placeholders). The cursor
+            // still advances (computed above) so a skipped garbage sample isn't re-ingested.
+            if s.kind == .heartRate, !LiveHR.validBPM.contains(Int(s.value)) { continue }
+
             guard s.kind.isCumulativeCounter else {
                 context.insert(StoredSample(s))
                 ingested.append(s)
@@ -350,6 +357,26 @@ struct LocalStore {
         try context.delete(model: StoredSample.self,
                            where: #Predicate { $0.start < cutoff })
         try context.save()
+    }
+
+    /// One-time cleanup: delete physiologically-impossible heart-rate samples — those outside
+    /// `LiveHR.validBPM` (30…220 bpm), including 0-bpm placeholders — that were persisted BEFORE
+    /// the decoder gained its band guard. A single garbage epoch (e.g. 4 bpm) otherwise surfaced
+    /// as an impossible "Resting HR 4 bpm" and depressed the sleep score / per-stage HR / Health
+    /// mirror across every consumer, not just one view. The decoder now blocks NEW out-of-band
+    /// values at the source, so this only scrubs the existing rows once. Returns the number deleted.
+    @discardableResult
+    func purgeImplausibleHeartRate() throws -> Int {
+        let hr = MetricKind.heartRate.rawValue
+        let lo = Double(LiveHR.minValidBPM)
+        let hi = Double(LiveHR.maxValidBPM)
+        let descriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == hr && ($0.value < lo || $0.value > hi) })
+        let stale = try context.fetch(descriptor)
+        guard !stale.isEmpty else { return 0 }
+        for row in stale { context.delete(row) }
+        try context.save()
+        return stale.count
     }
 
     /// Stored samples of one kind within `[start, end)`, oldest→newest. Used by the

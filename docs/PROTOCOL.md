@@ -333,9 +333,11 @@ time (no 12 h offset in this capture; bears on §5.6/§6.6). Reassemble + decode
     sync of the day / background), which neither capture triggered.
   - **Sync-open `0x02` flag byte** (byte[6]) observed as `00` and `03`; **both return the
     same activity/sleep `0x4c`+`0x47` data** (flag=03 segments carried fewer `0x4c`, more
-    `0x10`/`0x87`). So flag is NOT a per-metric stream selector. Purpose still 🔴 — other
-    flag values (`01`/`02`/`04`…) are untried and a candidate temp/summary selector for
-    **active probing** (`replay 02 00 <cursor> 0X 01 00`).
+    `0x10`/`0x87`). ⚠️ The earlier "flag is NOT a stream selector" conclusion is **not load-
+    bearing**: that probe used `FF FF FF FF` (no `0x82` for any flag) and predated the auth crack.
+    The decompiled `DataSyncType` enum makes byte[6] the prime suspect for the all-day HR/SpO₂
+    (`HrSync`/`Spo2Sync`) stream selector — re-probed correctly (real cursor, post-auth, full
+    candidate set incl. `off_2c` `0x0a`/`0x0b`) in **§5.6.1 / #99**.
   - **Ground truth for when we capture it:** RingConn reports temp Oura-style as a signed
     **deviation from a personal baseline** plus an absolute reading — observed `−0.16`
     deviation and `96.75 °F` (35.97 °C); the 2026-06-13 night showed `96.58 °F` (35.88 °C).
@@ -453,7 +455,49 @@ The epoch `1577793600` is 2019-12-31 **12:00:00** UTC (noon, not midnight): the 
 across **20 independent sync-open events** spanning 2026-06-13 21:52 UTC through
 2026-06-15 09:11 UTC: decoded cursor time matches capture wall-clock to < 0.5 s in
 every case (max observed delta 0.5 s, median 0.2 s). No timezone-dependent offset.
-`flag` byte[6] (`00`/`03`) meaning unknown 🟡.
+`flag` byte[6] (`00`/`03`) meaning unknown 🟡 — see §5.6.1.
+
+#### 5.6.1 `byte[6]` = `DataSyncType` stream selector? (#99 — 🔴 hypothesis, needs the probe capture)
+The decompiled app (v3.2.1, blutter) classifies every metric with a 32-member **`DataSyncType`**
+enum; `hr`/`spo2`/`step`/`stand` are **`ringData`** (pulled from the ring, the app calls them
+`HrSync`/`Spo2Sync`/…) while `activity`/`stress`/`temperature` are **`serverData`** (cloud-computed).
+The all-day HR/SpO₂ the official app shows are these dedicated ring streams. `byte[6]` of the
+sync-open is the prime suspect for the per-stream selector; we have only ever sent **`0x00`**
+(default sleep/activity), so we never pull all-day HR/SpO₂.
+
+⚠️ The selector encoding and the HR/SpO₂ record byte-layout are **NOT statically recoverable**
+(blutter dropped the BLE transport/parser). They need a **capture**. The on-device probe
+(`RingSession.probeAllDayStreams` / `OpenRingKit.DataSyncProbe`, #99) gathers it: it sweeps the
+candidate `byte[6]` values and records each one's raw responses.
+
+**Why re-run the sweep now (the old §5.3 attempt was inconclusive):** that attempt used the
+far-future cursor `FF FF FF FF` (returns **no `0x82` ACK for any flag**) AND predated the auth crack
+(#54), so every open was silently dropped. The probe fixes both — a **real ≈now cursor** and **post-
+auth** — and adds the `off_2c` ring-data group (`0x0a/0x0b/…`) the old sweep never tried.
+
+| byte[6] | hypothesis | would select | role |
+|---|---|---|---|
+| `0x00` | enum-idx 0 | hr / **default** | 🟢 control (current sleep/activity open) |
+| `0x01` | enum-idx 1 | spo2 | 🔴 candidate |
+| `0x02` | enum-idx 2 | step | 🔴 candidate |
+| `0x03` | enum-idx 3 | temperature | 🟢 control (observed; also returns activity/sleep) |
+| `0x04` | enum-idx 4 | stand | 🔴 candidate |
+| `0x05` | off_2c | sleep | 🔴 candidate |
+| `0x06` | enum-idx 6 | activity (serverData → maybe empty) | 🔴 candidate |
+| `0x08` | — | prior-sweep value | 🔴 candidate |
+| **`0x0a`** | **off_2c** | **hr** | 🔴 **★ prime all-day HR candidate** |
+| **`0x0b`** | **off_2c** | **spo2** | 🔴 **★ prime all-day SpO₂ candidate** |
+| `0x0c` | off_2c / enum-idx 12 | step / stress | 🔴 candidate |
+| `0x0d` | off_2c / enum-idx 13 | stand / sleep | 🔴 candidate |
+
+**What the probe captures / what to look for:** a selector that returns a `0x82` ACK **plus an
+opcode the `0x00` control did not** (a "NOVEL" opcode) is the all-day stream — most likely a
+dedicated HR/SpO₂ response opcode, or a flag-tagged variant of `0x4c`. The probe advances the
+ring's resume pointer like a normal sync (each near-now open does, §3). **Decode target** (the
+record shape to ground-truth, from the decompiled tables, all 🔴 until matched against the app):
+- `HistoryHrSyncInfo(utcTs, pr, hrv, mov, resprate, actiCount, item2p5, movClass, measureResult,
+  measureSource, confidence, …)` — one all-day HR/HRV/RR/motion row per `utcTs`.
+- `HistorySpo2SyncInfo(utcTs, spo2, measureResult, …)` — per-interval all-day SpO₂.
 
 ### 5.7 `0x81` — status replies (← `0x01`)
 **`81 00 XX YY`** (← `01 00 00`): `[2]` is the only varying byte, full 8-bit range,

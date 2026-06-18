@@ -11,6 +11,13 @@ import Foundation
 public enum LiveHR {
     /// Below this, the sensor hasn't locked on (warm-up); treat as not-yet-valid.
     public static let minValidBPM = 30
+    /// Upper physiological ceiling for a single HR reading. Above this is a decode artifact,
+    /// not a real beat rate (the zone/max-HR formula tops out at 220 = 220 − age 0).
+    public static let maxValidBPM = 220
+    /// The plausible band a decoded HR must fall in to be treated as a real reading. Shared by
+    /// the live decoder AND the history/sleep-vitals decoder so a garbage epoch (e.g. byte[4]==4,
+    /// the cause of the impossible "Resting HR 4 bpm") can never become a persisted sample.
+    public static let validBPM = minValidBPM...maxValidBPM
 
     /// HR in bpm from a SHORT `15 00 <hr> …` frame, or nil (incl. long `15 01` frames,
     /// whose byte[2] is 0 — they carry SpO2, not HR).
@@ -19,9 +26,10 @@ public enum LiveHR {
         return Int(payload[2])
     }
 
-    /// HR only once the sensor has locked on (filters the warm-up sentinel).
+    /// HR only once the sensor has locked on AND within the plausible band (filters the warm-up
+    /// sentinel ≈ 8 and any over-ceiling decode artifact).
     public static func decodeLocked(_ payload: [UInt8]) -> Int? {
-        guard let hr = decode(payload), hr >= minValidBPM else { return nil }
+        guard let hr = decode(payload), validBPM.contains(hr) else { return nil }
         return hr
     }
 

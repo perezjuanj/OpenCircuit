@@ -172,6 +172,56 @@ final class WorkoutSessionTests: XCTestCase {
         XCTAssertEqual(summary.distanceMeters, 500)
     }
 
+    // MARK: - HR backfill (workout window) + distance-based active-energy fallback
+
+    func testBackfillMergesInWindowStoredHRDedupedByTimestamp() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let win = DateInterval(start: t0, end: t0.addingTimeInterval(600))
+        let captured = [HRSample(bpm: 120, start: t0.addingTimeInterval(100), end: t0.addingTimeInterval(102))]
+        let stored = [
+            HRSample(bpm: 80,  start: t0.addingTimeInterval(100)),  // same start as captured → captured wins
+            HRSample(bpm: 130, start: t0.addingTimeInterval(300)),  // in-window, new → added
+            HRSample(bpm: 60,  start: t0.addingTimeInterval(900)),  // out-of-window → ignored
+        ]
+        let merged = WorkoutHRBackfill.merge(captured: captured, stored: stored, window: win)
+        XCTAssertEqual(merged.map(\.bpm), [120, 130], "sorted by start; tie kept live 120; out-of-window dropped")
+    }
+
+    func testBackfillEmptyStoredLeavesCapturedUntouched() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let win = DateInterval(start: t0, end: t0.addingTimeInterval(600))
+        let captured = [HRSample(bpm: 120, start: t0.addingTimeInterval(100))]
+        XCTAssertEqual(WorkoutHRBackfill.merge(captured: captured, stored: [], window: win).map(\.bpm), [120])
+        XCTAssertTrue(WorkoutHRBackfill.merge(captured: [], stored: [], window: win).isEmpty,
+                      "empty stays empty — never fabricated")
+    }
+
+    func testAggregatorBackfillFeedsFinalize() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 30)
+        let win = DateInterval(start: t0, end: t0.addingTimeInterval(600))
+        agg.backfill([HRSample(bpm: 100, start: t0.addingTimeInterval(10), end: t0.addingTimeInterval(12)),
+                      HRSample(bpm: 140, start: t0.addingTimeInterval(20), end: t0.addingTimeInterval(22))],
+                     window: win)
+        let profile = UserProfile(age: 30, weightKg: 70, heightCm: 170, sex: .male)
+        let summary = agg.finalize(sport: .walkingOutdoor, endDate: t0.addingTimeInterval(600),
+                                   distanceMeters: nil, hasRoute: false, profile: profile)
+        XCTAssertEqual(summary.hrSampleCount, 2)
+        XCTAssertEqual(summary.avgHR, 120)   // (100+140)/2
+        XCTAssertEqual(summary.maxHR, 140)
+    }
+
+    func testDistanceFallbackActiveKcalWhenNoHR() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 30)   // no HR captured
+        let profile = UserProfile(age: 30, weightKg: 70, heightCm: 170, sex: .male)
+        let summary = agg.finalize(sport: .walkingOutdoor, endDate: t0.addingTimeInterval(1800),
+                                   distanceMeters: 2000, hasRoute: true, profile: profile)
+        XCTAssertNil(summary.avgHR, "no HR was captured")
+        // 2 km × 70 kg × 0.5 = 70 kcal — an honest distance estimate instead of nil/--.
+        XCTAssertEqual(summary.estimatedActiveKcal!, 70.0, accuracy: 0.001)
+    }
+
     func testAggregatorSportTypeAndDatePassThrough() {
         let start = Date(timeIntervalSince1970: 1_000_000)
         let end   = Date(timeIntervalSince1970: 1_003_600)

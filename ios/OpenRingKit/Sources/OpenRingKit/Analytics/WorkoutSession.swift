@@ -300,6 +300,13 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
         samples.append(sample)
     }
 
+    /// Merge real HR the ring already has for this workout's window (e.g. surfaced by a history
+    /// sync) into the captured set, de-duplicating by timestamp. NEVER interpolates or fabricates
+    /// — when the store has nothing for the window the captured samples are left untouched (#45).
+    public func backfill(_ stored: [HRSample], window: DateInterval) {
+        samples = WorkoutHRBackfill.merge(captured: samples, stored: stored, window: window)
+    }
+
     /// Produce the final `WorkoutSummary`. Safe to call with zero samples — all HR
     /// fields will be nil rather than fabricated.
     public func finalize(
@@ -313,10 +320,11 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
         let maxHRValue: Int?
         let estimatedKcal: Double?
 
+        let hrKcal: Double?
         if samples.isEmpty {
             avgHR = nil
             maxHRValue = nil
-            estimatedKcal = nil
+            hrKcal = nil
         } else {
             let sum = samples.reduce(0) { $0 + $1.bpm }
             avgHR = sum / samples.count
@@ -328,8 +336,17 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
                 maxHR: formulaMaxHR,
                 restingHR: Calories.defaultRestingHR
             )
-            estimatedKcal = trimp.map { $0 * Calories.trimpKcalFactor }
+            hrKcal = trimp.map { $0 * Calories.trimpKcalFactor }
         }
+        // Distance-based active-energy fallback: a GPS walk/run/hike/cycle whose HR never locked
+        // (the live-HR path rarely locks in motion, #45) would otherwise show "--" active calories.
+        // Estimate from the measured GPS distance + body mass instead (clearly labeled an estimate),
+        // and surface the LARGER of the HR-TRIMP and distance estimates. nil only when NEITHER a
+        // dense-enough HR series nor a distance exists — never fabricated.
+        let distKcal = (distanceMeters ?? 0) > 0
+            ? Calories.activeKcalFromDistance(meters: distanceMeters!, profile: profile)
+            : nil
+        estimatedKcal = [hrKcal, distKcal].compactMap { $0 }.max()
 
         let zones = HRZoneClassifier.timeInZones(hrSamples: samples, maxHR: formulaMaxHR)
         return WorkoutSummary(
@@ -349,4 +366,22 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
 
     /// All samples collected so far (for HealthKit HR series write).
     public var collectedSamples: [HRSample] { samples }
+}
+
+// MARK: - HR backfill
+
+/// Pure merge of real stored HR into a workout's captured HR, for filling a workout window from
+/// the ring's own on-device record when the live poll missed it (#45). The DURABLE source is the
+/// all-day HR stream decode (#99); until that lands this is typically empty for daytime windows,
+/// and that empty result is preserved — never interpolated or fabricated (CLAUDE.md).
+public enum WorkoutHRBackfill {
+    /// Captured + in-window stored HR, de-duplicated by `start` timestamp (captured/live wins on a
+    /// tie), sorted ascending. Stored samples outside `window` are ignored.
+    public static func merge(captured: [HRSample], stored: [HRSample],
+                             window: DateInterval) -> [HRSample] {
+        var byStart: [Date: HRSample] = [:]
+        for s in stored where window.contains(s.start) { byStart[s.start] = s }
+        for s in captured { byStart[s.start] = s }   // captured (live) wins on an exact-timestamp tie
+        return byStart.values.sorted { $0.start < $1.start }
+    }
 }

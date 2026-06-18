@@ -102,6 +102,26 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(Calories.activeKcal(hrSamples: samples, maxHR: 180), 150.0, accuracy: 0.001)
     }
 
+    // Step/distance-derived active-energy ESTIMATE (the "0 active calories" fix): a day with
+    // walking, or a workout whose HR never locked, still reports honest active calories instead
+    // of 0 — derived (not a sensor reading), labeled an estimate at every write/display site.
+    func testActiveKcalFromDistance() {
+        let profile = UserProfile(age: 30, weightKg: 70, heightCm: 180, sex: .male)
+        // 2 km × 70 kg × 0.5 kcal·kg⁻¹·km⁻¹ = 70 kcal.
+        XCTAssertEqual(Calories.activeKcalFromDistance(meters: 2000, profile: profile), 70.0, accuracy: 0.001)
+        XCTAssertEqual(Calories.activeKcalFromDistance(meters: 0, profile: profile), 0.0, accuracy: 0.001)
+        XCTAssertEqual(Calories.activeKcalFromDistance(meters: -5, profile: profile), 0.0, accuracy: 0.001)
+    }
+
+    func testActiveKcalFromStepsNonZeroForWalk() {
+        let profile = UserProfile(age: 30, weightKg: 70, heightCm: 180, sex: .male)
+        let kcal = Calories.activeKcalFromSteps(steps: 5_000, profile: profile)
+        let expectedKm = DistanceEstimate.meters(steps: 5_000, profile: profile) / 1000.0
+        XCTAssertEqual(kcal, expectedKm * 70 * 0.5, accuracy: 0.001)
+        XCTAssertGreaterThan(kcal, 0, "a 5000-step walk must yield nonzero active calories")
+        XCTAssertEqual(Calories.activeKcalFromSteps(steps: 0, profile: profile), 0.0, accuracy: 0.001)
+    }
+
     // MARK: Sleep score (sleep.rs)
 
     func testSleepScore() {

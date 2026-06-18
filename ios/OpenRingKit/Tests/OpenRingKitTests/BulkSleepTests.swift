@@ -199,6 +199,36 @@ final class BulkSleepTests: XCTestCase {
         XCTAssertEqual(r.hrvRMSSD, 77)
     }
 
+    // MARK: HR physiological band (the "Resting HR 4 bpm" bug)
+    //
+    // The history/sleep decoder previously returned any raw[4] > 0 as HR, so a garbage epoch
+    // (byte[4]==4) became a 4 bpm sample that surfaced as an impossible Resting HR and depressed
+    // the sleep score / per-stage HR / Apple Health mirror. HR is now band-guarded (LiveHR.validBPM,
+    // 30…220) at the single decode choke point; HRV/SpO2/RR of the same epoch are unaffected.
+
+    func testHeartRateRejectsSubPhysiologicalValue() {
+        var b = hex(deepSleepRec); b[4] = 4
+        let r = BulkRecord(b)!
+        XCTAssertEqual(r.layout, .sleepVitals)
+        XCTAssertNil(r.heartRate, "4 bpm is below the 30 bpm physiological floor")
+        let samples = BulkSleep.samples(from: [r])
+        XCTAssertTrue(samples.filter { $0.kind == .heartRate }.isEmpty,
+                      "sub-floor HR must not become a persisted sample")
+        XCTAssertTrue(Set(samples.map(\.kind)).isSuperset(of: [.hrvSDNN, .spo2]),
+                      "HRV/SpO2 of the same epoch still decode")
+    }
+
+    func testHeartRateBandBoundaries() {
+        var hi = hex(deepSleepRec); hi[4] = 240          // > 220 ceiling → dropped
+        XCTAssertNil(BulkRecord(hi)!.heartRate)
+        var below = hex(deepSleepRec); below[4] = 29     // just below the 30 floor → dropped
+        XCTAssertNil(BulkRecord(below)!.heartRate)
+        var loEdge = hex(deepSleepRec); loEdge[4] = 30   // 30 floor inclusive
+        XCTAssertEqual(BulkRecord(loEdge)!.heartRate, 30)
+        var hiEdge = hex(deepSleepRec); hiEdge[4] = 220  // 220 ceiling inclusive
+        XCTAssertEqual(BulkRecord(hiEdge)!.heartRate, 220)
+    }
+
     // MARK: #41 — wear gate WIRED through BulkSleep.sleepSegments / mainSleep
     //
     // SleepDetection's temperature path is covered in SleepDetectionTests; these assert the

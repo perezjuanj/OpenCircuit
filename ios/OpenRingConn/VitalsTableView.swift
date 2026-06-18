@@ -21,6 +21,11 @@ struct VitalsTableView: View {
     /// Temperature samples over the last few days — narrowed in memory to the precise night
     /// window for the overnight average (the exact window depends on async @State).
     @Query private var recentTemp: [StoredSample]
+    /// Nightly metric samples (HRV + Respiratory Rate) over the last few days — narrowed in memory
+    /// to the night window for the overnight MEAN shown in the HRV/RR rows, so the Vitals figure
+    /// matches the Sleep card's (it previously showed the single newest epoch). Bounded like
+    /// recentHR/recentTemp (#32).
+    @Query private var recentHRV: [StoredSample]
     /// Latest persisted sleep summary (capped at 1). The sleep BREAKDOWN now lives in the
     /// dedicated SleepCardView; this query is retained only to bound the skin-temp night window
     /// (`nightWindow`) to the most recent night's actual onset/wake span.
@@ -73,6 +78,12 @@ struct VitalsTableView: View {
         _recentTemp = Query(FetchDescriptor<StoredSample>(
             predicate: #Predicate { $0.kindRaw == temp && $0.start > tempLookback && $0.value > 0 },
             sortBy: [SortDescriptor(\.start, order: .reverse)]))
+        // Nightly metrics (HRV + RR) over the last few days, narrowed to the night window in memory
+        // for the overnight mean (matches the Sleep card). Same bounded pattern as recentTemp.
+        let nightlyLookback = hourStart.addingTimeInterval(-Self.tempWindowDays * 86_400)
+        _recentHRV = Query(FetchDescriptor<StoredSample>(
+            predicate: #Predicate { ($0.kindRaw == hrv || $0.kindRaw == rr) && $0.start > nightlyLookback && $0.value > 0 },
+            sortBy: [SortDescriptor(\.start, order: .reverse)]))
 
         var sleepDesc = FetchDescriptor<StoredSleepSummary>(
             sortBy: [SortDescriptor(\.night, order: .reverse)])
@@ -87,7 +98,9 @@ struct VitalsTableView: View {
     /// `start`) is index-friendly so it can use a composite index if one is added later. (#32)
     private static func latestDescriptor(_ kindRaw: String) -> FetchDescriptor<StoredSample> {
         var d = FetchDescriptor<StoredSample>(
-            predicate: #Predicate { $0.kindRaw == kindRaw },
+            // `value > 0` so a 0-bpm/0-value placeholder (e.g. an EpochSync HR placeholder) can't
+            // become the displayed "latest" reading (it would render as "0 bpm").
+            predicate: #Predicate { $0.kindRaw == kindRaw && $0.value > 0 },
             sortBy: [SortDescriptor(\.start, order: .reverse)])
         d.fetchLimit = 1
         return d
@@ -148,13 +161,46 @@ struct VitalsTableView: View {
     /// sync lowers it immediately rather than waiting for a manual reading. (#32, #67)
     private var restingHR: Int? {
         let dayAgo = Date().addingTimeInterval(-86_400)
-        var lows = recentHR.map(\.value)
+        // Band-guard both sources to physiologically-plausible HR (LiveHR.validBPM, 30…220) so a
+        // stray out-of-band sample — a garbage 4 bpm epoch, or a not-yet-purged legacy row — can't
+        // become the displayed "Resting HR" (the impossible "4 bpm" bug). Defence in depth: the
+        // decoder now blocks these at the source and a one-time purge clears existing ones.
+        func plausible(_ v: Double) -> Bool { LiveHR.validBPM.contains(Int(v)) }
+        var lows = recentHR.map(\.value).filter(plausible)
         if let samples = session?.historySamples {
             lows += samples
-                .filter { $0.kind == .heartRate && $0.value > 0 && $0.start > dayAgo }
+                .filter { $0.kind == .heartRate && plausible($0.value) && $0.start > dayAgo }
                 .map(\.value)
         }
         return lows.min().map { Int($0) }
+    }
+
+    /// Overnight MEAN of a nightly metric (HRV / Respiratory Rate) over the most recent night's
+    /// in-bed window — the SAME value the Sleep card shows (via `OvernightAverages`), so the two
+    /// can't disagree (the cause of "HRV 86 ms in Vitals vs 64 ms in Sleep": Vitals showed the
+    /// single newest epoch, Sleep the overnight mean). nil when there's no usable night window or
+    /// no in-window samples, so the row falls back to "—" exactly like the Sleep card's empty state.
+    private func overnightMean(_ kind: MetricKind) -> Double? {
+        guard let s = storedSleep.first, s.asleepMin > 0,
+              s.inBedStart > .distantPast, s.inBedEnd > s.inBedStart else { return nil }
+        let window = DateInterval(start: s.inBedStart, end: s.inBedEnd)
+        let raw = kind.rawValue
+        let points = recentHRV
+            .filter { $0.kindRaw == raw }
+            .map { OvernightAverages.Point(value: $0.value, start: $0.start) }
+        return OvernightAverages.mean(points, window: window)
+    }
+
+    /// A nightly-metric row whose value is the overnight MEAN (HRV / Respiratory Rate). Value AND
+    /// caption derive from the SAME source: when there's no overnight mean the value shows "—" and
+    /// the caption shows "after overnight sync" — so a stray latest-epoch timestamp can't pair a
+    /// dated caption with an empty value.
+    @ViewBuilder
+    private func nightlyMeanRow(_ label: String, _ kind: MetricKind,
+                               _ fmt: (Double) -> String) -> some View {
+        let mean = overnightMean(kind)
+        row(label, value: mean.map(fmt) ?? "—",
+            time: mean == nil ? "after overnight sync" : (nightlyWhen(kind) ?? "after overnight sync"))
     }
 
     var body: some View {
@@ -171,16 +217,14 @@ struct VitalsTableView: View {
             // Sleep-derived rows: caption "after overnight sync" on each bare "—" row so the
             // user understands WHY they're empty, rather than seeing a bare dash with no context.
             // The full explanation lives in the dedicated Sleep card's empty state below. (#58)
-            row("HRV", value: valueText(.hrvSDNN) { "\(Int($0)) ms" },
-                time: nightlyWhen(.hrvSDNN) ?? "after overnight sync")
+            nightlyMeanRow("HRV", .hrvSDNN) { "\(Int($0.rounded())) ms" }
             divider
             row("Resting HR", value: restingHR.map { "\($0) bpm" } ?? "—",
                 time: restingHR == nil ? "after overnight sync" : nil)
             divider
             row("Steps (today)", value: stepsText, time: stepsTime)
             divider
-            row("Respiratory Rate", value: valueText(.respiratoryRate) { String(format: "%.1f /min", $0) },
-                time: nightlyWhen(.respiratoryRate) ?? "after overnight sync")
+            nightlyMeanRow("Respiratory Rate", .respiratoryRate) { String(format: "%.1f /min", $0) }
         }
         .padding(.vertical, 4)
         // Resolve the (async) sleep-schedule window once the view appears. The selector
@@ -270,9 +314,11 @@ struct VitalsTableView: View {
                     .symbolEffect(.pulse, isActive: active)
             }
             .buttonStyle(.plain)
-            // Disable while a sync holds the link, OR when the ring isn't streaming (#54) — a
-            // measure would only spin until timeout; the activation hint tells the user what to do.
-            .disabled(session?.syncing == true || session?.notStreaming == true)
+            // Disable while a sync OR a #99 stream probe holds the link, OR when the ring isn't
+            // streaming (#54) — a measure would only spin until timeout; the activation hint tells
+            // the user what to do.
+            .disabled(session?.syncing == true || session?.notStreaming == true
+                      || session?.probing == true)
         }
     }
 

@@ -13,6 +13,9 @@ struct OpenRingConnApp: App {
                 // (the data already lives in Apple Health; rollups are kept). Runs off the launch
                 // path, never per write — see LocalStore.pruneExpiredSamples. (#32)
                 .task { OpenRingConnApp.pruneExpiredSamplesAtLaunch(container) }
+                // One-time scrub of out-of-band heart-rate samples persisted before the decoder
+                // band-guard (the "Resting HR 4 bpm" bug). Gated so it scans at most once.
+                .task { OpenRingConnApp.purgeImplausibleHeartRateOnce(container) }
         }
         .modelContainer(container)
     }
@@ -84,6 +87,19 @@ struct OpenRingConnApp: App {
     @MainActor
     static func pruneExpiredSamplesAtLaunch(_ container: ModelContainer) {
         try? LocalStore(container.mainContext).pruneExpiredSamples()
+    }
+
+    /// Run the one-time out-of-band heart-rate scrub (`LocalStore.purgeImplausibleHeartRate`) at
+    /// most once, gated by a UserDefaults flag so it doesn't scan on every launch (#32). Best-
+    /// effort: a failure leaves the flag unset so it retries next launch, and never blocks the UI.
+    private static let hrPurgeDoneKey = "store.purgedImplausibleHR.v1"
+    @MainActor
+    static func purgeImplausibleHeartRateOnce(_ container: ModelContainer) {
+        guard !UserDefaults.standard.bool(forKey: hrPurgeDoneKey) else { return }
+        do {
+            _ = try LocalStore(container.mainContext).purgeImplausibleHeartRate()
+            UserDefaults.standard.set(true, forKey: hrPurgeDoneKey)
+        } catch { /* leave the flag unset so it retries next launch */ }
     }
 
     /// Delete the SQLite store plus its `-shm`/`-wal` sidecar files.

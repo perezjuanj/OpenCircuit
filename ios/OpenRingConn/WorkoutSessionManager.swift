@@ -165,6 +165,16 @@ final class WorkoutSessionManager: NSObject {
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
 
+        // Capture any REAL HR the ring already surfaced (e.g. epochs drained during this session)
+        // so it can backfill the workout window below. The live poll often can't lock HR while
+        // moving (#45); this fills from on-device data when present. Empty stays empty — never
+        // interpolated. NOTE: history-stream HR comes only from still/sleep-vitals epochs (active-
+        // movement epochs carry no HR field), so for an in-motion walk this is usually a no-op —
+        // the durable source for continuous workout HR is the all-day HR stream decode (#99).
+        let backfillHR: [HRSample] = (session?.historySamples ?? [])
+            .filter { $0.kind == .heartRate }
+            .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+
         // Stop the ring's live monitoring.
         session?.stopLiveMonitoring()
         session = nil
@@ -180,6 +190,13 @@ final class WorkoutSessionManager: NSObject {
         guard let agg = aggregator else {
             recordingState = .error("No session data")
             return
+        }
+
+        // Backfill the workout window with any real in-window stored HR before finalizing, so
+        // avg/max HR + zones reflect on-device data the live poll missed. No-op (preserved) when
+        // the store has nothing for the window. Captured live samples win on a timestamp tie.
+        if let start = sessionStart {
+            agg.backfill(backfillHR, window: DateInterval(start: start, end: max(endDate, start)))
         }
 
         let hasRoute = !routeLocations.isEmpty && selectedSport.isOutdoor
@@ -316,7 +333,9 @@ final class WorkoutSessionManager: NSObject {
             try? await builder.addSamples(hkHRSamples)
         }
 
-        // Add active energy (ESTIMATE — TRIMP-based, labeled in metadata)
+        // Add active energy (ESTIMATE — HR-TRIMP or, when HR didn't lock, a distance estimate;
+        // labeled in metadata). The daily step/distance active-energy estimate nets this out via
+        // the foot-distance recorded below, so it isn't double-counted in Health's Move total.
         if let kcal = summary.estimatedActiveKcal, kcal > 0 {
             let energyType = HKQuantityType(.activeEnergyBurned)
             let q = HKQuantity(unit: .kilocalorie(), doubleValue: kcal)
@@ -331,7 +350,8 @@ final class WorkoutSessionManager: NSObject {
         // Add distance (GPS — only for outdoor with route). Pick the correct HK type by sport:
         // cycling → .distanceCycling; walking/running/hiking → .distanceWalkingRunning. Writing
         // a cycling ride to the walk/run type would pollute that total (and never show as cycling
-        // distance).
+        // distance). Defer the daily-estimate netting record until the workout actually COMMITS.
+        var walkRunDistanceToCredit = 0.0
         if let dist = summary.distanceMeters, dist > 0, summary.hasRoute {
             let isCycling = summary.sport == .cyclingOutdoor
             let distType = HKQuantityType(isCycling ? .distanceCycling : .distanceWalkingRunning)
@@ -341,11 +361,7 @@ final class WorkoutSessionManager: NSObject {
                 start: summary.startDate, end: summary.endDate,
                 metadata: [HKMetadataKeyWasUserEntered: false])
             try? await builder.addSamples([distSample])
-            // Record foot-based GPS distance so the daily steps×stride estimate nets it out and
-            // doesn't double-count this window in Health's Walking + Running Distance total.
-            if !isCycling {
-                HealthKitWriter.recordWorkoutWalkRunDistance(dist)
-            }
+            if !isCycling { walkRunDistanceToCredit = dist }
         }
 
         // End collection and finish workout
@@ -358,6 +374,14 @@ final class WorkoutSessionManager: NSObject {
             guard let finished = try await builder.finishWorkout() else { return }
             workout = finished
         } catch { return }
+
+        // Workout is now COMMITTED to Health — only NOW record its foot-based GPS distance so the
+        // daily steps×stride distance + active-energy estimates net out exactly what was written
+        // (recording before finishWorkout would phantom-net a workout that failed to save, leaving
+        // Health permanently under-counted for the day).
+        if walkRunDistanceToCredit > 0 {
+            HealthKitWriter.recordWorkoutWalkRunDistance(walkRunDistanceToCredit)
+        }
 
         // Write GPS route if available
         if !routeLocations.isEmpty, summary.hasRoute {

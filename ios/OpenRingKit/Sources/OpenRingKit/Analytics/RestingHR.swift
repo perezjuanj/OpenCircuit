@@ -30,6 +30,11 @@ public enum RestingHR {
         window: TimeInterval = sustainedWindow,
         minSleepSamples: Int = minSleepSamples
     ) -> Double? {
+        // Drop physiologically-impossible readings (LiveHR.validBPM, 30…220) before deriving a
+        // resting value — so a stray garbage epoch (the "4 bpm" bug) or a not-yet-purged legacy row
+        // can't become the daily resting HR written to Apple Health. The lowest-sustained fallback
+        // takes a raw minimum, which is exactly where an unfiltered 4 bpm would otherwise win.
+        let hr = hr.filter { LiveHR.validBPM.contains($0.bpm) }
         if let asleepMean = sleepMean(hr: hr, sleep: sleep, minSleepSamples: minSleepSamples) {
             return asleepMean
         }

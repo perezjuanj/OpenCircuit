@@ -540,6 +540,7 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .disabled(session?.ready != true || session?.syncing == true
                       || session?.monitoring == true        // stop live before syncing
+                      || session?.probing == true           // a #99 stream probe owns the link
                       || session?.notStreaming == true)     // a not-streaming ring would sync nothing (#54)
 
             if session?.monitoring == true {
@@ -619,14 +620,61 @@ struct ContentView: View {
     private var debugCard: some View {
         card {
             DisclosureGroup(isExpanded: $showDebug) {
-                Text(session?.lastFrame ?? "no frames yet")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 4)
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(session?.lastFrame ?? "no frames yet")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
+                    Divider()
+                    allDayProbeSection
+                }
             } label: {
                 Text("Debug — last frame").font(.subheadline.weight(.medium))
+            }
+        }
+    }
+
+    /// #99 — on-device probe for the all-day HR/SpO₂ sync streams. Sweeps the `0x02` sync-open
+    /// `byte[6]` (DataSyncType) selector and shows each selector's raw responses so the wire format
+    /// can be ground-truthed. A capture/RE aid (the values are NOT decoded into health metrics yet).
+    private var allDayProbeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("All-day HR/SpO₂ stream probe (#99)").font(.subheadline.weight(.medium))
+            Text("Sweeps the sync-open byte[6] selector to find the HrSync/Spo2Sync stream. Pauses live/sync for ~45 s; read the per-selector opcodes below (a NOVEL opcode is the all-day stream).")
+                .font(.caption2).foregroundStyle(.secondary)
+            Button {
+                session?.probeAllDayStreams()
+            } label: {
+                Label(session?.probing == true ? "Probing…" : "Probe all-day streams",
+                      systemImage: "antenna.radiowaves.left.and.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(session?.ready != true || session?.probing == true
+                      || session?.syncing == true || session?.monitoring == true
+                      || session?.notStreaming == true)
+            if let report = session?.probeReport {
+                Text(report)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            ForEach(session?.probeResults ?? []) { r in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(String(format: "0x%02x", r.selector) + (r.sawAck ? " ACK✓" : " no-ACK")
+                         + " · op[" + r.opcodes.map { String(format: "%02x", $0) }.joined(separator: " ") + "]")
+                        .font(.caption2.monospaced().weight(.medium))
+                    // Every captured raw frame (up to the cap) — for a novel HR/SpO₂ stream this is
+                    // the record-byte evidence to ground-truth, so show them all, not just the first.
+                    ForEach(Array(r.sampleFrames.enumerated()), id: \.offset) { _, frame in
+                        Text(frame).font(.system(size: 9).monospaced()).foregroundStyle(.secondary)
+                    }
+                }
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -709,6 +757,8 @@ struct CaloriesCardView: View {
     /// Today's HR samples (for the active-calorie TRIMP estimate). Predicate-limited to
     /// heart rate since start-of-day so the fetch stays small.
     @Query private var hrSamples: [StoredSample]
+    /// Today's step rollup — drives the step/distance active-calorie fallback when HR is sparse.
+    @Query private var todayDaily: [StoredDaily]
 
     init() {
         let hr = MetricKind.heartRate.rawValue
@@ -716,6 +766,7 @@ struct CaloriesCardView: View {
         _hrSamples = Query(
             filter: #Predicate { $0.kindRaw == hr && $0.start >= dayStart },
             sort: \.start)
+        _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
     }
 
     private var profile: UserProfile {
@@ -730,11 +781,14 @@ struct CaloriesCardView: View {
         let fraction = Date().timeIntervalSince(dayStart) / 86_400
         return Calories.bmrKcalPerDay(profile: profile) * fraction
     }
-    /// Active kcal from today's measured HR (0 until HR is measured — it's sparse, so this
-    /// is a rough floor, not a continuous-wear estimate).
+    /// Active kcal today — the larger of the HR-TRIMP estimate (sparse; ~0 without dense HR) and a
+    /// step/distance estimate, so a day with walking still shows honest active calories instead of
+    /// 0. Both are clearly-labeled estimates (the ring transmits no active-energy value).
     private var activeToday: Double {
         let samples = hrSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        return Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
+        let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
+        let stepKcal = Calories.activeKcalFromSteps(steps: todayDaily.first?.steps ?? 0, profile: profile)
+        return max(hrKcal, stepKcal)
     }
 
     var body: some View {
@@ -751,7 +805,10 @@ struct CaloriesCardView: View {
             }
             Text("resting \(Int(restingToday.rounded())) · active \(Int(activeToday.rounded()))")
                 .font(.caption).foregroundStyle(.secondary)
-            Text("BMR \(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day · max HR \(maxHR) bpm")
+            // "max HR" here is the 220−age zone/calorie reference, NOT an observed peak — so it's
+            // constant by design. Label it as an age estimate so it doesn't read as a live "max HR"
+            // stat that looks stuck day to day.
+            Text("BMR \(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day · est. max HR \(maxHR) bpm (220−age)")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

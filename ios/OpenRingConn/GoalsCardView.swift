@@ -22,8 +22,11 @@ struct GoalsCardView: View {
     @AppStorage(GoalDefaults.workdaySleepMin) private var workdaySleepMin = GoalDefaults.defaultWorkdaySleepMin
     @AppStorage(GoalDefaults.weekendSleepMin) private var weekendSleepMin = GoalDefaults.defaultWeekendSleepMin
 
-    // Profile (for maxHR → exercise threshold)
+    // Profile (for maxHR → exercise threshold, and the step/distance active-calorie estimate)
     @AppStorage("userProfile.age") private var age = 35
+    @AppStorage("userProfile.weightKg") private var weightKg = 70.0
+    @AppStorage("userProfile.heightCm") private var heightCm = 170.0
+    @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
 
     // MARK: Data queries (bounded — no unbounded fetches)
     /// Today's step rollup.
@@ -62,10 +65,18 @@ struct GoalsCardView: View {
 
     private var currentSteps: Int { todayDaily.first?.steps ?? 0 }
 
+    private var profile: UserProfile {
+        UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
+                    sex: BiologicalSex(rawValue: sexRaw) ?? .male)
+    }
+
+    /// Active kcal today — the larger of the HR-TRIMP estimate (sparse; ~0 without dense HR) and a
+    /// step/distance estimate, so a day with walking still shows nonzero active calories. Estimate.
     private var currentActiveKcal: Double {
         let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        let maxHR = max(220 - age, 1)
-        return Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
+        let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: max(220 - age, 1))
+        let stepKcal = Calories.activeKcalFromSteps(steps: currentSteps, profile: profile)
+        return max(hrKcal, stepKcal)
     }
 
     private var currentActivityMin: Double {
@@ -123,7 +134,7 @@ struct GoalsCardView: View {
                          goal: formatDuration(sleepGoalMin),
                          color: .purple)
             }
-            Text("\u{B9} Active calories & activity minutes are estimates derived from heart rate (Edwards-TRIMP / elevated-HR threshold). Full accuracy follows the ring activity-payload decode.")
+            Text("\u{B9} Active calories & activity minutes are estimates (active kcal from heart rate where available, else steps × distance; minutes from an elevated-HR threshold). Full accuracy follows the ring activity-payload decode.")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
