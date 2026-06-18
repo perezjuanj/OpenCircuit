@@ -13,7 +13,9 @@
 // Two record layouts, keyed on byte [8]:
 //   • Sleep-vitals epoch ([8] in 0x57…0x63): [4]=HR bpm 🟢, [5]=HRV/RMSSD ms 🟢,
 //     [8]=SpO2 % 🟢, [10:15]=motion. [6]/[7] unresolved 🟡.
-//   • Activity/awake epoch ([8]=0x12/0x13): activity payload in [15:22] 🟡.
+//   • Activity/awake epoch ([8]=0x12/0x13): [4]=HR bpm 🟢 (ALL-DAY HR — same head as sleep;
+//     confirmed 2026-06-17 by sleep↔activity continuity across all captures, ±4.6 bpm / corr +0.76),
+//     [10:15]=motion, activity payload in [15:22] 🟡 (#93). No valid HRV/SpO2 under motion.
 // Respiratory rate + skin temp are NOT per-epoch (derived/summary). Sleep stages are
 // not on the wire — compute them in Swift (Analytics/SleepDetection), per Phase 5.
 //
@@ -76,13 +78,19 @@ public struct BulkRecord: Equatable {
         return .sleepVitals
     }
 
-    /// Heart rate in bpm — `[4]` on a sleep-vitals epoch (🟢). nil otherwise, when 0, or when the
-    /// byte is outside the physiological band (`LiveHR.validBPM`, 30…220). This band guard is the
-    /// single choke point every history/sleep HR sample flows through: it stops a garbage epoch
-    /// (e.g. byte[4]==4) from becoming a sample, which previously surfaced as an impossible
-    /// "Resting HR 4 bpm" and depressed the sleep score / per-stage HR / Apple Health mirror.
+    /// Heart rate in bpm — `[4]` on ANY worn epoch (🟢). This is the ALL-DAY HR: byte[4] carries
+    /// HR on BOTH sleep-vitals AND activity/awake epochs (the same head layout `[4]=HR, [5]=HRV`;
+    /// only `[8]` differs — SpO2 vs the `0x12/0x13` activity tag). Confirmed 2026-06-17 by aligning
+    /// every capture's worn 0x4c epochs: across 204 sleep↔activity transitions, activity `[4]`
+    /// tracks the neighbouring sleep HR to within 4.6 bpm (corr +0.76) and forms ONE continuous
+    /// series across layout boundaries (e.g. the 08:41–11:56 worn run). We previously gated this to
+    /// sleep-vitals only, discarding all daytime/active HR — the root of "no daytime/workout HR",
+    /// sparse-HR active calories, and thin resting-HR coverage (#45/#38).
+    /// nil for the idle (unworn) template — its `[4]==0x05` is rejected by the band below anyway —
+    /// and for any byte outside the physiological band (`LiveHR.validBPM`, 30…220), which also stops
+    /// a garbage epoch (the impossible "Resting HR 4 bpm") from becoming a sample.
     public var heartRate: Int? {
-        guard layout == .sleepVitals else { return nil }
+        guard layout != .idle else { return nil }
         let hr = Int(raw[4])
         return LiveHR.validBPM.contains(hr) ? hr : nil
     }
@@ -230,13 +238,15 @@ public enum BulkSleep {
         SleepStaging.classify(from: Self.records(records, within: hint, epoch: epoch), epoch: epoch)
     }
 
-    /// HR / HRV / SpO2 samples from sleep-vitals epochs, with device timestamps.
-    /// SpO2 is emitted as a 0…1 fraction (HealthKit oxygenSaturation). HRV is the
-    /// ring's RMSSD value written to the SDNN type (unit-compatible; see mapping).
+    /// HR / HRV / SpO2 / RR samples from worn epochs, with device timestamps. Iterates ALL
+    /// records (not just sleep-vitals) so ALL-DAY HR from activity/awake epochs (byte[4], 🟢) is
+    /// emitted too — the per-field accessors gate the rest: HRV/SpO2/RR stay sleep-vitals-only and
+    /// the idle template yields nothing. SpO2 is a 0…1 fraction (HealthKit oxygenSaturation); HRV is
+    /// the ring's RMSSD written to the SDNN type (unit-compatible; see mapping).
     public static func samples(from records: [BulkRecord],
                                epoch: Int = Command.syncEpoch) -> [QuantitySample] {
         var out: [QuantitySample] = []
-        for r in records where r.layout == .sleepVitals {
+        for r in records {
             let t = r.date(epoch: epoch)
             if let hr = r.heartRate {
                 out.append(QuantitySample(kind: .heartRate, start: t, value: Double(hr)))
