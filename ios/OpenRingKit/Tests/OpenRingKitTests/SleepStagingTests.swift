@@ -192,4 +192,79 @@ final class SleepStagingTests: XCTestCase {
         XCTAssertEqual(BulkSleep.stagedSegments(from: recs), SleepStaging.classify(from: recs),
                        "BulkSleep.stagedSegments is a thin wrapper over SleepStaging.classify")
     }
+
+    // MARK: - Issue #15 — all HealthKit sleep-analysis stage values (#15)
+
+    /// `stagedSegments` must produce every stage value required by issue #15:
+    /// `inBed`, `asleepCore` (light), `asleepDeep`, `asleepREM`, `awake`.
+    /// HEALTHKIT_MAPPING.md: `HKCategoryType(.sleepAnalysis)` with these values.
+    /// Uses a 5-cycle night (Deep troughs, REM peaks, brief awakenings) that exercises
+    /// all four asleep stages plus the enclosing inBed span.
+    func testStagedSegmentsProduceAllFiveHealthKitStages() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8  { recs.append(arec(c)); c += step }               // sleep onset (awake)
+        for _ in 0..<5 {
+            for _ in 0..<10 { recs.append(vrec(c, hr: 57, hrv: 55)); c += step }   // Light/core
+            for _ in 0..<8  { recs.append(vrec(c, hr: 50, hrv: 65)); c += step }   // Deep
+            for _ in 0..<8  { recs.append(vrec(c, hr: 57, hrv: 55)); c += step }   // Light/core
+            for _ in 0..<10 { recs.append(vrec(c, hr: 65, hrv: 40)); c += step }   // REM (elevated)
+            for _ in 0..<2  { recs.append(arec(c, motion: 0x15)); c += step }      // brief Awake
+        }
+        for _ in 0..<8  { recs.append(arec(c)); c += step }               // wake-up (awake)
+
+        let segs = BulkSleep.stagedSegments(from: recs)
+        XCTAssertFalse(segs.isEmpty, "staged segments must be produced")
+
+        let present = Set(segs.map(\.stage))
+        XCTAssertTrue(present.contains(.inBed),      "#15: inBed span required")
+        XCTAssertTrue(present.contains(.asleepCore),  "#15: asleepCore (light) required")
+        XCTAssertTrue(present.contains(.asleepDeep),  "#15: asleepDeep required")
+        XCTAssertTrue(present.contains(.asleepREM),   "#15: asleepREM required")
+        XCTAssertTrue(present.contains(.awake),       "#15: awake required")
+    }
+
+    /// `SleepStage.allCases` must cover all five values expected by HEALTHKIT_MAPPING.md.
+    /// This is a compile-time-checkable structural guard: if a new case is added (or one
+    /// renamed), the test breaks, forcing the HealthKitWriter mapping to be updated too.
+    func testSleepStageEnumCoversAllHealthKitValues() {
+        let required: Set<SleepStage> = [.inBed, .asleepCore, .asleepDeep, .asleepREM, .awake]
+        XCTAssertEqual(Set(SleepStage.allCases), required,
+                       "SleepStage must cover exactly the 5 HKCategoryValueSleepAnalysis cases")
+    }
+
+    // MARK: - Dedup: SyncCursor gates re-writing the same night (#15)
+
+    /// The `.sleep` SyncCursor must gate re-presenting the same night's staged segments.
+    /// `pendingHealthSleep` in LocalStore uses `cursor.isNew(.sleep, segments.max(\.end))`
+    /// — advance → not-new — so a second sync with the same night never double-writes.
+    func testSleepCursorDedupsByMaxEndDate() {
+        // Build a synthetic night and extract its max end date.
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+        for _ in 0..<120 { recs.append(vrec(c, hr: 55)); c += step }
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+
+        let segs = BulkSleep.stagedSegments(from: recs)
+        XCTAssertFalse(segs.isEmpty, "need staged segments for this test")
+        guard let maxEnd = segs.map(\.end).max() else { return XCTFail("no end dates") }
+
+        var cursor = SyncCursor()
+        // Before any write: the night is "new".
+        XCTAssertTrue(cursor.isNew(.sleep, maxEnd),
+                      "fresh cursor: staged night is new (must be written)")
+
+        // Simulate marking it written: advance the cursor past maxEnd.
+        cursor.advance(.sleep, to: maxEnd)
+
+        // Same or earlier end date: not new — dedup gate blocks a re-write.
+        XCTAssertFalse(cursor.isNew(.sleep, maxEnd),
+                       "after write: same night must not be written again (dedup)")
+
+        // A genuinely new future night (maxEnd + 1 s) must still pass through.
+        let nextNight = maxEnd.addingTimeInterval(1)
+        XCTAssertTrue(cursor.isNew(.sleep, nextNight),
+                      "next night is newer than cursor: must be written")
+    }
 }

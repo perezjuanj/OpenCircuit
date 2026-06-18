@@ -648,7 +648,15 @@ struct ContentView: View {
     private func flushHealth() {
         guard healthAuthorized else { return }
         let store = LocalStore(modelContext)
-        let segments = session?.sleepSegments ?? []
+        // Prefer stagedSegments (asleepCore/asleepDeep/asleepREM/awake — issue #15) when
+        // both are non-empty:
+        //   • coarse non-empty → wear gate passed (not a charging/off-wrist night)
+        //   • staged non-empty → classifier detected a valid overnight block
+        // Fall back to coarse segments (inBed/asleepCore/awake only) when staged is empty
+        // — no HR data in the block, or a non-overnight detection.
+        let staged = session?.stagedSegments ?? []
+        let coarse = session?.sleepSegments ?? []
+        let segments = !staged.isEmpty && !coarse.isEmpty ? staged : coarse
         Task {
             let r = await health.flushToHealth(store: store, sleepSegments: segments)
             if r.wroteAnything {
