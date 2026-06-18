@@ -515,6 +515,21 @@ struct LocalStore {
         let descriptor = FetchDescriptor<StoredSleepSummary>(
             predicate: #Predicate { $0.night == dayStart })
         if let existing = try? context.fetch(descriptor).first {
+            // Non-destructive upsert. A night can be drained in MORE THAN ONE piece (e.g. a
+            // background drain mid-night, then the foreground morning sync) — the ring hands off
+            // un-delivered history incrementally, so each drain stages only its own slice. Blindly
+            // overwriting let a later, SHORTER slice clobber a fuller capture already stored for this
+            // date (a 4 h fragment replacing a full night). Replace only when the new staging is at
+            // least as complete (wider in-bed span); otherwise keep the fuller stored night untouched.
+            // Non-regressive vs. blind overwrite; truly stitching two disjoint partials into one night
+            // (and the periodic overnight draining that needs it) is a follow-up that requires
+            // per-epoch persistence. See OpenRingKit/SleepSummaryMerge.
+            let storedSpan = existing.inBedEnd > existing.inBedStart
+                ? existing.inBedEnd.timeIntervalSince(existing.inBedStart) : 0
+            let newSpan = inBedEnd > inBedStart ? inBedEnd.timeIntervalSince(inBedStart) : 0
+            guard SleepSummaryMerge.shouldReplace(storedInBed: storedSpan, newInBed: newSpan) else {
+                return   // keep the fuller existing night (its window, stages, extras + feelScore)
+            }
             existing.asleepMin = m.asleep
             existing.deepMin = m.deep
             existing.lightMin = m.light
