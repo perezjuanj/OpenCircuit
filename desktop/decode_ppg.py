@@ -10,11 +10,14 @@ trailer per page; records do not span pages.
 
 Record (47 B), confirmed against captures/sleep_sync_btsnoop.log (FR02.018):
   [0:4]   BE counter, +0x0384 (900 s) per record
-  [4:6]   16-bit baseline ([4]=0x02 const, [5] drifts)
-  [6:9]   usually 00 00 00 (per-record flags)
-  [9:47]  38 B = 30 × 10-bit big-endian samples (+ 4 zero pad-bits), interleaved
-          as 2 channels × 15 (red/IR-like, tightly correlated). 10-bit is the
-          minimum-jitter width vs 8/12/16.
+  [4:6]   16-bit BE optical baseline/DC ([4] in {0x02,0x03}, NOT const; [5] drifts)
+  [6:9]   usually 00 00 00 (per-record flags/quality)
+  [9:47]  38 B = 30 × 10-bit big-endian samples (+ 4 zero pad-bits). 10-bit is proven
+          3 ways (jitter, lag-5 byte autocorrelation, range) — see issue #8 /
+          desktop/analyze_0x47_bitwidth.py. NOTE: the samples are ONE smooth optical
+          channel (lag-1 ~ lag-2 sample autocorrelation), NOT two interleaved red/IR
+          channels — that earlier claim is RETRACTED. The even/odd split below is kept
+          only as a display aid; it does NOT correspond to two physical channels.
 
 Usage:
   python -m openringconn decode-log captures/foo.log --addr <mac> > /tmp/dec.txt
@@ -74,12 +77,12 @@ def main(path):
         c = int.from_bytes(r[0:4], "big")
         s = samples(r)
         rng = max(s) - min(s)
-        chA, chB = s[0::2], s[1::2]   # two interleaved channels
+        chA, chB = s[0::2], s[1::2]   # display aid only — NOT two physical channels (see header)
         flag = "" if rng > 5 else "  (flat/idle)"
         print(f"{ts(c):%m-%d %H:%M}  base={r[4:6].hex()} range={rng:4d}{flag}")
         if rng > 5:
-            print(f"           red/A: {chA}")
-            print(f"           IR /B: {chB}")
+            print(f"           even: {chA}")
+            print(f"           odd : {chB}")
     return 0
 
 
