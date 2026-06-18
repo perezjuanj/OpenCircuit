@@ -127,8 +127,13 @@ final class HealthKitWriter {
             do { try await write(pending); try store.markHealthWritten(pending); result.samples = pending.count }
             catch { /* leave the watermark; retry next flush */ }
         }
-        // Sleep: same write-then-mark order (a failed save must not lose the night).
-        if let pendingSleep = try? store.pendingHealthSleep(sleepSegments), !pendingSleep.isEmpty {
+        // Sleep: same write-then-mark order (a failed save must not lose the night). Only mirror a
+        // SETTLED night (SleepHealthGate): with periodic overnight draining the staged night grows
+        // as epochs arrive, and `pendingHealthSleep` keys off the latest segment end — writing an
+        // in-progress night each drain would lay down OVERLAPPING sleep samples. Once the block has
+        // stopped advancing (sleeper is up), it writes once and the `.sleep` cursor blocks re-writes.
+        if SleepHealthGate.isSettled(latestSegmentEnd: sleepSegments.map(\.end).max(), now: Date()),
+           let pendingSleep = try? store.pendingHealthSleep(sleepSegments), !pendingSleep.isEmpty {
             do { try await write(sleep: pendingSleep); try store.markSleepWritten(pendingSleep); result.sleepSegments = pendingSleep.count }
             catch { /* leave the .sleep cursor; retry next flush */ }
         }

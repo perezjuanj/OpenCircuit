@@ -263,6 +263,10 @@ final class RingSession: NSObject {
     private var localStore: LocalStore?
     private var syncSession = EpochSyncSession()
     private let epochDecodingEnabled = false
+    /// Rolling archive of recent raw epochs (incl. the motion channel staging needs) + the last-drain
+    /// timestamp, persisted across sessions. Lets `finalizeSync` re-stage the night from the UNION of
+    /// all drained slices (stitching) and lets the periodic-drain cadence survive reconnects.
+    private let epochArchiveStore = EpochArchiveStore()
 
     private let dataServiceUUID = CBUUID(string: OpenRingKit.Transport.dataServiceUUID)
     private let notifyUUID = CBUUID(string: OpenRingKit.Transport.notifyCharUUID)
@@ -416,13 +420,7 @@ final class RingSession: NSObject {
             // Surface anything drained so overnight sleep/vitals aren't lost — the ring
             // discards delivered pages, so this is the only chance to keep them.
             if let self, !self.bulkRecords.isEmpty {
-                self.historySamples = BulkSleep.samples(from: self.bulkRecords)
-                self.sleepSegments = BulkSleep.sleepSegments(from: self.bulkRecords,
-                                                             temperatures: self.wearTemperatureSamples())   // wear gate (#41)
-                self.stagedSegments = self.overnightStagedSegments(from: self.bulkRecords)   // overnight gate (review #1)
-                self.persist(self.historySamples)   // auto-persist HR/HRV/SpO2 for the dashboard
-                self.persistSleepAndSteps()          // sleep summary + steps for offline display
-                self.bulkFinalized = true            // committed — the stop-time safety net can skip it
+                self.commitDrainedRecords()   // archive merge + stitched re-stage + persist (shared path)
             }
             // 3. Leave bulk mode and enter the selected live mode.
             for cmd in [Command.statusQuery, modeCmd, Command.fetch] {
@@ -530,7 +528,25 @@ final class RingSession: NSObject {
                 // tightens/relaxes as the window rolls over, not just at connect.
                 await self.refreshNightWindowIfNeeded()
                 if self.ready, !self.monitoring, !self.livePreparing, self.syncTask == nil, !self.probing {
-                    self.write(Command.fetch)   // 07 00 00 → fresh 0x10/0x87 descriptor
+                    // Periodic history drain (the buffer-overflow fix). The ring's ~4.75 h history
+                    // buffer drops its oldest epochs when full, so draining only on foreground/manual
+                    // events lets a quietly-held overnight link overflow and lose the early, deep-rich
+                    // hours. Drain on a cadence comfortably under the buffer (HistoryDrainCadence,
+                    // tighter at night), gated on `gotDataFrame` so we never poke a non-streaming ring
+                    // (#54). The cadence clock is persisted (EpochArchiveStore.lastDrainAt), so a fresh
+                    // session drains shortly after (re)connect (lastDrainAt nil ⇒ due) yet a flapping
+                    // link can't re-drain more often than the interval. Safe to repeat because
+                    // `finalizeSync` re-stitches the night from the EpochArchive union.
+                    let isNight = self.nightWindow?.contains(Date()) ?? false
+                    let saver = UserDefaults.standard.bool(forKey: Self.batterySaverEnabledKey)
+                    if self.gotDataFrame,
+                       HistoryDrainCadence.isDue(lastDrainAt: self.epochArchiveStore.lastDrainAt,
+                                                 now: Date(), isNight: isNight, batterySaver: saver) {
+                        ringLog.notice("sync: periodic history drain (keep the ring's ~4.75 h buffer emptied)")
+                        self.syncHistory()
+                    } else {
+                        self.write(Command.fetch)   // 07 00 00 → fresh 0x10/0x87 descriptor
+                    }
                 }
                 try? await Task.sleep(for: .seconds(self.keepaliveInterval))
             }
@@ -734,7 +750,12 @@ final class RingSession: NSObject {
     /// Persist the latest night's sleep summary + today's step count so the dashboard
     /// shows them OFFLINE after disconnect. Both UPSERT by day (no duplicates) and bypass
     /// the cumulative-counter `ingest` path entirely — the SyncCursor is untouched.
-    private func persistSleepAndSteps() {
+    /// Persist the night's summary + extras. `nightRecords` is the stitched, night-scoped union the
+    /// staging came from, so the per-stage HR / movement / stress / resting HR / Sleep Score are
+    /// computed over the WHOLE night — not just the final drained slice (which on a multi-drain night
+    /// would skew every derived metric). Naps stay on the per-drain `bulkRecords` (they're daytime,
+    /// outside the night-scoped union).
+    private func persistSleepAndSteps(nightRecords: [BulkRecord]) {
         guard let localStore else { return }
         if !stagedSegments.isEmpty {
             let summary = SleepStaging.summary(stagedSegments)
@@ -743,7 +764,8 @@ final class RingSession: NSObject {
             // remains the upsert key.
             let start = stagedSegments.map(\.start).min() ?? Date()
             let end = stagedSegments.map(\.end).max() ?? start
-            let extras = computeSleepExtras(summary: summary, start: start, end: end, store: localStore)
+            let extras = computeSleepExtras(summary: summary, start: start, end: end,
+                                            store: localStore, records: nightRecords)
             try? localStore.saveSleepSummary(summary, night: start, inBedStart: start, inBedEnd: end,
                                              extras: extras)
         }
@@ -758,7 +780,7 @@ final class RingSession: NSObject {
     /// stress from sleep-window RMSSD, per-stage average HR, and the movement timeline. All from
     /// already-decoded data; values are estimates (labeled as such in the UI).
     private func computeSleepExtras(summary: SleepStaging.Summary, start: Date, end: Date,
-                                    store: LocalStore) -> LocalStore.SleepNightExtras {
+                                    store: LocalStore, records: [BulkRecord]) -> LocalStore.SleepNightExtras {
         var extras = LocalStore.SleepNightExtras()
         let window = DateInterval(start: start, end: max(end, start))
 
@@ -776,16 +798,16 @@ final class RingSession: NSObject {
         let tempOffset = (nightlyTemp != nil && baseline != nil) ? nightlyTemp! - baseline! : nil
 
         // Per-stage HR + movement (#70).
-        let hrByStage = SleepDetailMetrics.averageHRByStage(records: bulkRecords, segments: stagedSegments)
+        let hrByStage = SleepDetailMetrics.averageHRByStage(records: records, segments: stagedSegments)
         extras.hrByStage = hrByStage
-        extras.movementLevels = SleepDetailMetrics.movementSummary(records: bulkRecords, in: window).levels
+        extras.movementLevels = SleepDetailMetrics.movementSummary(records: records, in: window).levels
 
         // Overnight stress (#71): median sleep-window RMSSD → band score.
-        let rmssd = bulkRecords.filter { window.contains($0.date()) }.compactMap { $0.hrvRMSSD }
+        let rmssd = records.filter { window.contains($0.date()) }.compactMap { $0.hrvRMSSD }
         if let stress = SleepStress.overnightScore(rmssd: rmssd) { extras.stressScore = stress }
 
         // Resting/asleep HR for the composite HR factor (sleep mean → low-activity floor).
-        let nightHR = bulkRecords.compactMap { r -> HRSample? in
+        let nightHR = records.compactMap { r -> HRSample? in
             guard let hr = r.heartRate else { return nil }
             let t = r.date()
             return HRSample(bpm: hr, start: t, end: t)
@@ -951,13 +973,7 @@ final class RingSession: NSObject {
         // that never reached its finalize doesn't silently drop last night's sleep/vitals.
         // No-op once the drain already committed (bulkFinalized) or nothing was captured.
         if !bulkRecords.isEmpty, !bulkFinalized {
-            historySamples = BulkSleep.samples(from: bulkRecords)
-            sleepSegments = BulkSleep.sleepSegments(from: bulkRecords,
-                                                    temperatures: wearTemperatureSamples())   // wear gate (#41)
-            stagedSegments = overnightStagedSegments(from: bulkRecords)   // overnight gate (review #1)
-            persist(historySamples)
-            persistSleepAndSteps()
-            bulkFinalized = true
+            commitDrainedRecords()   // archive merge + stitched re-stage + persist (shared path)
         }
         // Persist the last live reading so the dashboard shows it after disconnect — stamped at
         // WHEN THE VALUE WAS MEASURED (`liveHRAt`/`liveSpO2At`), not `lastFrameAt`. The idle
@@ -1035,29 +1051,52 @@ final class RingSession: NSObject {
         finalizeSync()
     }
 
+    /// Commit a freshly-captured batch of epoch records. A history-sync drain (`finalizeSync`), the
+    /// live-enter backlog drain, AND the stop-time safety net all funnel through here, so every
+    /// capture path stitches identically — fold the batch into the rolling EpochArchive and re-stage
+    /// LAST night from the UNION. Centralising this means no path can persist a partial slice that
+    /// overwrites a fuller summary, the archive stays complete regardless of which path drained the
+    /// tail, and the periodic-drain cadence clock is stamped once per commit. Caller guarantees
+    /// `!bulkRecords.isEmpty`.
+    ///
+    /// Each drain returns only the slice since the last (the ring advances its resume pointer on
+    /// ACK), and the motion channel staging needs survives ONLY in the persisted raw records —
+    /// derived HR/HRV/SpO₂ samples can't reconstruct it. `latestNightRecords` scopes the (possibly
+    /// multi-night) union to LAST night so staging never picks the prior night (`findSleep` returns
+    /// the earliest block) or a daytime nap.
+    private func commitDrainedRecords() {
+        epochArchiveStore.recordDrain()
+        let temps = wearTemperatureSamples()
+        let union = epochArchiveStore.merge(bulkRecords)
+        let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temps)
+        // HealthKit path: THIS batch's new samples (the SyncCursor dedups against what's written).
+        historySamples = BulkSleep.samples(from: bulkRecords)
+        // Sleep staging + its analytics come from the stitched, night-scoped union — not this slice.
+        sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)   // wear gate (#41)
+        stagedSegments = overnightStagedSegments(from: nightRecords)   // overnight gate (review #1)
+        persist(historySamples)   // auto-persist HR/HRV/SpO2 for the dashboard
+        persistSleepAndSteps(nightRecords: nightRecords)   // summary + extras from the stitched night
+        bulkFinalized = true      // committed — the stop-time safety net can skip these records
+    }
+
     private func finalizeSync() {
         guard syncing else { return }
-        historySamples = BulkSleep.samples(from: bulkRecords)
-        sleepSegments = BulkSleep.sleepSegments(from: bulkRecords,
-                                                temperatures: wearTemperatureSamples())   // wear gate (#41)
-        stagedSegments = overnightStagedSegments(from: bulkRecords)   // overnight gate (review #1)
-        persist(historySamples)   // auto-persist HR/HRV/SpO2 for the dashboard
-        persistSleepAndSteps()    // sleep summary + steps for offline display
-        bulkFinalized = true      // committed — the stop-time safety net can skip these records
+        if bulkRecords.isEmpty {
+            // An empty poll (the periodic cadence fires even with nothing un-synced) brings no new
+            // epochs — nothing to stitch. Stamp the cadence clock and finalize WITHOUT re-staging /
+            // re-saving / re-flushing, so a periodic drain doesn't churn the stored night.
+            epochArchiveStore.recordDrain()
+            ringLog.notice("sync: FINALIZE records=0 (no re-stage; cadence stamped)")
+            syncStatus = steps != nil
+                ? "Up to date — last night is likely already in the vitals dashboard. The ring clears history after each sync, so nothing new to fetch."
+                : "No data received — is the ring bonded/awake?"
+        } else {
+            commitDrainedRecords()
+            ringLog.notice("sync: FINALIZE records=\(self.bulkRecords.count) samples=\(self.historySamples.count) sleepSegs=\(self.sleepSegments.count) steps=\(self.steps ?? -1)")
+            syncStatus = "Synced \(bulkRecords.count) epochs"
+        }
         syncing = false
         syncTask = nil
-        ringLog.notice("sync: FINALIZE records=\(self.bulkRecords.count) samples=\(self.historySamples.count) sleepSegs=\(self.sleepSegments.count) steps=\(self.steps ?? -1)")
-        if !bulkRecords.isEmpty {
-            syncStatus = "Synced \(bulkRecords.count) epochs"
-        } else if steps != nil {
-            // Link is fine (status frames arrived) — the ring just had no un-synced
-            // sleep/vitals pages. It only stores history until it has been handed off once;
-            // a prior sync (or the official app) has already drained it. Last night's HRV,
-            // Resting HR, RR, and Sleep are still visible in the vitals dashboard. (#58)
-            syncStatus = "Up to date — last night is likely already in the vitals dashboard. The ring clears history after each sync, so nothing new to fetch."
-        } else {
-            syncStatus = "No data received — is the ring bonded/awake?"
-        }
     }
 
     /// Per-selector dwell: time to collect responses after the sync-open + fetch. Phase 1 has

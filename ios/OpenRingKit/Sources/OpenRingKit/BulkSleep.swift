@@ -230,6 +230,34 @@ public enum BulkSleep {
     // never per-segment timing — treat output as approximate stage proportions.
     // `sleepSegments` (coarse asleep/awake) remains the non-experimental default.
 
+    /// Scope `records` to the most recent OVERNIGHT sleep block (± a margin) so that staging a
+    /// multi-night archive UNION always describes LAST NIGHT. Without this, `SleepStaging.classify`
+    /// → `mainSleep` → `findSleep` returns the EARLIEST sleep block > 1 h, so a union that still
+    /// holds the prior night (retention spans > 24 h) would stage the wrong night every morning.
+    /// Picks the latest-ending block that is both long enough (`minSleepDuration`) AND overnight
+    /// (`SleepWindow.isOvernightBlock`), so a daytime nap never wins. Detection honours the wear
+    /// gate (`temperatures`) so an off-wrist/charging block can't masquerade as the night. Returns
+    /// `records` unchanged when no overnight block is found (caller stages exactly as before).
+    public static func latestNightRecords(from records: [BulkRecord],
+                                          temperatures: [TemperatureSample] = [],
+                                          epoch: Int = Command.syncEpoch) -> [BulkRecord] {
+        // Motion detection needs a time-ordered timeline; sort defensively so the helper is correct
+        // for any caller, not only the pre-sorted EpochArchive union.
+        let records = records.sorted { $0.counter < $1.counter }
+        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: records, epoch: epoch),
+                                                      temperatureSamples: temperatures)
+        let nights = periods.filter {
+            $0.activity == .sleep
+                && $0.duration > ActivityPeriod.minSleepDuration
+                && SleepWindow.isOvernightBlock(start: $0.start, end: $0.end)
+        }
+        guard let latest = nights.max(by: { $0.end < $1.end }) else { return records }
+        let margin: TimeInterval = 30 * 60   // don't clip onset/wake at detection granularity
+        let lo = latest.start.addingTimeInterval(-margin)
+        let hi = latest.end.addingTimeInterval(margin)
+        return records.filter { let t = $0.date(epoch: epoch); return t >= lo && t <= hi }
+    }
+
     /// Light/Deep/REM/Awake staging of the detected sleep block. Thin wrapper over
     /// `SleepStaging.classify` (kept for source compatibility with existing callers).
     public static func stagedSegments(from records: [BulkRecord],
