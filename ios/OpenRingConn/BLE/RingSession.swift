@@ -266,7 +266,9 @@ final class RingSession: NSObject {
     /// Rolling archive of recent raw epochs (incl. the motion channel staging needs) + the last-drain
     /// timestamp, persisted across sessions. Lets `finalizeSync` re-stage the night from the UNION of
     /// all drained slices (stitching) and lets the periodic-drain cadence survive reconnects.
-    private let epochArchiveStore = EpochArchiveStore()
+    /// Namespaced by the ring's identifier (#multi-ring) so two rings' epoch archives can't collide on
+    /// the UInt32 epoch counter (which would corrupt overnight stitching).
+    private let epochArchiveStore: EpochArchiveStore
 
     private let dataServiceUUID = CBUUID(string: OpenRingKit.Transport.dataServiceUUID)
     private let notifyUUID = CBUUID(string: OpenRingKit.Transport.notifyCharUUID)
@@ -295,6 +297,8 @@ final class RingSession: NSObject {
     init(peripheral: CBPeripheral, localStore: LocalStore? = nil) {
         self.peripheral = peripheral
         self.localStore = localStore
+        // Scope the per-ring epoch archive to this ring's identifier (#multi-ring).
+        self.epochArchiveStore = EpochArchiveStore(namespace: peripheral.identifier.uuidString)
         super.init()
         peripheral.delegate = self
         // Seed the model name from the peripheral's advertised name; may be overridden later
@@ -847,21 +851,26 @@ final class RingSession: NSObject {
     // value AND the day it was seen in UserDefaults (not LocalStore: avoids a SwiftData migration
     // and a per-day-row collision). The per-day TOTAL still lives in StoredDaily via addDailySteps.
 
-    private static let lastRawStepsKey = "steps.lastRawValue"      // Int: last raw [4:6] counter
-    private static let lastRawStepsDayKey = "steps.lastRawDay"     // Date: start-of-day it was observed
+    // Per-ring (#multi-ring): namespaced by the ring's CoreBluetooth identifier so a second ring's
+    // onboard counter is never diffed against the first ring's baseline (which would yield garbage
+    // step deltas on a ring switch). `deviceKey` is the same id RingScanner remembers and migrates
+    // the legacy un-namespaced state onto.
+    private var deviceKey: String { peripheral.identifier.uuidString }
+    private var lastRawStepsKey: String { "steps.lastRawValue.\(deviceKey)" }    // Int: last raw [4:6] counter
+    private var lastRawStepsDayKey: String { "steps.lastRawDay.\(deviceKey)" }   // Date: start-of-day it was observed
 
     /// Last raw counter we recorded, or nil if we've never seen one (first run / cleared). Stored
     /// as an object so a legitimate 0 reading is distinguishable from "unset".
     private var persistedLastRawSteps: Int? {
-        UserDefaults.standard.object(forKey: Self.lastRawStepsKey) as? Int
+        UserDefaults.standard.object(forKey: lastRawStepsKey) as? Int
     }
     /// Start-of-day the persisted raw counter was observed (for midnight-rollover detection).
     private var persistedLastRawStepsDay: Date? {
-        UserDefaults.standard.object(forKey: Self.lastRawStepsDayKey) as? Date
+        UserDefaults.standard.object(forKey: lastRawStepsDayKey) as? Date
     }
     private func persistStepRawState(raw: Int, day: Date) {
-        UserDefaults.standard.set(raw, forKey: Self.lastRawStepsKey)
-        UserDefaults.standard.set(day, forKey: Self.lastRawStepsDayKey)
+        UserDefaults.standard.set(raw, forKey: lastRawStepsKey)
+        UserDefaults.standard.set(day, forKey: lastRawStepsDayKey)
     }
 
     /// Start (or switch) live monitoring in a single mode. Guarantees only one metric

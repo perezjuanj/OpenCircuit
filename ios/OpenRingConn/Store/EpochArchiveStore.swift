@@ -11,16 +11,23 @@ import OpenRingKit
 // HistoryDrainCadence); this is just the persistence plumbing.
 struct EpochArchiveStore {
     private let defaults: UserDefaults
-    init(_ defaults: UserDefaults = .standard) { self.defaults = defaults }
+    private let archiveKey: String
+    private let lastDrainKey: String
 
-    private enum Key {
-        static let archive = "sleep.epochArchive"
-        static let lastDrain = "sleep.lastHistoryDrainAt"
+    /// `namespace` scopes the keys to a single ring (its CoreBluetooth identifier) so two rings'
+    /// epoch archives can't collide on the UInt32 epoch counter (which would corrupt overnight
+    /// stitching) (#multi-ring). An empty namespace keeps the legacy un-suffixed keys for any caller
+    /// that isn't ring-scoped.
+    init(namespace: String = "", _ defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let suffix = namespace.isEmpty ? "" : ".\(namespace)"
+        self.archiveKey = "sleep.epochArchive\(suffix)"
+        self.lastDrainKey = "sleep.lastHistoryDrainAt\(suffix)"
     }
 
     /// The stored archive (decoded), or `[]` when none yet.
     func load() -> [BulkRecord] {
-        guard let data = defaults.data(forKey: Key.archive) else { return [] }
+        guard let data = defaults.data(forKey: archiveKey) else { return [] }
         return EpochArchive.decode(data)
     }
 
@@ -29,19 +36,19 @@ struct EpochArchiveStore {
     @discardableResult
     func merge(_ incoming: [BulkRecord]) -> [BulkRecord] {
         let union = EpochArchive.merge(existing: load(), incoming: incoming)
-        defaults.set(EpochArchive.encode(union), forKey: Key.archive)
+        defaults.set(EpochArchive.encode(union), forKey: archiveKey)
         return union
     }
 
     /// When the ring's history buffer was last drained (any drain, incl. an empty one — we still
     /// polled the buffer). Drives `HistoryDrainCadence.isDue` so the cadence survives reconnects.
     var lastDrainAt: Date? {
-        let t = defaults.double(forKey: Key.lastDrain)
+        let t = defaults.double(forKey: lastDrainKey)
         return t > 0 ? Date(timeIntervalSince1970: t) : nil
     }
 
     /// Stamp a completed drain (foreground, background, or periodic).
     func recordDrain(at now: Date = Date()) {
-        defaults.set(now.timeIntervalSince1970, forKey: Key.lastDrain)
+        defaults.set(now.timeIntervalSince1970, forKey: lastDrainKey)
     }
 }
