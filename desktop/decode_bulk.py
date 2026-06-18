@@ -26,8 +26,11 @@ keyed on [8]:
     [22]    trailer flags
 
   Activity/awake epoch ([8]=0x12/0x13):
+    [4]     heart rate (bpm)   CONFIRMED  <- ALL-DAY HR (same head as sleep-vitals;
+            mined 2026-06-17: activity [4] tracks adjacent sleep HR +-4.6 bpm / corr +0.76,
+            continuous across layout boundaries). No separate 0x0a HrSync stream exists.
     [10:15] 5x motion counts (elevated when moving)
-    [15:22] 7-byte activity/physiology payload (unresolved)
+    [15:22] 7-byte activity/physiology payload (unresolved, #93)
 
 Respiratory rate + skin temp are NOT per-epoch here (derived/summary).
 Sleep stages are app-computed from these signals, not stored on the wire.
@@ -113,7 +116,8 @@ def main(path):
                 line = f"HR={r[4]:3d}bpm  HRV={r[5]:3d}ms  SpO2={r[8]:2d}%"
             else:
                 bar = "#" * min(msum, 40)
-                line = f"activity mot={mot.hex()} {bar}"
+                hr = f"HR={r[4]:3d}bpm " if 30 <= r[4] <= 220 else ""        # all-day HR on activity epochs
+                line = f"activity {hr}mot={mot.hex()} {bar}"
             print(f"  {ts(c):%H:%M}  {line}")
         print()
     return 0

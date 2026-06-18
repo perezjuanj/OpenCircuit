@@ -292,8 +292,18 @@ time (no 12 h offset in this capture; bears on §5.6/§6.6). Reassemble + decode
 `desktop/decode_bulk.py`.
 
 **Two record layouts**, distinguished by `[8]`:
-- **Activity/awake epoch** `[8]=0x12`/`0x13`: physiology/activity in `[15:22]`, motion
-  in `[10:15]` elevated.
+- **Activity/awake epoch** `[8]=0x12`/`0x13`: **`[4]` = HR bpm 🟢 — this is the ALL-DAY HR.**
+  The activity epoch shares the sleep-vitals HEAD (`[4]`=HR, `[5]`=HRV), differing only at `[8]`
+  (activity tag vs SpO2). Confirmed 2026-06-17 by mining every capture's worn `0x4c` epochs: across
+  204 sleep↔activity transitions, activity `[4]` tracks the neighbouring sleep HR to within 4.6 bpm
+  (Pearson +0.76) and forms ONE continuous series across layout boundaries (e.g. the `walk_decoded`
+  11:02–12:14 run: 61–85 bpm tracking motion, and the `login_activate` 08:41–11:56 run, smooth across
+  every SLEEP↔ACTIV change). 🟢 NEGATIVE result from the same mining: the official app NEVER uses a
+  distinct `byte[6]` sync-open selector for HR (only `0x00`/`0x03` across all captures) — there is no
+  separate `HrSync`/`0x0a` stream on the wire; all-day HR is the activity-epoch `[4]` we had been
+  discarding (`BulkSleep.heartRate` was gated to sleep-vitals). Resolves the daytime/workout-HR gap
+  (#45/#38). HRV `[5]`/SpO2 stay sleep-vitals-only (motion corrupts them). Activity payload in
+  `[15:22]` still 🟡 (#93). motion in `[10:15]` elevated.
 - **Sleep-vitals epoch**: per-epoch vitals in `[4:9]`, motion `[10:15]` at `01` baseline,
   `[15:22]` ≈ zero. `[8]` is the **SpO2 %** (typically `0x57–0x63` = 87–99, but lower on a real
   desaturation). ⚠️ Layout is decided **structurally** (#39), NOT by this band: classify as

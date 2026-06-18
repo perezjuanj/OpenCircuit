@@ -62,7 +62,23 @@ final class BulkSleepTests: XCTestCase {
         XCTAssertEqual(recs[2].spo2Percent, 0x5f)        // 95 %
         XCTAssertEqual(recs[2].heartRate, 0x54)          // 84 bpm (waking/active in-bed)
         XCTAssertNil(recs[2].hrvRMSSD, "HRV byte is 0 here -> no sample")
-        XCTAssertNil(recs[0].heartRate, "activity epoch exposes no HR field")
+        // ALL-DAY HR: an activity epoch ALSO carries HR at byte[4] (0x55 = 85 bpm here — matches
+        // the adjacent sleep epoch's 84). HRV/SpO2 stay sleep-vitals-only (motion corrupts them and
+        // [8] is the activity tag, not SpO2), so only HR is surfaced for activity epochs.
+        XCTAssertEqual(recs[0].heartRate, 85, "activity epoch exposes all-day HR at [4]")
+        XCTAssertNil(recs[0].hrvRMSSD, "HRV stays sleep-vitals-only (unreliable under motion)")
+        XCTAssertNil(recs[0].spo2Percent, "no SpO2 on an activity epoch ([8] is the activity tag)")
+    }
+
+    func testSamplesFromActivityEpochEmitsAllDayHROnly() {
+        // ALL-DAY HR (#45/#38): an activity/awake epoch emits HR (byte[4]) but NOT HRV/SpO2/RR —
+        // so daytime + workout HR now reaches the store, while motion-corrupted HRV/SpO2 don't.
+        let r = BulkRecord(hex("0c22a16b55210a7d120a01010101010000040240040000"))!
+        XCTAssertEqual(r.layout, .activity)
+        let s = BulkSleep.samples(from: [r])
+        XCTAssertEqual(s.count, 1, "activity epoch emits HR only")
+        XCTAssertEqual(s.first?.kind, .heartRate)
+        XCTAssertEqual(s.first?.value, 85)
     }
 
     func testSamplesFromSleepVitals() {
