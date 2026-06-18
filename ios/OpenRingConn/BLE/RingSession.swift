@@ -1275,6 +1275,17 @@ extension RingSession: CBPeripheralDelegate {
                     let macStr = mac.map { String(format: "%02x", $0) }.joined(separator: ":")
                     ringLog.notice("ring MAC (System ID): \(macStr, privacy: .public) → auth V=0x\(String(format: "%02x", RingAuth.macTailXor(mac)), privacy: .public)")
                     self.firmwareInfo.mac = macStr.uppercased()   // (#79) surfaced in DeviceInfoView
+                    // The auth challenge can arrive BEFORE this read completes (service-discovery
+                    // race). When it does, it was answered with the legacy fixed fallback — correct
+                    // ONLY for the originally-captured ring, so ANY OTHER ring never starts streaming
+                    // (#multi-ring). Now that we have THIS ring's MAC, re-prime the handshake: a fresh
+                    // `status0` makes the ring re-challenge and we answer with the correct SM3. Gated on
+                    // a ready write path + no data yet, so it's a one-shot that never disturbs a stream
+                    // that already authed.
+                    if self.writeChar != nil, !self.gotDataFrame {
+                        ringLog.notice("auth: MAC arrived after challenge — re-priming status0 for SM3 reply (#multi-ring)")
+                        self.write(Command.status0)
+                    }
                 } else {
                     ringLog.notice("System ID unparsed (\(bytes.count, privacy: .public)B): \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
                 }

@@ -410,17 +410,30 @@ struct ContentView: View {
             // User-initiated measure timed out without locking a reading. Persists until the
             // user taps Measure again (which clears it naturally). (#55)
             if session?.userMeasureFailed == true { measureFailedHint }
+            // Switch to a different ring. The app silently auto-reconnects to the active ring, so
+            // without this there's no way to reach the picker and pick another (#multi-ring).
+            if connected || isConnecting {
+                Button {
+                    scanner.chooseRing()
+                } label: {
+                    Label("Switch ring", systemImage: "arrow.left.arrow.right")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+                .padding(.top, 2)
+            }
             if !connected {
                 switch scanner.state {
                 case .scanning:
-                    // A foreground scan turning up >1 ring shows the picker; otherwise we're still
-                    // looking (a lone ring auto-connects after a short settle).
-                    if scanner.discovered.count > 1 {
+                    // Show the picker when >1 ring is around, or whenever the user is deliberately
+                    // choosing (even a single ring, so the active one can't silently grab the link
+                    // back). Otherwise we're still searching.
+                    if scanner.discovered.count > 1 || (scanner.choosingRing && !scanner.discovered.isEmpty) {
                         ringPicker
                     } else {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
-                            Text("Searching for ring…")
+                            Text(scanner.choosingRing ? "Looking for rings…" : "Searching for ring…")
                                 .font(.subheadline).foregroundStyle(.secondary)
                             Spacer()
                             Button("Cancel") { scanner.cancelScan() }.font(.subheadline)
@@ -429,7 +442,7 @@ struct ContentView: View {
                 case .connecting:
                     // The status line above already says "Connecting…", but a pending connect has no
                     // timeout — give the user an escape hatch so a ring that's out of range can't wedge
-                    // the card forever.
+                    // the card forever. (Switch ring above also breaks out of this.)
                     HStack {
                         Spacer()
                         Button("Cancel") { scanner.disconnect() }.font(.subheadline)
@@ -447,13 +460,19 @@ struct ContentView: View {
         }
     }
 
-    /// Shown only when a foreground scan turns up more than one ring (multi-ring households). Tapping
-    /// a row connects to that ring and makes it active; a single ring auto-connects without ever
-    /// showing this. The "Last used" badge marks the previously active ring; rows are ordered active-
-    /// first, then by name (a stable key), with a per-row signal glyph showing proximity.
+    /// True while a connection attempt / auto-reconnect is in flight (used to offer "Switch ring" so
+    /// the user isn't stuck waiting on the active ring when they want a different one).
+    private var isConnecting: Bool {
+        if case .connecting = scanner.state { return true } else { return false }
+    }
+
+    /// The ring list — shown when a scan finds >1 ring, or whenever the user taps "Switch ring".
+    /// Tapping a row connects to that ring and makes it active. The "Last used" badge marks the
+    /// previously active ring; rows are ordered active-first, then by name (a stable key), with a
+    /// per-row signal glyph showing proximity.
     private var ringPicker: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Multiple rings found — pick one")
+            Text(scanner.choosingRing ? "Choose a ring" : "Multiple rings found — pick one")
                 .font(.subheadline.weight(.medium))
             ForEach(sortedDiscoveredRings) { ring in
                 Button {
