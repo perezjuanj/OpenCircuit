@@ -31,7 +31,11 @@ final class RingSession: NSObject {
     /// NOT when the last frame arrived. The idle keepalive bumps `lastFrameAt` to ≈now on every
     /// descriptor frame, so stamping a persisted reading with `lastFrameAt` re-dated a lingering
     /// (stale) HR/SpO₂ to ~now. Stamp with the true capture time instead (see `stopLiveMonitoring`).
-    private var liveHRAt: Date?
+    ///
+    /// Exposed `private(set)` so a workout poll can tell a genuinely fresh in-motion lock from a
+    /// held latch — `liveHR` is never cleared while monitoring, so without the capture time a
+    /// consumer re-records the last still value forever (the "stuck at 98" workout bug). (#45)
+    private(set) var liveHRAt: Date?
     private var liveSpO2At: Date?
     /// Recent live-HR samples (oldest→newest, capped). Lets the UI show whether the
     /// reading is converging vs. stuck — these sensors report a windowed average that
@@ -51,6 +55,11 @@ final class RingSession: NSObject {
     /// measured — not `Date()`, which would push a minutes-old reading into HealthKit "now".
     private(set) var lastFrameAt: Date?
     private(set) var monitoring = false
+    /// True while a WORKOUT owns the live-HR link. Set via `beginWorkoutHR()`. Suppresses the
+    /// periodic auto-measure (see `idleForAutoMeasure`) so a concurrent measure can't call
+    /// `stopLiveMonitoring()` on the workout's cycle mid-session — the silent "records zero HR for
+    /// the rest of the workout" contention bug. The workout always runs its OWN fresh cycle.
+    private(set) var workoutHolding = false
     /// When the current live-monitoring cycle began (set in `startLiveMonitoring`). Lets the
     /// stop-time persist keep ONLY readings actually measured during this cycle, so a value
     /// lingering from an earlier cycle isn't re-persisted (and re-dated) at stop.
@@ -633,9 +642,10 @@ final class RingSession: NSObject {
     }
 
     /// True only when the link is up and nothing else is using it — never interrupt a user
-    /// measurement, a sync, or the live-enter drain.
+    /// measurement, a sync, the live-enter drain, or a workout (which owns the link and must not be
+    /// torn down by an auto-measure firing mid-session).
     private var idleForAutoMeasure: Bool {
-        ready && !monitoring && !livePreparing && syncTask == nil && !probing
+        ready && !monitoring && !livePreparing && syncTask == nil && !probing && !workoutHolding
     }
 
     /// Next sleep between auto-measure cycles: the base interval while worn, exponentially backed
@@ -912,6 +922,30 @@ final class RingSession: NSObject {
             }
             startLiveMonitoring(quickLiveRead: quickLiveRead, clearStaleValue: userInitiated)
         }
+    }
+
+    /// Take exclusive ownership of the live-HR link for a workout, then start a fresh HR cycle the
+    /// workout owns. Fixes the contention where a workout begun while the ring was already
+    /// monitoring (a periodic auto-measure, or a lingering Measure) would RIDE that foreign cycle —
+    /// which then tears itself down (`stopLiveMonitoring`) on lock/timeout, silently killing the
+    /// workout's HR for the rest of the session. We:
+    ///   1. set `workoutHolding` so `idleForAutoMeasure` is false → auto-measure won't start while
+    ///      the workout runs (and can't grab the link between our stop+start below), and
+    ///   2. clear `autoMeasuring` so a concurrent `autoMeasureOnce` awaiting its lock can't call
+    ///      `stopLiveMonitoring()` on our cycle when it wakes (its teardown is gated on that flag),
+    ///   3. drop any foreign cycle and start our OWN — `monitoringStartedAt` resets to now.
+    /// `@MainActor` makes this run atomically relative to the auto-measure task's await points.
+    func beginWorkoutHR() {
+        workoutHolding = true
+        autoMeasuring = false
+        if monitoring { stopLiveMonitoring() }   // drop any auto/user-measure cycle we'd otherwise ride
+        startMonitoring(mode: .hr, userInitiated: false, quickLiveRead: true)   // fresh, workout-owned cycle
+    }
+
+    /// Release the workout's hold and stop its live cycle. Auto-measure resumes on its own cadence.
+    func endWorkoutHR() {
+        workoutHolding = false
+        stopLiveMonitoring()
     }
 
     /// Per-mode user-measure budget (seconds): HR needs longer stillness to converge than SpO₂.

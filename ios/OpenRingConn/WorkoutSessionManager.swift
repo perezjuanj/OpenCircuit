@@ -20,6 +20,7 @@ import CoreLocation
 import HealthKit
 import OpenRingKit
 import Observation
+import UIKit
 
 // MARK: - Workout state
 
@@ -54,8 +55,17 @@ final class WorkoutSessionManager: NSObject {
 
     /// Live elapsed seconds since the session started (updated by the timer loop).
     private(set) var elapsedSeconds: TimeInterval = 0
-    /// Live HR mirror (nil when the ring hasn't locked a reading or HR is dropping; see #45).
+    /// Live HR mirror — the last GENUINELY FRESH lock recorded (not the ring's held latch; see
+    /// #45). Persists between locks so the UI doesn't flicker; `currentHRIsStale` marks it old.
     private(set) var currentHR: Int?
+    /// Capture time of `currentHR` (the lock's true time, not "now"). Drives staleness.
+    private(set) var currentHRAt: Date?
+    /// True when the displayed HR is older than ~3 missed polls — the UI shows "measuring…"
+    /// instead of implying the frozen number is a live reading. Honest gap, never fabricated.
+    var currentHRIsStale: Bool {
+        guard let at = currentHRAt else { return true }
+        return Date().timeIntervalSince(at) > 8
+    }
     /// Running zone breakdown updated as HR samples arrive.
     private(set) var liveZoneBreakdown = WorkoutZoneBreakdown()
     /// GPS distance in meters (phone CoreLocation). nil until first location fix.
@@ -64,6 +74,10 @@ final class WorkoutSessionManager: NSObject {
     private(set) var gpsActive = false
     /// Location authorization status — surfaced so the UI can explain a denied state.
     private(set) var locationAuthStatus: CLAuthorizationStatus = .notDetermined
+    /// True when the user opted into indoor keep-alive but location permission isn't granted — so
+    /// this indoor workout will STOP recording once the screen locks. Surfaced in the workout UI so
+    /// the opt-in doesn't fail silently (the keep-alive needs location to hold the app alive).
+    private(set) var keepAliveUnavailable = false
     /// Count of HR samples captured so far (helps UI surface "good / sparse data").
     private(set) var hrSampleCount: Int = 0
 
@@ -72,14 +86,31 @@ final class WorkoutSessionManager: NSObject {
     private var aggregator: WorkoutSessionAggregator?
     private var sessionStart: Date?
 
+    /// Capture time of the last HR sample we actually recorded — the dedupe key that stops a held
+    /// latch from being re-recorded every poll (the "stuck at 98" climbing-counter bug, #45).
+    private var lastRecordedHRAt: Date?
+
     private var hrPollTask: Task<Void, Never>?
     private var timerTask: Task<Void, Never>?
 
-    /// CoreLocation manager for outdoor GPS route capture.
+    /// CoreLocation manager for outdoor GPS route capture (or the indoor keep-alive session).
     private var locationManager: CLLocationManager?
-    /// Accumulated route locations (outdoor sessions only).
+    /// Accumulated route locations (outdoor `.route` sessions only — never the keep-alive).
     private var routeLocations: [CLLocation] = []
     private var lastLocation: CLLocation?
+
+    /// Why a location session is running this workout. `.route`: outdoor — store fixes for the
+    /// HKWorkoutRoute + GPS distance. `.keepAlive`: indoor — run coarse location purely to keep the
+    /// app alive while the phone is locked so HR keeps recording; fixes are NEVER stored. nil when
+    /// no location session is running (indoor with the toggle off, or permission denied).
+    private enum LocationPurpose { case route, keepAlive }
+    private var locationPurpose: LocationPurpose?
+
+    /// Opt-in (Settings ▸ Workouts): keep recording during INDOOR workouts while the screen is
+    /// locked by running a coarse location session purely to stay alive — the only sanctioned iOS
+    /// keep-alive for a request/response BLE device with no GPS. Off by default: costs battery and
+    /// shows the blue location indicator. Shared key with `UserProfileSettingsView`.
+    static let indoorKeepAliveEnabledKey = "workout.indoorKeepAlive"
 
     private weak var session: RingSession?
 
@@ -114,20 +145,36 @@ final class WorkoutSessionManager: NSObject {
         aggregator = WorkoutSessionAggregator(startDate: start, userAge: age)
         elapsedSeconds = 0
         currentHR = nil
+        currentHRAt = nil
+        lastRecordedHRAt = nil
         liveZoneBreakdown = WorkoutZoneBreakdown()
         distanceMeters = nil
         gpsActive = false
+        keepAliveUnavailable = false
         hrSampleCount = 0
         routeLocations = []
         lastLocation = nil
 
         recordingState = .starting
 
-        // Start the ring's live HR polling (existing path — no new BLE commands).
-        session.startMonitoring(mode: .hr, userInitiated: false, quickLiveRead: true)
+        // Take exclusive ownership of the ring's live-HR link for this workout (a fresh, owned
+        // monitoring cycle that the periodic auto-measure can't tear down mid-session).
+        session.beginWorkoutHR()
 
-        // Begin GPS if this is an outdoor sport type.
-        if selectedSport.isOutdoor { startGPS() }
+        // Keep the screen awake while a workout is foregrounded so it doesn't auto-dim → lock →
+        // suspend (which would stall the poll loops). Background tracking is handled by the
+        // location session below; this is the foreground-UX half.
+        UIApplication.shared.isIdleTimerDisabled = true
+
+        // Begin a location session: outdoor → GPS route + distance; indoor → optional keep-alive so
+        // HR keeps recording while the phone is locked (opt-in, since it costs battery). The
+        // `location` background mode + continuous updates keep the app alive so the BLE poll loops
+        // keep ticking under lock — the only sanctioned keep-alive for our request/response ring.
+        if selectedSport.isOutdoor {
+            startLocation(purpose: .route)
+        } else if UserDefaults.standard.bool(forKey: Self.indoorKeepAliveEnabledKey) {
+            startLocation(purpose: .keepAlive)
+        }
 
         // HR collection loop: snapshots session.liveHR every 2 s.
         // #45 NOTE: live HR is best-effort. Gaps are preserved (no gap-filling/interpolation).
@@ -170,19 +217,23 @@ final class WorkoutSessionManager: NSObject {
         // moving (#45); this fills from on-device data when present. Empty stays empty — never
         // interpolated. NOTE: history-stream HR comes only from still/sleep-vitals epochs (active-
         // movement epochs carry no HR field), so for an in-motion walk this is usually a no-op —
-        // the durable source for continuous workout HR is the all-day HR stream decode (#99).
+        // the durable source for continuous workout HR is the ring's SPORT-mode stream (#90:
+        // SportHrModel{utc,hr,conf}), still to be captured. (The earlier #99 byte[6]=HrSync theory
+        // was disproven — PROTOCOL.md §5.3: all-day HR is the 0x4c epoch, not a live stream.)
         let backfillHR: [HRSample] = (session?.historySamples ?? [])
             .filter { $0.kind == .heartRate }
             .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
 
-        // Stop the ring's live monitoring.
-        session?.stopLiveMonitoring()
+        // Release the workout's hold on the ring and stop its live cycle (auto-measure resumes).
+        session?.endWorkoutHR()
         session = nil
 
-        // Stop GPS.
+        // Stop the location session (route or keep-alive) and let the screen sleep again.
         locationManager?.stopUpdatingLocation()
         locationManager?.delegate = nil
+        locationPurpose = nil
         gpsActive = false
+        UIApplication.shared.isIdleTimerDisabled = false
 
         let endDate = Date()
         let profile = HealthKitWriter.storedUserProfile()
@@ -220,10 +271,12 @@ final class WorkoutSessionManager: NSObject {
     func cancel() {
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
-        session?.stopLiveMonitoring()
+        session?.endWorkoutHR()
         session = nil
         locationManager?.stopUpdatingLocation()
         locationManager?.delegate = nil
+        locationPurpose = nil
+        UIApplication.shared.isIdleTimerDisabled = false
         recordingState = .idle
     }
 
@@ -240,26 +293,35 @@ final class WorkoutSessionManager: NSObject {
 
     // MARK: - HR collection
 
-    /// Snapshot the current liveHR from the ring session. Only records when monitoring is
-    /// active AND the ring has a locked reading (>= LiveHR.minValidBPM). Attributes a 2-s
-    /// window to each poll result — the ring holds the last known value between polls, so
-    /// this is the best honest approximation of "HR was X for the last 2 s."
+    /// Snapshot the ring's live HR — but record a sample ONLY for a genuinely fresh lock, never
+    /// the value the ring holds in `liveHR` between polls. `RingSession.liveHR` is a latch that is
+    /// never cleared while monitoring, so the old "record it every poll" logic re-emitted one early
+    /// still reading (e.g. 98) forever — freezing the UI number while the reading counter climbed
+    /// and writing a flat, fabricated HR line to HealthKit (the #45 "stuck at 98" bug).
     ///
-    /// Gaps (liveHR == nil or below minValidBPM) are preserved — we NEVER fabricate or
-    /// interpolate values to fill them (ref #45: live HR is best-effort / on-demand).
+    /// `WorkoutHRGate.shouldRecord` admits only a lock that is fresh (captured recently), in-session
+    /// (at/after the cycle start, so a pre-workout resting lock can't seed it) and not-yet-recorded
+    /// (its capture time advanced). On any miss we record nothing — the gap is preserved, never
+    /// interpolated. The displayed `currentHR` is kept (UI marks it stale via `currentHRIsStale`)
+    /// so it doesn't flicker; what we never do is COUNT or PERSIST a held value as a new reading.
     private func collectHRSnapshot() {
-        guard let session, session.monitoring,
-              let bpm = session.liveHR, bpm >= LiveHR.minValidBPM else {
-            // No lock — gap preserved, not filled (#45).
-            currentHR = nil
+        guard let session, session.monitoring else { return }
+        guard WorkoutHRGate.shouldRecord(liveHRAt: session.liveHRAt,
+                                         sessionStart: sessionStart,
+                                         lastRecordedAt: lastRecordedHRAt,
+                                         now: Date()),
+              let bpm = session.liveHR, LiveHR.validBPM.contains(bpm),
+              let at = session.liveHRAt else {
+            // No fresh lock this tick — gap preserved (#45). Keep currentHR; the UI ages it out.
             return
         }
-        let now = Date()
-        let sampleStart = now.addingTimeInterval(-2)
-        let sample = HRSample(bpm: bpm, start: sampleStart, end: now)
+        lastRecordedHRAt = at
+        // Attribute the ~2 s window leading up to the lock's true capture time (not "now").
+        let sample = HRSample(bpm: bpm, start: at.addingTimeInterval(-2), end: at)
         aggregator?.add(sample: sample)
         hrSampleCount += 1
         currentHR = bpm
+        currentHRAt = at
 
         // Update live zone breakdown.
         if let agg = aggregator {
@@ -271,23 +333,51 @@ final class WorkoutSessionManager: NSObject {
 
     // MARK: - GPS / CoreLocation
 
-    private func startGPS() {
+    private func startLocation(purpose: LocationPurpose) {
+        locationPurpose = purpose
         let mgr = CLLocationManager()
         mgr.delegate = self
-        mgr.desiredAccuracy = kCLLocationAccuracyBest
-        mgr.distanceFilter = 5   // update every 5 m
         locationManager = mgr
         locationAuthStatus = mgr.authorizationStatus
         switch mgr.authorizationStatus {
         case .authorizedWhenInUse, .authorizedAlways:
-            mgr.startUpdatingLocation()
-            gpsActive = true
+            configureAndStart(mgr, purpose: purpose)
         case .notDetermined:
+            // Configured in didChangeAuthorization once the user responds to the prompt.
             mgr.requestWhenInUseAuthorization()
         default:
-            // Permission denied — workout proceeds without GPS (graceful).
+            // Denied. Outdoor: proceed without a route (graceful). Indoor keep-alive: we can't stay
+            // alive in the background without it, so HR records only while the app is foreground —
+            // flag it so the UI can tell the user instead of failing silently.
             gpsActive = false
+            if purpose == .keepAlive { keepAliveUnavailable = true }
         }
+    }
+
+    /// Apply the background-capable configuration for `purpose` and begin updates. Called only once
+    /// authorization is WhenInUse/Always (from `startLocation` or `didChangeAuthorization`).
+    ///
+    /// `allowsBackgroundLocationUpdates = true` (paired with the `location` UIBackgroundMode) is
+    /// what keeps a foreground-started workout running after the phone locks — without it the BLE
+    /// poll loops freeze on suspend. `pausesLocationUpdatesAutomatically = false` is critical:
+    /// otherwise iOS auto-pauses at a rest/stoplight, the app suspends, and HR polling dies
+    /// mid-workout. The blue indicator is shown honestly while we hold location.
+    private func configureAndStart(_ mgr: CLLocationManager, purpose: LocationPurpose) {
+        switch purpose {
+        case .route:
+            mgr.desiredAccuracy = kCLLocationAccuracyBest
+            mgr.distanceFilter = 5                                  // update every 5 m
+        case .keepAlive:
+            mgr.desiredAccuracy = kCLLocationAccuracyHundredMeters  // coarse — save battery; fixes discarded
+            mgr.distanceFilter = kCLDistanceFilterNone
+        }
+        mgr.activityType = .fitness
+        mgr.pausesLocationUpdatesAutomatically = false
+        mgr.allowsBackgroundLocationUpdates = true
+        mgr.showsBackgroundLocationIndicator = true
+        mgr.startUpdatingLocation()
+        gpsActive = true
+        keepAliveUnavailable = false   // location granted — keep-alive can hold the app alive
     }
 
     // MARK: - HealthKit write
@@ -408,12 +498,13 @@ extension WorkoutSessionManager: CLLocationManagerDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.locationAuthStatus = manager.authorizationStatus
-            if manager.authorizationStatus == .authorizedWhenInUse
-                || manager.authorizationStatus == .authorizedAlways {
-                manager.startUpdatingLocation()
-                self.gpsActive = true
+            if (manager.authorizationStatus == .authorizedWhenInUse
+                || manager.authorizationStatus == .authorizedAlways),
+               let purpose = self.locationPurpose {
+                self.configureAndStart(manager, purpose: purpose)
             } else {
                 self.gpsActive = false
+                if self.locationPurpose == .keepAlive { self.keepAliveUnavailable = true }
             }
         }
     }
@@ -422,7 +513,14 @@ extension WorkoutSessionManager: CLLocationManagerDelegate {
                                      didUpdateLocations locations: [CLLocation]) {
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Indoor keep-alive runs location ONLY to keep the app alive — never store its fixes
+            // (no route, no distance). Only an outdoor `.route` session contributes to the map.
+            guard self.locationPurpose == .route else { return }
             for loc in locations {
+                // Reject stale/cached fixes: CoreLocation delivers a cached last-known location as
+                // the first callback after startUpdatingLocation() — and again on each background
+                // resume — which would add a bogus distance jump from a previous location. (#75)
+                guard abs(loc.timestamp.timeIntervalSinceNow) < 10 else { continue }
                 // Reject low-accuracy fixes (> 50 m horizontal accuracy).
                 guard loc.horizontalAccuracy >= 0, loc.horizontalAccuracy <= 50 else { continue }
                 if let prev = self.lastLocation {
