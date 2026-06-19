@@ -410,18 +410,6 @@ struct ContentView: View {
             // User-initiated measure timed out without locking a reading. Persists until the
             // user taps Measure again (which clears it naturally). (#55)
             if session?.userMeasureFailed == true { measureFailedHint }
-            // Switch to a different ring. The app silently auto-reconnects to the active ring, so
-            // without this there's no way to reach the picker and pick another (#multi-ring).
-            if connected || isConnecting {
-                Button {
-                    scanner.chooseRing()
-                } label: {
-                    Label("Switch ring", systemImage: "arrow.left.arrow.right")
-                        .font(.subheadline)
-                }
-                .buttonStyle(.bordered)
-                .padding(.top, 2)
-            }
             if !connected {
                 switch scanner.state {
                 case .scanning:
@@ -442,7 +430,7 @@ struct ContentView: View {
                 case .connecting:
                     // The status line above already says "Connecting…", but a pending connect has no
                     // timeout — give the user an escape hatch so a ring that's out of range can't wedge
-                    // the card forever. (Switch ring above also breaks out of this.)
+                    // the card forever.
                     HStack {
                         Spacer()
                         Button("Cancel") { scanner.disconnect() }.font(.subheadline)
@@ -460,13 +448,8 @@ struct ContentView: View {
         }
     }
 
-    /// True while a connection attempt / auto-reconnect is in flight (used to offer "Switch ring" so
-    /// the user isn't stuck waiting on the active ring when they want a different one).
-    private var isConnecting: Bool {
-        if case .connecting = scanner.state { return true } else { return false }
-    }
-
-    /// The ring list — shown when a scan finds >1 ring, or whenever the user taps "Switch ring".
+    /// The ring list — shown when a scan finds >1 ring, or whenever the user taps "Connect a
+    /// different ring" (Device Info).
     /// Tapping a row connects to that ring and makes it active. The "Last used" badge marks the
     /// previously active ring; rows are ordered active-first, then by name (a stable key), with a
     /// per-row signal glyph showing proximity.

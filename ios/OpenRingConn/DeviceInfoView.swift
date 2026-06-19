@@ -10,6 +10,7 @@ import OpenRingKit
 /// as each DIS characteristic is read after connection. Unread fields show "--".
 struct DeviceInfoView: View {
     var session: RingSession?
+    @Environment(\.dismiss) private var dismiss
 
     private var info: FirmwareInfo { session?.firmwareInfo ?? FirmwareInfo() }
 
@@ -51,6 +52,22 @@ struct DeviceInfoView: View {
                      + "(DIS 0x2A23 System ID). CoreBluetooth hides the live MAC on iOS; "
                      + "this is the only way to recover it without Bluetooth scanning permissions.")
                     .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            // Switching rings is an uncommon action (most people have one ring), so it lives here
+            // rather than on the main screen. Drops the current link and scans so a different ring
+            // can be picked; dismiss back to the dashboard where the picker appears. Data from all
+            // rings stays in one shared timeline. (#multi-ring)
+            Section {
+                Button {
+                    RingScanner.shared.chooseRing()
+                    dismiss()
+                } label: {
+                    Label("Connect a different ring", systemImage: "arrow.left.arrow.right")
+                }
+            } footer: {
+                Text("Disconnects this ring and scans so you can choose another. Each ring's data "
+                     + "merges into one shared health timeline — switching never erases the other's data.")
             }
         }
         .navigationTitle("Device Info")
