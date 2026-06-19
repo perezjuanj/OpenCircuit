@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- OpenCircuit does not track users across apps/sites. -->
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<!-- Local-first: health metrics stay on device / in the user's own HealthKit store and
+	     are never transmitted to us or a third party, so no data is "collected" per Apple's
+	     definition. The App Store privacy label is set to "Data Not Collected" in App Store Connect. -->
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<!-- Required-reason APIs actually used by the app. -->
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<!-- CA92.1: access info stored in user defaults by this app, accessible only to it. -->
+				<string>CA92.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

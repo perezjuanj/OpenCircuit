@@ -5,3 +5,8 @@
 .swiftpm/
 DerivedData/
 OpenCircuitKit/.build/
+# Device/archive derived-data path used by CLI builds (xcodebuild -derivedDataPath)
+build-device/
+build/
+# Throwaway icon background candidates — only branding/logo.svg + AppIcon.appiconset are committed
+OpenCircuit/branding/candidates/

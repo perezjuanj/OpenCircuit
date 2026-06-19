@@ -25,6 +25,13 @@ targets:
         # User-facing app name (home screen, Settings). Independent of PRODUCT_NAME / bundle id,
         # which stay "OpenCircuit"/com.standardsoftwaresolutions.opencircuit internally (#100 rebrand).
         CFBundleDisplayName: OpenCircuit
+        # Version/build come from the build settings below (single source of truth). XcodeGen
+        # generates this Info.plist, so these MUST live here, not be hand-edited into the plist.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # Export compliance: only crypto is SM3 hashing for ring auth (exempt) → declare no
+        # non-exempt encryption, so TestFlight uploads skip the manual compliance prompt.
+        ITSAppUsesNonExemptEncryption: false
         # HealthKit auth strings (Phase 4) — required or the app crashes on request. Shown verbatim
         # in the iOS permission dialogs, so they use the user-facing name "OpenCircuit".
         NSHealthShareUsageDescription: "OpenCircuit reads health metrics from your ring to display them."
@@ -60,11 +67,17 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.standardsoftwaresolutions.opencircuit
-        MARKETING_VERSION: "0.1"
+        # Single source of truth for version/build — Info.plist references these via
+        # $(MARKETING_VERSION)/$(CURRENT_PROJECT_VERSION). Bump CURRENT_PROJECT_VERSION
+        # for EVERY TestFlight upload (build numbers must be unique & increasing).
+        MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
+        # App icon lives in OpenCircuit/Assets.xcassets/AppIcon.appiconset (single 1024px icon,
+        # iOS 17 single-size format). Set explicitly so CLI/device builds assign it after xcodegen.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # On-device signing. Set here so CLI device builds work after `xcodegen generate`
         # (which would otherwise drop the team and fail signing). Team 765RD9BJ8C =
         # S&S Holdings International LLC (DBA Standard Software Solutions); paid, HealthKit-capable.
@@ -83,3 +96,18 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.standardsoftwaresolutions.opencircuit.tests
         SWIFT_VERSION: "5.9"
         GENERATE_INFOPLIST_FILE: YES
+
+# Shared scheme for the app target so `xcodebuild -scheme OpenCircuit` (CLI device
+# build/run) works after `xcodegen generate` — XcodeGen does not auto-create one.
+schemes:
+  OpenCircuit:
+    build:
+      targets:
+        OpenCircuit: all
+        OpenCircuitTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - OpenCircuitTests
