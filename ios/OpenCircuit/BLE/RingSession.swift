@@ -94,12 +94,13 @@ final class RingSession: NSObject {
 
     // MARK: Wear gate / not-worn proxy (#56, #41)
     //
-    // `appearsNotWorn` is true when the ring reads as OFF-WRIST / ON THE CHARGER, inferred from
-    // PROVEN proxies only — periodic auto-measures that never lock (🟢) plus, when available, a
-    // cold raw skin-temp reading (🟡, AutoMeasureGate). NO charging-flag byte is consulted (that
-    // descriptor field is undecoded — #61). It gates only the AUTOMATIC HR/SpO₂ refresh (which on
-    // the charger just times out and drains battery, #56) and a small UI hint; manual Measure /
-    // Sync are never blocked by it. Reset per connection (a new RingSession each connect).
+    // `appearsNotWorn` is the temperature/no-lock PROXY for off-wrist (still 🟡 — no confirmed
+    // skin-contact byte): periodic auto-measures that never lock (🟢) plus, when available, a cold
+    // raw skin-temp reading (🟡, AutoMeasureGate). For the CHARGER case specifically the decoded
+    // `charging` byte (#61, `[2]==0x04` 🟢) is now the definitive signal and is consulted directly
+    // by `skipAutoMeasureProbe`. This gates only the AUTOMATIC HR/SpO₂ refresh (which on the
+    // charger just times out and drains battery, #56) and a small UI hint; manual Measure / Sync
+    // are never blocked by it. Reset per connection (a new RingSession each connect).
     private(set) var appearsNotWorn = false
     /// Consecutive periodic auto-measure cycles that never locked a reading — the 🟢 not-worn
     /// signal. Reset to 0 on a lock (or cleared by a warm skin-temp reading).
@@ -168,21 +169,30 @@ final class RingSession: NSObject {
     /// IS a few minutes old.
     private static let batteryStaleAfter: TimeInterval = 120
 
-    // MARK: Charging inference (#60)
+    // MARK: Charging state (#61 — DECODED) + inference fallback (#60)
     //
-    // The ring's charging byte is NOT on the wire in any confirmed field (PROTOCOL.md §5).
-    // A strictly rising battery % across consecutive 0x10/0x87 frames is the best 🟢 proxy.
-    // This window is private; `inferredCharging` is computed from it via the kit's pure function.
-    // The inference is persisted before session teardown (see `invalidate`) so the connection
-    // card can surface a hint during the reconnect backoff when session == nil.
+    // The charging byte IS on the wire (resolved 2026-06-19, PROTOCOL.md §5.4): descriptor
+    // `[2] == 0x04` ⟺ on the charger 🟢, confirmed by a labelled A/B (battery 66→74 % over a
+    // 6-min charge; 100 % of charging frames read 0x04, `[17]==0x46` as a second witness). So
+    // `charging` is the real, per-frame, instant signal. The rising-battery `inferredCharging`
+    // proxy (#60) is kept only as a FALLBACK for the reconnect-backoff window when no live frame
+    // exists (session == nil) — it's persisted before teardown so the card can still hint.
 
-    /// Rolling battery % readings (oldest→newest, capped) for charging inference (#60).
+    /// 🟢 Confirmed on-charger state from the most recent 0x10/0x87 descriptor (`DeviceStatus.isOnCharger`,
+    /// `[2]==0x04`). Per-frame and instant — flips on charger contact before temp/battery move.
+    /// Reset per connection. Prefer this over `inferredCharging` whenever connected.
+    private(set) var charging = false
+
+    /// 🟢 Ring battery voltage in mV from the descriptor `[14:16]` (`DeviceStatus.batteryVoltageMillivolts`,
+    /// #89), or nil until a valid frame. ~4000 mV worn, climbs toward ~4400 mV on the charger.
+    private(set) var batteryVoltageMV: Int?
+
+    /// Rolling battery % readings (oldest→newest, capped) for the charging-inference fallback (#60).
     private var batteryTrend: [Int] = []
     private static let batteryTrendCapacity = 4
 
-    /// True when the last few battery readings are strictly rising — suggesting the ring may
-    /// be charging (🟢 proxy). The UI labels this "inferred" to avoid asserting certainty.
-    /// Never derived from the reconnect count (#60).
+    /// True when the last few battery readings are strictly rising — the pre-#61 fallback used
+    /// only when no live frame is in hand (use `charging` while connected). Labelled "inferred".
     var inferredCharging: Bool { ChargingInference.inferred(from: batteryTrend) }
 
     /// UserDefaults key for the last-persisted charging inference (#60). Written before session
@@ -297,11 +307,24 @@ final class RingSession: NSObject {
     /// DIS fields collected from the ring (firmware version, generation, manufacturer, etc.) (#79).
     /// Populated incrementally as each DIS characteristic is read; `DeviceInfoView` observes this.
     private(set) var firmwareInfo = FirmwareInfo()
-    /// Rolling battery % samples for the TTE estimate (#86). Capped at 20 entries (oldest→newest).
+    /// Rolling battery % samples for the TTE estimate (#86), **persisted per-ring** across
+    /// reconnects/relaunches so the discharge slope isn't wiped each session — that wipe was why
+    /// "time to empty" almost never appeared. Loaded in `init`, rewritten on every reading via the
+    /// pure `BatteryTTE.record` (which noise-filters using the decoded charging byte, #61).
     private var batteryHistory: [BatteryTTE.Sample] = []
-    private static let batteryHistoryCap = 20
+    private static let batteryHistoryCap = 60
     /// Read accessor for the TTE sample window (#86).
     var batteryTTESamples: [BatteryTTE.Sample] { batteryHistory }
+    /// Per-ring UserDefaults key for the persisted TTE history (scoped like the epoch archive).
+    private var batteryHistoryKey: String { "battery.tteHistory.v1.\(peripheral.identifier.uuidString)" }
+
+    /// Rolling RISING samples while the ring is on the charger — the time-to-FULL counterpart of
+    /// `batteryHistory` (#61). Persisted per-ring too (short-lived; clears on unplug). Fed via the
+    /// pure `BatteryTTE.recordCharge`; consumed by `BatteryTTE.timeToFull`.
+    private var batteryChargeHistory: [BatteryTTE.Sample] = []
+    /// Read accessor for the time-to-full charge window (#61).
+    var batteryChargeSamples: [BatteryTTE.Sample] { batteryChargeHistory }
+    private var batteryChargeHistoryKey: String { "battery.chargeHistory.v1.\(peripheral.identifier.uuidString)" }
 
     init(peripheral: CBPeripheral, localStore: LocalStore? = nil) {
         self.peripheral = peripheral
@@ -309,6 +332,16 @@ final class RingSession: NSObject {
         // Scope the per-ring epoch archive to this ring's identifier (#multi-ring).
         self.epochArchiveStore = EpochArchiveStore(namespace: peripheral.identifier.uuidString)
         super.init()
+        // Restore this ring's persisted battery history so the TTE estimate is available
+        // immediately on reconnect instead of rebuilding a discharge slope from scratch (#86).
+        if let data = UserDefaults.standard.data(forKey: batteryHistoryKey),
+           let saved = try? JSONDecoder().decode([BatteryTTE.Sample].self, from: data) {
+            self.batteryHistory = saved
+        }
+        if let data = UserDefaults.standard.data(forKey: batteryChargeHistoryKey),
+           let saved = try? JSONDecoder().decode([BatteryTTE.Sample].self, from: data) {
+            self.batteryChargeHistory = saved
+        }
         peripheral.delegate = self
         // Seed the model name from the peripheral's advertised name; may be overridden later
         // by a dedicated DIS Model Number characteristic if the ring exposes one. (#79)
@@ -657,13 +690,15 @@ final class RingSession: NSObject {
                                  rawSkinTempC: lastRawSkinTempC)
     }
 
-    /// Skip the live-enter probe entirely this cycle (#56): we've inferred not-worn AND the raw
-    /// skin temp still reads cold, so a probe would only time out and burn battery. Requires a
-    /// COLD reading (positive evidence) — a missing temp falls back to probing so a sensor gap
-    /// can't silently stop measuring. Re-wear is caught when the temp warms (the keepalive keeps
-    /// it fresh), which clears `appearsNotWorn`.
+    /// Skip the live-enter probe entirely this cycle (#56): a probe would only time out and burn
+    /// battery. Skips when EITHER the ring reports **confirmed on-charger** (`charging`, decoded
+    /// `[2]==0x04` 🟢 — #61, definitive, no temp needed) OR the older proxy fires (inferred
+    /// not-worn AND a COLD raw skin temp — positive evidence; a missing temp falls back to probing
+    /// so a sensor gap can't silently stop measuring). Re-wear/undock is caught when `charging`
+    /// clears or the temp warms (the keepalive keeps both fresh), resuming measurement promptly.
     private var skipAutoMeasureProbe: Bool {
-        appearsNotWorn && (lastRawSkinTempC.map { $0 < ActivityPeriod.wornMinTemperatureC } ?? false)
+        if charging { return true }
+        return appearsNotWorn && (lastRawSkinTempC.map { $0 < ActivityPeriod.wornMinTemperatureC } ?? false)
     }
 
     /// Fold one finished auto-measure cycle into the not-worn inference (#56): a lock proves the
@@ -1451,6 +1486,15 @@ extension RingSession: CBPeripheralDelegate {
                     self.persist([QuantitySample(kind: .temperature, start: Date(), value: t.celsius)])
                 }
             }
+            // Confirmed charging state (#61 🟢): descriptor [2]==0x04 ⟺ on the charger. Per-frame
+            // and instant — drives the auto-measure skip (#56) and a true "charging" UI signal,
+            // superseding the rising-% inference while connected. Also decode ring voltage (#89).
+            if let onCharger = DeviceStatus.isOnCharger(bytes) {
+                if onCharger != self.charging { self.charging = onCharger }
+            }
+            if let mv = DeviceStatus.batteryVoltageMillivolts(bytes) {
+                if mv != self.batteryVoltageMV { self.batteryVoltageMV = mv }
+            }
             // Ring battery % is descriptor byte[1] (§5.4 🟢, ground-truthed).
             // Also stamps `batteryFetchedAt` (#57) and extends the charging-inference trend (#60)
             // and the TTE sample window (#86).
@@ -1464,10 +1508,27 @@ extension RingSession: CBPeripheralDelegate {
                         self.batteryTrend.removeFirst()
                     }
                 }
-                // TTE: rolling window of timestamped battery % readings (#86).
-                self.batteryHistory.append(BatteryTTE.Sample(percent: b, at: Date()))
-                if self.batteryHistory.count > Self.batteryHistoryCap {
-                    self.batteryHistory.removeFirst()
+                // TTE (#86): fold into the persisted per-ring discharge history via the pure
+                // accumulator — it noise-filters with the decoded charging byte (#61), prunes, and
+                // keeps a clean slope across reconnects. Persist only when the history changed.
+                let updated = BatteryTTE.record(self.batteryHistory, percent: b, at: Date(),
+                                                charging: self.charging,
+                                                cap: Self.batteryHistoryCap)
+                if updated != self.batteryHistory {
+                    self.batteryHistory = updated
+                    if let data = try? JSONEncoder().encode(updated) {
+                        UserDefaults.standard.set(data, forKey: self.batteryHistoryKey)
+                    }
+                }
+                // Time-to-FULL (#61): mirror window, active only while the charging byte is set.
+                let charge = BatteryTTE.recordCharge(self.batteryChargeHistory, percent: b, at: Date(),
+                                                     charging: self.charging,
+                                                     cap: Self.batteryHistoryCap)
+                if charge != self.batteryChargeHistory {
+                    self.batteryChargeHistory = charge
+                    if let data = try? JSONEncoder().encode(charge) {
+                        UserDefaults.standard.set(data, forKey: self.batteryChargeHistoryKey)
+                    }
                 }
             }
             // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).

@@ -380,21 +380,49 @@ struct ContentView: View {
                 // the 2-s live-HR polls that keep liveReadingsStale fresh during monitoring.
                 if let b = session?.batteryPercent {
                     let stale = session?.batteryStale == true   // (#57) dedicated battery freshness
+                    let charging = session?.charging == true     // (#61) decoded [2]==0x04, definite
                     VStack(alignment: .trailing, spacing: 0) {
-                        Label("\(b)%", systemImage: batteryIcon(b))
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(stale ? AnyShapeStyle(.tertiary)
-                                             : AnyShapeStyle(b <= 20 ? Color.red : Color.secondary))
+                        // Charging (#61): green % + ⚡ — takes precedence over stale/low-battery red
+                        // (a charging frame is by definition fresh, and "low but charging" reads green).
+                        HStack(spacing: 3) {
+                            Image(systemName: batteryIcon(b))
+                            Text("\(b)%")
+                            if charging { Image(systemName: "bolt.fill").font(.caption2) }
+                        }
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(charging ? AnyShapeStyle(Color.green)
+                                         : stale ? AnyShapeStyle(.tertiary)
+                                         : AnyShapeStyle(b <= 20 ? Color.red : Color.secondary))
                         if let asOf = batteryAsOf {
                             Text(asOf).font(.caption2).foregroundStyle(.tertiary)
                         }
-                        // TTE estimate (#86): only shown when discharging (not inferred charging)
-                        // and the window has enough data for a clean rate.
-                        if session?.inferredCharging != true,
-                           let samples = session?.batteryTTESamples,
-                           let tte = BatteryTTE.timeToEmpty(samples) {
-                            Text("~\(tteString(tte)) est.")
-                                .font(.caption2).foregroundStyle(.tertiary)
+                        // Time-to-FULL (#61) while charging: needs the rising charge slope, so it
+                        // shows "estimating…" for the first ~2 pp of a charge, then "~Xh to full".
+                        if charging {
+                            if b >= 100 {
+                                Text("Full").font(.caption2).foregroundStyle(.tertiary)
+                            } else if let ttf = BatteryTTE.timeToFull(session?.batteryChargeSamples ?? []),
+                                      ttf > 0 {
+                                Text("~\(tteString(ttf)) to full")
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                            } else {
+                                Text("estimating time to full…")
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                            }
+                        }
+                        // Time-to-empty (#86): shown whenever discharging. With the persisted
+                        // history it's available almost always; right after a charge (no discharge
+                        // slope yet) it shows "estimating…" until ~2 pp have drained. Suppressed
+                        // while charging (decoded byte or rising-% inference) and when stale.
+                        if session?.charging != true, session?.inferredCharging != true, !stale {
+                            if let samples = session?.batteryTTESamples,
+                               let tte = BatteryTTE.timeToEmpty(samples) {
+                                Text("~\(tteString(tte)) left")
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                            } else {
+                                Text("estimating time left…")
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                            }
                         }
                     }
                 }
@@ -403,12 +431,12 @@ struct ContentView: View {
             // un-activated/un-bonded signature. Until the activate step is reverse-engineered, the
             // only fix is to open the official app once; say so instead of spinning forever.
             if connected, session?.notStreaming == true { activationHint }
-            // Connected + streaming, but the ring reads off-wrist / on the charger (#56) — surface
-            // it (estimated) instead of silently backing the auto-measure off. notStreaming takes
-            // precedence (an un-activated ring's wear state is meaningless), and we hide it during
-            // an active measurement so it can't contradict the "measuring" cue.
+            // Connected + streaming, but the ring is on the charger (#61, confirmed byte) or reads
+            // off-wrist (#56, estimated) — surface it instead of silently backing the auto-measure
+            // off. notStreaming takes precedence (an un-activated ring's wear state is meaningless),
+            // and we hide it during an active measurement so it can't contradict the "measuring" cue.
             if connected, session?.notStreaming != true, session?.monitoring != true,
-               session?.appearsNotWorn == true {
+               session?.charging == true || session?.appearsNotWorn == true {
                 notWornHint
             }
             // User-initiated measure timed out without locking a reading. Persists until the
@@ -525,13 +553,18 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
     }
 
-    /// Shown when `RingSession.appearsNotWorn` — connected but the ring reads off-wrist / on the
-    /// charger (a proxy from auto-measures that never lock + a cold skin-temp reading, #56). Honest
-    /// that it's an estimate; manual Measure/Sync are never blocked by it.
+    /// Shown when the ring is on the charger or reads off-wrist (auto-measure paused; manual
+    /// Measure/Sync are never blocked). When the decoded charging byte confirms the charger
+    /// (#61, `RingSession.charging`) the copy is definite; otherwise it's the off-wrist proxy
+    /// (auto-measures that never lock + a cold skin-temp reading, #56), labelled an estimate.
     private var notWornHint: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "pause.circle").foregroundStyle(.secondary)
-            Text("Ring looks off-wrist or charging (estimated) — auto-measure paused")
+        let onCharger = session?.charging == true
+        return HStack(spacing: 6) {
+            Image(systemName: onCharger ? "bolt.circle" : "pause.circle")
+                .foregroundStyle(.secondary)
+            Text(onCharger
+                 ? "Ring is on the charger — auto-measure paused"
+                 : "Ring looks off-wrist (estimated) — auto-measure paused")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -591,8 +624,10 @@ struct ContentView: View {
     /// Human-readable battery time-to-empty string (#86): "Xh Ym" or just "Xm" for < 1 h.
     private func tteString(_ tte: TimeInterval) -> String {
         let totalMin = Int(tte / 60)
-        let h = totalMin / 60
+        let d = totalMin / 1440
+        let h = (totalMin % 1440) / 60
         let m = totalMin % 60
+        if d > 0 { return h > 0 ? "\(d)d \(h)h" : "\(d)d" }
         if h > 0 { return m > 0 ? "\(h)h \(m)m" : "\(h)h" }
         return "\(max(totalMin, 1))m"
     }

@@ -47,16 +47,49 @@ public enum DeviceStatus {
         return SkinTemperature(channelA: Double(a) / 10, channelB: Double(b) / 10)
     }
 
-    // MARK: - Wear / charging proxy (#41, #60)
+    // MARK: - Charging state + voltage (DECODED, #61 / #89)
     //
-    // ⚠️  PROXY ONLY. The hardware charging/wear byte at 0x10/0x87 [2] is not yet decoded
-    // (#61 — needs a charged-vs-uncharged capture pair). These functions wrap the best
-    // 🟡/🟢 proxies available today behind the same call signature that a future
-    // hardware-byte decoder will fill in — callers stay identical when #61 lands.
+    // Resolved 2026-06-19 by a clean labelled A/B capture (finger → charger → off → finger):
+    // over a 6-min charge the battery rose 66→74 % and the skin temp fell 31→27 °C, and against
+    // that ground truth `[2]` read **0x04 for 100 % of charging frames and never** in the worn
+    // or off-wrist-idle phases. Confirmed buffer-wide: of all 0x10/0x87 frames, `[2]==0x04` is
+    // ~30× enriched for a rising-battery window vs `0x02`/`0x03`, and `[17]==0x46` co-occurs
+    // **exclusively** with `0x04` (0 of 428 worn frames) — an independent second witness.
+    //   `[2]`: 0x02/0x03 = worn-streaming sub-frame toggle · 0x01 = startup/settle · **0x04 = ON CHARGER** 🟢
+    //   `[14:16]` = battery voltage, mV, 16-bit BE (4001→4384 mV across the charge; Li-ion curve) 🟢
+
+    /// 🟢 True when a 0x10/0x87 descriptor reports the ring is **on the charger** (`[2] == 0x04`,
+    /// PROTOCOL.md §5.4). `[17] == 0x46` corroborates while charging but is not required (it lags
+    /// the first frame or two of a charge). Returns nil if the frame isn't a descriptor.
+    ///
+    /// This is the real hardware signal that supersedes the `isCharging(batteryTrend:)` proxy:
+    /// it is per-frame, instant (flips on contact before temperature or battery % move), and does
+    /// not depend on a rising-% window. Prefer it whenever a live descriptor frame is available;
+    /// fall back to the battery-trend proxy only when no fresh frame exists.
+    public static func isOnCharger(_ frame: [UInt8]) -> Bool? {
+        guard frame.count >= 19, frame[0] == 0x10 || frame[0] == 0x87 else { return nil }
+        return frame[2] == 0x04
+    }
+
+    /// 🟢 Ring battery voltage in millivolts from a 0x10/0x87 descriptor: `[14:16]`, 16-bit BE
+    /// (PROTOCOL.md §5.4 / #89). Ground-truthed 2026-06-19: 4001 mV worn → 4384 mV peak charge →
+    /// 4196 mV relaxed — a textbook single-cell Li-ion curve. Returns nil if the frame isn't a
+    /// descriptor or the value is outside a plausible single-cell band (2.5–4.6 V), filtering
+    /// zero/garbage frames.
+    public static func batteryVoltageMillivolts(_ frame: [UInt8]) -> Int? {
+        guard frame.count >= 19, frame[0] == 0x10 || frame[0] == 0x87 else { return nil }
+        let mv = (Int(frame[14]) << 8) | Int(frame[15])
+        return (2500...4600).contains(mv) ? mv : nil
+    }
+
+    // MARK: - Wear proxy (#41, #56) + battery-trend charging fallback (#60)
+    //
+    // `isWorn` is still a temperature PROXY (no confirmed skin-contact byte — distinct from the
+    // now-decoded charging byte above). `isCharging(batteryTrend:)` is the pre-#61 fallback for
+    // when no live descriptor frame is in hand; with a frame, use `isOnCharger` instead.
     //
     // Use `isWorn` to gate sleep detection, temperature averaging, and HealthKit writes.
-    // Use `isCharging` to surface a "ring on charger" hint in the UI. Both are labelled
-    // "inferred" / "likely" everywhere they appear — never "confirmed".
+    // `isWorn` is labelled "inferred" / "likely" everywhere it appears — never "confirmed".
 
     /// 🟡 Inferred wear state from the skin-temperature field of a 0x10/0x87 descriptor.
     ///
@@ -77,15 +110,17 @@ public enum DeviceStatus {
         return temp.celsius >= wornMinC
     }
 
-    /// 🟢 Inferred charging state from a rolling window of battery % readings.
+    /// 🟢 Inferred charging state from a rolling window of battery % readings — the **fallback**
+    /// for when no live descriptor frame is available (use `isOnCharger(_:)`, the decoded
+    /// `[2]==0x04` byte, whenever a frame is in hand).
     ///
     /// True when `batteryTrend` is a strictly rising sequence (every consecutive pair
-    /// increases) — the confirmed indirect signal that the ring is charging. Delegates to
+    /// increases) — the indirect signal that the ring is charging. Delegates to
     /// `ChargingInference.inferred(from:)`; see that type for edge-case semantics
     /// (requires ≥ 2 readings; flat or falling returns `false`).
     ///
-    /// - Note: Never certainty — label this "inferred" / "likely" in all UI copy.
-    ///   Will be superseded by the decoded hardware byte (#61).
+    /// - Note: Inferred, not instant — it needs the % to actually tick up. The decoded
+    ///   `isOnCharger(_:)` byte (#61) is per-frame and supersedes it where a frame exists.
     public static func isCharging(batteryTrend: [Int]) -> Bool {
         ChargingInference.inferred(from: batteryTrend)
     }

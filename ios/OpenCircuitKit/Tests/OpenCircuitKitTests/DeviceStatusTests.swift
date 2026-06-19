@@ -124,6 +124,60 @@ final class DeviceStatusTests: XCTestCase {
         XCTAssertFalse(DeviceStatus.isCharging(batteryTrend: [74, 76, 75]))
     }
 
+    // MARK: - isOnCharger / batteryVoltageMillivolts (DECODED byte, #61 / #89)
+    //
+    // Fixtures are REAL frames from the 2026-06-19 labelled A/B capture
+    // (captures/charger66b, finger → charger → off → finger).
+
+    /// A real ON-CHARGER frame mid-charge: [2]=04, [17]=46, voltage [14:15]=10 f7 (4343 mV).
+    private let chargingFrame: [UInt8] =
+        [0x10, 0x47, 0x04, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x01, 0x06,
+         0x00, 0x00, 0x00, 0x00, 0x10, 0xf7, 0x02, 0x46, 0x00]
+    /// A real WORN/streaming frame: [2]=02, [17]=ff, voltage [14:15]=0f a1 (4001 mV).
+    private let wornFrame: [UInt8] =
+        [0x10, 0x42, 0x02, 0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x3e,
+         0x00, 0x00, 0x00, 0x00, 0x0f, 0xa1, 0x00, 0xff, 0x00]
+
+    func testIsOnChargerTrueForChargingFrame() {
+        XCTAssertEqual(DeviceStatus.isOnCharger(chargingFrame), true)
+    }
+
+    func testIsOnChargerFalseForWornFrame() {
+        XCTAssertEqual(DeviceStatus.isOnCharger(wornFrame), false)
+    }
+
+    func testIsOnChargerFalseForStartupStateByte() {
+        // [2]=0x01 is the startup/settle transient, not charging.
+        var f = wornFrame; f[2] = 0x01
+        XCTAssertEqual(DeviceStatus.isOnCharger(f), false)
+    }
+
+    func testIsOnChargerWorksFor0x87() {
+        var f = chargingFrame; f[0] = 0x87
+        XCTAssertEqual(DeviceStatus.isOnCharger(f), true)
+    }
+
+    func testIsOnChargerNilForNonDescriptor() {
+        var f = chargingFrame; f[0] = 0x4C
+        XCTAssertNil(DeviceStatus.isOnCharger(f))
+        XCTAssertNil(DeviceStatus.isOnCharger([0x10, 0x04]))   // too short
+    }
+
+    func testBatteryVoltageDecodesChargingPeak() {
+        XCTAssertEqual(DeviceStatus.batteryVoltageMillivolts(chargingFrame), 4343)
+    }
+
+    func testBatteryVoltageDecodesWornBaseline() {
+        XCTAssertEqual(DeviceStatus.batteryVoltageMillivolts(wornFrame), 4001)
+    }
+
+    func testBatteryVoltageNilForImplausibleAndNonDescriptor() {
+        var zero = wornFrame; zero[14] = 0; zero[15] = 0        // 0 mV → out of band
+        XCTAssertNil(DeviceStatus.batteryVoltageMillivolts(zero))
+        var notDesc = wornFrame; notDesc[0] = 0x4C
+        XCTAssertNil(DeviceStatus.batteryVoltageMillivolts(notDesc))
+    }
+
     // MARK: - Combined: still + ambient temp + battery-rising → NOT sleep (#41 core case)
     //
     // This is the key regression guard: a ring on the charger produces a still motion

@@ -94,4 +94,118 @@ final class BatteryTTETests: XCTestCase {
     func testJustReachedFullDoesNotFireBelow100() {
         XCTAssertFalse(BatteryTTE.justReachedFull(percent: 99, inferredCharging: true, wasFull: false))
     }
+
+    // MARK: - record (robust history accumulation, #86)
+
+    func testRecordAppendsDischargeStep() {
+        let h = [sample(80, hours: 0)]
+        let out = BatteryTTE.record(h, percent: 79, at: t0.addingTimeInterval(3_600), charging: false)
+        XCTAssertEqual(out.map(\.percent), [80, 79])
+    }
+
+    func testRecordIgnoresEqualAndSmallNoiseRise() {
+        var h = [sample(80, hours: 0), sample(79, hours: 1)]
+        // equal reading → ignored (keeps first-seen time)
+        h = BatteryTTE.record(h, percent: 79, at: t0.addingTimeInterval(2 * 3_600), charging: false)
+        XCTAssertEqual(h.map(\.percent), [80, 79])
+        // +1 pp jitter while NOT charging → ignored, slope preserved
+        h = BatteryTTE.record(h, percent: 80, at: t0.addingTimeInterval(3 * 3_600), charging: false)
+        XCTAssertEqual(h.map(\.percent), [80, 79])
+        // discharge continues cleanly afterwards
+        h = BatteryTTE.record(h, percent: 78, at: t0.addingTimeInterval(4 * 3_600), charging: false)
+        XCTAssertEqual(h.map(\.percent), [80, 79, 78])
+    }
+
+    func testRecordResetsBaselineWhenCharging() {
+        let h = [sample(80, hours: 0), sample(70, hours: 5)]
+        let out = BatteryTTE.record(h, percent: 71, at: t0.addingTimeInterval(6 * 3_600), charging: true)
+        XCTAssertEqual(out.map(\.percent), [71], "a charging frame invalidates the discharge slope")
+    }
+
+    func testRecordResetsOnMissedChargeJump() {
+        let h = [sample(60, hours: 0), sample(55, hours: 5)]
+        // +20 pp while the byte says not-charging → a charge we missed between frames → reset
+        let out = BatteryTTE.record(h, percent: 75, at: t0.addingTimeInterval(6 * 3_600), charging: false)
+        XCTAssertEqual(out.map(\.percent), [75])
+    }
+
+    func testRecordPersistsAcrossReconnectIntoUsableEstimate() {
+        // Simulate readings folded over hours, then confirm a clean TTE comes out — the
+        // "survives reconnect" guarantee is that the array itself is the persisted state.
+        var h: [BatteryTTE.Sample] = []
+        h = BatteryTTE.record(h, percent: 90, at: t0, charging: false)
+        h = BatteryTTE.record(h, percent: 88, at: t0.addingTimeInterval(2 * 3_600), charging: false)
+        let tte = BatteryTTE.timeToEmpty(h, now: t0.addingTimeInterval(2 * 3_600))
+        XCTAssertNotNil(tte, "2 pp over 2 h → 1 %/hr → ~88 h left")
+        XCTAssertEqual(tte!, 88.0 * 3_600, accuracy: 60)
+    }
+
+    func testRecordPrunesByCap() {
+        var h: [BatteryTTE.Sample] = []
+        for i in 0..<80 { h = BatteryTTE.record(h, percent: 100 - i, at: t0.addingTimeInterval(Double(i) * 60), charging: false, cap: 60) }
+        XCTAssertEqual(h.count, 60)
+        XCTAssertEqual(h.last?.percent, 21)   // most-recent retained
+    }
+
+    func testRecordPrunesByAge() {
+        let old = [BatteryTTE.Sample(percent: 90, at: t0)]
+        // a reading 15 days later → the 14-day-old sample is pruned
+        let out = BatteryTTE.record(old, percent: 89, at: t0.addingTimeInterval(15 * 86_400), charging: false)
+        XCTAssertEqual(out.map(\.percent), [89])
+    }
+
+    func testSampleCodableRoundTrip() throws {
+        let h = [sample(80, hours: 0), sample(78, hours: 3)]
+        let data = try JSONEncoder().encode(h)
+        let back = try JSONDecoder().decode([BatteryTTE.Sample].self, from: data)
+        XCTAssertEqual(back, h)
+    }
+
+    // MARK: - timeToFull + recordCharge (time-to-full, #61)
+
+    func testTimeToFullCleanCharge() {
+        // 66→74 % over 6 min = 80 %/hr; 26 % left → 26/80 h = 0.325 h = 1170 s
+        let s = [BatteryTTE.Sample(percent: 66, at: t0),
+                 BatteryTTE.Sample(percent: 74, at: t0.addingTimeInterval(6 * 60))]
+        let ttf = BatteryTTE.timeToFull(s, now: t0.addingTimeInterval(6 * 60))
+        XCTAssertNotNil(ttf)
+        XCTAssertEqual(ttf!, 1170, accuracy: 5)
+    }
+
+    func testTimeToFullZeroWhenAlreadyFull() {
+        let s = [sample(98, hours: 0), sample(100, hours: 0.5)]
+        XCTAssertEqual(BatteryTTE.timeToFull(s), 0)
+    }
+
+    func testTimeToFullNilOnFalling() {
+        XCTAssertNil(BatteryTTE.timeToFull([sample(80, hours: 0), sample(78, hours: 1)]))
+    }
+
+    func testTimeToFullResetsWindowOnUnplug() {
+        // rise, then a fall (unplug), then rise again → only the trailing rising run counts
+        let s = [sample(50, hours: 0), sample(60, hours: 0.2),
+                 sample(55, hours: 0.3),                       // unplug dip
+                 sample(57, hours: 0.4), sample(65, hours: 0.5)]
+        let ttf = BatteryTTE.timeToFull(s, now: t0.addingTimeInterval(0.5 * 3_600))
+        XCTAssertNotNil(ttf)   // measured over 57→65 only
+    }
+
+    func testRecordChargeAccumulatesWhileChargingAndClearsWhenNot() {
+        var h: [BatteryTTE.Sample] = []
+        h = BatteryTTE.recordCharge(h, percent: 66, at: t0, charging: true)
+        h = BatteryTTE.recordCharge(h, percent: 68, at: t0.addingTimeInterval(60), charging: true)
+        h = BatteryTTE.recordCharge(h, percent: 70, at: t0.addingTimeInterval(120), charging: true)
+        XCTAssertEqual(h.map(\.percent), [66, 68, 70])
+        // Unplugged → charge history clears so a stale slope can't linger.
+        h = BatteryTTE.recordCharge(h, percent: 70, at: t0.addingTimeInterval(180), charging: false)
+        XCTAssertTrue(h.isEmpty)
+    }
+
+    func testRecordChargeIgnoresTinyDropResetsOnBigDrop() {
+        var h = [BatteryTTE.Sample(percent: 80, at: t0)]
+        h = BatteryTTE.recordCharge(h, percent: 79, at: t0.addingTimeInterval(30), charging: true) // tiny dip → ignore
+        XCTAssertEqual(h.map(\.percent), [80])
+        h = BatteryTTE.recordCharge(h, percent: 76, at: t0.addingTimeInterval(60), charging: true) // ≥3 drop → reset
+        XCTAssertEqual(h.map(\.percent), [76])
+    }
 }

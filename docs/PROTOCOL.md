@@ -540,11 +540,34 @@ within the day and `active_seconds` ≤ 150/epoch.
 layout** (only `[0]` respid differs; `0x87` body == `0x10` body) → shared descriptor,
 XOR-valid. **`[1]`=BATTERY %** 🟢 (ground-truthed 2026-06-15: `0x4c`=76 matched the app's
 76% exactly at capture time; the buffer showed a clean 92→86→85→84→78→77→76 discharge
-curve — it is NOT a per-session marker) · `[2]`=
-state enum `01–04` (not a counter) 🟡 · **`[4:6]`=STEP COUNT (16-bit BE)** 🟢 ·
+curve — it is NOT a per-session marker) · **`[2]`=CHARGE/STATE: `0x04`=ON CHARGER** 🟢
+(`0x02`/`0x03`=worn-streaming sub-frame toggle, `0x01`=startup/settle; see below) ·
+**`[4:6]`=STEP COUNT (16-bit BE)** 🟢 ·
 **`[6:8]`/`[8:10]`=SKIN TEMPERATURE, two channels, 0.1 °C BE** 🟢 (each prefixed `01`=
-valid; see below) · `[15]`=declines over an evening but **not plain battery** 🟡 ·
-`[17]`=`ff` idle; **non-`ff` precedes a bulk stream → "data follows"** 🟡.
+valid; see below) · **`[14:16]`=BATTERY VOLTAGE mV (16-bit BE)** 🟢 (#89, see below) ·
+`[17]`=`ff` idle / **`0x46` while charging** 🟢 (second witness to `[2]`; supersedes the
+old "non-`ff` = data-follows" guess).
+
+**`[2]` = charge/state byte; `0x04` = ON CHARGER · `[14:16]` = battery voltage mV** 🟢
+(resolved 2026-06-19, **#61** + **#89**; `captures/charger66b`, labelled A/B
+finger→charger→off→finger). Over a 6-min charge the battery rose **66→74 %** and skin temp
+fell **31.4→26.6 °C**; against that ground truth:
+- **`[2]` read `0x04` for 100 % of charging frames (30/30) and never** during the worn or
+  off-wrist-idle phases. Buffer-wide, `[2]==0x04` is ~30× enriched for a rising-battery
+  window vs `0x02`/`0x03` (65 % vs 2 %); the worn stream just toggles `0x02`↔`0x03` every
+  frame, and `0x01` is a brief connect/settle transient. The earlier brief test (06-19
+  10:31) that *looked* like it falsified this was just too-short charger taps — they still
+  flipped `[2]`→`0x04`, but never moved battery/temp.
+- **`[17]==0x46` co-occurs exclusively with `0x04`** (29/35 charge frames; 0 of 428 worn
+  frames) — an independent corroborating indicator. It lags the first frame or two of a charge.
+- **`[14:16]` = battery voltage in mV** (16-bit BE): `4001` mV worn → climbs monotonically
+  to `4384` mV peak charge → relaxes to `4196` mV off-charger — a textbook single-cell Li-ion
+  curve. This is **#89's "ring raw voltage."** (Supersedes the old `[14]` "declines over days"
+  / `[15]` "declines over an evening" notes — both are just bytes of the slowly-moving voltage.)
+- The ring **stays BLE-connected and keeps streaming the descriptor while on the charger**
+  (the whole charge is in-band), so charging is readable live — no need for the battery-%-rising
+  proxy when a frame is in hand. Decoded by `OpenCircuitKit.DeviceStatus.isOnCharger` /
+  `.batteryVoltageMillivolts`.
 
 **`[6:8]` / `[8:10]` = skin temperature in 0.1 °C** 🟢 (ground-truthed 2026-06-15,
 `captures/morning_temp_20260615`). Two near-equal 16-bit BE values (e.g. `01 64 01 65` =
@@ -722,8 +745,10 @@ Each names the single capture that converts a 🟡/🔴 field into a decoded met
    span `0x0384`=900 s. Cross-checked: last session ends 6 min before the sync.
    `morning_temp_20260615` re-confirms: 28/29 `0x4c` steps=150 (1×151 rounding), 19/19
    `0x47` steps=900, across 752 `0x4c` and 128 `0x47` records. (Issue #3 ✅ closed.)
-4. **`0x10`/`0x87` `[6:8]`/`[15]`:** sync after a known wear interval + app UI/battery
-   screenshot → maps A/B to record counts and `[15]` to a real quantity.
+4. ✅ **`0x10`/`0x87` `[15]` — RESOLVED.** `[15]` is the **low byte of the 16-bit battery
+   voltage `[14:16]`** (§5.4, #89), ground-truthed by the 2026-06-19 charger A/B (`4001→4384`
+   mV across a charge). Its "declines over an evening/days" behaviour was just the voltage
+   sagging — not a separate quantity. `[14]` likewise = voltage high byte.
 5. ✅ **`0x81 00` byte[2] — NOT battery; per-session nonce 🟡.** `morning_temp_20260615`
    shows 20 sessions, byte[2] spans 31–249, non-monotonic, exceeds 100% repeatedly.
    Definitively not battery %. Likely a per-session ring-state nonce (source unknown 🔴).
