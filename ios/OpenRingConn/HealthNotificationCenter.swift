@@ -270,8 +270,11 @@ struct HealthNotificationCenter {
         // Wear reminder
         if d.bool(forKey: ReminderDefaults.wearEnabled) {
             let r = WearReminder()
-            // "ever connected" = a peripheral ID has been persisted by RingScanner.
-            let hasSavedRing = d.string(forKey: "com.openringconn.ring.peripheralID") != nil
+            // "ever connected" = a ring identifier has been persisted by RingScanner. Tolerant of
+            // both the multi-ring list and the pre-migration single key (a background launch may run
+            // this before RingScanner has migrated). (#multi-ring)
+            let hasSavedRing = (d.stringArray(forKey: "com.openringconn.ring.peripheralIDs")?.isEmpty == false)
+                || d.string(forKey: "com.openringconn.ring.peripheralID") != nil
             // Use the DURABLE last-frame timestamp (survives cold launch / session teardown), not
             // the ephemeral session value — otherwise the reminder fires "Put your ring back on"
             // on every cold foreground while the ring is actually worn and merely reconnecting.

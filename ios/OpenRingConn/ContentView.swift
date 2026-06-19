@@ -111,6 +111,11 @@ struct ContentView: View {
                     handleForegroundActivation()
                     refreshObservability()        // pick up anything a background run wrote
                     evaluateForegroundAlerts()    // live battery + Health-auth check (#44)
+                } else if phase == .background {
+                    // Don't leave a user-initiated foreground scan/picker running once we leave the
+                    // foreground — a nil-filtered scan yields nothing in the background and just keeps
+                    // the radio engaged. Preserves the active ring (cancelScan, not stop).
+                    if case .scanning = scanner.state { scanner.cancelScan() }
                 }
             }
             // Fire the armed one-shot sync the moment the (re)connected link is ready.
@@ -406,15 +411,98 @@ struct ContentView: View {
             // user taps Measure again (which clears it naturally). (#55)
             if session?.userMeasureFailed == true { measureFailedHint }
             if !connected {
-                Button {
-                    scanner.start()
-                } label: {
-                    Label("Scan & connect", systemImage: "dot.radiowaves.left.and.right")
-                        .frame(maxWidth: .infinity)
+                switch scanner.state {
+                case .scanning:
+                    // >1 ring nearby on a fresh scan → let the user pick; otherwise we're still
+                    // looking (a lone ring auto-connects after a short settle).
+                    if scanner.discovered.count > 1 {
+                        ringPicker
+                    } else {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Searching for ring…")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Cancel") { scanner.cancelScan() }.font(.subheadline)
+                        }
+                    }
+                case .connecting:
+                    // The status line above already says "Connecting…", but a pending connect has no
+                    // timeout — give the user an escape hatch so a ring that's out of range can't wedge
+                    // the card forever.
+                    HStack {
+                        Spacer()
+                        Button("Cancel") { scanner.disconnect() }.font(.subheadline)
+                    }
+                default:
+                    Button {
+                        scanner.start()
+                    } label: {
+                        Label("Scan & connect", systemImage: "dot.radiowaves.left.and.right")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
             }
         }
+    }
+
+    /// The ring list shown on the dashboard when a fresh "Scan & connect" finds more than one ring.
+    /// (Switching rings later uses the dedicated picker sheet in Device Info.) Tapping a row connects
+    /// to that ring and makes it active. The "Last used" badge marks the previously active ring; rows
+    /// are ordered active-first, then by name (a stable key), with a per-row signal glyph for proximity.
+    private var ringPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(scanner.choosingRing ? "Choose a ring" : "Multiple rings found — pick one")
+                .font(.subheadline.weight(.medium))
+            ForEach(sortedDiscoveredRings) { ring in
+                Button {
+                    scanner.connect(to: ring.id)
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(ring.name.isEmpty ? "RingConn" : ring.name)
+                                .font(.subheadline.weight(.medium))
+                            if ring.id.uuidString == scanner.activeRingID {
+                                Text("Last used").font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .foregroundStyle(signalStyle(ring.rssi))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.08)))
+            }
+            Button("Cancel") { scanner.cancelScan() }.font(.subheadline)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Discovered rings ordered for the picker: the active/last-used ring first, then by NAME. A
+    /// stable key (not live RSSI) is deliberate — sorting by RSSI made rows jump several times a
+    /// second as advertisements refreshed. The per-row signal glyph still conveys proximity.
+    private var sortedDiscoveredRings: [RingScanner.DiscoveredRing] {
+        scanner.discovered.sorted { lhs, rhs in
+            let lActive = lhs.id.uuidString == scanner.activeRingID
+            let rActive = rhs.id.uuidString == scanner.activeRingID
+            if lActive != rActive { return lActive }
+            if lhs.name != rhs.name { return lhs.name < rhs.name }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    /// RSSI is negative dBm; closer to 0 = stronger. Fade the signal glyph by proximity so the user
+    /// can tell which physical ring is nearest.
+    private func signalStyle(_ rssi: Int) -> some ShapeStyle {
+        if rssi > -65 { return AnyShapeStyle(.primary) }
+        if rssi > -80 { return AnyShapeStyle(.secondary) }
+        return AnyShapeStyle(.tertiary)
     }
 
     /// Shown when `RingSession.notStreaming` — the ring is connected but not delivering data (not

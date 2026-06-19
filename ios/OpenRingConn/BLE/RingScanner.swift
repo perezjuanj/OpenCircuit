@@ -38,21 +38,65 @@ final class RingScanner: NSObject {
     /// central across relaunches. Must be constant for the life of the app.
     private static let restoreIdentifier = "com.openringconn.central.restore"
 
-    /// UserDefaults key holding the last connected peripheral's CoreBluetooth identifier
-    /// (a per-device UUID — NOT the MAC, which iOS never exposes). Lets us reconnect by
-    /// identifier with no scan after a cold launch / background relaunch.
-    private static let savedPeripheralKey = "com.openringconn.ring.peripheralID"
+    /// UserDefaults keys for the remembered ring set. We store a LIST of connected rings'
+    /// CoreBluetooth identifiers (per-device UUIDs — NOT the MAC, which iOS never exposes) plus which
+    /// one is "active". Multi-ring is SEQUENTIAL: one ring is connected at a time and each ring's data
+    /// merges into a single shared timeline (no per-ring data segregation). Reconnect targets the
+    /// active ring by identifier with no scan after a cold launch / background relaunch.
+    private static let savedPeripheralIDsKey = "com.openringconn.ring.peripheralIDs"
+    private static let activePeripheralIDKey = "com.openringconn.ring.activePeripheralID"
+    /// Legacy single-ring key (pre multi-ring). Migrated into the list once, then retired.
+    private static let legacyPeripheralKey = "com.openringconn.ring.peripheralID"
 
-    /// Last connected peripheral's `identifier.uuidString`, persisted across launches.
-    private static var savedPeripheralID: String? {
-        get { UserDefaults.standard.string(forKey: savedPeripheralKey) }
-        set { UserDefaults.standard.set(newValue, forKey: savedPeripheralKey) }
+    /// Every ring the user has connected at least once (its `identifier.uuidString`).
+    private static var savedPeripheralIDs: [String] {
+        get { UserDefaults.standard.stringArray(forKey: savedPeripheralIDsKey) ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: savedPeripheralIDsKey) }
     }
 
-    /// True when a previously connected ring's identifier is saved, so a no-scan
-    /// reconnect-by-identifier is possible. The foreground auto-refresh uses this to
-    /// decide whether there's anything to reconnect to (vs. requiring a user Scan).
-    var hasSavedRing: Bool { Self.savedPeripheralID != nil }
+    /// The ring we auto-reconnect to. Cleared by an explicit user stop so we don't silently
+    /// reconnect; the ring stays in `savedPeripheralIDs` so it's still one tap away in the picker.
+    private static var activePeripheralID: String? {
+        get { UserDefaults.standard.string(forKey: activePeripheralIDKey) }
+        set { UserDefaults.standard.set(newValue, forKey: activePeripheralIDKey) }
+    }
+
+    /// Record a freshly connected ring: add it to the remembered set and make it active.
+    private static func rememberRing(_ id: String) {
+        var ids = savedPeripheralIDs
+        if !ids.contains(id) { ids.append(id) }
+        savedPeripheralIDs = ids
+        activePeripheralID = id
+    }
+
+    /// One-time migration from the single-ring key to the multi-ring list. Also moves the active
+    /// ring's per-ring sync state (step raw-counter + epoch archive) onto its namespaced keys, so the
+    /// existing ring's step deltas and overnight stitching survive the update untouched. Per-ring keys
+    /// are `"<base>.<deviceKey>"` — see `RingSession` (steps) and `EpochArchiveStore` (archive).
+    private static func migrateLegacyRingStateIfNeeded() {
+        let d = UserDefaults.standard
+        // Already migrated (or a fresh install with nothing to migrate)?
+        guard d.stringArray(forKey: savedPeripheralIDsKey) == nil,
+              let legacy = d.string(forKey: legacyPeripheralKey) else { return }
+        d.set([legacy], forKey: savedPeripheralIDsKey)
+        d.set(legacy, forKey: activePeripheralIDKey)
+        for base in ["steps.lastRawValue", "steps.lastRawDay", "sleep.epochArchive", "sleep.lastHistoryDrainAt"] {
+            let namespaced = "\(base).\(legacy)"
+            if d.object(forKey: namespaced) == nil, let value = d.object(forKey: base) {
+                d.set(value, forKey: namespaced)
+                d.removeObject(forKey: base)
+            }
+        }
+        d.removeObject(forKey: legacyPeripheralKey)
+    }
+
+    /// True when there's an ACTIVE saved ring to reconnect to (a no-scan reconnect-by-identifier is
+    /// possible). The foreground auto-refresh uses this to decide whether to reconnect vs. require a
+    /// user Scan. False after an explicit stop, even if rings remain remembered.
+    var hasSavedRing: Bool { Self.activePeripheralID != nil }
+
+    /// The active ring's id, for the connect UI (the "Last used" picker badge).
+    var activeRingID: String? { Self.activePeripheralID }
 
     /// Set when a reconnect was requested before Bluetooth finished powering on; retried
     /// from `centralManagerDidUpdateState` once `.poweredOn` arrives.
@@ -81,6 +125,7 @@ final class RingScanner: NSObject {
     private(set) var reconnectStalled = false
 
     private override init() {
+        Self.migrateLegacyRingStateIfNeeded()
         super.init()
         // Opting into state restoration: iOS preserves this central's connections/pending
         // connects while the app is suspended and relaunches the app (into the background)
@@ -94,6 +139,38 @@ final class RingScanner: NSObject {
 
     /// True once the user has connected; keeps us auto-reconnecting if the ring sleeps.
     private var wantConnection = false
+
+    // MARK: Foreground discovery + ring picker (#multi-ring)
+
+    /// A ring seen during a foreground scan, surfaced to the connect UI. The picker is shown ONLY
+    /// when more than one distinct ring is discovered; a single match auto-connects (today's UX).
+    struct DiscoveredRing: Identifiable, Equatable {
+        let id: UUID            // peripheral.identifier
+        let name: String
+        var rssi: Int
+    }
+    private(set) var discovered: [DiscoveredRing] = []
+    /// The CBPeripheral objects behind `discovered`, kept so a picker tap can connect by id.
+    private var discoveredPeripherals: [UUID: CBPeripheral] = [:]
+    /// Foreground scans accumulate matches and debounce before deciding (auto-connect vs. picker);
+    /// background/service-filtered scans connect on the first match (there's no UI off-screen).
+    private var allowPicker = false
+    /// "Choose a ring" mode (the Switch-ring flow): show the picker for ANY discovered ring and never
+    /// auto-connect a lone one — the user is deliberately picking, so even one ring must be confirmed
+    /// (otherwise the just-disconnected active ring would silently grab the link straight back).
+    private(set) var choosingRing = false
+    /// Fires once the discovery set has been quiet briefly: 1 ring → auto-connect, >1 → leave the
+    /// picker up for the user. Re-armed only when a NEW distinct ring appears (not on RSSI updates),
+    /// so a ring that keeps advertising can't push the decision out forever.
+    private var selectionDebounce: Task<Void, Never>?
+    /// Gives up a fruitless foreground scan so the radio doesn't spin forever when nothing is found.
+    private var scanTimeoutTask: Task<Void, Never>?
+    /// Quiet window after the latest new ring before we decide. Sized generously (not snappy-minimal)
+    /// so a second, weaker-signal ring whose first advertisement arrives a beat after the first still
+    /// surfaces BEFORE a lone-ring auto-connect would fire — i.e. the picker isn't silently skipped.
+    /// This only adds latency to the explicit "Scan & connect" tap, never to the silent reconnect path.
+    private static let selectionQuietWindow: TimeInterval = 2.5
+    private static let scanTimeout: TimeInterval = 25
 
     /// Service filter for background scans. iOS only delivers scan results to a
     /// backgrounded app when `scanForPeripherals` filters by explicit service UUIDs;
@@ -111,18 +188,120 @@ final class RingScanner: NSObject {
         guard central.state == .poweredOn else { return }
         wantConnection = true
         resetReconnectBackoff()   // a fresh user scan starts clean — no lingering backoff/calm state
+        // Foreground scans (nil filter) accumulate matches and let the user pick when >1 ring is in
+        // range; background scans (service-filtered) connect on the first match — there's no UI.
+        allowPicker = (services == nil)
+        choosingRing = false
+        if allowPicker {
+            clearDiscovery()
+            armScanTimeout()
+        }
         state = .scanning
         central.scanForPeripherals(withServices: services)
+    }
+
+    /// Scan for OTHER nearby rings for the in-app "Connect a different ring" picker, WITHOUT dropping
+    /// the current link. The connected ring doesn't advertise, so it won't appear; the user stays
+    /// connected (and reconnect-safe) until they actually pick another. The picker view reads
+    /// `discovered`, taps call `connect(to:)`, and dismissing calls `stopBrowsing()`. We deliberately
+    /// do NOT enter the `.scanning` state — the existing connection (and its UI) stays as-is.
+    func startBrowsing() {
+        guard central.state == .poweredOn else { return }
+        allowPicker = true     // didDiscover accumulates into `discovered` instead of connect-on-first
+        choosingRing = true    // never auto-connect a lone ring — the user is explicitly choosing
+        clearDiscovery()
+        central.scanForPeripherals(withServices: nil)
+    }
+
+    /// Stop the in-app picker scan (sheet dismissed / ring chosen). Leaves any current link intact.
+    func stopBrowsing() {
+        choosingRing = false
+        clearDiscovery()
+        central.stopScan()
+    }
+
+    /// Connect to a specific discovered ring — a picker tap, or the auto-connect of a lone match.
+    /// Makes it the active ring on a successful connect (`didConnect` → `rememberRing`).
+    func connect(to id: UUID) {
+        guard let peripheral = discoveredPeripherals[id] else { return }
+        choosingRing = false
+        resetReconnectBackoff()   // drop any pending backoff reconnect to the previous ring (#multi-ring)
+        selectionDebounce?.cancel(); selectionDebounce = nil
+        scanTimeoutTask?.cancel(); scanTimeoutTask = nil
+        central.stopScan()
+        // Switching from a DIFFERENT live ring (the in-app picker scans without dropping the current
+        // link): tear the old one down first so we don't leak its connection / run two sessions. The
+        // identity guards in didDisconnect/didFailToConnect ignore the old ring's late callbacks.
+        if let current = target, current.identifier != id {
+            central.cancelPeripheralConnection(current)
+            teardownSession()
+        }
+        wantConnection = true
+        target = peripheral
+        state = .connecting(peripheral.name ?? "RingConn")
+        central.connect(peripheral)
+    }
+
+    /// Drop the discovery set and cancel its timers. Called on a fresh scan, on connect, and on stop.
+    private func clearDiscovery() {
+        selectionDebounce?.cancel(); selectionDebounce = nil
+        scanTimeoutTask?.cancel(); scanTimeoutTask = nil
+        discovered = []
+        discoveredPeripherals = [:]
+    }
+
+    /// After the discovery set settles: a lone ring auto-connects (preserving the one-tap flow);
+    /// more than one leaves the picker up for the user. No-op once we've left the scanning state, or
+    /// in "choose" mode (where even a lone ring must be confirmed by tapping it).
+    private func armSelectionDebounce() {
+        selectionDebounce?.cancel()
+        selectionDebounce = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.selectionQuietWindow))
+            guard let self, !Task.isCancelled else { return }
+            guard case .scanning = self.state, !self.choosingRing else { return }
+            if self.discovered.count == 1, let only = self.discovered.first {
+                self.connect(to: only.id)
+            }
+        }
+    }
+
+    /// Stop a foreground scan that turned up nothing, so the radio doesn't spin forever and the UI
+    /// can show the Scan button again. If rings WERE found (picker showing) we keep scanning so the
+    /// list stays live until the user picks.
+    private func armScanTimeout() {
+        scanTimeoutTask?.cancel()
+        scanTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.scanTimeout))
+            guard let self, !Task.isCancelled else { return }
+            guard case .scanning = self.state, self.discovered.isEmpty else { return }
+            self.selectionDebounce?.cancel(); self.selectionDebounce = nil
+            self.central.stopScan()
+            self.state = .idle
+        }
     }
 
     func stop() {
         wantConnection = false
         resetReconnectBackoff()   // user stop: cancel any pending backoff reconnect
-        // Explicit user stop: forget the ring so we don't silently auto-reconnect on the next
-        // launch (reconnect-by-identifier only re-arms while an id is saved). (Reviewer MINOR.)
-        Self.savedPeripheralID = nil
+        clearDiscovery()          // abandon any in-flight foreground scan / picker
+        choosingRing = false
+        // Explicit user stop: clear the ACTIVE ring so we don't silently auto-reconnect on the next
+        // launch (reconnect-by-identifier only re-arms while a ring is active). The ring stays in the
+        // remembered set so it's still one tap away in the picker. (Reviewer MINOR.)
+        Self.activePeripheralID = nil
         central.stopScan()
         if let target { central.cancelPeripheralConnection(target) }
+        if case .scanning = state { state = .idle }
+    }
+
+    /// Abort an in-flight foreground scan / picker WITHOUT forgetting the active ring (unlike `stop`,
+    /// which is a deliberate "forget this ring"). Wired to the connect card's Cancel while searching
+    /// or choosing, so backing out of a scan never disarms the silent auto-reconnect to the last ring.
+    func cancelScan() {
+        resetReconnectBackoff()
+        clearDiscovery()
+        choosingRing = false
+        central.stopScan()
         if case .scanning = state { state = .idle }
     }
 
@@ -172,7 +351,7 @@ final class RingScanner: NSObject {
             return false
         }
         reconnectWhenPoweredOn = false
-        guard let idString = Self.savedPeripheralID,
+        guard let idString = Self.activePeripheralID,
               let uuid = UUID(uuidString: idString),
               let peripheral = central.retrievePeripherals(withIdentifiers: [uuid]).first
         else { return false }
@@ -194,6 +373,8 @@ final class RingScanner: NSObject {
     func disconnect() {
         wantConnection = false
         resetReconnectBackoff()   // user stop: drop any pending backoff reconnect (#35)
+        clearDiscovery()          // abandon any in-flight foreground scan / picker
+        choosingRing = false
         central.stopScan()
         if let target {
             central.cancelPeripheralConnection(target)
@@ -332,7 +513,7 @@ extension RingScanner: CBCentralManagerDelegate {
                 // The link survived the relaunch — rebuild the session now; `didConnect`
                 // won't fire again. RingSession re-matches characteristics (skipping a full
                 // service re-discovery when they're already present, #42).
-                Self.savedPeripheralID = peripheral.identifier.uuidString
+                Self.rememberRing(peripheral.identifier.uuidString)
                 self.state = .connected(peripheral.name ?? "RingConn")
                 // Tear down any session that already exists (e.g. a later `didConnect` racing this
                 // restore) before replacing it, so its tasks don't keep writing to the peripheral
@@ -355,9 +536,9 @@ extension RingScanner: CBCentralManagerDelegate {
         }
     }
 
-    /// Pick which restored peripheral to re-adopt: prefer the saved id, else the first.
+    /// Pick which restored peripheral to re-adopt: prefer the active ring, else the first.
     private func restoredTarget(from peripherals: [CBPeripheral]) -> CBPeripheral? {
-        if let id = Self.savedPeripheralID,
+        if let id = Self.activePeripheralID,
            let match = peripherals.first(where: { $0.identifier.uuidString == id }) {
             return match
         }
@@ -372,21 +553,42 @@ extension RingScanner: CBCentralManagerDelegate {
             ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String
             ?? ""
         guard OpenRingKit.Transport.matchesRingName(name) else { return }
+        let rssi = RSSI.intValue
         Task { @MainActor in
-            self.central.stopScan()
-            self.target = peripheral
-            self.state = .connecting(name)
-            self.central.connect(peripheral)
+            guard self.allowPicker else {
+                // Background / service-filtered scan: no UI — connect on the first match.
+                self.central.stopScan()
+                self.target = peripheral
+                self.state = .connecting(name)
+                self.central.connect(peripheral)
+                return
+            }
+            // Foreground: accumulate distinct rings, then debounce → auto-connect one / show a picker.
+            let id = peripheral.identifier
+            let isNew = self.discoveredPeripherals[id] == nil
+            self.discoveredPeripherals[id] = peripheral
+            if let idx = self.discovered.firstIndex(where: { $0.id == id }) {
+                // Keep a previously-seen name if this advertisement frame lacks one.
+                let keptName = name.isEmpty ? self.discovered[idx].name : name
+                self.discovered[idx] = DiscoveredRing(id: id, name: keptName, rssi: rssi)
+            } else {
+                self.discovered.append(DiscoveredRing(id: id, name: name, rssi: rssi))
+            }
+            // Re-arm only when a NEW ring appears — RSSI refreshes of a known ring must not keep
+            // pushing the auto-connect decision out.
+            if isNew { self.armSelectionDebounce() }
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager,
                                     didConnect peripheral: CBPeripheral) {
         Task { @MainActor in
-            // Remember this ring so we can reconnect by identifier (no scan) after a
-            // cold launch or background relaunch.
+            // Remember this ring (and make it active) so we can reconnect by identifier (no scan)
+            // after a cold launch or background relaunch.
             self.target = peripheral
-            Self.savedPeripheralID = peripheral.identifier.uuidString
+            Self.rememberRing(peripheral.identifier.uuidString)
+            self.central.stopScan()  // defensive: a reconnect/restoration connect may land mid-scan
+            self.clearDiscovery()    // scan succeeded — drop the discovery set / picker
             // A connect landed — stop any pending backoff timer and clear the calm "unreachable"
             // note. (We don't reset the attempt COUNT yet: a charging ring can connect then
             // immediately drop, so the backoff only truly resets once the link proves stable.) #35
@@ -420,6 +622,11 @@ extension RingScanner: CBCentralManagerDelegate {
                                     didDisconnectPeripheral peripheral: CBPeripheral,
                                     error: Error?) {
         Task { @MainActor in
+            // Ignore disconnects for a ring we've intentionally moved on from. When switching rings,
+            // `connect(to:)` cancels the old ring and sets `target` to the new one synchronously — so
+            // a late `didDisconnect` for the OLD ring must not tear down the new session or reconnect
+            // the old ring (which would bounce us back and leak the new link). (#multi-ring)
+            guard peripheral.identifier == self.target?.identifier else { return }
             self.connectStableTask?.cancel(); self.connectStableTask = nil
             self.teardownSession()   // cancel ALL of the session's tasks, persisting last reading (#42)
             // Auto-reconnect: CoreBluetooth's connect has no timeout — it reconnects (using the
@@ -427,6 +634,25 @@ extension RingScanner: CBCentralManagerDelegate {
             // to re-pair or open the official app again. But we no longer re-issue it IMMEDIATELY:
             // a ring on the charger that drops the link in a loop would keep the radio armed for
             // hours. Back off with a growing delay instead (#35).
+            if self.wantConnection {
+                self.scheduleReconnect(peripheral)
+            } else {
+                self.state = .idle
+            }
+        }
+    }
+
+    /// A connect attempt failed outright (as opposed to connecting then dropping). Recover the same
+    /// way as a disconnect: back off and retry while we still want the ring, else fall idle — so the
+    /// UI never wedges on a permanent "Connecting…" after a failed attempt.
+    nonisolated func centralManager(_ central: CBCentralManager,
+                                    didFailToConnect peripheral: CBPeripheral,
+                                    error: Error?) {
+        Task { @MainActor in
+            // Same identity guard as didDisconnect: a failed connect for a ring we've switched away
+            // from must not schedule a reconnect to it over the new target. (#multi-ring)
+            guard peripheral.identifier == self.target?.identifier else { return }
+            self.connectStableTask?.cancel(); self.connectStableTask = nil
             if self.wantConnection {
                 self.scheduleReconnect(peripheral)
             } else {

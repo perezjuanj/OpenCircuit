@@ -266,7 +266,9 @@ final class RingSession: NSObject {
     /// Rolling archive of recent raw epochs (incl. the motion channel staging needs) + the last-drain
     /// timestamp, persisted across sessions. Lets `finalizeSync` re-stage the night from the UNION of
     /// all drained slices (stitching) and lets the periodic-drain cadence survive reconnects.
-    private let epochArchiveStore = EpochArchiveStore()
+    /// Namespaced by the ring's identifier (#multi-ring) so two rings' epoch archives can't collide on
+    /// the UInt32 epoch counter (which would corrupt overnight stitching).
+    private let epochArchiveStore: EpochArchiveStore
 
     private let dataServiceUUID = CBUUID(string: OpenRingKit.Transport.dataServiceUUID)
     private let notifyUUID = CBUUID(string: OpenRingKit.Transport.notifyCharUUID)
@@ -295,18 +297,28 @@ final class RingSession: NSObject {
     init(peripheral: CBPeripheral, localStore: LocalStore? = nil) {
         self.peripheral = peripheral
         self.localStore = localStore
+        // Scope the per-ring epoch archive to this ring's identifier (#multi-ring).
+        self.epochArchiveStore = EpochArchiveStore(namespace: peripheral.identifier.uuidString)
         super.init()
         peripheral.delegate = self
         // Seed the model name from the peripheral's advertised name; may be overridden later
         // by a dedicated DIS Model Number characteristic if the ring exposes one. (#79)
         firmwareInfo.modelName = peripheral.name ?? ""
-        // Re-discovery guard (#42): on a restored / already-connected peripheral the data service
-        // is usually already discovered, so re-scanning ALL services on every relaunch is wasted
-        // work. If the data service is already present, go straight to (re-)matching its
-        // characteristics — that still re-fires `didDiscoverCharacteristicsFor`, so `ready` lands.
-        // Only fall back to a full `discoverServices` when we've never seen the service.
-        if let dataService = peripheral.services?.first(where: { $0.uuid == dataServiceUUID }) {
-            peripheral.discoverCharacteristics(nil, for: dataService)
+        // Re-discovery guard (#42): on a restored / already-connected peripheral the services are
+        // usually already cached, so re-scanning them on every relaunch is wasted work. When they're
+        // cached, go straight to (re-)matching characteristics — that still re-fires
+        // `didDiscoverCharacteristicsFor`, so `ready` lands. Only fall back to a full
+        // `discoverServices` when we've never seen the data service.
+        //
+        // Crucially, re-match EVERY cached service, not just the data service: the DIS System ID
+        // characteristic (→ MAC → SM3 auth) lives on a DIFFERENT service. Discovering only the data
+        // service skipped it, so a reconnect (cached services, e.g. switching back to a ring) never
+        // re-read the MAC and fell back to the legacy fixed auth — which only authenticates a ring
+        // whose challenge is 0xb0, hence the flaky "not streaming" on switch-back (#multi-ring).
+        if let services = peripheral.services, services.contains(where: { $0.uuid == dataServiceUUID }) {
+            for service in services {
+                peripheral.discoverCharacteristics(nil, for: service)
+            }
         } else {
             peripheral.discoverServices(nil)
         }
@@ -847,21 +859,26 @@ final class RingSession: NSObject {
     // value AND the day it was seen in UserDefaults (not LocalStore: avoids a SwiftData migration
     // and a per-day-row collision). The per-day TOTAL still lives in StoredDaily via addDailySteps.
 
-    private static let lastRawStepsKey = "steps.lastRawValue"      // Int: last raw [4:6] counter
-    private static let lastRawStepsDayKey = "steps.lastRawDay"     // Date: start-of-day it was observed
+    // Per-ring (#multi-ring): namespaced by the ring's CoreBluetooth identifier so a second ring's
+    // onboard counter is never diffed against the first ring's baseline (which would yield garbage
+    // step deltas on a ring switch). `deviceKey` is the same id RingScanner remembers and migrates
+    // the legacy un-namespaced state onto.
+    private var deviceKey: String { peripheral.identifier.uuidString }
+    private var lastRawStepsKey: String { "steps.lastRawValue.\(deviceKey)" }    // Int: last raw [4:6] counter
+    private var lastRawStepsDayKey: String { "steps.lastRawDay.\(deviceKey)" }   // Date: start-of-day it was observed
 
     /// Last raw counter we recorded, or nil if we've never seen one (first run / cleared). Stored
     /// as an object so a legitimate 0 reading is distinguishable from "unset".
     private var persistedLastRawSteps: Int? {
-        UserDefaults.standard.object(forKey: Self.lastRawStepsKey) as? Int
+        UserDefaults.standard.object(forKey: lastRawStepsKey) as? Int
     }
     /// Start-of-day the persisted raw counter was observed (for midnight-rollover detection).
     private var persistedLastRawStepsDay: Date? {
-        UserDefaults.standard.object(forKey: Self.lastRawStepsDayKey) as? Date
+        UserDefaults.standard.object(forKey: lastRawStepsDayKey) as? Date
     }
     private func persistStepRawState(raw: Int, day: Date) {
-        UserDefaults.standard.set(raw, forKey: Self.lastRawStepsKey)
-        UserDefaults.standard.set(day, forKey: Self.lastRawStepsDayKey)
+        UserDefaults.standard.set(raw, forKey: lastRawStepsKey)
+        UserDefaults.standard.set(day, forKey: lastRawStepsDayKey)
     }
 
     /// Start (or switch) live monitoring in a single mode. Guarantees only one metric
@@ -1266,6 +1283,17 @@ extension RingSession: CBPeripheralDelegate {
                     let macStr = mac.map { String(format: "%02x", $0) }.joined(separator: ":")
                     ringLog.notice("ring MAC (System ID): \(macStr, privacy: .public) → auth V=0x\(String(format: "%02x", RingAuth.macTailXor(mac)), privacy: .public)")
                     self.firmwareInfo.mac = macStr.uppercased()   // (#79) surfaced in DeviceInfoView
+                    // The auth challenge can arrive BEFORE this read completes (service-discovery
+                    // race). When it does, it was answered with the legacy fixed fallback — correct
+                    // ONLY for the originally-captured ring, so ANY OTHER ring never starts streaming
+                    // (#multi-ring). Now that we have THIS ring's MAC, re-prime the handshake: a fresh
+                    // `status0` makes the ring re-challenge and we answer with the correct SM3. Gated on
+                    // a ready write path + no data yet, so it's a one-shot that never disturbs a stream
+                    // that already authed.
+                    if self.writeChar != nil, !self.gotDataFrame {
+                        ringLog.notice("auth: MAC arrived after challenge — re-priming status0 for SM3 reply (#multi-ring)")
+                        self.write(Command.status0)
+                    }
                 } else {
                     ringLog.notice("System ID unparsed (\(bytes.count, privacy: .public)B): \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
                 }
