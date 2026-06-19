@@ -2,7 +2,7 @@
 """Extract the sleep/vitals the ring actually held — the data our app failed to sync.
 
 Decodes the 0x4c sleep-vitals epochs from a `decode-log` txt into REAL HR / HRV /
-SpO2 / respiratory-rate values, faithfully mirroring OpenRingKit's BulkSleep.swift
+SpO2 / respiratory-rate values, faithfully mirroring OpenCircuitKit's BulkSleep.swift
 (the on-device decoder) so the numbers match what the app would have surfaced. No
 fabrication: every value is a byte off the wire; out-of-band values are flagged, not
 clamped or invented (project rule — tag 🟢/🟡/🔴).

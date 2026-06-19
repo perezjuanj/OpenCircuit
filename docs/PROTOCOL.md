@@ -27,7 +27,7 @@ command**: `0x02` sync-open (even the known-good real cursor `0c2298c3` that ret
 `82 00 00 82` on the bonded phone), `0x07` fetch, `0x95` poll — zero response. So:
 - The **bonded phone** (Android btsnoop) is the only way to pull real data; this is why
   all metric RE here uses phone captures, and why the iPhone app works (iOS bonds).
-- The **desktop `openringconn` workbench can scan/enumerate/handshake but NOT pull data**
+- The **desktop `opencircuit` workbench can scan/enumerate/handshake but NOT pull data**
   — CoreBluetooth/bleak can't initiate pairing (`pair()` → NotImplementedError on macOS).
   `listen`/`replay` of data commands will see nothing. Active probing from the Mac is a
   dead end; capture the phone instead.
@@ -36,10 +36,10 @@ command**: `0x02` sync-open (even the known-good real cursor `0c2298c3` that ret
 Our iPhone app first hit the same wall (live HR poll → only the `81 01` handshake, no
 `0x15` frames). The fix: **bond the iPhone to the ring once** — installing the official
 RingConn iOS app and signing in establishes the device↔ring LE bond. BLE bonds are
-**per device, not per app**, so OpenRingConn then inherits it: `02`/`07`/`95` go through
+**per device, not per app**, so OpenCircuit then inherits it: `02`/`07`/`95` go through
 and **live HR decoded 68 bpm** + history sync started. The ring supports multiple paired
 phones, so this doesn't disturb the Android pairing.
-> **Operational requirement:** any device running OpenRingConn must already be bonded to
+> **Operational requirement:** any device running OpenCircuit must already be bonded to
 > the ring (pair via the official app once). This is the make-or-break unknown — answered:
 > offline decode works, *direct ring access* just needs a one-time bond.
 
@@ -176,7 +176,7 @@ opens at ≈now first (the official app OR us) drains the backlog and advances i
 with nothing. (This is why overnight sleep "vanished" — even after the cursor fix, a competing
 official-app sync can still win the one-time backlog.)
 
-**The fix in OpenRingConn:** (1) history/overnight opens use `Command.syncUpToNow()`
+**The fix in OpenCircuit:** (1) history/overnight opens use `Command.syncUpToNow()`
 (cursor = `floor(now) − epoch`), exactly the app's history behaviour — this part is solid (the
 capture proves cursor≈now drains, and lower-bound is ruled out, so it can't return empty). (2)
 The live/quick path still uses `Command.syncAll` (`FF FF FF FF`) to skip the drain for a fast HR
@@ -568,7 +568,7 @@ the official app and forcing a from-scratch ring re-sync, the app showed **81 st
 steps) and climbs through the day (6→24→35→79→80→81). NOTE this is the **ring's own
 count**, which differs from the app's normal display (cloud-aggregated daily total, e.g.
 917 earlier same day) — search for the *ring's* value, not the app's. Decoded by
-`OpenRingKit.DeviceStatus.steps`.
+`OpenCircuitKit.DeviceStatus.steps`.
 
 ### 5.5 `0x50` — end-of-history cursor report (NO XOR trailer) 🟡
 Spontaneous after the last bulk page. Distinct class: **no XOR trailer** (last byte
@@ -606,7 +606,7 @@ sync-open is the prime suspect for the per-stream selector; we have only ever se
 
 ⚠️ The selector encoding and the HR/SpO₂ record byte-layout are **NOT statically recoverable**
 (blutter dropped the BLE transport/parser). They need a **capture**. The on-device probe
-(`RingSession.probeAllDayStreams` / `OpenRingKit.DataSyncProbe`, #99) gathers it: it sweeps the
+(`RingSession.probeAllDayStreams` / `OpenCircuitKit.DataSyncProbe`, #99) gathers it: it sweeps the
 candidate `byte[6]` values and records each one's raw responses.
 
 **Why re-run the sweep now (the old §5.3 attempt was inconclusive):** that attempt used the
@@ -662,7 +662,7 @@ the `0x10`/`0x87` descriptor `[1]`, §5.4 🟢 — already decoded.)
 ≈ 1/sec (30→1475→9045 over 3 sessions) 🟡.
 
 ### 5.8 Per-connection AUTH (the activation gate) 🟢 CRACKED — issue #54
-> ✅ **Standalone confirmed on-device 2026-06-16:** with the official app logged out, OpenRingConn
+> ✅ **Standalone confirmed on-device 2026-06-16:** with the official app logged out, OpenCircuit
 > activated the ring and streamed on its own. No official app needed. (+ heartbeat + bonding below.)
 The `01 01 <…>` arg is a deterministic **challenge→response auth** — what "activates" the ring for
 streaming. Sequence every connect: host `01 00 00` → ring `81 00 <chal> <xor>`; host must answer
@@ -678,20 +678,20 @@ response = SM3( bytes([V, challenge]) )[29:32] # last 3 bytes of the 32-byte SM3
 own MAC — **no cloud key, no app secret** — so it's computable offline for any RingConn. For this
 ring (`F8:79:99:F7:03:AD`): `V = F7^03^AD = 0x59`, e.g. `f(0xe5)=52 0b e1`, `f(0xb0)=31 82 67`. The
 old hardcoded `01 01 31 82 67` was simply `f(0xb0)`, which is why it only worked when the challenge
-happened to be `0xb0`. Impl: `RingAuth.authCommand(challenge:mac:)` (`OpenRingKit/RingAuth.swift`).
+happened to be `0xb0`. Impl: `RingAuth.authCommand(challenge:mac:)` (`OpenCircuitKit/RingAuth.swift`).
 
 **MAC on iOS:** CoreBluetooth hides the MAC, but the ring exposes it via the DIS **System ID**
 characteristic (`0x2a23`, §1) — read it once on connect (`RingAuth.macFromSystemID`).
 
 **This is the "open the official app to activate" gate, now closed:** a client that answers the
-challenge correctly activates the ring's stream itself; OpenRingConn now does this reactively on
+challenge correctly activates the ring's stream itself; OpenCircuit now does this reactively on
 `81 00` (`RingSession` `case 0x81`), so it streams standalone with no official-app dependency. (It's
 per-connection auth — **not** app-startup and **not** a re-bond; see bonding below.)
 
 **Heartbeat 🟢:** ring→host `11 00 <ctr> <tok> <xor>` (~2.5 min idle; `ctr` resets to 01 per
 connection; `tok` = the session token also in `0x10[1]`; `[last]`=XOR). Host replies a constant
 `91 00 00` (does not echo). `0x10` telemetry streams on its own ~40/110 s timer regardless of the
-ACK. (OpenRingConn now ACKs it — `Command.heartbeatAck`.)
+ACK. (OpenCircuit now ACKs it — `Command.heartbeatAck`.)
 
 **Bonding 🟢 — NO CLOUD KEY (resolves the Phase-1 make-or-break unknown):** the link is **LE Secure
 Connections "Just Works"** (ring IOcap=NoInputNoOutput), LTK generated **locally via ECDH** during
@@ -737,7 +737,7 @@ Each names the single capture that converts a 🟡/🔴 field into a decoded met
 7. **Auth function `f(challenge)` (issue #54 — the activation gate):** `01 01 <nonce>` is a
    deterministic challenge→response, NOT arbitrary (§5.8). 24/256 entries known from captures;
    recover the full `f` by decompiling the official APK (`com.gdjztech.ringconn`) — needed to make
-   OpenRingConn stream standalone (without the official app activating the ring).
+   OpenCircuit stream standalone (without the official app activating the ring).
 8. **Skin temp + its transport:** temp is measured only at night yet is absent from a full
    activity/sleep/PPG sync, from `0x0900`, and from a capture with the Temperature screen
    open (that screen reads cache, no BLE). **Mac active-probing is ruled out** — data
@@ -754,7 +754,7 @@ Each names the single capture that converts a 🟡/🔴 field into a decoded met
 ## How to extend this file
 
 1. Capture with the official app doing one thing (e.g. only a SpO2 measurement).
-2. Isolate the writes/notifications in that window (`openringconn decode-log`).
+2. Isolate the writes/notifications in that window (`opencircuit decode-log`).
 3. Form a hypothesis about the command + response format; note it 🔴.
-4. Replay the write with `openringconn replay` and confirm the response → 🟡.
+4. Replay the write with `opencircuit replay` and confirm the response → 🟡.
 5. Reproduce across sessions / values until stable → 🟢.

@@ -1,4 +1,4 @@
-name: OpenRingConn
+name: OpenCircuit
 options:
   bundleIdPrefix: com.dreamality
   deploymentTarget:
@@ -6,24 +6,24 @@ options:
   createIntermediateGroups: true
 
 packages:
-  OpenRingKit:
-    path: OpenRingKit
+  OpenCircuitKit:
+    path: OpenCircuitKit
 
 targets:
-  OpenRingConn:
+  OpenCircuit:
     type: application
     platform: iOS
     sources:
-      - path: OpenRingConn
+      - path: OpenCircuit
     dependencies:
-      - package: OpenRingKit
-        product: OpenRingKit
+      - package: OpenCircuitKit
+        product: OpenCircuitKit
     info:
-      path: OpenRingConn/Info.plist
+      path: OpenCircuit/Info.plist
       properties:
         UILaunchScreen: {}
         # User-facing app name (home screen, Settings). Independent of PRODUCT_NAME / bundle id,
-        # which stay "OpenRingConn"/com.dreamality.openringconn internally (#100 rebrand).
+        # which stay "OpenCircuit"/com.dreamality.opencircuit internally (#100 rebrand).
         CFBundleDisplayName: OpenCircuit
         # HealthKit auth strings (Phase 4) — required or the app crashes on request. Shown verbatim
         # in the iOS permission dialogs, so they use the user-facing name "OpenCircuit".
@@ -49,17 +49,17 @@ targets:
           - fetch
           - processing
         BGTaskSchedulerPermittedIdentifiers:
-          - com.dreamality.openringconn.bgrefresh
-          - com.dreamality.openringconn.bgprocessing
+          - com.dreamality.opencircuit.bgrefresh
+          - com.dreamality.opencircuit.bgprocessing
     # HealthKit entitlement enabled (2026-06-15) — signed under the paid Dreamality team
-    # (DEVELOPMENT_TEAM below). The App ID com.dreamality.openringconn carries the HealthKit
+    # (DEVELOPMENT_TEAM below). The App ID com.dreamality.opencircuit carries the HealthKit
     # capability in that account; automatic signing registers it on first build.
     entitlements:
-      path: OpenRingConn/OpenRingConn.entitlements
+      path: OpenCircuit/OpenCircuit.entitlements
       properties: { com.apple.developer.healthkit: true }
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.dreamality.openringconn
+        PRODUCT_BUNDLE_IDENTIFIER: com.dreamality.opencircuit
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.9"
@@ -71,15 +71,15 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 2ZH5MPQ5G6
 
-  OpenRingConnTests:
+  OpenCircuitTests:
     type: bundle.unit-test
     platform: iOS
     sources:
-      - path: OpenRingConnTests
+      - path: OpenCircuitTests
     dependencies:
-      - target: OpenRingConn
+      - target: OpenCircuit
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.dreamality.openringconn.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.dreamality.opencircuit.tests
         SWIFT_VERSION: "5.9"
         GENERATE_INFOPLIST_FILE: YES

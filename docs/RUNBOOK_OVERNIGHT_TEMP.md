@@ -60,7 +60,7 @@ Provide the zip path + the ground-truth numbers. Claude will:
 1. Extract `FS/data/log/bt/btsnoop_hci.log` from the zip.
 2. Decode + filter to the ring:
    ```
-   python -m openringconn decode-log captures/btsnoop_hci.log --addr F8:79:99:F7:03:AD
+   python -m opencircuit decode-log captures/btsnoop_hci.log --addr F8:79:99:F7:03:AD
    ```
 3. Search for the temp value. Working hypothesis: encoded as **0.1 °C** (so 96.58 °F =
    35.88 °C → look for `0x0166`/`0x0167`), but Claude matches against whatever number you

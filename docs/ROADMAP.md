@@ -23,20 +23,20 @@ Validate the spec cheaply before committing to Swift.
 **Exit:** one full day of the ring's data pulled offline, matching the app.
 
 ## Phase 3 — iOS app skeleton
-- [x] Port the validated **framing codec** to Swift — `ios/OpenRingKit` SwiftPM
+- [x] Port the validated **framing codec** to Swift — `ios/OpenCircuitKit` SwiftPM
       package (`Frame`, `Opcode`, `LiveHR`), tested against real FR02.018 capture
       frames. Builds/tests without Xcode via `swift run RingKitVerify`.
-- [x] Port **sleep-vitals parser** — `OpenRingKit/BulkSleep.swift` decodes `0x4c`
+- [x] Port **sleep-vitals parser** — `OpenCircuitKit/BulkSleep.swift` decodes `0x4c`
       history pages → HR/HRV/SpO2 per-epoch `QuantitySample`s (PROTOCOL.md §5.3 🟢,
       app-confirmed). Tested against real 2026-06-13 sync frames. Steps/temp/RR parsers
       still pending their formats (🟡/🔴).
-- [x] **Xcode app target** — `ios/project.yml` (XcodeGen) generates `OpenRingConn`
-      (bundle `com.openringconn.app`, iOS 17, embeds OpenRingKit, HealthKit + BLE
+- [x] **Xcode app target** — `ios/project.yml` (XcodeGen) generates `OpenCircuit`
+      (bundle `com.opencircuit.app`, iOS 17, embeds OpenCircuitKit, HealthKit + BLE
       Info.plist keys + `bluetooth-central` background mode). **Compiles** for the
       iOS simulator (`xcodebuild … CODE_SIGNING_ALLOWED=NO` → BUILD SUCCEEDED).
 - [x] **CoreBluetooth glue** — `BLE/RingScanner.swift` (scan by confirmed name
       prefix, connect) + `RingSession.swift` (discover notify/write chars by UUID,
-      enable notify, poll live HR via OpenRingKit.Frame, decode 0x15 frames).
+      enable notify, poll live HR via OpenCircuitKit.Frame, decode 0x15 frames).
       `syncHistory()` drains `0x4c` pages → `BulkSleep` → HR/HRV/SpO2 samples,
       finalized on `0x50` end-of-history; ContentView writes them to HealthKit.
 - [x] **HealthKitWriter** — auth + per-type write/units per HEALTHKIT_MAPPING.md.
@@ -51,7 +51,7 @@ Validate the spec cheaply before committing to Swift.
 Remaining for end-to-end into Apple Health: the paid-account HealthKit entitlement (Phase 4).
 
 > **Blocked on hardware/decisions (hard stops):** (a) notify/write **characteristic
-> UUIDs are still 🟡** — `openringconn scan` must bind them to the confirmed handles
+> UUIDs are still 🟡** — `opencircuit scan` must bind them to the confirmed handles
 > 0x0804/0x0802 before the app can connect; (b) **history/metric record formats are
 > 🔴** (PROTOCOL.md §5) — sync beyond live HR needs captures; (c) running on device
 > needs **code-signing** (Apple Developer account). Compilation verified; functional
@@ -76,7 +76,7 @@ Remaining for end-to-end into Apple Health: the paid-account HealthKit entitleme
 
 ## Phase 5 — Analytics (port from openwhoop)
 - [x] Port **HRV (RMSSD)**, **stress (Baevsky index)**, **strain (Edwards TRIMP)**,
-      and **sleep score** to Swift in `OpenRingKit/Analytics/`, with tests mirroring
+      and **sleep score** to Swift in `OpenCircuitKit/Analytics/`, with tests mirroring
       openwhoop's own Rust vectors (exact calibration anchors match: strain 21.0 at
       24h@maxHR, stress 10.0 at constant RR).
 - [x] Port **sleep-cycle detection** (activity.rs: stillness → Sleep/Active periods,

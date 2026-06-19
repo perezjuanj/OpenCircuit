@@ -22,7 +22,7 @@ The official app already speaks the protocol. Record it and read along.
    ```
 5. Drop it in `desktop/captures/` and run:
    ```
-   python -m openringconn decode-log captures/btsnoop_hci.log --addr <ring-mac>
+   python -m opencircuit decode-log captures/btsnoop_hci.log --addr <ring-mac>
    ```
    This prints, per ATT operation: timestamp, direction, handle, and hex payload —
    filtered to the ring. Cross-reference timestamps with the action you performed.
@@ -50,9 +50,9 @@ and encrypted-vs-plaintext determination.
 Once you can see the app's traffic, reproduce it yourself:
 
 ```
-python -m openringconn scan            # enumerate services/characteristics/handles
-python -m openringconn listen          # subscribe to notify char, log everything live
-python -m openringconn replay --hex "950095" --handle 0x0802   # send a command
+python -m opencircuit scan            # enumerate services/characteristics/handles
+python -m opencircuit listen          # subscribe to notify char, log everything live
+python -m opencircuit replay --hex "950095" --handle 0x0802   # send a command
 ```
 
 Loop: copy a write you saw the app make → `replay` it → watch `listen` for the
@@ -62,7 +62,7 @@ response → record in `PROTOCOL.md`.
 
 - **Find the framing before the fields.** Capture several frames of the same type
   and diff them — fixed bytes are header/command-id, varying tail is often a CRC.
-- **Checksums:** `openringconn guess-checksum` brute-forces common CRC-8/16/32
+- **Checksums:** `opencircuit guess-checksum` brute-forces common CRC-8/16/32
   params (incl. openwhoop's Whoop poly `0x4C11DB7`) against a frame.
 - **Timestamps:** history records usually carry an epoch or minutes-since-midnight.
   Capture at a known time and look for a 4-byte field near `now`.
