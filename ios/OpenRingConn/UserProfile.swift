@@ -37,6 +37,11 @@ struct UserProfileSettingsView: View {
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
     @AppStorage("units.distance")    private var distUnitRaw = DistanceUnit.localeDefault.rawValue
 
+    // Indoor-workout background keep-alive — shared key with WorkoutSessionManager. Off by default.
+    // When on, an indoor workout runs a coarse location session purely to keep the app alive while
+    // the screen is locked so HR keeps recording (costs battery; shows the blue location indicator).
+    @AppStorage(WorkoutSessionManager.indoorKeepAliveEnabledKey) private var indoorKeepAlive = false
+
     // App-side reminder settings (#84). Keys/defaults shared with ReminderDefaults.
     @AppStorage(ReminderDefaults.sedentaryEnabled)     private var sedentaryEnabled    = true
     @AppStorage(ReminderDefaults.sedentaryIntervalMin) private var sedentaryIntervalMin = 50
@@ -159,7 +164,7 @@ struct UserProfileSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Toggle("Skin-temp & fever alerts", isOn: $tempFeverEnabled)
-                Text("Note: OpenRingConn is not a medical device. These reminders are based on ring "
+                Text("Note: OpenCircuit is not a medical device. These reminders are based on ring "
                      + "sensor data only and are not a diagnosis. If you feel unwell, consult a "
                      + "qualified medical professional.")
                     .font(.caption2).foregroundStyle(.secondary)
@@ -206,6 +211,16 @@ struct UserProfileSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            // MARK: Workouts
+            Section("Workouts") {
+                Toggle("Keep tracking when screen is off", isOn: $indoorKeepAlive)
+                Text("For indoor workouts (strength, yoga), keep recording heart rate while your "
+                     + "phone is locked. Uses location to stay active, so the blue location "
+                     + "indicator shows and battery use is higher — no location is stored. Outdoor "
+                     + "workouts always keep tracking via GPS.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             // MARK: Units (#83)
             Section("Units") {
                 Picker("Temperature", selection: $tempUnitRaw) {
@@ -233,6 +248,21 @@ struct UserProfileSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            // MARK: About / legal (#100 rebrand, #101 privacy)
+            Section("About") {
+                LabeledContent("App", value: "OpenCircuit")
+                LabeledContent("Version", value: appVersion)
+                Link(destination: URL(string: Self.privacyPolicyURL)!) {
+                    Label("Privacy Policy", systemImage: "hand.raised")
+                }
+                Text("OpenCircuit is an independent, local-first app compatible with the RingConn "
+                     + "Gen 2 smart ring. It is not affiliated with, authorized, or endorsed by "
+                     + "RingConn or JZ_Tech; \"RingConn\" is a trademark of its respective owner. "
+                     + "Your data stays on your device and is written only to Apple Health — nothing "
+                     + "is sent to any server. OpenCircuit is not a medical device.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
         }
         .navigationTitle("User Profile")
     }
@@ -242,6 +272,16 @@ struct UserProfileSettingsView: View {
     private func formatGoalSleep(_ minutes: Int) -> String {
         let h = minutes / 60, m = minutes % 60
         return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+    }
+
+    // MARK: About helpers
+    /// Privacy policy (required for HealthKit). GitHub renders the markdown as a reachable page;
+    /// swap for a GitHub Pages URL when one is set up (#101).
+    private static let privacyPolicyURL = "https://github.com/perezjuanj/OpenCircuit/blob/master/docs/PRIVACY.md"
+    private var appVersion: String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
+        return "\(v) (\(b))"
     }
 
     // MARK: Imperial display over metric storage

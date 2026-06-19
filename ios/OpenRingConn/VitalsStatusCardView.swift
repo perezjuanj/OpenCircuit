@@ -66,7 +66,7 @@ struct VitalsStatusCardView: View {
             } else {
                 Text("Building your baseline")
                     .font(.subheadline.weight(.medium))
-                Text("Wear the ring overnight for about a week so OpenRingConn can learn your personal "
+                Text("Wear the ring overnight for about a week so OpenCircuit can learn your personal "
                      + "resting HR, SpO₂, HRV and skin-temperature ranges, then flag unusual days.")
                     .font(.caption).foregroundStyle(.secondary)
             }

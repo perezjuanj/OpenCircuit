@@ -22,20 +22,30 @@ targets:
       path: OpenRingConn/Info.plist
       properties:
         UILaunchScreen: {}
-        # HealthKit auth strings (Phase 4) — required or the app crashes on request.
-        NSHealthShareUsageDescription: "OpenRingConn reads health metrics from your RingConn ring to display them."
-        NSHealthUpdateUsageDescription: "OpenRingConn writes your ring's metrics into Apple Health."
+        # User-facing app name (home screen, Settings). Independent of PRODUCT_NAME / bundle id,
+        # which stay "OpenRingConn"/com.dreamality.openringconn internally (#100 rebrand).
+        CFBundleDisplayName: OpenCircuit
+        # HealthKit auth strings (Phase 4) — required or the app crashes on request. Shown verbatim
+        # in the iOS permission dialogs, so they use the user-facing name "OpenCircuit".
+        NSHealthShareUsageDescription: "OpenCircuit reads health metrics from your ring to display them."
+        NSHealthUpdateUsageDescription: "OpenCircuit writes your ring's metrics into Apple Health."
         # BLE (Phase 3) — required to connect to the ring.
-        NSBluetoothAlwaysUsageDescription: "OpenRingConn connects to your RingConn ring over Bluetooth Low Energy."
-        # Location (Phase 3, #75) — used ONLY when recording an outdoor workout to map the
-        # GPS route on the phone side (the ring has no GPS). Not used at any other time.
-        NSLocationWhenInUseUsageDescription: "OpenRingConn uses your location to map outdoor workout routes (walking, running, cycling, hiking). Location is not used outside of an active workout."
+        NSBluetoothAlwaysUsageDescription: "OpenCircuit connects to your RingConn Gen 2 ring over Bluetooth Low Energy."
+        # Location (Phase 3, #75) — used ONLY during an active workout: to map the GPS route
+        # (outdoor; the ring has no GPS) AND, with the `location` background mode below, to keep
+        # the app alive so heart-rate recording continues while the phone is locked. Not used at
+        # any other time. The `location` background mode is REQUIRED before setting
+        # allowsBackgroundLocationUpdates=true at runtime, or CoreLocation throws.
+        NSLocationWhenInUseUsageDescription: "OpenCircuit uses your location during an active workout to map outdoor routes and to keep recording your heart rate while your phone is locked. It is never used outside of a workout."
         # Background sync while suspended (docs/HANDOFF_MACOS_IOS.md). `processing` enables the
         # BGProcessingTask (longer runtime) so the optical-HR poll can clear its ~60 s warm-up in
         # the background (#45/#50 follow-up). iOS still runs it at its discretion, so this is
-        # best-effort — not a guarantee of daytime background HR.
+        # best-effort — not a guarantee of daytime background HR. `location` keeps a foreground-
+        # started workout alive in the background (the BLE poll loops are Task.sleep loops that
+        # iOS otherwise freezes on suspend).
         UIBackgroundModes:
           - bluetooth-central
+          - location
           - fetch
           - processing
         BGTaskSchedulerPermittedIdentifiers:

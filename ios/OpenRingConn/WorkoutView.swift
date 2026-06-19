@@ -21,6 +21,12 @@ struct WorkoutView: View {
     @State private var manager = WorkoutSessionManager()
     @Environment(\.dismiss) private var dismiss
 
+    // Distance display unit (#83) — same key/default as UserProfileSettingsView. Storage stays in
+    // metres (manager.distanceMeters); only the display converts. @AppStorage re-renders the live
+    // and summary distance when the user flips the toggle. `?? .metric` mirrors the temp sites.
+    @AppStorage("units.distance") private var distUnitRaw = DistanceUnit.localeDefault.rawValue
+    private var distanceUnit: DistanceUnit { DistanceUnit(rawValue: distUnitRaw) ?? .metric }
+
     /// True while a session is starting/active (recording in progress).
     private var isRecording: Bool {
         switch manager.recordingState {
@@ -155,17 +161,24 @@ struct WorkoutView: View {
             HStack(spacing: 16) {
                 VStack(spacing: 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        // Show the last REAL reading; dim it once it ages out (the ring's spot-read
+                        // can't lock under motion — we never pretend a held value is live, #45).
                         if let hr = manager.currentHR {
                             Text("\(hr)").font(.system(size: 40, weight: .bold, design: .rounded))
                                 .monospacedDigit().contentTransition(.numericText())
-                                .foregroundStyle(.red)
+                                .foregroundStyle(manager.currentHRIsStale ? AnyShapeStyle(.secondary)
+                                                                          : AnyShapeStyle(.red))
                         } else {
                             Text("--").font(.system(size: 40, weight: .bold, design: .rounded))
                                 .foregroundStyle(.secondary)
                         }
                         Text("bpm").font(.subheadline).foregroundStyle(.secondary)
                     }
-                    Text("Heart Rate").font(.caption2).foregroundStyle(.secondary)
+                    if manager.currentHR == nil || manager.currentHRIsStale {
+                        Text("measuring…").font(.caption2).foregroundStyle(.orange)
+                    } else {
+                        Text("Heart Rate").font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
                 VStack(spacing: 4) {
@@ -179,7 +192,7 @@ struct WorkoutView: View {
                         HStack(alignment: .firstTextBaseline, spacing: 2) {
                             Text(distanceText)
                                 .font(.title2.weight(.semibold)).monospacedDigit()
-                            Text("km").font(.caption).foregroundStyle(.secondary)
+                            Text(distanceUnit.symbol).font(.caption).foregroundStyle(.secondary)
                         }
                         HStack(spacing: 3) {
                             if manager.gpsActive {
@@ -210,6 +223,17 @@ struct WorkoutView: View {
             .padding(.horizontal)
 
             Spacer()
+
+            // Indoor keep-alive needs location to hold the app alive while locked; if it's not
+            // granted, the opt-in can't work — say so rather than failing silently.
+            if manager.keepAliveUnavailable {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text("Location is off, so tracking will pause when the screen locks. Keep the app open, or enable location for OpenCircuit in Settings.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal)
+            }
 
             // #45 disclaimer
             Text("Live HR is best-effort (polling, no background refresh — issue #45). Gaps are shown honestly.")
@@ -267,7 +291,7 @@ struct WorkoutView: View {
                     }
                     statCell("HR Readings", "\(summary.hrSampleCount)")
                     if let dist = summary.distanceMeters {
-                        statCell("Distance", String(format: "%.2f km", dist / 1000))
+                        statCell("Distance", UnitsFormatter.distance(dist, unit: distanceUnit, fractionDigits: 2))
                     }
                 }
                 .padding(.horizontal)
@@ -338,8 +362,8 @@ struct WorkoutView: View {
     }
 
     private var distanceText: String {
-        let km = (manager.distanceMeters ?? 0) / 1000
-        return String(format: "%.2f", km)
+        let v = distanceUnit.convert(fromMeters: manager.distanceMeters ?? 0)
+        return String(format: "%.2f", v)
     }
 
     private func formattedDuration(_ seconds: TimeInterval) -> String {

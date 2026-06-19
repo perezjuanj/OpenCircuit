@@ -414,7 +414,7 @@ struct CycleCalendarView: View {
     // MARK: Disclaimer footer
 
     private var disclaimerFooter: some View {
-        Text("Cycle predictions are statistical estimates only. OpenRingConn is not a medical device. Do not use these estimates for contraception or medical decisions. If you have concerns about your menstrual health, consult a qualified healthcare professional.")
+        Text("Cycle predictions are statistical estimates only. OpenCircuit is not a medical device. Do not use these estimates for contraception or medical decisions. If you have concerns about your menstrual health, consult a qualified healthcare professional.")
             .font(.caption2)
             .foregroundStyle(.secondary)
             .padding(.horizontal, 4)

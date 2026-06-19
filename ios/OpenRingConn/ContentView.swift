@@ -7,6 +7,10 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var scanner = RingScanner.shared
     @State private var healthAuthorized = false
+    /// Set when an explicit Authorize-Health attempt throws — the signature of a build WITHOUT the
+    /// HealthKit entitlement (e.g. a free-Apple-ID sideload, which strips it). Drives the "needs the
+    /// TestFlight build" note. Never set on a properly-provisioned build, where the request succeeds. (#104)
+    @State private var healthUnavailable = false
     @State private var lastWrite: String?
     @State private var showDebug = false
     @State private var showWorkout = false
@@ -77,7 +81,7 @@ struct ContentView: View {
             // Pull-to-refresh: swipe down to force a history sync, mirroring the "Sync from ring"
             // button. The control stays up until the bounded sync settles (QoL). See `forceSync`.
             .refreshable { await forceSync() }
-            .navigationTitle("OpenRingConn")
+            .navigationTitle("OpenCircuit")
             .navigationDestination(for: Route.self) { route in destination(for: route) }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -771,9 +775,20 @@ struct ContentView: View {
             if !healthAuthorized {
                 Button {
                     Task {
-                        try? await health.requestAuthorization()
+                        do {
+                            try await health.requestAuthorization()
+                        } catch {
+                            // The request throws when the HealthKit entitlement is absent — the
+                            // signature of a free-Apple-ID sideload (the entitlement is paid-account
+                            // only and gets stripped on re-sign). Surface it instead of failing
+                            // silently; the app still works as a local dashboard. (#104)
+                            healthUnavailable = true
+                        }
                         healthAuthorized = health.isShareAuthorized
-                        if healthAuthorized { observability.markHealthEverAuthorized() }
+                        if healthAuthorized {
+                            healthUnavailable = false
+                            observability.markHealthEverAuthorized()
+                        }
                         flushHealth()   // backfill everything already in the store
                     }
                 } label: {
@@ -782,6 +797,13 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(!HealthKitWriter.isAvailable)
+                if healthUnavailable {
+                    Text("This build can't write to Apple Health — that needs the TestFlight build. "
+                         + "(Free side-loaded builds can't use HealthKit.) OpenCircuit still works "
+                         + "as a local dashboard.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             } else {
                 // Mirroring is automatic after every sync; this is just a reassurance line
                 // plus a manual nudge for the impatient.

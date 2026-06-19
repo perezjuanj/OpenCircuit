@@ -9,6 +9,8 @@
 	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>OpenCircuit</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -24,16 +26,17 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>OpenRingConn connects to your RingConn ring over Bluetooth Low Energy.</string>
+	<string>OpenCircuit connects to your RingConn Gen 2 ring over Bluetooth Low Energy.</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>OpenRingConn reads health metrics from your RingConn ring to display them.</string>
+	<string>OpenCircuit reads health metrics from your ring to display them.</string>
 	<key>NSHealthUpdateUsageDescription</key>
-	<string>OpenRingConn writes your ring's metrics into Apple Health.</string>
+	<string>OpenCircuit writes your ring's metrics into Apple Health.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>OpenRingConn uses your location to map outdoor workout routes (walking, running, cycling, hiking). Location is not used outside of an active workout.</string>
+	<string>OpenCircuit uses your location during an active workout to map outdoor routes and to keep recording your heart rate while your phone is locked. It is never used outside of a workout.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>
+		<string>location</string>
 		<string>fetch</string>
 		<string>processing</string>
 	</array>

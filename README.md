@@ -1,17 +1,23 @@
-# OpenRingConn
+# OpenCircuit
 
 Local-first, no-cloud health data for the **RingConn Gen 2** smart ring — read all
 metrics over Bluetooth LE and write them to **Apple Health**. Inspired by
 [openwhoop](https://github.com/bWanShiTong/openwhoop), which does the same for the
 Whoop 4.0.
 
-> **Status: Phase 1 — protocol reverse engineering.** The RingConn Gen 2 BLE
-> protocol is almost entirely undocumented. Nothing here can pull real data until
-> the protocol is decoded. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+> **OpenCircuit** is the user-facing name (home screen / store). The Xcode target,
+> the bundle id (`com.dreamality.openringconn`), and the `OpenRingKit` Swift package
+> keep their original internal names for continuity. See [`docs/ROADMAP.md`](docs/ROADMAP.md)
+> for status.
+
+> ⚠️ **Not affiliated with RingConn.** OpenCircuit is an independent interoperability
+> project — not affiliated with, authorized, or endorsed by RingConn or JZ_Tech.
+> "RingConn" is a trademark of its respective owner. OpenCircuit is **not a medical
+> device**. Privacy: [`docs/PRIVACY.md`](docs/PRIVACY.md) · License: [`LICENSE`](LICENSE) (MIT).
 
 ## Why this exists
 
-The RingConn app sends your data to RingConn's cloud (AWS, UK). OpenRingConn keeps
+The RingConn app sends your data to RingConn's cloud (AWS, UK). OpenCircuit keeps
 it on your devices: the ring talks BLE straight to a client you control, which
 writes into Apple Health. No subscription, no third-party server.
 

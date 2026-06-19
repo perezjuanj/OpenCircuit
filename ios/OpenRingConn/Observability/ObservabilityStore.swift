@@ -157,13 +157,13 @@ struct LocalAlertCenter {
         switch alert {
         case .notSynced:
             content.title = "Ring not synced"
-            content.body = "OpenRingConn hasn't synced your ring in a while. Open the app to refresh, and check Settings ▸ General ▸ Background App Refresh."
+            content.body = "OpenCircuit hasn't synced your ring in a while. Open the app to refresh, and check Settings ▸ General ▸ Background App Refresh."
         case .lowBattery:
             content.title = "Ring battery low"
             content.body = "Your RingConn battery is low — charge it soon to keep tracking."
         case .healthAuthLost:
             content.title = "Apple Health access off"
-            content.body = "OpenRingConn can no longer write to Apple Health. Re-enable it in Settings ▸ Health ▸ Data Access & Devices."
+            content.body = "OpenCircuit can no longer write to Apple Health. Re-enable it in Settings ▸ Health ▸ Data Access & Devices."
         }
         // One pending request per condition (stable id) — re-posting just refreshes it.
         let request = UNNotificationRequest(identifier: "obs.alert.\(alert.rawValue)",
