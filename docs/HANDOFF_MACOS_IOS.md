@@ -16,7 +16,7 @@ Confirm in `docs/PROTOCOL.md` whether the BLE link is **encrypted/authenticated*
   workbench first (it iterates faster than rebuilding/redeploying an iOS app).
 
 ## What the desktop workbench already gives you (reuse the knowledge, not the code)
-`desktop/openringconn/` has, in Python, the things the Swift app must re-implement:
+`desktop/opencircuit/` has, in Python, the things the Swift app must re-implement:
 - `ble.py` — the observed UUIDs/handles (notify `8327ad97-…`, write `8327ad98-…`,
   live-HR handle `0x0804`, keepalive `95 00 95` → `0x0802`).
 - `framing.py` — `decode_live_hr()` and the checksum parameters that matched real
@@ -27,7 +27,7 @@ Confirm in `docs/PROTOCOL.md` whether the BLE link is **encrypted/authenticated*
 Create `ios/` as a SwiftUI app. Suggested module layout:
 
 ```
-ios/OpenRingConn/
+ios/OpenCircuit/
   BLE/
     RingScanner.swift        # CBCentralManager: scan, match name/service, connect
     RingSession.swift        # subscribe notify char, write commands, keepalive
@@ -61,16 +61,16 @@ paid Apple Developer Program membership** — a free personal team cannot provis
 
 ### Turn it on when you have the paid account
 1. Join the Apple Developer Program ($99/yr); add your Apple ID to Xcode.
-2. In `ios/project.yml`, **uncomment the `entitlements:` block** under the OpenRingConn
+2. In `ios/project.yml`, **uncomment the `entitlements:` block** under the OpenCircuit
    target (it's right above `settings:`), then regenerate:
    ```
    cd ios && xcodegen generate
    ```
    (Do NOT set `CODE_SIGN_ENTITLEMENTS` on a free team — it breaks device launch with a
    pre-main libxpc crash. Only add the entitlement once you actually have the paid team.)
-3. Open `OpenRingConn.xcodeproj` → OpenRingConn target → Signing & Capabilities → pick
+3. Open `OpenCircuit.xcodeproj` → OpenCircuit target → Signing & Capabilities → pick
    your **Team** (sets `DEVELOPMENT_TEAM`). Automatic signing registers the App ID
-   `com.openringconn.app` and enables the HealthKit capability for it.
+   `com.opencircuit.app` and enables the HealthKit capability for it.
 4. Build+run on the iPhone. In the app: **Authorize Apple Health** (grant all types) →
    **Sync history** → **Write to Apple Health**.
 5. Open **Bevel** — it reads HR / HRV / SpO2 / sleep from Apple Health.

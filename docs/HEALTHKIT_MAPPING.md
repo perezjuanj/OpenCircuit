@@ -35,7 +35,7 @@ device's own timestamps (so historical sync backfills correctly).
 
 ### Temperature → `.basalBodyTemperature` (#29)
 
-OpenRingConn only captures skin temperature during the nightly sleep window
+OpenCircuit only captures skin temperature during the nightly sleep window
 (`RingSession` gates temp frames to the detected/scheduled night), so it belongs in a
 rest-oriented type — NOT clinical `.bodyTemperature`, whose oral/core chart a skin reading
 (~5 °C below core) would corrupt.
@@ -58,13 +58,13 @@ The ring reports HRV as **RMSSD** (`BulkSleep` / `HRV.rmssd`), but HealthKit onl
 single HRV field, `.heartRateVariabilitySDNN`. RMSSD and SDNN are **not** related by a
 fixed constant (their ratio depends on the RR spectrum), so we do **not** apply a made-up
 conversion. Instead each HRV sample is written to the SDNN field with metadata
-`OpenRingConnHRVStatistic = "RMSSD"` (`HealthKitWriter.metadata(for:)`), so the value is
+`OpenCircuitHRVStatistic = "RMSSD"` (`HealthKitWriter.metadata(for:)`), so the value is
 honest and a reader can tell which statistic it actually is. If a future capture shows the
 ring also reports true SDNN, switch to writing that directly and drop the tag.
 
 ### Resting HR: derived daily, idempotent (#18, #37)
 
-The ring does not transmit resting HR; `OpenRingKit.RestingHR` derives a daily value:
+The ring does not transmit resting HR; `OpenCircuitKit.RestingHR` derives a daily value:
 preferred = mean HR across the night's `asleep*` segments; fallback = the lowest sustained
 (5-min rolling-mean) HR, the same basis Apple Health uses, so the values sit side by side.
 `HealthKitWriter.flushRestingHR` writes one `.restingHeartRate` sample per day, anchored at
