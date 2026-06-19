@@ -1,4 +1,4 @@
-# CLAUDE.md — OpenRingConn
+# CLAUDE.md — OpenCircuit
 
 Project context for Claude Code. Read this and `docs/ROADMAP.md` first.
 
@@ -30,7 +30,7 @@ Health** — no cloud, no subscription.
 ## Map
 | Path | What |
 |---|---|
-| `desktop/openringconn/` | RE workbench: scan/enumerate/listen/replay/decode-log/guess-checksum |
+| `desktop/opencircuit/` | RE workbench: scan/enumerate/listen/replay/decode-log/guess-checksum |
 | `docs/PROTOCOL.md` | Living protocol spec (the Phase 1 deliverable) |
 | `docs/REVERSE_ENGINEERING.md` | Capture + decode workflow |
 | `docs/RUNBOOK_OVERNIGHT_TEMP.md` | **Overnight capture for skin temp / sleep stages / HRV (#7,#9,#12)** |

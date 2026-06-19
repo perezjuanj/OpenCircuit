@@ -6,7 +6,7 @@ metrics over Bluetooth LE and write them to **Apple Health**. Inspired by
 Whoop 4.0.
 
 > **OpenCircuit** is the user-facing name (home screen / store). The Xcode target,
-> the bundle id (`com.dreamality.openringconn`), and the `OpenRingKit` Swift package
+> the bundle id (`com.dreamality.opencircuit`), and the `OpenCircuitKit` Swift package
 > keep their original internal names for continuity. See [`docs/ROADMAP.md`](docs/ROADMAP.md)
 > for status.
 
@@ -60,9 +60,9 @@ cd desktop
 python -m venv .venv && . .venv/Scripts/activate   # Windows; use bin/activate on *nix
 pip install -r requirements.txt
 
-python -m openringconn scan          # find the ring, list services/characteristics
-python -m openringconn listen        # connect and log every notification (hex)
-python -m openringconn decode-log captures/btsnoop_hci.log   # parse an Android HCI capture
+python -m opencircuit scan          # find the ring, list services/characteristics
+python -m opencircuit listen        # connect and log every notification (hex)
+python -m opencircuit decode-log captures/btsnoop_hci.log   # parse an Android HCI capture
 ```
 
 ## Legal / safety
