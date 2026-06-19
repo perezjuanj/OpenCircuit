@@ -1,4 +1,4 @@
-# OpenRingConn
+# OpenCircuit
 
 Local-first, no-cloud health data for the **RingConn Gen 2** smart ring — read all
 metrics over Bluetooth LE and write them to **Apple Health**. Inspired by
@@ -11,7 +11,7 @@ Whoop 4.0.
 
 ## Why this exists
 
-The RingConn app sends your data to RingConn's cloud (AWS, UK). OpenRingConn keeps
+The RingConn app sends your data to RingConn's cloud (AWS, UK). OpenCircuit keeps
 it on your devices: the ring talks BLE straight to a client you control, which
 writes into Apple Health. No subscription, no third-party server.
 
@@ -54,9 +54,9 @@ cd desktop
 python -m venv .venv && . .venv/Scripts/activate   # Windows; use bin/activate on *nix
 pip install -r requirements.txt
 
-python -m openringconn scan          # find the ring, list services/characteristics
-python -m openringconn listen        # connect and log every notification (hex)
-python -m openringconn decode-log captures/btsnoop_hci.log   # parse an Android HCI capture
+python -m OpenCircuit scan          # find the ring, list services/characteristics
+python -m OpenCircuit listen        # connect and log every notification (hex)
+python -m OpenCircuit decode-log captures/btsnoop_hci.log   # parse an Android HCI capture
 ```
 
 ## Legal / safety
