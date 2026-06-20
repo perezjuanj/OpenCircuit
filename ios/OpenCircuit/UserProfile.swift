@@ -15,6 +15,13 @@ struct UserProfileSettingsView: View {
     @State private var heightFeetInput = 0
     @State private var heightInchesInput = 0
 
+    // Apple Health connection. Auth lives here so there's ALWAYS a reachable entry point — the
+    // dashboard's authorize button is a post-sync nudge that only appears when there's un-synced
+    // history. `health` queries the shared HKHealthStore, so its status matches the dashboard's.
+    private let health = HealthKitWriter()
+    @State private var healthAuthorized = false
+    @State private var healthUnavailable = false
+
     // Periodic auto-measure toggle — same UserDefaults key RingSession reads. Default true
     // (the user opted into periodic measuring); flip off to save ring battery.
     @AppStorage(RingSession.autoMeasureEnabledKey) private var autoMeasureEnabled = true
@@ -112,6 +119,51 @@ struct UserProfileSettingsView: View {
                     }
                 }
             }
+
+            Section("Apple Health") {
+                if healthAuthorized {
+                    LabeledContent("Status") {
+                        Label("Connected", systemImage: "checkmark.circle.fill")
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(.green)
+                    }
+                    Text("OpenCircuit is writing your ring's metrics into Apple Health.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if HealthKitWriter.isAvailable {
+                    Button {
+                        Task {
+                            do {
+                                try await health.requestAuthorization()
+                            } catch {
+                                // Thrown only when the HealthKit entitlement is absent — the
+                                // signature of a free-Apple-ID sideload (the entitlement is paid-
+                                // account only and is stripped on re-sign). Surface it; the app
+                                // still works as a local dashboard. (#104)
+                                healthUnavailable = true
+                            }
+                            healthAuthorized = health.isShareAuthorized
+                            if healthAuthorized { healthUnavailable = false }
+                        }
+                    } label: {
+                        Label("Connect Apple Health", systemImage: "heart.text.square")
+                    }
+                    if healthUnavailable {
+                        Text("This build can't write to Apple Health — that needs the TestFlight "
+                             + "build. (Free side-loaded builds can't use HealthKit.) OpenCircuit "
+                             + "still works as a local dashboard.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("Write your ring's heart rate, HRV, SpO₂, temperature, sleep and more "
+                             + "into Apple Health. If you previously declined, turn OpenCircuit on in "
+                             + "Settings ▸ Health ▸ Data Access & Devices.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("Apple Health isn't available on this device.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .task { healthAuthorized = health.isShareAuthorized }
 
             Section("Tracking") {
                 Toggle("Auto-measure HR & SpO₂", isOn: $autoMeasureEnabled)
