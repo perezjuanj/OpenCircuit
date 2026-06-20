@@ -77,14 +77,19 @@ def counter(r: list[int]) -> int:
 def decode(r: list[int]) -> dict:
     lay = layout(r)
     d = {"counter": counter(r), "layout": lay}
+    # Motion [10:15] and all-day HR [4] ride EVERY worn epoch, sleep or activity (🟢, the
+    # same head layout — only [8] differs). Emit them for activity too so the CSV carries a
+    # CONTINUOUS motion + HR timeline; sleep-staging validation needs the awake/active
+    # epochs, which the old sleepVitals-only branch dropped (motion + HR went blank).
+    if lay != "idle":
+        d["motion"] = r[10:15]
+        d["hr"] = r[4] if 30 <= r[4] <= 220 else None     # LiveHR.validBPM band
     if lay == "sleepVitals":
-        d["hr"] = r[4] if r[4] > 0 else None
         d["hrv"] = r[5] if r[5] > 0 else None
         d["rr"] = round(r[7] / 8.0, 1) if r[7] > 0 else None
         spo2 = r[8]
         d["spo2"] = spo2 if 70 <= spo2 <= 100 else None
         d["spo2_raw"] = spo2
-        d["motion"] = r[10:15]
     return d
 
 

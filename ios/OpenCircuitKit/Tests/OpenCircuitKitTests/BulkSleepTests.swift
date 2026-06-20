@@ -148,22 +148,25 @@ final class BulkSleepTests: XCTestCase {
         var recs: [BulkRecord] = []
         var c: UInt32 = 0x0c220000
         for _ in 0..<20 { recs.append(rec(c, motion: 0x14, sub: 0x12)); c += 150 }   // awake
-        // still block: 60 high-HR (REM), 60 low-HR (Deep), 60 mid-HR (Light)
-        for _ in 0..<60 { recs.append(rec(c, motion: 0x01, sub: 0x62, hr: 72)); c += 150 }
-        for _ in 0..<60 { recs.append(rec(c, motion: 0x01, sub: 0x62, hr: 50)); c += 150 }
-        for _ in 0..<60 { recs.append(rec(c, motion: 0x01, sub: 0x62, hr: 60)); c += 150 }
+        // still block: 60 elevated-HR (REM), 60 low-HR (Deep), 60 mid-HR (Light). Deep is FLAT;
+        // REM/Light carry HR jitter — that variability is how the model keeps them out of Deep
+        // (a perfectly flat mid-HR block would correctly read as Deep). REM stays below the wake
+        // threshold (floor 50 + 18) so it isn't trimmed as wake.
+        for k in 0..<60 { recs.append(rec(c, motion: 0x01, sub: 0x62, hr: k % 2 == 0 ? 62 : 70)); c += 150 }  // REM
+        for _ in 0..<60 { recs.append(rec(c, motion: 0x01, sub: 0x62, hr: 50)); c += 150 }                     // Deep (flat)
+        for k in 0..<60 { recs.append(rec(c, motion: 0x01, sub: 0x62, hr: k % 2 == 0 ? 56 : 62)); c += 150 }  // Light (jittery)
         for _ in 0..<20 { recs.append(rec(c, motion: 0x14, sub: 0x12)); c += 150 }   // awake
 
         let segs = BulkSleep.stagedSegments(from: recs)
         let stages = Set(segs.map(\.stage))
         XCTAssertTrue(stages.contains(.inBed))
         XCTAssertTrue(stages.contains(.asleepDeep), "low-HR region -> deep")
-        XCTAssertTrue(stages.contains(.asleepREM), "high-HR region -> REM")
+        XCTAssertTrue(stages.contains(.asleepREM), "elevated-HR region -> REM")
         XCTAssertTrue(stages.contains(.asleepCore), "mid-HR region -> light/core")
         // Deep segment should fall in the low-HR (middle) third of the night.
         let deep = segs.filter { $0.stage == .asleepDeep }.max(by: { $0.duration < $1.duration })!
         let remSeg = segs.filter { $0.stage == .asleepREM }.max(by: { $0.duration < $1.duration })!
-        XCTAssertLessThan(remSeg.start, deep.start, "REM region (HR 72) precedes Deep region (HR 50) as constructed")
+        XCTAssertLessThan(remSeg.start, deep.start, "REM region (HR ~66) precedes Deep region (HR 50) as constructed")
     }
 
     func testStagingEmptyWithoutSleep() {

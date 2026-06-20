@@ -342,9 +342,12 @@ func vrec(_ c: UInt32, motion: UInt8, hr: UInt8) -> BulkRecord {
 var staged: [BulkRecord] = []
 var sc: UInt32 = 0x0c220000
 for _ in 0..<20 { staged.append(bulkRec(sc, motion: 0x14, sub: 0x12)); sc += 150 }
-for _ in 0..<60 { staged.append(vrec(sc, motion: 0x01, hr: 72)); sc += 150 }   // REM band
-for _ in 0..<60 { staged.append(vrec(sc, motion: 0x01, hr: 50)); sc += 150 }   // Deep band
-for _ in 0..<60 { staged.append(vrec(sc, motion: 0x01, hr: 60)); sc += 150 }   // Light
+// Deep is FLAT; REM/Light carry HR jitter — that variability is how the model keeps them out
+// of Deep (a flat mid-HR block would correctly read as Deep). REM stays below the wake
+// threshold (floor 50 + 18) so it isn't trimmed as wake.
+for k in 0..<60 { staged.append(vrec(sc, motion: 0x01, hr: k % 2 == 0 ? 62 : 70)); sc += 150 }  // REM band
+for _ in 0..<60 { staged.append(vrec(sc, motion: 0x01, hr: 50)); sc += 150 }                     // Deep band (flat)
+for k in 0..<60 { staged.append(vrec(sc, motion: 0x01, hr: k % 2 == 0 ? 56 : 62)); sc += 150 }  // Light (jittery)
 for _ in 0..<20 { staged.append(bulkRec(sc, motion: 0x14, sub: 0x12)); sc += 150 }
 let stages = Set(BulkSleep.stagedSegments(from: staged).map { $0.stage })
 check(stages.contains(.asleepDeep) && stages.contains(.asleepREM) && stages.contains(.asleepCore),
@@ -380,10 +383,11 @@ var night2: [BulkRecord] = []
 var nc: UInt32 = 0x0c220000
 for _ in 0..<8 { night2.append(bulkRec(nc, motion: 0x14, sub: 0x12)); nc += 150 }
 for cycle in 0..<5 {
-    for _ in 0..<10 { night2.append(vrecHRV(nc, hr: 56, hrv: 60)); nc += 150 }   // Light
-    for _ in 0..<8  { night2.append(vrecHRV(nc, hr: 50, hrv: 70)); nc += 150 }   // Deep
-    for _ in 0..<8  { night2.append(vrecHRV(nc, hr: 56, hrv: 60)); nc += 150 }   // Light
-    for _ in 0..<10 { night2.append(vrecHRV(nc, hr: 62, hrv: 45)); nc += 150 }   // REM
+    // Light/REM jitter, Deep flat — the model separates Deep by FLATNESS, not just low HR.
+    for k in 0..<10 { night2.append(vrecHRV(nc, hr: k % 2 == 0 ? 54 : 62, hrv: 60)); nc += 150 }   // Light (jittery)
+    for _ in 0..<8  { night2.append(vrecHRV(nc, hr: 50, hrv: 70)); nc += 150 }                      // Deep (flat)
+    for k in 0..<8  { night2.append(vrecHRV(nc, hr: k % 2 == 0 ? 54 : 62, hrv: 60)); nc += 150 }   // Light (jittery)
+    for k in 0..<10 { night2.append(vrecHRV(nc, hr: k % 2 == 0 ? 64 : 78, hrv: 45)); nc += 150 }   // REM (elevated, jittery)
     if cycle < 4 { for _ in 0..<2 { night2.append(bulkRec(nc, motion: 0x15, sub: 0x12)); nc += 150 } }
 }
 for _ in 0..<8 { night2.append(bulkRec(nc, motion: 0x14, sub: 0x12)); nc += 150 }

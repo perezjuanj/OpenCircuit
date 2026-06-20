@@ -18,15 +18,26 @@
 //   • HRV [5]  — RMSSD; fused in as a secondary REM cue via its short-term variability.
 //   • motion [10:15] — the awake signal (a moving sleeper is awake).
 //
-// Stage logic, per asleep epoch (Awake is decided first, from motion):
+// Awake is decided FIRST, and from HR as well as motion: an epoch is awake when its
+// motion exceeds the threshold OR its smoothed HR sits a margin above the night's
+// sleeping floor. That HR gate is the fix for "lying still but awake" — the motion
+// still-block alone counts pre-sleep / quiet-morning wakefulness as sleep, so the
+// in-bed window starts hours early and a low-movement morning wake is missed. Sleep
+// ONSET/OFFSET are then the start of the first, and end of the last, SUSTAINED asleep
+// run; leading/trailing awake is trimmed out of the in-bed window. (REM and quiet wake
+// overlap in HR, so the wake margin is set deliberately wide — above REM elevation —
+// and short HR-only awake runs erode back to asleep so a REM bump can't punch a hole.)
+//
+// Stage logic, per asleep epoch:
 //   • Deep  — HR near the night's minimum (low percentile) AND low HR variability AND
 //             no motion: the calm, consolidated low-HR troughs.
 //   • REM   — HR elevated toward waking OR HR/HRV notably variable, but motion ~0
 //             (muscle atonia). Variability — not absolute HR — is what separates REM
 //             from Light, matching the physiology.
 //   • Light — everything else asleep (the remainder).
-// Stages persist in real sleep, so short Deep/REM runs are smoothed back to Light to
-// avoid single-epoch flapping.
+// Bands are percentiles of the TRIMMED (in-window) asleep distribution, so pre-sleep
+// wakefulness no longer pollutes them. Stages persist in real sleep, so short Deep/REM
+// runs are smoothed back to Light to avoid single-epoch flapping.
 
 import Foundation
 
@@ -36,8 +47,13 @@ public enum SleepStaging {
 
     /// Tunable thresholds. All HR/variability cut-offs are PERCENTILES of the night's
     /// own asleep distribution (plus small absolute floors), so they adapt per night
-    /// rather than baking in fixed bpm. Defaults are general heuristics, not fitted to
-    /// any single night.
+    /// rather than baking in fixed bpm. The Deep/REM percentile defaults were CALIBRATED
+    /// (2026-06-20) against a Helio strap hypnogram (06-20: Deep 19% / Light 55% / REM 26%)
+    /// and the RingConn app's 06-14 totals (Deep 15% / Light 62% / REM 22%), validated to
+    /// give physiological proportions across four decoded nights. Deep is keyed off HR
+    /// FLATNESS (low variability) as much as low HR — real light sleep carries HR jitter,
+    /// which is what keeps it out of Deep; a too-strict deepHRPercentile collapsed Deep to
+    /// a few minutes on real (flat-HR) nights.
     public struct Tuning: Sendable, Equatable {
         /// Motion magnitude (sum of non-baseline `[10:15]` counts over the epoch) above
         /// which the epoch is Awake. Baseline `01` contributes 0.
@@ -69,18 +85,53 @@ public enum SleepStaging {
         /// only). Only contributes on epochs where HRV is present.
         public var hrvVarWeight: Double
 
+        // --- HR-aware wake / onset-offset (the "still but awake" fix) --------------
+        // The motion still-block alone counts lying-still-but-awake as sleep, so the
+        // in-bed window can start hours before real sleep onset and a quiet morning
+        // wake (little movement) is missed. These gate sleep on HR: a sleeper's HR sits
+        // near the night's floor; awake/active HR rides well above it.
+
+        /// Low percentile of the block's HR taken as the night's SLEEPING FLOOR. Robust:
+        /// even a window polluted by pre-sleep wake has a real sleep core at the bottom,
+        /// so the floor is stable where a high percentile (the thing we're detecting)
+        /// would not be.
+        public var sleepFloorPercentile: Double
+        /// bpm above the sleeping floor at which a (smoothed) epoch counts as awake.
+        /// Deliberately set ABOVE typical REM elevation — REM and quiet wake overlap in
+        /// HR, so the seam is wide; sustained wake (pre-sleep activity, the morning rise)
+        /// clears it while a REM bump does not. The single most validation-sensitive knob;
+        /// retune against a captured night with known bed/wake times.
+        public var wakeHRMarginBPM: Double
+        /// Half-window (epochs each side) for the rolling-MEDIAN HR used by the wake gate,
+        /// so a one-epoch HR spike doesn't read as an awakening.
+        public var hrWakeHalfWindow: Int
+        /// A sustained asleep run of at least this many epochs anchors sleep ONSET (its
+        /// start) and OFFSET (the end of the last such run). Leading/trailing awake outside
+        /// that span is trimmed from the in-bed window — this is what shrinks an over-wide
+        /// motion window back to the real night.
+        public var onsetSustainEpochs: Int
+        /// Minimum length of an HR-ONLY-driven interior awake run; shorter ones erode back
+        /// to asleep so a transient REM-ish HR bump can't punch a hole in sleep. Motion-
+        /// driven awake epochs are exempt (a real movement is awake however brief).
+        public var minHRWakeRunEpochs: Int
+
         public init(awakeMotion: Int = 15,
-                    deepHRPercentile: Double = 0.20,
-                    remHRPercentile: Double = 0.80,
+                    deepHRPercentile: Double = 0.42,
+                    remHRPercentile: Double = 0.86,
                     deepVarPercentile: Double = 0.50,
-                    remVarPercentile: Double = 0.75,
+                    remVarPercentile: Double = 0.84,
                     variabilityHalfWindow: Int = 2,
                     deepVarFloor: Double = 2.5,
                     remVarFloor: Double = 3.0,
                     minDeepRunEpochs: Int = 3,
                     minREMRunEpochs: Int = 2,
                     minAwakeRunEpochs: Int = 1,
-                    hrvVarWeight: Double = 0.5) {
+                    hrvVarWeight: Double = 0.5,
+                    sleepFloorPercentile: Double = 0.12,
+                    wakeHRMarginBPM: Double = 18,
+                    hrWakeHalfWindow: Int = 2,
+                    onsetSustainEpochs: Int = 6,
+                    minHRWakeRunEpochs: Int = 5) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -93,6 +144,11 @@ public enum SleepStaging {
             self.minREMRunEpochs = minREMRunEpochs
             self.minAwakeRunEpochs = minAwakeRunEpochs
             self.hrvVarWeight = hrvVarWeight
+            self.sleepFloorPercentile = sleepFloorPercentile
+            self.wakeHRMarginBPM = wakeHRMarginBPM
+            self.hrWakeHalfWindow = hrWakeHalfWindow
+            self.onsetSustainEpochs = onsetSustainEpochs
+            self.minHRWakeRunEpochs = minHRWakeRunEpochs
         }
 
         public static let `default` = Tuning()
@@ -157,21 +213,46 @@ public enum SleepStaging {
             for i in variability.indices { variability[i] += tuning.hrvVarWeight * hrvVar[i] }
         }
 
-        // --- Night-relative bands from the ASLEEP (non-moving) distribution --------
-        let asleep = rows.indices.filter { rows[$0].motion <= tuning.awakeMotion }
-        let hrPool = (asleep.count >= 4 ? asleep.map { hr[$0] } : hr).sorted()
-        let varPoolRaw = asleep.count >= 4 ? asleep.map { variability[$0] } : variability
-        let varPool = varPoolRaw.sorted()
+        // --- HR-aware AWAKE: motion OR sustained HR elevation ----------------------
+        // The motion still-block treats "lying still but awake" as sleep, so on its own
+        // the in-bed window starts before real onset and a quiet morning wake is missed.
+        // Gate on HR: awake/active HR rides well above the night's sleeping floor.
+        let sleepFloor = percentile(hr.sorted(), tuning.sleepFloorPercentile)
+        let wakeThreshold = sleepFloor + tuning.wakeHRMarginBPM
+        let smHR = rollingMedian(hr, half: tuning.hrWakeHalfWindow)
+        let motionAwake = rows.map { $0.motion > tuning.awakeMotion }
+        var awake = rows.indices.map { smHR[$0] >= wakeThreshold || motionAwake[$0] }
+        // Erode HR-only awake runs shorter than the floor so a transient REM-ish HR bump
+        // doesn't read as an awakening (motion-driven awakes are kept, however brief).
+        erodeShortHRWake(&awake, motionAwake: motionAwake, minRun: tuning.minHRWakeRunEpochs)
+
+        // --- ONSET / OFFSET: trim leading & trailing awake -------------------------
+        // The kept window runs from the start of the first SUSTAINED asleep run to the
+        // end of the last one; everything outside is pre-sleep / post-wake awake-in-bed
+        // and is dropped. This is what shrinks an over-wide motion window (e.g.
+        // 23:01→09:34 with hours of quiet wakefulness) back to the real night.
+        guard let (lo, hi) = sleepSpan(awake, sustain: tuning.onsetSustainEpochs) else { return [] }
+        let windowStart = rows[lo].time
+        let windowEnd = (hi + 1 < rows.count) ? rows[hi + 1].time : block.end
+
+        // --- Night-relative bands from the IN-WINDOW asleep distribution -----------
+        // Computed over [lo, hi] asleep epochs only, so trimmed pre-sleep wakefulness no
+        // longer pollutes the percentiles (which previously dragged the bands up and
+        // collapsed Deep to a few minutes).
+        let windowIdx = Array(lo...hi)
+        let asleepIdx = windowIdx.filter { !awake[$0] }
+        let pool = asleepIdx.count >= 4 ? asleepIdx : windowIdx
+        let hrPool = pool.map { hr[$0] }.sorted()
+        let varPool = pool.map { variability[$0] }.sorted()
 
         let deepHR = percentile(hrPool, tuning.deepHRPercentile)
         let remHR = percentile(hrPool, tuning.remHRPercentile)
         let deepVar = max(percentile(varPool, tuning.deepVarPercentile), tuning.deepVarFloor)
         let remVar = max(percentile(varPool, tuning.remVarPercentile), tuning.remVarFloor)
 
-        // --- Per-epoch decision ----------------------------------------------------
-        var stages: [SleepStage] = rows.indices.map { i in
-            let r = rows[i]
-            if r.motion > tuning.awakeMotion { return .awake }
+        // --- Per-epoch decision (over the kept window) -----------------------------
+        var stages: [SleepStage] = windowIdx.map { i in
+            if awake[i] { return .awake }
             if hr[i] <= deepHR && variability[i] <= deepVar { return .asleepDeep }
             if hr[i] >= remHR || variability[i] > remVar { return .asleepREM }
             return .asleepCore
@@ -179,18 +260,18 @@ public enum SleepStaging {
         smooth(&stages, tuning)
 
         // --- Merge consecutive same-stage epochs into segments ---------------------
-        var segs = [SleepSegment(start: block.start, end: block.end, stage: .inBed)]
-        var i = 0
-        while i < rows.count {
-            var j = i
-            while j + 1 < rows.count && stages[j + 1] == stages[i] { j += 1 }
-            // Fully tile [block.start, block.end] so staged segments partition the inBed
+        var segs = [SleepSegment(start: windowStart, end: windowEnd, stage: .inBed)]
+        var k = 0
+        while k < windowIdx.count {
+            var j = k
+            while j + 1 < windowIdx.count && stages[j + 1] == stages[k] { j += 1 }
+            // Fully tile [windowStart, windowEnd] so staged segments partition the inBed
             // window (else efficiency is understated): clamp the first segment's start to
-            // block.start and the last segment's end to block.end. (Reviewer MINOR fix.)
-            let segStart = (i == 0) ? block.start : rows[i].time
-            let segEnd = (j + 1 < rows.count) ? rows[j + 1].time : block.end
-            segs.append(SleepSegment(start: segStart, end: min(segEnd, block.end), stage: stages[i]))
-            i = j + 1
+            // windowStart and the last segment's end to windowEnd.
+            let segStart = (k == 0) ? windowStart : rows[windowIdx[k]].time
+            let segEnd = (j + 1 < windowIdx.count) ? rows[windowIdx[j + 1]].time : windowEnd
+            segs.append(SleepSegment(start: segStart, end: min(segEnd, windowEnd), stage: stages[k]))
+            k = j + 1
         }
         return segs
     }
@@ -244,6 +325,59 @@ public enum SleepStaging {
             }
             i = j + 1
         }
+    }
+
+    /// Centered rolling MEDIAN over a ±`half`-epoch window. Robust to single-epoch HR
+    /// spikes, so the wake gate keys off a sustained level rather than a transient.
+    private static func rollingMedian(_ xs: [Double], half: Int) -> [Double] {
+        let n = xs.count
+        guard n > 0 else { return [] }
+        var out = [Double](repeating: 0, count: n)
+        for i in 0 ..< n {
+            let s = max(0, i - half), e = min(n - 1, i + half)
+            var w = Array(xs[s ... e]); w.sort()
+            out[i] = w[w.count / 2]
+        }
+        return out
+    }
+
+    /// Relabel awake runs that are driven ONLY by HR elevation (no motion epoch inside)
+    /// and shorter than `minRun` back to asleep, so a transient REM-ish HR bump doesn't
+    /// read as an awakening. A run containing any motion-awake epoch is left untouched.
+    private static func erodeShortHRWake(_ awake: inout [Bool], motionAwake: [Bool], minRun: Int) {
+        let n = awake.count
+        var i = 0
+        while i < n {
+            guard awake[i] else { i += 1; continue }
+            var j = i
+            while j + 1 < n && awake[j + 1] { j += 1 }
+            let run = j - i + 1
+            let hasMotion = (i ... j).contains { motionAwake[$0] }
+            if run < minRun && !hasMotion { for k in i ... j { awake[k] = false } }
+            i = j + 1
+        }
+    }
+
+    /// Indices spanning real sleep: from the start of the FIRST asleep run of length
+    /// ≥ `sustain` to the end of the LAST such run. Short asleep flickers before the
+    /// first / after the last sustained run are treated as pre-sleep / post-wake and fall
+    /// outside the span. nil when no run is long enough (no real sleep block).
+    private static func sleepSpan(_ awake: [Bool], sustain: Int) -> (Int, Int)? {
+        let n = awake.count
+        var first: Int?, last: Int?
+        var i = 0
+        while i < n {
+            guard !awake[i] else { i += 1; continue }
+            var j = i
+            while j + 1 < n && !awake[j + 1] { j += 1 }
+            if j - i + 1 >= sustain {
+                if first == nil { first = i }
+                last = j
+            }
+            i = j + 1
+        }
+        if let f = first, let l = last { return (f, l) }
+        return nil
     }
 
     /// Centered rolling standard deviation over a ±`half`-epoch window.

@@ -131,20 +131,81 @@ final class SleepStagingTests: XCTestCase {
         }
     }
 
+    // MARK: - HR-aware onset/offset ("still but awake") — the screenshot fix
+
+    /// A long, STILL block of elevated HR before real sleep (e.g. lying in bed / on the
+    /// couch awake) must be TRIMMED out of the in-bed window, not counted as sleep. This
+    /// is the case motion alone misses (no movement → "still" → falsely asleep) and the
+    /// root of the 3-hour over-count: in-bed onset 23:01 vs a real ~02:00.
+    func testStillButElevatedHRPreSleepIsTrimmed() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        let preEpochs = 40
+        for _ in 0..<preEpochs { recs.append(vrec(c, hr: 78)); c += step }   // still but AWAKE (high HR)
+        let onset = c
+        for _ in 0..<120 { recs.append(vrec(c, hr: 54)); c += step }          // real sleep core
+        for _ in 0..<8 { recs.append(arec(c)); c += step }                    // morning (motion-active)
+
+        let segs = SleepStaging.classify(from: recs)
+        XCTAssertFalse(segs.isEmpty)
+        let inBed = segs.first { $0.stage == .inBed }!
+        let onsetDate = Date(timeIntervalSince1970: Double(Int(onset) + Command.syncEpoch))
+        // In-bed window starts at real onset (the low-HR block), NOT the elevated pre-sleep.
+        XCTAssertEqual(inBed.start.timeIntervalSince(onsetDate), 0, accuracy: Double(step) * 2,
+                       "pre-sleep elevated-HR block is trimmed from in-bed")
+        // The pre-sleep block is not counted as asleep: asleep ≈ the 120-epoch core.
+        let s = SleepStaging.summary(segs)
+        let coreMin = Double(120 * Int(step)) / 60
+        XCTAssertEqual(Double(s.minutes.asleep), coreMin, accuracy: 30,
+                       "asleep reflects the real core, not the pre-sleep wake")
+        // None of the trimmed pre-sleep time leaks back as an Awake segment.
+        for seg in segs where seg.stage != .inBed {
+            XCTAssertGreaterThanOrEqual(seg.start, inBed.start)
+        }
+    }
+
+    /// A sustained HR elevation in the MIDDLE of sleep with NO motion (lying still, eyes
+    /// open) must surface as Awake. Pure-motion staging misses this — it's why a real
+    /// ~1-hour morning wake was reported as ~10 min.
+    func testInteriorSustainedHRWakeWithoutMotionIsAwake() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+        for _ in 0..<60 { recs.append(vrec(c, hr: 54)); c += step }
+        let wakeStart = c
+        for _ in 0..<10 { recs.append(vrec(c, hr: 80)); c += step }           // still but AWAKE, 25 min
+        for _ in 0..<60 { recs.append(vrec(c, hr: 54)); c += step }
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+
+        let segs = SleepStaging.classify(from: recs)
+        let awake = segs.filter { $0.stage == .awake }
+        XCTAssertFalse(awake.isEmpty, "sustained mid-sleep HR elevation -> Awake, even with no motion")
+        let wt = Date(timeIntervalSince1970: Double(Int(wakeStart) + Command.syncEpoch))
+        XCTAssertTrue(awake.contains { abs($0.start.timeIntervalSince(wt)) < Double(step) * 4 },
+                      "awake segment aligns with the HR elevation")
+        // It stays interior (sleep resumes after), so onset is before and offset after it.
+        let inBed = segs.first { $0.stage == .inBed }!
+        for a in awake { XCTAssertLessThan(a.end, inBed.end) }
+    }
+
     // MARK: - Constructed-night partition (sanity vs. RingConn night totals)
 
     func testConstructedNightPartitionsLikeATracker() {
         // ~5 sleep cycles: Light-heavy with periodic Deep troughs and elevated REM,
         // plus brief awakenings. We assert the SHAPE (light ≫ rem > deep, modest awake,
         // inBed ≈ asleep + awake) the way the app's night totals do — NOT exact minutes.
+        // Light/REM carry HR JITTER and Deep is FLAT — that's how the model separates them
+        // (Deep = the flat low-HR troughs; real light sleep is never perfectly flat). A
+        // flat-HR "Light" block would correctly read as Deep, which is why this models the
+        // real variability structure (confirmed against the Helio hypnogram, 2026-06-20).
         var recs: [BulkRecord] = []
         var c: UInt32 = 0x0c220000
         for _ in 0..<8 { recs.append(arec(c)); c += step }                   // sleep onset (awake)
         for cycle in 0..<5 {
-            for _ in 0..<10 { recs.append(vrec(c, hr: 56, hrv: 60)); c += step }   // Light
-            for _ in 0..<8  { recs.append(vrec(c, hr: 50, hrv: 70)); c += step }   // Deep
-            for _ in 0..<8  { recs.append(vrec(c, hr: 56, hrv: 60)); c += step }   // Light
-            for _ in 0..<10 { recs.append(vrec(c, hr: 62, hrv: 45)); c += step }   // REM (elevated)
+            for k in 0..<10 { recs.append(vrec(c, hr: k % 2 == 0 ? 54 : 62, hrv: 60)); c += step }   // Light (jittery mid)
+            for _ in 0..<8  { recs.append(vrec(c, hr: 50, hrv: 70)); c += step }                      // Deep (flat low)
+            for k in 0..<8  { recs.append(vrec(c, hr: k % 2 == 0 ? 54 : 62, hrv: 60)); c += step }   // Light (jittery mid)
+            for k in 0..<10 { recs.append(vrec(c, hr: k % 2 == 0 ? 64 : 78, hrv: 45)); c += step }   // REM (elevated, jittery)
             if cycle < 4 { for _ in 0..<2 { recs.append(arec(c, motion: 0x15)); c += step } } // brief wake
         }
         for _ in 0..<8 { recs.append(arec(c)); c += step }                   // morning (awake)
