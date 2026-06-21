@@ -89,27 +89,40 @@ struct SleepCardView: View {
     /// already reads from it.
     private var latest: StoredSleepSummary? { storedSleep.first }
 
-    /// The night to show: prefer this connection's freshly synced staging (instant), else the
-    /// most recent persisted night (survives all day / offline). Only ever a real night (asleep > 0).
-    /// The live `liveSegments` are already gated to overnight sleep by RingSession (review #1), so a
-    /// daytime nap never reaches here as "last night".
+    /// The night to show. The persisted row is merge-protected (a shorter slice can never shrink a
+    /// fuller stored night — `SleepSummaryMerge`), so for the SAME night we show whichever of {this
+    /// sync's fresh staging, the stored rollup} has MORE time asleep. Preferring the live staging
+    /// UNCONDITIONALLY was the "sleep shrinks on every sync" display bug: a re-sync that staged a
+    /// thinner fragment repainted the smaller number over the fuller stored night. Live still wins
+    /// instantly when it's at least as complete, or when it's a genuinely newer night. Only ever a
+    /// real night (asleep > 0); daytime naps are gated out upstream by RingSession (review #1).
     private var night: Night? {
-        if !liveSegments.isEmpty {
+        let live: Night? = {
+            guard !liveSegments.isEmpty else { return nil }
             let s = SleepStaging.summary(liveSegments)
-            if s.minutes.asleep > 0 {
-                let start = liveSegments.map(\.start).min()
-                let end = liveSegments.map(\.end).max()
-                return Night(summary: s, inBedStart: start, inBedEnd: end,
-                             when: end ?? start ?? Date(), wakeKnown: end != nil)
-            }
-        }
-        if let s = storedSleep.first, s.asleepMin > 0 {
+            guard s.minutes.asleep > 0 else { return nil }
+            let start = liveSegments.map(\.start).min()
+            let end = liveSegments.map(\.end).max()
+            return Night(summary: s, inBedStart: start, inBedEnd: end,
+                         when: end ?? start ?? Date(), wakeKnown: end != nil)
+        }()
+        let stored: Night? = {
+            guard let s = storedSleep.first, s.asleepMin > 0 else { return nil }
             let start = s.inBedStart > .distantPast ? s.inBedStart : nil
             let end = (s.inBedEnd > s.inBedStart) ? s.inBedEnd : nil
             return Night(summary: s.asSummary, inBedStart: start, inBedEnd: end,
                          when: end ?? start ?? s.night, wakeKnown: end != nil)
+        }()
+        switch (live, stored) {
+        case let (l?, r?):
+            // A genuinely newer live night (wake a day+ past the stored one) always wins; otherwise
+            // it's the same night → show the fuller (more asleep) so a thin re-stage can't shrink it.
+            if l.when.timeIntervalSince(r.when) > 18 * 3600 { return l }
+            return l.summary.minutes.asleep >= r.summary.minutes.asleep ? l : r
+        case let (l?, nil): return l
+        case let (nil, r?): return r
+        default: return nil
         }
-        return nil
     }
 
     var body: some View {

@@ -52,6 +52,32 @@ final class LatestNightRecordsTests: XCTestCase {
         XCTAssertEqual(BulkSleep.latestNightRecords(from: only).count, only.count)
     }
 
+    /// A night handed off in TWO fragments (a data gap from a dropped buffer / missed drain) must be
+    /// returned WHOLE — both fragments — not clipped to the latest block. This is the record-level half
+    /// of the shrink fix; previously only the latest fragment survived.
+    func testFragmentedNightReturnsBothFragments() {
+        let base = Date(timeIntervalSince1970: 1_780_000_000)
+        let anchor = twoAM(base, dayOffset: 0)                 // 02:00 local
+        let p1Start = anchor.addingTimeInterval(-3 * 3600)     // ~23:00 prev — 3 h fragment
+        let p2Start = anchor.addingTimeInterval(40 * 60)       // 02:40 — 3 h fragment, ~43 min gap
+        let p1 = night(startingAt: p1Start)
+        let p2 = night(startingAt: p2Start)
+        // Prior night, 1 day earlier, must NOT be absorbed into the cluster.
+        let prior = night(startingAt: twoAM(base, dayOffset: -1))
+        let union = p2 + prior + p1                            // shuffled order
+
+        let scoped = BulkSleep.latestNightRecords(from: union)
+
+        // Both of last night's fragments are retained …
+        XCTAssertEqual(scoped.count, p1.count + p2.count,
+                       "both fragments of last night are kept (stitched), prior night excluded")
+        // … and none of the prior night leaks in (cluster gap > maxIntraNightGap).
+        let priorCutoff = p1Start.addingTimeInterval(-31 * 60)
+        XCTAssertTrue(scoped.allSatisfy { $0.date() >= priorCutoff }, "prior night excluded")
+        // The earliest kept record is from fragment 1, not fragment 2.
+        XCTAssertLessThan(scoped.map { $0.date() }.min()!, p2Start, "fragment 1 is retained, not clipped")
+    }
+
     func testNoOvernightBlockReturnsInputUnchanged() {
         // A still block at ~14:00 local (daytime nap) — not overnight → input returned unchanged so
         // the caller stages exactly as before.

@@ -182,11 +182,31 @@ public enum SleepStaging {
     }
 
     /// Classify a night's records into `inBed` + Awake/Light(core)/Deep/REM segments.
-    /// Returns `[]` when no sleep block (≥1 h still) is detected. The first element is
-    /// always the `inBed` span; the rest tile the staged epochs in order.
+    /// Returns `[]` when no sleep block (≥1 h still) is detected.
+    ///
+    /// STITCHING: a night handed off across several drains (the ring buffers only ~4.75 h and drops
+    /// the oldest; each sync drains a partial slice) arrives as CONTIGUOUS runs separated by data gaps.
+    /// Each run is staged independently and the segments concatenated, so the whole captured night is
+    /// kept — not just one block. Without this, a single gap split the night and only the latest
+    /// fragment survived (the "sleep shrinks on every sync" bug). Each fragment carries its own `inBed`
+    /// segment (gaps are NOT counted as in-bed); `summary` sums them. A single-fragment input (every
+    /// existing caller of a contiguous night, and every unit test) is staged exactly as before.
     public static func classify(from records: [BulkRecord],
                                 epoch: Int = Command.syncEpoch,
                                 tuning: Tuning = .default) -> [SleepSegment] {
+        let frags = BulkSleep.contiguousFragments(records)
+        guard frags.count > 1 else {
+            return classifyContiguous(from: records, epoch: epoch, tuning: tuning)
+        }
+        return frags
+            .flatMap { classifyContiguous(from: $0, epoch: epoch, tuning: tuning) }
+            .sorted { $0.start < $1.start }
+    }
+
+    /// Stage ONE contiguous record run (no internal data gaps) into `inBed` + stage segments.
+    private static func classifyContiguous(from records: [BulkRecord],
+                                           epoch: Int = Command.syncEpoch,
+                                           tuning: Tuning = .default) -> [SleepSegment] {
         guard let block = BulkSleep.mainSleep(from: records, epoch: epoch) else { return [] }
 
         // Epochs inside the in-bed window, forward-filling HR/HRV across dropped reads.
@@ -292,7 +312,11 @@ public enum SleepStaging {
         let deep: TimeInterval = t[.asleepDeep] ?? 0
         let rem: TimeInterval = t[.asleepREM] ?? 0
         let staged = awake + light + deep + rem
-        let inBed = segments.first { $0.stage == .inBed }?.duration ?? staged
+        // Sum ALL in-bed segments: a stitched multi-fragment night carries one per fragment, and the
+        // inter-fragment data gaps must NOT count as in-bed (they'd understate efficiency as phantom
+        // wake). A single-fragment night has exactly one, so this is unchanged for it.
+        let inBedSum = segments.filter { $0.stage == .inBed }.reduce(0) { $0 + $1.duration }
+        let inBed = inBedSum > 0 ? inBedSum : staged
         return Summary(inBed: inBed, awake: awake, light: light, deep: deep, rem: rem)
     }
 

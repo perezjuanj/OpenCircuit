@@ -235,6 +235,59 @@ final class SleepStagingTests: XCTestCase {
         XCTAssertEqual(SleepStaging.totalAsleep(segs), s.totalAsleep, accuracy: 0.001)
     }
 
+    // MARK: - Stitching a night handed off in MULTIPLE fragments (the shrink fix)
+
+    /// A night split by a data gap (ring buffer dropped epochs / a missed overnight drain) must be
+    /// STITCHED: both fragments staged and summed, not just the latest one kept. This is the core of
+    /// the "sleep shrinks on every sync" fix — previously a single gap discarded everything but one
+    /// block.
+    func testFragmentedNightIsStitchedAcrossGap() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        // Fragment 1: a ~5 h sleep core, bracketed by onset/EOF motion.
+        for _ in 0..<8   { recs.append(arec(c)); c += step }
+        for _ in 0..<120 { recs.append(vrec(c, hr: 52)); c += step }
+        for _ in 0..<8   { recs.append(arec(c)); c += step }
+        // Data gap well past the detector's break threshold (no records for 2 h).
+        c += UInt32(2 * 3600)
+        // Fragment 2: a second ~4 h sleep core.
+        for _ in 0..<8   { recs.append(arec(c)); c += step }
+        for _ in 0..<100 { recs.append(vrec(c, hr: 52)); c += step }
+        for _ in 0..<8   { recs.append(arec(c)); c += step }
+
+        XCTAssertEqual(BulkSleep.contiguousFragments(recs).count, 2, "gap splits into two fragments")
+
+        let segs = SleepStaging.classify(from: recs)
+        XCTAssertFalse(segs.isEmpty)
+        let s = SleepStaging.summary(segs)
+
+        // Asleep spans BOTH cores (120 + 100 epochs), not just one fragment.
+        let bothCoresMin = Double((120 + 100) * Int(step)) / 60
+        XCTAssertEqual(Double(s.minutes.asleep), bothCoresMin, accuracy: 40,
+                       "stitched asleep covers both fragments, not just the latest")
+        // One in-bed span per fragment; the 2 h gap is NOT counted as in-bed.
+        let inBeds = segs.filter { $0.stage == .inBed }
+        XCTAssertEqual(inBeds.count, 2, "one in-bed segment per fragment")
+        let wallSpan = (segs.map(\.end).max()!).timeIntervalSince(segs.map(\.start).min()!)
+        XCTAssertGreaterThan(wallSpan - s.inBed, 1.5 * 3600,
+                             "the inter-fragment gap is excluded from in-bed")
+        // Partition still holds across the stitch: in-bed ≈ asleep + awake.
+        XCTAssertEqual(s.inBed, s.totalAsleep + s.awake, accuracy: Double(step) * 2)
+    }
+
+    /// A single contiguous night must be unchanged by the stitching path (one fragment ⇒ one in-bed
+    /// segment, identical to the pre-stitch classifier).
+    func testSingleFragmentNightUnchangedByStitch() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8   { recs.append(arec(c)); c += step }
+        for _ in 0..<120 { recs.append(vrec(c, hr: 52)); c += step }
+        for _ in 0..<8   { recs.append(arec(c)); c += step }
+        XCTAssertEqual(BulkSleep.contiguousFragments(recs).count, 1)
+        let segs = SleepStaging.classify(from: recs)
+        XCTAssertEqual(segs.filter { $0.stage == .inBed }.count, 1)
+    }
+
     func testNoSleepBlockYieldsNoSegments() {
         var recs: [BulkRecord] = []
         var c: UInt32 = 0x0c220000

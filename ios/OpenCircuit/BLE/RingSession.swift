@@ -804,8 +804,14 @@ final class RingSession: NSObject {
     /// falls back to the stored real night. (Adversarial review #1.)
     private func overnightStagedSegments(from records: [BulkRecord]) -> [SleepSegment] {
         let segs = BulkSleep.stagedSegments(from: records)
-        guard let block = segs.first(where: { $0.stage == .inBed }) else { return segs }
-        return SleepWindow.isOvernightBlock(start: block.start, end: block.end) ? segs : []
+        // A stitched night carries one `inBed` segment PER fragment (sorted by start), so gate on the
+        // WHOLE-NIGHT envelope — earliest onset to latest wake — not just the first fragment. Testing
+        // `first(where: .inBed)` would judge the night by its earliest fragment's midpoint and wrongly
+        // reject (→ drop the whole night) an early-evening-onset night whose first fragment alone has a
+        // daytime midpoint. (Adversarial review.)
+        let inBeds = segs.filter { $0.stage == .inBed }
+        guard let lo = inBeds.map(\.start).min(), let hi = inBeds.map(\.end).max() else { return segs }
+        return SleepWindow.isOvernightBlock(start: lo, end: hi) ? segs : []
     }
 
     /// Persist the latest night's sleep summary + today's step count so the dashboard

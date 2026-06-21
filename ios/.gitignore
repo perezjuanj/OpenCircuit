@@ -10,3 +10,6 @@ build-device/
 build/
 # Throwaway icon background candidates — only branding/logo.svg + AppIcon.appiconset are committed
 OpenCircuit/branding/candidates/
+
+# Xcode simulator derived data (local build output)
+build-sim/

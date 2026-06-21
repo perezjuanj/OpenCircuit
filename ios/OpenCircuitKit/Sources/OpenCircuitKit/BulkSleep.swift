@@ -149,6 +149,28 @@ public enum BulkSleep {
         frames.flatMap { records(fromPage: $0) }
     }
 
+    /// Split records into CONTIGUOUS runs, breaking wherever the gap between consecutive epoch
+    /// counters exceeds `maxGap`. A "night" arrives in MORE THAN ONE drain (the ring buffers only
+    /// ~4.75 h and drops the oldest; each manual sync drains a partial slice), so the union holds the
+    /// real night as several fragments separated by data gaps. Staging each fragment independently and
+    /// summing — instead of keeping only one block — is what stitches the night back together. The
+    /// threshold matches `SleepDetection`'s gap-break (`gravityMaxGap`) so a fragment never contains a
+    /// gap the detector would itself split on (which would re-introduce the single-block discard).
+    public static func contiguousFragments(_ records: [BulkRecord],
+                                           maxGap: TimeInterval = ActivityPeriod.gravityMaxGap) -> [[BulkRecord]] {
+        let sorted = records.sorted { $0.counter < $1.counter }
+        guard !sorted.isEmpty else { return [] }
+        var frags: [[BulkRecord]] = []
+        var cur: [BulkRecord] = [sorted[0]]
+        for i in 1 ..< sorted.count {
+            let gap = TimeInterval(Int(sorted[i].counter) - Int(sorted[i - 1].counter))
+            if gap > maxGap { frags.append(cur); cur = [sorted[i]] }
+            else { cur.append(sorted[i]) }
+        }
+        frags.append(cur)
+        return frags
+    }
+
     /// Expand 0x4c records into a per-30 s motion timeline (5 sub-samples per
     /// 150 s epoch from the [10:15] channel) for `SleepDetection.detectFromMotion`.
     /// Motion counts are passed through directly (baseline `01` = still); callers
@@ -202,6 +224,23 @@ public enum BulkSleep {
                                      temperatures: [TemperatureSample] = [],
                                      epoch: Int = Command.syncEpoch) -> [SleepSegment] {
         let scoped = Self.records(records, within: hint, epoch: epoch)
+        // Stitch a multi-fragment night: a night handed off across several drains arrives as
+        // contiguous runs separated by data gaps. Segmenting each run on its own and summing — rather
+        // than taking the single longest block — keeps the whole captured night (mirrors the staged
+        // path in SleepStaging.classify). A single-fragment input takes the original path verbatim.
+        let frags = contiguousFragments(scoped)
+        guard frags.count > 1 else {
+            return sleepSegmentsContiguous(from: scoped, temperatures: temperatures, epoch: epoch)
+        }
+        return frags
+            .flatMap { sleepSegmentsContiguous(from: $0, temperatures: temperatures, epoch: epoch) }
+            .sorted { $0.start < $1.start }
+    }
+
+    /// Coarse asleep/awake segmentation of ONE contiguous record run (no internal data gaps).
+    private static func sleepSegmentsContiguous(from scoped: [BulkRecord],
+                                                temperatures: [TemperatureSample],
+                                                epoch: Int) -> [SleepSegment] {
         let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
                                                       temperatureSamples: temperatures)
         // Main in-bed block = longest sleep period over the minimum duration (1 h).
@@ -238,6 +277,12 @@ public enum BulkSleep {
     /// (`SleepWindow.isOvernightBlock`), so a daytime nap never wins. Detection honours the wear
     /// gate (`temperatures`) so an off-wrist/charging block can't masquerade as the night. Returns
     /// `records` unchanged when no overnight block is found (caller stages exactly as before).
+    /// Maximum gap between two sleep blocks for them to count as the SAME night. The ring buffers
+    /// only ~4.75 h and drops the oldest, and a missed overnight drain leaves a hole, so one night's
+    /// fragments can sit several hours apart; the PRIOR night is ~(24 h − sleep) ≈ 14 h+ away. 6 h
+    /// cleanly absorbs intra-night buffer-loss gaps while never merging two different nights.
+    public static let maxIntraNightGap: TimeInterval = 6 * 3600
+
     public static func latestNightRecords(from records: [BulkRecord],
                                           temperatures: [TemperatureSample] = [],
                                           epoch: Int = Command.syncEpoch) -> [BulkRecord] {
@@ -251,10 +296,22 @@ public enum BulkSleep {
                 && $0.duration > ActivityPeriod.minSleepDuration
                 && SleepWindow.isOvernightBlock(start: $0.start, end: $0.end)
         }
-        guard let latest = nights.max(by: { $0.end < $1.end }) else { return records }
+        guard let anchor = nights.max(by: { $0.end < $1.end }) else { return records }
+        // Cluster the night: starting from the latest-ending overnight block, absorb EARLIER overnight
+        // blocks that sit within `maxIntraNightGap` of the running cluster start, chaining backward.
+        // This is what lets a night fragmented across several drains be staged as ONE night — the old
+        // code kept only `anchor`, discarding every earlier fragment (a single 35-min data gap already
+        // threw away ~5 h of a real 10 h night). The whole clustered span (gaps included) is returned;
+        // `SleepStaging`/`sleepSegments` then stitch the fragments inside it.
+        var clusterStart = anchor.start
+        for p in nights.sorted(by: { $0.start > $1.start }) where p.end <= anchor.end {
+            if clusterStart.timeIntervalSince(p.end) <= maxIntraNightGap {
+                clusterStart = min(clusterStart, p.start)
+            }
+        }
         let margin: TimeInterval = 30 * 60   // don't clip onset/wake at detection granularity
-        let lo = latest.start.addingTimeInterval(-margin)
-        let hi = latest.end.addingTimeInterval(margin)
+        let lo = clusterStart.addingTimeInterval(-margin)
+        let hi = anchor.end.addingTimeInterval(margin)
         return records.filter { let t = $0.date(epoch: epoch); return t >= lo && t <= hi }
     }
 
