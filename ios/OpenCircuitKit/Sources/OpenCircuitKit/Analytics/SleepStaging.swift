@@ -86,6 +86,14 @@ public enum SleepStaging {
         /// Weight of HRV short-term variability fused into the variability score (0 = HR
         /// only). Only contributes on epochs where HRV is present.
         public var hrvVarWeight: Double
+        /// Weight of respiratory-rate short-term variability fused into the variability
+        /// score (0 = no RR contribution). Mirrors `hrvVarWeight` exactly: it adds
+        /// `rrVarWeight × rollingSD(RR)` to the blended variability scale, and only on
+        /// epochs where RR is present. RingConn's on-device staging fuses RR (APK RE), but
+        /// the exact weight is not recoverable from their binary, so this defaults to 0 —
+        /// byte-identical output to the pre-RR model — and is meant to be SUPERVISED-FIT
+        /// against captured RingConn labels before being raised.
+        public var rrVarWeight: Double
 
         // --- HR-aware wake / onset-offset (the "still but awake" fix) --------------
         // The motion still-block alone counts lying-still-but-awake as sleep, so the
@@ -129,6 +137,7 @@ public enum SleepStaging {
                     minREMRunEpochs: Int = 2,
                     minAwakeRunEpochs: Int = 1,
                     hrvVarWeight: Double = 0.5,
+                    rrVarWeight: Double = 0,
                     sleepFloorPercentile: Double = 0.12,
                     wakeHRMarginBPM: Double = 18,
                     hrWakeHalfWindow: Int = 2,
@@ -146,6 +155,7 @@ public enum SleepStaging {
             self.minREMRunEpochs = minREMRunEpochs
             self.minAwakeRunEpochs = minAwakeRunEpochs
             self.hrvVarWeight = hrvVarWeight
+            self.rrVarWeight = rrVarWeight
             self.sleepFloorPercentile = sleepFloorPercentile
             self.wakeHRMarginBPM = wakeHRMarginBPM
             self.hrWakeHalfWindow = hrWakeHalfWindow
@@ -215,14 +225,16 @@ public enum SleepStaging {
         let inBlock = records
             .filter { $0.date(epoch: epoch) >= block.start && $0.date(epoch: epoch) <= block.end }
             .sorted { $0.counter < $1.counter }
-        var lastHR: Int?, lastHRV: Int?
-        var rows: [(time: Date, hr: Int, hrv: Int?, motion: Int)] = []
+        var lastHR: Int?, lastHRV: Int?, lastSpo2: Int?, lastRR: Double?
+        var rows: [(time: Date, hr: Int, hrv: Int?, motion: Int, spo2: Int?, rr: Double?)] = []
         for r in inBlock {
             if let hr = r.heartRate { lastHR = hr }
             if let v = r.hrvRMSSD { lastHRV = v }
+            if let s = r.spo2Percent { lastSpo2 = s }       // forward-filled like HRV
+            if let rr = r.respiratoryRate { lastRR = rr }   // forward-filled like HRV
             guard let hr = lastHR else { continue }   // skip until the first HR reading
             let motion = r.motion.reduce(0) { $0 + ($1 == 1 ? 0 : Int($1)) }
-            rows.append((r.date(epoch: epoch), hr, lastHRV, motion))
+            rows.append((r.date(epoch: epoch), hr, lastHRV, motion, lastSpo2, lastRR))
         }
         guard rows.count >= 2 else { return [] }
 
@@ -233,6 +245,14 @@ public enum SleepStaging {
             let hrv = filledForward(rows.map { $0.hrv }).map { Double($0 ?? 0) }
             let hrvVar = rollingSD(hrv, half: tuning.variabilityHalfWindow)
             for i in variability.indices { variability[i] += tuning.hrvVarWeight * hrvVar[i] }
+        }
+        // Respiratory-rate variability, fused identically to the HRV term above. Defaults
+        // off (rrVarWeight == 0) so the blended variability — and every stage decision —
+        // is byte-identical to the pre-RR model until the weight is fit.
+        if tuning.rrVarWeight > 0, rows.contains(where: { $0.rr != nil }) {
+            let rr = filledForward(rows.map { $0.rr }).map { $0 ?? 0 }
+            let rrVar = rollingSD(rr, half: tuning.variabilityHalfWindow)
+            for i in variability.indices { variability[i] += tuning.rrVarWeight * rrVar[i] }
         }
 
         // --- HR-aware AWAKE: motion OR sustained HR elevation ----------------------
@@ -436,13 +456,13 @@ public enum SleepStaging {
         return out
     }
 
-    /// Forward-then-backward fill of nil gaps, so a sparse HRV channel has no artificial
-    /// jumps where readings drop out.
-    private static func filledForward(_ xs: [Int?]) -> [Int?] {
+    /// Forward-then-backward fill of nil gaps, so a sparse channel (HRV, RR) has no
+    /// artificial jumps where readings drop out.
+    private static func filledForward<T>(_ xs: [T?]) -> [T?] {
         var out = xs
-        var last: Int?
+        var last: T?
         for i in out.indices { if let v = out[i] { last = v } else { out[i] = last } }
-        var next: Int?
+        var next: T?
         for i in stride(from: out.count - 1, through: 0, by: -1) {
             if let v = out[i] { next = v } else { out[i] = next }
         }

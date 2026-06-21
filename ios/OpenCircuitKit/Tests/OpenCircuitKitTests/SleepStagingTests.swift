@@ -20,6 +20,19 @@ final class SleepStagingTests: XCTestCase {
         return BulkRecord(b)!
     }
 
+    /// A sleep-vitals epoch that ALSO sets the respiratory-rate byte `[7] = rr*8`, so
+    /// `BulkRecord.respiratoryRate` (raw[7]/8) decodes. The plain `vrec` leaves `[7] = 0`
+    /// (RR = nil); this variant is for the RR-fusion tests. `rr` must be ≤ 31 (rr*8 ≤ 248).
+    private func vrecRR(_ counter: UInt32, hr: UInt8, hrv: UInt8 = 0, motion: UInt8 = 1,
+                        rr: Double) -> BulkRecord {
+        var b = [UInt8](repeating: 0, count: 23)
+        b[0] = UInt8(counter >> 24); b[1] = UInt8((counter >> 16) & 0xFF)
+        b[2] = UInt8((counter >> 8) & 0xFF); b[3] = UInt8(counter & 0xFF)
+        b[4] = hr; b[5] = hrv; b[7] = UInt8((rr * 8).rounded()); b[8] = 0x62
+        for k in 0..<5 { b[10 + k] = motion }
+        return BulkRecord(b)!
+    }
+
     /// An active/awake epoch (sub 0x12, high motion, no vitals).
     private func arec(_ counter: UInt32, motion: UInt8 = 0x14) -> BulkRecord {
         var b = [UInt8](repeating: 0, count: 23)
@@ -129,6 +142,68 @@ final class SleepStagingTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(a.start, inBed.start)
             XCTAssertLessThanOrEqual(a.end, inBed.end)
         }
+    }
+
+    // MARK: - SpO2 + respiratory-rate fusion (additive; default-inert)
+
+    /// The new `rrVarWeight` knob defaults to 0, so the classifier output for ANY night —
+    /// even one carrying respiratory-rate readings — must be byte-identical with the default
+    /// tuning vs. an explicit `Tuning(rrVarWeight: 0)`. This is the safety property that
+    /// guarantees the RR feature regresses nothing until it is deliberately fit.
+    func testRrVarWeightZeroIsNoOp() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+        // A varied night carrying RR (and SpO2 via [8]) on every asleep epoch.
+        for k in 0..<140 {
+            recs.append(vrecRR(c, hr: k % 3 == 0 ? 52 : 58, hrv: 55,
+                               rr: k % 2 == 0 ? 13 : 18)); c += step
+        }
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+
+        let withDefault = SleepStaging.classify(from: recs)
+        let withExplicitZero = SleepStaging.classify(from: recs,
+                                                     tuning: SleepStaging.Tuning(rrVarWeight: 0))
+        XCTAssertEqual(withDefault, withExplicitZero,
+                       "rrVarWeight defaults to 0 ⇒ RR is inert and output is unchanged")
+    }
+
+    /// Respiratory-rate variability is a REM cue, mirroring the HRV term. A flat-HR /
+    /// flat-HRV block whose ONLY variable signal is respiratory rate must NOT read as REM
+    /// at the default (rrVarWeight = 0), but SHOULD gain REM once rrVarWeight is raised.
+    /// This proves RR is genuinely fused into the variability score (not merely carried).
+    func testRrVariabilityAddsREMCue() {
+        // deepHR (p42) < target HR (54) < remHR (p86), so the target is neither Deep- nor
+        // REM-by-HR; the only thing that can push it to REM is its RR variability.
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<12 { recs.append(arec(c)); c += step }                              // onset (awake)
+        for _ in 0..<120 { recs.append(vrecRR(c, hr: 50, hrv: 50, rr: 15)); c += step }  // low, flat (Deep)
+        let tStart = c
+        for k in 0..<16 {                                                                // FLAT HR/HRV, OSC RR
+            recs.append(vrecRR(c, hr: 54, hrv: 50, rr: k % 2 == 0 ? 10 : 22)); c += step
+        }
+        let tEnd = c
+        for _ in 0..<80 { recs.append(vrecRR(c, hr: 58, hrv: 50, rr: 15)); c += step }   // high, flat (light/REM-by-HR)
+        for _ in 0..<12 { recs.append(arec(c)); c += step }                              // offset (awake)
+
+        let lo = Date(timeIntervalSince1970: Double(Int(tStart) + Command.syncEpoch))
+        let hi = Date(timeIntervalSince1970: Double(Int(tEnd) + Command.syncEpoch))
+        func remInTarget(_ w: Double) -> Double {
+            let segs = SleepStaging.classify(from: recs,
+                                             tuning: SleepStaging.Tuning(rrVarWeight: w))
+            return segs.filter { $0.stage == .asleepREM }.reduce(0.0) { acc, s in
+                acc + max(0, min(s.end, hi).timeIntervalSince(max(s.start, lo)))
+            }
+        }
+
+        let remOff = remInTarget(0)
+        let remOn = remInTarget(1.0)
+        XCTAssertEqual(remOff, 0, accuracy: 0.001,
+                       "with rrVarWeight:0 the flat-HR/flat-HRV block carries no REM")
+        XCTAssertGreaterThan(remOn, 0,
+                             "raising rrVarWeight turns the RR-variable block into REM")
+        XCTAssertGreaterThan(remOn, remOff, "RR variability adds a REM cue the HR-only model misses")
     }
 
     // MARK: - HR-aware onset/offset ("still but awake") — the screenshot fix
