@@ -34,6 +34,8 @@ Health** — no cloud, no subscription.
 | `docs/PROTOCOL.md` | Living protocol spec (the Phase 1 deliverable) |
 | `docs/REVERSE_ENGINEERING.md` | Capture + decode workflow |
 | `docs/RUNBOOK_OVERNIGHT_TEMP.md` | **Overnight capture for skin temp / sleep stages / HRV (#7,#9,#12)** |
+| `docs/RUNBOOK_SLEEP_GROUNDTRUTH.md` | **Capture RingConn's computed hypnogram (`sleepPhases`) via mitmproxy → fit our staging to it** |
+| `desktop/ringconn_sleep_fit.py` | Supervised-fit harness: align our epochs to RingConn `sleepPhases`, fit `SleepStaging.Tuning` (`--synthetic` to demo) |
 | `docs/HEALTHKIT_MAPPING.md` | Each metric → HealthKit type |
 | `docs/HANDOFF_MACOS_IOS.md` | **Pickup instructions for the iOS work on macOS** |
 | `docs/ROADMAP.md` | Phases + risks |
