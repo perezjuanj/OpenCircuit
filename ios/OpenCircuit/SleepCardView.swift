@@ -23,6 +23,12 @@ struct SleepCardView: View {
     @Environment(\.modelContext) private var modelContext
     /// Temperature display unit (#83). Syncs with the Units section in UserProfileSettingsView.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
+    /// User's manual sleep schedule (same keys as SleepScheduleDefaults) — used only to judge whether
+    /// last night looks buffer-limited (the overnight-charging hint). Read directly so the card needs
+    /// no async schedule provider.
+    @AppStorage("sleepSchedule.enabled") private var scheduleEnabled = false
+    @AppStorage("sleepSchedule.bedMinutes") private var bedMinutes = 22 * 60 + 30
+    @AppStorage("sleepSchedule.wakeMinutes") private var wakeMinutes = 6 * 60 + 30
     /// Trailing persisted nights (latest first) — the offline source of truth. The window is
     /// wider than 1 so the rolling skin-temp baseline + the offset mini-chart (#69) have history;
     /// `latest` (= `storedSleep.first`) still drives the headline night.
@@ -175,6 +181,32 @@ struct SleepCardView: View {
         // Footer: sleep window · efficiency · est. caveat.
         Text(footer(night).joined(separator: " · "))
             .font(.caption2).foregroundStyle(.tertiary)
+        captureHint(night)
+    }
+
+    /// Actionable hint when last night looks LIMITED BY THE RING'S ~4.75 h memory (the early hours were
+    /// overwritten before any overnight drain). iOS runs OpenCircuit's background sync far more reliably
+    /// while the phone is charging, so that's the one lever the user controls. Shown only on positive
+    /// evidence (see `SleepCaptureCoverage`), so it doesn't nag on a genuinely short night.
+    @ViewBuilder
+    private func captureHint(_ night: Night) -> some View {
+        // Scheduled bedtime for this night, only when the user enabled a manual schedule — without it
+        // we can't tell a truncated night from a genuinely short one, so no hint (see SleepCaptureCoverage).
+        let bedtime: Date? = {
+            guard scheduleEnabled, let wake = night.inBedEnd else { return nil }
+            return SleepWindow.interval(bedMinutes: bedMinutes, wakeMinutes: wakeMinutes,
+                                        nightEndingNear: wake)?.start
+        }()
+        if let onset = night.inBedStart,
+           SleepCaptureCoverage.classify(capturedOnset: onset, capturedInBed: night.summary.inBed,
+                                         scheduledBedtime: bedtime) == .likelyTruncated {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "bolt.badge.clock").font(.caption2).foregroundStyle(.orange)
+                Text("Synced only from \(onset.formatted(date: .omitted, time: .shortened)) — the ring holds ~4.75h of memory and overwrites the oldest. Keep your phone charging nearby overnight so OpenCircuit can capture the whole night.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .padding(.top, 2)
+        }
     }
 
     /// The Wave-1 sleep-detail rows in one group: per-stage HR, overnight stress, skin-temp
