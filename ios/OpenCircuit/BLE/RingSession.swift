@@ -330,6 +330,45 @@ final class RingSession: NSObject {
     var batteryChargeSamples: [BatteryTTE.Sample] { batteryChargeHistory }
     private var batteryChargeHistoryKey: String { "battery.chargeHistory.v1.\(peripheral.identifier.uuidString)" }
 
+    // MARK: Diagnostics — raw history-frame capture (Gen 3 triage, discussion #111)
+    //
+    // OFF by default and gated by a UserDefaults toggle reachable only from the DEBUG-only
+    // Device-Info section. When ON, the `0x47`/`0x4c`/`0x50`/`0x82`/`0x10` frames are recorded raw
+    // (persisted per-ring, like the battery history) so an iOS-only tester on a NEW ring generation
+    // can export the bytes for us to decode — the overnight sleep-vitals layout is pinned to Gen 2
+    // (FW FR02.018) and won't decode on a ring whose `0x4c` records differ. The pure buffer +
+    // report serializer live in OpenCircuitKit (`HistoryFrameCapture`).
+
+    /// UserDefaults toggle gating the capture (default OFF). Set from the DEBUG Device-Info UI.
+    static let diagnosticsCaptureKey = "diagnostics.captureHistoryFrames"
+    /// Per-ring persisted capture buffer (scoped like the epoch archive / battery history).
+    private var historyCapture = HistoryFrameCapture()
+    private var historyCaptureKey: String { "diagnostics.historyCapture.v1.\(peripheral.identifier.uuidString)" }
+    /// True when the user has opted into raw-frame capture.
+    private var diagnosticsCaptureEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.diagnosticsCaptureKey)
+    }
+    /// Number of frames captured so far (drives the DEBUG Device-Info row).
+    var diagnosticsFrameCount: Int { historyCapture.count }
+    /// A shareable plain-text report of every captured frame + this ring's firmware/generation.
+    func diagnosticsReport() -> String { historyCapture.report(firmware: firmwareInfo) }
+    /// Clear the capture buffer (and its persisted copy).
+    func clearDiagnosticsCapture() {
+        historyCapture.clear()
+        UserDefaults.standard.removeObject(forKey: historyCaptureKey)
+    }
+
+    /// Record one raw frame into the capture buffer when capture is enabled and the opcode is one
+    /// we triage on. Persists per-ring on change so a BACKGROUND overnight drain is kept too (the
+    /// tester may never have the app foregrounded while it syncs). Cheap no-op when disabled.
+    private func recordDiagnosticFrameIfEnabled(_ bytes: [UInt8]) {
+        guard diagnosticsCaptureEnabled else { return }
+        guard historyCapture.recordIfRelevant(bytes) else { return }
+        if let data = try? JSONEncoder().encode(historyCapture) {
+            UserDefaults.standard.set(data, forKey: historyCaptureKey)
+        }
+    }
+
     init(peripheral: CBPeripheral, localStore: LocalStore? = nil) {
         self.peripheral = peripheral
         self.localStore = localStore
@@ -345,6 +384,12 @@ final class RingSession: NSObject {
         if let data = UserDefaults.standard.data(forKey: batteryChargeHistoryKey),
            let saved = try? JSONDecoder().decode([BatteryTTE.Sample].self, from: data) {
             self.batteryChargeHistory = saved
+        }
+        // Restore this ring's persisted diagnostic capture (DEBUG triage, #111) so a buffer built
+        // across a background overnight drain survives relaunch and is exportable in the morning.
+        if let data = UserDefaults.standard.data(forKey: historyCaptureKey),
+           let saved = try? JSONDecoder().decode(HistoryFrameCapture.self, from: data) {
+            self.historyCapture = saved
         }
         peripheral.delegate = self
         // Seed the model name from the peripheral's advertised name; may be overridden later
@@ -1397,6 +1442,10 @@ extension RingSession: CBPeripheralDelegate {
             // opcodes the switch below returns early on (0x82/0x50/0x4c…) and any NEW opcode it would
             // drop in `default`. Must precede that switch so nothing is missed.
             if self.probing { self.collectProbeFrame(bytes) }
+            // Diagnostic raw-frame capture (DEBUG triage, #111): record history/descriptor frames
+            // when the user has opted in. Before the early-returning switch so `0x50`/`0x82`/`0x4c`
+            // are all captured. No-op (cheap UserDefaults bool read) when disabled.
+            self.recordDiagnosticFrameIfEnabled(bytes)
             // A DATA frame (anything but the cold `0x81` status reply, which even an un-activated ring
             // answers) proves the ring's data path is live: clear `notStreaming` + satisfy the
             // activation watchdog (#54). Guarded so `@Observable` doesn't republish on every frame.

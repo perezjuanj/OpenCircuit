@@ -33,6 +33,19 @@ You can also open the same file in **Wireshark** (`btatt` filter) for a GUI view
 iOS has no on-device HCI log. Options: a macOS + iPhone **PacketLogger** capture
 (Additional Tools for Xcode), or an external sniffer (below).
 
+### In-app frame capture (iOS, no Mac/sniffer needed)
+For a tester who only runs the iOS app (e.g. a new ring generation that connects but
+whose overnight sleep/HRV/RR won't decode — the Gen 2 `0x4c` layout is firmware-pinned),
+a **Debug build** exposes **Device Info ▸ Diagnostics (debug)**:
+1. Toggle **Capture history frames** on.
+2. Wear the ring overnight, then open the app / sync in the morning. Captured frames are
+   persisted per-ring, so a **background** overnight drain is kept too.
+3. Tap **Share capture** → send us the `.txt`. It carries the ring's firmware/generation
+   plus every raw `0x47`/`0x4c`/`0x50`/`0x82`/`0x10` frame (hex) for offline decoding.
+
+The section is compiled out of Release builds (`#if DEBUG`) and is OFF by default. The file
+includes overnight HR/HRV/SpO₂ bytes — treat it as personal data.
+
 ### External sniffer (most reliable, needs hardware)
 A **Nordic nRF52840 dongle + nRF Sniffer for BLE** plugin for Wireshark captures
 the live link regardless of phone OS. Best for catching the connection handshake
