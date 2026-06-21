@@ -352,6 +352,24 @@ for _ in 0..<20 { staged.append(bulkRec(sc, motion: 0x14, sub: 0x12)); sc += 150
 let stages = Set(BulkSleep.stagedSegments(from: staged).map { $0.stage })
 check(stages.contains(.asleepDeep) && stages.contains(.asleepREM) && stages.contains(.asleepCore),
       "staging separates Deep/REM/Light by HR band (experimental)")
+// Stitch: a night split by a data gap must be staged across BOTH fragments, not just the latest
+// (the "sleep shrinks on every sync" fix). Two ~2.5 h sleep cores separated by a 2 h hole.
+var frag: [BulkRecord] = []
+var fc: UInt32 = 0x0c220000
+for _ in 0..<8  { frag.append(bulkRec(fc, motion: 0x14, sub: 0x12)); fc += 150 }
+for _ in 0..<60 { frag.append(vrec(fc, motion: 0x01, hr: 52)); fc += 150 }
+for _ in 0..<8  { frag.append(bulkRec(fc, motion: 0x14, sub: 0x12)); fc += 150 }
+fc += 2 * 3600                                                    // data gap (dropped epochs)
+for _ in 0..<8  { frag.append(bulkRec(fc, motion: 0x14, sub: 0x12)); fc += 150 }
+for _ in 0..<60 { frag.append(vrec(fc, motion: 0x01, hr: 52)); fc += 150 }
+for _ in 0..<8  { frag.append(bulkRec(fc, motion: 0x14, sub: 0x12)); fc += 150 }
+check(BulkSleep.contiguousFragments(frag).count == 2, "data gap splits into two fragments")
+let stitched = SleepStaging.classify(from: frag)
+check(stitched.filter { $0.stage == .inBed }.count == 2, "stitch: one inBed segment per fragment")
+let stitchedSummary = SleepStaging.summary(stitched)
+check(abs(stitchedSummary.totalAsleep - 120 * 150) < 30 * 60,
+      "stitch: asleep spans BOTH fragments (~2×2.5 h), not just one")
+
 // Regression: a sleep-vitals epoch with baseline motion + zero payload is NOT idle.
 let zeroPayloadSleep = BulkRecord(hex("0c22cd8b38520973620a01010101010000000000000004"))!
 check(zeroPayloadSleep.layout == .sleepVitals && zeroPayloadSleep.heartRate == 0x38,

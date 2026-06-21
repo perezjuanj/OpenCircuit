@@ -69,7 +69,7 @@ public struct ActivityPeriod: Equatable, Sendable {
     static let gravityStillThreshold: Float = 0.01     // g
     static let gravityWindowMinutes = 15
     static let gravityStillFraction: Float = 0.70
-    static let gravityMaxGap: TimeInterval = 20 * 60
+    public static let gravityMaxGap: TimeInterval = 20 * 60
     /// Motion-count stillness threshold for the 0x4c [10:15] channel (🟢 grounded:
     /// recovers the captured night's in-bed window). Baseline `01` = still.
     static let motionStillThreshold: Float = 2

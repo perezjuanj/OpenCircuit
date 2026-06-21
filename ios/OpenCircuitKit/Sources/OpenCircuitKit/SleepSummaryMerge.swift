@@ -30,12 +30,19 @@ public enum SleepSummaryMerge {
     ///   - storedInBed: the stored row's in-bed span (seconds); pass `0` for a legacy row with no
     ///     valid clock window (`inBedEnd <= inBedStart`).
     ///   - newInBed: the freshly-staged in-bed span (seconds).
-    /// - Returns: `true` to overwrite. Replace only when the new capture is at least as COMPLETE —
-    ///   its in-bed span is not shorter than the stored one (longer/equal span ⇒ it covers at least
-    ///   as much of the night). A stored span of `0` (or non-positive) is always replaced, so the
-    ///   first real capture of a night always lands.
-    public static func shouldReplace(storedInBed: TimeInterval, newInBed: TimeInterval) -> Bool {
-        guard storedInBed > 0 else { return true }
+    ///   - storedAsleep: the stored row's time-actually-asleep (seconds); `0` when unknown (legacy).
+    ///   - newAsleep: the freshly-staged time-actually-asleep (seconds); `0` when unknown.
+    /// - Returns: `true` to overwrite. Completeness is judged PRIMARILY by time ASLEEP — a capture
+    ///   that recovers more sleep (a stitched multi-fragment night) supersedes a thinner one, and a
+    ///   shorter fragment never shrinks a fuller night. In-bed SPAN alone was the wrong proxy: a wide
+    ///   window padded with awake/gaps could carry LESS sleep yet replace a fuller night, shrinking the
+    ///   displayed total. Span is used only as a fallback when neither asleep value is known (legacy
+    ///   rows / a no-HR block). A stored row with no usable data (both non-positive) is always replaced
+    ///   so the first real capture of a night always lands.
+    public static func shouldReplace(storedInBed: TimeInterval, newInBed: TimeInterval,
+                                     storedAsleep: TimeInterval = 0, newAsleep: TimeInterval = 0) -> Bool {
+        guard storedInBed > 0 || storedAsleep > 0 else { return true }
+        if storedAsleep > 0 || newAsleep > 0 { return newAsleep >= storedAsleep }
         return newInBed >= storedInBed
     }
 }

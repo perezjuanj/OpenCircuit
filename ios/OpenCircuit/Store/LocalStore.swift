@@ -452,7 +452,14 @@ struct LocalStore {
     func pendingHealthSleep(_ segments: [SleepSegment]) throws -> [SleepSegment] {
         guard let latest = segments.map(\.end).max() else { return [] }
         let cursor = try loadCursor()
-        return cursor.isNew(.sleep, latest) ? segments : []
+        guard cursor.isNew(.sleep, latest) else { return [] }
+        // A stitched multi-fragment night re-includes earlier fragments that an earlier drain may have
+        // ALREADY mirrored to Health (the watermark sits inside this night). Write only segments that
+        // extend past it — otherwise the morning sync re-writes the earlier fragment, duplicating /
+        // overlapping sleep samples (HealthKit doesn't dedup). With the cursor before the night (the
+        // common case) every segment passes, so a whole night still lands. (Adversarial review.)
+        if let last = cursor.last(.sleep) { return segments.filter { $0.end > last } }
+        return segments
     }
 
     /// Advance the `.sleep` cursor past the night just written to Apple Health.
@@ -527,7 +534,12 @@ struct LocalStore {
             let storedSpan = existing.inBedEnd > existing.inBedStart
                 ? existing.inBedEnd.timeIntervalSince(existing.inBedStart) : 0
             let newSpan = inBedEnd > inBedStart ? inBedEnd.timeIntervalSince(inBedStart) : 0
-            guard SleepSummaryMerge.shouldReplace(storedInBed: storedSpan, newInBed: newSpan) else {
+            // Completeness is judged on time ASLEEP (span is a fallback): a later, shorter slice — or a
+            // wide window padded with awake — can't shrink a fuller night. See SleepSummaryMerge.
+            guard SleepSummaryMerge.shouldReplace(
+                storedInBed: storedSpan, newInBed: newSpan,
+                storedAsleep: TimeInterval(existing.asleepMin) * 60,
+                newAsleep: TimeInterval(m.asleep) * 60) else {
                 return   // keep the fuller existing night (its window, stages, extras + feelScore)
             }
             existing.asleepMin = m.asleep
