@@ -101,7 +101,7 @@ final class HistoryFrameCaptureTests: XCTestCase {
                               mac: "AA:BB:CC:DD:EE:FF")
         let report = cap.report(firmware: fw)
         XCTAssertTrue(report.contains("FR05.001"))
-        XCTAssertTrue(report.contains("Unknown"))          // Gen 3 prefix isn't known → .unknown
+        XCTAssertTrue(report.contains("Gen 3"))            // FR05 prefix → .gen3 (recognized)
         XCTAssertTrue(report.contains(FirmwareInfo.pinnedVersion))
         XCTAssertTrue(report.contains("4c 00 ab cd"))      // the raw frame hex
         XCTAssertTrue(report.contains("Frames captured: 1"))

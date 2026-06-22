@@ -23,6 +23,12 @@ final class FirmwareInfoTests: XCTestCase {
         XCTAssertEqual(info.generation, .gen2Air)
     }
 
+    func testGen3Prefix() {
+        var info = FirmwareInfo()
+        info.version = "FR05.008"   // RingConn Gen3-C384
+        XCTAssertEqual(info.generation, .gen3)
+    }
+
     func testUnknownPrefix() {
         var info = FirmwareInfo()
         info.version = "FR99.001"

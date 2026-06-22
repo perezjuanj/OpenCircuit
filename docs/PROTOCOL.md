@@ -176,6 +176,19 @@ opens at ≈now first (the official app OR us) drains the backlog and advances i
 with nothing. (This is why overnight sleep "vanished" — even after the cursor fix, a competing
 official-app sync can still win the one-time backlog.)
 
+> **🟢 SELF-contention confirmed on-device (night of 2026-06-21→22, device unified log).** The other
+> contender does NOT have to be the official app — it can be **us**. With OpenCircuit the sole syncer
+> (no official app running), our own keepalive `periodic history drain` opened at cursor≈now every
+> ~90 min ALL NIGHT; each open advanced the shared resume pointer past the night, so the morning had
+> no backlog to hand off. The whole night drained as **~12 epochs total** (1–3 per drain), every sync
+> `sleepSegs=0`, and the Sleep card silently held the prior night's value. The earlier "~4.75 h buffer
+> overflow" rationale for draining overnight is **wrong for the sleep channel** — §3 above shows the
+> first open drained a **19-day** backlog in one shot, so the ring buffers history for days, not hours.
+> **Fix (2026-06-22):** OpenCircuit now goes quiet inside the user's sleep window — NO history drains and
+> NO `syncAll` live reads (it keeps only the `07 00 00` fetch heartbeat, which doesn't touch the
+> history pointer, so skin temp + the wear gate still stream) — and does ONE big drain after the window
+> ends, mirroring the official app's morning sync. See `RingSession.isInSleepWindow`.
+
 **The fix in OpenCircuit:** (1) history/overnight opens use `Command.syncUpToNow()`
 (cursor = `floor(now) − epoch`), exactly the app's history behaviour — this part is solid (the
 capture proves cursor≈now drains, and lower-bound is ruled out, so it can't return empty). (2)
@@ -626,49 +639,40 @@ The epoch `1577793600` is 2019-12-31 **12:00:00** UTC (noon, not midnight): the 
 across **20 independent sync-open events** spanning 2026-06-13 21:52 UTC through
 2026-06-15 09:11 UTC: decoded cursor time matches capture wall-clock to < 0.5 s in
 every case (max observed delta 0.5 s, median 0.2 s). No timezone-dependent offset.
-`flag` byte[6] (`00`/`03`) meaning unknown 🟡 — see §5.6.1.
+`flag` byte[6] (`00`/`03`) is the **history-channel selector** (🟢 from captures, verified on-device) — see §5.6.1.
 
-#### 5.6.1 `byte[6]` = `DataSyncType` stream selector? (#99 — 🔴 hypothesis, needs the probe capture)
-The decompiled app (v3.2.1, blutter) classifies every metric with a 32-member **`DataSyncType`**
-enum; `hr`/`spo2`/`step`/`stand` are **`ringData`** (pulled from the ring, the app calls them
-`HrSync`/`Spo2Sync`/…) while `activity`/`stress`/`temperature` are **`serverData`** (cloud-computed).
-The all-day HR/SpO₂ the official app shows are these dedicated ring streams. `byte[6]` of the
-sync-open is the prime suspect for the per-stream selector; we have only ever sent **`0x00`**
-(default sleep/activity), so we never pull all-day HR/SpO₂.
+#### 5.6.1 `byte[6]` = history-CHANNEL selector — TWO channels, `0x00` + `0x03` (#99 — 🟢 RESOLVED + verified on-device 2026-06-21)
+**Confidence: 🟢 end-to-end.** The mechanism was proven by channel-aware mining of the EXISTING captures
+(no new capture needed), and OUR drain is now **verified on-device**: a pull-to-refresh with `byte[6]=0x03`
+at cursor≈now returned **8 all-day epochs** (Debug card readout "sleep 0 · all-day 8"), confirming the ring
+answers our ≈now open and streams the daytime pages — not just the official app's own-cursor open (§3).
+Across all 14 captures the official app sends **only two** `byte[6]` values,
+`0x00` and `0x03`, and they are **two parallel history channels** — each with its own advancing resume
+cursor, interleaved over the same time span, both delivering `0x4c` epoch + `0x47` PPG pages. The app
+drains **both** every sync; we had hardcoded `0x00`, so we missed everything `0x03` carries.
+- **`0x00`** — sleep/overnight log (+ idle epochs). Overnight-weighted SpO₂. (What we always pulled.)
+- **`0x03`** — awake/all-day log: activity-HR epochs (`[8]=0x12/0x13`) **plus a periodic (~10 min)
+  daytime SpO₂ reading** (sleep-vitals layout, `[8]`=SpO₂). **0 % timestamp overlap with `0x00`** —
+  genuinely additional data. Decodes with the SAME 23-byte §5.3 schema, e.g. 06-14 ch `0x03`:
+  09:52→98 %, 10:12→97 %, 10:42→92 %, 11:02→89 %, 11:22→90 % (waking hours, HR swinging 57–90).
 
-⚠️ The selector encoding and the HR/SpO₂ record byte-layout are **NOT statically recoverable**
-(blutter dropped the BLE transport/parser). They need a **capture**. The on-device probe
-(`RingSession.probeAllDayStreams` / `OpenCircuitKit.DataSyncProbe`, #99) gathers it: it sweeps the
-candidate `byte[6]` values and records each one's raw responses.
+So all-day SpO₂ was on the wire all along — in channel `0x03`, which our `0x00`-only syncs never
+requested. That is the whole cause of "daytime SpO₂ stale for hours" while overnight SpO₂ and on-demand
+work. The earlier hypothesis (`byte[6]` = a 32-member `DataSyncType` enumerator; prime candidates
+`0x0a`/`0x0b`) is **REFUTED** — the app never sends those values. Channel `0x03` is also **not** the
+steps/activity stream (its records fail the 历史活动响应 activity-map bounds, §5.3.1); genuine
+steps/activity stay `serverData` (cloud-computed), consistent with #93. The decompiled
+`HistoryHrSyncInfo`/`HistorySpo2SyncInfo` tables are the app's CLOUD-side mirrors of this `0x4c` data,
+not a distinct wire stream.
 
-**Why re-run the sweep now (the old §5.3 attempt was inconclusive):** that attempt used the
-far-future cursor `FF FF FF FF` (returns **no `0x82` ACK for any flag**) AND predated the auth crack
-(#54), so every open was silently dropped. The probe fixes both — a **real ≈now cursor** and **post-
-auth** — and adds the `off_2c` ring-data group (`0x0a/0x0b/…`) the old sweep never tried.
-
-| byte[6] | hypothesis | would select | role |
-|---|---|---|---|
-| `0x00` | enum-idx 0 | hr / **default** | 🟢 control (current sleep/activity open) |
-| `0x01` | enum-idx 1 | spo2 | 🔴 candidate |
-| `0x02` | enum-idx 2 | step | 🔴 candidate |
-| `0x03` | enum-idx 3 | temperature | 🟢 control (observed; also returns activity/sleep) |
-| `0x04` | enum-idx 4 | stand | 🔴 candidate |
-| `0x05` | off_2c | sleep | 🔴 candidate |
-| `0x06` | enum-idx 6 | activity (serverData → maybe empty) | 🔴 candidate |
-| `0x08` | — | prior-sweep value | 🔴 candidate |
-| **`0x0a`** | **off_2c** | **hr** | 🔴 **★ prime all-day HR candidate** |
-| **`0x0b`** | **off_2c** | **spo2** | 🔴 **★ prime all-day SpO₂ candidate** |
-| `0x0c` | off_2c / enum-idx 12 | step / stress | 🔴 candidate |
-| `0x0d` | off_2c / enum-idx 13 | stand / sleep | 🔴 candidate |
-
-**What the probe captures / what to look for:** a selector that returns a `0x82` ACK **plus an
-opcode the `0x00` control did not** (a "NOVEL" opcode) is the all-day stream — most likely a
-dedicated HR/SpO₂ response opcode, or a flag-tagged variant of `0x4c`. The probe advances the
-ring's resume pointer like a normal sync (each near-now open does, §3). **Decode target** (the
-record shape to ground-truth, from the decompiled tables, all 🔴 until matched against the app):
-- `HistoryHrSyncInfo(utcTs, pr, hrv, mov, resprate, actiCount, item2p5, movClass, measureResult,
-  measureSource, confidence, …)` — one all-day HR/HRV/RR/motion row per `utcTs`.
-- `HistorySpo2SyncInfo(utcTs, spo2, measureResult, …)` — per-interval all-day SpO₂.
+**Fix (shipped, verified on-device 2026-06-21):** `syncHistory()` drains both channels via
+`drainChannel(channel:)` — `0x00` then `0x03` (`Command.syncChannelSleep`/`syncChannelAllDay`,
+`syncSince(channel:)`) — on EVERY sync path (button, pull-to-refresh, foreground/background auto,
+periodic). The all-day SpO₂/HR
+flow through the existing `BulkSleep` decode → Apple Health (same schema, no new parser).
+`AllDayChannelTests` guards that daytime `0x03` SpO₂ reaches Health as samples but is kept out of sleep
+staging by the `latestNightRecords` overnight gate. The on-device `byte[6]` sweep (`DataSyncProbe`,
+`sweepAllDayStreams`) is **removed** — superseded by this finding.
 
 ### 5.7 `0x81` — status replies (← `0x01`)
 **`81 00 XX YY`** (← `01 00 00`): `[2]` is the only varying byte, full 8-bit range,

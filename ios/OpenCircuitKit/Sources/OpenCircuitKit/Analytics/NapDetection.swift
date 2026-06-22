@@ -19,6 +19,14 @@ public enum NapDetection {
     /// meeting) than a nap; still recorded, but flagged `isLongNap` for the UI to caveat. The app
     /// carries the same `isLongNap` distinction.
     public static let longNapDuration: TimeInterval = 3 * 60 * 60
+    /// Minimum share of a candidate block's WORN epochs the ring measured as sleep (sleep-vitals
+    /// layout) for it to count as a nap. This is what separates a real nap from awake stillness —
+    /// the ring computes sleep-vitals (HRV/SpO₂) only when it detects sleep physiology, and tags
+    /// awake epochs (including the sedentary stillness the all-day `0x03` channel surfaces) as
+    /// activity (`[8]=0x12/0x13`). Motion alone can't tell them apart. 🟡 Grounded in the captures:
+    /// real sleep blocks run 43–67 % sleep-vitals while the awake all-day channel's still runs are
+    /// 0–25 %, so 0.35 separates them with margin; verify against an on-device daytime nap.
+    public static let minNapSleepVitalsShare = 0.35
 
     public struct Nap: Equatable, Sendable {
         public let start: Date
@@ -56,11 +64,31 @@ public enum NapDetection {
             // not a nap — reuse the overnight-block test (inverted) so the rule matches the
             // main-night gate exactly.
             if SleepWindow.isOvernightBlock(start: p.start, end: p.end) { return nil }
+            // Real nap vs awake stillness: require the block to be predominantly ring-measured
+            // sleep, so the all-day channel's activity-tagged sedentary stillness is excluded
+            // (motion detection alone classes it as sleep). See `minNapSleepVitalsShare`.
+            guard sleepVitalsShare(of: p, in: records, epoch: epoch) >= minNapSleepVitalsShare else {
+                return nil
+            }
 
             let segs = napSegments(from: records, period: p, epoch: epoch)
             return Nap(start: p.start, end: p.end, segments: segs)
         }
         .sorted { $0.start < $1.start }
+    }
+
+    /// Fraction of a candidate block's WORN epochs the ring measured as sleep (sleep-vitals layout).
+    /// Awake/activity epochs (`[8]=0x12/0x13`) and the off-wrist idle template don't count, so a
+    /// sedentary-but-awake still block — the all-day channel's false-nap source — scores ~0.
+    private static func sleepVitalsShare(of period: ActivityPeriod,
+                                         in records: [BulkRecord],
+                                         epoch: Int) -> Double {
+        let worn = records.filter {
+            let t = $0.date(epoch: epoch)
+            return t >= period.start && t <= period.end && $0.layout != .idle
+        }
+        guard !worn.isEmpty else { return 0 }
+        return Double(worn.filter { $0.layout == .sleepVitals }.count) / Double(worn.count)
     }
 
     /// Coarse HealthKit segments for a nap: an `inBed` span plus the asleep/awake sub-blocks

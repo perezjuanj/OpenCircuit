@@ -9,6 +9,15 @@
 // fills — keeps it emptied. Safe to do repeatedly only because the night is re-stitched from the
 // EpochArchive union (a single drain returns just the slice since the last one).
 //
+// ⚠️ OVERNIGHT UPDATE (2026-06-22, device-log confirmed): draining DURING the sleep window is now
+// SUPPRESSED at the call site (`RingSession.isInSleepWindow`) — each cursor≈now open advanced the
+// ring's shared resume pointer past the night, so the morning had no backlog to hand off (~12 epochs
+// all night, every sync sleepSegs=0). The "~4.75 h buffer overflow" fear above is WRONG for the sleep
+// channel: PROTOCOL §3 shows a 19-day backlog drained in one shot, so the ring buffers for days. This
+// cadence now governs DAYTIME draining only; the night is left untouched for one morning sync (the
+// official app's behaviour). The `isNight` arm is retained for the pure unit tests but no longer
+// drives an overnight drain.
+//
 // Pure (no Apple frameworks) so it unit-tests on the CLI, matching KeepaliveCadence / ReconnectBackoff.
 
 import Foundation
