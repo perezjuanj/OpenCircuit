@@ -248,6 +248,10 @@ final class RingSession: NSObject {
     private(set) var syncing = false
     /// User-facing result of the last sync (e.g. "204 epochs"), or an error note.
     private(set) var syncStatus: String?
+    /// Per-channel epochs drained by the last `syncHistory()` — e.g. "sleep 42 · all-day 8" — so the
+    /// Debug card can show that channel `0x03` (all-day) actually returned data (#99 verification).
+    private(set) var lastDrainSummary: String?
+    private var drainCountsByLabel: [String: Int] = [:]
 
     private var bulkRecords: [BulkRecord] = []
     private var bulkFinalized = false    // captured pages already committed (sleep/vitals) — stop-time safety net skips re-commit
@@ -1102,6 +1106,7 @@ final class RingSession: NSObject {
         // re-writes and the dashboard reads the persisted summary, not these).
         syncing = true
         syncStatus = nil
+        drainCountsByLabel.removeAll()
         // Channel 0x00 — the sleep/overnight history (+ idle epochs).
         await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
         // Channel 0x03 — the awake/all-day log: activity HR + a periodic ~10-min daytime SpO₂ reading
@@ -1110,6 +1115,7 @@ final class RingSession: NSObject {
         if !Task.isCancelled {
             await drainChannel(channel: Command.syncChannelAllDay, label: "all-day")
         }
+        lastDrainSummary = "sleep \(drainCountsByLabel["sleep"] ?? 0) · all-day \(drainCountsByLabel["all-day"] ?? 0) epochs"
         finalizeSync()
     }
 
@@ -1146,6 +1152,7 @@ final class RingSession: NSObject {
                 break
             }
         }
+        drainCountsByLabel[label] = bulkRecords.count - recordsAtStart
     }
 
     /// Commit a freshly-captured batch of epoch records. A history-sync drain (`finalizeSync`), the

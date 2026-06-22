@@ -893,15 +893,24 @@ struct ContentView: View {
         card {
             DisclosureGroup(isExpanded: $showDebug) {
                 VStack(alignment: .leading, spacing: 12) {
+                    // Per-channel epochs from the last sync — `all-day N` with N>0 proves the 0x03
+                    // (daytime SpO₂/HR) channel is being drained, not just sleep (#99).
+                    if let drain = session?.lastDrainSummary {
+                        Text("Last sync — \(drain)")
+                            .font(.caption.monospaced().weight(.medium))
+                            .foregroundStyle(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 4)
+                        Divider()
+                    }
                     Text(session?.lastFrame ?? "no frames yet")
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.top, 4)
                 }
             } label: {
-                Text("Debug — last frame").font(.subheadline.weight(.medium))
+                Text("Debug — last sync & frame").font(.subheadline.weight(.medium))
             }
         }
     }
