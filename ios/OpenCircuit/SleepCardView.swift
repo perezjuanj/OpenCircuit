@@ -131,6 +131,34 @@ struct SleepCardView: View {
         }
     }
 
+    /// True when we're past this morning's expected wake yet the night on screen did NOT end today —
+    /// i.e. last night wasn't captured and we're falling back to an older recorded night. Gated on
+    /// being past the scheduled wake so a mid-sleep glance (e.g. 3 a.m., the night still in progress)
+    /// never claims a miss. Uses the same manual/default schedule the rest of the night gating uses.
+    /// Drives `missedNightNotice` so a stale total never silently reads as last night (the
+    /// overnight-self-contention failure mode).
+    private var lastNightMissing: Bool {
+        guard let night, night.wakeKnown else { return false }
+        let now = Date()
+        let wakeRef = SleepWindow.interval(bedMinutes: bedMinutes, wakeMinutes: wakeMinutes,
+                                           nightEndingNear: now)?.end ?? now
+        return now > wakeRef && !Calendar.current.isDateInToday(night.when)
+    }
+
+    /// Honest fallback banner shown above the stage details when `lastNightMissing`: last night didn't
+    /// make it into the store, so the night below is older. The header already carries its real date;
+    /// this makes sure the big total isn't mistaken for last night.
+    private var missedNightNotice: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "moon.zzz").font(.caption2).foregroundStyle(.orange)
+            Text("No sleep recorded for last night. Showing your most recent recorded night — wear the ring to bed and sync in the morning.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 6).padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.12)))
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
@@ -143,6 +171,7 @@ struct SleepCardView: View {
                 }
             }
             if let night {
+                if lastNightMissing { missedNightNotice }
                 content(night)
             } else {
                 emptyState
