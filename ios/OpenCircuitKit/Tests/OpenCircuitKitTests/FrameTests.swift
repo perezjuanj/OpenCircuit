@@ -92,6 +92,23 @@ final class FrameTests: XCTestCase {
         XCTAssertEqual(Array(open[6...8]), [0x00, 0x01, 0x00])
     }
 
+    func testSyncOpenChannelSelectorLandsAtByte6() {
+        // The channel selector (#99: 0x00 sleep, 0x03 all-day) is byte[6] of the 0x02 open — the
+        // whole all-day-SpO₂ drain depends on 0x03 landing exactly there. Default stays 0x00.
+        XCTAssertEqual(Command.syncChannelSleep, 0x00)
+        XCTAssertEqual(Command.syncChannelAllDay, 0x03)
+        let sleep = Command.syncSince(unixSeconds: Command.syncEpoch + 0x0c2298c3)
+        XCTAssertEqual(sleep[6], 0x00, "default channel is the sleep log")
+        let allDay = Command.syncSince(unixSeconds: Command.syncEpoch + 0x0c2298c3,
+                                       channel: Command.syncChannelAllDay)
+        XCTAssertEqual(allDay, [0x02, 0x00, 0x0c, 0x22, 0x98, 0xc3, 0x03, 0x01, 0x00])
+        // Only byte[6] differs between the two channel opens at the same cursor.
+        XCTAssertEqual(Array(allDay[0...5]), Array(sleep[0...5]))
+        XCTAssertEqual(Array(allDay[7...8]), Array(sleep[7...8]))
+        XCTAssertEqual(Command.syncUpToNow(now: Date(timeIntervalSince1970: 1_750_000_000),
+                                           channel: Command.syncChannelAllDay)[6], 0x03)
+    }
+
     func testLiveHRDecode() {
         // Real 0x15 frame from the capture: byte[2] = 0x5B = 91 bpm.
         XCTAssertEqual(LiveHR.decode(hex("15005b0ab0f4")), 91)

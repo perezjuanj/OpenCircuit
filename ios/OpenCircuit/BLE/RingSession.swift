@@ -248,6 +248,10 @@ final class RingSession: NSObject {
     private(set) var syncing = false
     /// User-facing result of the last sync (e.g. "204 epochs"), or an error note.
     private(set) var syncStatus: String?
+    /// Per-channel epochs drained by the last `syncHistory()` — e.g. "sleep 42 · all-day 8" — so the
+    /// Debug card can show that channel `0x03` (all-day) actually returned data (#99 verification).
+    private(set) var lastDrainSummary: String?
+    private var drainCountsByLabel: [String: Int] = [:]
 
     private var bulkRecords: [BulkRecord] = []
     private var bulkFinalized = false    // captured pages already committed (sleep/vitals) — stop-time safety net skips re-commit
@@ -257,26 +261,6 @@ final class RingSession: NSObject {
     private var syncQuietTicks = 0      // seconds since the last page arrived
     private var drainSawPage = false    // a 0x47/0x4c page arrived since last check (live-enter drain)
     private var drainDone = false       // 0x50 end-of-history seen during live-enter drain
-
-    // MARK: #99 — all-day HR/SpO₂ stream probe (DataSyncType byte[6] selector sweep)
-    //
-    // A deliberate, user-triggered diagnostic: re-run the `0x02` sync-open flag sweep the RIGHT way
-    // (real ≈now cursor + post-auth — the two reasons the old PROTOCOL.md §5.3 sweep was
-    // inconclusive) across the full candidate set, capturing every RAW response per selector. It
-    // does NOT decode HR/SpO₂ records (that needs ground truth) — it gathers the capture that
-    // unblocks the ticket. Cancels/pauses live+sync+keepalive while it runs so each response is
-    // unambiguously attributable to one selector.
-
-    /// True while a selector sweep is in flight (pauses keepalive/auto-measure/sync).
-    private(set) var probing = false
-    /// Human-readable summary of the last completed sweep (shown in the debug card + unified log).
-    private(set) var probeReport: String?
-    /// Per-selector evidence from the last (or in-progress) sweep.
-    private(set) var probeResults: [SelectorProbeResult] = []
-    private var probeTask: Task<Void, Never>?
-    /// The selector currently being probed; non-nil only between `beginSelector`/`endSelector`, so
-    /// the frame handler folds raw responses into the right bucket.
-    private var probeCurrent: SelectorProbeResult?
 
     private let peripheral: CBPeripheral
     private var notifyChar: CBCharacteristic?
@@ -386,11 +370,9 @@ final class RingSession: NSObject {
         autoMeasureTask?.cancel(); autoMeasureTask = nil
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
         syncTask?.cancel(); syncTask = nil
-        probeTask?.cancel(); probeTask = nil   // #99 sweep — don't keep writing selectors after teardown
         monitoring = false
         livePreparing = false
         syncing = false
-        probing = false
         autoMeasuring = false
         userMeasuring = false
         userMeasureDeadline = nil
@@ -417,7 +399,7 @@ final class RingSession: NSObject {
     ///   as live while a fresh user measurement warms up (#45 C). Off for auto/background so a
     ///   prior value stays on screen until the new one locks.
     func startLiveMonitoring(quickLiveRead: Bool = false, clearStaleValue: Bool = false) {
-        guard monitorTask == nil, !probing else { return }   // a #99 sweep owns the link; don't fight it
+        guard monitorTask == nil else { return }
         // Live and history sync can't coexist (ring is one mode at a time). Cancel any
         // in-flight sync so the ring is free to enter live mode.
         syncTask?.cancel(); syncTask = nil
@@ -585,7 +567,7 @@ final class RingSession: NSObject {
                 // Re-resolve the night window (self-throttled to ≤ every 30 min) so the cadence
                 // tightens/relaxes as the window rolls over, not just at connect.
                 await self.refreshNightWindowIfNeeded()
-                if self.ready, !self.monitoring, !self.livePreparing, self.syncTask == nil, !self.probing {
+                if self.ready, !self.monitoring, !self.livePreparing, self.syncTask == nil {
                     // Periodic history drain (the buffer-overflow fix). The ring's ~4.75 h history
                     // buffer drops its oldest epochs when full, so draining only on foreground/manual
                     // events lets a quietly-held overnight link overflow and lose the early, deep-rich
@@ -682,7 +664,7 @@ final class RingSession: NSObject {
     /// measurement, a sync, the live-enter drain, or a workout (which owns the link and must not be
     /// torn down by an auto-measure firing mid-session).
     private var idleForAutoMeasure: Bool {
-        ready && !monitoring && !livePreparing && syncTask == nil && !probing && !workoutHolding
+        ready && !monitoring && !livePreparing && syncTask == nil && !workoutHolding
     }
 
     /// Next sleep between auto-measure cycles: the base interval while worn, exponentially backed
@@ -946,11 +928,6 @@ final class RingSession: NSObject {
     /// - `quickLiveRead`: prompt live-read entry (the default for foreground/auto). The overnight
     ///   background capture passes `false` for the full sleep drain (see `startLiveMonitoring`).
     func startMonitoring(mode: LiveMode, userInitiated: Bool = true, quickLiveRead: Bool = true) {
-        // A #99 sweep owns the link. Refuse here (before mutating userMeasuring/liveMode) so no
-        // caller — Measure tap, workout start, auto-measure — can set an orphaned `userMeasuring`
-        // flag that `startLiveMonitoring`'s own `!probing` guard would then leave with no task to
-        // clear it (review P2). The UI also disables these affordances while probing.
-        guard !probing else { return }
         if monitoring {
             if liveMode == mode {
                 if userInitiated { rearmUserMeasure() }   // re-poll on demand; auto leaves it alone
@@ -1093,25 +1070,29 @@ final class RingSession: NSObject {
         persist(last)
     }
 
-    /// Pull stored history: open the sync session at cursor ≈ now (`syncUpToNow`, §3 — drains
-    /// the ring's un-delivered backlog; NOT `syncAll`/0xFFFFFFFF, which returns empty) and fetch.
-    /// The ring streams 0x4c/0x47 pages, drained+decoded in didUpdateValue; results
-    /// land in `historySamples` once 0x50 (end-of-history) arrives.
+    /// Pull stored history from BOTH ring history channels — `0x00` (sleep/overnight) then `0x03`
+    /// (awake/all-day: activity HR + a periodic ~10-min daytime SpO₂ reading). Each is opened at
+    /// cursor ≈ now (`syncUpToNow`, §3 — drains the ring's un-delivered backlog on that channel; NOT
+    /// `syncAll`/0xFFFFFFFF, which returns empty). The ring streams 0x4c/0x47 pages, drained+decoded
+    /// in didUpdateValue; results land in `historySamples` once each channel's 0x50 arrives.
+    ///
+    /// The official app drains both channels every sync; we previously only pulled `0x00`, so daytime
+    /// SpO₂ went stale (the #99 gap — resolved by mining the captures, not a byte[6] selector sweep).
     func syncHistory() {
-        guard syncTask == nil, !probing else { return }   // already syncing, or a #99 sweep owns the link
+        guard syncTask == nil else { return }    // already syncing
         stopLiveMonitoring()                     // live polling would fight the drain
         syncTask = Task { [weak self] in
             await self?.performHistoryDrain()
         }
     }
 
-    /// Open a history sync (cursor ≈ now — drains the ring's un-delivered backlog; NOT
-    /// `syncAll`/0xFFFFFFFF, which returns empty), drain 0x4c/0x47 pages to the `0x50` end marker
-    /// (or 3 s-quiet / 45 s cap), and COMMIT them via `finalizeSync`. Sets `syncing` for the
-    /// duration so the frame handler captures pages into `bulkRecords`. Shared by the user-facing
-    /// `syncHistory()` and the #99 probe's Phase 1, which commits the backlog BEFORE sweeping so the
-    /// sweep sees an empty backlog and each selector's response is attributable (not leftover sleep
-    /// pages still trickling in). `finalizeSync` clears `syncing`/`syncTask` on exit.
+    /// Drain BOTH history channels into `bulkRecords` — `0x00` (sleep/overnight) then `0x03`
+    /// (awake/all-day) — and COMMIT the union via `finalizeSync`. Sets `syncing` for the whole
+    /// duration so the frame handler captures pages into `bulkRecords`. The firmware assigns each
+    /// epoch to exactly ONE channel (🟢 the captures show 0 % counter overlap between `0x00` and
+    /// `0x03`), so the two streams union cleanly in the EpochArchive with no counter collisions —
+    /// the daytime channel never overwrites a sleep epoch's motion/HRV. `finalizeSync` clears
+    /// `syncing`/`syncTask` on exit.
     private func performHistoryDrain() async {
         bulkRecords.removeAll()
         bulkFinalized = false                    // fresh capture — uncommitted until finalizeSync
@@ -1123,33 +1104,55 @@ final class RingSession: NSObject {
         // last staged night standing — a non-empty drain overwrites it via `commitDrainedRecords`,
         // and a night that ages out of the archive is harmless to retain (the `.sleep` cursor blocks
         // re-writes and the dashboard reads the persisted summary, not these).
-        syncDone = false
-        syncQuietTicks = 0
         syncing = true
         syncStatus = nil
-        let historyOpen = Command.syncUpToNow()
-        ringLog.notice("sync: START open=\(historyOpen.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public) (cursor≈now, §3)")
-        // Open at cursor ≈ NOW: the ring streams its un-delivered backlog up to now and advances
-        // its own resume pointer (§3). `syncAll`'s far-future cursor returned an empty history —
-        // the bug that dropped overnight sleep/HRV/RR.
-        for cmd in [Command.status0, historyOpen, Command.fetch] {   // 81 00 challenge → reactive SM3 auth (#54)
+        drainCountsByLabel.removeAll()
+        // Channel 0x00 — the sleep/overnight history (+ idle epochs).
+        await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
+        // Channel 0x03 — the awake/all-day log: activity HR + a periodic ~10-min daytime SpO₂ reading
+        // (same 23-byte schema, so it flows through the same BulkSleep decode → Health as-is). The
+        // official app drains this too; pulling only 0x00 was why daytime SpO₂ went stale (#99).
+        if !Task.isCancelled {
+            await drainChannel(channel: Command.syncChannelAllDay, label: "all-day")
+        }
+        lastDrainSummary = "sleep \(drainCountsByLabel["sleep"] ?? 0) · all-day \(drainCountsByLabel["all-day"] ?? 0) epochs"
+        finalizeSync()
+    }
+
+    /// Open ONE history channel at cursor ≈ now and drain its 0x4c/0x47 pages — the frame handler
+    /// folds 0x4c records into `bulkRecords` while `syncing`. Bounded by the channel's `0x50` end
+    /// marker, by 3 s of quiet AFTER pages have started (a lost end-marker), or a 45 s hard cap, so
+    /// nothing can hang the sync. `syncDone`/`syncQuietTicks` reset per channel so each channel's
+    /// end-marker is awaited independently.
+    private func drainChannel(channel: UInt8, label: String) async {
+        syncDone = false
+        syncQuietTicks = 0
+        let recordsAtStart = bulkRecords.count
+        let open = Command.syncUpToNow(channel: channel)
+        ringLog.notice("sync: START ch=\(label, privacy: .public) open=\(open.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public) (cursor≈now, §3)")
+        // Open at cursor ≈ NOW: the ring streams its un-delivered backlog on this channel up to now
+        // and advances its own resume pointer (§3). `syncAll`'s far-future cursor returns empty.
+        // status0 re-primes the SM3 challenge per channel (the second open may be re-challenged).
+        for cmd in [Command.status0, open, Command.fetch] {   // 81 00 challenge → reactive SM3 auth (#54)
             write(cmd)
             try? await Task.sleep(for: .milliseconds(300))
-            if Task.isCancelled { break }
+            if Task.isCancelled { return }
         }
-        // Watchdog: finalize on 0x50, or when pages stop (3 s quiet), or a 45 s cap — so the sync
-        // can never hang if the end-marker or a write is lost. The common case (ring sends 0x50)
-        // exits immediately; the quiet fallback only fires when the end-marker is lost, and pages
-        // stream sub-second apart during a real drain, so 3 s of silence reliably means "done".
         for tick in 0 ..< 45 {
             try? await Task.sleep(for: .seconds(1))
-            if Task.isCancelled { break }
-            if syncDone || syncQuietTicks >= 3 {
-                ringLog.notice("sync: watchdog exit at \(tick)s (done=\(self.syncDone), quiet=\(self.syncQuietTicks), records=\(self.bulkRecords.count))")
+            if Task.isCancelled { return }
+            // Count seconds since the last page (the frame handler zeroes `syncQuietTicks` on every
+            // 0x47/0x4c). The quiet-exit only applies once pages have actually started this channel,
+            // so a slow open can't cut the drain off before the stream begins — an empty channel
+            // exits on its 0x50 (`syncDone`); only a lost 0x50 falls through to the 45 s cap.
+            syncQuietTicks += 1
+            let sawPages = bulkRecords.count > recordsAtStart
+            if syncDone || (sawPages && syncQuietTicks >= 3) {
+                ringLog.notice("sync: ch=\(label, privacy: .public) drained at \(tick)s (done=\(self.syncDone), quiet=\(self.syncQuietTicks), records=\(self.bulkRecords.count))")
                 break
             }
         }
-        finalizeSync()
+        drainCountsByLabel[label] = bulkRecords.count - recordsAtStart
     }
 
     /// Commit a freshly-captured batch of epoch records. A history-sync drain (`finalizeSync`), the
@@ -1200,90 +1203,6 @@ final class RingSession: NSObject {
         syncTask = nil
     }
 
-    /// Per-selector dwell: time to collect responses after the sync-open + fetch. Phase 1 has
-    /// already drained the backlog, so a near-now open here returns only the ACK + whatever stream
-    /// THIS selector opens — a few seconds is enough before moving to the next selector.
-    private static let probeSelectorDwell: Duration = .seconds(3)
-
-    /// #99 — sweep the `0x02` sync-open `byte[6]` (DataSyncType) selector across all candidates,
-    /// capturing each selector's raw responses so we can find which one returns an all-day HR/SpO₂
-    /// stream. Post-auth (status0 primes the SM3 challenge) with a real ≈now cursor — the two fixes
-    /// the inconclusive desktop sweep lacked. Phase 1 first commits the real history backlog so the
-    /// sweep is non-destructive and each selector's response is attributable. Results land in
-    /// `probeResults`/`probeReport` and the unified log. Idempotent; refuses to start mid-sync/live
-    /// (stops live first) so responses aren't muddied.
-    func probeAllDayStreams() {
-        guard probeTask == nil, !probing, syncTask == nil else { return }   // not mid-sync/probe
-        guard ready else { probeReport = "Connect the ring first."; return }
-        stopLiveMonitoring()                 // live polling would inject its own 0x15 traffic
-        probing = true                       // pauses keepalive/auto-measure for the WHOLE probe
-        probeResults.removeAll()
-        probeCurrent = nil
-        probeReport = "Syncing history first, then probing \(DataSyncProbe.candidates.count) selectors…"
-        ringLog.notice("probe #99: START — commit backlog, then sweep \(DataSyncProbe.candidates.count) selectors (real ≈now cursor, post-auth)")
-        probeTask = Task { [weak self] in
-            guard let self else { return }
-            // PHASE 1 — drain + COMMIT the real history backlog first. This makes the probe
-            // NON-DESTRUCTIVE (the ring's resume pointer advances either way once pages are ACKed,
-            // so we must persist what drains — see PROTOCOL.md §3 backlog-shred). It also gives
-            // clean Phase-2 attribution: with the backlog handed off, any pages a selector returns
-            // are genuinely THAT selector's stream, not leftover sleep/activity still trickling in.
-            await self.performHistoryDrain()     // sets/clears `syncing`; persists via finalizeSync
-            guard !Task.isCancelled else { self.finishProbe(); return }
-            // PHASE 2 — sweep the byte[6] selectors against the now-empty backlog. `syncing` is
-            // false here, so the 0x4c handler no longer folds pages into `bulkRecords`; the probe's
-            // `collectProbeFrame` captures the raw responses into the per-selector buckets instead.
-            self.write(Command.status0)          // re-prime auth in case the session re-challenged
-            try? await Task.sleep(for: .milliseconds(400))
-            // One cursor for the whole sweep so the only thing varying is byte[6].
-            let nowSecs = Int(Date().timeIntervalSince1970)
-            for sel in DataSyncProbe.candidates {
-                // BREAK (don't return) on cancel so `finishProbe` always runs and clears `probing`
-                // — otherwise a cancelled sweep leaves the link paused (keepalive/sync stay gated).
-                guard !Task.isCancelled else { break }
-                self.beginSelector(sel)
-                self.write(DataSyncProbe.syncOpen(unixSeconds: nowSecs, selector: sel.byte))
-                try? await Task.sleep(for: .milliseconds(250))
-                if !Task.isCancelled { self.write(Command.fetch) }
-                try? await Task.sleep(for: Self.probeSelectorDwell)
-                self.endSelector()   // keep the partial bucket even if the dwell was cut short
-            }
-            self.finishProbe()
-        }
-    }
-
-    private func beginSelector(_ sel: DataSyncSelector) {
-        probeCurrent = SelectorProbeResult(selector: sel.byte, label: sel.label)
-    }
-
-    /// Fold one raw response frame into the active selector's bucket (called for EVERY frame while
-    /// probing, including the opcodes the normal switch returns early on / drops). No-op between
-    /// selectors.
-    private func collectProbeFrame(_ bytes: [UInt8]) {
-        probeCurrent?.record(bytes)
-    }
-
-    private func endSelector() {
-        guard let r = probeCurrent else { return }
-        probeResults.append(r)
-        let ops = r.opcodes.map { String(format: "%02x", $0) }.joined(separator: " ")
-        ringLog.notice("probe #99: selector 0x\(String(format: "%02x", r.selector), privacy: .public) ack=\(r.sawAck) frames=\(r.frameCount) op=[\(ops, privacy: .public)] — \(r.label, privacy: .public)")
-        // Log EVERY captured raw frame (not just the first) — a novel HR/SpO₂ opcode falls through
-        // the handler's `default` with no other log, so this is the only on-device record of the
-        // bytes needed to ground-truth the record layout (#99, review P3).
-        if !r.sampleFrames.isEmpty {
-            ringLog.notice("probe #99:   raw[0x\(String(format: "%02x", r.selector), privacy: .public)]\n\(r.sampleFrames.joined(separator: "\n"), privacy: .public)")
-        }
-        probeCurrent = nil
-    }
-
-    private func finishProbe() {
-        probing = false
-        probeTask = nil
-        let report = DataSyncProbe.summarize(probeResults)
-        probeReport = report
-        ringLog.notice("probe #99: DONE\n\(report, privacy: .public)")
-    }
 
     private func write(_ bytes: [UInt8]) {
         guard let writeChar else {
@@ -1393,10 +1312,6 @@ extension RingSession: CBPeripheralDelegate {
             }
             self.lastFrame = data.map { String(format: "%02x", $0) }.joined(separator: " ")
             self.lastFrameAt = Date()   // freshness anchor for staleness + last-reading timestamp (#36)
-            // #99 probe: capture EVERY raw frame into the active selector's bucket — including the
-            // opcodes the switch below returns early on (0x82/0x50/0x4c…) and any NEW opcode it would
-            // drop in `default`. Must precede that switch so nothing is missed.
-            if self.probing { self.collectProbeFrame(bytes) }
             // A DATA frame (anything but the cold `0x81` status reply, which even an un-activated ring
             // answers) proves the ring's data path is live: clear `notStreaming` + satisfy the
             // activation watchdog (#54). Guarded so `@Observable` doesn't republish on every frame.

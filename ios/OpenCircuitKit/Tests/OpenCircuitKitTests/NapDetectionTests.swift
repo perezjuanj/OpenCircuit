@@ -9,25 +9,28 @@ final class NapDetectionTests: XCTestCase {
 
     private let step: UInt32 = 150
 
-    /// One epoch with a uniform motion byte (baseline 1 = still; higher = movement).
-    private func rec(_ counter: UInt32, motion: UInt8) -> BulkRecord {
+    /// One epoch with a uniform motion byte (baseline 1 = still; higher = movement). `tag` is byte
+    /// [8] — 0 (default) decodes as sleep-vitals layout, `0x12` as an awake/activity epoch.
+    private func rec(_ counter: UInt32, motion: UInt8, tag: UInt8 = 0) -> BulkRecord {
         var b = [UInt8](repeating: 0, count: 23)
         b[0] = UInt8(counter >> 24); b[1] = UInt8((counter >> 16) & 0xFF)
         b[2] = UInt8((counter >> 8) & 0xFF); b[3] = UInt8(counter & 0xFF)
         for k in 0..<5 { b[10 + k] = motion }
+        b[8] = tag
         return BulkRecord(b)!
     }
 
     /// Build active→still→active records and the `epoch` so that counter 0 lands at `anchorHour`
-    /// local today. `activeEpochs`/`stillEpochs` are 2.5-min epochs each.
-    private func dayRecords(anchorHour: Int, activeEpochs: Int, stillEpochs: Int)
+    /// local today. `activeEpochs`/`stillEpochs` are 2.5-min epochs each. `stillTag` sets byte[8] of
+    /// the still block (default 0 = sleep-vitals layout, i.e. ring-measured sleep; `0x12` = awake).
+    private func dayRecords(anchorHour: Int, activeEpochs: Int, stillEpochs: Int, stillTag: UInt8 = 0)
         -> (records: [BulkRecord], epoch: Int) {
         let cal = Calendar.current
         let anchor = cal.date(byAdding: .hour, value: anchorHour, to: cal.startOfDay(for: Date()))!
         var recs: [BulkRecord] = []
         var c: UInt32 = 0
         for _ in 0..<activeEpochs { recs.append(rec(c, motion: 20)); c += step }
-        for _ in 0..<stillEpochs { recs.append(rec(c, motion: 1)); c += step }
+        for _ in 0..<stillEpochs { recs.append(rec(c, motion: 1, tag: stillTag)); c += step }
         for _ in 0..<activeEpochs { recs.append(rec(c, motion: 20)); c += step }
         return (recs, Int(anchor.timeIntervalSince1970))
     }
@@ -42,6 +45,22 @@ final class NapDetectionTests: XCTestCase {
         XCTAssertGreaterThan(nap.asleep, 0)
         XCTAssertFalse(nap.isLongNap, "60-min nap is not a long nap")
         XCTAssertFalse(nap.segments.isEmpty)
+    }
+
+    func testRejectsAwakeSedentaryStillBlock() {
+        // A 60-min daytime still block the ring tagged ACTIVITY (0x12) — sedentary-but-awake, exactly
+        // the all-day-channel (0x03) stillness motion detection alone mistakes for a nap. The
+        // sleep-vitals-share gate (#99 review) must reject it.
+        let (recs, epoch) = dayRecords(anchorHour: 14, activeEpochs: 8, stillEpochs: 24, stillTag: 0x12)
+        let naps = NapDetection.naps(from: recs, mainSleep: nil, epoch: epoch)
+        XCTAssertTrue(naps.isEmpty, "awake sedentary stillness (activity-tagged) is not a nap")
+    }
+
+    func testDetectsRingMeasuredSleepNap() {
+        // The same block, but ring-measured as sleep (sleep-vitals layout, [8]=SpO₂ 0x62) → a real nap.
+        let (recs, epoch) = dayRecords(anchorHour: 14, activeEpochs: 8, stillEpochs: 24, stillTag: 0x62)
+        let naps = NapDetection.naps(from: recs, mainSleep: nil, epoch: epoch)
+        XCTAssertEqual(naps.count, 1, "ring-measured daytime sleep is a nap")
     }
 
     func testRejectsShortStillBlock() {

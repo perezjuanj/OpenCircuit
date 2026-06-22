@@ -58,27 +58,36 @@ public enum Command {
     /// PROTOCOL.md §5.6 — derived from 3 capture (time,cursor) pairs to <0.34 s).
     public static let syncEpoch = 1_577_793_600
 
-    /// Build `02 00 <cursor BE4> 00 01 00` with `cursor = unixSeconds − syncEpoch` (big-endian).
+    /// History-channel selector — `byte[6]` of the `0x02` sync-open. The ring keeps TWO history
+    /// channels, each with its own resume cursor; the official app drains BOTH every sync (🟢 mined
+    /// from every capture — the app only ever sends these two values):
+    ///   • `0x00` — sleep/overnight log (+ idle epochs). What we historically pulled.
+    ///   • `0x03` — awake/all-day log: activity HR + a periodic (~10 min) daytime SpO₂ reading.
+    /// Pulling only `0x00` left daytime SpO₂ stale (the #99 gap). Same 23-byte record schema on both.
+    public static let syncChannelSleep: UInt8 = 0x00
+    public static let syncChannelAllDay: UInt8 = 0x03
+
+    /// Build `02 00 <cursor BE4> <channel> 01 00` with `cursor = unixSeconds − syncEpoch` (big-endian).
     /// A plausible-recent cursor acts as a "drain up to ≈now" trigger (§3) — NOT a hard bound
-    /// (records can overshoot it): the ring streams everything it hasn't handed off, from its own
-    /// internal resume point up to its current time, then self-advances that point.
-    public static func syncSince(unixSeconds: Int) -> [UInt8] {
+    /// (records can overshoot it): the ring streams everything it hasn't handed off on `channel`,
+    /// from its own internal resume point up to its current time, then self-advances that point.
+    public static func syncSince(unixSeconds: Int, channel: UInt8 = syncChannelSleep) -> [UInt8] {
         // `clamping` (not `truncatingIfNeeded`): a pre-2020 clock clamps to 0, and a far-future
         // clock clamps to 0xFFFFFFFF (fails safe to the empty/skip-backlog open) instead of
         // silently WRAPPING to a small value that would look like a valid recent cursor.
         let c = UInt32(clamping: unixSeconds - syncEpoch)
         return [0x02, 0x00,
                 UInt8(c >> 24), UInt8((c >> 16) & 0xFF), UInt8((c >> 8) & 0xFF), UInt8(c & 0xFF),
-                0x00, 0x01, 0x00]
+                channel, 0x01, 0x00]
     }
 
-    /// Open a HISTORY sync "up to NOW" — cursor ≈ current wall-clock (🟢 the official app's history
-    /// behaviour, PROTOCOL.md §3: it opens at ≈now every sync). This triggers a drain up to the
-    /// ring's current time and advances its OWN resume pointer, so there is nothing to persist on
-    /// our side. Use this — NOT `syncAll` (0xFFFFFFFF, far-future, which does NOT pull history) —
-    /// for sleep/vitals history. `now` is injectable for tests.
-    public static func syncUpToNow(now: Date = Date()) -> [UInt8] {
-        syncSince(unixSeconds: Int(now.timeIntervalSince1970))
+    /// Open a HISTORY sync "up to NOW" on `channel` — cursor ≈ current wall-clock (🟢 the official
+    /// app's history behaviour, PROTOCOL.md §3: it opens at ≈now every sync). This triggers a drain
+    /// up to the ring's current time and advances its OWN resume pointer, so there is nothing to
+    /// persist on our side. Use this — NOT `syncAll` (0xFFFFFFFF, far-future, which does NOT pull
+    /// history) — for sleep/vitals history. `now` is injectable for tests.
+    public static func syncUpToNow(now: Date = Date(), channel: UInt8 = syncChannelSleep) -> [UInt8] {
+        syncSince(unixSeconds: Int(now.timeIntervalSince1970), channel: channel)
     }
 
     /// Per-connection auth response: the ring challenges with `byte[2]` of its `81 00` reply, and

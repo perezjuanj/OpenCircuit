@@ -124,7 +124,7 @@ struct GoalsCardView: View {
                          goal: "\(Int(activeKcalGoal))",
                          color: .orange)
                 goalRing(progress: progress.activityMinutes,
-                         label: "Move min\u{B9}",
+                         label: "Exercise min\u{B9}",
                          current: "\(Int(currentActivityMin))",
                          goal: "\(Int(actMinGoal))",
                          color: .blue)
@@ -134,7 +134,7 @@ struct GoalsCardView: View {
                          goal: formatDuration(sleepGoalMin),
                          color: .purple)
             }
-            Text("\u{B9} Active calories & activity minutes are estimates (active kcal from heart rate where available, else steps × distance; minutes from an elevated-HR threshold). Full accuracy follows the ring activity-payload decode.")
+            Text("\u{B9} Active calories & exercise minutes are estimates (active kcal from heart rate where available, else steps × distance; exercise minutes from an elevated-HR threshold — independent of steps). Full accuracy follows the ring activity-payload decode.")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

@@ -398,12 +398,12 @@ final class RingScanner: NSObject {
         reconnectKnownPeripheral()   // re-arm the standing pending connect (no scan)
     }
 
-    /// What a bounded background read captured. The background read uses the FULL (quiet-bounded)
-    /// drain — `startMonitoring(.hr, userInitiated: false, quickLiveRead: false)` — so the
-    /// overnight HR/HRV/SpO2 + sleep segments + step/temp descriptor land in the store before it
-    /// polls a live HR, and we still come away with last night's data even when the optical HR
-    /// never locks. `gotData` is the BGTask success flag — true if we captured anything worth
-    /// persisting, not just an HR.
+    /// What a bounded background read captured. The background read runs the SAME two-channel
+    /// `syncHistory()` drain the foreground uses (0x00 sleep + 0x03 all-day, #99), so overnight AND
+    /// daytime HR/HRV/SpO2 + sleep segments + step/temp land in the store, THEN it polls a quick
+    /// live HR — and we still come away with last night's data even when the optical HR never locks.
+    /// `gotData` is the BGTask success flag — true if we captured anything worth persisting, not
+    /// just an HR.
     struct BackgroundCapture {
         var heartRate: Int?
         var sleepSegments: [SleepSegment] = []
@@ -417,7 +417,8 @@ final class RingScanner: NSObject {
     /// reconnect) on the way out so nothing is held open in the background.
     func captureForBackground(timeout: TimeInterval) async -> BackgroundCapture {
         let deadline = Date().addingTimeInterval(timeout)
-        var didStart = false
+        var didDrain = false
+        var startedLiveRead = false
         if !reconnectKnownPeripheral() {
             start(services: Self.backgroundScanServices)
         }
@@ -427,13 +428,20 @@ final class RingScanner: NSObject {
 
         while !Task.isCancelled && Date() < deadline {
             if let session, session.ready {
-                if !didStart {
-                    // Full drain (capture overnight sleep) but NOT user-initiated — keep any
-                    // prior live HR until a fresh one locks. The extended background timeout
-                    // (below) is what finally gives the HR poll a real budget so it can lock
-                    // instead of being crammed behind the drain (#45 A).
-                    session.startMonitoring(mode: .hr, userInitiated: false, quickLiveRead: false)
-                    didStart = true
+                if !didDrain {
+                    // Thorough history drain — BOTH channels (0x00 sleep + 0x03 all-day daytime
+                    // SpO₂/HR), the SAME `syncHistory()` path the foreground Sync / pull-to-refresh
+                    // use, so the background captures daytime data too, not just overnight (#99).
+                    // Previously this opened the live-enter drain (channel 0x00 only) which is why
+                    // automatic syncs never refreshed daytime SpO₂.
+                    session.syncHistory()
+                    didDrain = true
+                } else if session.syncing == false && !startedLiveRead {
+                    // Backlog committed — now a quick optical HR read (syncAll → empty → fast lock),
+                    // NOT user-initiated so any prior live HR stays until a fresh one locks. The
+                    // extended background timeout gives this poll a real budget past its warm-up (#45 A).
+                    session.startMonitoring(mode: .hr, userInitiated: false, quickLiveRead: true)
+                    startedLiveRead = true
                 }
                 // Snapshot the decoded history as it lands; the drain completes before the
                 // first live HR, so this captures sleep/steps even if HR never locks.

@@ -127,15 +127,10 @@ struct WorkoutView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            // Also blocked during a #99 stream probe — it owns the link, so workout HR couldn't
-            // start (and would silently record nothing) until the ~45 s sweep finishes (review P3).
-            .disabled(session == nil || session?.ready != true || session?.probing == true)
+            .disabled(session == nil || session?.ready != true)
 
             if session == nil || session?.ready != true {
                 Text("Connect to the ring before starting a workout.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            } else if session?.probing == true {
-                Text("Finishing an all-day HR/SpO₂ stream probe… you can start a workout in a moment.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
         }
