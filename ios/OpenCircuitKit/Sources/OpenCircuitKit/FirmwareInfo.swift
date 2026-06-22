@@ -3,6 +3,13 @@
 //   FR01 → Gen 1
 //   FR02 → Gen 2
 //   FR04 → Gen 2 Air
+//   FR05 → Gen 3   (model "RingConn Gen3-C384", confirmed from an FR05.008 capture)
+//
+// Gen 3 note: an overnight FR05.008 / Gen3-C384 capture decodes byte-for-byte with the
+// Gen-2 schemas — the 0x10/0x87 status descriptor (battery/temp/voltage/steps/case) and
+// the 0x4c history epoch (HR/HRV/RR/SpO2, 0x96 counter step) are unchanged, and the
+// decoded overnight SpO2 nadir matched the official app's reported low. So Gen 3 is
+// labelled here for the device-info screen; no decode path branches on generation.
 //
 // `hasFirmwareMismatch`: the version is non-empty AND doesn't start with the pinned
 // string — a mismatch means we reverse-engineered on a different FW build and certain
@@ -18,6 +25,7 @@ public enum RingGeneration: String, Equatable, Sendable {
     case gen1    = "Gen 1"
     case gen2    = "Gen 2"
     case gen2Air = "Gen 2 Air"
+    case gen3    = "Gen 3"
     case unknown = "Unknown"
 }
 
@@ -43,11 +51,12 @@ public struct FirmwareInfo: Equatable, Sendable {
         !version.isEmpty && !version.hasPrefix(Self.pinnedVersion)
     }
 
-    /// Generation decoded from the four-character FW prefix (FR01/FR02/FR04).
+    /// Generation decoded from the four-character FW prefix (FR01/FR02/FR04/FR05).
     public var generation: RingGeneration {
         if version.hasPrefix("FR01") { return .gen1 }
         if version.hasPrefix("FR02") { return .gen2 }
         if version.hasPrefix("FR04") { return .gen2Air }
+        if version.hasPrefix("FR05") { return .gen3 }
         return .unknown
     }
 
