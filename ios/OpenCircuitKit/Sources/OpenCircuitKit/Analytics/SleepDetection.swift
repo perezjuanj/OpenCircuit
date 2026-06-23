@@ -155,6 +155,9 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// → still, exactly as before — so this is a no-op for Gen 2 while fixing Gen 3.
     public static func detectFromMotion(_ history: [MotionSample]) -> [ActivityPeriod] {
         guard history.count >= 2 else { return [] }
+        // The rolling floor and `detect` both assume a time-ordered timeline; sort defensively so an
+        // unsorted caller (e.g. the nap path feeds the concatenated 0x00+0x03 channels) is correct.
+        let history = history.sorted { $0.time < $1.time }
         let relative = motionAboveLocalFloor(history)
         return detect(times: history.map(\.time), deltas: relative,
                       stillThreshold: motionStillThreshold)
@@ -193,9 +196,9 @@ public struct ActivityPeriod: Equatable, Sendable {
     }
 
     /// Per-index low percentile over a centered time window. Unworn `.greatestFiniteMagnitude`
-    /// sentinels are excluded from the percentile (they'd peg it high) but still get a floor so the
-    /// caller can de-floor them. Falls back to the index's own value when a window has no worn
-    /// samples. O(n·w); n is one night of 30-s samples, so this stays trivial.
+    /// sentinels are excluded from the percentile (they'd peg it high). A window with NO worn samples
+    /// returns a `0` floor, so an unworn sentinel de-floors to itself (`max(0, GFM - 0)` = GFM →
+    /// active) rather than collapsing to "still". O(n·w); n is one night of 30-s samples, so trivial.
     static func rollingLowPercentile(_ values: [Float], times: [Date],
                                      windowSeconds: TimeInterval, percentile: Double) -> [Float] {
         let n = values.count
@@ -209,7 +212,7 @@ public struct ActivityPeriod: Equatable, Sendable {
             if hi < lo { hi = lo }
             while hi < n && times[hi] <= times[i].addingTimeInterval(half) { hi += 1 }
             let worn = values[lo ..< hi].filter { $0 < .greatestFiniteMagnitude }.sorted()
-            out[i] = worn.isEmpty ? values[i]
+            out[i] = worn.isEmpty ? 0
                 : worn[Int((Double(worn.count - 1) * percentile).rounded())]
         }
         return out
