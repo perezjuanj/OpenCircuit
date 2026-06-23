@@ -104,6 +104,15 @@ final class BulkSleepTests: XCTestCase {
         return BulkRecord(b)!
     }
 
+    /// Realistic "active" motion. A MOVING wrist produces a VARYING accelerometer signal; a
+    /// *constant* reading — at ANY level — is an idle/off-wrist signature (Gen-3 idles at a high
+    /// constant ~16–39, Gen-2 at 1). Detection is now device-agnostic (subtracts a local idle
+    /// floor), so a constant stream correctly reads as still regardless of its level — off-wrist
+    /// idle is rejected by the temp/HR gates, not by pretending a constant value means motion.
+    /// These fixtures previously used a constant byte for "active"; that only worked because the
+    /// old absolute threshold was hard-coded to Gen 2's `1`. Varying motion is the real signal.
+    private func activeMotion(_ i: Int) -> UInt8 { [0x0a, 0x28, 0x50][i % 3] }
+
     func testMotionTimelineExpansion() {
         let r = BulkRecord(hex(deepSleepRec))!
         let tl = BulkSleep.motionTimeline(from: [r])
@@ -116,11 +125,11 @@ final class BulkSleepTests: XCTestCase {
         // 20 active epochs, then ~9 h still (216 epochs @150 s), then 20 active.
         var recs: [BulkRecord] = []
         var c: UInt32 = 0x0c220000
-        for _ in 0..<20 { recs.append(rec(c, motion: 0x14, sub: 0x12)); c += 150 }
+        for i in 0..<20 { recs.append(rec(c, motion: activeMotion(i), sub: 0x12)); c += 150 }
         let onset = c
         for _ in 0..<216 { recs.append(rec(c, motion: 0x01, sub: 0x62)); c += 150 }
         let wake = c
-        for _ in 0..<20 { recs.append(rec(c, motion: 0x14, sub: 0x12)); c += 150 }
+        for i in 0..<20 { recs.append(rec(c, motion: activeMotion(i), sub: 0x12)); c += 150 }
 
         let block = BulkSleep.mainSleep(from: recs)
         XCTAssertNotNil(block)
@@ -172,14 +181,14 @@ final class BulkSleepTests: XCTestCase {
     func testStagingEmptyWithoutSleep() {
         var recs: [BulkRecord] = []
         var c: UInt32 = 0x0c220000
-        for _ in 0..<50 { recs.append(rec(c, motion: 0x18, sub: 0x12, hr: 70)); c += 150 }
+        for i in 0..<50 { recs.append(rec(c, motion: activeMotion(i), sub: 0x12, hr: 70)); c += 150 }
         XCTAssertTrue(BulkSleep.stagedSegments(from: recs).isEmpty, "no sleep block -> no staging")
     }
 
     func testNoSleepWhenAllActive() {
         var recs: [BulkRecord] = []
         var c: UInt32 = 0x0c220000
-        for _ in 0..<100 { recs.append(rec(c, motion: 0x18, sub: 0x12)); c += 150 }
+        for i in 0..<100 { recs.append(rec(c, motion: activeMotion(i), sub: 0x12)); c += 150 }
         XCTAssertNil(BulkSleep.mainSleep(from: recs))
         XCTAssertTrue(BulkSleep.sleepSegments(from: recs).isEmpty)
     }

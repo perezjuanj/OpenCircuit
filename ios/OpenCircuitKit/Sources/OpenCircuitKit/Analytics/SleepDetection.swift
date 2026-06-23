@@ -92,6 +92,33 @@ public struct ActivityPeriod: Equatable, Sendable {
         return nil
     }
 
+    /// The main overnight sleep block as the CLUSTERED span of sleep periods: chain consecutive
+    /// `.sleep` periods whose intervening gap is shorter than `maxPause` (a brief awakening or a
+    /// posture shift, not a true wake), then return the longest cluster's `[firstStart, lastEnd]`
+    /// when it spans at least `minSleepDuration`. Brief awakenings inside the span stay as `.active`
+    /// periods so the caller still surfaces them as awake sub-segments. Without this, a night broken
+    /// by a >15-min stir (Gen 2) or a posture-driven motion-floor step (Gen 3, where each step reads
+    /// briefly "active" until the rolling floor catches up) collapses to just its longest fragment,
+    /// badly under-counting the night. `maxSleepPause` was defined for exactly this but unused until
+    /// now. A clean single-block night (every existing single-night test) returns that block verbatim.
+    public static func mainSleepBlock(_ periods: [ActivityPeriod],
+                                      maxPause: TimeInterval = maxSleepPause) -> ActivityPeriod? {
+        let sleeps = periods.filter { $0.activity == .sleep }.sorted { $0.start < $1.start }
+        guard !sleeps.isEmpty else { return nil }
+        var clusters: [(start: Date, end: Date)] = []
+        for s in sleeps {
+            if let last = clusters.last, s.start.timeIntervalSince(last.end) < maxPause {
+                clusters[clusters.count - 1].end = max(last.end, s.end)
+            } else {
+                clusters.append((s.start, s.end))
+            }
+        }
+        guard let best = clusters.max(by: {
+            $0.end.timeIntervalSince($0.start) < $1.end.timeIntervalSince($1.start)
+        }), best.end.timeIntervalSince(best.start) > minSleepDuration else { return nil }
+        return ActivityPeriod(activity: .sleep, start: best.start, end: best.end)
+    }
+
     /// Detect Sleep/Active periods from a gravity-vector timeline.
     public static func detectFromGravity(_ history: [GravitySample]) -> [ActivityPeriod] {
         guard history.count >= 2 else { return [] }
@@ -116,10 +143,76 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// directly — it already IS a movement magnitude, so it feeds the same core
     /// as the gravity deltas. Unworn/no-measurement samples should be passed as a
     /// large value (active) by the caller.
+    ///
+    /// The motion channel has a device-dependent IDLE FLOOR: a still Gen-2 ring reads ~`1`,
+    /// but a still Gen-3 ring (FR05.008, "RingConn Gen3-C384") reads a constant ~`15–16` even
+    /// in deep sleep (🟢, confirmed on an overnight Gen-3 capture, 2026-06-23). An ABSOLUTE
+    /// `motionStillThreshold` calibrated to Gen 2's `1` therefore classified EVERY Gen-3 epoch
+    /// as movement → no sleep block detected → blank Sleep/HRV/Respiratory cards. So measure
+    /// stillness RELATIVE to the night's OWN floor: subtract `motionBaseline` (a low percentile
+    /// of the worn samples) so whatever the device idles at maps to ~0, then apply the same
+    /// threshold. A constant-floor timeline (every existing test, an idle ring) maps to all-zero
+    /// → still, exactly as before — so this is a no-op for Gen 2 while fixing Gen 3.
     public static func detectFromMotion(_ history: [MotionSample]) -> [ActivityPeriod] {
         guard history.count >= 2 else { return [] }
-        return detect(times: history.map(\.time), deltas: history.map(\.movement),
+        let relative = motionAboveLocalFloor(history)
+        return detect(times: history.map(\.time), deltas: relative,
                       stillThreshold: motionStillThreshold)
+    }
+
+    /// Target span of the rolling idle-floor window for DETECTION (finding the in-bed block).
+    /// Long enough that a brief movement burst never lifts its own local floor and that the block
+    /// boundaries stay stable; drift between plateaus is handled by `maxSleepPause` bridging.
+    static let motionFloorWindowSeconds: TimeInterval = 30 * 60
+    /// Shorter floor window for per-epoch STAGING (awake-vs-asleep WITHIN the block). The block is
+    /// already established, so here we want the floor to follow a posture-driven step QUICKLY —
+    /// otherwise the ~15-min lag of the longer window reads each Gen-3 motion-floor step as a false
+    /// awakening (validated against ground truth: a tester's night measured 55 min "awake" at the
+    /// 30-min window vs ~20 min — matching the RingConn-app/Fitbit ~0 — at this shorter one).
+    static let motionFloorWindowSecondsStaging: TimeInterval = 15 * 60
+    /// Low percentile used as the "idle" estimate inside the window.
+    static let motionFloorPercentile: Double = 0.10
+
+    /// Movement magnitude measured ABOVE a LOCAL, rolling idle floor.
+    ///
+    /// The 0x4c motion channel idles at a device-dependent — and even time-varying — level: a
+    /// still Gen-2 ring reads ~`1`, a still Gen-3 ring reads ~`15`, and a Gen-3 ring's idle reading
+    /// DRIFTS across the night as sleeping posture changes (16→24→39 on the 2026-06-23 FR05.008
+    /// capture). An absolute threshold can't serve all three, and a single per-night baseline still
+    /// splits a drifting night into false "active" stretches. So at each sample we subtract a low
+    /// percentile of the motion within a ~30-min window around it: a flat plateau at ANY level maps
+    /// to ~0 (still), while a genuine burst — short relative to the window — rises above its local
+    /// floor and stays active. A constant-floor timeline (Gen 2's flat `1`, every existing test, an
+    /// idle ring) maps to all-zero exactly as the old absolute threshold did → no-op for Gen 2.
+    static func motionAboveLocalFloor(_ history: [MotionSample]) -> [Float] {
+        let mags = history.map(\.movement)
+        let floor = rollingLowPercentile(mags, times: history.map(\.time),
+                                         windowSeconds: motionFloorWindowSeconds,
+                                         percentile: motionFloorPercentile)
+        return zip(mags, floor).map { max(0, $0 - $1) }
+    }
+
+    /// Per-index low percentile over a centered time window. Unworn `.greatestFiniteMagnitude`
+    /// sentinels are excluded from the percentile (they'd peg it high) but still get a floor so the
+    /// caller can de-floor them. Falls back to the index's own value when a window has no worn
+    /// samples. O(n·w); n is one night of 30-s samples, so this stays trivial.
+    static func rollingLowPercentile(_ values: [Float], times: [Date],
+                                     windowSeconds: TimeInterval, percentile: Double) -> [Float] {
+        let n = values.count
+        guard n > 0, times.count == n else { return values }
+        let half = windowSeconds / 2
+        var out = [Float](repeating: 0, count: n)
+        // Window bounds advance monotonically with i (times are sorted), so this is ~O(n) amortized.
+        var lo = 0, hi = 0
+        for i in 0 ..< n {
+            while lo < n && times[lo] < times[i].addingTimeInterval(-half) { lo += 1 }
+            if hi < lo { hi = lo }
+            while hi < n && times[hi] <= times[i].addingTimeInterval(half) { hi += 1 }
+            let worn = values[lo ..< hi].filter { $0 < .greatestFiniteMagnitude }.sorted()
+            out[i] = worn.isEmpty ? values[i]
+                : worn[Int((Double(worn.count - 1) * percentile).rounded())]
+        }
+        return out
     }
 
     /// Sleep/Active detection (motion) with a WEAR GATE (#41): any detected `.sleep` block

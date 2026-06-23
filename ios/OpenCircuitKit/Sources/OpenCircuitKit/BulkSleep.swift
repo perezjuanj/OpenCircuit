@@ -209,9 +209,11 @@ public enum BulkSleep {
                                  temperatures: [TemperatureSample] = [],
                                  epoch: Int = Command.syncEpoch) -> ActivityPeriod? {
         let scoped = Self.records(records, within: hint, epoch: epoch)
-        var periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
+        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
                                                       temperatureSamples: temperatures)
-        return ActivityPeriod.findSleep(&periods)
+        // Clustered span (brief awakenings bridged), not just the first/longest fragment — see
+        // mainSleepBlock. A drifting Gen-3 floor or a real mid-sleep stir otherwise splits the night.
+        return ActivityPeriod.mainSleepBlock(periods)
     }
 
     /// HealthKit sleep segments for the detected night: an `inBed` span plus
@@ -243,11 +245,9 @@ public enum BulkSleep {
                                                 epoch: Int) -> [SleepSegment] {
         let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
                                                       temperatureSamples: temperatures)
-        // Main in-bed block = longest sleep period over the minimum duration (1 h).
-        guard let block = periods
-            .filter({ $0.activity == .sleep })
-            .max(by: { $0.duration < $1.duration }),
-            block.duration > 60 * 60 else { return [] }
+        // Main in-bed block = the clustered sleep span (brief awakenings bridged via maxSleepPause),
+        // not just the longest single fragment — so a drift-fragmented Gen-3 night isn't truncated.
+        guard let block = ActivityPeriod.mainSleepBlock(periods) else { return [] }
 
         var segs = [SleepSegment(start: block.start, end: block.end, stage: .inBed)]
         for p in periods where p.start < block.end && p.end > block.start {

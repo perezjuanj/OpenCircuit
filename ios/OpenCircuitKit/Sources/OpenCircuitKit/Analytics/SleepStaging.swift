@@ -227,13 +227,24 @@ public enum SleepStaging {
             .sorted { $0.counter < $1.counter }
         var lastHR: Int?, lastHRV: Int?, lastSpo2: Int?, lastRR: Double?
         var rows: [(time: Date, hr: Int, hrv: Int?, motion: Int, spo2: Int?, rr: Double?)] = []
-        for r in inBlock {
+        // Per-epoch motion energy is measured ABOVE a LOCAL idle floor (same rolling estimate as
+        // detection). Gen 2 idles at ~1, Gen 3 at ~15–16 and DRIFTS across the night with posture
+        // (16→24→39, 🟢 FR05.008 capture 2026-06-23). The old `$1 == 1 ? 0 : …` hard-coded Gen 2's
+        // flat `1`, so every still Gen-3 epoch summed to ~75 and the `awakeMotion` gate marked the
+        // WHOLE night awake → `sleepSpan` found nothing → no staged segments. De-flooring against the
+        // local rolling floor stays a no-op for Gen 2 (flat `1` → 0) while tracking Gen-3 drift.
+        let times = inBlock.map { $0.date(epoch: epoch) }
+        let rawMotion = inBlock.map { Float($0.motion.reduce(0) { $0 + Int($1) }) }
+        let floor = ActivityPeriod.rollingLowPercentile(rawMotion, times: times,
+                        windowSeconds: ActivityPeriod.motionFloorWindowSecondsStaging,
+                        percentile: ActivityPeriod.motionFloorPercentile)
+        for (idx, r) in inBlock.enumerated() {
             if let hr = r.heartRate { lastHR = hr }
             if let v = r.hrvRMSSD { lastHRV = v }
             if let s = r.spo2Percent { lastSpo2 = s }       // forward-filled like HRV
             if let rr = r.respiratoryRate { lastRR = rr }   // forward-filled like HRV
             guard let hr = lastHR else { continue }   // skip until the first HR reading
-            let motion = r.motion.reduce(0) { $0 + ($1 == 1 ? 0 : Int($1)) }
+            let motion = max(0, Int(rawMotion[idx] - floor[idx]))
             rows.append((r.date(epoch: epoch), hr, lastHRV, motion, lastSpo2, lastRR))
         }
         guard rows.count >= 2 else { return [] }

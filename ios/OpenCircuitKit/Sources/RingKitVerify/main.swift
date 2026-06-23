@@ -324,9 +324,13 @@ func bulkRec(_ c: UInt32, motion: UInt8, sub: UInt8) -> BulkRecord {
 }
 var night: [BulkRecord] = []
 var cc: UInt32 = 0x0c220000
-for _ in 0..<20 { night.append(bulkRec(cc, motion: 0x14, sub: 0x12)); cc += 150 }
+// Active flanks use VARYING motion — a constant reading at any level is now an idle/still signature
+// (device-agnostic local floor; see SleepDetection.motionAboveLocalFloor). Constant-0x14 flanks
+// otherwise de-floor to "still" and bridge into the block, over-stating its duration.
+func activeMotion(_ i: Int) -> UInt8 { [0x0a, 0x28, 0x50][i % 3] }
+for i in 0..<20 { night.append(bulkRec(cc, motion: activeMotion(i), sub: 0x12)); cc += 150 }
 for _ in 0..<216 { night.append(bulkRec(cc, motion: 0x01, sub: 0x62)); cc += 150 }
-for _ in 0..<20 { night.append(bulkRec(cc, motion: 0x14, sub: 0x12)); cc += 150 }
+for i in 0..<20 { night.append(bulkRec(cc, motion: activeMotion(i), sub: 0x12)); cc += 150 }
 let block = BulkSleep.mainSleep(from: night)
 check(block?.activity == .sleep, "motion detection finds the sleep block")
 check(abs((block?.duration ?? 0) - 216 * 150) < 30 * 60, "sleep block ~9 h")
