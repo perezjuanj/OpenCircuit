@@ -27,15 +27,15 @@ final class HistoryDrainCadenceTests: XCTestCase {
 
     func testNotDueBeforeIntervalElapses() {
         let now = Date(timeIntervalSince1970: 1_000_000)
-        let last = now.addingTimeInterval(-60 * 60)   // 1 h ago
-        // Night interval is 90 min, so 1 h ago is NOT yet due.
+        let last = now.addingTimeInterval(-20 * 60)   // 20 min ago
+        // Night interval is 30 min, so 20 min ago is NOT yet due.
         XCTAssertFalse(HistoryDrainCadence.isDue(lastDrainAt: last, now: now,
                                                  isNight: true, batterySaver: false))
     }
 
     func testDueAfterIntervalElapses() {
         let now = Date(timeIntervalSince1970: 1_000_000)
-        let last = now.addingTimeInterval(-100 * 60)  // 100 min ago > 90 min night interval
+        let last = now.addingTimeInterval(-40 * 60)   // 40 min ago > 30 min night interval
         XCTAssertTrue(HistoryDrainCadence.isDue(lastDrainAt: last, now: now,
                                                 isNight: true, batterySaver: false))
     }

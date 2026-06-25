@@ -1,22 +1,22 @@
-// Periodic history-drain cadence. The companion to KeepaliveCadence: that decides how often to
-// poll the descriptor (steps/temp/battery); THIS decides how often, while connected+idle, to drain
-// the ring's 0x4c history backlog.
+// Periodic history-drain cadence. The companion to KeepaliveCadence: that decides how often to keep
+// the link warm; THIS decides how often, while connected+idle, to drain the ring's 0x4c history.
 //
-// WHY. The ring's onboard history buffer holds only ~114 epochs (~4.75 h) and DROPS THE OLDEST when
-// full. Today history is drained only on foreground/manual events, so a link held quietly overnight
-// (or simply not foregrounded) lets the buffer overflow and the early, deep-sleep-rich hours are
-// gone before the morning sync. Draining on a fixed cadence — comfortably more often than the buffer
-// fills — keeps it emptied. Safe to do repeatedly only because the night is re-stitched from the
-// EpochArchive union (a single drain returns just the slice since the last one).
+// WHY a cadence (not just foreground/manual). Each `0x02` drain hands off only the slice since the
+// last one and self-advances the ring's resume pointer, so draining on a timer keeps the night
+// captured as a series of slices that the EpochArchive union re-stitches into one night. Safe to
+// repeat precisely because of that stitch.
 //
-// ⚠️ OVERNIGHT UPDATE (2026-06-22, device-log confirmed): draining DURING the sleep window is now
-// SUPPRESSED at the call site (`RingSession.isInSleepWindow`) — each cursor≈now open advanced the
-// ring's shared resume pointer past the night, so the morning had no backlog to hand off (~12 epochs
-// all night, every sync sleepSegs=0). The "~4.75 h buffer overflow" fear above is WRONG for the sleep
-// channel: PROTOCOL §3 shows a 19-day backlog drained in one shot, so the ring buffers for days. This
-// cadence now governs DAYTIME draining only; the night is left untouched for one morning sync (the
-// official app's behaviour). The `isNight` arm is retained for the pure unit tests but no longer
-// drives an overnight drain.
+// ⚠️ HISTORY (2026-06-22 → 2026-06-24): draining overnight was briefly SUPPRESSED, on the theory that
+// the drains' cursor≈now opens advanced the shared resume pointer past the night (~12 epochs/night,
+// every sync sleepSegs=0). That was the wrong culprit. The real shredder was the bare `0x07` `fetch`
+// heartbeat — "fetch NEXT history record" — which `RingSession`'s keepalive fired every ~60 s for
+// skin-temp INSIDE the window, walking the pointer through the whole night and discarding each 0x4c
+// page (device-confirmed 2026-06-24: a 6.3 h EpochArchive hole, pointer parked at the last temp
+// descriptor). With the overnight `fetch` removed (statusQuery keeps the link warm instead), nothing
+// walks the pointer between drains, so this cadence drives the night again — tighter at night so each
+// drain also yields a skin-temp reading now that the 60 s temp heartbeat is gone. (The ring buffers
+// for DAYS — §3, a 19-day backlog drained in one shot — so the cadence is about temp resolution and
+// freshness, not the old "~4.75 h buffer overflow" fear, which was wrong for the sleep channel.)
 //
 // Pure (no Apple frameworks) so it unit-tests on the CLI, matching KeepaliveCadence / ReconnectBackoff.
 
@@ -25,11 +25,11 @@ import Foundation
 public enum HistoryDrainCadence {
 
     /// Minimum seconds between periodic drains while connected+idle.
-    /// - `isNight`: inside the sleep window — tighten so the buffer can't overflow across a night.
-    /// - `batterySaver`: user opted into the battery-saver toggle — relax, but stay well under the
-    ///   ~4.75 h buffer so even a missed drain doesn't lose data.
+    /// - `isNight`: inside the sleep window — tightened to 30–45 min so each drain also lands a
+    ///   skin-temp reading (the 60 s `fetch` temp heartbeat no longer runs overnight; see header).
+    /// - `batterySaver`: user opted into the battery-saver toggle — relax both arms.
     public static func interval(isNight: Bool, batterySaver: Bool) -> TimeInterval {
-        if isNight { return (batterySaver ? 120 : 90) * 60 }   // 1.5–2 h overnight (buffer ≈ 4.75 h)
+        if isNight { return (batterySaver ? 45 : 30) * 60 }    // 30–45 min: each drain also carries a temp read
         return (batterySaver ? 240 : 180) * 60                 // 3–4 h by day
     }
 

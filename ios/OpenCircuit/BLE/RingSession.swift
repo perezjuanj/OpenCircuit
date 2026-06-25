@@ -578,23 +578,30 @@ final class RingSession: NSObject {
                     // link can't re-drain more often than the interval. Safe to repeat because
                     // `finalizeSync` re-stitches the night from the EpochArchive union.
                     let saver = UserDefaults.standard.bool(forKey: Self.batterySaverEnabledKey)
-                    // Drain history on a cadence — but NEVER inside the sleep window. A history open
-                    // (`02 .. cursor≈now ..`) advances the ring's SINGLE resume pointer (PROTOCOL.md §3
-                    // "Contention"); draining every ~90 min overnight kept advancing it past the night,
-                    // so the morning had no backlog left to hand off (device log 06-22: ~12 sleep epochs
-                    // ALL NIGHT, every drain sleepSegs=0). The official app never syncs overnight — it
-                    // does ONE big morning sync of the whole night — so we leave the backlog untouched in
-                    // the window and let the first drain AFTER it (daytime cadence) pull the night whole.
-                    // The `fetch` heartbeat still fires through the night: it only reads the 0x10/0x87
-                    // descriptor (steps/temp/battery) and does NOT touch the history pointer, so skin
-                    // temp (#69) and the wear gate keep their overnight stream.
-                    if self.gotDataFrame, !self.isInSleepWindow,
+                    let night = self.isInSleepWindow
+                    // Drain history on a cadence — tighter at night. The night is captured as STITCHED
+                    // slices (the EpochArchive union): each `0x02` open hands off the backlog accumulated
+                    // since the last drain and advances the ring's SINGLE resume pointer by exactly that
+                    // slice (PROTOCOL.md §3). The earlier "never drain overnight" rule blamed the wrong
+                    // thing: it's the bare `0x07` `fetch` heartbeat — `0x07` is "fetch NEXT history
+                    // record" — that walks the pointer. Fired every ~60 s for skin-temp INSIDE the sleep
+                    // window, it stepped the pointer through the whole night, skimming the 0x87 temp
+                    // header off each record while DISCARDING its 0x4c sleep-vitals page, so the morning
+                    // drain found an empty backlog (device-confirmed 2026-06-24: a 6.3 h EpochArchive
+                    // hole, pointer parked at the last temp descriptor). So overnight we DRAIN on a
+                    // cadence and keep the link warm with `0xD0` statusQuery (status only — does NOT
+                    // advance the history pointer) instead of `fetch`; skin temp (#69) now rides each
+                    // drain's own descriptor read. Daytime is unchanged: frequent foreground syncs keep
+                    // the pointer current, so the bare `fetch` between them is harmless there.
+                    if self.gotDataFrame,
                        HistoryDrainCadence.isDue(lastDrainAt: self.epochArchiveStore.lastDrainAt,
-                                                 now: Date(), isNight: false, batterySaver: saver) {
-                        ringLog.notice("sync: periodic history drain (daytime backlog; overnight left for one morning sync)")
+                                                 now: Date(), isNight: night, batterySaver: saver) {
+                        ringLog.notice("sync: periodic history drain (\(night ? "night · stitched slice" : "daytime backlog", privacy: .public))")
                         self.syncHistory()
+                    } else if night {
+                        self.write(Command.statusQuery)  // D0 00 00 → 0x50: keep the link warm WITHOUT walking the history pointer
                     } else {
-                        self.write(Command.fetch)   // 07 00 00 → fresh 0x10/0x87 descriptor
+                        self.write(Command.fetch)        // 07 00 00 → fresh 0x10/0x87 descriptor (steps/temp/battery)
                     }
                 }
                 try? await Task.sleep(for: .seconds(self.keepaliveInterval))
@@ -1113,14 +1120,13 @@ final class RingSession: NSObject {
     /// The official app drains both channels every sync; we previously only pulled `0x00`, so daytime
     /// SpO₂ went stale (the #99 gap — resolved by mining the captures, not a byte[6] selector sweep).
     func syncHistory(manual: Bool = false) {
-        // Automatic drains are SUPPRESSED inside the sleep window so the night's backlog accumulates
-        // untouched for ONE big morning sync (PROTOCOL.md §3 contention — see `isInSleepWindow`). A
-        // manual "Sync from ring" / pull-to-refresh passes `manual: true` and bypasses this; user
-        // intent wins (and a daytime manual sync is unaffected).
-        if !manual, isInSleepWindow {
-            ringLog.notice("sync: SKIP auto-drain — in sleep window; leaving the ring to log the night (morning sync pulls it whole)")
-            return
-        }
+        // Draining inside the sleep window is no longer suppressed. The night's backlog is captured by
+        // the keepalive's cadenced drains and stitched via the EpochArchive — what used to shred the
+        // night was the bare `0x07` fetch heartbeat WALKING the resume pointer, not the drains (see the
+        // keepalive loop). Each drain hands off only its own slice and self-advances the pointer, so
+        // repeated/overnight drains are safe and additive. `manual` is retained for callers (user Sync /
+        // pull-to-refresh) and telemetry; both manual and automatic paths now drain.
+        _ = manual
         guard syncTask == nil else { return }    // already syncing
         stopLiveMonitoring()                     // live polling would fight the drain
         syncTask = Task { [weak self] in
