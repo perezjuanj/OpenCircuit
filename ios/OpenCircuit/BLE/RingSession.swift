@@ -238,12 +238,22 @@ final class RingSession: NSObject {
     /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
     /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
     private(set) var historySamples: [QuantitySample] = []
-    /// Sleep-stage segments computed from the motion channel for the last sync
-    /// (coarse inBed/asleepCore/awake — the version written to HealthKit).
+    /// COARSE sleep segments from the motion channel (inBed/asleepCore/awake, no HR onset
+    /// trim). The fallback for HealthKit/store when no HR-staged block exists. Its non-emptiness
+    /// also doubles as the wear gate (#41) — empty on a charging/off-wrist night.
     private(set) var sleepSegments: [SleepSegment] = []
-    /// Experimental Light/Deep/REM/Awake staging (HR+motion heuristic, approximate —
-    /// matches stage totals but not architecture; for display, not HealthKit).
+    /// HR-aware Light/Deep/REM/Awake staging (the descent-onset trim lives here). The PREFERRED
+    /// source for both the dashboard and Apple Health (#15); see `healthSleepSegments`.
     private(set) var stagedSegments: [SleepSegment] = []
+    /// The segments to mirror to Apple Health and persist: the HR-aware `stagedSegments` when a
+    /// real overnight block was staged, else the coarse `sleepSegments`. Returns empty when the
+    /// coarse wear gate is empty (charging/off-wrist), so nothing is written for a non-worn night.
+    /// The SINGLE definition of the staged-vs-coarse policy — the foreground flush and the
+    /// background BGTask both read it, so they can never drift apart (they previously did: the
+    /// BGTask wrote the un-trimmed coarse segments while the foreground wrote staged).
+    var healthSleepSegments: [SleepSegment] {
+        !stagedSegments.isEmpty && !sleepSegments.isEmpty ? stagedSegments : sleepSegments
+    }
     /// True while a history sync is in progress.
     private(set) var syncing = false
     /// User-facing result of the last sync (e.g. "204 epochs"), or an error note.
@@ -898,9 +908,15 @@ final class RingSession: NSObject {
             // remains the upsert key.
             let start = stagedSegments.map(\.start).min() ?? Date()
             let end = stagedSegments.map(\.end).max() ?? start
+            // Actual sleep onset/wake (first…last asleep epoch) — narrower than the in-bed window by
+            // the sleep latency, so the card can show "fell asleep at X" instead of conflating it with
+            // bedtime. nil → unknown (no asleep block); persisted as distantPast and the card falls back.
+            let sleep = SleepStaging.sleepWindow(stagedSegments)
             let extras = computeSleepExtras(summary: summary, start: start, end: end,
                                             store: localStore, records: nightRecords)
             try? localStore.saveSleepSummary(summary, night: start, inBedStart: start, inBedEnd: end,
+                                             sleepOnset: sleep?.onset ?? .distantPast,
+                                             sleepWake: sleep?.wake ?? .distantPast,
                                              extras: extras)
         }
         // Naps are detected over the whole drained window (independent of the overnight gate)

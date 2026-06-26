@@ -82,6 +82,11 @@ struct SleepCardView: View {
         let summary: SleepStaging.Summary
         let inBedStart: Date?
         let inBedEnd: Date?
+        /// Actual sleep onset / final wake (first…last asleep epoch), narrower than the in-bed window
+        /// by the sleep latency + any lie-in. nil when unknown (a legacy stored row, or no asleep
+        /// block) — the card then falls back to the in-bed window for the clock labels.
+        let onset: Date?
+        let wake: Date?
         /// Reference time for the "last night / yesterday / date" label.
         let when: Date
         /// True when `when` is a real wake time. When false (a legacy rollup with no in-bed clock
@@ -109,14 +114,19 @@ struct SleepCardView: View {
             guard s.minutes.asleep > 0 else { return nil }
             let start = liveSegments.map(\.start).min()
             let end = liveSegments.map(\.end).max()
+            let sleep = SleepStaging.sleepWindow(liveSegments)
             return Night(summary: s, inBedStart: start, inBedEnd: end,
+                         onset: sleep?.onset, wake: sleep?.wake,
                          when: end ?? start ?? Date(), wakeKnown: end != nil)
         }()
         let stored: Night? = {
             guard let s = storedSleep.first, s.asleepMin > 0 else { return nil }
             let start = s.inBedStart > .distantPast ? s.inBedStart : nil
             let end = (s.inBedEnd > s.inBedStart) ? s.inBedEnd : nil
+            let onset = s.sleepOnset > .distantPast ? s.sleepOnset : nil
+            let wake = s.sleepWake > s.sleepOnset ? s.sleepWake : nil
             return Night(summary: s.asSummary, inBedStart: start, inBedEnd: end,
+                         onset: onset, wake: wake,
                          when: end ?? start ?? s.night, wakeKnown: end != nil)
         }()
         switch (live, stored) {
@@ -187,17 +197,28 @@ struct SleepCardView: View {
     private func content(_ night: Night) -> some View {
         let s = night.summary
         let m = s.minutes
-        // Headline: total time asleep + the composite Sleep Score badge (#70).
+        // Headline: time ASLEEP, with TIME IN BED beneath it (the two-window model) + the
+        // composite Sleep Score badge (#70). Asleep and in-bed are deliberately distinct — the
+        // ring's "asleep" excludes the pre-sleep wind-down and any in-bed wake.
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text("\(m.asleep / 60)h \(m.asleep % 60)m")
-                .font(.system(size: 36, weight: .bold, design: .rounded))
-                .monospacedDigit().contentTransition(.numericText())
-            Text("asleep").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("\(m.asleep / 60)h \(m.asleep % 60)m")
+                        .font(.system(size: 36, weight: .bold, design: .rounded))
+                        .monospacedDigit().contentTransition(.numericText())
+                    Text("asleep").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                }
+                Text("\(m.inBed / 60)h \(m.inBed % 60)m in bed")
+                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            }
             Spacer()
             if let score = latest?.sleepScore, score > 0 { scoreBadge(score) }
         }
         stageBar(m)
         stageLegend(m)
+        // When we actually fell asleep / woke (distinct from the bedtime window) + latency — this is
+        // what makes the in-bed-vs-asleep gap legible ("I wasn't asleep yet at 11pm").
+        sleepWindowCaption(night)
         // Overnight HR / HRV / SpO₂ averages for this night (moved out of the sync card, where
         // they read as a current "latest" reading). Computed over the night window from stored
         // samples, so they describe the same night the card is showing and persist with it.
@@ -562,15 +583,48 @@ struct SleepCardView: View {
         }
     }
 
-    /// Footer parts: clock window (when known) + efficiency + the estimate caveat.
-    private func footer(_ night: Night) -> [String] {
-        var parts: [String] = []
-        if let start = night.inBedStart, let end = night.inBedEnd {
-            parts.append("\(start.formatted(date: .omitted, time: .shortened))–\(end.formatted(date: .omitted, time: .shortened))")
+    /// The actual-sleep clock window + sleep latency, shown as a caption under the stage legend.
+    /// Falls back to the in-bed window when the onset/wake aren't recorded (a legacy stored night).
+    /// This is the surface that distinguishes "in bed" from "asleep" at a glance.
+    @ViewBuilder
+    private func sleepWindowCaption(_ night: Night) -> some View {
+        if let text = sleepWindowText(night) {
+            HStack(spacing: 6) {
+                Image(systemName: "bed.double.fill").font(.caption2).foregroundStyle(.indigo)
+                Text(text).font(.caption2).foregroundStyle(.secondary)
+            }
+            .padding(.top, 2)
         }
-        parts.append("\(Int((night.summary.efficiency * 100).rounded()))% efficiency")
-        parts.append("est.")
-        return parts
+    }
+
+    /// "Asleep 12:24 AM–8:49 AM · 21m to fall asleep", or nil when the actual sleep window is
+    /// unknown. Requires a real onset/wake (NOT a fallback to the in-bed window) — labeling the
+    /// whole bedtime "Asleep" would re-assert the very over-count this change removes, so a legacy
+    /// stored night (no onset recorded) simply omits the caption.
+    private func sleepWindowText(_ night: Night) -> String? {
+        guard let onset = night.onset, let wake = night.wake, wake > onset else { return nil }
+        var parts = ["Asleep \(Self.clock(onset))–\(Self.clock(wake))"]
+        // Sleep latency = time in bed before onset. Shown only when plausibly measured (a positive
+        // gap under ~4 h) so an unknown/legacy window doesn't print a bogus value.
+        if let bed = night.inBedStart {
+            let latency = onset.timeIntervalSince(bed)
+            if latency >= 60, latency < 4 * 3600 {
+                parts.append("\(Int((latency / 60).rounded()))m to fall asleep")
+            }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func clock(_ d: Date) -> String {
+        d.formatted(date: .omitted, time: .shortened)
+    }
+
+    /// Footer parts: efficiency + the estimate caveat. The time-in-bed DURATION sits under the
+    /// headline and the ASLEEP clock window in `sleepWindowCaption`; the old wall-clock in-bed range
+    /// is dropped here because it disagreed with the (gap-excluded) in-bed duration on stitched
+    /// multi-fragment nights — efficiency, in-bed, asleep and awake now all reconcile to one basis.
+    private func footer(_ night: Night) -> [String] {
+        ["\(Int((night.summary.efficiency * 100).rounded()))% efficiency", "est."]
     }
 
     /// No-sleep state, scoped to SLEEP only. It deliberately does NOT claim HRV / Resting HR /

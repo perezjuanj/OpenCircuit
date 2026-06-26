@@ -80,7 +80,7 @@ SLEEPTYPE_MAP = {
 # --- Tuning: mirrors Swift SleepStaging.Tuning EXACTLY, plus experimental extensions --
 @dataclass
 class Tuning:
-    # --- These 17 fields mirror Swift SleepStaging.Tuning one-for-one (same defaults) --
+    # --- These 21 fields mirror Swift SleepStaging.Tuning one-for-one (same defaults) --
     awakeMotion: int = 15
     deepHRPercentile: float = 0.42
     remHRPercentile: float = 0.86
@@ -98,6 +98,11 @@ class Tuning:
     hrWakeHalfWindow: int = 2
     onsetSustainEpochs: int = 6
     minHRWakeRunEpochs: int = 5
+    # Descent-relative onset trim (the "mild wind-down" fix) — mirrors Swift one-for-one.
+    onsetSettleFraction: float = 0.35
+    onsetMinDescentBPM: float = 10.0
+    onsetScanEpochs: int = 12
+    onsetSearchEpochs: int = 48
 
     # --- Experimental extensions (NOT in Swift Tuning yet; off by default). The fit
     #     reports whether turning these on helps; if so, add them to the Swift struct. --
@@ -105,13 +110,14 @@ class Tuning:
     spo2DipEnabled: bool = False    # treat an SpO2 dip vs the night median as a REM cue
     spo2DipDelta: float = 3.0       # %SpO2 below the night median to count as a dip
 
-    # Names of the 17 fields that map to the real Swift initializer.
+    # Names of the 21 fields that map to the real Swift initializer.
     SWIFT_FIELDS = (
         "awakeMotion", "deepHRPercentile", "remHRPercentile", "deepVarPercentile",
         "remVarPercentile", "variabilityHalfWindow", "deepVarFloor", "remVarFloor",
         "minDeepRunEpochs", "minREMRunEpochs", "minAwakeRunEpochs", "hrvVarWeight",
         "sleepFloorPercentile", "wakeHRMarginBPM", "hrWakeHalfWindow",
         "onsetSustainEpochs", "minHRWakeRunEpochs",
+        "onsetSettleFraction", "onsetMinDescentBPM", "onsetScanEpochs", "onsetSearchEpochs",
     )
 
 
@@ -444,6 +450,38 @@ def _erode_short_hr_wake(awake, motion_awake, min_run):
         i = j + 1
 
 
+def _mark_descent_onset_awake(awake, sm_hr, motion_awake, floor, t):
+    """Port of SleepStaging.markDescentOnsetAwake (mutates `awake`): mark the leading pre-sleep
+    wind-down as awake until smoothed HR first settles near the floor. No-op when there is no
+    real evening->floor descent, or when HR never sustains below the band within the search
+    window."""
+    n = len(sm_hr)
+    if t.onsetScanEpochs < 1 or n <= t.onsetScanEpochs:
+        return
+    evening = percentile(sorted(sm_hr[:t.onsetScanEpochs]), 0.5)
+    descent = evening - floor
+    if descent < t.onsetMinDescentBPM:
+        return
+    band = floor + t.onsetSettleFraction * descent
+    limit = min(t.onsetSearchEpochs, n)
+    onset = None
+    i = 0
+    while i < limit:
+        if sm_hr[i] <= band and not motion_awake[i]:
+            j = i
+            while j + 1 < n and sm_hr[j + 1] <= band and not motion_awake[j + 1]:
+                j += 1
+            if j - i + 1 >= t.onsetSustainEpochs:
+                onset = i
+                break
+            i = j + 1
+        else:
+            i += 1
+    if onset is not None and onset > 0:
+        for k in range(onset):
+            awake[k] = True
+
+
 def _sleep_span(awake, sustain):
     """Port of SleepStaging.sleepSpan: (first, last) of sustained asleep runs, or None."""
     n = len(awake)
@@ -576,6 +614,7 @@ def classify_prepared(pf, t, band_pool=None):
     motion_awake = [pf.motion_sum[i] > t.awakeMotion for i in range(n)]
     awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
     _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
+    _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
 
     span = _sleep_span(awake, t.onsetSustainEpochs)
     if span is None:
@@ -655,6 +694,7 @@ def baseline_band_pool(nights_prepared, t):
             motion_awake = [pf.motion_sum[i] > t.awakeMotion for i in range(n)]
             awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
             _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
+            _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
             span = _sleep_span(awake, t.onsetSustainEpochs)
             if span is None:
                 continue
@@ -761,6 +801,9 @@ SEARCH_GRID = {
     "hrWakeHalfWindow": [1, 2, 3],
     "onsetSustainEpochs": [4, 6, 8],
     "minHRWakeRunEpochs": [3, 5, 7],
+    "onsetSettleFraction": [0.25, 0.35, 0.45, 0.6],
+    "onsetMinDescentBPM": [8, 10, 14],
+    "onsetSearchEpochs": [36, 48, 72],
 }
 
 
@@ -832,7 +875,7 @@ def print_metrics(title, metrics):
 
 
 def swift_initializer(t):
-    """Emit a paste-ready Swift SleepStaging.Tuning(...) for the 17 mirrored fields."""
+    """Emit a paste-ready Swift SleepStaging.Tuning(...) for the 21 mirrored fields."""
     def fmt(v):
         if isinstance(v, bool):
             return "true" if v else "false"

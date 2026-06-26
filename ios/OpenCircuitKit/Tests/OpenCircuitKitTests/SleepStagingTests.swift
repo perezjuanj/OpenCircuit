@@ -326,6 +326,79 @@ final class SleepStagingTests: XCTestCase {
         for a in awake { XCTAssertLessThan(a.end, inBed.end) }
     }
 
+    // MARK: - Descent-relative onset trim (the "mild wind-down" fix)
+
+    /// The case the FIXED `wakeHRMarginBPM` gate misses: HR drifting DOWN through a calm,
+    /// still wind-down that never rises a full 18 bpm above the floor (e.g. 62 → 56 → 50).
+    /// The old gate counted that whole stretch as asleep (efficiency pinned at ~100%); the
+    /// descent-relative onset must mark it AWAKE-IN-BED instead, so asleep ≈ the real core
+    /// and efficiency drops below 1. A control run with the trim disabled (huge
+    /// `onsetMinDescentBPM`) shows the wind-down WOULD otherwise read as asleep.
+    func testMildWindDownBelowFixedMarginIsTrimmedAsAwakeInBed() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8 { recs.append(arec(c)); c += step }                   // before bed (outside block)
+        let onset = { () -> UInt32 in
+            for _ in 0..<12 { recs.append(vrec(c, hr: 62)); c += step }       // wind-down, still, < floor+18
+            for _ in 0..<4  { recs.append(vrec(c, hr: 56)); c += step }       // settling
+            let o = c
+            for _ in 0..<120 { recs.append(vrec(c, hr: 50)); c += step }      // asleep core
+            return o
+        }()
+        for _ in 0..<8 { recs.append(arec(c)); c += step }                   // morning (outside block)
+
+        let segs = SleepStaging.classify(from: recs)
+        let s = SleepStaging.summary(segs)
+        // (a) asleep reflects the 120-epoch core, NOT the 16-epoch wind-down too.
+        let coreMin = Double(120 * Int(step)) / 60
+        XCTAssertEqual(Double(s.minutes.asleep), coreMin, accuracy: 30,
+                       "mild wind-down is not counted as asleep")
+        // (b) efficiency is now < 1 (the wind-down is awake-in-bed, not asleep).
+        XCTAssertLessThan(s.efficiency, 0.95, "wind-down pulls efficiency below 100%")
+        // (c) an awake-in-bed segment covers the pre-onset wind-down.
+        let onsetDate = Date(timeIntervalSince1970: Double(Int(onset) + Command.syncEpoch))
+        XCTAssertTrue(segs.contains { $0.stage == .awake && $0.end <= onsetDate.addingTimeInterval(Double(step) * 2) },
+                      "the wind-down surfaces as awake-in-bed, ending at onset")
+        // Control: with the descent gate disabled, the SAME wind-down reads as asleep (eff ~1).
+        let disabled = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(onsetMinDescentBPM: 999))
+        let sd = SleepStaging.summary(disabled)
+        XCTAssertGreaterThan(sd.minutes.asleep, s.minutes.asleep,
+                             "disabling the trim counts the wind-down as asleep (the old behavior)")
+        XCTAssertGreaterThan(sd.efficiency, s.efficiency)
+    }
+
+    /// SAFETY 1 — descent gate. A night with NO real wind-down (flat HR from lights-out) must be
+    /// BYTE-IDENTICAL with the trim on vs off: there is nothing to trim, so the calibrated split
+    /// is untouched. This is what keeps the change inert on the nights it shouldn't touch.
+    func testFlatNightIsByteIdenticalWithTrimOnVsOff() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        for k in 0..<140 { recs.append(vrec(c, hr: k % 3 == 0 ? 52 : 50, hrv: 55)); c += step }  // flat, calm
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        let on = SleepStaging.classify(from: recs)                                       // default (trim on)
+        let off = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(onsetMinDescentBPM: 999))
+        XCTAssertEqual(on, off, "no wind-down (descent < gate) → trim is inert, output identical")
+    }
+
+    /// SAFETY 2 — bounded search. A night that stays elevated for HOURS and only settles past the
+    /// onset search horizon must NOT be trimmed (we don't guess "awake until 2 a.m." from HR alone).
+    /// The leading elevated stretch is left as-is rather than declared a multi-hour wake.
+    func testLateSettleBeyondSearchWindowIsNotTrimmed() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        for _ in 0..<60 { recs.append(vrec(c, hr: 60)); c += step }    // 2.5 h elevated — beyond the 48-epoch search
+        for _ in 0..<80 { recs.append(vrec(c, hr: 50)); c += step }    // settles only here
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        let on = SleepStaging.classify(from: recs)
+        let off = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(onsetMinDescentBPM: 999))
+        // No onset found within the search window → identical to trim-off (no runaway leading wake).
+        XCTAssertEqual(SleepStaging.summary(on).minutes.awake,
+                       SleepStaging.summary(off).minutes.awake,
+                       "a late settle past the search window is not trimmed (bounded, no runaway)")
+    }
+
     // MARK: - Constructed-night partition (sanity vs. RingConn night totals)
 
     func testConstructedNightPartitionsLikeATracker() {

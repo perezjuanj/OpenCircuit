@@ -88,10 +88,17 @@ final class StoredSleepSummary {
     var remMin: Int = 0
     var awakeMin: Int = 0
     var efficiency: Double = 0
-    /// Actual sleep-window clock times (first segment start … last segment end), NOT
-    /// start-of-day — so a night-temp window aligns to real sleep onset/wake, not midnight.
+    /// IN-BED window clock times (first segment start … last segment end), NOT start-of-day — so a
+    /// night-temp window aligns to real bedtime/get-up, not midnight. This is TIME IN BED: it
+    /// includes the pre-sleep and post-wake awake-in-bed spans, so it is wider than the sleep window.
     var inBedStart: Date = Date.distantPast
     var inBedEnd: Date = Date.distantPast
+    /// ACTUAL SLEEP window clock times: real onset (first asleep epoch) … final wake (last asleep
+    /// epoch). Narrower than [inBedStart, inBedEnd] by the sleep latency + any lie-in. `distantPast`
+    /// = not recorded (a legacy row written before these columns; the card falls back to the in-bed
+    /// window). Defaulted so SwiftData lightweight migration adds them to older stores (cf. #21).
+    var sleepOnset: Date = Date.distantPast
+    var sleepWake: Date = Date.distantPast
     var updatedAt: Date = Date.distantPast
 
     // MARK: Wave-1 sleep analytics (#69/#70/#71). Every column is DEFAULTED so SwiftData
@@ -128,6 +135,8 @@ final class StoredSleepSummary {
         efficiency: Double = 0,
         inBedStart: Date = Date.distantPast,
         inBedEnd: Date = Date.distantPast,
+        sleepOnset: Date = Date.distantPast,
+        sleepWake: Date = Date.distantPast,
         updatedAt: Date = Date(),
         skinTempC: Double = 0,
         sleepScore: Int = 0,
@@ -148,6 +157,8 @@ final class StoredSleepSummary {
         self.efficiency = efficiency
         self.inBedStart = inBedStart
         self.inBedEnd = inBedEnd
+        self.sleepOnset = sleepOnset
+        self.sleepWake = sleepWake
         self.updatedAt = updatedAt
         self.skinTempC = skinTempC
         self.sleepScore = sleepScore
@@ -516,6 +527,7 @@ struct LocalStore {
 
     func saveSleepSummary(_ summary: SleepStaging.Summary, night: Date,
                           inBedStart: Date, inBedEnd: Date,
+                          sleepOnset: Date = .distantPast, sleepWake: Date = .distantPast,
                           extras: SleepNightExtras = SleepNightExtras()) throws {
         let dayStart = Calendar.current.startOfDay(for: night)
         let m = summary.minutes
@@ -550,6 +562,8 @@ struct LocalStore {
             existing.efficiency = summary.efficiency
             existing.inBedStart = inBedStart
             existing.inBedEnd = inBedEnd
+            existing.sleepOnset = sleepOnset
+            existing.sleepWake = sleepWake
             existing.updatedAt = Date()
             applyExtras(extras, to: existing)   // feelScore deliberately preserved
         } else {
@@ -562,7 +576,9 @@ struct LocalStore {
                 awakeMin: m.awake,
                 efficiency: summary.efficiency,
                 inBedStart: inBedStart,
-                inBedEnd: inBedEnd
+                inBedEnd: inBedEnd,
+                sleepOnset: sleepOnset,
+                sleepWake: sleepWake
             )
             applyExtras(extras, to: row)
             context.insert(row)

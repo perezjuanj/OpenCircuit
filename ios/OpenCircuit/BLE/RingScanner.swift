@@ -447,8 +447,10 @@ final class RingScanner: NSObject {
                     startedLiveRead = true
                 }
                 // Snapshot the decoded history as it lands; the drain completes before the
-                // first live HR, so this captures sleep/steps even if HR never locks.
-                if !session.sleepSegments.isEmpty { capture.sleepSegments = session.sleepSegments }
+                // first live HR, so this captures sleep/steps even if HR never locks. Use the
+                // staged-preferred segments so the BGTask mirrors the SAME (onset-trimmed) sleep to
+                // Health as the foreground flush — not the un-trimmed coarse segments.
+                if !session.healthSleepSegments.isEmpty { capture.sleepSegments = session.healthSleepSegments }
                 if let s = session.steps { capture.steps = s }
                 if let liveHR = session.liveHR { capture.heartRate = liveHR; break }
             } else if case .idle = state {
@@ -461,7 +463,7 @@ final class RingScanner: NSObject {
         // Final snapshot before teardown, in case we exited on the deadline after the drain
         // completed but before a live HR arrived.
         if let session {
-            if capture.sleepSegments.isEmpty { capture.sleepSegments = session.sleepSegments }
+            if capture.sleepSegments.isEmpty { capture.sleepSegments = session.healthSleepSegments }
             if capture.steps == nil { capture.steps = session.steps }
             if capture.heartRate == nil { capture.heartRate = session.liveHR }
         }

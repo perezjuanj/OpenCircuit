@@ -125,6 +125,39 @@ public enum SleepStaging {
         /// driven awake epochs are exempt (a real movement is awake however brief).
         public var minHRWakeRunEpochs: Int
 
+        // --- Descent-relative ONSET trim (the "mild wind-down" fix) -----------------
+        // The fixed `wakeHRMarginBPM` gate (floor + 18) catches a CLEARLY elevated pre-sleep
+        // block (lying in bed at 78 bpm) but MISSES the common case: HR drifting down from a
+        // calm-evening level (~65) through the quiet wind-down (~55–60) into sleep (~50) — all
+        // of it BELOW floor+18, so the whole pre-sleep stretch reads as asleep and efficiency
+        // pins at an impossible ~100%. These knobs add a SECOND, leading-edge-only onset rule
+        // keyed to the night's OWN HR descent: onset is where smoothed HR first SETTLES near the
+        // floor (a fraction of the way down from the evening level) and stays there. It scales
+        // per person/night (a fast sleeper with no descent is untouched) and is bounded on both
+        // ends — gated on a real descent, searched only within the first window — so it can never
+        // run away and trim genuine sleep as wake. Validated 2026-06-26 against a Helio strap
+        // (onset matched within ~20 min) plus the night's stored summaries; SUPERVISED-FIT
+        // territory, so every knob is exposed.
+
+        /// Fraction of the evening→floor HR descent at which (smoothed) HR is taken to have
+        /// "settled" into sleep. Onset band = floor + fraction × (eveningLevel − floor). Lower =
+        /// stricter (band nearer the floor) → onset later / trims more. 0 disables the band move
+        /// (band == floor); raise toward 1 to trim only the most elevated wind-down.
+        public var onsetSettleFraction: Double
+        /// Minimum evening→floor descent (bpm) for the onset trim to fire at all. Below this there
+        /// is no real wind-down to trim (the sleeper was already calm at lights-out), so the night
+        /// is left byte-identical to the pre-onset-trim model. The single safety gate that keeps a
+        /// flat night — where the band would otherwise cut through ordinary sleep — untouched.
+        public var onsetMinDescentBPM: Double
+        /// Epochs at the window head used to estimate the pre-sleep "evening level" (their median,
+        /// robust to a one-epoch spike). ~12 ≈ the first 30 min in bed.
+        public var onsetScanEpochs: Int
+        /// The onset settle is sought ONLY within the first this-many epochs of the window; if HR
+        /// never sustains below the band that early, the night is NOT trimmed (no onset guessed).
+        /// Bounds the trim so a restless night that only quiets hours in can't be declared
+        /// "awake until 2 a.m." ~48 ≈ 2 h.
+        public var onsetSearchEpochs: Int
+
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
                     remHRPercentile: Double = 0.86,
@@ -142,7 +175,11 @@ public enum SleepStaging {
                     wakeHRMarginBPM: Double = 18,
                     hrWakeHalfWindow: Int = 2,
                     onsetSustainEpochs: Int = 6,
-                    minHRWakeRunEpochs: Int = 5) {
+                    minHRWakeRunEpochs: Int = 5,
+                    onsetSettleFraction: Double = 0.35,
+                    onsetMinDescentBPM: Double = 10,
+                    onsetScanEpochs: Int = 12,
+                    onsetSearchEpochs: Int = 48) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -161,6 +198,10 @@ public enum SleepStaging {
             self.hrWakeHalfWindow = hrWakeHalfWindow
             self.onsetSustainEpochs = onsetSustainEpochs
             self.minHRWakeRunEpochs = minHRWakeRunEpochs
+            self.onsetSettleFraction = onsetSettleFraction
+            self.onsetMinDescentBPM = onsetMinDescentBPM
+            self.onsetScanEpochs = onsetScanEpochs
+            self.onsetSearchEpochs = onsetSearchEpochs
         }
 
         public static let `default` = Tuning()
@@ -279,6 +320,14 @@ public enum SleepStaging {
         // doesn't read as an awakening (motion-driven awakes are kept, however brief).
         erodeShortHRWake(&awake, motionAwake: motionAwake, minRun: tuning.minHRWakeRunEpochs)
 
+        // --- Descent-relative onset: trim the quiet pre-sleep wind-down -------------
+        // Mark the LEADING in-bed stretch as awake while HR is still settling DOWN toward the
+        // night's floor — the calm-but-awake wind-down that sits below floor+18 and so slips
+        // past the gate above (pinning efficiency at ~100%). Leading-edge only and bounded; a
+        // night with no real descent is left untouched. Runs AFTER erosion so it isn't undone.
+        markDescentOnsetAwake(&awake, smHR: smHR, motionAwake: motionAwake,
+                              floor: sleepFloor, tuning: tuning)
+
         // --- ONSET / OFFSET: trim leading & trailing awake -------------------------
         // The kept window runs from the start of the first SUSTAINED asleep run to the
         // end of the last one; everything outside is pre-sleep / post-wake awake-in-bed
@@ -374,6 +423,19 @@ public enum SleepStaging {
         return (t[.asleepCore] ?? 0) + (t[.asleepDeep] ?? 0) + (t[.asleepREM] ?? 0)
     }
 
+    /// The actual SLEEP window: from the first asleep epoch (real onset) to the end of the last
+    /// asleep epoch (final wake). Distinct from the IN-BED window (segment min…max), which also
+    /// spans the pre-sleep and post-wake awake-in-bed time. `nil` when nothing is asleep. The gap
+    /// between in-bed start and `onset` is the sleep latency; this is what lets the card say "fell
+    /// asleep at X / woke at Y" rather than implying the whole bedtime was sleep.
+    public static func sleepWindow(_ segments: [SleepSegment]) -> (onset: Date, wake: Date)? {
+        let asleep = segments.filter {
+            $0.stage == .asleepCore || $0.stage == .asleepDeep || $0.stage == .asleepREM
+        }
+        guard let onset = asleep.map(\.start).min(), let wake = asleep.map(\.end).max() else { return nil }
+        return (onset, wake)
+    }
+
     // MARK: - Helpers
 
     /// Relabel sub-minimum Deep/REM/Awake runs to Light, so stages don't flap epoch to
@@ -450,6 +512,37 @@ public enum SleepStaging {
         }
         if let f = first, let l = last { return (f, l) }
         return nil
+    }
+
+    /// Mark the leading pre-sleep WIND-DOWN as awake: the stretch before HR first settles near the
+    /// night's floor. Fills `awake[0..<onset] = true`, where `onset` is the start of the first
+    /// sustained run of smoothed HR at/below a descent-relative band, sought only within the first
+    /// `onsetSearchEpochs`. A no-op (leaves `awake` untouched) when there is no real evening→floor
+    /// descent, or when HR never sustains below the band early — so it can only ever ADD leading
+    /// awake on a genuine wind-down, never trim real sleep on a flat or restless night.
+    private static func markDescentOnsetAwake(_ awake: inout [Bool], smHR: [Double],
+                                              motionAwake: [Bool], floor: Double, tuning: Tuning) {
+        let n = smHR.count
+        guard tuning.onsetScanEpochs >= 1, n > tuning.onsetScanEpochs else { return }
+        // Evening level = median of the first few in-bed epochs (robust to a single spike).
+        let evening = percentile(Array(smHR[0 ..< tuning.onsetScanEpochs]).sorted(), 0.5)
+        let descent = evening - floor
+        guard descent >= tuning.onsetMinDescentBPM else { return }   // already calm → nothing to trim
+        let band = floor + tuning.onsetSettleFraction * descent
+        // First index BEGINNING a sustained (≥ onsetSustainEpochs) at/below-band run — i.e. the
+        // settle into sleep. The run may extend past the search horizon; only its START must fall
+        // within `onsetSearchEpochs`. Motion epochs break a settle run (a moving sleeper is awake).
+        let limit = min(tuning.onsetSearchEpochs, n)
+        var i = 0
+        var onset: Int?
+        while i < limit {
+            guard smHR[i] <= band && !motionAwake[i] else { i += 1; continue }
+            var j = i
+            while j + 1 < n && smHR[j + 1] <= band && !motionAwake[j + 1] { j += 1 }
+            if j - i + 1 >= tuning.onsetSustainEpochs { onset = i; break }
+            i = j + 1
+        }
+        if let o = onset, o > 0 { for k in 0 ..< o { awake[k] = true } }
     }
 
     /// Centered rolling standard deviation over a ±`half`-epoch window.
