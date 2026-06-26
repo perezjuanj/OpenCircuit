@@ -314,6 +314,44 @@ final class RingSession: NSObject {
     var batteryChargeSamples: [BatteryTTE.Sample] { batteryChargeHistory }
     private var batteryChargeHistoryKey: String { "battery.chargeHistory.v1.\(peripheral.identifier.uuidString)" }
 
+    // MARK: Diagnostics — raw-frame capture + epoch-archive export (tester triage, #111)
+    //
+    // The capture toggle (default OFF) records the ring's raw 0x47/0x4c/0x50/0x82/0x10 frames so a
+    // tester on a new ring generation can hand us the bytes to decode. Separately `archivedEpochs`
+    // exposes the persisted, decoded 0x4c history so the diagnostics export can show WHICH epochs were
+    // drained — and the gaps where they weren't (the sleep-loss signal). Both feed `DiagnosticsReport`.
+
+    /// UserDefaults toggle gating raw-frame capture (default OFF). Bound from DeviceInfoView.
+    static let diagnosticsCaptureKey = "diagnostics.captureHistoryFrames"
+    private var historyCapture = HistoryFrameCapture()
+    private var historyCaptureKey: String { "diagnostics.historyCapture.v1.\(peripheral.identifier.uuidString)" }
+    private var diagnosticsCaptureEnabled: Bool { UserDefaults.standard.bool(forKey: Self.diagnosticsCaptureKey) }
+
+    /// Frames captured so far (drives the DeviceInfoView row).
+    var diagnosticsFrameCount: Int { historyCapture.count }
+    /// The decoded 0x4c epoch archive this ring has accumulated — the basis for the gap report.
+    var archivedEpochs: [BulkRecord] { epochArchiveStore.load() }
+    /// Raw-frame capture report (firmware header + per-frame hex). `redactMAC` masks all but the last
+    /// octet for sharing (the MAC matters only for auth RE, not sleep triage).
+    func frameCaptureReport(redactMAC: Bool) -> String {
+        var fw = firmwareInfo
+        if redactMAC, let m = fw.mac, m.count >= 2 { fw.mac = "··:··:··:··:··:" + String(m.suffix(2)) }
+        return historyCapture.report(firmware: fw)
+    }
+    /// Clear the capture buffer + its persisted copy.
+    func clearDiagnosticsCapture() {
+        historyCapture.clear()
+        UserDefaults.standard.removeObject(forKey: historyCaptureKey)
+    }
+    /// Record one raw frame when capture is on and the opcode is one we triage. Persists per-ring so a
+    /// BACKGROUND overnight drain survives relaunch. Cheap no-op (UserDefaults bool read) when disabled.
+    private func recordDiagnosticFrameIfEnabled(_ bytes: [UInt8]) {
+        guard diagnosticsCaptureEnabled, historyCapture.recordIfRelevant(bytes) else { return }
+        if let data = try? JSONEncoder().encode(historyCapture) {
+            UserDefaults.standard.set(data, forKey: historyCaptureKey)
+        }
+    }
+
     init(peripheral: CBPeripheral, localStore: LocalStore? = nil) {
         self.peripheral = peripheral
         self.localStore = localStore
@@ -329,6 +367,12 @@ final class RingSession: NSObject {
         if let data = UserDefaults.standard.data(forKey: batteryChargeHistoryKey),
            let saved = try? JSONDecoder().decode([BatteryTTE.Sample].self, from: data) {
             self.batteryChargeHistory = saved
+        }
+        // Restore this ring's persisted frame capture (#111) so a buffer built across a background
+        // overnight drain survives relaunch and is exportable in the morning.
+        if let data = UserDefaults.standard.data(forKey: historyCaptureKey),
+           let saved = try? JSONDecoder().decode(HistoryFrameCapture.self, from: data) {
+            self.historyCapture = saved
         }
         peripheral.delegate = self
         // Seed the model name from the peripheral's advertised name; may be overridden later
@@ -1360,6 +1404,7 @@ extension RingSession: CBPeripheralDelegate {
             }
             self.lastFrame = data.map { String(format: "%02x", $0) }.joined(separator: " ")
             self.lastFrameAt = Date()   // freshness anchor for staleness + last-reading timestamp (#36)
+            self.recordDiagnosticFrameIfEnabled(bytes)   // diagnostics capture (#111) — no-op when off
             // A DATA frame (anything but the cold `0x81` status reply, which even an un-activated ring
             // answers) proves the ring's data path is live: clear `notStreaming` + satisfy the
             // activation watchdog (#54). Guarded so `@Observable` doesn't republish on every frame.
