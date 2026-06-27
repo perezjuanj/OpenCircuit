@@ -362,7 +362,7 @@ struct SleepCardView: View {
                     Text(skinTempString(r.nightlyC))
                         .font(.caption.weight(.semibold)).monospacedDigit()
                     if let off = r.offsetC {
-                        Text(String(format: "%+.1f°C vs baseline", off))
+                        Text("\(skinTempDeltaString(off)) vs baseline")
                             .font(.caption2).foregroundStyle(tempColor(r.band))
                     } else {
                         Text("baseline building").font(.caption2).foregroundStyle(.tertiary)
@@ -378,6 +378,14 @@ struct SleepCardView: View {
     private func skinTempString(_ celsius: Double) -> String {
         let unit = TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius
         return UnitsFormatter.temperature(celsius, unit: unit)
+    }
+
+    /// Format a skin-temp OFFSET from baseline in the user's chosen unit. A delta scales by 9/5
+    /// (no +32), so this must use the delta formatter — not the absolute one — and must honour the
+    /// same unit as the value above (it was hardcoded to °C while the value showed °F).
+    private func skinTempDeltaString(_ celsiusDelta: Double) -> String {
+        let unit = TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius
+        return UnitsFormatter.temperatureDelta(celsiusDelta, unit: unit)
     }
 
     private func tempColor(_ band: SkinTempBaseline.DeviationBand?) -> Color {

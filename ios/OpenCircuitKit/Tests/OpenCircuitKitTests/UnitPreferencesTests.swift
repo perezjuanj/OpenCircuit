@@ -32,6 +32,30 @@ final class UnitPreferencesTests: XCTestCase {
         XCTAssertEqual(TemperatureUnit.fahrenheit.symbol, "°F")
     }
 
+    // MARK: - TemperatureUnit delta conversion (offset from baseline)
+
+    /// A DELTA scales by 9/5 with NO +32 offset: +0.5 °C is +0.9 °F, not +32.9 °F. This is the
+    /// bug — the baseline offset was converted (or hardcoded) as an absolute temperature.
+    func testDeltaCelsiusToFahrenheitScalesWithoutOffset() {
+        XCTAssertEqual(TemperatureUnit.fahrenheit.convertDelta(fromCelsius: 0.5), 0.9, accuracy: 0.0001)
+        XCTAssertEqual(TemperatureUnit.fahrenheit.convertDelta(fromCelsius: -1.0), -1.8, accuracy: 0.0001)
+    }
+
+    func testZeroDeltaIsZeroInBothUnits() {
+        XCTAssertEqual(TemperatureUnit.fahrenheit.convertDelta(fromCelsius: 0), 0, accuracy: 0.0001)
+        XCTAssertEqual(TemperatureUnit.celsius.convertDelta(fromCelsius: 0), 0, accuracy: 0.0001)
+    }
+
+    func testDeltaCelsiusIdentity() {
+        XCTAssertEqual(TemperatureUnit.celsius.convertDelta(fromCelsius: 0.7), 0.7, accuracy: 0.0001)
+    }
+
+    func testFormatterTemperatureDeltaIsSignedAndScaled() {
+        XCTAssertEqual(UnitsFormatter.temperatureDelta(0.5, unit: .fahrenheit), "+0.9 °F")
+        XCTAssertEqual(UnitsFormatter.temperatureDelta(0.5, unit: .celsius), "+0.5 °C")
+        XCTAssertEqual(UnitsFormatter.temperatureDelta(-1.0, unit: .fahrenheit), "-1.8 °F")
+    }
+
     // MARK: - DistanceUnit conversion
 
     func testMetrestoKilometres() {

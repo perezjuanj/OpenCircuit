@@ -17,6 +17,9 @@ struct VitalsStatusCardView: View {
     /// Trailing nights for the canonical skin-temp baseline/offset (#69).
     @Query private var sleepNights: [StoredSleepSummary]
 
+    /// User's temperature-unit preference (#83), so the skin-temp delta matches the rest of the app.
+    @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
+
     private static let historyDays = 32
 
     init() {
@@ -198,8 +201,9 @@ struct VitalsStatusCardView: View {
 
     private func detail(for signal: VitalsBaseline.Signal) -> String {
         if signal.isTemperature {
-            // Skin temp is shown in °F app-wide; a °C delta scales to °F by 9/5.
-            return String(format: "%+.1f °F vs your baseline.", signal.delta * 9 / 5)
+            // Skin-temp delta in the user's chosen unit (a delta scales by 9/5 with no +32 offset).
+            let unit = TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius
+            return "\(UnitsFormatter.temperatureDelta(signal.delta, unit: unit)) vs your baseline."
         }
         guard let base = signal.baselineMean else { return "Outside your usual range." }
         switch signal.vital {

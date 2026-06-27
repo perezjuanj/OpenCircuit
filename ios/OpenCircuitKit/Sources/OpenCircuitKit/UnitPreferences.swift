@@ -23,6 +23,17 @@ public enum TemperatureUnit: String, CaseIterable, Codable, Sendable {
         }
     }
 
+    /// Convert a temperature DIFFERENCE (a delta/offset, e.g. "+0.5 °C above baseline") to this
+    /// unit. A delta scales by the ratio only — the +32 offset of an ABSOLUTE conversion must NOT
+    /// be applied, or a +0.5 °C delta would read as +32.9 °F. Always use this (never `convert`)
+    /// for an offset-from-baseline.
+    public func convertDelta(fromCelsius c: Double) -> Double {
+        switch self {
+        case .celsius:    return c
+        case .fahrenheit: return c * 9 / 5
+        }
+    }
+
     /// The unit abbreviation shown next to a formatted value.
     public var symbol: String {
         switch self {
@@ -80,6 +91,15 @@ public enum UnitsFormatter {
                                    fractionDigits: Int = 1) -> String {
         let v = unit.convert(fromCelsius: celsius)
         return String(format: "%.\(fractionDigits)f \(unit.symbol)", v)
+    }
+
+    /// Format a temperature DELTA (offset from baseline) in the requested unit, signed, e.g.
+    /// "+0.5 °C" or "+0.9 °F". Uses `convertDelta` (ratio only, no +32) so a small offset stays
+    /// small after conversion — the fix for a baseline delta that was hardcoded to °C.
+    public static func temperatureDelta(_ celsiusDelta: Double, unit: TemperatureUnit,
+                                        fractionDigits: Int = 1) -> String {
+        let v = unit.convertDelta(fromCelsius: celsiusDelta)
+        return String(format: "%+.\(fractionDigits)f \(unit.symbol)", v)
     }
 
     /// Format a metres value in the requested unit, e.g. "3.2 km" or "2.0 mi".
