@@ -158,6 +158,24 @@ public enum SleepStaging {
         /// "awake until 2 a.m." ~48 ≈ 2 h.
         public var onsetSearchEpochs: Int
 
+        // --- Lead-in wake ONSET (the "lay awake still for hours" fix) ----------------
+        // The descent trim above keys off a clean HR DESCENT into the floor. But the hardest night
+        // is lying still and AWAKE for hours with FLUCTUATING HR (the 2026-06-26 capture: HR bouncing
+        // 58–99 with a clear ~90-bpm block near midnight, then sleep ~01:30). The fixed/descent gates
+        // mark the clearly-elevated epochs awake, but the SHORT still dips between them read as
+        // "asleep", so onset anchors to the FIRST such dip — hours before real sleep. This rule says:
+        // if a SUSTAINED awake block still lies ahead within the onset search window, sleep hasn't
+        // begun — push onset past the END of the LAST such block. It reuses the already-validated
+        // awake detection (motion + HR gate), so it only ever moves onset past epochs ALREADY judged
+        // awake, never invents wake from a quiet signal.
+
+        /// A consolidated asleep run of at least this many epochs BEFORE a lead-in wake block means the
+        /// block is a normal mid-night awakening (real sleep already happened) — so onset is NOT pushed
+        /// past it. Only when no real sleep preceded the block (longest prior asleep run < this) is the
+        /// block treated as part of a pre-sleep struggle. The single guard that keeps a normal night —
+        /// asleep early, one brief stir — untouched. ~16 ≈ a 40-min first cycle.
+        public var minConsolidatedSleepEpochs: Int
+
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
                     remHRPercentile: Double = 0.86,
@@ -179,7 +197,8 @@ public enum SleepStaging {
                     onsetSettleFraction: Double = 0.35,
                     onsetMinDescentBPM: Double = 10,
                     onsetScanEpochs: Int = 12,
-                    onsetSearchEpochs: Int = 48) {
+                    onsetSearchEpochs: Int = 48,
+                    minConsolidatedSleepEpochs: Int = 16) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -202,6 +221,7 @@ public enum SleepStaging {
             self.onsetMinDescentBPM = onsetMinDescentBPM
             self.onsetScanEpochs = onsetScanEpochs
             self.onsetSearchEpochs = onsetSearchEpochs
+            self.minConsolidatedSleepEpochs = minConsolidatedSleepEpochs
         }
 
         public static let `default` = Tuning()
@@ -327,6 +347,12 @@ public enum SleepStaging {
         // night with no real descent is left untouched. Runs AFTER erosion so it isn't undone.
         markDescentOnsetAwake(&awake, smHR: smHR, motionAwake: motionAwake,
                               floor: sleepFloor, tuning: tuning)
+
+        // --- Lead-in wake onset: push past a clear pre-sleep wake block -------------
+        // Handles the "lay still but awake for hours, fluctuating HR" night the descent trim misses:
+        // if a sustained awake block still lies ahead in the search window (and no real sleep preceded
+        // it), onset hasn't happened yet — mark everything up to that block's end as awake-in-bed.
+        markLeadInWakeOnset(&awake, tuning: tuning)
 
         // --- ONSET / OFFSET: trim leading & trailing awake -------------------------
         // The kept window runs from the start of the first SUSTAINED asleep run to the
@@ -543,6 +569,41 @@ public enum SleepStaging {
             i = j + 1
         }
         if let o = onset, o > 0 { for k in 0 ..< o { awake[k] = true } }
+    }
+
+    /// Push sleep ONSET past a clear pre-sleep wake episode. On a night spent lying still and AWAKE
+    /// for hours — HR fluctuating, with a clearly-elevated block — the fixed/descent gates flag the
+    /// obviously-awake epochs but leave the SHORT still dips between them reading as "asleep", so the
+    /// onset anchors to the first dip, hours early. If a SUSTAINED awake run (≥ `onsetSustainEpochs`)
+    /// still BEGINS within the onset search window, real sleep hasn't started: mark everything up to
+    /// the END of the LAST such run as awake-in-bed. Operates ONLY on epochs already judged awake by
+    /// the motion/HR gates (it never converts a quiet epoch to wake), and is GUARDED — it does nothing
+    /// when a consolidated asleep run (≥ `minConsolidatedSleepEpochs`) preceded the block, so a normal
+    /// night (asleep early, one brief stir) is untouched and only a genuine pre-sleep struggle is
+    /// trimmed. Leading-edge + bounded by the search window, so it can never run away.
+    private static func markLeadInWakeOnset(_ awake: inout [Bool], tuning: Tuning) {
+        let n = awake.count
+        let limit = min(tuning.onsetSearchEpochs, n)
+        guard limit > 0 else { return }
+        // Last sustained awake run that BEGINS within the search window (it may extend past it).
+        var blockStart: Int?, blockEnd: Int?
+        var i = 0
+        while i < limit {
+            guard awake[i] else { i += 1; continue }
+            var j = i
+            while j + 1 < n && awake[j + 1] { j += 1 }
+            if j - i + 1 >= tuning.onsetSustainEpochs { blockStart = i; blockEnd = j }
+            i = j + 1
+        }
+        guard let bs = blockStart, let be = blockEnd else { return }
+        // Guard: if a real consolidated sleep run preceded the block, it's a mid-night awakening, not
+        // a pre-sleep struggle — leave onset where it is.
+        var longest = 0, run = 0
+        for k in 0 ..< bs {
+            if awake[k] { run = 0 } else { run += 1; longest = max(longest, run) }
+        }
+        guard longest < tuning.minConsolidatedSleepEpochs else { return }
+        for k in 0 ... be { awake[k] = true }
     }
 
     /// Centered rolling standard deviation over a ±`half`-epoch window.

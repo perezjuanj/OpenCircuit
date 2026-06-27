@@ -399,6 +399,68 @@ final class SleepStagingTests: XCTestCase {
                        "a late settle past the search window is not trimmed (bounded, no runaway)")
     }
 
+    // MARK: - Lead-in wake onset (the "lay still but awake for hours" fix)
+
+    /// The 2026-06-26 screenshot night: the user lay still but AWAKE for hours before sleep, HR
+    /// FLUCTUATING with a clearly-elevated (~90 bpm) block, then settled into sleep at a level the
+    /// descent band never reaches within the search window. The fixed gate flags the 90-bpm block but
+    /// leaves the short still dips before it reading as "asleep", so onset wrongly anchored to the
+    /// FIRST dip (hours early, the "asleep 10:37 PM" bug). Onset must instead land AFTER the last
+    /// pre-sleep wake block — the dips before it are awake-in-bed, not sleep.
+    func testFragmentedPreSleepAnchorsOnsetAfterLastWakeBlock() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8 { recs.append(arec(c)); c += step }                    // before bed (outside block)
+        let firstDip = c
+        for _ in 0..<10 { recs.append(vrec(c, hr: 64)); c += step }            // brief still dip (pre-sleep, NOT real sleep)
+        for _ in 0..<16 { recs.append(vrec(c, hr: 90)); c += step }            // clearly AWAKE (~90 bpm), still
+        let afterWake = c
+        for _ in 0..<40 { recs.append(vrec(c, hr: 60)); c += step }            // early light sleep, above the descent band
+        for _ in 0..<100 { recs.append(vrec(c, hr: 52)); c += step }           // deep consolidated sleep (settles past the search window)
+        for _ in 0..<8 { recs.append(arec(c)); c += step }                     // morning
+
+        let segs = SleepStaging.classify(from: recs)
+        XCTAssertFalse(segs.isEmpty)
+        guard let win = SleepStaging.sleepWindow(segs) else { return XCTFail("no sleep window") }
+        let firstDipDate = Date(timeIntervalSince1970: Double(Int(firstDip) + Command.syncEpoch))
+        let afterWakeDate = Date(timeIntervalSince1970: Double(Int(afterWake) + Command.syncEpoch))
+        // (a) onset is at/after the end of the wake block — NOT the first 64-bpm dip ~1 h earlier.
+        XCTAssertGreaterThanOrEqual(win.onset, afterWakeDate.addingTimeInterval(-Double(step) * 2),
+                                    "onset anchors after the last pre-sleep wake block, not the first still dip")
+        XCTAssertGreaterThan(win.onset.timeIntervalSince(firstDipDate), Double(step) * 20,
+                             "the fragmented pre-sleep (dip + wake block) is well before onset")
+        // (b) control: with the lead-in rule off (consolidation guard 0 ⇒ never fires), onset
+        // regresses to the early dip — proving the rule is what fixes it.
+        let off = SleepStaging.classify(from: recs,
+                                        tuning: SleepStaging.Tuning(minConsolidatedSleepEpochs: 0))
+        guard let winOff = SleepStaging.sleepWindow(off) else { return XCTFail("no window (off)") }
+        XCTAssertLessThan(winOff.onset, win.onset,
+                          "without the lead-in rule, onset anchors earlier (the bug)")
+    }
+
+    /// GUARD: a night with REAL consolidated sleep before an early awakening must NOT have its onset
+    /// pushed past that awakening — the lead-in rule only fires on a pre-sleep struggle (no sleep yet),
+    /// never on a normal mid-night stir after the user is already asleep.
+    func testConsolidatedSleepBeforeEarlyWakeKeepsOnsetEarly() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8 { recs.append(arec(c)); c += step }                     // before bed (outside block)
+        let onset = c
+        for _ in 0..<30 { recs.append(vrec(c, hr: 52)); c += step }            // real sleep (75 min) BEFORE the stir
+        for _ in 0..<8 { recs.append(vrec(c, hr: 90)); c += step }             // early awakening (still asleep night)
+        for _ in 0..<100 { recs.append(vrec(c, hr: 52)); c += step }           // back to sleep
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+
+        let segs = SleepStaging.classify(from: recs)
+        guard let win = SleepStaging.sleepWindow(segs) else { return XCTFail("no sleep window") }
+        let onsetDate = Date(timeIntervalSince1970: Double(Int(onset) + Command.syncEpoch))
+        // Onset stays at the FIRST sleep block (the 90-bpm stir is an interior awakening, not pre-sleep).
+        XCTAssertEqual(win.onset.timeIntervalSince(onsetDate), 0, accuracy: Double(step) * 3,
+                       "consolidated sleep before the stir keeps onset early — the stir is interior wake")
+        let awake = segs.filter { $0.stage == .awake }
+        XCTAssertFalse(awake.isEmpty, "the early awakening still surfaces as an interior awake segment")
+    }
+
     // MARK: - Constructed-night partition (sanity vs. RingConn night totals)
 
     func testConstructedNightPartitionsLikeATracker() {
