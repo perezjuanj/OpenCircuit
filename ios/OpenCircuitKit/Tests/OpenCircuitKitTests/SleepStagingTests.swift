@@ -654,4 +654,69 @@ final class SleepStagingTests: XCTestCase {
         XCTAssertTrue(cursor.isNew(.sleep, nextNight),
                       "next night is newer than cursor: must be written")
     }
+
+    // MARK: - Personal (multi-night) baseline — Deep band anchoring (RingConn-aligned)
+
+    /// The factory uses the MEDIAN of recent nights' deep-sleep HR, ignores non-positive entries
+    /// (nights with no detected Deep), and needs ≥ `minNights` valid nights or it returns nil.
+    func testPersonalBaselineFactory() {
+        XCTAssertNil(SleepStaging.PersonalBaseline.fromRecentDeepHR([51, 52], minNights: 3),
+                     "too few nights → no baseline (stay single-night)")
+        XCTAssertNil(SleepStaging.PersonalBaseline.fromRecentDeepHR([0, 0, 51], minNights: 3),
+                     "zeros (no-Deep nights) are filtered → too few valid → nil")
+        // Odd count: sorted valid [51,51,52,75,102] → median 52, robust to the 75/102 outlier nights.
+        XCTAssertEqual(SleepStaging.PersonalBaseline.fromRecentDeepHR([51, 75, 52, 51, 102])?.deepSleepHR,
+                       52)
+        // Even count → TRUE median (mean of the two central values), NOT an upper-median:
+        // sorted [48,49,70,72] → (49+70)/2 = 59.5 (an upper-median would wrongly bias up to 70).
+        XCTAssertEqual(SleepStaging.PersonalBaseline.fromRecentDeepHR([72, 48, 70, 49])?.deepSleepHR,
+                       59.5)
+    }
+
+    /// The core win: a GLOBALLY-ELEVATED night (flat HR well above the person's norm) is read as mostly
+    /// Deep by the single-night classifier (its own lowest epochs look "deep"), but a personal baseline
+    /// anchored to the true deep HR (~50) recognises that 70 bpm is not deep for this person → not Deep.
+    func testBaselineSuppressesDeepOnGloballyElevatedNight() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+        for _ in 0..<120 { recs.append(vrec(c, hr: 70, hrv: 55)); c += step }   // flat, still, ELEVATED
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+
+        let noBaseline = SleepStaging.classify(from: recs)
+        let withBaseline = SleepStaging.classify(from: recs,
+            baseline: SleepStaging.PersonalBaseline(deepSleepHR: 50))   // ceiling 50+10 = 60 < 70
+        XCTAssertGreaterThan(fraction(noBaseline, .asleepDeep), 0.5,
+            "single-night: the flat block reads as Deep relative to its own distribution")
+        XCTAssertLessThan(fraction(withBaseline, .asleepDeep), 0.05,
+            "with a personal baseline, a 70-bpm night is not deep for a person whose deep HR is ~50")
+        // The suppressed Deep must become LIGHT, not REM: a flat elevated night has remHR ≈ the flat HR,
+        // so letting suppressed epochs fall through to the REM test would absurdly read the whole night
+        // as REM. A calm, flat epoch is Light (REM needs elevation OR variability).
+        XCTAssertGreaterThan(fraction(withBaseline, .asleepCore), 0.8,
+            "baseline-suppressed Deep relabels to Light")
+        XCTAssertLessThan(fraction(withBaseline, .asleepREM), 0.2,
+            "a flat elevated night does not spuriously read as all-REM")
+    }
+
+    /// SAFETY: the baseline must be INERT on a normal night — when the night's Deep HR sits within the
+    /// margin of the baseline (or below it), the ceiling never binds and the staging is byte-identical
+    /// to the single-night classifier. Two cases: a matching baseline, and a clearly non-binding one.
+    func testBaselineIsInertWhenItDoesNotBind() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+        for _ in 0..<120 { recs.append(vrec(c, hr: 50, hrv: 55)); c += step }   // normal calm low-HR night
+        for _ in 0..<12 { recs.append(arec(c)); c += step }
+
+        let single = SleepStaging.classify(from: recs)
+        // Matching baseline (deep HR 50, ceiling 60 ≥ the night's 50 epochs) → no Deep removed.
+        XCTAssertEqual(single, SleepStaging.classify(from: recs,
+            baseline: SleepStaging.PersonalBaseline(deepSleepHR: 50)),
+            "a baseline matching the night's deep HR changes nothing")
+        // A higher baseline (ceiling well above all HR) is likewise inert.
+        XCTAssertEqual(single, SleepStaging.classify(from: recs,
+            baseline: SleepStaging.PersonalBaseline(deepSleepHR: 80)),
+            "a non-binding baseline is byte-identical to the single-night classifier")
+    }
 }

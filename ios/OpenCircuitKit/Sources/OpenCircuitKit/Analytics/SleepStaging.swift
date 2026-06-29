@@ -176,6 +176,17 @@ public enum SleepStaging {
         /// asleep early, one brief stir — untouched. ~16 ≈ a 40-min first cycle.
         public var minConsolidatedSleepEpochs: Int
 
+        /// When a `PersonalBaseline` is supplied to `classify`, an epoch may be DEEP only if its HR
+        /// is within this many bpm of the person's TYPICAL deep-sleep HR. This caps Deep on a
+        /// STRONGLY-ELEVATED night (fever, illness), whose OWN low percentile would otherwise admit
+        /// "Deep" at an HR that is not deep for this person. Set DELIBERATELY WIDE so it never strips
+        /// genuine Deep on a merely MILDLY-elevated night that still had real deep sleep (a hard
+        /// training day, a warm room, a glass of wine run ~10–15 bpm high but still reach deep) — only
+        /// a clearly anomalous night (≳ this margin above the personal floor) is suppressed. It only
+        /// ever REMOVES Deep, never adds it, and is ignored entirely when no baseline is supplied, so
+        /// the single-night classifier is byte-identical (the property is inert without a baseline).
+        public var deepBaselineMarginBPM: Double
+
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
                     remHRPercentile: Double = 0.86,
@@ -198,7 +209,8 @@ public enum SleepStaging {
                     onsetMinDescentBPM: Double = 10,
                     onsetScanEpochs: Int = 12,
                     onsetSearchEpochs: Int = 48,
-                    minConsolidatedSleepEpochs: Int = 16) {
+                    minConsolidatedSleepEpochs: Int = 16,
+                    deepBaselineMarginBPM: Double = 18) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -222,9 +234,42 @@ public enum SleepStaging {
             self.onsetScanEpochs = onsetScanEpochs
             self.onsetSearchEpochs = onsetSearchEpochs
             self.minConsolidatedSleepEpochs = minConsolidatedSleepEpochs
+            self.deepBaselineMarginBPM = deepBaselineMarginBPM
         }
 
         public static let `default` = Tuning()
+    }
+
+    /// A person's rolling, multi-night HR baseline. RingConn's on-device staging is believed to key its
+    /// stages off multi-day personalized baselines (🟡 probable — `hrAvg7Days`/`hrvAvg7Days` fields read
+    /// from the v3.2.1 APK data model; exact use + thresholds NOT recoverable, see memory
+    /// `ringconn-sleep-is-on-device`), where ours historically used single-night percentiles only. A
+    /// single-night percentile is fragile on an
+    /// ATYPICAL night: when the WHOLE night runs elevated (fever, alcohol, illness), the night's own
+    /// lowest epochs still look "deep" relative to that night, so Deep is assigned at an HR that is not
+    /// deep for the person. Anchoring the Deep band to the person's typical deep-sleep HR fixes that.
+    /// Optional everywhere — absent it, staging is exactly the single-night classifier as before.
+    public struct PersonalBaseline: Sendable, Equatable {
+        /// The person's TYPICAL deep-sleep heart rate (bpm), across recent nights — the personal
+        /// "sleeping floor" the Deep band anchors to (see `Tuning.deepBaselineMarginBPM`).
+        public let deepSleepHR: Double
+
+        public init(deepSleepHR: Double) { self.deepSleepHR = deepSleepHR }
+
+        /// Build from recent nights' per-night deep-sleep HR means (e.g. `StoredSleepSummary.hrDeep`).
+        /// Uses the MEDIAN — robust to a single outlier night (a fever night, or a night with no real
+        /// Deep) — and ignores non-positive entries (a night with no detected Deep contributes nothing).
+        /// Returns `nil` when fewer than `minNights` valid nights exist: too little history to
+        /// personalize, so the caller stays on single-night staging until the baseline is trustworthy.
+        public static func fromRecentDeepHR(_ deepHRs: [Int], minNights: Int = 3) -> PersonalBaseline? {
+            let valid = deepHRs.filter { $0 > 0 }.map(Double.init).sorted()
+            guard valid.count >= minNights else { return nil }
+            // True median (average the two central values for an even count) — an upper-median would
+            // bias the ceiling upward (weaker suppression) on the common even-count windows.
+            let mid = valid.count / 2
+            let median = valid.count.isMultiple(of: 2) ? (valid[mid - 1] + valid[mid]) / 2 : valid[mid]
+            return PersonalBaseline(deepSleepHR: median)
+        }
     }
 
     /// Per-stage durations for a night, plus convenience totals. `inBed` is the whole
@@ -266,20 +311,22 @@ public enum SleepStaging {
     /// existing caller of a contiguous night, and every unit test) is staged exactly as before.
     public static func classify(from records: [BulkRecord],
                                 epoch: Int = Command.syncEpoch,
-                                tuning: Tuning = .default) -> [SleepSegment] {
+                                tuning: Tuning = .default,
+                                baseline: PersonalBaseline? = nil) -> [SleepSegment] {
         let frags = BulkSleep.contiguousFragments(records)
         guard frags.count > 1 else {
-            return classifyContiguous(from: records, epoch: epoch, tuning: tuning)
+            return classifyContiguous(from: records, epoch: epoch, tuning: tuning, baseline: baseline)
         }
         return frags
-            .flatMap { classifyContiguous(from: $0, epoch: epoch, tuning: tuning) }
+            .flatMap { classifyContiguous(from: $0, epoch: epoch, tuning: tuning, baseline: baseline) }
             .sorted { $0.start < $1.start }
     }
 
     /// Stage ONE contiguous record run (no internal data gaps) into `inBed` + stage segments.
     private static func classifyContiguous(from records: [BulkRecord],
                                            epoch: Int = Command.syncEpoch,
-                                           tuning: Tuning = .default) -> [SleepSegment] {
+                                           tuning: Tuning = .default,
+                                           baseline: PersonalBaseline? = nil) -> [SleepSegment] {
         guard let block = BulkSleep.mainSleep(from: records, epoch: epoch) else { return [] }
 
         // Epochs inside the in-bed window, forward-filling HR/HRV across dropped reads.
@@ -379,9 +426,24 @@ public enum SleepStaging {
         let remVar = max(percentile(varPool, tuning.remVarPercentile), tuning.remVarFloor)
 
         // --- Per-epoch decision (over the kept window) -----------------------------
+        // Personal-baseline DEEP ceiling: with a multi-night baseline, an epoch may be Deep only if its
+        // HR is within `deepBaselineMarginBPM` of the person's typical deep-sleep HR. nil baseline ⇒ no
+        // ceiling ⇒ byte-identical to the single-night classifier. Only ever REMOVES Deep (relabels to
+        // REM/Light by the same rules below), so a globally-elevated night can't read its non-deep
+        // troughs as Deep just because they're the lowest THAT night.
+        let deepCeiling = baseline.map { $0.deepSleepHR + tuning.deepBaselineMarginBPM }
         var stages: [SleepStage] = windowIdx.map { i in
             if awake[i] { return .awake }
-            if hr[i] <= deepHR && variability[i] <= deepVar { return .asleepDeep }
+            // A calm, low-variability trough is deep-LIKE by the night's own bands.
+            if hr[i] <= deepHR && variability[i] <= deepVar {
+                // It's real Deep only if also near the PERSON's deep HR (when a baseline exists). A calm
+                // trough too elevated for this person is NOT Deep — but it is Light, NOT REM: REM needs
+                // HR elevation OR variability, and this epoch is flat. Returning Light here (rather than
+                // letting it fall through to the REM test, where a flat elevated night has remHR ≈ the
+                // flat HR and the whole night would absurdly read as REM) keeps the relabel physiological.
+                let nearPersonalDeep = deepCeiling.map { hr[i] <= $0 } ?? true
+                return nearPersonalDeep ? .asleepDeep : .asleepCore
+            }
             if hr[i] >= remHR || variability[i] > remVar { return .asleepREM }
             return .asleepCore
         }

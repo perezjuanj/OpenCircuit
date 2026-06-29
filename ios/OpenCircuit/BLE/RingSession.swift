@@ -905,7 +905,7 @@ final class RingSession: NSObject {
     /// real night's totals are preserved) means a daytime block yields `[]`, and the card then
     /// falls back to the stored real night. (Adversarial review #1.)
     private func overnightStagedSegments(from records: [BulkRecord]) -> [SleepSegment] {
-        let segs = BulkSleep.stagedSegments(from: records)
+        let segs = BulkSleep.stagedSegments(from: records, baseline: personalSleepBaseline(from: records))
         // A stitched night carries one `inBed` segment PER fragment (sorted by start), so gate on the
         // WHOLE-NIGHT envelope — earliest onset to latest wake — not just the first fragment. Testing
         // `first(where: .inBed)` would judge the night by its earliest fragment's midpoint and wrongly
@@ -914,6 +914,30 @@ final class RingSession: NSObject {
         let inBeds = segs.filter { $0.stage == .inBed }
         guard let lo = inBeds.map(\.start).min(), let hi = inBeds.map(\.end).max() else { return segs }
         return SleepWindow.isOvernightBlock(start: lo, end: hi) ? segs : []
+    }
+
+    /// The user's rolling deep-sleep HR baseline from recent stored nights (RingConn is believed to key
+    /// its staging off multi-day personalized baselines — 🟡 probable, APK RE, see memory
+    /// `ringconn-sleep-is-on-device`; we historically used single-night percentiles only). It anchors
+    /// the Deep band so a globally-elevated night isn't mislabeled as having normal Deep (see
+    /// `SleepStaging.PersonalBaseline`). Uses the recent stored nights (count-bounded, up to 7 — NOT a
+    /// strict time window), nil until ≥3 PRIOR nights exist, so early nights stage exactly
+    /// as the single-night classifier — and the median is robust to one outlier (fever) night.
+    ///
+    /// EXCLUDES the night being staged (its start-of-day, derived from the motion block) — exactly as
+    /// the skin-temp rolling baseline above does. Without this, a re-sync of the SAME night would fold
+    /// tonight's own (already-persisted) deep HR into its own baseline: staging would become
+    /// non-idempotent across drains and the baseline would be contaminated by the very night it
+    /// reclassifies. Excluding it makes a night's staging depend only on SETTLED prior nights, so it is
+    /// deterministic and the Sleep card can't diverge from what was written to Health. (Code review.)
+    private func personalSleepBaseline(from records: [BulkRecord]) -> SleepStaging.PersonalBaseline? {
+        guard let localStore else { return nil }
+        let stagedDay = BulkSleep.mainSleep(from: records).map { Calendar.current.startOfDay(for: $0.start) }
+        let recentDeepHR = ((try? localStore.recentSleepSummaries(limit: 8)) ?? [])
+            .filter { stagedDay == nil || Calendar.current.startOfDay(for: $0.night) != stagedDay! }
+            .prefix(7)
+            .map(\.hrDeep)
+        return SleepStaging.PersonalBaseline.fromRecentDeepHR(Array(recentDeepHR))
     }
 
     /// Persist the latest night's sleep summary + today's step count so the dashboard

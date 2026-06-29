@@ -333,8 +333,10 @@ public enum BulkSleep {
     /// `SleepStaging.classify` (kept for source compatibility with existing callers).
     public static func stagedSegments(from records: [BulkRecord],
                                       within hint: DateInterval? = nil,
-                                      epoch: Int = Command.syncEpoch) -> [SleepSegment] {
-        SleepStaging.classify(from: Self.records(records, within: hint, epoch: epoch), epoch: epoch)
+                                      epoch: Int = Command.syncEpoch,
+                                      baseline: SleepStaging.PersonalBaseline? = nil) -> [SleepSegment] {
+        SleepStaging.classify(from: Self.records(records, within: hint, epoch: epoch),
+                              epoch: epoch, baseline: baseline)
     }
 
     /// HR / HRV / SpO2 / RR samples from worn epochs, with device timestamps. Iterates ALL

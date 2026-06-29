@@ -232,14 +232,37 @@ struct SleepCardView: View {
         Text(footer(night).joined(separator: " · "))
             .font(.caption2).foregroundStyle(.tertiary)
         captureHint(night)
+        confidenceHint(night)
     }
 
-    /// Actionable hint when last night looks LIMITED BY THE RING'S ~4.75 h memory (the early hours were
-    /// overwritten before any overnight drain). iOS runs OpenCircuit's background sync far more reliably
-    /// while the phone is charging, so that's the one lever the user controls. Shown only on positive
-    /// evidence (see `SleepCaptureCoverage`), so it doesn't nag on a genuinely short night.
+    /// Honest caveat when last night read implausibly high efficiency (near-zero detected wake over a
+    /// full night). The ring senses wake only from motion + HR elevation, so lying-still-but-awake at a
+    /// near-sleep heart rate (reading in bed, resting before rising) is invisible to it and gets absorbed
+    /// into light sleep — a hardware ceiling shared with the official RingConn app (see `SleepConfidence`).
+    /// We can't recover the lost wake, but we can stop presenting the inflated duration as gospel. Shown
+    /// only on a multi-hour night above a clearly-implausible efficiency, so it informs without nagging.
     @ViewBuilder
-    private func captureHint(_ night: Night) -> some View {
+    private func confidenceHint(_ night: Night) -> some View {
+        // Only meaningful on a CONTIGUOUS, fully-captured night. Skip a truncated night (under-captured,
+        // the opposite problem — see isLikelyTruncated) and a FRAGMENTED night, where data gaps make the
+        // SUMMED in-bed (and thus efficiency) an artifact rather than a sign of stillness: if the
+        // wall-clock in-bed span far exceeds the summed in-bed, there are gaps, so don't judge efficiency.
+        let contiguous: Bool = {
+            guard let s = night.inBedStart, let e = night.inBedEnd, night.summary.inBed > 0 else { return true }
+            return e.timeIntervalSince(s) <= night.summary.inBed * 1.15
+        }()
+        if contiguous, !isLikelyTruncated(night),
+           SleepConfidence.classify(night.summary) == .durationLikelyHigh {
+            hintRow(systemImage: "info.circle", tint: .secondary,
+                    "Very still night — duration may read a little high. The ring can't sense motionless wakefulness (no movement, near-sleep heart rate), so quiet time awake in bed is counted as light sleep.")
+        }
+    }
+
+    /// True when last night looks LIMITED BY THE RING'S ~4.75 h memory (early hours overwritten before
+    /// any overnight drain) — positive evidence only (see `SleepCaptureCoverage`). Shared by the capture
+    /// tip and the confidence note so the two stay MUTUALLY EXCLUSIVE: a truncated night is
+    /// UNDER-captured, the exact opposite of the "duration may read high" case.
+    private func isLikelyTruncated(_ night: Night) -> Bool {
         // Scheduled bedtime for this night, only when the user enabled a manual schedule — without it
         // we can't tell a truncated night from a genuinely short one, so no hint (see SleepCaptureCoverage).
         let bedtime: Date? = {
@@ -247,16 +270,30 @@ struct SleepCardView: View {
             return SleepWindow.interval(bedMinutes: bedMinutes, wakeMinutes: wakeMinutes,
                                         nightEndingNear: wake)?.start
         }()
-        if let onset = night.inBedStart,
-           SleepCaptureCoverage.classify(capturedOnset: onset, capturedInBed: night.summary.inBed,
-                                         scheduledBedtime: bedtime) == .likelyTruncated {
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "bolt.badge.clock").font(.caption2).foregroundStyle(.orange)
-                Text("Synced only from \(onset.formatted(date: .omitted, time: .shortened)) — the ring holds ~4.75h of memory and overwrites the oldest. Keep your phone charging nearby overnight so OpenCircuit can capture the whole night.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-            .padding(.top, 2)
+        guard let onset = night.inBedStart else { return false }
+        return SleepCaptureCoverage.classify(capturedOnset: onset, capturedInBed: night.summary.inBed,
+                                             scheduledBedtime: bedtime) == .likelyTruncated
+    }
+
+    /// Actionable tip when last night looks limited by the ring's ~4.75 h memory: iOS runs the overnight
+    /// drain far more reliably while charging, the one lever the user controls.
+    @ViewBuilder
+    private func captureHint(_ night: Night) -> some View {
+        if let onset = night.inBedStart, isLikelyTruncated(night) {
+            hintRow(systemImage: "bolt.badge.clock", tint: .orange,
+                    "Synced only from \(onset.formatted(date: .omitted, time: .shortened)) — the ring holds ~4.75h of memory and overwrites the oldest. Keep your phone charging nearby overnight so OpenCircuit can capture the whole night.")
         }
+    }
+
+    /// One Sleep-card caption row: a small tinted SF Symbol + secondary caption text. Shared by the
+    /// capture and confidence hints so their layout (spacing / font / padding) can't drift apart.
+    @ViewBuilder
+    private func hintRow(systemImage: String, tint: Color, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: systemImage).font(.caption2).foregroundStyle(tint)
+            Text(text).font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(.top, 2)
     }
 
     /// The Wave-1 sleep-detail rows in one group: per-stage HR, overnight stress, skin-temp
