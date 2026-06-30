@@ -265,6 +265,7 @@ final class RingSession: NSObject {
 
     private var bulkRecords: [BulkRecord] = []
     private var bulkFinalized = false    // captured pages already committed (sleep/vitals) — stop-time safety net skips re-commit
+    private var didRestageFromArchive = false   // once-per-session: surface retained-but-unstaged archive epochs (#119)
     private var dailyStepsTotal = 0      // cached display total for the last sample day (mirrors StoredDaily)
     private var syncTask: Task<Void, Never>?
     private var syncDone = false        // 0x50 end-of-history seen
@@ -419,6 +420,7 @@ final class RingSession: NSObject {
         // to be nil-ed by the scanner; ContentView reads from UserDefaults during the
         // reconnect-backoff window so the hint stays live while reconnecting.
         UserDefaults.standard.set(inferredCharging, forKey: Self.inferredChargingKey)
+        flushDrainedToArchive()   // a sync may be in flight — bank its pages before we cancel it (#119)
         monitorTask?.cancel(); monitorTask = nil
         keepaliveTask?.cancel(); keepaliveTask = nil
         autoMeasureTask?.cancel(); autoMeasureTask = nil
@@ -464,6 +466,7 @@ final class RingSession: NSObject {
         if clearStaleValue { liveHR = nil; liveHRAt = nil }   // fresh user read — don't let a stale value look live (#45 C)
         liveHRTrend.removeAll()   // fresh convergence window
         liveHRWarmup = nil
+        flushDrainedToArchive()   // an in-flight sync just cancelled above — bank its pages before the wipe (#119)
         bulkRecords.removeAll()   // any pages we drain below land here (don't lose them)
         bulkFinalized = false
         drainSawPage = false
@@ -610,6 +613,13 @@ final class RingSession: NSObject {
             // Resolve the night window up front so the first temp frame is gated correctly
             // (otherwise the very first reading races the reactive refresh and could leak).
             await self?.refreshNightWindowIfNeeded()
+            // Once per connected session: re-stage last night from the persisted archive, so epochs that
+            // were banked by `flushDrainedToArchive` (an interrupted drain) but never staged into a
+            // summary still surface — merge-protected, so it can only grow a fuller night (#119).
+            if let self, !self.didRestageFromArchive {
+                self.didRestageFromArchive = true
+                self.restageFromArchive()
+            }
             // Prime a status session so the ring answers fetch with the descriptor.
             for cmd in [Command.status0] {   // elicits the 81 00 challenge → reactive SM3 auth (#54)
                 guard let self, !Task.isCancelled else { return }
@@ -622,38 +632,37 @@ final class RingSession: NSObject {
                 // tightens/relaxes as the window rolls over, not just at connect.
                 await self.refreshNightWindowIfNeeded()
                 if self.ready, !self.monitoring, !self.livePreparing, self.syncTask == nil {
-                    // Periodic history drain (the buffer-overflow fix). The ring's ~4.75 h history
-                    // buffer drops its oldest epochs when full, so draining only on foreground/manual
-                    // events lets a quietly-held overnight link overflow and lose the early, deep-rich
-                    // hours. Drain on a cadence comfortably under the buffer (HistoryDrainCadence,
-                    // tighter at night), gated on `gotDataFrame` so we never poke a non-streaming ring
-                    // (#54). The cadence clock is persisted (EpochArchiveStore.lastDrainAt), so a fresh
-                    // session drains shortly after (re)connect (lastDrainAt nil ⇒ due) yet a flapping
-                    // link can't re-drain more often than the interval. Safe to repeat because
-                    // `finalizeSync` re-stitches the night from the EpochArchive union.
+                    // Connected+idle: either drain the ring's 0x4c history on a cadence, or just keep the
+                    // link warm. Gated on `gotDataFrame` so we never poke a non-streaming ring (#54). The
+                    // cadence clock is persisted (EpochArchiveStore.lastDrainAt), so a fresh session
+                    // drains shortly after (re)connect (lastDrainAt nil ⇒ due) yet a flapping link can't
+                    // re-drain more often than the interval.
                     let saver = UserDefaults.standard.bool(forKey: Self.batterySaverEnabledKey)
                     let night = self.isInSleepWindow
-                    // Drain history on a cadence — tighter at night. The night is captured as STITCHED
-                    // slices (the EpochArchive union): each `0x02` open hands off the backlog accumulated
-                    // since the last drain and advances the ring's SINGLE resume pointer by exactly that
-                    // slice (PROTOCOL.md §3). The earlier "never drain overnight" rule blamed the wrong
-                    // thing: it's the bare `0x07` `fetch` heartbeat — `0x07` is "fetch NEXT history
-                    // record" — that walks the pointer. Fired every ~60 s for skin-temp INSIDE the sleep
-                    // window, it stepped the pointer through the whole night, skimming the 0x87 temp
-                    // header off each record while DISCARDING its 0x4c sleep-vitals page, so the morning
-                    // drain found an empty backlog (device-confirmed 2026-06-24: a 6.3 h EpochArchive
-                    // hole, pointer parked at the last temp descriptor). So overnight we DRAIN on a
-                    // cadence and keep the link warm with `0xD0` statusQuery (status only — does NOT
-                    // advance the history pointer) instead of `fetch`; skin temp (#69) now rides each
-                    // drain's own descriptor read. Daytime is unchanged: frequent foreground syncs keep
-                    // the pointer current, so the bare `fetch` between them is harmless there.
-                    if self.gotDataFrame,
-                       HistoryDrainCadence.isDue(lastDrainAt: self.epochArchiveStore.lastDrainAt,
-                                                 now: Date(), isNight: night, batterySaver: saver) {
-                        ringLog.notice("sync: periodic history drain (\(night ? "night · stitched slice" : "daytime backlog", privacy: .public))")
+                    // OVERNIGHT-QUIET (#111/#119): inside the sleep window we DO NOT drain at all. Each
+                    // drain's cursor≈now open + per-channel `0x07` fetch contends the ring's single resume
+                    // pointer; cadenced overnight drains were thought safe (only the old 60 s temp `fetch`
+                    // heartbeat shredded the night), but Randy's 6/30 capture disproved it — draining every
+                    // ~30 min, the ring still stopped handing off 0x4c sleep history at ~02:35 and lost the
+                    // back ~3 h. So overnight we keep the link warm with `0xD0` statusQuery (status only —
+                    // does NOT walk the pointer) and let the night accumulate UNTOUCHED on the ring (it
+                    // buffers for days), then drain the whole night in ONE pass at WAKE: when `night` flips
+                    // false, `lastDrainAt` is hours old ⇒ `isDue` ⇒ `shouldDrain` ⇒ one catch-up drain.
+                    // TRADEOFFS (honest): (1) overnight skin temp is ELIMINATED, not merely lower-res —
+                    // statusQuery elicits no 0x10/0x87 descriptor, so the only night temp is at wake, and
+                    // the #41 sleep wear-gate reverts to MOTION-ONLY overnight (can re-expose the
+                    // still/charging-reads-as-sleep over-count). (2) the phone banks NOTHING overnight, so
+                    // a co-installed official RingConn app that syncs first in the morning can take the
+                    // WHOLE night (shared resume pointer, §3). Accepted because the night's SLEEP data —
+                    // the reported loss — is recovered; revisit if temp/over-count regress on device.
+                    let cadenceDue = self.gotDataFrame
+                        && HistoryDrainCadence.isDue(lastDrainAt: self.epochArchiveStore.lastDrainAt,
+                                                     now: Date(), isNight: night, batterySaver: saver)
+                    if HistoryDrainCadence.shouldDrain(manual: false, inSleepWindow: night, isDue: cadenceDue) {
+                        ringLog.notice("sync: periodic history drain (\(night ? "night?!" : "daytime / wake catch-up", privacy: .public))")
                         self.syncHistory()
                     } else if night {
-                        self.write(Command.statusQuery)  // D0 00 00 → 0x50: keep the link warm WITHOUT walking the history pointer
+                        self.write(Command.statusQuery)  // D0 00 00 → 0x50: keep warm WITHOUT walking the history pointer
                     } else {
                         self.write(Command.fetch)        // 07 00 00 → fresh 0x10/0x87 descriptor (steps/temp/battery)
                     }
@@ -1229,13 +1238,18 @@ final class RingSession: NSObject {
     /// The official app drains both channels every sync; we previously only pulled `0x00`, so daytime
     /// SpO₂ went stale (the #99 gap — resolved by mining the captures, not a byte[6] selector sweep).
     func syncHistory(manual: Bool = false) {
-        // Draining inside the sleep window is no longer suppressed. The night's backlog is captured by
-        // the keepalive's cadenced drains and stitched via the EpochArchive — what used to shred the
-        // night was the bare `0x07` fetch heartbeat WALKING the resume pointer, not the drains (see the
-        // keepalive loop). Each drain hands off only its own slice and self-advances the pointer, so
-        // repeated/overnight drains are safe and additive. `manual` is retained for callers (user Sync /
-        // pull-to-refresh) and telemetry; both manual and automatic paths now drain.
-        _ = manual
+        // OVERNIGHT-QUIET gate (#111/#119): an AUTOMATIC drain inside the sleep window is suppressed.
+        // Cadenced overnight drains were thought "safe and additive" (only the old 60 s `0x07` temp
+        // heartbeat shredded the night), but Randy's 6/30 capture disproved that — draining every ~30
+        // min, the ring still stopped handing off 0x4c sleep history at ~02:35 and lost the back ~3 h.
+        // So we drain NOTHING inside the window (the keepalive keeps the link warm with statusQuery and
+        // the night accumulates untouched on the ring) and pull the whole night in ONE pass at wake.
+        // A user-initiated sync (`manual`) always bypasses the gate. (See HistoryDrainCadence header.)
+        guard HistoryDrainCadence.shouldDrain(manual: manual, inSleepWindow: isInSleepWindow, isDue: true)
+        else {
+            ringLog.notice("sync: SKIP (overnight-quiet — drain deferred to wake)")
+            return
+        }
         guard syncTask == nil else { return }    // already syncing
         stopLiveMonitoring()                     // live polling would fight the drain
         syncTask = Task { [weak self] in
@@ -1251,6 +1265,7 @@ final class RingSession: NSObject {
     /// the daytime channel never overwrites a sleep epoch's motion/HRV. `finalizeSync` clears
     /// `syncing`/`syncTask` on exit.
     private func performHistoryDrain() async {
+        flushDrainedToArchive()                  // bank any pages a prior interrupted drain left uncommitted (#119)
         bulkRecords.removeAll()
         bulkFinalized = false                    // fresh capture — uncommitted until finalizeSync
         historySamples.removeAll()
@@ -1338,6 +1353,38 @@ final class RingSession: NSObject {
         persist(historySamples)   // auto-persist HR/HRV/SpO2 for the dashboard
         persistSleepAndSteps(nightRecords: nightRecords)   // summary + extras from the stitched night
         bulkFinalized = true      // committed — the stop-time safety net can skip these records
+    }
+
+    /// Durably merge any not-yet-committed drained pages into the persisted EpochArchive BEFORE they're
+    /// dropped. Archive-only (no re-stage); idempotent (EpochArchive dedups by counter). A drain can be
+    /// superseded before it reaches `finalizeSync` — `startLiveMonitoring`/`performHistoryDrain` wipe
+    /// `bulkRecords` up front and `invalidate()` cancels `syncTask` without committing — and the ring
+    /// won't re-send those epochs (cursor≈now self-advances its resume pointer on ACK), so without this
+    /// they left PERMANENT holes in the committed archive even though they reached the phone (the gap
+    /// behind Randy's truncated sleep, #119). Cheap: fires only at the few supersession points, not per
+    /// page. The follow-up `restageFromArchive()` turns the retained pages into a summary.
+    private func flushDrainedToArchive() {
+        guard !bulkRecords.isEmpty, !bulkFinalized else { return }
+        _ = epochArchiveStore.merge(bulkRecords)
+        ringLog.notice("sync: flushed \(self.bulkRecords.count) uncommitted page-records to archive before teardown")
+    }
+
+    /// Re-stage last night from the PERSISTED archive union (not the in-memory drain slice) and refresh
+    /// the stored summary. Closes the loop on `flushDrainedToArchive`: pages that merged-on-arrival but
+    /// never reached a non-empty `commitDrainedRecords` (an interrupted drain whose follow-up came back
+    /// empty) would otherwise sit on disk while the summary stayed truncated. `saveSleepSummary` is
+    /// merge-protected (SleepSummaryMerge) so this can only GROW a fuller night, never shrink one, and it
+    /// leaves `historySamples` alone (no new HealthKit samples to write). Run once per session (at
+    /// connect) so retained-but-unstaged data surfaces without churning the periodic empty-poll path.
+    private func restageFromArchive() {
+        let union = epochArchiveStore.load()
+        guard !union.isEmpty else { return }
+        let temps = wearTemperatureSamples()
+        let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temps)
+        sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)
+        stagedSegments = overnightStagedSegments(from: nightRecords)
+        persistSleepAndSteps(nightRecords: nightRecords)
+        ringLog.notice("sync: re-staged last night from archive union (\(union.count) epochs)")
     }
 
     private func finalizeSync() {
