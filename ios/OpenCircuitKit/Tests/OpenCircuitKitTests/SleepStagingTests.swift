@@ -719,4 +719,44 @@ final class SleepStagingTests: XCTestCase {
             baseline: SleepStaging.PersonalBaseline(deepSleepHR: 80)),
             "a non-binding baseline is byte-identical to the single-night classifier")
     }
+
+    // MARK: - Night-scoping cap (the "no sleep recorded" regression, build 16)
+
+    /// REGRESSION (2026-06-30, reproduced against a real device store): the all-day `0x03` channel fills
+    /// the DAYTIME, and detection reads a sedentary worn day as "still" = sleep, so it can emit one long
+    /// still block bridging daytime into the night. That block's MIDPOINT still reads "overnight", so
+    /// `latestNightRecords` anchored on it (and chained back to the prior night), returned a >maxNightSpan
+    /// window, `classify` stitched a >24 h window, and `RingSession.overnightStagedSegments`' overnight
+    /// gate (midpoint must be night) discarded the WHOLE night → no summary persisted. The night-span cap
+    /// must scope to ONE night. Built deterministically (Calendar.current for both construction and the
+    /// overnight check) so it is timezone-robust.
+    func testLatestNightRecordsCapsAllDayBridgedBlockToOneNight() {
+        let cal = Calendar.current
+        let wake = cal.date(bySettingHour: 8, minute: 0, second: 0, of: Date())!
+        // 20 h of continuous still, low-HR epochs ending at wake — a sedentary day bridged into the night
+        // (12:00 → 08:00). Midpoint ~22:00 is solidly overnight, so detection yields an anchor (the bug's
+        // precondition: the bridged block reads "overnight" despite spanning the afternoon).
+        let start = cal.date(byAdding: .hour, value: -20, to: wake)!
+        XCTAssertGreaterThan(wake.timeIntervalSince(start), BulkSleep.maxNightSpan,
+                             "precondition: the bridged block exceeds maxNightSpan")
+        var c = UInt32(start.timeIntervalSince1970 - Double(Command.syncEpoch))
+        var recs: [BulkRecord] = []
+        for _ in 0 ..< Int(wake.timeIntervalSince(start) / 150) { recs.append(vrec(c, hr: 52, hrv: 55)); c += step }
+
+        let scoped = BulkSleep.latestNightRecords(from: recs)
+        guard let lo = scoped.map({ $0.date() }).min(), let hi = scoped.map({ $0.date() }).max() else {
+            return XCTFail("scoping returned nothing")
+        }
+        // The window is capped to one night (≤ maxNightSpan + the ±30-min onset/wake margins), NOT the 20 h block.
+        XCTAssertLessThanOrEqual(hi.timeIntervalSince(lo), BulkSleep.maxNightSpan + 3600,
+            "a >maxNightSpan bridged block must be capped to one night, not returned whole")
+        // And it keeps the LATEST data (the wake edge), so staging describes the most recent night.
+        XCTAssertEqual(hi.timeIntervalSince(wake), 0, accuracy: 3600,
+            "the scoped window ends at the latest night's wake")
+        // The scoped night is overnight → the overnight gate accepts it → a summary WOULD persist.
+        let inBeds = SleepStaging.classify(from: scoped).filter { $0.stage == .inBed }
+        XCTAssertEqual(inBeds.count, 1, "one capped night → a single in-bed window, not a stitched >24 h span")
+        XCTAssertTrue(SleepWindow.isOvernightBlock(start: inBeds[0].start, end: inBeds[0].end),
+            "the capped night is overnight, so overnightStagedSegments persists it")
+    }
 }

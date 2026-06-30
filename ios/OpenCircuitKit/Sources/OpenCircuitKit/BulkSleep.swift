@@ -296,6 +296,16 @@ public enum BulkSleep {
     /// cleanly absorbs intra-night buffer-loss gaps while never merging two different nights.
     public static let maxIntraNightGap: TimeInterval = 6 * 3600
 
+    /// Maximum plausible span of a SINGLE night (in-bed), used to cap the night-scoping window. Even a
+    /// long lie-in fits well under this. WHY: the all-day `0x03` channel fills the DAYTIME, and detection
+    /// reads a sedentary worn day as "still" = sleep, so it can emit a giant block bridging daytime into
+    /// the night (🟢 reproduced 2026-06-30: a 20.5 h "block" 12:33→09:07). That block's midpoint reads
+    /// "overnight", so `latestNightRecords` anchored on it and chained back to the PRIOR night's tail,
+    /// returning ~two nights; `classify` then stitched both into a >24 h window whose midpoint is daytime,
+    /// which the overnight gate (`RingSession.overnightStagedSegments`) discards → NO sleep summary
+    /// persisted. Capping the window to the latest `maxNightSpan` before the wake keeps it to one night.
+    public static let maxNightSpan: TimeInterval = 14 * 3600
+
     public static func latestNightRecords(from records: [BulkRecord],
                                           temperatures: [TemperatureSample] = [],
                                           epoch: Int = Command.syncEpoch) -> [BulkRecord] {
@@ -323,6 +333,12 @@ public enum BulkSleep {
                 clusterStart = min(clusterStart, p.start)
             }
         }
+        // Cap the window to ONE night: never reach back more than `maxNightSpan` before the wake. Without
+        // this, an all-day-data-bridged "overnight" block (or a prior night's tail chained within
+        // maxIntraNightGap) widens the window past 24 h, its midpoint lands in daytime, and the overnight
+        // gate discards the whole night → no summary persisted (🟢 reproduced 2026-06-30). A real night —
+        // even a long lie-in — fits inside maxNightSpan, so legitimate multi-drain stitching is untouched.
+        clusterStart = max(clusterStart, anchor.end.addingTimeInterval(-maxNightSpan))
         let margin: TimeInterval = 30 * 60   // don't clip onset/wake at detection granularity
         let lo = clusterStart.addingTimeInterval(-margin)
         let hi = anchor.end.addingTimeInterval(margin)
