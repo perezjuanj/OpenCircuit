@@ -2,9 +2,16 @@
 // (calculate_rmssd / rolling_hrv / clean_rr). Device-agnostic time-series math.
 //
 // ⚠️ Whoop-specific INPUT assumption (CLAUDE.md: only analytics port across):
-// these consume per-beat RR intervals in milliseconds. Whether RingConn reports
-// RR at all — and at what cadence — is 🔴 unconfirmed (PROTOCOL.md §5). Wiring
-// these to real ring data is gated on a capture; the math itself is general.
+// these consume per-beat R-R INTERVALS in milliseconds (the time between
+// heartbeats) — NOT to be confused with "respiratory rate" (breaths/min), which
+// IS now 🟢 confirmed and wired (0x4c[7]÷8 → `BulkRecord.respiratoryRate` →
+// HealthKit, PROTOCOL.md §5.3). The ring never exposes raw per-beat R-R
+// intervals: it only ever sends the firmware-FINISHED RMSSD value
+// (`BulkRecord.hrvRMSSD`), so this math has no real input to consume — still
+// 🔴, unrelated to the respiratory-rate decode. Wiring these to real ring data
+// would need a future capture that exposes the raw IBI stream (see #8's
+// `0x47` characterization — close, but not proven to be per-beat); the math
+// itself is general and ready if that ever surfaces.
 //
 // Note vs HealthKit: HealthKit stores HRV as SDNN, but openwhoop computes RMSSD
 // (see HEALTHKIT_MAPPING.md). We port RMSSD faithfully; conversion/choice of what

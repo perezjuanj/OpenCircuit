@@ -156,6 +156,25 @@ everything the ring hasn't handed off, up to the ring's current time.** The curs
 
 ⚠️ **Load-bearing and NOT ground-truthed (🟡): what `FF FF FF FF` actually does.** The official
 app never sends it in any capture, so this is inferred:
+- **New 🟡 signal (2026-06-24, on-device iOS log, FW unspecified): the `0x82` sync-open ACK's
+  `byte[2]` differs by cursor.** Every real-cursor open (`syncUpToNow`, `ch=sleep`/`ch=all-day`)
+  in that session ACKed `82 00 00 82` (byte[2]=`0x00`), reproduced 3×. Every `syncAll`
+  (`FF FF FF FF`) open in the SAME session ACKed `82 00 01 83` (byte[2]=`0x01`), also reproduced
+  3×, on the live-HR and live-SpO2 entry sequences. `PROTOCOL.md` previously documented every
+  `0x82` example as `82 00 00 82` with byte[2] unexamined — this is the first evidence it's not
+  constant. Plausible reading: byte[2] flags whether the open actually had backlog to hand off
+  (`0x00`) vs the skip-backlog/empty case (`0x01`) — which would make it a cheap, synchronous way
+  to confirm `FF FF FF FF` does NOT drain history, independent of the A/B test below. Still 🟡:
+  one session, no confirmation of what byte[2] means when a REAL cursor returns genuinely empty
+  (only ever observed non-empty real-cursor opens so far).
+- **New 🟡 signal (2026-06-28, on-device iOS log): `0x82 byte[1]` appears to flag
+  pointer-at-end (history already consumed).** All-day channel (`0x03`) ACKed `82 ff 00 7d`
+  (byte[1]=`0xff`) in a session where the sleep channel had already been drained by a prior sync.
+  Every prior real-cursor ACK with actual pages to deliver had byte[1]=`0x00` (e.g. `82 00 00 82`).
+  Pattern: **byte[1]=`0x00` → pages will follow; byte[1]=`0xff` → pointer already at end, nothing
+  to stream.** The app now captures this as `sawEmptyHistorySignal` and exits the drain loop after
+  3 s of quiet instead of waiting the full 45 s cap — a ~42 s saving per empty channel. Still 🟡:
+  single session; confirmed for `0x03` (all-day), not yet for `0x00` (sleep).
 - "`FF FF FF FF` → empty" comes only from our `livehr.py` replay — which *also* reused a stale
   `01 01` nonce (§ session-open nuances), a confound, so "empty" might be the nonce, not the
   cursor. (The iOS broken-vs-fixed paths use the **same** hardcoded nonce and differ *only* in

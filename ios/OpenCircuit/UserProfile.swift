@@ -19,11 +19,16 @@ struct UserProfileSettingsView: View {
     // dashboard's authorize button is a post-sync nudge that only appears when there's un-synced
     // history. `health` queries the shared HKHealthStore, so its status matches the dashboard's.
     private let health = HealthKitWriter()
+    private let historyInspector = HealthKitHistoryInspector()
     @State private var healthAuthorized = false
     @State private var healthUnavailable = false
+    @State private var historicalReport: HealthKitHistoryInspector.Report?
+    @State private var historicalCheckError: String?
+    @State private var historicalCheckRunning = false
 
-    // Periodic auto-measure toggle — same UserDefaults key RingSession reads. Default true
-    // (the user opted into periodic measuring); flip off to save ring battery.
+    // Periodic background recording toggle — same UserDefaults key RingSession reads. Default true
+    // so connected sessions keep recording fresh HR/SpO₂ samples without requiring a foreground
+    // live-measure screen; flip off to save ring battery.
     @AppStorage(RingSession.autoMeasureEnabledKey) private var autoMeasureEnabled = true
 
     // Sleep schedule (manual). Persisted as minutes-since-midnight so it's timezone-free
@@ -39,7 +44,6 @@ struct UserProfileSettingsView: View {
     // Daily goals (#77). Keys/defaults shared with GoalsCardView via `GoalDefaults`.
     @AppStorage(GoalDefaults.workdaySteps)    private var workdaySteps    = GoalDefaults.defaultWorkdaySteps
     @AppStorage(GoalDefaults.weekendSteps)    private var weekendSteps    = GoalDefaults.defaultWeekendSteps
-    @AppStorage(GoalDefaults.activeKcal)      private var activeKcalGoal  = GoalDefaults.defaultActiveKcal
     @AppStorage(GoalDefaults.activityMinutes) private var actMinGoal      = GoalDefaults.defaultActivityMinutes
     @AppStorage(GoalDefaults.workdaySleepMin) private var workdaySleepMin = GoalDefaults.defaultWorkdaySleepMin
     @AppStorage(GoalDefaults.weekendSleepMin) private var weekendSleepMin = GoalDefaults.defaultWeekendSleepMin
@@ -51,6 +55,11 @@ struct UserProfileSettingsView: View {
     // Unit preferences (#83). Default to locale-appropriate units out of the box.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
     @AppStorage("units.distance")    private var distUnitRaw = DistanceUnit.localeDefault.rawValue
+
+    // Local calibration server + BP estimate Health writeback.
+    @AppStorage(CalibrationDefaults.baseURLKey) private var calibrationBaseURL = CalibrationDefaults.defaultBaseURL
+    @AppStorage(CalibrationDefaults.apiTokenKey) private var calibrationAPIToken = ""
+    @AppStorage(CalibrationDefaults.autoWriteBPToHealthKey) private var autoWriteBPToHealth = false
 
     // Indoor-workout background keep-alive — shared key with WorkoutSessionManager. Off by default.
     // When on, an indoor workout runs a coarse location session purely to keep the app alive while
@@ -162,15 +171,52 @@ struct UserProfileSettingsView: View {
                     Text("Apple Health isn't available on this device.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                if HealthKitWriter.isAvailable {
+                    Button {
+                        Task { await runHistoricalHealthCheck() }
+                    } label: {
+                        Label("Check historical baseline data", systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90")
+                    }
+                    .disabled(historicalCheckRunning)
+                    if historicalCheckRunning {
+                        ProgressView("Scanning Apple Health history…")
+                            .font(.caption)
+                    }
+                    if let historicalReport {
+                        HistoricalHealthCheckView(report: historicalReport)
+                    } else if let historicalCheckError {
+                        Text(historicalCheckError)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Read the last 30 days of Apple Health history to see whether missing baseline inputs can be recovered there before adding a full reverse import.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
             .task { healthAuthorized = health.isShareAuthorized }
 
             Section("Tracking") {
-                Toggle("Auto-measure HR & SpO₂", isOn: $autoMeasureEnabled)
-                Text("While connected, the ring re-measures heart rate (~every 10 min) and "
-                     + "blood oxygen on its own, so the dashboard stays fresh — like the "
-                     + "official app. Uses more ring battery; turn off to measure only on tap.")
+                Toggle("Auto-record HR & SpO₂", isOn: $autoMeasureEnabled)
+                Text("While connected, OpenCircuit periodically records heart rate (~every 10 min) "
+                     + "and blood oxygen in the background so the app and Apple Health pick up fresh "
+                     + "samples without relying on a live home-screen reading. Uses more ring battery.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section("Calibration server") {
+                TextField("Base URL", text: $calibrationBaseURL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                SecureField("API token (optional)", text: $calibrationAPIToken)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Toggle("Write BP estimates to Apple Health", isOn: $autoWriteBPToHealth)
+                Text("Used by the cuff + PPG calibration flow. OpenCircuit uploads raw PPG to `/ppg/import`, optional ECG to `/ecg/raw-import`, and calibration metadata to `/calibration/session`.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Sleep schedule") {
@@ -193,9 +239,6 @@ struct UserProfileSettingsView: View {
                 Stepper(value: $weekendSteps, in: 1_000...30_000, step: 500) {
                     LabeledContent("Weekend steps", value: weekendSteps.formatted())
                 }
-                Stepper(value: $activeKcalGoal, in: 50...1_500, step: 25) {
-                    LabeledContent("Active calories", value: "\(Int(activeKcalGoal)) kcal")
-                }
                 Stepper(value: $actMinGoal, in: 5...180, step: 5) {
                     LabeledContent("Exercise minutes", value: "\(Int(actMinGoal)) min")
                 }
@@ -205,7 +248,7 @@ struct UserProfileSettingsView: View {
                 Stepper(value: $weekendSleepMin, in: 240...600, step: 15) {
                     LabeledContent("Weekend sleep", value: formatGoalSleep(weekendSleepMin))
                 }
-                Text("Progress rings on the dashboard show today's goal vs. actual. Exercise minutes = elevated-HR minutes (basic threshold estimate), independent of steps/calories.")
+                Text("Progress rings on the dashboard show today's goal vs. actual. Exercise minutes = elevated-HR minutes (basic threshold estimate).")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -401,5 +444,24 @@ struct UserProfileSettingsView: View {
                 minutes.wrappedValue = SleepWindow.minutes(hour: c.hour ?? 0, minute: c.minute ?? 0)
             }
         )
+    }
+
+    private func runHistoricalHealthCheck() async {
+        historicalCheckRunning = true
+        historicalCheckError = nil
+        defer { historicalCheckRunning = false }
+        do {
+            if !healthAuthorized {
+                try await health.requestAuthorization()
+                healthAuthorized = health.isShareAuthorized
+            }
+            historicalReport = try await historyInspector.inspectHistoricalCoverage()
+            if historicalReport?.nightsFound == 0 {
+                historicalCheckError = "No qualifying overnight Apple Health sleep history was found in the last 30 days, or OpenCircuit does not have Health read permission yet."
+            }
+        } catch {
+            historicalReport = nil
+            historicalCheckError = "Couldn't read Apple Health history on this build."
+        }
     }
 }

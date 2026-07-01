@@ -66,9 +66,10 @@ struct ExportView: View {
             }
 
             Section {
-                Text("Exports all stored samples (HR, SpO₂, temperature, HRV, RR), "
-                     + "nightly sleep summaries, and daily step rollups for the selected range. "
-                     + "Data stays on your device and is only shared when YOU tap Export.")
+                Text("Exports the full local ring-data cache for the selected range: scalar vitals, "
+                     + "nightly sleep summaries and extras, intraday step deltas, naps, daytime "
+                     + "temperature, daily rollups, and recent history-sync evidence. Data stays on "
+                     + "your device and is only shared when YOU tap Export.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -104,24 +105,52 @@ struct ExportView: View {
         }
         sampleRows.sort { $0.start < $1.start }
 
-        // Collect sleep summaries
-        let nights = (try? store.recentSleepSummaries(limit: 1_000)) ?? []
-        let sleepRows = nights
-            .filter { $0.night >= rangeStart && $0.night < rangeEnd }
+        // Collect sleep summaries + sleep-side extras
+        let sleepRows = ((try? store.sleepSummaries(from: rangeStart, to: rangeEnd)) ?? [])
             .map {
                 ExportEngine.SleepRow(
                     night: $0.night, asleepMin: $0.asleepMin,
                     deepMin: $0.deepMin, lightMin: $0.lightMin,
                     remMin: $0.remMin, awakeMin: $0.awakeMin,
-                    efficiency: $0.efficiency, skinTempC: $0.skinTempC,
-                    sleepScore: $0.sleepScore, stressScore: $0.stressScore)
+                    efficiency: $0.efficiency,
+                    inBedStart: $0.inBedStart == .distantPast ? nil : $0.inBedStart,
+                    inBedEnd: $0.inBedEnd == .distantPast ? nil : $0.inBedEnd,
+                    skinTempC: $0.skinTempC, sleepScore: $0.sleepScore, stressScore: $0.stressScore,
+                    feelScore: $0.feelScore, hrDeep: $0.hrDeep, hrLight: $0.hrLight,
+                    hrRem: $0.hrRem, hrAwake: $0.hrAwake, movementLevels: $0.movementLevels)
             }
 
-        // Collect daily rollups
-        let dailies = (try? store.recentDailies(limit: 1_000)) ?? []
-        let dailyRows = dailies
-            .filter { $0.day >= rangeStart && $0.day < rangeEnd }
+        // Collect daily rollups + timestamped step deltas
+        let dailyRows = ((try? store.dailies(from: rangeStart, to: rangeEnd)) ?? [])
             .map { ExportEngine.DailyRow(day: $0.day, steps: $0.steps) }
+        let stepSampleRows = ((try? store.stepSamples(from: rangeStart, to: rangeEnd)) ?? [])
+            .map { ExportEngine.StepSampleRow(start: $0.start, end: $0.end, delta: $0.delta) }
+
+        // Collect naps + daytime temperatures
+        let napRows = ((try? store.naps(from: rangeStart, to: rangeEnd)) ?? [])
+            .map {
+                ExportEngine.NapRow(start: $0.start, end: $0.end,
+                                    asleepMin: $0.asleepMin, isLongNap: $0.isLongNap)
+            }
+        let daytimeTemperatureRows = ((try? store.daytimeTemperatures(from: rangeStart, to: rangeEnd)) ?? [])
+            .map { ExportEngine.DaytimeTemperatureRow(time: $0.time, celsius: $0.celsius) }
+
+        // Recent sync-forensics whose capture time falls in the export window
+        let evidenceRows = ObservabilityStore().historySyncEvidence()
+            .filter { $0.date >= rangeStart && $0.date < rangeEnd }
+            .map {
+                ExportEngine.HistorySyncEvidenceRow(
+                    capturedAt: $0.date,
+                    ringID: $0.ringID,
+                    trigger: $0.trigger,
+                    sleepCommitted: $0.sleepCommitted,
+                    stagedSleepSegments: $0.stagedSleepSegments,
+                    mergedRecordCount: $0.mergedRecordCount,
+                    historySampleCount: $0.historySampleCount,
+                    rawRecordBlobBase64: $0.rawRecordBlob.base64EncodedString(),
+                    channels: $0.channels
+                )
+            }
 
         // Serialise
         let content: String
@@ -133,12 +162,24 @@ struct ExportView: View {
                 "",
                 ExportEngine.sleepCSV(sleepRows),
                 "",
-                ExportEngine.dailyCSV(dailyRows)
+                ExportEngine.dailyCSV(dailyRows),
+                "",
+                ExportEngine.stepSamplesCSV(stepSampleRows),
+                "",
+                ExportEngine.napsCSV(napRows),
+                "",
+                ExportEngine.daytimeTemperatureCSV(daytimeTemperatureRows),
+                "",
+                ExportEngine.historySyncEvidenceCSV(evidenceRows)
             ].joined(separator: "\n")
             ext = "csv"
         case .json:
             guard let json = ExportEngine.toJSON(samples: sampleRows, sleep: sleepRows,
-                                                  daily: dailyRows) else {
+                                                 daily: dailyRows,
+                                                 stepSamples: stepSampleRows,
+                                                 naps: napRows,
+                                                 daytimeTemperatures: daytimeTemperatureRows,
+                                                 historySyncEvidence: evidenceRows) else {
                 errorMessage = "Failed to serialise JSON — please try again."
                 return
             }
@@ -171,7 +212,8 @@ struct ExportView: View {
 // MARK: - UIActivityViewController bridge
 
 /// Wraps `UIActivityViewController` for the system share sheet (iOS 17 compatible).
-private struct ShareActivityView: UIViewControllerRepresentable {
+/// Internal (not file-private) — also reused by the Debug card's raw-capture export (ContentView).
+struct ShareActivityView: UIViewControllerRepresentable {
     let url: URL
 
     func makeUIViewController(context: Context) -> UIActivityViewController {

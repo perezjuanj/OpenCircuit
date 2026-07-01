@@ -7,10 +7,15 @@
 // readings — and EXCLUDES the overnight sleep window to avoid counting sleeping
 // elevated HR as voluntary exercise.
 //
-// ⚠️ The FULL 4-level intensity mapping (Vigorous/Moderate/Low/Inactive minutes)
-// is GATED on the activity-epoch decode (#93). That payload at 0x4c[15:22] carries
-// the true per-epoch activity intensity; do NOT invent 4 intensity buckets from
-// the basic HR threshold alone. This file is the basic-threshold placeholder only.
+// ⚠️ The FULL 4-level intensity mapping (Vigorous/Moderate/Low/Inactive minutes) is
+// GATED on the *separate, still-uncaptured* 历史活动响应 activity record (#93,
+// PROTOCOL.md §5.3.1) — NOT on 0x4c[15:22], which is just the tail of the
+// already-decoded `acti_counts` intensity blob on the MEASUREMENT record we already
+// have (a same-record "is it moving" signal, not 4 calibrated bands). Do not invent
+// 4 intensity buckets from the basic HR threshold alone. This file is the
+// basic-threshold placeholder until that capture (sync-open `byte[6]=0x02`, see
+// `RingSession.probeActivityChannels`) lands and the bands can be calibrated against
+// the app's own per-day readout.
 //
 // HealthKit target: `.appleExerciseTime` (written by HealthKitWriter as a delta,
 // not stored as a ring sample in LocalStore).
@@ -20,7 +25,8 @@ import Foundation
 public enum ExerciseMinutes {
 
     /// HR threshold for exercise: ≥ 50% of max HR (brisk-walking equivalent).
-    /// NOTE: Full 4-level intensity (Vigorous/Moderate/Low/Inactive) follows #93 decode.
+    /// NOTE: Full 4-level intensity (Vigorous/Moderate/Low/Inactive) follows the #93
+    /// activity-record capture (PROTOCOL.md §5.3.1), not the current measurement record.
     public static func threshold(maxHR: Int) -> Int {
         return max(Int(Double(max(maxHR, 1)) * 0.5), 60)
     }

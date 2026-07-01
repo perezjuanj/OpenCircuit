@@ -16,6 +16,8 @@ struct VitalsStatusCardView: View {
     @Query private var hrvSamples: [StoredSample]
     /// Trailing nights for the canonical skin-temp baseline/offset (#69).
     @Query private var sleepNights: [StoredSleepSummary]
+    private let healthBaselineReader = HealthKitVitalsBaselineReader()
+    @State private var healthBaselineReport: HealthKitVitalsBaselineReader.Report?
 
     private static let historyDays = 32
 
@@ -74,6 +76,10 @@ struct VitalsStatusCardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding()
         .background(RoundedRectangle(cornerRadius: 16).fill(Color(.secondarySystemGroupedBackground)))
+        .task {
+            guard healthBaselineReport == nil else { return }
+            healthBaselineReport = try? await healthBaselineReader.loadReport(lookbackDays: Self.historyDays)
+        }
     }
 
     // MARK: Report
@@ -81,21 +87,41 @@ struct VitalsStatusCardView: View {
     /// The Vitals Status report for the latest day, or nil until at least one vital has enough
     /// baseline history. Pure logic lives in OpenCircuitKit.VitalsBaseline; this assembles its inputs.
     private var report: VitalsBaseline.Report? {
+        let config = VitalsBaseline.Config()
         var inputs: [VitalsBaseline.VitalInput] = []
-        if let i = vitalInput(.restingHR, dailySeries(restingHRDaily())) { inputs.append(i) }
-        if let i = vitalInput(.overnightSpO2, dailySeries(dailyMeans(spo2Samples, scale: 100))) { inputs.append(i) }
-        if let i = vitalInput(.overnightHRV, dailySeries(dailyMeans(hrvSamples, scale: 1))) { inputs.append(i) }
-        let offset = skinTempOffset()
+        if let i = vitalInput(.restingHR, localDays: restingHRDaily(),
+                              fallback: healthBaselineReport?.restingHR,
+                              config: config) { inputs.append(i) }
+        if let i = vitalInput(.overnightSpO2, localDays: dailyMeans(spo2Samples, scale: 100),
+                              fallback: healthBaselineReport?.overnightSpO2,
+                              config: config) { inputs.append(i) }
+        if let i = vitalInput(.overnightHRV, localDays: dailyMeans(hrvSamples, scale: 1),
+                              fallback: healthBaselineReport?.overnightHRV,
+                              config: config) { inputs.append(i) }
+        let offset = skinTempOffset() ?? healthBaselineReport?.skinTempOffsetC
         guard !inputs.isEmpty || offset != nil else { return nil }
-        return VitalsBaseline.report(inputs, skinTempOffsetC: offset)
+        return VitalsBaseline.report(inputs, skinTempOffsetC: offset, config: config)
     }
 
-    /// Build a VitalInput from a chronological (today-last) series, requiring enough prior days.
+    /// Build a VitalInput from local history first, falling back to Apple Health history when the
+    /// local store has not yet accumulated enough baseline days.
     private func vitalInput(_ vital: VitalsBaseline.Vital,
-                            _ series: [Double]) -> VitalsBaseline.VitalInput? {
+                            localDays: [(day: Date, value: Double)],
+                            fallback: [HealthKitVitalsBaselineReader.DailyValue]?,
+                            config: VitalsBaseline.Config) -> VitalsBaseline.VitalInput? {
+        let localSeries = dailySeries(localDays)
+        if let input = vitalInput(vital, series: localSeries, config: config) { return input }
+        let fallbackSeries = fallback?.sorted { $0.day < $1.day }.map(\.value) ?? []
+        return vitalInput(vital, series: fallbackSeries, config: config)
+    }
+
+    /// Build a VitalInput from a chronological (oldest→newest) series, requiring enough prior days.
+    private func vitalInput(_ vital: VitalsBaseline.Vital,
+                            series: [Double],
+                            config: VitalsBaseline.Config) -> VitalsBaseline.VitalInput? {
         guard let today = series.last else { return nil }
         let prior = Array(series.dropLast())
-        guard prior.count >= VitalsBaseline.Config().minBaselineDays else { return nil }
+        guard prior.count >= config.minBaselineDays else { return nil }
         return VitalsBaseline.VitalInput(vital: vital, today: today, prior: prior)
     }
 

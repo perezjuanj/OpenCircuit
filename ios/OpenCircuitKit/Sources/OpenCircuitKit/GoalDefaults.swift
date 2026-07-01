@@ -18,9 +18,6 @@ public enum GoalDefaults {
     public static let workdaySteps    = "goals.workdaySteps"
     public static let weekendSteps    = "goals.weekendSteps"
 
-    // Active calories — single goal (no weekday/weekend in APK data)
-    public static let activeKcal      = "goals.activeKcal"
-
     // Activity / exercise duration minutes — single goal
     public static let activityMinutes = "goals.activityMinutes"
 
@@ -31,7 +28,6 @@ public enum GoalDefaults {
     // Defaults
     public static let defaultWorkdaySteps    = 8_000
     public static let defaultWeekendSteps    = 10_000
-    public static let defaultActiveKcal      = 300.0
     public static let defaultActivityMinutes = 30.0          // WHO: 150 min/week ÷ 5
     public static let defaultWorkdaySleepMin = 7 * 60        // 7 h
     public static let defaultWeekendSleepMin = 8 * 60        // 8 h
@@ -86,21 +82,18 @@ public struct GoalProgress: Equatable, Sendable {
     public var met: Bool { current >= goal && goal > 0 }
 }
 
-/// Today's progress across all four tracked goals.
+/// Today's progress across the tracked goals.
 public struct DailyGoalProgress: Equatable, Sendable {
     public let steps: GoalProgress
-    public let activeKcal: GoalProgress
     public let activityMinutes: GoalProgress
     public let sleepMinutes: GoalProgress   // last night's sleep vs. tonight's goal
 
     public init(
         steps: GoalProgress,
-        activeKcal: GoalProgress,
         activityMinutes: GoalProgress,
         sleepMinutes: GoalProgress
     ) {
         self.steps = steps
-        self.activeKcal = activeKcal
         self.activityMinutes = activityMinutes
         self.sleepMinutes = sleepMinutes
     }

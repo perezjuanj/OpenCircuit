@@ -23,13 +23,43 @@ struct TaskRecord: Codable, Identifiable, Equatable {
     var detail: String?
 }
 
+/// One persisted metric-capture / persistence diagnostic event. Kept lightweight and bounded so
+/// "captured but not stored" incidents survive beyond the transient Xcode/unified log.
+struct MetricRecord: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var date: Date
+    var source: String
+    var detail: String
+}
+
+/// One persisted history-sync evidence bundle. Kept separate from the human-readable activity log:
+/// this is a machine-oriented breadcrumb for "why did sleep not land?" incidents.
+struct HistorySyncEvidence: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var date: Date
+    var ringID: String
+    var trigger: String
+    var sleepCommitted: Bool
+    var stagedSleepSegments: Int
+    var mergedRecordCount: Int
+    var historySampleCount: Int
+    var channels: [HistoryChannelTrace]
+    /// Reconstructed raw 0x4c records captured this sync (fixed 23-byte records concatenated).
+    /// Stored for a few days so a failed overnight sync can be replayed/analyzed later.
+    var rawRecordBlob: Data
+}
+
 /// Reads/writes the observability timestamps + bounded outcome log in UserDefaults.
 struct ObservabilityStore {
     private let defaults: UserDefaults
     init(_ defaults: UserDefaults = .standard) { self.defaults = defaults }
 
-    /// Keep the last N outcomes (newest survive — see `BoundedLog`). Small: this is a debug aid.
-    static let logLimit = 40
+    /// Keep the last N outcomes (newest survive — see `BoundedLog`).
+    /// 200 task records covers ~30+ days at typical iOS background-task rates.
+    static let logLimit = 200
+    static let metricLogLimit = 400
+    static let historySyncEvidenceLimit = 24
+    static let historySyncEvidenceRetention: TimeInterval = 3 * 24 * 3600
 
     private enum Key {
         static let lastSync = "obs.lastSuccessfulSync"
@@ -37,6 +67,8 @@ struct ObservabilityStore {
         static let bgLastRun = "obs.bgLastRun"
         static let bgLastScheduled = "obs.bgLastScheduled"
         static let log = "obs.taskLog"
+        static let metricLog = "obs.metricLog"
+        static let historySyncEvidence = "obs.historySyncEvidence"
         static let alertFired = "obs.alertLastFired"        // [SyncAlert.rawValue: epoch]
         static let healthEverAuthorized = "obs.healthEverAuthorized"
     }
@@ -88,9 +120,53 @@ struct ObservabilityStore {
         return list
     }
 
+    func records(since cutoff: Date) -> [TaskRecord] {
+        records().filter { $0.date >= cutoff }
+    }
+
     private func append(_ record: TaskRecord) {
         let capped = BoundedLog.appendCapped(record, to: records(), limit: Self.logLimit)
         if let data = try? JSONEncoder().encode(capped) { defaults.set(data, forKey: Key.log) }
+    }
+
+    // MARK: Metric persistence breadcrumbs
+
+    func metricRecords() -> [MetricRecord] {
+        guard let data = defaults.data(forKey: Key.metricLog),
+              let list = try? JSONDecoder().decode([MetricRecord].self, from: data) else { return [] }
+        return list
+    }
+
+    func metricRecords(since cutoff: Date) -> [MetricRecord] {
+        metricRecords().filter { $0.date >= cutoff }
+    }
+
+    func recordMetricEvent(source: String, detail: String, at now: Date = Date()) {
+        let record = MetricRecord(date: now, source: source, detail: detail)
+        let capped = BoundedLog.appendCapped(record, to: metricRecords(), limit: Self.metricLogLimit)
+        if let data = try? JSONEncoder().encode(capped) {
+            defaults.set(data, forKey: Key.metricLog)
+        }
+    }
+
+    // MARK: History-sync evidence
+
+    func historySyncEvidence() -> [HistorySyncEvidence] {
+        guard let data = defaults.data(forKey: Key.historySyncEvidence),
+              let list = try? JSONDecoder().decode([HistorySyncEvidence].self, from: data) else { return [] }
+        return list
+    }
+
+    func recordHistorySyncEvidence(_ entry: HistorySyncEvidence, at now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-Self.historySyncEvidenceRetention)
+        var rows = historySyncEvidence().filter { $0.date >= cutoff }
+        rows.append(entry)
+        if rows.count > Self.historySyncEvidenceLimit {
+            rows.removeFirst(rows.count - Self.historySyncEvidenceLimit)
+        }
+        if let data = try? JSONEncoder().encode(rows) {
+            defaults.set(data, forKey: Key.historySyncEvidence)
+        }
     }
 
     // MARK: Alert debounce persistence (consumed by SyncAlertPolicy)

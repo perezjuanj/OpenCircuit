@@ -17,16 +17,12 @@ struct GoalsCardView: View {
     // MARK: Goal settings (shared with UserProfileSettingsView / GoalDefaults)
     @AppStorage(GoalDefaults.workdaySteps)    private var workdaySteps    = GoalDefaults.defaultWorkdaySteps
     @AppStorage(GoalDefaults.weekendSteps)    private var weekendSteps    = GoalDefaults.defaultWeekendSteps
-    @AppStorage(GoalDefaults.activeKcal)      private var activeKcalGoal  = GoalDefaults.defaultActiveKcal
     @AppStorage(GoalDefaults.activityMinutes) private var actMinGoal      = GoalDefaults.defaultActivityMinutes
     @AppStorage(GoalDefaults.workdaySleepMin) private var workdaySleepMin = GoalDefaults.defaultWorkdaySleepMin
     @AppStorage(GoalDefaults.weekendSleepMin) private var weekendSleepMin = GoalDefaults.defaultWeekendSleepMin
 
-    // Profile (for maxHR → exercise threshold, and the step/distance active-calorie estimate)
+    // Profile (for maxHR → exercise threshold)
     @AppStorage("userProfile.age") private var age = 35
-    @AppStorage("userProfile.weightKg") private var weightKg = 70.0
-    @AppStorage("userProfile.heightCm") private var heightCm = 170.0
-    @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
 
     // MARK: Data queries (bounded — no unbounded fetches)
     /// Today's step rollup.
@@ -44,9 +40,8 @@ struct GoalsCardView: View {
             filter: #Predicate<StoredDaily> { $0.day == dayStart },
             sort: \.day)
 
-        // Count ALL of today's HR (no upper-hour cap) so this card matches CaloriesCardView and
-        // doesn't lag up to 59 min behind it — e.g. right after an on-demand measurement. The
-        // stable `dayStart` lower bound already keeps the @Query descriptor stable.
+        // Count ALL of today's HR (no upper-hour cap) so a fresh on-demand measurement is visible
+        // immediately. The stable `dayStart` lower bound already keeps the @Query descriptor stable.
         _todayHR = Query(FetchDescriptor<StoredSample>(
             predicate: #Predicate { $0.kindRaw == hrKind && $0.start >= dayStart && $0.value > 0 },
             sortBy: [SortDescriptor(\.start, order: .forward)]))
@@ -64,20 +59,6 @@ struct GoalsCardView: View {
     }
 
     private var currentSteps: Int { todayDaily.first?.steps ?? 0 }
-
-    private var profile: UserProfile {
-        UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
-                    sex: BiologicalSex(rawValue: sexRaw) ?? .male)
-    }
-
-    /// Active kcal today — the larger of the HR-TRIMP estimate (sparse; ~0 without dense HR) and a
-    /// step/distance estimate, so a day with walking still shows nonzero active calories. Estimate.
-    private var currentActiveKcal: Double {
-        let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: max(220 - age, 1))
-        let stepKcal = Calories.activeKcalFromSteps(steps: currentSteps, profile: profile)
-        return max(hrKcal, stepKcal)
-    }
 
     private var currentActivityMin: Double {
         let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
@@ -98,7 +79,6 @@ struct GoalsCardView: View {
     private var progress: DailyGoalProgress {
         DailyGoalProgress(
             steps:           GoalProgress(current: Double(currentSteps),     goal: Double(stepsGoal)),
-            activeKcal:      GoalProgress(current: currentActiveKcal,        goal: activeKcalGoal),
             activityMinutes: GoalProgress(current: currentActivityMin,       goal: actMinGoal),
             sleepMinutes:    GoalProgress(current: Double(lastNightSleepMin), goal: Double(sleepGoalMin))
         )
@@ -118,13 +98,8 @@ struct GoalsCardView: View {
                          current: "\(currentSteps.formatted())",
                          goal: "\(stepsGoal.formatted())",
                          color: .green)
-                goalRing(progress: progress.activeKcal,
-                         label: "Active kcal\u{B9}",
-                         current: "\(Int(currentActiveKcal))",
-                         goal: "\(Int(activeKcalGoal))",
-                         color: .orange)
                 goalRing(progress: progress.activityMinutes,
-                         label: "Exercise min\u{B9}",
+                         label: "Exercise min",
                          current: "\(Int(currentActivityMin))",
                          goal: "\(Int(actMinGoal))",
                          color: .blue)
@@ -134,7 +109,7 @@ struct GoalsCardView: View {
                          goal: formatDuration(sleepGoalMin),
                          color: .purple)
             }
-            Text("\u{B9} Active calories & exercise minutes are estimates (active kcal from heart rate where available, else steps × distance; exercise minutes from an elevated-HR threshold — independent of steps). Full accuracy follows the ring activity-payload decode.")
+            Text("Exercise minutes are estimated from elevated heart-rate time. Full activity accuracy follows the ring activity-payload decode.")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

@@ -217,7 +217,7 @@ final class RingScanner: NSObject {
     func stopBrowsing() {
         choosingRing = false
         clearDiscovery()
-        central.stopScan()
+        if central.state == .poweredOn { central.stopScan() }   // CB calls are UB before powered-on
     }
 
     /// Connect to a specific discovered ring — a picker tap, or the auto-connect of a lone match.
@@ -228,6 +228,10 @@ final class RingScanner: NSObject {
         resetReconnectBackoff()   // drop any pending backoff reconnect to the previous ring (#multi-ring)
         selectionDebounce?.cancel(); selectionDebounce = nil
         scanTimeoutTask?.cancel(); scanTimeoutTask = nil
+        // CB calls are UB before powered-on — guard them (same as stop()/disconnect()). This is a
+        // user picker tap: Bluetooth could have been toggled off in the gap between discovery and
+        // the tap, unlike the other call sites here whose calling context already implies poweredOn.
+        guard central.state == .poweredOn else { return }
         central.stopScan()
         // Switching from a DIFFERENT live ring (the in-app picker scans without dropping the current
         // link): tear the old one down first so we don't leak its connection / run two sessions. The
@@ -275,7 +279,7 @@ final class RingScanner: NSObject {
             guard let self, !Task.isCancelled else { return }
             guard case .scanning = self.state, self.discovered.isEmpty else { return }
             self.selectionDebounce?.cancel(); self.selectionDebounce = nil
-            self.central.stopScan()
+            if self.central.state == .poweredOn { self.central.stopScan() }
             self.state = .idle
         }
     }
@@ -289,8 +293,10 @@ final class RingScanner: NSObject {
         // launch (reconnect-by-identifier only re-arms while a ring is active). The ring stays in the
         // remembered set so it's still one tap away in the picker. (Reviewer MINOR.)
         Self.activePeripheralID = nil
-        central.stopScan()
-        if let target { central.cancelPeripheralConnection(target) }
+        if central.state == .poweredOn {   // CB calls are UB before powered-on
+            central.stopScan()
+            if let target { central.cancelPeripheralConnection(target) }
+        }
         if case .scanning = state { state = .idle }
     }
 
@@ -301,7 +307,7 @@ final class RingScanner: NSObject {
         resetReconnectBackoff()
         clearDiscovery()
         choosingRing = false
-        central.stopScan()
+        if central.state == .poweredOn { central.stopScan() }   // CB calls are UB before powered-on
         if case .scanning = state { state = .idle }
     }
 
@@ -358,6 +364,7 @@ final class RingScanner: NSObject {
         wantConnection = true
         target = peripheral
         state = .connecting(peripheral.name ?? "RingConn")
+        guard central.state == .poweredOn else { return false }
         central.connect(peripheral)
         return true
     }
@@ -375,9 +382,14 @@ final class RingScanner: NSObject {
         resetReconnectBackoff()   // user stop: drop any pending backoff reconnect (#35)
         clearDiscovery()          // abandon any in-flight foreground scan / picker
         choosingRing = false
-        central.stopScan()
-        if let target {
-            central.cancelPeripheralConnection(target)
+        // CB commands are UB (API-MISUSE-logged, no-op) before `.poweredOn` — guard them; the local
+        // intent flags above/below still apply regardless, so a pre-power-on call still tears down
+        // our own state correctly, it just has nothing live to tell the radio to stop/cancel.
+        if central.state == .poweredOn {
+            central.stopScan()
+            if let target {
+                central.cancelPeripheralConnection(target)
+            }
         }
         teardownSession()         // cancel all of the session's tasks, not just the live poll (#42)
         target = nil
@@ -392,10 +404,36 @@ final class RingScanner: NSObject {
     /// suspension. (Reviewer MAJOR fix.)
     private func endBackgroundReadRearming() {
         teardownSession()   // stopLiveMonitoring + cancel keepalive/auto-measure/sync tasks (#42)
-        if let target { central.cancelPeripheralConnection(target) }
+        // CB calls are UB before powered-on — guard them, same as stop()/disconnect() (API MISUSE
+        // otherwise: this runs at the end of a background read, exactly when the radio's power
+        // state is most likely to be in flux).
+        if central.state == .poweredOn, let target {
+            central.cancelPeripheralConnection(target)
+        }
         target = nil
         state = .idle
         reconnectKnownPeripheral()   // re-arm the standing pending connect (no scan)
+    }
+
+    /// Load the last committed sleep segments for the active ring from the persisted archive.
+    /// Returns ([], []) when no ring has been connected yet or nothing was ever committed.
+    /// Used by `ContentView.flushHealth()` as a fallback when `session?.stagedSegments` is empty
+    /// (session nil or fresh reconnect after teardown) — ensures a previously-drained night still
+    /// reaches HealthKit even if the session that drained it is long gone.
+    func loadLastCommittedSleepSegments() -> (coarse: [SleepSegment], staged: [SleepSegment]) {
+        // Prefer the live session's store (avoids a UserDefaults round-trip when connected).
+        if let session { return session.epochArchiveStore.loadPendingSleepSegments() }
+        // Fall back to the active ring's persisted store when disconnected.
+        guard let ringID = Self.activePeripheralID else { return ([], []) }
+        return EpochArchiveStore(namespace: ringID).loadPendingSleepSegments()
+    }
+
+    /// Clear the persisted pending segments after a confirmed HealthKit write, so the slot
+    /// doesn't accumulate a stale night across ring switches or months of data.
+    func clearLastCommittedSleepSegments() {
+        if let session { session.epochArchiveStore.clearPendingSleepSegments(); return }
+        guard let ringID = Self.activePeripheralID else { return }
+        EpochArchiveStore(namespace: ringID).clearPendingSleepSegments()
     }
 
     /// What a bounded background read captured. The background read runs the SAME two-channel
@@ -490,7 +528,7 @@ extension RingScanner: CBCentralManagerDelegate {
                 if self.reconnectWhenPoweredOn {
                     self.reconnectWhenPoweredOn = false
                     if let target = self.target {
-                        self.central.connect(target)
+                        if self.central.state == .poweredOn { self.central.connect(target) }
                     } else {
                         self.reconnectKnownPeripheral()
                     }
@@ -568,10 +606,10 @@ extension RingScanner: CBCentralManagerDelegate {
         Task { @MainActor in
             guard self.allowPicker else {
                 // Background / service-filtered scan: no UI — connect on the first match.
-                self.central.stopScan()
+                if self.central.state == .poweredOn { self.central.stopScan() }
                 self.target = peripheral
                 self.state = .connecting(name)
-                self.central.connect(peripheral)
+                if self.central.state == .poweredOn { self.central.connect(peripheral) }
                 return
             }
             // Foreground: accumulate distinct rings, then debounce → auto-connect one / show a picker.
@@ -598,7 +636,7 @@ extension RingScanner: CBCentralManagerDelegate {
             // after a cold launch or background relaunch.
             self.target = peripheral
             Self.rememberRing(peripheral.identifier.uuidString)
-            self.central.stopScan()  // defensive: a reconnect/restoration connect may land mid-scan
+            if self.central.state == .poweredOn { self.central.stopScan() }  // defensive: a reconnect/restoration connect may land mid-scan
             self.clearDiscovery()    // scan succeeded — drop the discovery set / picker
             // A connect landed — stop any pending backoff timer and clear the calm "unreachable"
             // note. (We don't reset the attempt COUNT yet: a charging ring can connect then

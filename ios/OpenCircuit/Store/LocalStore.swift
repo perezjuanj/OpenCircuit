@@ -184,10 +184,10 @@ final class StoredDaily {
     @Attribute(.unique) var day: Date = Date.distantPast
     var steps: Int = 0
     var updatedAt: Date = Date.distantPast
-    /// Running step total already written to Apple Health for this day. The next Health
-    /// write pushes only `steps - healthWrittenSteps` as a stepCount sample, so HealthKit
-    /// (which SUMS stepCount) lands on the daily total instead of overcounting on every
-    /// sync. Defaulted for lightweight migration of stores written before this column.
+    /// SUPERSEDED as the Health-write gate by `StoredStepSample.healthWritten` (#steps-history)
+    /// — Health now receives each timestamped snapshot individually rather than one per-day
+    /// delta off this watermark. Kept (frozen, no longer written) only so existing stores don't
+    /// need a destructive migration; safe to ignore when reasoning about what's in Health.
     var healthWrittenSteps: Int = 0
 
     init(day: Date, steps: Int = 0, updatedAt: Date = Date(), healthWrittenSteps: Int = 0) {
@@ -195,6 +195,29 @@ final class StoredDaily {
         self.steps = steps
         self.updatedAt = updatedAt
         self.healthWrittenSteps = healthWrittenSteps
+    }
+}
+
+/// One timestamped step DELTA as actually observed off the ring's `0x10/0x87` descriptor
+/// counter (#steps-history). Unlike `StoredDaily` (a single running per-day total with no
+/// timing info), `start`/`end` bound the window this delta was folded over, so:
+///   - Apple Health receives a narrow, correctly-timed `stepCount` sample instead of one
+///     `startOfDay→now` write that HealthKit's hourly view would smear evenly across every
+///     elapsed hour of the day.
+///   - A Trends/table view can show the actual intraday step shape, not just a daily total.
+/// Append-only, no unique key — many rows per day are expected.
+@Model
+final class StoredStepSample {
+    var start: Date = Date.distantPast
+    var end: Date = Date.distantPast
+    var delta: Int = 0
+    var healthWritten: Bool = false
+
+    init(start: Date, end: Date, delta: Int, healthWritten: Bool = false) {
+        self.start = start
+        self.end = end
+        self.delta = delta
+        self.healthWritten = healthWritten
     }
 }
 
@@ -225,11 +248,38 @@ final class StoredNap {
     var durationMin: Int { max(Int(end.timeIntervalSince(start) / 60), 0) }
 }
 
+/// A DAYTIME skin-temp reading, kept entirely separate from the nightly `StoredSleepSummary
+/// .skinTempC` baseline and from Apple Health (#41 deliberately blocks daytime readings from
+/// that path — mixing them in would skew the nightly cycle-tracking baseline and mis-report a
+/// daytime spot reading as the night's value). This table exists purely so the Trends UI can
+/// show a true intraday temperature line; it is re-derivable from the ring's live descriptor
+/// stream (not backed up before a schema-wipe, like `StoredSample`) and pruned on the same
+/// retention window. Every column is defaulted for SwiftData lightweight migration (cf. #21).
+@Model
+final class StoredDaytimeTemp {
+    var time: Date = Date.distantPast
+    var celsius: Double = 0
+
+    init(time: Date, celsius: Double) {
+        self.time = time
+        self.celsius = celsius
+    }
+}
+
 @MainActor
 struct LocalStore {
     let context: ModelContext
 
     init(_ context: ModelContext) { self.context = context }
+
+    struct IngestPreview: Equatable {
+        var inputCount = 0
+        var plausibleCount = 0
+        var freshCount = 0
+        var duplicateCount = 0
+        var invalidTimestampCount = 0
+        var invalidHeartRateCount = 0
+    }
 
     /// The store-ingest cursor rows (live `@Model` objects, so mutating `.last` updates the
     /// context). Skips the `hk:`-prefixed HealthKit-watermark rows (see `pendingHealthSamples`)
@@ -238,6 +288,37 @@ struct LocalStore {
     private func storeCursorRows() throws -> [StoredCursor] {
         try context.fetch(FetchDescriptor<StoredCursor>())
             .filter { !$0.kindRaw.hasPrefix(Self.healthCursorPrefix) }
+    }
+
+    /// Dry-run of `ingest(_:)` for logging/observability. Lets the caller tell whether a captured
+    /// sample would be rejected as implausible or duplicate before the real write runs.
+    func previewIngest(_ samples: [QuantitySample], now: Date = Date()) throws -> IngestPreview {
+        let rows = try storeCursorRows()
+        let cursor = SyncCursor(lastByKind: Dictionary(uniqueKeysWithValues: rows.map { ($0.kindRaw, $0.last) }))
+
+        var preview = IngestPreview()
+        preview.inputCount = samples.count
+        var plausible: [QuantitySample] = []
+        plausible.reserveCapacity(samples.count)
+
+        let epochFloor = Date(timeIntervalSince1970: TimeInterval(Command.syncEpoch))
+        let futureCeiling = now.addingTimeInterval(86_400)
+        for s in samples {
+            if s.start < epochFloor || s.start > futureCeiling {
+                preview.invalidTimestampCount += 1
+                continue
+            }
+            if s.kind == .heartRate, !LiveHR.validBPM.contains(Int(s.value)) {
+                preview.invalidHeartRateCount += 1
+                continue
+            }
+            plausible.append(s)
+        }
+
+        preview.plausibleCount = plausible.count
+        preview.freshCount = cursor.selectNewStaged(plausible).fresh.count
+        preview.duplicateCount = max(preview.plausibleCount - preview.freshCount, 0)
+        return preview
     }
 
     /// Rebuild the in-memory SyncCursor from persisted rows.
@@ -261,8 +342,18 @@ struct LocalStore {
         for r in rows { rowByKind[r.kindRaw] = r }
         let cursor = SyncCursor(lastByKind: rowByKind.mapValues(\.last))
 
+        // Plausibility BEFORE the cursor ever sees these samples. A SyncCursor only moves
+        // FORWARD (never resets), so a single corrupted-timestamp sample (e.g. a misaligned
+        // bulk-page parse computing a date decades off) or an out-of-band HR value advancing a
+        // kind's watermark would silently block every later LEGITIMATE sample of that kind
+        // forever — exactly what happened to `.heartRate` (and, transitively, sleep staging,
+        // which can't run without HR). Filtering here, before `selectNewStaged`, means a sample
+        // that's about to be discarded can never poison the watermark in the first place. (See
+        // `repairFutureSyncCursors` for undoing damage from before this reordering existed.)
+        let plausible = samples.filter { Self.isPlausible($0) }
+
         // Stage the advance — don't touch the persisted cursor until the save commits (#22).
-        let (fresh, advanced) = cursor.selectNewStaged(samples)
+        let (fresh, advanced) = cursor.selectNewStaged(plausible)
         guard !fresh.isEmpty else { return [] }
 
         var cumulativeStates: [MetricKind: CumulativeMetricState] = [:]
@@ -270,13 +361,6 @@ struct LocalStore {
         var ingested: [QuantitySample] = []
 
         for s in fresh {
-            // Single ingest choke point for HR plausibility: drop heart-rate samples outside
-            // LiveHR.validBPM (30…220), including 0-bpm placeholders. This protects EVERY store
-            // consumer and the Apple Health mirror, present and future — covering paths the
-            // sleep-vitals decoder guard doesn't (e.g. EpochSync value-0 placeholders). The cursor
-            // still advances (computed above) so a skipped garbage sample isn't re-ingested.
-            if s.kind == .heartRate, !LiveHR.validBPM.contains(Int(s.value)) { continue }
-
             guard s.kind.isCumulativeCounter else {
                 context.insert(StoredSample(s))
                 ingested.append(s)
@@ -339,6 +423,22 @@ struct LocalStore {
         return ingested
     }
 
+    /// Single ingest choke point for sample plausibility, checked BEFORE the SyncCursor — see the
+    /// ordering note in `ingest`. Two independent gates:
+    /// - TIMESTAMP: reject any sample whose `start` predates the ring's own counter epoch
+    ///   (2019-12-31 — nothing real can be older) or sits implausibly far in the future
+    ///   (clock-skew tolerance). Catches a corrupted epoch-counter decode that would otherwise
+    ///   surface as something like "13y ago" — or, worse, decades in the FUTURE.
+    /// - HEART RATE: reject values outside `LiveHR.validBPM` (30…220), including 0-bpm
+    ///   placeholders — covers paths the sleep-vitals decoder guard doesn't (e.g. EpochSync
+    ///   value-0 placeholders).
+    private static func isPlausible(_ s: QuantitySample, now: Date = Date()) -> Bool {
+        let epochFloor = Date(timeIntervalSince1970: TimeInterval(Command.syncEpoch))
+        guard s.start >= epochFloor, s.start <= now.addingTimeInterval(86_400) else { return false }
+        if s.kind == .heartRate, !LiveHR.validBPM.contains(Int(s.value)) { return false }
+        return true
+    }
+
     // MARK: Retention (#32)
     //
     // Days of raw `StoredSample` history kept on-device. Older epochs are pruned — the data
@@ -356,7 +456,28 @@ struct LocalStore {
         let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: now) ?? now
         try context.delete(model: StoredSample.self,
                            where: #Predicate { $0.start < cutoff })
+        try context.delete(model: StoredDaytimeTemp.self,
+                           where: #Predicate { $0.time < cutoff })
+        try context.delete(model: StoredStepSample.self,
+                           where: #Predicate { $0.start < cutoff })
         try context.save()
+    }
+
+    /// Record one DAYTIME skin-temp reading (Trends-only — see `StoredDaytimeTemp`). Plain
+    /// insert, no upsert: readings are frequent and timestamped, so duplicates aren't a
+    /// dedup concern the way a single nightly summary row is.
+    func recordDaytimeTemperature(_ celsius: Double, at time: Date) throws {
+        context.insert(StoredDaytimeTemp(time: time, celsius: celsius))
+        try context.save()
+    }
+
+    /// Daytime skin-temp readings in `[start, end)`, oldest first.
+    func daytimeTemperatures(from start: Date, to end: Date) throws -> [StoredDaytimeTemp] {
+        let descriptor = FetchDescriptor<StoredDaytimeTemp>(
+            predicate: #Predicate { $0.time >= start && $0.time < end },
+            sortBy: [SortDescriptor(\.time)]
+        )
+        return try context.fetch(descriptor)
     }
 
     /// One-time cleanup: delete physiologically-impossible heart-rate samples — those outside
@@ -377,6 +498,77 @@ struct LocalStore {
         for row in stale { context.delete(row) }
         try context.save()
         return stale.count
+    }
+
+    /// One-time scrub for samples with an implausible TIMESTAMP, predating the `ingest` epoch
+    /// guard added alongside it. A single misaligned bulk-page parse can mint a sample dated years
+    /// off (e.g. before the ring's own counter epoch), which then surfaces as something like "13y
+    /// ago" in any relative-time caption that reads it — every consumer, not just one view. New
+    /// out-of-band timestamps are now blocked at `ingest`'s source; this only scrubs existing rows
+    /// once. Returns the number deleted.
+    @discardableResult
+    func purgeImplausibleTimestamps() throws -> Int {
+        let epochFloor = Date(timeIntervalSince1970: TimeInterval(Command.syncEpoch))
+        let futureCeiling = Date().addingTimeInterval(86_400)
+        let descriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.start < epochFloor || $0.start > futureCeiling })
+        let stale = try context.fetch(descriptor)
+        guard !stale.isEmpty else { return 0 }
+        for row in stale { context.delete(row) }
+        try context.save()
+        return stale.count
+    }
+
+    /// Repair for a `SyncCursor` watermark stuck in the far future — the lasting damage from a
+    /// corrupted-timestamp sample that advanced a kind's cursor BEFORE `ingest` checked
+    /// plausibility ahead of the cursor (see the ordering note there). A cursor only moves
+    /// FORWARD, so once poisoned it silently blocks every later legitimate sample of that kind —
+    /// `purgeImplausibleTimestamps` cleans the bad SAMPLE rows but never touches the cursor itself,
+    /// so without this the block persists even after the source bug is fixed.
+    ///
+    /// Covers BOTH cursor families sharing this table: the plain ingest cursor (`heartRate`) and
+    /// the `hk:`-prefixed HealthKit-mirror cursor (`hk:heartRate`) — a poisoned mirror cursor would
+    /// keep new, valid LOCAL samples from ever reaching Apple Health even after the ingest side is
+    /// fixed. Each poisoned row is reset to the latest ALREADY-STORED plausible sample of its bare
+    /// kind, or removed entirely when none exists, so the next ingest/flush re-admits the backlog
+    /// instead of staying stuck forever.
+    ///
+    /// Deliberately run on EVERY launch (not gated to once) rather than a one-time scrub like the
+    /// sample purges above: it's a handful of cursor rows (cheap to re-check), and a single
+    /// one-time pass turned out NOT to be reliably sufficient — `hk:heartRate` was still observed
+    /// stuck after the first run (cause unconfirmed; likely launch-task ordering against the other
+    /// one-time scrubs). Re-running it every launch is a self-healing no-op once nothing's stuck,
+    /// and guarantees this can't silently stay broken from one bad run. Returns the number of rows
+    /// repaired (logged by the caller).
+    @discardableResult
+    func repairFutureSyncCursors(now: Date = Date()) throws -> Int {
+        let ceiling = now.addingTimeInterval(86_400)
+        let rows = try context.fetch(FetchDescriptor<StoredCursor>())
+        let stuck = rows.filter { $0.last > ceiling }
+        guard !stuck.isEmpty else { return 0 }
+        // Capture kind names BEFORE any `context.delete` below — reading a property off a
+        // deleted-but-unsaved SwiftData model is unreliable, so the log message must not touch
+        // `stuck` again after the mutation loop.
+        let stuckKinds = stuck.map(\.kindRaw)
+
+        for row in stuck {
+            let bareKind = row.kindRaw.hasPrefix(Self.healthCursorPrefix)
+                ? String(row.kindRaw.dropFirst(Self.healthCursorPrefix.count))
+                : row.kindRaw
+            var latestDescriptor = FetchDescriptor<StoredSample>(
+                predicate: #Predicate { $0.kindRaw == bareKind && $0.start <= now },
+                sortBy: [SortDescriptor(\.start, order: .reverse)]
+            )
+            latestDescriptor.fetchLimit = 1
+            if let latest = try context.fetch(latestDescriptor).first {
+                row.last = latest.start
+            } else {
+                context.delete(row)
+            }
+        }
+        try context.save()
+        ringLog.notice("cursor repair: reset \(stuckKinds.count) stuck row(s): \(stuckKinds.joined(separator: ", "), privacy: .public)")
+        return stuckKinds.count
     }
 
     /// Stored samples of one kind within `[start, end)`, oldest→newest. Used by the
@@ -600,6 +792,14 @@ struct LocalStore {
         return try context.fetch(descriptor)
     }
 
+    /// Sleep summaries whose `night` bucket falls within `[from, to)`, oldest first.
+    func sleepSummaries(from: Date, to: Date) throws -> [StoredSleepSummary] {
+        let descriptor = FetchDescriptor<StoredSleepSummary>(
+            predicate: #Predicate { $0.night >= from && $0.night < to },
+            sortBy: [SortDescriptor(\.night, order: .forward)])
+        return try context.fetch(descriptor)
+    }
+
     /// Persist the user's subjective sleep rating (1–9, #70) onto an existing night. No-op if
     /// the night isn't in the store yet (a rating only makes sense once a night exists).
     func setFeelScore(_ score: Int, night: Date) throws {
@@ -640,6 +840,14 @@ struct LocalStore {
         return try context.fetch(descriptor)
     }
 
+    /// Naps whose start time falls within `[from, to)`, oldest first.
+    func naps(from: Date, to: Date) throws -> [StoredNap] {
+        let descriptor = FetchDescriptor<StoredNap>(
+            predicate: #Predicate { $0.start >= from && $0.start < to },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
+        return try context.fetch(descriptor)
+    }
+
     /// Naps not yet mirrored to Apple Health (oldest first), for `HealthKitWriter.flushNaps`.
     func pendingNaps() throws -> [StoredNap] {
         let descriptor = FetchDescriptor<StoredNap>(
@@ -656,13 +864,18 @@ struct LocalStore {
         try context.save()
     }
 
-    /// Accumulate a step DELTA into the running total for `day`, UPSERTED by start-of-day. The
-    /// ring's onboard counter is a since-handoff delta that RESETS (the official app sums the
-    /// deltas in local memory), so we sum observed deltas the same way rather than storing the
-    /// raw counter — `StepAccumulator` (#34) computes the reset-aware delta. New day = new row.
-    /// `day` is the SAMPLE time of the reading (when the descriptor arrived), so a delta observed
-    /// just after midnight for late-night steps is stamped onto its own day, not the prior one.
-    func addDailySteps(_ delta: Int, day: Date = Date()) throws {
+    /// Accumulate a SAME-DAY step delta into the running total for `day`, UPSERTED by
+    /// start-of-day, AND record a timestamped `StoredStepSample` snapshot (#steps-history) so the
+    /// delta's actual observation window survives alongside the rollup. `RingSession` derives the
+    /// delta from the descriptor's current-day raw total: within one day it stores only the
+    /// increment between repeated reads, while the first read of a new day credits that day's
+    /// full already-taken count. New day = new row. `day` is the SAMPLE time of the reading (when
+    /// the descriptor arrived), so a value observed just after midnight is stamped onto its own
+    /// day, not the prior one. `windowStart` is when the PREVIOUS reading was observed (the start
+    /// of the window this delta was folded over); falls back to the day boundary when the caller
+    /// doesn't know one (fresh baseline / day rollover), matching the rollup's own "today so far"
+    /// fallback.
+    func addDailySteps(_ delta: Int, day: Date = Date(), windowStart: Date? = nil) throws {
         guard delta > 0 else { return }
         let dayStart = Calendar.current.startOfDay(for: day)
         let descriptor = FetchDescriptor<StoredDaily>(predicate: #Predicate { $0.day == dayStart })
@@ -672,6 +885,7 @@ struct LocalStore {
         } else {
             context.insert(StoredDaily(day: dayStart, steps: delta))
         }
+        context.insert(StoredStepSample(start: windowStart ?? dayStart, end: day, delta: delta))
         try context.save()
     }
 
@@ -682,26 +896,32 @@ struct LocalStore {
         return (try? context.fetch(descriptor).first)?.steps ?? 0
     }
 
-    /// Steps accumulated today but not yet written to Apple Health (0 if none/caught up).
-    /// Pairs with `advanceStepsWritten` so the day's stepCount reaches Health as deltas that
-    /// sum to the daily total, never the full total re-added on every sync.
-    func pendingStepDelta(day: Date = Date()) throws -> Int {
-        let dayStart = Calendar.current.startOfDay(for: day)
-        let descriptor = FetchDescriptor<StoredDaily>(predicate: #Predicate { $0.day == dayStart })
-        guard let row = try? context.fetch(descriptor).first else { return 0 }
-        return max(row.steps - row.healthWrittenSteps, 0)
+    /// Step snapshots not yet mirrored to Apple Health, oldest first — each carries its own
+    /// narrow `start`/`end` window (#steps-history), so `HealthKitWriter` can write accurately-
+    /// timed `stepCount` samples instead of one `startOfDay→now` smear. Unbounded by "today":
+    /// also picks up any earlier day's leftover delta a missed flush left pending.
+    func pendingStepSamples() throws -> [StoredStepSample] {
+        let descriptor = FetchDescriptor<StoredStepSample>(
+            predicate: #Predicate { $0.healthWritten == false },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
+        return try context.fetch(descriptor)
     }
 
-    /// Record that `delta` more of today's steps are now reflected in Apple Health. Advancing
-    /// by the delta just written (rather than to an external total) keeps the watermark exactly
-    /// in step with what was pushed, so the next `pendingStepDelta` is correct.
-    func advanceStepsWritten(by delta: Int, day: Date = Date()) throws {
-        guard delta > 0 else { return }
-        let dayStart = Calendar.current.startOfDay(for: day)
-        let descriptor = FetchDescriptor<StoredDaily>(predicate: #Predicate { $0.day == dayStart })
-        guard let row = try? context.fetch(descriptor).first else { return }
-        row.healthWrittenSteps = min(row.healthWrittenSteps + delta, row.steps)
+    /// Mark step snapshots written to Apple Health so they aren't re-sent. Mutates the live
+    /// `@Model` rows `pendingStepSamples()` just returned (same context) rather than re-fetching.
+    func markStepSamplesWritten(_ samples: [StoredStepSample]) throws {
+        guard !samples.isEmpty else { return }
+        for row in samples { row.healthWritten = true }
         try context.save()
+    }
+
+    /// Step snapshots in `[from, to)`, oldest first — the timestamped step history for the
+    /// Trends/day-detail intraday views (#steps-history); `StoredDaily` only has the day total.
+    func stepSamples(from: Date, to: Date) throws -> [StoredStepSample] {
+        let descriptor = FetchDescriptor<StoredStepSample>(
+            predicate: #Predicate { $0.start >= from && $0.start < to },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
+        return try context.fetch(descriptor)
     }
 
     /// Most recent stored daily rollup (latest day), or nil.
@@ -718,6 +938,14 @@ struct LocalStore {
         var descriptor = FetchDescriptor<StoredDaily>(
             sortBy: [SortDescriptor(\.day, order: .reverse)])
         descriptor.fetchLimit = limit
+        return try context.fetch(descriptor)
+    }
+
+    /// Daily step rollups whose `day` bucket falls within `[from, to)`, oldest first.
+    func dailies(from: Date, to: Date) throws -> [StoredDaily] {
+        let descriptor = FetchDescriptor<StoredDaily>(
+            predicate: #Predicate { $0.day >= from && $0.day < to },
+            sortBy: [SortDescriptor(\.day, order: .forward)])
         return try context.fetch(descriptor)
     }
 

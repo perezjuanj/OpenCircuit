@@ -22,6 +22,7 @@ let ringLog = Logger(subsystem: "com.standardsoftwaresolutions.opencircuit", cat
 @Observable
 @MainActor
 final class RingSession: NSObject {
+    private let observability = ObservabilityStore()
 
     enum LiveMode { case hr, spo2 }
 
@@ -46,7 +47,7 @@ final class RingSession: NSObject {
     /// arriving and climbing, vs. no HR frames at all.
     private(set) var liveHRWarmup: Int?
     private(set) var steps: Int?          // ring onboard step count (0x10/0x87 [4:6], §5.4)
-    private(set) var liveTemperature: Double?   // skin temp °C (0x10/0x87 [6:8]/[8:10], §5.4)
+    private(set) var liveTemperature: Double?   // live skin temp °C for UI (0x10/0x87 [6:8]/[8:10], §5.4)
     private(set) var batteryPercent: Int?       // ring battery % (0x10/0x87 [1], §5.4 🟢)
     private(set) var liveMode: LiveMode = .hr
     /// Wall-clock time of the most recent frame actually received from the ring (#36). Lets the
@@ -71,6 +72,16 @@ final class RingSession: NSObject {
     private(set) var lastFrame: String?
     private(set) var decodedEpochRecords = 0
     private(set) var storedMetricSamples = 0
+    /// Diagnostic-only decode of the most recent `0x47` PPG/optical-trend page (issue #8 —
+    /// PROTOCOL.md §5.2). Bit-width (10-bit BE) and cadence (900s) are settled offline, but
+    /// channel identity and absolute units are NOT — so this is surfaced for inspection (e.g.
+    /// the Debug card) only, never written to HealthKit or fed into any analytic.
+    private(set) var lastPPGTrendSummary: String?
+    /// Decode-sanity anomalies from the most recent drain (firmware-drift risk, #firmware-pin) —
+    /// PATTERNS across a whole drain that a single-field clamp can't see, distinct from "this
+    /// sync got little/no data" (sparse/contended syncs are expected and silent). Computed in
+    /// `commitDrainedRecords()`; surfaced via `ObservabilityStore`/`ActivityLogView`.
+    private(set) var lastSyncAnomalies: Set<DecodeAnomaly> = []
     private(set) var ready = false
     /// True once the notify subscription is CONFIRMED (`didUpdateNotificationStateFor` success) —
     /// distinct from `ready`, which only means the notify/write characteristics were DISCOVERED.
@@ -221,6 +232,14 @@ final class RingSession: NSObject {
     private var monitorTask: Task<Void, Never>?
     private var keepaliveTask: Task<Void, Never>?
     private var autoMeasureTask: Task<Void, Never>?
+    /// One-shot post-sync device-status refresh. The history drain (`0x4c`/`0x47`) does NOT
+    /// guarantee an immediate `0x10`/`0x87` descriptor, so steps / battery / charger / case-state
+    /// can stay stale until the next keepalive tick. This bounded follow-up fetch makes the
+    /// non-overnight metrics refresh immediately after a sync instead of "eventually".
+    private var postSyncStatusTask: Task<Void, Never>?
+    /// A status refresh was requested while the link was busy. Fulfilled on the next idle window
+    /// so steps/battery still recover even when a live read starts immediately after a sync.
+    private var pendingDeviceStatusRefresh = false
     /// Fires once after the notify subscription is confirmed: if no DATA frame has arrived within
     /// `firstFrameTimeout`, flips `notStreaming` (ring not activated/bonded). #54.
     private var streamWatchdogTask: Task<Void, Never>?
@@ -252,6 +271,9 @@ final class RingSession: NSObject {
     /// Debug card can show that channel `0x03` (all-day) actually returned data (#99 verification).
     private(set) var lastDrainSummary: String?
     private var drainCountsByLabel: [String: Int] = [:]
+    private var drainTraces: [HistoryChannelTrace] = []
+    private var activeDrainTrace: HistoryChannelTrace?
+    private var historySyncTrigger = "foreground"
 
     private var bulkRecords: [BulkRecord] = []
     private var bulkFinalized = false    // captured pages already committed (sleep/vitals) — stop-time safety net skips re-commit
@@ -261,6 +283,170 @@ final class RingSession: NSObject {
     private var syncQuietTicks = 0      // seconds since the last page arrived
     private var drainSawPage = false    // a 0x47/0x4c page arrived since last check (live-enter drain)
     private var drainDone = false       // 0x50 end-of-history seen during live-enter drain
+
+    // MARK: Calibration PPG capture
+
+    /// Guided calibration uses a dedicated raw PPG push-stream (`0x13`) rather than the ordinary
+    /// history drain. Keep it separate from `monitoring`/`syncing` so the rest of the app can gate
+    /// on it explicitly without pretending it is a normal live-HR read.
+    private(set) var calibrationCapturing = false
+    private var calibrationKeepaliveTask: Task<Void, Never>?
+    private var calibrationWatchdogTask: Task<Void, Never>?
+    private var calibrationStopTask: Task<Void, Never>?
+    private var calibrationFrameSink: ((PPGRawFrame) -> Void)?
+    private var calibrationContinuation: CheckedContinuation<Int, Error>?
+    private var calibrationSampleCount = 0
+    private var calibrationLastFrameAt = Date.distantPast
+    private var calibrationMissCount = 0
+
+    // MARK: Activity-channel probe (debug / RE — issue #93)
+    //
+    // The per-day step/activity history record (历史活动响应, PROTOCOL.md §5.3.1) has never been
+    // captured: every sync we've ever decoded used sync-open byte[6] ∈ {0x00, 0x03} (sleep,
+    // all-day), and both return the MEASUREMENT record, not the ACTIVITY one. The official app is
+    // gone now, so OpenCircuit is the only client that can take this capture. This probe sweeps
+    // untried byte[6] values and records EVERY raw frame (any opcode) regardless of whether we can
+    // decode it — the actual decoding happens offline (`desktop/decode_activity.py`) so a wrong
+    // first guess at the record layout doesn't require a new on-device capture.
+
+    /// True while a forensic capture is running — either the activity-channel probe or the
+    /// one-time historic pull below. Every write + inbound frame is appended to `rawCaptureLog`
+    /// verbatim, independent of the normal decode path, so the capture can be shared and decoded
+    /// offline without disturbing the primary workflow.
+    private var captureRawFrames = false
+    /// Raw frames captured by the most recent forensic session, one per line. Notification lines are
+    /// formatted to match the desktop tool's `decode-log` text dump (`Notification 0x0804 <hex>`),
+    /// and writes use the sibling `Write 0x0802 <hex>` form so the whole exchange can be replayed
+    /// or analyzed offline as a single artifact.
+    private(set) var rawCaptureLog: [String] = []
+    private var probeTask: Task<Void, Never>?
+    /// True while `probeActivityChannels` is running, and which channel it's currently on — surfaced
+    /// so the Debug card can show progress instead of looking hung for the ~8s-per-channel sweep.
+    private(set) var probing = false
+    private(set) var probeStatus: String?
+    /// True while the dedicated one-time historic pull is running. Kept separate from `syncing`
+    /// because the pull is a user-facing capture mode layered on top of the normal history drain.
+    private(set) var capturingHistoricPull = false
+    /// User-facing status for the one-time historic pull — start/progress/finish summary surfaced in
+    /// the sync card so the user knows when the raw capture is ready to export.
+    private(set) var historicPullStatus: String?
+    /// True while the full forensic sweep is running: known history drain first, then unknown
+    /// channel probes for offline RE on the Mac. Separate from `capturingHistoricPull` because this
+    /// is explicitly broader and slower than the known-channel pull.
+    private(set) var capturingForensicSweep = false
+    /// User-facing status for the full forensic sweep.
+    private(set) var forensicSweepStatus: String?
+
+    /// Sweep untried sync-open `byte[6]` channel selectors looking for the undecoded activity/step
+    /// history stream (历史活动响应, PROTOCOL.md §5.3.1). For each candidate: open a history sync on
+    /// that channel (cursor ≈ now, same "drain up to now" trigger as the known sleep/all-day channels
+    /// — PROTOCOL.md §3), fetch, and capture every raw frame until the channel goes quiet. Channels are
+    /// independent (their own resume cursor — §5.6.1), so probing an untried one can't disturb the
+    /// 0x00/0x03 history this session also drains. `0x02` leads the default order — §5.3.1 names it the
+    /// single best-guess selector (enum-idx 2 in the decompiled `DataSyncType`, the same gap as the
+    /// all-day HR/SpO2 probe that #99 resolved at `0x03`); the rest are the other untried values the
+    /// official app never sends (0x00/0x03 are the only two ever observed in any capture). After this
+    /// capture, decode it with the predicted layout in `decode_activity.py` /
+    /// `ActivityRecordPredicted.decode(_:)` to confirm or rule it out.
+    func probeActivityChannels(_ candidates: [UInt8] = [0x02, 0x01, 0x04, 0x05, 0x08]) {
+        guard probeTask == nil else { return }
+        captureRawFrames = true
+        rawCaptureLog.removeAll()
+        probing = true
+        probeStatus = "Starting…"
+        probeTask = Task { [weak self] in
+            for channel in candidates {
+                guard let self, !Task.isCancelled else { break }
+                self.probeStatus = "Probing channel 0x\(String(format: "%02X", channel))…"
+                self.rawCaptureLog.append("# --- probe: channel 0x\(String(format: "%02X", channel)) "
+                                          + "at \(Date()) ---")
+                self.write(Command.status0)
+                try? await Task.sleep(for: .milliseconds(200))
+                self.write(Command.syncUpToNow(channel: channel))
+                try? await Task.sleep(for: .milliseconds(200))
+                self.write(Command.fetch)
+                // Drain until quiet (no new frame for ~1s) or an 8s backstop per channel — a real
+                // stream answers within a second or two; an unsupported/empty channel just sits idle.
+                var lastCount = self.rawCaptureLog.count
+                var quiet = 0
+                for _ in 0..<40 {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    guard !Task.isCancelled else { break }
+                    if self.rawCaptureLog.count == lastCount {
+                        quiet += 1
+                        if quiet >= 5 { break }
+                    } else {
+                        quiet = 0
+                        lastCount = self.rawCaptureLog.count
+                    }
+                }
+            }
+            guard let self else { return }
+            self.rawCaptureLog.append("# --- probe complete: \(self.rawCaptureLog.count) lines ---")
+            self.probeStatus = "Done — \(self.rawCaptureLog.count) lines captured"
+            self.probing = false
+            self.captureRawFrames = false
+            self.probeTask = nil
+        }
+    }
+
+    /// One-time forensic history capture for "what is on the ring right now?" investigations.
+    /// Reuses the SAME two-channel drain as `syncHistory(manual:)` so it does not change the primary
+    /// decode path, but additionally records every write + notification into `rawCaptureLog` for
+    /// offline mapping. This is intentionally explicit and user-driven — not tied to keepalive,
+    /// auto-measure, or pull-to-refresh — so the normal workflow remains unchanged.
+    func captureHistoricPull() {
+        guard syncTask == nil, probeTask == nil, !capturingHistoricPull else { return }
+        stopLiveMonitoring(scheduleStatusRefresh: false)
+        historySyncTrigger = "historic-pull"
+        captureRawFrames = true
+        rawCaptureLog.removeAll()
+        capturingHistoricPull = true
+        historicPullStatus = "Starting one-time historic pull…"
+        rawCaptureLog.append("# --- one-time historic pull started at \(Date()) ---")
+        rawCaptureLog.append("# drains known history channels: 0x00 sleep + 0x03 all-day")
+        rawCaptureLog.append("# use this capture to map what the ring emitted before another client drains it")
+        syncTask = Task { [weak self] in
+            guard let self else { return }
+            await self.performHistoryDrain()
+            self.rawCaptureLog.append("# --- one-time historic pull finished at \(Date()) ---")
+            self.rawCaptureLog.append("# summary: \(self.lastDrainSummary ?? "no drain summary")")
+            self.historicPullStatus = "Done — \(self.lastDrainSummary ?? "capture complete")"
+            self.capturingHistoricPull = false
+            self.captureRawFrames = false
+        }
+    }
+
+    /// Full forensic sweep for iPhone -> Mac workflows: first drain the KNOWN history channels
+    /// (`0x00` sleep + `0x03` all-day) with the normal history path, then probe a shortlist of
+    /// UNKNOWN channel selectors into the SAME raw log so the Mac can decode both the proven and
+    /// exploratory traffic from one exported artifact.
+    func captureForensicSweep(_ candidates: [UInt8] = [0x02, 0x01, 0x04, 0x05, 0x08]) {
+        guard syncTask == nil, probeTask == nil, !capturingHistoricPull, !capturingForensicSweep else { return }
+        stopLiveMonitoring(scheduleStatusRefresh: false)
+        historySyncTrigger = "forensic-sweep"
+        captureRawFrames = true
+        rawCaptureLog.removeAll()
+        capturingForensicSweep = true
+        forensicSweepStatus = "Starting forensic sweep…"
+        rawCaptureLog.append("# --- forensic sweep started at \(Date()) ---")
+        rawCaptureLog.append("# phase 1: drain known channels 0x00 sleep + 0x03 all-day")
+        rawCaptureLog.append("# phase 2: probe unknown channel selectors for hidden history streams")
+        syncTask = Task { [weak self] in
+            guard let self else { return }
+            await self.performHistoryDrain()
+            self.rawCaptureLog.append("# --- known-channel drain complete: \(self.lastDrainSummary ?? "no drain summary") ---")
+            self.forensicSweepStatus = "Known channels drained; probing unknown channels…"
+            for channel in candidates {
+                guard !Task.isCancelled else { break }
+                await self.captureProbeChannel(channel: channel)
+            }
+            self.rawCaptureLog.append("# --- forensic sweep finished at \(Date()) ---")
+            self.forensicSweepStatus = "Done — known channels + \(candidates.count) unknown-channel probes captured"
+            self.capturingForensicSweep = false
+            self.captureRawFrames = false
+        }
+    }
 
     private let peripheral: CBPeripheral
     private var notifyChar: CBCharacteristic?
@@ -275,7 +461,12 @@ final class RingSession: NSObject {
     /// all drained slices (stitching) and lets the periodic-drain cadence survive reconnects.
     /// Namespaced by the ring's identifier (#multi-ring) so two rings' epoch archives can't collide on
     /// the UInt32 epoch counter (which would corrupt overnight stitching).
-    private let epochArchiveStore: EpochArchiveStore
+    let epochArchiveStore: EpochArchiveStore
+    /// `writeChar` can outlive an actual usable link during reconnect churn, so connection state
+    /// is part of the write gate too.
+    private var canWriteCommands: Bool {
+        peripheral.state == .connected && writeChar != nil
+    }
 
     private let dataServiceUUID = CBUUID(string: OpenCircuitKit.Transport.dataServiceUUID)
     private let notifyUUID = CBUUID(string: OpenCircuitKit.Transport.notifyCharUUID)
@@ -368,6 +559,7 @@ final class RingSession: NSObject {
         monitorTask?.cancel(); monitorTask = nil
         keepaliveTask?.cancel(); keepaliveTask = nil
         autoMeasureTask?.cancel(); autoMeasureTask = nil
+        postSyncStatusTask?.cancel(); postSyncStatusTask = nil
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
         syncTask?.cancel(); syncTask = nil
         monitoring = false
@@ -415,15 +607,18 @@ final class RingSession: NSObject {
         drainSawPage = false
         drainDone = false
         let modeCmd = liveMode == .hr ? Command.liveHRMode : Command.liveSpO2Mode
-        // Quick live read skips the backlog (`syncAll` → empty → lock HR fast); the overnight
-        // background capture (quickLiveRead == false) opens at NOW so the night's backlog drains
-        // (§3). Computed on the MainActor before the Task.
-        let syncOpen = quickLiveRead ? Command.syncAll : Command.syncUpToNow()
+        // Quick live reads no longer open a synthetic history session first. The device log showed
+        // frequent reads repeatedly entering through `syncAll` (`02 .. ff ff ff ff ..`) before live
+        // mode, entangling dense sampling with history/open-state churn. Overnight/background reads
+        // still open at NOW so the real backlog drains (§3); quick reads jump straight into live
+        // mode and only commit any pages that happen to arrive anyway.
+        let syncOpen: [UInt8]? = quickLiveRead ? nil : Command.syncUpToNow()
         monitorTask = Task { [weak self] in
             // 1. Init + open the sync session at `syncOpen`.
             // `status0` elicits the `81 00` auth challenge; the didUpdateValue handler answers it
             // reactively with the SM3 auth (#54) before `syncOpen` opens the data session.
-            for cmd in [Command.status0, syncOpen] {
+            let startup = [Command.status0] + (syncOpen.map { [$0] } ?? [])
+            for cmd in startup {
                 guard let self, !Task.isCancelled else { return }
                 self.write(cmd)
                 try? await Task.sleep(for: .milliseconds(250))
@@ -436,7 +631,7 @@ final class RingSession: NSObject {
             //    pathological backlog eat the HR poll's budget, #45); the full-drain path keeps
             //    the longer cap so a big overnight backlog is fully captured.
             guard let s0 = self, !Task.isCancelled else { return }
-            s0.write(Command.fetch)
+            if syncOpen != nil { s0.write(Command.fetch) }
             // Drain backstop in 500 ms ticks. A quick read starts with a short ~3 s cap so a
             // silent ring can't starve the HR poll (#45); the overnight path uses the full ~15 s.
             // The shared quiet-exit (3 quiet ticks ≈ 1.5 s after the last page) ends a real drain.
@@ -445,7 +640,7 @@ final class RingSession: NSObject {
             // the warm-up sentinel (8). So if the short cap is reached mid-stream, promote it to
             // the full cap and let the quiet-exit finish the drain — the short cap then only bites
             // a genuinely silent ring (the common no-backlog case still exits at ~1.5 s, unchanged).
-            var cap = quickLiveRead ? 6 : 30   // ×500 ms ⇒ ~3 s quick / ~15 s full backstop
+            var cap = quickLiveRead ? 0 : 30   // quick reads skip the explicit history-open drain
             var quiet = 0
             var tick = 0
             while tick < cap {
@@ -567,7 +762,8 @@ final class RingSession: NSObject {
                 // Re-resolve the night window (self-throttled to ≤ every 30 min) so the cadence
                 // tightens/relaxes as the window rolls over, not just at connect.
                 await self.refreshNightWindowIfNeeded()
-                if self.ready, !self.monitoring, !self.livePreparing, self.syncTask == nil {
+                if self.ready, !self.monitoring, !self.livePreparing, self.syncTask == nil, !self.calibrationCapturing {
+                    self.maybeRequestDeviceStatusRefresh(reason: "idle keepalive")
                     // Periodic history drain (the buffer-overflow fix). The ring's ~4.75 h history
                     // buffer drops its oldest epochs when full, so draining only on foreground/manual
                     // events lets a quietly-held overnight link overflow and lose the early, deep-rich
@@ -677,7 +873,7 @@ final class RingSession: NSObject {
         // ring's resume pointer (syncAll's pointer effect is the 🟡 backlog-shredder risk, PROTOCOL.md
         // §3) — exactly what we must avoid overnight so the night's backlog survives for one morning
         // sync. Overnight HR/SpO₂ come from the synced sleep epochs anyway, so nothing is lost.
-        ready && !monitoring && !livePreparing && syncTask == nil && !workoutHolding && !isInSleepWindow
+        ready && !monitoring && !livePreparing && syncTask == nil && !workoutHolding && !calibrationCapturing && !isInSleepWindow
     }
 
     /// Next sleep between auto-measure cycles: the base interval while worn, exponentially backed
@@ -741,7 +937,7 @@ final class RingSession: NSObject {
             if mode == .hr, liveHR != nil { locked = true; break }
             if mode == .spo2, liveSpO2 != nil { locked = true; break }
             // Bail if a user tap switched the mode out from under us — don't fight them.
-            if !monitoring || liveMode != mode { autoMeasuring = false; return nil }
+            if !monitoring || liveMode != mode || calibrationCapturing { autoMeasuring = false; return nil }
             try? await Task.sleep(for: .seconds(1))
         }
         // Only tear down if WE still own the live read (user didn't take over).
@@ -806,7 +1002,40 @@ final class RingSession: NSObject {
     /// data is always visible offline). The SyncCursor dedupes, so repeated calls are safe.
     private func persist(_ samples: [QuantitySample]) {
         guard let localStore, !samples.isEmpty else { return }
-        storedMetricSamples += (try? localStore.ingest(samples).count) ?? 0
+        let preview = try? localStore.previewIngest(samples)
+        let ingested: [QuantitySample]
+        do {
+            ingested = try localStore.ingest(samples)
+        } catch {
+            let detail = "store save failed input=\(samples.count) error=\(error.localizedDescription)"
+            observability.recordMetricEvent(source: "persist", detail: detail)
+            ringLog.error("persist FAILED: \(detail, privacy: .public)")
+            return
+        }
+        storedMetricSamples += ingested.count
+        // TEMP DIAGNOSTIC (HR-not-recording investigation): how many of the samples HANDED to
+        // ingest actually came back as stored. Paired with `hr-diag` above — if `hrSamplesPreIngest`
+        // was >0 but `hrIngested` here is 0, `ingest`'s cursor/plausibility gate is still rejecting
+        // them post-fix. Remove once the root cause is confirmed.
+        let hrIn = samples.filter { $0.kind == .heartRate }.count
+        if hrIn > 0 {
+            let hrOut = ingested.filter { $0.kind == .heartRate }.count
+            ringLog.notice("hr-diag: persist call hrIn=\(hrIn) hrIngested=\(hrOut)")
+        }
+        if let preview {
+            let metrics = Dictionary(grouping: samples, by: \.kind).keys.map(\.rawValue).sorted().joined(separator: ",")
+            let detail = "metrics=[\(metrics)] input=\(preview.inputCount) plausible=\(preview.plausibleCount) fresh=\(preview.freshCount) stored=\(ingested.count) dup=\(preview.duplicateCount) invalidTime=\(preview.invalidTimestampCount) invalidHR=\(preview.invalidHeartRateCount)"
+            observability.recordMetricEvent(source: "persist", detail: detail)
+            ringLog.notice("persist-diag: \(detail, privacy: .public)")
+        }
+    }
+
+    /// Record a DAYTIME skin-temp reading for the Trends intraday chart only (`StoredDaytimeTemp`)
+    /// — deliberately a SEPARATE table from the nightly `.temperature` path above, so this never
+    /// touches the nightly cycle-tracking baseline or Apple Health (#41's guarantee is unchanged).
+    private func persistDaytimeTemperature(_ celsius: Double, at time: Date) {
+        guard let localStore else { return }
+        try? localStore.recordDaytimeTemperature(celsius, at: time)
     }
 
     /// Staged sleep segments for a sync, but ONLY when the detected block is OVERNIGHT sleep.
@@ -923,12 +1152,12 @@ final class RingSession: NSObject {
 
     // MARK: Step counter state (cross-session, #34)
     //
-    // The ring's onboard step counter (descriptor [4:6]) is a since-handoff DELTA the official
-    // app resets; if that app isn't running it keeps climbing (it does NOT reset at midnight on
-    // its own). To compute a TRUE delta across a reconnect — instead of rebasing to the current
-    // counter and dropping every step taken while we were disconnected — we persist the last raw
-    // value AND the day it was seen in UserDefaults (not LocalStore: avoids a SwiftData migration
-    // and a per-day-row collision). The per-day TOTAL still lives in StoredDaily via addDailySteps.
+    // The ring's onboard step field (descriptor [4:6]) is the ring's CURRENT DAY total. To avoid
+    // double-counting while connected we persist the last raw value AND the day it was seen in
+    // UserDefaults, then fold repeated same-day reads into deltas. Crucially, once the day changes
+    // the next raw value is already "today so far" and must be credited in full so an afternoon
+    // reconnect still recovers the morning's steps. The per-day TOTAL lives in StoredDaily via
+    // addDailySteps.
 
     // Per-ring (#multi-ring): namespaced by the ring's CoreBluetooth identifier so a second ring's
     // onboard counter is never diffed against the first ring's baseline (which would yield garbage
@@ -937,6 +1166,7 @@ final class RingSession: NSObject {
     private var deviceKey: String { peripheral.identifier.uuidString }
     private var lastRawStepsKey: String { "steps.lastRawValue.\(deviceKey)" }    // Int: last raw [4:6] counter
     private var lastRawStepsDayKey: String { "steps.lastRawDay.\(deviceKey)" }   // Date: start-of-day it was observed
+    private var lastStepSampleAtKey: String { "steps.lastSampleAt.\(deviceKey)" } // Date: wall-clock of that reading
 
     /// Last raw counter we recorded, or nil if we've never seen one (first run / cleared). Stored
     /// as an object so a legitimate 0 reading is distinguishable from "unset".
@@ -947,9 +1177,16 @@ final class RingSession: NSObject {
     private var persistedLastRawStepsDay: Date? {
         UserDefaults.standard.object(forKey: lastRawStepsDayKey) as? Date
     }
-    private func persistStepRawState(raw: Int, day: Date) {
+    /// Wall-clock time of that same last reading — the window START for the NEXT timestamped
+    /// step delta (#steps-history), so a steady stream of same-day descriptor reads produces
+    /// narrow, accurately-timed snapshots instead of crediting steps to the whole elapsed day.
+    private var persistedLastStepSampleAt: Date? {
+        UserDefaults.standard.object(forKey: lastStepSampleAtKey) as? Date
+    }
+    private func persistStepRawState(raw: Int, day: Date, sampleAt: Date) {
         UserDefaults.standard.set(raw, forKey: lastRawStepsKey)
         UserDefaults.standard.set(day, forKey: lastRawStepsDayKey)
+        UserDefaults.standard.set(sampleAt, forKey: lastStepSampleAtKey)
     }
 
     /// Start (or switch) live monitoring in a single mode. Guarantees only one metric
@@ -1068,7 +1305,7 @@ final class RingSession: NSObject {
     }
 
     /// Stop the poll loop. HR/SpO2 keep their last value.
-    func stopLiveMonitoring() {
+    func stopLiveMonitoring(scheduleStatusRefresh: Bool = true) {
         monitorTask?.cancel()
         monitorTask = nil
         monitoring = false
@@ -1102,6 +1339,9 @@ final class RingSession: NSObject {
             last.append(QuantitySample(kind: .spo2, start: at, value: Double(spo2) / 100))
         }
         persist(last)
+        if scheduleStatusRefresh {
+            scheduleDeviceStatusRefresh(reason: "live-stop")
+        }
     }
 
     /// Pull stored history from BOTH ring history channels — `0x00` (sleep/overnight) then `0x03`
@@ -1122,10 +1362,82 @@ final class RingSession: NSObject {
             return
         }
         guard syncTask == nil else { return }    // already syncing
-        stopLiveMonitoring()                     // live polling would fight the drain
+        historySyncTrigger = manual ? "manual" : "auto"
+        stopLiveMonitoring(scheduleStatusRefresh: false)   // live polling would fight the drain
         syncTask = Task { [weak self] in
             await self?.performHistoryDrain()
         }
+    }
+
+    /// Capture raw push-stream PPG frames for calibration (`0x13`, 25 samples/frame). The caller
+    /// receives decoded frames as they arrive and the async result returns the total sample count.
+    func startPPGCalibrationCapture(duration: TimeInterval,
+                                    onFrame: @escaping (PPGRawFrame) -> Void) async throws -> Int {
+        guard ready else { throw NSError(domain: "OpenCircuit.Calibration", code: 1, userInfo: [NSLocalizedDescriptionKey: "Ring is not ready"]) }
+        guard !syncing, !monitoring, !livePreparing, !calibrationCapturing else {
+            throw NSError(domain: "OpenCircuit.Calibration", code: 2, userInfo: [NSLocalizedDescriptionKey: "Ring is busy"])
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            calibrationContinuation = continuation
+            calibrationFrameSink = onFrame
+            calibrationSampleCount = 0
+            calibrationMissCount = 0
+            calibrationLastFrameAt = Date()
+            calibrationCapturing = true
+            syncTask?.cancel(); syncTask = nil
+            stopLiveMonitoring(scheduleStatusRefresh: false)
+            beginCalibrationPPGMode(duration: duration)
+        }
+    }
+
+    private func beginCalibrationPPGMode(duration: TimeInterval) {
+        calibrationKeepaliveTask?.cancel()
+        calibrationWatchdogTask?.cancel()
+        calibrationStopTask?.cancel()
+        Task { [weak self] in
+            guard let self else { return }
+            await self.enterCalibrationPPGMode()
+
+            self.calibrationKeepaliveTask = Task { [weak self] in
+                while let self, !Task.isCancelled, self.calibrationCapturing {
+                    try? await Task.sleep(for: .seconds(30))
+                    guard !Task.isCancelled, self.calibrationCapturing else { return }
+                    self.write([0x96, 0x01, 0x00, 0x00, 0x00])
+                }
+            }
+            self.calibrationWatchdogTask = Task { [weak self] in
+                while let self, !Task.isCancelled, self.calibrationCapturing {
+                    try? await Task.sleep(for: .milliseconds(1500))
+                    guard !Task.isCancelled, self.calibrationCapturing else { return }
+                    let silentFor = Date().timeIntervalSince(self.calibrationLastFrameAt)
+                    if silentFor < 1.4 { continue }
+                    self.calibrationMissCount += 1
+                    self.write([0x96, 0x01, 0x00, 0x00, 0x00])
+                    if self.calibrationMissCount >= 5 {
+                        ringLog.notice("calibration: raw PPG stalled; re-enter mode10+mode01")
+                        await self.enterCalibrationPPGMode()
+                        self.calibrationMissCount = 0
+                        self.calibrationLastFrameAt = Date()
+                    }
+                }
+            }
+            self.calibrationStopTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(duration))
+                self?.finishCalibrationPPGCapture(success: true)
+            }
+        }
+    }
+
+    private func enterCalibrationPPGMode() async {
+        write(Command.status0)
+        try? await Task.sleep(for: .milliseconds(250))
+        write([0x06, 0x10, 0x00])
+        try? await Task.sleep(for: .milliseconds(500))
+        write([0x06, 0x00, 0x00])
+        try? await Task.sleep(for: .milliseconds(500))
+        write(Command.liveHRMode)
+        try? await Task.sleep(for: .milliseconds(250))
+        write([0x96, 0x01, 0x00, 0x00, 0x00])
     }
 
     /// Drain BOTH history channels into `bulkRecords` — `0x00` (sleep/overnight) then `0x03`
@@ -1139,6 +1451,8 @@ final class RingSession: NSObject {
         bulkRecords.removeAll()
         bulkFinalized = false                    // fresh capture — uncommitted until finalizeSync
         historySamples.removeAll()
+        drainTraces.removeAll()
+        activeDrainTrace = nil
         // Do NOT wipe the staged sleep here. A periodic drain often returns EMPTY (nothing un-synced),
         // and `finalizeSync`'s empty branch deliberately doesn't re-stage; wiping first would blank
         // `sleepSegments`/`stagedSegments` and `flushHealth` reads those live (no store fallback), so
@@ -1171,7 +1485,14 @@ final class RingSession: NSObject {
         syncQuietTicks = 0
         let recordsAtStart = bulkRecords.count
         let open = Command.syncUpToNow(channel: channel)
+        var trace = HistoryChannelTrace(label: label, channel: channel)
+        trace.recordsAtStart = recordsAtStart
+        activeDrainTrace = trace
+        if captureRawFrames {
+            rawCaptureLog.append("# --- history drain channel \(label) (0x\(String(format: "%02X", channel))) ---")
+        }
         ringLog.notice("sync: START ch=\(label, privacy: .public) open=\(open.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public) (cursor≈now, §3)")
+        print("[OC] sync START ch=\(label)")
         // Open at cursor ≈ NOW: the ring streams its un-delivered backlog on this channel up to now
         // and advances its own resume pointer (§3). `syncAll`'s far-future cursor returns empty.
         // status0 re-primes the SM3 challenge per channel (the second open may be re-challenged).
@@ -1182,19 +1503,59 @@ final class RingSession: NSObject {
         }
         for tick in 0 ..< 45 {
             try? await Task.sleep(for: .seconds(1))
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                finishActiveDrainTrace(.cancelled)
+                return
+            }
             // Count seconds since the last page (the frame handler zeroes `syncQuietTicks` on every
             // 0x47/0x4c). The quiet-exit only applies once pages have actually started this channel,
             // so a slow open can't cut the drain off before the stream begins — an empty channel
             // exits on its 0x50 (`syncDone`); only a lost 0x50 falls through to the 45 s cap.
+            // Exception: when the ring's 0x82 ACK carries byte[1]==0xff (pointer-at-end signal, 🟡),
+            // we know no pages are coming. Apply the same 3-tick quiet exit without waiting for pages
+            // to start — saves up to 42 s per empty channel (observed: all-day channel 2026-06-28).
             syncQuietTicks += 1
             let sawPages = bulkRecords.count > recordsAtStart
-            if syncDone || (sawPages && syncQuietTicks >= 3) {
-                ringLog.notice("sync: ch=\(label, privacy: .public) drained at \(tick)s (done=\(self.syncDone), quiet=\(self.syncQuietTicks), records=\(self.bulkRecords.count))")
+            let ackedEmpty = activeDrainTrace?.sawEmptyHistorySignal == true && !sawPages
+            if syncDone || (sawPages && syncQuietTicks >= 3) || (ackedEmpty && syncQuietTicks >= 3) {
+                let added = self.bulkRecords.count - recordsAtStart
+                ringLog.notice("sync: ch=\(label, privacy: .public) drained at \(tick)s (done=\(self.syncDone), quiet=\(self.syncQuietTicks), ackedEmpty=\(ackedEmpty), records=\(self.bulkRecords.count))")
+                print("[OC] sync DRAIN ch=\(label) added=\(added) ackedEmpty=\(ackedEmpty)")
+                finishActiveDrainTrace(syncDone ? .endMarker : .quietAfterPages)
                 break
             }
         }
+        if activeDrainTrace != nil {
+            let sawPages = bulkRecords.count > recordsAtStart
+            finishActiveDrainTrace(sawPages ? .hardTimeout : .quietNoPages)
+        }
         drainCountsByLabel[label] = bulkRecords.count - recordsAtStart
+    }
+
+    /// Probe one speculative sync-open channel into the forensic raw log. Uses the same
+    /// cursor≈now open as the proven channels; if the selector is unsupported or empty it simply
+    /// goes quiet after a short backstop. Unknown channels are treated as RE-only and are not fed
+    /// into the normal decode/persist path here.
+    private func captureProbeChannel(channel: UInt8) async {
+        rawCaptureLog.append("# --- probe: channel 0x\(String(format: "%02X", channel)) at \(Date()) ---")
+        write(Command.status0)
+        try? await Task.sleep(for: .milliseconds(200))
+        write(Command.syncUpToNow(channel: channel))
+        try? await Task.sleep(for: .milliseconds(200))
+        write(Command.fetch)
+        var lastCount = rawCaptureLog.count
+        var quiet = 0
+        for _ in 0..<40 {
+            try? await Task.sleep(for: .milliseconds(200))
+            guard !Task.isCancelled else { break }
+            if rawCaptureLog.count == lastCount {
+                quiet += 1
+                if quiet >= 5 { break }
+            } else {
+                quiet = 0
+                lastCount = rawCaptureLog.count
+            }
+        }
     }
 
     /// Commit a freshly-captured batch of epoch records. A history-sync drain (`finalizeSync`), the
@@ -1212,16 +1573,60 @@ final class RingSession: NSObject {
     /// the earliest block) or a daytime nap.
     private func commitDrainedRecords() {
         epochArchiveStore.recordDrain()
+        var anomalies = DecodeAnomaly.detect(records: bulkRecords)
+        if DecodeAnomaly.hasSustainedTemperatureAnomaly(nightTemperatureLog.map(\.celsius)) {
+            anomalies.insert(.skinTempOutOfPhysicalRange)
+        }
+        lastSyncAnomalies = anomalies
+        if !anomalies.isEmpty {
+            let names = anomalies.map(\.rawValue).joined(separator: ", ")
+            ringLog.error("decode anomaly detected: \(names, privacy: .public) — possible firmware/format drift")
+        }
         let temps = wearTemperatureSamples()
         let union = epochArchiveStore.merge(bulkRecords)
         let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temps)
+        let sleepTrace = drainTraces.first { $0.label == "sleep" }
+        let sleepOutcome = sleepTrace?.outcome
+        let sleepCanCommit = sleepOutcome?.allowsSleepCommit ?? false
+        let sleepHasFreshRecords = (sleepTrace?.recordsAdded ?? 0) > 0
+        // TEMP DIAGNOSTIC (sleep-empty investigation): pinpoint which stage of the staging pipeline
+        // loses the night — archive union size, the night-scoped slice `latestNightRecords` picked,
+        // and whether `mainSleep`'s motion-based block detector finds anything at all in that slice.
+        // Remove once the root cause is confirmed.
+        let mainSleepBlock = BulkSleep.mainSleep(from: nightRecords, temperatures: temps)
+        ringLog.notice("sleep-diag: union=\(union.count) nightRecords=\(nightRecords.count) temps=\(temps.count) mainSleep=\(mainSleepBlock != nil ? "\(mainSleepBlock!.start)..\(mainSleepBlock!.end)" : "nil", privacy: .public)")
         // HealthKit path: THIS batch's new samples (the SyncCursor dedups against what's written).
         historySamples = BulkSleep.samples(from: bulkRecords)
-        // Sleep staging + its analytics come from the stitched, night-scoped union — not this slice.
-        sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)   // wear gate (#41)
-        stagedSegments = overnightStagedSegments(from: nightRecords)   // overnight gate (review #1)
+        // Sleep staging + persistence are conservative: a partial / PPG-only / no-ack sleep drain
+        // must NOT overwrite a fuller stored night. We still keep the raw records + scalar samples.
+        var committedSleep = false
+        if sleepCanCommit, sleepHasFreshRecords {
+            sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)   // wear gate (#41)
+            stagedSegments = overnightStagedSegments(from: nightRecords)   // overnight gate (review #1)
+            persistSleepAndSteps(nightRecords: nightRecords)   // summary + extras from the stitched night
+            // Persist segments to the archive store so they survive session teardown. Without this,
+            // a background task expiry or session reconnect clears the in-memory arrays and
+            // `flushHealth()` fires with empty segments — sleep is permanently stranded in
+            // StoredSleepSummary and never reaches HealthKit. The `.sleep` cursor prevents re-writes.
+            epochArchiveStore.savePendingSleepSegments(coarse: sleepSegments, staged: stagedSegments)
+            ringLog.notice("sleep-persist: saved coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count) segments to archive (survives teardown)")
+            print("[OC] sleep COMMITTED coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count)")
+            committedSleep = true
+        } else if let sleepOutcome {
+            let detail = "outcome=\(sleepOutcome.rawValue) recordsAdded=\(sleepTrace?.recordsAdded ?? 0) 4c=\(sleepTrace?.page4CCount ?? 0) 47=\(sleepTrace?.page47Count ?? 0) 50=\(sleepTrace?.endMarkerCount ?? 0)"
+            observability.recordMetricEvent(source: "sleep-sync", detail: detail)
+            ringLog.notice("sleep: skip re-stage/persist — \(detail, privacy: .public)")
+        }
+        // TEMP DIAGNOSTIC (HR-not-recording investigation): how many of THIS drain's raw records
+        // decoded a valid HR (byte[4]) vs how many HR samples that produced, BEFORE ingest. If this
+        // shows 0, the decode itself is the problem (bad records this drain); if it's >0 but the
+        // local store still isn't growing, the problem is downstream in `persist`/`ingest`. Remove
+        // once the root cause is confirmed.
+        let decodedHRCount = bulkRecords.compactMap(\.heartRate).count
+        let hrSampleCount = historySamples.filter { $0.kind == .heartRate }.count
+        ringLog.notice("hr-diag: bulkRecords=\(self.bulkRecords.count) decodedHR=\(decodedHRCount) hrSamplesPreIngest=\(hrSampleCount)")
         persist(historySamples)   // auto-persist HR/HRV/SpO2 for the dashboard
-        persistSleepAndSteps(nightRecords: nightRecords)   // summary + extras from the stitched night
+        recordHistorySyncEvidence(sleepCommitted: committedSleep)
         bulkFinalized = true      // committed — the stop-time safety net can skip these records
     }
 
@@ -1233,16 +1638,137 @@ final class RingSession: NSObject {
             // re-saving / re-flushing, so a periodic drain doesn't churn the stored night.
             epochArchiveStore.recordDrain()
             ringLog.notice("sync: FINALIZE records=0 (no re-stage; cadence stamped)")
+            print("[OC] sync FINALIZE records=0 (ring empty)")
             syncStatus = steps != nil
                 ? "Up to date — last night is likely already in the vitals dashboard. The ring clears history after each sync, so nothing new to fetch."
                 : "No data received — is the ring bonded/awake?"
+            recordHistorySyncEvidence(sleepCommitted: false)
         } else {
             commitDrainedRecords()
-            ringLog.notice("sync: FINALIZE records=\(self.bulkRecords.count) samples=\(self.historySamples.count) sleepSegs=\(self.sleepSegments.count) steps=\(self.steps ?? -1)")
-            syncStatus = "Synced \(bulkRecords.count) epochs"
+            let sleepOutcome = drainTraces.first { $0.label == "sleep" }?.outcome
+            ringLog.notice("sync: FINALIZE records=\(self.bulkRecords.count) samples=\(self.historySamples.count) sleepSegs=\(self.sleepSegments.count) sleepOutcome=\(sleepOutcome?.rawValue ?? "none", privacy: .public) steps=\(self.steps ?? -1)")
+            print("[OC] sync FINALIZE records=\(self.bulkRecords.count) sleepSegs=\(self.sleepSegments.count) sleepOutcome=\(sleepOutcome?.rawValue ?? "none") steps=\(self.steps ?? -1)")
+            if let sleepOutcome, sleepOutcome != .complete, sleepOutcome != .empty {
+                syncStatus = "Partial sync — sleep channel \(sleepOutcome.rawValue); raw data kept for retry"
+            } else {
+                syncStatus = "Synced \(bulkRecords.count) epochs"
+            }
         }
         syncing = false
         syncTask = nil
+        scheduleDeviceStatusRefresh(reason: "post-sync")
+    }
+
+    private func finishActiveDrainTrace(_ exitReason: HistoryChannelExitReason) {
+        guard var trace = activeDrainTrace else { return }
+        trace.finishedAt = Date()
+        trace.recordsAtEnd = bulkRecords.count
+        trace.exitReason = exitReason
+        drainTraces.append(trace)
+        let outcome = trace.outcome.rawValue
+        observability.recordMetricEvent(
+            source: "history-drain",
+            detail: "trigger=\(historySyncTrigger) label=\(trace.label) outcome=\(outcome) ack=\(trace.sawSyncAck) 4c=\(trace.page4CCount) 47=\(trace.page47Count) 50=\(trace.endMarkerCount) added=\(trace.recordsAdded)"
+        )
+        activeDrainTrace = nil
+    }
+
+    private func updateActiveDrainTrace(bytes: [UInt8]) {
+        guard var trace = activeDrainTrace else { return }
+        guard let opcode = bytes.first else { return }
+        if trace.firstOpcode == nil { trace.firstOpcode = opcode }
+        trace.lastOpcode = opcode
+        switch opcode {
+        case 0x82:
+            trace.sawSyncAck = true
+            trace.syncAckFlag = bytes.count > 2 ? bytes[2] : nil
+            // byte[1]==0xff is a new signal (2026-06-28, `82 ff 00 7d`) meaning the ring's
+            // history pointer is already at end — nothing to stream on this channel. Distinct
+            // from byte[1]==0x00 which preceded real page streams in every prior capture.
+            if bytes.count > 1, bytes[1] == 0xff { trace.sawEmptyHistorySignal = true }
+        case 0x47:
+            trace.page47Count += 1
+        case 0x4C:
+            trace.page4CCount += 1
+        case 0x50:
+            trace.endMarkerCount += 1
+        default:
+            break
+        }
+        activeDrainTrace = trace
+    }
+
+    private func recordHistorySyncEvidence(sleepCommitted: Bool) {
+        let entry = HistorySyncEvidence(
+            date: Date(),
+            ringID: peripheral.identifier.uuidString,
+            trigger: historySyncTrigger,
+            sleepCommitted: sleepCommitted,
+            stagedSleepSegments: sleepSegments.count,
+            mergedRecordCount: bulkRecords.count,
+            historySampleCount: historySamples.count,
+            channels: drainTraces,
+            rawRecordBlob: EpochArchive.encode(bulkRecords)
+        )
+        observability.recordHistorySyncEvidence(entry)
+    }
+
+    /// Queue a device-status refresh for the next idle moment. Used after history syncs and after
+    /// live monitoring tears down, because both often want an immediate steps/battery refresh but
+    /// can overlap with a temporarily busy link.
+    private func scheduleDeviceStatusRefresh(reason: String) {
+        pendingDeviceStatusRefresh = true
+        maybeRequestDeviceStatusRefresh(reason: reason)
+    }
+
+    /// Ask the ring for a fresh device-status descriptor (`0x10`/`0x87`) once the link is idle.
+    /// The descriptor is the source for the "doesn't need overnight staging" metrics:
+    /// today's step counter, battery %, charging state, case battery, and any live-only skin-temp
+    /// snapshot. We try the proven command families in increasing strength: `fetch`, then
+    /// `status0`→`fetch`, then `d0`→`fetch`. If the ring still stays quiet we leave the request
+    /// queued so the next idle transition can retry.
+    private func maybeRequestDeviceStatusRefresh(reason: String) {
+        guard pendingDeviceStatusRefresh, postSyncStatusTask == nil else { return }
+        guard ready else { return }
+        guard !syncing, !monitoring, !livePreparing, !workoutHolding, !calibrationCapturing else {
+            ringLog.notice("status: defer device snapshot (\(reason, privacy: .public)) — busy (sync=\(self.syncing), monitor=\(self.monitoring), preparing=\(self.livePreparing), workout=\(self.workoutHolding), calibration=\(self.calibrationCapturing))")
+            return
+        }
+        pendingDeviceStatusRefresh = false
+        let previousBatteryFetch = batteryFetchedAt
+        postSyncStatusTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.postSyncStatusTask = nil }
+            ringLog.notice("status: request device snapshot (\(reason, privacy: .public))")
+            self.write(Command.fetch)
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled else { return }
+            if self.batteryFetchedAt == previousBatteryFetch {
+                ringLog.notice("status: no device snapshot after fetch — re-prime status0 then fetch")
+                self.write(Command.status0)
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled else { return }
+                self.write(Command.fetch)
+                try? await Task.sleep(for: .milliseconds(750))
+                guard !Task.isCancelled else { return }
+            }
+            if self.batteryFetchedAt == previousBatteryFetch {
+                ringLog.notice("status: no device snapshot after status0/fetch — try d0 then fetch")
+                self.write(Command.statusQuery)
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled else { return }
+                self.write(Command.fetch)
+                try? await Task.sleep(for: .milliseconds(750))
+                guard !Task.isCancelled else { return }
+            }
+            // A fresh device-status frame always carries battery too, so `batteryFetchedAt`
+            // advancing is a reliable witness that steps/charger/case-state had the chance to
+            // refresh. If it never moved, keep the request queued for the next idle transition.
+            if self.batteryFetchedAt == previousBatteryFetch {
+                self.pendingDeviceStatusRefresh = true
+                ringLog.notice("status: no 0x10/0x87 device snapshot arrived (\(reason, privacy: .public)); will retry on the next idle transition")
+            }
+        }
     }
 
 
@@ -1250,6 +1776,24 @@ final class RingSession: NSObject {
         guard let writeChar else {
             ringLog.warning("write DROPPED (no writeChar yet): \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
             return
+        }
+        guard canWriteCommands else {
+            let state: String
+            switch peripheral.state {
+            case .connected: state = "connected"
+            case .connecting: state = "connecting"
+            case .disconnected: state = "disconnected"
+            case .disconnecting: state = "disconnecting"
+            @unknown default: state = "unknown"
+            }
+            let hex = bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
+            let detail = "skipped state=\(state) ready=\(ready) notify=\(notifySubscribed) bytes=\(hex)"
+            observability.recordMetricEvent(source: "ble-write", detail: detail)
+            ringLog.warning("write SKIPPED (unusable link): \(detail, privacy: .public)")
+            return
+        }
+        if captureRawFrames {
+            rawCaptureLog.append("Write 0x0802 " + bytes.map { String(format: "%02x", $0) }.joined(separator: " "))
         }
         // Write char advertises `write` (with response).
         ringLog.debug("→ write \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
@@ -1354,6 +1898,15 @@ extension RingSession: CBPeripheralDelegate {
             }
             self.lastFrame = data.map { String(format: "%02x", $0) }.joined(separator: " ")
             self.lastFrameAt = Date()   // freshness anchor for staleness + last-reading timestamp (#36)
+            // Raw capture for the activity-channel probe (#93/#99-style RE) — every inbound frame,
+            // any opcode, while a probe is in flight. Format matches the desktop `decode-log` text
+            // dump so captures here can feed `desktop/decode_activity.py` unchanged.
+            if self.captureRawFrames {
+                self.rawCaptureLog.append("Notification 0x0804 " + self.lastFrame!)
+            }
+            if self.syncing, self.activeDrainTrace != nil {
+                self.updateActiveDrainTrace(bytes: bytes)
+            }
             // A DATA frame (anything but the cold `0x81` status reply, which even an un-activated ring
             // answers) proves the ring's data path is live: clear `notStreaming` + satisfy the
             // activation watchdog (#54). Guarded so `@Observable` doesn't republish on every frame.
@@ -1370,14 +1923,19 @@ extension RingSession: CBPeripheralDelegate {
             // Frames arriving while the link isn't `ready` mean discovery didn't land on this
             // (restored) reconnect — re-run it so we can ack and the buttons enable. #reconnect
             if !self.ready { self.rediscoverIfNeeded() }
-            // The ring's onboard step counter (descriptor [4:6], §5.4) is a since-handoff DELTA the
-            // official app resets; if that app isn't running it keeps climbing (it does NOT reset
-            // at midnight on its own). Fold each observed counter into a persistent per-day total,
-            // reset-aware, using the last raw value persisted ACROSS sessions — so a reconnect
-            // computes the TRUE delta since we last saw the ring instead of rebasing to the current
-            // counter and dropping every step taken while disconnected (#34). The pure, unit-tested
-            // StepAccumulator owns the reset/midnight math; this stays a thin caller.
-            if let v = DeviceStatus.steps(bytes) {
+            // The ring's onboard step field (descriptor [4:6], §5.4) is the ring's current-day
+            // total. Fold repeated same-day reads into deltas so the keepalive doesn't re-add the
+            // whole total every time, but once the calendar day changes treat the next raw value as
+            // "today so far" so a reconnect later that day still catches the steps already taken.
+            // The pure, unit-tested StepAccumulator owns that day-boundary math; this stays a thin
+            // caller.
+            let stepCounter = DeviceStatus.steps(bytes)
+            let skinTemp = DeviceStatus.skinTemperature(bytes)
+            let onCharger = DeviceStatus.isOnCharger(bytes)
+            let batteryMV = DeviceStatus.batteryVoltageMillivolts(bytes)
+            let caseB = DeviceStatus.caseBattery(bytes)
+            let battery = DeviceStatus.battery(bytes)
+            if let v = stepCounter {
                 // Stamp by SAMPLE time (when the descriptor arrived), not a hardcoded Date(), so a
                 // delta lands on the right StoredDaily row at a day boundary (#34). NOTE: on the LIVE
                 // path lastFrameAt was just set to now (line ~689), so sampleDate ≈ ingest time — this
@@ -1398,7 +1956,16 @@ extension RingSession: CBPeripheralDelegate {
                     }
                 }
                 if update.deltaToAdd > 0 {
-                    try? localStore?.addDailySteps(update.deltaToAdd, day: sampleDate)
+                    // Window this delta to when it was actually observed (#steps-history): from
+                    // the LAST same-day reading we saw, so a steady ~30-60s descriptor poll yields
+                    // narrow, accurately-timed snapshots instead of crediting steps to the whole
+                    // elapsed day. Falls back to the day boundary on a rollover/fresh baseline,
+                    // where there genuinely is no prior same-day reading to anchor to. Clamped so a
+                    // stale/cross-session timestamp can never produce an inverted or pre-midnight
+                    // window.
+                    var windowStart = dayChanged ? sampleDay : (self.persistedLastStepSampleAt ?? sampleDay)
+                    if windowStart < sampleDay || windowStart > sampleDate { windowStart = sampleDay }
+                    try? localStore?.addDailySteps(update.deltaToAdd, day: sampleDate, windowStart: windowStart)
                     // Record activity time for the sedentary reminder (#84).
                     UserDefaults.standard.set(sampleDate.timeIntervalSince1970,
                                               forKey: ReminderDefaults.lastActivityAt)
@@ -1408,15 +1975,15 @@ extension RingSession: CBPeripheralDelegate {
                 // baseline-only first reading recovers today's already-accumulated count.
                 dailyStepsTotal = (try? localStore?.todaySteps(day: sampleDate)) ?? dailyStepsTotal
                 self.steps = dailyStepsTotal
-                // Persist the raw counter + its day for the NEXT reading (cross-session, #34).
-                self.persistStepRawState(raw: v, day: sampleDay)
+                // Persist the raw counter + its day + this reading's timestamp for the NEXT
+                // reading (cross-session, #34 / #steps-history).
+                self.persistStepRawState(raw: v, day: sampleDay, sampleAt: sampleDate)
             }
             // Skin temperature rides the same 0x10/0x87 descriptor (§5.4). It streams live
-            // (~30–60 s) and is NOT in the sleep sync, so capture + persist it here — but ONLY
-            // during the nightly sleep window. Daytime readings are too noisy/unpredictable
-            // (activity, ambient swings, intermittent skin contact) to be a usable trend, so we
-            // drop them and surface no live value outside the window.
-            if let t = DeviceStatus.skinTemperature(bytes) {
+            // (~30–60 s) and is NOT in the sleep sync, so the connected UI should reflect it
+            // immediately whenever the reading looks worn/plausible. Persistence remains stricter:
+            // ONLY night-window + worn readings are stored / mirrored into the overnight trend.
+            if let t = skinTemp {
                 // Wear proxy (#56/#41): record the RAW reading BEFORE the night-window / worn
                 // gates below. A cold (off-wrist/charging) reading is exactly what the not-worn
                 // inference and the sleep wear-gate need, and neither survives those gates.
@@ -1445,31 +2012,36 @@ extension RingSession: CBPeripheralDelegate {
                         self.nightTemperatureLog.removeFirst(self.nightTemperatureLog.count - Self.nightTemperatureLogCap)
                     }
                 }
-                // Persist / display ONLY a worn reading: a cold charging reading isn't a skin
-                // temperature, so it must not pollute the nightly average or reach Apple Health
-                // (#41). The cold reading still drives the wear proxies above.
-                self.liveTemperature = (inNightWindow && worn) ? t.celsius : nil
+                // Display any worn/plausible live reading immediately, even by day, so the UI
+                // reflects the same device-status snapshot Healthops uses. Still suppress cold
+                // charger / off-wrist values from the user-facing skin-temp row.
+                self.liveTemperature = worn ? t.celsius : nil
+                // Persist ONLY a worn overnight reading into the NIGHTLY path: daytime values
+                // must not pollute the nightly average or reach Apple Health (#41).
                 if inNightWindow, worn {
                     self.persist([QuantitySample(kind: .temperature, start: Date(), value: t.celsius)])
+                } else if worn {
+                    // Daytime reading: Trends-only, via the separate StoredDaytimeTemp table —
+                    // #41's guarantee above is untouched.
+                    self.persistDaytimeTemperature(t.celsius, at: Date())
                 }
             }
             // Confirmed charging state (#61 🟢): descriptor [2]==0x04 ⟺ on the charger. Per-frame
             // and instant — drives the auto-measure skip (#56) and a true "charging" UI signal,
             // superseding the rising-% inference while connected. Also decode ring voltage (#89).
-            if let onCharger = DeviceStatus.isOnCharger(bytes) {
+            if let onCharger {
                 if onCharger != self.charging { self.charging = onCharger }
             }
-            if let mv = DeviceStatus.batteryVoltageMillivolts(bytes) {
+            if let mv = batteryMV {
                 if mv != self.batteryVoltageMV { self.batteryVoltageMV = mv }
             }
             // Charging-case battery (#89): [17] low7 = case %, bit 0x80 = case charging, 0xff = not
             // docked. Always reassign (nil when the ring leaves the case) so the UI clears promptly.
-            let caseB = DeviceStatus.caseBattery(bytes)
             if caseB != self.caseBattery { self.caseBattery = caseB }
             // Ring battery % is descriptor byte[1] (§5.4 🟢, ground-truthed).
             // Also stamps `batteryFetchedAt` (#57) and extends the charging-inference trend (#60)
             // and the TTE sample window (#86).
-            if let b = DeviceStatus.battery(bytes) {
+            if let b = battery {
                 self.batteryPercent = b
                 self.batteryFetchedAt = Date()   // dedicated freshness anchor (#57)
                 // Charging inference: rolling window of distinct readings (#60).
@@ -1502,6 +2074,12 @@ extension RingSession: CBPeripheralDelegate {
                     }
                 }
             }
+            if stepCounter != nil || skinTemp != nil || onCharger != nil || batteryMV != nil || caseB != nil || battery != nil {
+                self.pendingDeviceStatusRefresh = false
+                self.postSyncStatusTask?.cancel(); self.postSyncStatusTask = nil
+                let tempText = self.liveTemperature.map { String(format: "%.2f", $0) } ?? "-"
+                ringLog.notice("status frame: stepsRaw=\(stepCounter ?? -1) total=\(self.steps ?? -1) batt=\(self.batteryPercent ?? -1)% charging=\(self.charging) case=\(self.caseBattery?.percent ?? -1)% temp=\(tempText, privacy: .public)")
+            }
             // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).
             switch bytes.first {
             case 0x47:
@@ -1510,7 +2088,8 @@ extension RingSession: CBPeripheralDelegate {
                 ringLog.debug("← 0x47 PPG page (\(bytes.count)B), ack")
                 self.write(Command.pageAck47)
                 self.handlePPGPage(data)   // Layer-A epoch decode, gated (#24)
-                return   // PPG page — BulkSleep decode TODO (issue #8)
+                self.logPPGTrend(bytes)    // diagnostic-only optical-trend decode (issue #8)
+                return
             case 0x4C:
                 self.drainSawPage = true
                 if self.syncing || self.livePreparing {   // keep records during a sync OR a live-enter drain
@@ -1542,6 +2121,11 @@ extension RingSession: CBPeripheralDelegate {
                 ringLog.debug("← 0x11 heartbeat, ack 91 00 00")
                 self.write(Command.heartbeatAck)
                 return
+            case 0x13:
+                if self.calibrationCapturing {
+                    self.handleCalibrationPPGFrame(bytes)
+                    return
+                }
             case 0x81:
                 // Auth handshake (#54, §5.8). `81 00 <chal>` (← our `01 00 00`) is the ring's
                 // challenge — reply with `01 01 <SM3([V,chal])[-3:]> 00` so the ring activates its
@@ -1622,6 +2206,22 @@ extension RingSession: CBPeripheralDelegate {
         decodedEpochRecords += syncSession.appendPPGPage(data).count
     }
 
+    /// Diagnostic-only decode of a `0x47` page's optical-trend samples (issue #8 —
+    /// PROTOCOL.md §5.2). Surfaces a summary for inspection (`lastPPGTrendSummary`, e.g. the
+    /// Debug card); never feeds HealthKit or any analytic — channel identity and absolute
+    /// units are still unconfirmed (see `PPGTrend.swift`'s header).
+    private func logPPGTrend(_ bytes: [UInt8]) {
+        let records = EpochRecord.parsePPGPage(Data(bytes))
+        guard !records.isEmpty else { return }
+        let allSamples = records.flatMap { PPGTrend.samples(from: $0.rawPayload) }
+        guard let lo = allSamples.min(), let hi = allSamples.max() else { return }
+        let mean = Double(allSamples.reduce(0, +)) / Double(allSamples.count)
+        let summary = "\(records.count) records, \(allSamples.count) samples, "
+            + "range \(lo)–\(hi), mean \(String(format: "%.0f", mean))"
+        self.lastPPGTrendSummary = summary
+        ringLog.debug("0x47 optical-trend (diagnostic, issue #8): \(summary, privacy: .public)")
+    }
+
     private func handleEndOfHistory(_ data: Data) {
         guard syncSession.complete(with: data) != nil,
               epochDecodingEnabled else { return }
@@ -1632,5 +2232,56 @@ extension RingSession: CBPeripheralDelegate {
         } catch {
             // Persistence failures should not interrupt the BLE drain/ACK loop.
         }
+    }
+
+    private func handleCalibrationPPGFrame(_ bytes: [UInt8]) {
+        guard bytes.count >= 156 else { return }
+        calibrationLastFrameAt = Date()
+        calibrationMissCount = 0
+        let seq = bytes[2]
+        let wallClockS = Date().timeIntervalSince1970
+        var chA: [Int] = []
+        var chB: [Int] = []
+        var chC: [Int] = []
+        chA.reserveCapacity(25)
+        chB.reserveCapacity(25)
+        chC.reserveCapacity(25)
+        for i in 0..<25 {
+            let offset = 6 + i * 6
+            guard offset + 5 < bytes.count else { break }
+            chA.append(Int(bytes[offset]) << 8 | Int(bytes[offset + 1]))
+            let rawB = UInt16(bytes[offset + 2]) << 8 | UInt16(bytes[offset + 3])
+            let rawC = UInt16(bytes[offset + 4]) << 8 | UInt16(bytes[offset + 5])
+            chB.append(Int(Int16(bitPattern: rawB)))
+            chC.append(Int(Int16(bitPattern: rawC)))
+        }
+        let frame = PPGRawFrame(seq: seq, wallClockS: wallClockS, chA: chA, chB: chB, chC: chC)
+        calibrationSampleCount += chA.count
+        calibrationFrameSink?(frame)
+    }
+
+    private func finishCalibrationPPGCapture(success: Bool) {
+        calibrationKeepaliveTask?.cancel()
+        calibrationKeepaliveTask = nil
+        calibrationWatchdogTask?.cancel()
+        calibrationWatchdogTask = nil
+        calibrationStopTask?.cancel()
+        calibrationStopTask = nil
+        if calibrationCapturing {
+            write([0x06, 0x00, 0x00])
+        }
+        calibrationCapturing = false
+        calibrationFrameSink = nil
+        let count = calibrationSampleCount
+        calibrationSampleCount = 0
+        calibrationMissCount = 0
+        calibrationLastFrameAt = .distantPast
+        if success {
+            calibrationContinuation?.resume(returning: count)
+        } else {
+            calibrationContinuation?.resume(throwing: NSError(domain: "OpenCircuit.Calibration", code: 3, userInfo: [NSLocalizedDescriptionKey: "PPG capture failed"]))
+        }
+        calibrationContinuation = nil
+        scheduleDeviceStatusRefresh(reason: "calibration-stop")
     }
 }
