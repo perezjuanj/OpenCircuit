@@ -7,7 +7,7 @@ Usage:
     python ppg_watch.py [--watch-dir DIR] [--api-url URL] [--vault-dir DIR]
 
 Defaults:
-    --watch-dir  /Users/pravinsail/OpenCircuit-master/desktop
+    --watch-dir  <repo-root>/desktop
     --api-url    http://localhost:8765
     --vault-dir  ~/Documents/Obsidian/Health/PPG   (skipped if not set)
 """

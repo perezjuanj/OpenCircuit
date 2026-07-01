@@ -73,7 +73,7 @@ auth_response = SM3([V, challenge_byte])[-3:]  # last 3 bytes of SM3 hash
 ```
 
 Ring UUID: `375373B7-94D7-5B6E-9866-54073B5C04B3`  
-Ring MAC: `F8:79:99:C1:E3:4C`
+Ring MAC: `AA:BB:CC:DD:EE:FF`
 
 ### Channel Identity (confirmed)
 
@@ -129,7 +129,7 @@ stable segments before a burst. analyze_ppg_13.py recomputes zero-phase filter o
 
 ## 3. File Inventory
 
-All tools in `/Users/pravinsail/OpenCircuit-master/desktop/`:
+All tools in `<repo-root>/desktop/`:
 
 ### Stage 1 Production Tools
 
@@ -210,7 +210,7 @@ absolute DC unreliable for channel ID; SpO2 ratiometry is the authoritative meth
 ## 5. Stage 1 Confirmed Numbers (use these as ground truth)
 
 ```
-Ring:          RingConn Air 2  MAC F8:79:99:C1:E3:4C
+Ring:          RingConn Air 2  MAC AA:BB:CC:DD:EE:FF
 Session date:  2026-06-26
 Finger:        Index finger (left hand)
 
@@ -314,7 +314,7 @@ Deferred until ECG reference is available.
 
 ### Quick validation that tools still work
 ```bash
-cd /Users/pravinsail/OpenCircuit-master/desktop
+cd <repo-root>/desktop
 .venv/bin/python debug_ppg_mode10.py 375373B7-94D7-5B6E-9866-54073B5C04B3
 ```
 Expected output: `SUCCESS: RSP 0x13 confirmed` within 15s.

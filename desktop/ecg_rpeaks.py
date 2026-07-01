@@ -27,7 +27,7 @@ import duckdb
 import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks
 
-DEFAULT_DB = Path("/Users/pravinsail/HealthLocal/db/healthlocal.duckdb")
+DEFAULT_DB = Path.home() / "HealthLocal" / "db" / "healthlocal.duckdb"
 FS = 512.0  # Apple Watch ECG sample rate (Hz)
 
 # ── Pan-Tompkins bandpass: 5–15 Hz isolates QRS complex ─────────────────────

@@ -28,7 +28,7 @@ import duckdb
 import numpy as np
 import requests
 
-DEFAULT_DB   = Path("/Users/pravinsail/HealthLocal/db/healthlocal.duckdb")
+DEFAULT_DB   = Path.home() / "HealthLocal" / "db" / "healthlocal.duckdb"
 DEFAULT_API  = "http://localhost:8765"
 DESKTOP_DIR  = Path(__file__).parent
 MIN_NOTCH    = 3   # minimum notch pulses in a window to trust AI%/RI

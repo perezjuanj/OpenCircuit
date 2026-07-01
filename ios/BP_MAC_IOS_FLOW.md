@@ -3,10 +3,10 @@
 This document explains how BP estimation currently works on the Mac, what the user has to do, what each tool/script is responsible for, how the iOS implementation compares, and what must be in place for the iOS app to show the same BP estimate behavior as the Mac setup.
 
 It is based on:
-- `/Users/pravinsail/OpenCircuit-master/desktop/`
-- `/Users/pravinsail/OpenCircuit-master/docs/BLE_INVESTIGATION_LOG.md`
-- `/Users/pravinsail/OpenCircuit-master/docs/HANDOFF_MACOS_IOS.md`
-- `/Users/pravinsail/OpenCircuit-master/claude session .md`
+- `<repo-root>/desktop/`
+- `<repo-root>/docs/BLE_INVESTIGATION_LOG.md`
+- `<repo-root>/docs/HANDOFF_MACOS_IOS.md`
+- `<repo-root>/claude session .md`
 
 ## Executive Summary
 
@@ -358,7 +358,7 @@ This is a key operational dependency.
 
 Observed risk:
 - the local API reports a DB path under `/data/db/healthlocal.duckdb`
-- desktop scripts default to `/Users/pravinsail/HealthLocal/db/healthlocal.duckdb`
+- desktop scripts default to `~/HealthLocal/db/healthlocal.duckdb`
 
 If those are not the same DB:
 - import can happen in one place

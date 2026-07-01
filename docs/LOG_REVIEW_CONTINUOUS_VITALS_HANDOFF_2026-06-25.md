@@ -62,7 +62,7 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1448)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1448)
 
 Current issue in code:
 
@@ -86,8 +86,8 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1461)
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1494)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1461)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1494)
 
 ### 3. Quick live measurement still opens sync sessions
 
@@ -103,8 +103,8 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:548)
-- [ios/OpenCircuitKit/Sources/OpenCircuitKit/Opcodes.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuitKit/Sources/OpenCircuitKit/Opcodes.swift:34)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:548)
+- [ios/OpenCircuitKit/Sources/OpenCircuitKit/Opcodes.swift](<repo-root>/ios/OpenCircuitKit/Sources/OpenCircuitKit/Opcodes.swift:34)
 
 Important protocol note already in code:
 
@@ -125,7 +125,7 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1787)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1787)
 
 ### 5. SpO2 live measurement succeeds
 
@@ -143,7 +143,7 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1797)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1797)
 
 ### 6. Status snapshots succeed often enough for temp and steps
 
@@ -164,8 +164,8 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1582)
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1622)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1582)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1622)
 
 ### 7. Some history epochs are decoded and persisted
 
@@ -183,8 +183,8 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1348)
-- [ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift:354)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1348)
+- [ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift](<repo-root>/ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift:354)
 
 ### 8. Some successfully decoded HR samples are not ingested
 
@@ -207,8 +207,8 @@ This is the strongest evidence for the user's reported issue:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:903)
-- [ios/OpenCircuit/Store/LocalStore.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/Store/LocalStore.swift:274)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:903)
+- [ios/OpenCircuit/Store/LocalStore.swift](<repo-root>/ios/OpenCircuit/Store/LocalStore.swift:274)
 
 Likely reasons:
 
@@ -236,7 +236,7 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1341)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1341)
 
 Why this matters:
 
@@ -265,7 +265,7 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:629)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:629)
 
 ### 11. Step counter resets occur mid-day
 
@@ -282,8 +282,8 @@ Interpretation:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1598)
-- [ios/OpenCircuit/Store/LocalStore.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/Store/LocalStore.swift:789)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1598)
+- [ios/OpenCircuit/Store/LocalStore.swift](<repo-root>/ios/OpenCircuit/Store/LocalStore.swift:789)
 
 ## What the Log Proves
 
@@ -383,7 +383,7 @@ Why:
 
 Code areas:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1448)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1448)
 - the scanner/central state path that triggers reconnect attempts
 
 Expected effect:
@@ -406,8 +406,8 @@ Why:
 
 Code areas:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:531)
-- [ios/OpenCircuitKit/Sources/OpenCircuitKit/Opcodes.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuitKit/Sources/OpenCircuitKit/Opcodes.swift:34)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:531)
+- [ios/OpenCircuitKit/Sources/OpenCircuitKit/Opcodes.swift](<repo-root>/ios/OpenCircuitKit/Sources/OpenCircuitKit/Opcodes.swift:34)
 
 Expected effect:
 
@@ -428,8 +428,8 @@ Why:
 
 Code areas:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:903)
-- [ios/OpenCircuit/Store/LocalStore.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/Store/LocalStore.swift:274)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:903)
+- [ios/OpenCircuit/Store/LocalStore.swift](<repo-root>/ios/OpenCircuit/Store/LocalStore.swift:274)
 
 Minimum instrumentation to add:
 
@@ -459,7 +459,7 @@ Why:
 
 Code areas:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:905)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:905)
 
 Expected effect:
 
@@ -491,9 +491,9 @@ Current limitations:
 
 Relevant current storage areas:
 
-- [ios/OpenCircuit/Store/LocalStore.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/Store/LocalStore.swift:228)
-- [ios/OpenCircuit/Store/LocalStore.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/Store/LocalStore.swift:512)
-- [ios/OpenCircuit/Store/LocalStore.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/Store/LocalStore.swift:789)
+- [ios/OpenCircuit/Store/LocalStore.swift](<repo-root>/ios/OpenCircuit/Store/LocalStore.swift:228)
+- [ios/OpenCircuit/Store/LocalStore.swift](<repo-root>/ios/OpenCircuit/Store/LocalStore.swift:512)
+- [ios/OpenCircuit/Store/LocalStore.swift](<repo-root>/ios/OpenCircuit/Store/LocalStore.swift:789)
 
 Expected effect:
 
@@ -514,8 +514,8 @@ Why:
 
 Current Health write path:
 
-- [ios/OpenCircuit/Store/LocalStore.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/Store/LocalStore.swift:552)
-- [ios/OpenCircuit/Health/HealthKitWriter.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/Health/HealthKitWriter.swift:122)
+- [ios/OpenCircuit/Store/LocalStore.swift](<repo-root>/ios/OpenCircuit/Store/LocalStore.swift:552)
+- [ios/OpenCircuit/Health/HealthKitWriter.swift](<repo-root>/ios/OpenCircuit/Health/HealthKitWriter.swift:122)
 
 Status:
 
@@ -535,8 +535,8 @@ Why:
 
 Relevant code:
 
-- [ios/OpenCircuit/BLE/RingSession.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuit/BLE/RingSession.swift:1341)
-- [ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift](/Users/pravinsail/OpenCircuit-master/ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift:208)
+- [ios/OpenCircuit/BLE/RingSession.swift](<repo-root>/ios/OpenCircuit/BLE/RingSession.swift:1341)
+- [ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift](<repo-root>/ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift:208)
 
 Expected effect:
 

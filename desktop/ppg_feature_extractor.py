@@ -50,7 +50,7 @@ MAX_PULSE_SAMPLES_UP = int(MAX_PULSE_S * FS_UP)
 NOTCH_SEARCH_START = 0.10   # fraction of pulse to start looking for notch after peak
 NOTCH_SEARCH_END = 0.75     # fraction of pulse where diastolic peak must end by
 
-DEFAULT_DB = Path("/Users/pravinsail/HealthLocal/db/healthlocal.duckdb")
+DEFAULT_DB = Path.home() / "HealthLocal" / "db" / "healthlocal.duckdb"
 
 
 # ── DuckDB helpers ────────────────────────────────────────────────────────────

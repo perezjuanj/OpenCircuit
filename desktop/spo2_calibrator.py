@@ -30,10 +30,11 @@ Usage:
 import argparse
 import statistics
 import sys
+from pathlib import Path
 
 import duckdb
 
-DB = "/Users/pravinsail/HealthLocal/db/healthlocal.duckdb"
+DB = str(Path.home() / "HealthLocal" / "db" / "healthlocal.duckdb")
 
 # Current formula in ppg_pipeline.py (lines ~58-59)
 CURRENT_A = 110.0

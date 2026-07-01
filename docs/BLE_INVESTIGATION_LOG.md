@@ -1,6 +1,6 @@
 # RingConn Gen 2 Air — BLE Investigation Log (Living Document)
 
-Ring MAC: `F8:79:99:C1:E3:4C`  
+Ring MAC: `AA:BB:CC:DD:EE:FF`  
 BLE UUID (Device): `375373B7-94D7-5B6E-9866-54073B5C04B3` (CBPeripheral UUID, macOS)  
 Started: 2026-06-23  
 Last updated: 2026-06-26 (night — Stage 1 ingestion pipeline complete; 4 production tools ready)
@@ -62,7 +62,7 @@ Sweep completed 2026-06-26. All commands sent as `XX 00 00` after successful SM3
 | 0x23 | 0xA3 | `00` | unknown ack | 🟢 |
 | 0x24 | 0xA4 | `00` | unknown ack | 🟢 |
 | 0x27 | 0xA7 | `ff` (rejected) | — | skip |
-| 0x28 | 0xA8 | `11 "RCA2F255230360G11"` | **Device serial number** | 🟢 |
+| 0x28 | 0xA8 | `11 "RCXXXXXXXXXXXXXX"` | **Device serial number** | 🟢 |
 | 0x29 | 0xA9 | `[valid][HR][valid][SpO2][0×4]` | **Polled HR+SpO2 snapshot** | 🟢 |
 | 0x2A | 0xAA | `00` | unknown ack | 🟢 |
 | 0x2B | 0xAB | `03` | firmware state / version? | 🟢 |
@@ -435,7 +435,7 @@ Add startup buffer flush to `capture_ppg.py` — after `enter_ppg_mode()`, drain
 
 ### Quick sanity check before any Stage 2 session
 ```bash
-cd /Users/pravinsail/OpenCircuit-master/desktop
+cd <repo-root>/desktop
 .venv/bin/python debug_ppg_mode10.py 375373B7-94D7-5B6E-9866-54073B5C04B3
 ```
 Expected: `SUCCESS: RSP 0x13 confirmed` within 15s.
@@ -479,7 +479,7 @@ Also probe CMD 0x05 with param bytes (0x05 00 00 triggered passive 0x4D; what do
 | 2026-06-24 | CMD 0x21 = BleEnterOTA → bricked ring temporarily |
 | 2026-06-26 | Full sweep 0x00-0xFF complete. ~25 opcodes respond to XX 00 00 |
 | 2026-06-26 | 0x2B safe, 0x30 → 0x0B (breaks cmd=rsp^0x80 rule) |
-| 2026-06-26 | 0x28 → serial number "RCA2F255230360G11" |
+| 2026-06-26 | 0x28 → serial number "RCXXXXXXXXXXXXXX" |
 | 2026-06-26 | 0x0D = non-destructive batch history peek (alias: 0x12) |
 | 2026-06-26 | 0x29 = polled HR+SpO2 snapshot (no mode required) |
 | 2026-06-26 | Third GATT service (0x0900) = DFU/OTA only (zero response to probes) |
