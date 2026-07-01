@@ -77,6 +77,25 @@ final class ExportEngineTests: XCTestCase {
         XCTAssertTrue(lines[1].hasSuffix(",8000"), "steps should be last field")
     }
 
+    func testStepSamplesCSVHeader() {
+        XCTAssertEqual(ExportEngine.stepSamplesCSV([]), "start,end,delta")
+    }
+
+    func testNapsCSVHeader() {
+        XCTAssertEqual(ExportEngine.napsCSV([]), "start,end,asleepMin,isLongNap")
+    }
+
+    func testDaytimeTemperatureCSVHeader() {
+        XCTAssertEqual(ExportEngine.daytimeTemperatureCSV([]), "time,celsius")
+    }
+
+    func testHistorySyncEvidenceCSVHeader() {
+        XCTAssertEqual(
+            ExportEngine.historySyncEvidenceCSV([]),
+            "capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64"
+        )
+    }
+
     // MARK: - toJSON
 
     func testToJSONReturnsValidJSON() {
@@ -84,8 +103,25 @@ final class ExportEngineTests: XCTestCase {
         let slRow = ExportEngine.SleepRow(
             night: night, asleepMin: 450, deepMin: 90, lightMin: 180,
             remMin: 120, awakeMin: 30, efficiency: 0.9375,
-            skinTempC: 36.5, sleepScore: 82, stressScore: 40)
+            inBedStart: t0, inBedEnd: t1, skinTempC: 36.5, sleepScore: 82, stressScore: 40,
+            feelScore: 7, hrDeep: 55, hrLight: 60, hrRem: 64, hrAwake: 68, movementLevels: [0, 1, 2])
         let dRow = ExportEngine.DailyRow(day: night, steps: 8_000)
+        let stepRow = ExportEngine.StepSampleRow(start: t0, end: t1, delta: 123)
+        let napRow = ExportEngine.NapRow(start: t0, end: t1, asleepMin: 30, isLongNap: false)
+        let tempRow = ExportEngine.DaytimeTemperatureRow(time: t0, celsius: 34.2)
+        var trace = HistoryChannelTrace(label: "sleep", channel: 0x00, startedAt: t0)
+        trace.finishedAt = t1
+        trace.sawSyncAck = true
+        trace.page4CCount = 1
+        trace.endMarkerCount = 1
+        trace.recordsAtStart = 2
+        trace.recordsAtEnd = 8
+        trace.exitReason = .endMarker
+        let evidenceRow = ExportEngine.HistorySyncEvidenceRow(
+            capturedAt: t0, ringID: "ring-1", trigger: "manual",
+            sleepCommitted: true, stagedSleepSegments: 4,
+            mergedRecordCount: 8, historySampleCount: 10,
+            rawRecordBlobBase64: "AQID", channels: [trace])
 
         let json = ExportEngine.toJSON(samples: [sRow], sleep: [slRow], daily: [dRow], now: t0)
         XCTAssertNotNil(json, "toJSON should not return nil")
@@ -95,9 +131,23 @@ final class ExportEngineTests: XCTestCase {
             return XCTFail("produced string is not valid JSON")
         }
         XCTAssertNotNil(obj["exportedAt"], "exportedAt key required")
+        XCTAssertEqual(obj["schemaVersion"] as? Int, 2)
         XCTAssertNotNil(obj["samples"] as? [[String: Any]])
         XCTAssertNotNil(obj["sleep"] as? [[String: Any]])
         XCTAssertNotNil(obj["daily"] as? [[String: Any]])
+        let full = ExportEngine.toJSON(samples: [sRow], sleep: [slRow], daily: [dRow],
+                                       stepSamples: [stepRow], naps: [napRow],
+                                       daytimeTemperatures: [tempRow],
+                                       historySyncEvidence: [evidenceRow], now: t0)
+        XCTAssertNotNil(full)
+        guard let full, let fullData = full.data(using: .utf8),
+              let fullObj = try? JSONSerialization.jsonObject(with: fullData) as? [String: Any] else {
+            return XCTFail("expanded JSON is not valid")
+        }
+        XCTAssertEqual((fullObj["stepSamples"] as? [[String: Any]])?.count, 1)
+        XCTAssertEqual((fullObj["naps"] as? [[String: Any]])?.count, 1)
+        XCTAssertEqual((fullObj["daytimeTemperatures"] as? [[String: Any]])?.count, 1)
+        XCTAssertEqual((fullObj["historySyncEvidence"] as? [[String: Any]])?.count, 1)
     }
 
     func testToJSONEmptyInputsStillValid() {

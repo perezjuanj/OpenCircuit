@@ -1,17 +1,25 @@
-// 7-day rolling aggregate computation for available decoded metrics (#74).
+// Rolling daily-trend aggregate computation for every tracked metric (#74).
 //
 // SCOPE — AVAILABLE DATA ONLY.
-// Daily aggregates and 7-day rolling means for the metrics we actually decode:
-//   • Sleep-window HR / HRV / SpO2 / RR averages (from stored bulk-epoch samples)
+// Daily aggregates and N-day rolling means for the metrics we actually decode:
+//   • All-day HR / HRV / SpO2 / RR averages, over the whole calendar day (from stored
+//     samples — HR is on every worn epoch, sleep AND activity; HRV/SpO2/RR are on
+//     whichever epochs land .sleepVitals, which is NOT exclusively overnight, see
+//     BulkSleep.swift)
+//   • Sleep-window HR / HRV / SpO2 / RR averages (the SAME samples, restricted to the
+//     night's in-bed window) — kept alongside the all-day figures because they answer
+//     a different question (overnight baseline vs. the whole day)
 //   • Steps (from StoredDaily)
+//   • Active energy / distance (ESTIMATEs derived from the day's step total, the same
+//     basis HealthKitWriter uses — see Calories/DistanceEstimate)
+//   • Exercise minutes (ESTIMATE — elevated-HR minutes outside the sleep window, the
+//     same basis as ExerciseMinutes/HealthKitWriter)
 //   • Nightly skin temp (from StoredSleepSummary.skinTempC)
+//   • Daytime skin temp (from the separate StoredDaytimeTemp table — kept apart from the
+//     nightly baseline/Apple Health per #41, but shown here as its own all-day trend)
 //   • Sleep score (from StoredSleepSummary.sleepScore)
 //   • Overnight stress (from StoredSleepSummary.stressScore)
 //   • Resting HR (optional, from caller-supplied values)
-//
-// ⚠️ Daytime/waking HR, HRV, SpO2 aggregates are NOT included. They need the
-// undecoded activity-epoch payload ([15:22] / #93). Those aggregates follow that
-// decode — do not guess or invent daytime values.
 //
 // The >29 bpm HR guard is applied per the APK SQL (pp.txt:62996):
 //   `AVG(CASE WHEN hrAvg>29 THEN hrAvg END) AS hr7Avg`
@@ -35,13 +43,24 @@ public enum TrendsEngine {
         public let sleepScore: Int?    // composite 0–100 (nil / 0 = not computed)
         public let stressScore: Int?   // overnight stress 0–100 (nil / 0 = not computed)
         public let skinTempC: Double?  // nightly skin temp °C (nil / 0 = no data)
+        public let dayTempC: Double?   // daytime skin temp °C avg, from StoredDaytimeTemp
 
         // Sleep-window vitals (from stored epoch samples within the night's window)
-        // These are the ONLY HR/HRV/SpO2/RR we can aggregate — daytime values need #93.
         public let sleepHRAvg: Double?
         public let sleepHRVAvg: Double?     // ms RMSSD
         public let sleepSpO2Avg: Double?    // 0…1 fraction
         public let sleepRRAvg: Double?      // breaths/min
+
+        // All-day vitals (the SAME stored samples, over the whole calendar day)
+        public let dayHRAvg: Double?
+        public let dayHRVAvg: Double?       // ms RMSSD
+        public let daySpO2Avg: Double?      // 0…1 fraction
+        public let dayRRAvg: Double?        // breaths/min
+
+        // Activity ESTIMATEs (derived from the day's steps / HR, same basis as HealthKitWriter)
+        public let activeEnergyKcal: Double?
+        public let distanceM: Double?
+        public let exerciseMin: Double?
 
         public init(
             date: Date,
@@ -50,10 +69,18 @@ public enum TrendsEngine {
             sleepScore: Int? = nil,
             stressScore: Int? = nil,
             skinTempC: Double? = nil,
+            dayTempC: Double? = nil,
             sleepHRAvg: Double? = nil,
             sleepHRVAvg: Double? = nil,
             sleepSpO2Avg: Double? = nil,
-            sleepRRAvg: Double? = nil
+            sleepRRAvg: Double? = nil,
+            dayHRAvg: Double? = nil,
+            dayHRVAvg: Double? = nil,
+            daySpO2Avg: Double? = nil,
+            dayRRAvg: Double? = nil,
+            activeEnergyKcal: Double? = nil,
+            distanceM: Double? = nil,
+            exerciseMin: Double? = nil
         ) {
             self.date = date
             self.steps = steps
@@ -61,10 +88,18 @@ public enum TrendsEngine {
             self.sleepScore = sleepScore
             self.stressScore = stressScore
             self.skinTempC = skinTempC
+            self.dayTempC = dayTempC
             self.sleepHRAvg = sleepHRAvg
             self.sleepHRVAvg = sleepHRVAvg
             self.sleepSpO2Avg = sleepSpO2Avg
             self.sleepRRAvg = sleepRRAvg
+            self.dayHRAvg = dayHRAvg
+            self.dayHRVAvg = dayHRVAvg
+            self.daySpO2Avg = daySpO2Avg
+            self.dayRRAvg = dayRRAvg
+            self.activeEnergyKcal = activeEnergyKcal
+            self.distanceM = distanceM
+            self.exerciseMin = exerciseMin
         }
     }
 
@@ -77,10 +112,18 @@ public enum TrendsEngine {
         public let sleepScore: Double?
         public let stressScore: Double?
         public let skinTempC: Double?
+        public let dayTempC: Double?
         public let sleepHRAvg: Double?
         public let sleepHRVAvg: Double?
         public let sleepSpO2Avg: Double?
         public let sleepRRAvg: Double?
+        public let dayHRAvg: Double?
+        public let dayHRVAvg: Double?
+        public let daySpO2Avg: Double?
+        public let dayRRAvg: Double?
+        public let activeEnergyKcal: Double?
+        public let distanceM: Double?
+        public let exerciseMin: Double?
     }
 
     /// The APK SQL guard: exclude readings ≤ 29 bpm (pp.txt:62996).
@@ -97,10 +140,18 @@ public enum TrendsEngine {
             sleepScore:     avgInt(tail.compactMap(\.sleepScore).filter { $0 > 0 }),
             stressScore:    avgInt(tail.compactMap(\.stressScore).filter { $0 > 0 }),
             skinTempC:      avgDouble(tail.compactMap(\.skinTempC).filter { $0 > 0 }),
+            dayTempC:       avgDouble(tail.compactMap(\.dayTempC).filter { $0 > 0 }),
             sleepHRAvg:     avgDouble(tail.compactMap(\.sleepHRAvg).filter { $0 > minValidHR }),
             sleepHRVAvg:    avgDouble(tail.compactMap(\.sleepHRVAvg).filter { $0 > 0 }),
             sleepSpO2Avg:   avgDouble(tail.compactMap(\.sleepSpO2Avg).filter { $0 > 0 }),
-            sleepRRAvg:     avgDouble(tail.compactMap(\.sleepRRAvg).filter { $0 > 0 })
+            sleepRRAvg:     avgDouble(tail.compactMap(\.sleepRRAvg).filter { $0 > 0 }),
+            dayHRAvg:       avgDouble(tail.compactMap(\.dayHRAvg).filter { $0 > minValidHR }),
+            dayHRVAvg:      avgDouble(tail.compactMap(\.dayHRVAvg).filter { $0 > 0 }),
+            daySpO2Avg:     avgDouble(tail.compactMap(\.daySpO2Avg).filter { $0 > 0 }),
+            dayRRAvg:       avgDouble(tail.compactMap(\.dayRRAvg).filter { $0 > 0 }),
+            activeEnergyKcal: avgDouble(tail.compactMap(\.activeEnergyKcal).filter { $0 > 0 }),
+            distanceM:        avgDouble(tail.compactMap(\.distanceM).filter { $0 > 0 }),
+            exerciseMin:      avgDouble(tail.compactMap(\.exerciseMin).filter { $0 > 0 })
         )
     }
 

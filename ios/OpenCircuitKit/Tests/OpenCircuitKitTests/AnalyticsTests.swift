@@ -116,7 +116,7 @@ final class AnalyticsTests: XCTestCase {
     func testActiveKcalFromStepsNonZeroForWalk() {
         let profile = UserProfile(age: 30, weightKg: 70, heightCm: 180, sex: .male)
         let kcal = Calories.activeKcalFromSteps(steps: 5_000, profile: profile)
-        let expectedKm = DistanceEstimate.meters(steps: 5_000, profile: profile) / 1000.0
+        let expectedKm = DistanceEstimate.meters(steps: 5_000) / 1000.0
         XCTAssertEqual(kcal, expectedKm * 70 * 0.5, accuracy: 0.001)
         XCTAssertGreaterThan(kcal, 0, "a 5000-step walk must yield nonzero active calories")
         XCTAssertEqual(Calories.activeKcalFromSteps(steps: 0, profile: profile), 0.0, accuracy: 0.001)
