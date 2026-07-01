@@ -1,10 +1,10 @@
 import XCTest
 @testable import OpenCircuitKit
 
-// Step accumulation (#34): fold the ring's since-handoff raw counter into per-day deltas,
-// reset-aware and midnight-aware. These cases pin the behavior the live BLE path can't
-// easily test: a normal climb, the no-baseline first reading, a mid-day reset/handoff vs the
-// expected midnight reset, a 16-bit wraparound, and "no movement" (which must NOT double-count).
+// Step accumulation (#34): the descriptor carries the ring's current-day count, so repeated
+// same-day reads must add only the incremental delta while the first read of a new day must
+// recover that day's already-accumulated total. These cases pin that behavior without needing
+// the live BLE path in test.
 final class StepAccumulatorTests: XCTestCase {
 
     func testClimbCountsTheDelta() {
@@ -22,11 +22,12 @@ final class StepAccumulatorTests: XCTestCase {
         XCTAssertFalse(u.isReset)
     }
 
-    func testFirstReadingHasNoBaselineAndCountsNothing() {
-        // previousRaw == nil: we can't tell how many raw steps predate us, so adopt the reading
-        // as the baseline and count none (don't retro-count someone else's steps onto today).
+    func testFirstReadingHasNoBaselineCreditsFullRawCount() {
+        // previousRaw == nil (first run / fresh pairing / reinstall): credit the full raw count
+        // as today's steps so far, same as a reset — otherwise a fresh pairing silently drops
+        // every step already on the ring (the #34 failure mode this type exists to prevent).
         let u = StepAccumulator.update(previousRaw: nil, newRaw: 8000, dayChanged: false)
-        XCTAssertEqual(u.deltaToAdd, 0)
+        XCTAssertEqual(u.deltaToAdd, 8000)
         XCTAssertFalse(u.isReset)
         XCTAssertFalse(u.isAnomalousReset)
     }
@@ -41,20 +42,20 @@ final class StepAccumulatorTests: XCTestCase {
     }
 
     func testMidnightResetCountsNewValueButIsNotAnomalous() {
-        // A drop across midnight is the official app's normal daily reset — still a reset (add
-        // the new value to the new day), but NOT anomalous.
+        // A new calendar day always starts from the ring's current-day total. If the raw count
+        // also dropped overnight, surface it as a non-anomalous reset for logging only.
         let u = StepAccumulator.update(previousRaw: 9000, newRaw: 50, dayChanged: true)
         XCTAssertEqual(u.deltaToAdd, 50)
         XCTAssertTrue(u.isReset)
         XCTAssertFalse(u.isAnomalousReset)
     }
 
-    func testMidnightClimbCreditsIncrementalDeltaToNewDay() {
-        // Official app NOT running: the ring's counter keeps climbing across midnight. The
-        // incremental delta (not the whole counter) is what the new day earns — anything else
-        // would bleed the prior day's accumulated baseline into the new day.
-        let u = StepAccumulator.update(previousRaw: 9000, newRaw: 9100, dayChanged: true)
-        XCTAssertEqual(u.deltaToAdd, 100)
+    func testFirstReadingOnNewDayCreditsFullCurrentDayTotal() {
+        // Missing the morning's first few reads must NOT lose those already-taken steps. Even if
+        // today's raw has already climbed past yesterday's last reading, the new day earns the
+        // full current-day total, not just the difference from yesterday.
+        let u = StepAccumulator.update(previousRaw: 2000, newRaw: 3000, dayChanged: true)
+        XCTAssertEqual(u.deltaToAdd, 3000)
         XCTAssertFalse(u.isReset)
         XCTAssertFalse(u.isAnomalousReset)
     }
@@ -70,11 +71,13 @@ final class StepAccumulatorTests: XCTestCase {
 
     func testResetFlagIsNeverSetOnAClimb() {
         // isAnomalousReset must only ever be true alongside isReset.
-        for dayChanged in [true, false] {
-            let u = StepAccumulator.update(previousRaw: 10, newRaw: 20, dayChanged: dayChanged)
-            XCTAssertFalse(u.isReset)
-            XCTAssertFalse(u.isAnomalousReset)
-        }
+        let sameDay = StepAccumulator.update(previousRaw: 10, newRaw: 20, dayChanged: false)
+        XCTAssertFalse(sameDay.isReset)
+        XCTAssertFalse(sameDay.isAnomalousReset)
+
+        let newDay = StepAccumulator.update(previousRaw: 10, newRaw: 20, dayChanged: true)
+        XCTAssertFalse(newDay.isReset)
+        XCTAssertFalse(newDay.isAnomalousReset)
     }
 
     func testSummingDeltasReconstructsADayOfSteps() {

@@ -14,6 +14,11 @@ struct ContentView: View {
     @State private var lastWrite: String?
     @State private var showDebug = false
     @State private var showWorkout = false
+    @State private var showCalibration = false
+    @StateObject private var calibration = CalibrationSessionManager()
+    /// Raw-capture export state for the activity-channel probe (debug / RE — issue #93).
+    @State private var probeExportURL: URL?
+    @State private var showProbeShareSheet = false
     /// Women's health feature gate (#78). Matches the key in UserProfileSettingsView.
     @AppStorage("userProfile.womensHealthEnabled") private var womensHealthEnabled = false
 
@@ -115,6 +120,7 @@ struct ContentView: View {
                 if healthAuthorized { observability.markHealthEverAuthorized() }
                 refreshObservability()
                 if healthAuthorized { flushHealth() }
+                await calibration.refreshLatestEstimateIfNeeded(minInterval: 0)
             }
             // Foreground auto-refresh: reconnect to the last-known ring and pull fresh data
             // when the app becomes active, so opening it after a while shows updated vitals
@@ -124,6 +130,7 @@ struct ContentView: View {
                     handleForegroundActivation()
                     refreshObservability()        // pick up anything a background run wrote
                     evaluateForegroundAlerts()    // live battery + Health-auth check (#44)
+                    Task { await calibration.refreshLatestEstimateIfNeeded() }
                 } else if phase == .background {
                     // Don't leave a user-initiated foreground scan/picker running once we leave the
                     // foreground — a nil-filtered scan yields nothing in the background and just keeps
@@ -148,6 +155,11 @@ struct ContentView: View {
             }
             .onChange(of: session?.monitoring) { _, monitoring in
                 if monitoring == false { flushHealth() }
+            }
+            .sheet(isPresented: $showCalibration, onDismiss: {
+                Task { await calibration.refreshLatestEstimateIfNeeded(minInterval: 2) }
+            }) {
+                CalibrationSessionView(manager: calibration, session: session)
             }
             // Battery: TTE + charging-complete notification (#86).
             .onChange(of: session?.batteryPercent) { _, pct in
@@ -211,7 +223,6 @@ struct ContentView: View {
         case .vitals:       vitalsCard
         case .vitalsStatus: vitalsStatusCard
         case .sleep:        sleepCard
-        case .calories:     caloriesCard
         case .goals:        card { GoalsCardView() }
         case .workout:      workoutCard
         case .cycle:        cycleCalendarCard
@@ -227,7 +238,7 @@ struct ContentView: View {
         case .trends:      TrendsView()
         case .cycle:       CycleCalendarView()
         case .deviceInfo:  DeviceInfoView(session: session)
-        case .activityLog: ActivityLogView()
+        case .activityLog: ActivityLogView(session: session)
         }
     }
 
@@ -309,8 +320,11 @@ struct ContentView: View {
     /// session actually received frames on this connection.
     private func recordForegroundSync() {
         let gotData = session?.lastFrameAt != nil || (session?.historySamples.isEmpty == false)
-        observability.recordSyncOutcome(kind: .foreground, success: gotData,
-                                        detail: gotData ? "synced from ring" : "no frames received")
+        var detail = gotData ? "synced from ring" : "no frames received"
+        if let anomalies = session?.lastSyncAnomalies, !anomalies.isEmpty {
+            detail += " — anomaly: \(anomalies.map(\.rawValue).joined(separator: ", "))"
+        }
+        observability.recordSyncOutcome(kind: .foreground, success: gotData, detail: detail)
         refreshObservability()
     }
 
@@ -371,7 +385,7 @@ struct ContentView: View {
                     Text("Updating…").font(.caption).foregroundStyle(.secondary)
                 } else if session?.autoMeasuring == true {
                     ProgressView().controlSize(.small)
-                    Text("Auto-measuring…").font(.caption).foregroundStyle(.secondary)
+                    Text("Recording vitals…").font(.caption).foregroundStyle(.secondary)
                 } else if session?.userMeasuring == true, session?.livePreparing == true {
                     // User-initiated: draining the history backlog before live mode starts (#55).
                     ProgressView().controlSize(.small)
@@ -669,6 +683,10 @@ struct ContentView: View {
         card {
             Text("VITALS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             VitalsTableView(session: session)
+            Text("Home shows the latest recorded readings and when they were recorded. New heart-rate and SpO₂ samples arrive from ring syncs, periodic background recording while connected, and workouts rather than a live stream on this screen.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.top, 8)
         }
     }
 
@@ -732,7 +750,7 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
-    /// 7-day trends nav card — taps through to the full TrendsView (#74).
+    /// Daily trends nav card — taps through to the full TrendsView (#74).
     private var trendsNavigationCard: some View {
         Button {
             path.append(.trends)
@@ -740,7 +758,7 @@ struct ContentView: View {
             card {
                 HStack(spacing: 8) {
                     Image(systemName: "chart.line.uptrend.xyaxis").foregroundStyle(.purple)
-                    Text("7-DAY TRENDS")
+                    Text("TRENDS")
                         .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     Spacer()
                     Image(systemName: "chevron.right")
@@ -749,12 +767,6 @@ struct ContentView: View {
             }
         }
         .buttonStyle(.plain)
-    }
-
-    /// Calories on the home page (was buried in the profile page). Headline is today's
-    /// estimated burn; the reference figures stay as a small secondary line.
-    private var caloriesCard: some View {
-        card { CaloriesCardView() }
     }
 
     // MARK: Sync + Health
@@ -806,18 +818,120 @@ struct ContentView: View {
                       || session?.monitoring == true        // stop live before syncing
                       || session?.notStreaming == true)     // a not-streaming ring would sync nothing (#54)
 
+            Button {
+                session?.captureHistoricPull()
+            } label: {
+                Label(session?.capturingHistoricPull == true ? "Capturing historic pull…" : "One-time historic pull",
+                      systemImage: "externaldrive.badge.timemachine")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(session?.ready != true || session?.syncing == true
+                      || session?.capturingHistoricPull == true
+                      || session?.monitoring == true
+                      || session?.probing == true
+                      || session?.notStreaming == true)
+
+            Button {
+                session?.captureForensicSweep()
+            } label: {
+                Label(session?.capturingForensicSweep == true ? "Running forensic sweep…" : "Forensic sweep (known + unknown)",
+                      systemImage: "waveform.path.ecg.rectangle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(session?.ready != true || session?.syncing == true
+                      || session?.capturingHistoricPull == true
+                      || session?.capturingForensicSweep == true
+                      || session?.monitoring == true
+                      || session?.probing == true
+                      || session?.notStreaming == true)
+
             if session?.monitoring == true {
                 Text("Stop live HR/SpO₂ before syncing.").font(.caption2).foregroundStyle(.secondary)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Calibration & BP").font(.headline)
+                    Spacer()
+                    if session?.calibrationCapturing == true { ProgressView() }
+                }
+                if let estimate = calibration.latestEstimate,
+                   let sbp = estimate.meanSBPMmhg,
+                   let dbp = estimate.meanDBPMmhg {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(Int(sbp.rounded())) / \(Int(dbp.rounded())) mmHg")
+                            .font(.title3.weight(.semibold))
+                            .monospacedDigit()
+                        Text("Estimated from calibrated ring PPG")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("No blood-pressure estimate saved yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if !calibration.latestEstimateStatus.isEmpty {
+                    Text(calibration.latestEstimateStatus)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    showCalibration = true
+                } label: {
+                    Label(session?.calibrationCapturing == true ? "Capturing..." : "Start calibration session",
+                          systemImage: "waveform.path.ecg")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(session?.ready != true || session?.syncing == true
+                          || session?.monitoring == true
+                          || session?.calibrationCapturing == true
+                          || session?.notStreaming == true)
+
+                Button {
+                    Task { await calibration.refreshLatestEstimate(force: true) }
+                } label: {
+                    Label("Refresh BP estimate", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(calibration.isRefreshingEstimate)
+                Text("This workflow uses the local calibration server to upload cuff readings, raw ring PPG, and optional Apple Watch ECG.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
             if let status = session?.syncStatus, session?.syncing != true {
                 Text(status).font(.caption).foregroundStyle(.secondary)
             }
+            if let status = session?.historicPullStatus, session?.capturingHistoricPull != true {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+            if let status = session?.forensicSweepStatus, session?.capturingForensicSweep != true {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+            if let log = session?.rawCaptureLog, !log.isEmpty, session?.capturingHistoricPull != true {
+                Button("Share raw history capture") { shareProbeCapture(log) }
+                    .font(.caption)
+            }
+            Text("Use OpenCircuit as the sole sync app for this ring. Overnight sleep and heart-rate history are written after the morning history sync rather than as a live overnight stream on the home screen.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("The one-time historic pull uses the same known two-channel drain as normal sync, but also records the raw BLE exchange so you can map exactly what was present on the ring at pull time.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("Forensic sweep goes further: it drains the known history channels first, then probes the unresolved channel selectors into the same raw log for Mac-side reverse engineering.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
 
-            // The Health mirror controls. What this sync pulled (avg HR/HRV/SpO₂) now lives with
-            // the night it describes — the Sleep card's "overnight average" row — instead of here,
-            // where the overnight averages read as a current "latest from the ring" value and
-            // contradicted the live Vitals readings (HR/SpO₂ are also measured on demand).
-            if session?.historySamples.isEmpty == false {
+            // The Health mirror controls. Show the Authorize button whenever Health isn't yet
+            // authorized — regardless of whether the current sync had records — so a first-time
+            // user (or one whose syncs all return empty) can still enable Health mirroring.
+            // Once authorized, only show the "auto-syncing" line when there are recent records
+            // (avoids a persistent green banner while the ring is empty).
+            if !healthAuthorized || session?.historySamples.isEmpty == false {
                 Divider()
                 healthRow
             }
@@ -917,10 +1031,60 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    activityProbeRow
                 }
             } label: {
                 Text("Debug — last sync & frame").font(.subheadline.weight(.medium))
             }
+        }
+        .sheet(isPresented: $showProbeShareSheet) {
+            if let url = probeExportURL { ShareActivityView(url: url) }
+        }
+    }
+
+    /// RE tool (issue #93): sweep untried sync-open `byte[6]` channels looking for the
+    /// undecoded per-day activity/step history stream, then export every captured raw frame
+    /// for offline decoding (`desktop/decode_activity.py`). See `RingSession.probeActivityChannels`.
+    @ViewBuilder
+    private var activityProbeRow: some View {
+        Divider()
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Activity-channel probe (RE tool, #93)")
+                .font(.caption.weight(.medium))
+            Text("Looks for the per-day step/activity history stream. Take a walk first so there's "
+                 + "motion to find, then run this and share the capture for decoding.")
+                .font(.caption2).foregroundStyle(.secondary)
+            HStack {
+                Button(session?.probing == true ? "Probing…" : "Run probe") {
+                    session?.probeActivityChannels()
+                }
+                .font(.caption)
+                .disabled(session?.ready != true || session?.probing == true
+                          || session?.syncing == true || session?.monitoring == true)
+                if session?.probing == true { ProgressView().controlSize(.small) }
+                Spacer()
+                if let log = session?.rawCaptureLog, !log.isEmpty, session?.probing != true {
+                    Button("Share capture") { shareProbeCapture(log) }
+                        .font(.caption)
+                }
+            }
+            if let status = session?.probeStatus {
+                Text(status).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Write the probe's captured raw frames to a temp file and present the share sheet — same
+    /// pattern as `ExportView.runExport`, just for the RE capture instead of stored samples.
+    private func shareProbeCapture(_ log: [String]) {
+        let fileName = "opencircuit-activity-probe-\(Int(Date().timeIntervalSince1970)).log"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        do {
+            try log.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+            probeExportURL = url
+            showProbeShareSheet = true
+        } catch {
+            ringLog.error("activity probe: failed to write capture file: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -944,21 +1108,45 @@ struct ContentView: View {
         // `healthSleepSegments` encodes the staged-vs-coarse policy once (prefer the HR-aware,
         // onset-trimmed staging — issue #15 — and fall back to coarse only when no overnight block
         // was staged; empty on a non-worn night). The background BGTask reads the same property.
-        let segments = session?.healthSleepSegments ?? []
+        var segments = session?.healthSleepSegments ?? []
+        // When the session is nil or fresh (reconnect / relaunch after a previous drain), the
+        // in-memory segment arrays are empty and the sleep write would be silently skipped —
+        // leaving last night's data stuck in StoredSleepSummary and never reaching HealthKit.
+        // Fall back to the segments persisted in the epoch-archive store by the drain that
+        // committed them. The `.sleep` cursor in LocalStore guards against double-writing even
+        // if the persisted segments are reused across multiple flush calls.
+        if segments.isEmpty {
+            let persisted = scanner.loadLastCommittedSleepSegments()
+            segments = !persisted.staged.isEmpty ? persisted.staged : persisted.coarse
+            if !segments.isEmpty {
+                ringLog.notice("flushHealth: session segments empty — using \(segments.count) persisted segments (fallback path)")
+            }
+        }
         Task {
             let r = await health.flushToHealth(store: store, sleepSegments: segments)
+            if r.sleepSegments > 0 {
+                // Clear the persisted segments now that they're confirmed written to HealthKit.
+                scanner.clearLastCommittedSleepSegments()
+            }
             if r.wroteAnything {
                 observability.recordHealthWrite()
                 refreshObservability()
+                let summary = "samples=\(r.samples)"
+                    + (r.sleepSegments > 0 ? " sleep=\(r.sleepSegments)" : "")
+                    + (r.steps > 0 ? " steps=\(r.steps)" : "")
+                    + (r.distanceM > 0 ? " dist=\(Int(r.distanceM.rounded()))m" : "")
+                    + (r.restingDays > 0 ? " rhr=\(r.restingDays)d" : "")
+                    + (r.naps > 0 ? " naps=\(r.naps)" : "")
+                print("[OC] healthKit WROTE \(summary)")
                 lastWrite = "Synced to Health: \(r.samples) samples"
                     + (r.sleepSegments > 0 ? ", \(r.sleepSegments) sleep segs" : "")
                     + (r.steps > 0 ? ", \(r.steps) steps" : "")
                     + (r.distanceM > 0 ? ", \(Int(r.distanceM.rounded()))m est." : "")
                     + (r.restingDays > 0 ? ", \(r.restingDays) resting HR" : "")
-                    + (r.passiveHours > 0 ? ", \(r.passiveHours)h basal" : "")
-                    + (r.activeKcal > 0 ? ", \(Int(r.activeKcal.rounded())) active kcal" : "")
                     + (r.exerciseMinutes > 0 ? ", \(Int(r.exerciseMinutes.rounded()))min exercise est." : "")
                     + (r.naps > 0 ? ", \(r.naps) nap\(r.naps == 1 ? "" : "s")" : "")
+            } else {
+                print("[OC] healthKit flush: nothing new to write (authorized=\(health.isShareAuthorized))")
             }
         }
     }
@@ -996,7 +1184,7 @@ struct ContentView: View {
 /// `dashboard.sectionOrder`, so keep these stable across releases; `allCases` order is the default
 /// (first-run) layout.
 private enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
-    case vitals, vitalsStatus, sleep, calories, goals, workout, cycle, trends, sync
+    case vitals, vitalsStatus, sleep, goals, workout, cycle, trends, sync
     var id: String { rawValue }
 }
 
@@ -1005,76 +1193,4 @@ private enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
 /// cards' custom ones.
 private enum Route: Hashable {
     case trends, cycle, deviceInfo, activityLog
-}
-
-/// Home-page calories card. Headline = today's estimated burn; secondary lines break it
-/// into resting (BMR prorated over the elapsed day) + active (Edwards-TRIMP from today's
-/// measured HR), then the static BMR/max-HR reference figures. Body inputs (age/weight/
-/// height/sex) still come from the profile page — the ring transmits none of them.
-struct CaloriesCardView: View {
-    // Shared @AppStorage keys with UserProfileSettingsView (single source of truth).
-    @AppStorage("userProfile.age") private var age = 35
-    @AppStorage("userProfile.weightKg") private var weightKg = 70.0
-    @AppStorage("userProfile.heightCm") private var heightCm = 170.0
-    @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
-
-    /// Today's HR samples (for the active-calorie TRIMP estimate). Predicate-limited to
-    /// heart rate since start-of-day so the fetch stays small.
-    @Query private var hrSamples: [StoredSample]
-    /// Today's step rollup — drives the step/distance active-calorie fallback when HR is sparse.
-    @Query private var todayDaily: [StoredDaily]
-
-    init() {
-        let hr = MetricKind.heartRate.rawValue
-        let dayStart = Calendar.current.startOfDay(for: Date())
-        _hrSamples = Query(
-            filter: #Predicate { $0.kindRaw == hr && $0.start >= dayStart },
-            sort: \.start)
-        _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
-    }
-
-    private var profile: UserProfile {
-        UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
-                    sex: BiologicalSex(rawValue: sexRaw) ?? .male)
-    }
-    private var maxHR: Int { max(220 - age, 1) }
-
-    /// Resting kcal accrued so far today: full-day BMR scaled by the elapsed fraction of today.
-    private var restingToday: Double {
-        let dayStart = Calendar.current.startOfDay(for: Date())
-        let fraction = Date().timeIntervalSince(dayStart) / 86_400
-        return Calories.bmrKcalPerDay(profile: profile) * fraction
-    }
-    /// Active kcal today — the larger of the HR-TRIMP estimate (sparse; ~0 without dense HR) and a
-    /// step/distance estimate, so a day with walking still shows honest active calories instead of
-    /// 0. Both are clearly-labeled estimates (the ring transmits no active-energy value).
-    private var activeToday: Double {
-        let samples = hrSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
-        let stepKcal = Calories.activeKcalFromSteps(steps: todayDaily.first?.steps ?? 0, profile: profile)
-        return max(hrKcal, stepKcal)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Image(systemName: "flame.fill").foregroundStyle(.orange)
-                Text("CALORIES").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            }
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("\(Int((restingToday + activeToday).rounded()))")
-                    .font(.system(size: 40, weight: .bold, design: .rounded))
-                    .monospacedDigit().contentTransition(.numericText())
-                Text("kcal today").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
-            }
-            Text("resting \(Int(restingToday.rounded())) · active \(Int(activeToday.rounded()))")
-                .font(.caption).foregroundStyle(.secondary)
-            // "max HR" here is the 220−age zone/calorie reference, NOT an observed peak — so it's
-            // constant by design. Label it as an age estimate so it doesn't read as a live "max HR"
-            // stat that looks stuck day to day.
-            Text("BMR \(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day · est. max HR \(maxHR) bpm (220−age)")
-                .font(.caption2).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
 }

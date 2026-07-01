@@ -47,6 +47,23 @@ final class BulkSleepTests: XCTestCase {
         XCTAssertEqual(r.motion, [1, 1, 1, 1, 1])
     }
 
+    func testConfidenceAndFullActivityCounts() {
+        // deepSleepRec bytes: [6]=0x05 (confidence), [10:20]=01 01 01 01 01 2a a0 00 00 90.
+        let r = BulkRecord(hex(deepSleepRec))!
+        XCTAssertEqual(r.confidence, 5)
+        XCTAssertEqual(r.activityCounts, [1, 1, 1, 1, 1, 0x2a, 0xa0, 0x00, 0x00, 0x90])
+        // activityCounts' first 5 bytes always equal `motion` — same underlying bytes.
+        XCTAssertEqual(Array(r.activityCounts.prefix(5)), r.motion)
+    }
+
+    func testConfidenceNilOnIdleEpoch() {
+        // Idle/unworn template (§5.3): [4:8]=05 00 0c 00, [9]=0a, motion 01x5, [15:22]=00x7.
+        let idleRec = "0c0000000500" + "0c0001" + "0a" + "0101010101" + "00000000000000" + "00"
+        let r = BulkRecord(hex(idleRec))!
+        XCTAssertEqual(r.layout, .idle)
+        XCTAssertNil(r.confidence)
+    }
+
     func testCounterToWallClock() {
         // counter = seconds since syncEpoch (PROTOCOL.md §5.6).
         let r = BulkRecord(hex(deepSleepRec))!

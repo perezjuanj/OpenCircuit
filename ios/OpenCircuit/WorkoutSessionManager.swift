@@ -113,6 +113,12 @@ final class WorkoutSessionManager: NSObject {
     static let indoorKeepAliveEnabledKey = "workout.indoorKeepAlive"
 
     private weak var session: RingSession?
+    /// Where to persist this workout's continuous HR samples so they count toward today's
+    /// Activity-minutes goal and Trends/exports — the same store the ring's history sync writes
+    /// to. Without this, a workout's HR only ever reached HealthKit via its own HKWorkoutBuilder
+    /// write; LocalStore (and anything reading from it, like GoalsCardView) never saw it, so a
+    /// fully-tracked workout with clearly elevated HR throughout still counted 0 Activity minutes.
+    private var store: LocalStore?
 
     // MARK: HealthKit
 
@@ -136,9 +142,10 @@ final class WorkoutSessionManager: NSObject {
     /// Begin a workout session. Drives the ring's existing live-HR poll (0x95→0x15) via
     /// `RingSession.startMonitoring`. Does NOT send any new BLE write command to the ring
     /// beyond what the existing live-HR path already uses.
-    func start(session: RingSession) {
+    func start(session: RingSession, store: LocalStore? = nil) {
         guard case .idle = recordingState else { return }
         self.session = session
+        self.store = store
         let start = Date()
         sessionStart = start
         let age = HealthKitWriter.storedUserProfile().age
@@ -215,11 +222,13 @@ final class WorkoutSessionManager: NSObject {
         // Capture any REAL HR the ring already surfaced (e.g. epochs drained during this session)
         // so it can backfill the workout window below. The live poll often can't lock HR while
         // moving (#45); this fills from on-device data when present. Empty stays empty — never
-        // interpolated. NOTE: history-stream HR comes only from still/sleep-vitals epochs (active-
-        // movement epochs carry no HR field), so for an in-motion walk this is usually a no-op —
-        // the durable source for continuous workout HR is the ring's SPORT-mode stream (#90:
-        // SportHrModel{utc,hr,conf}), still to be captured. (The earlier #99 byte[6]=HrSync theory
-        // was disproven — PROTOCOL.md §5.3: all-day HR is the 0x4c epoch, not a live stream.)
+        // interpolated. History-stream HR now covers BOTH still/sleep-vitals AND activity epochs
+        // (BulkRecord.heartRate excludes only `.idle`, per #45/#38), so this backfill is no longer
+        // a near-guaranteed no-op for an in-motion walk — it's just lower-resolution than a true
+        // continuous stream would be. A durable SPORT-mode stream (#90: SportHrModel{utc,hr,conf})
+        // would still improve resolution if it's ever captured, but is no longer the only source.
+        // (The earlier #99 byte[6]=HrSync theory was disproven — PROTOCOL.md §5.3: all-day HR is
+        // the 0x4c epoch, not a live stream.)
         let backfillHR: [HRSample] = (session?.historySamples ?? [])
             .filter { $0.kind == .heartRate }
             .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
@@ -250,6 +259,19 @@ final class WorkoutSessionManager: NSObject {
             agg.backfill(backfillHR, window: DateInterval(start: start, end: max(endDate, start)))
         }
 
+        // Persist this workout's continuous HR into LocalStore — same store the ring's history
+        // sync writes to. These samples carry REAL start/end spans (unlike the zero-duration point
+        // samples live-monitoring/history-sync persist elsewhere), so GoalsCardView's
+        // ExerciseMinutes estimate can credit them directly without needing two elevated point
+        // samples within one epoch of each other. `ingest` is cursor-gated, so re-running a workout
+        // (or this code path firing twice) can't double-count.
+        if let store {
+            let toIngest = agg.collectedSamples.map {
+                QuantitySample(kind: .heartRate, start: $0.start, end: $0.end, value: Double($0.bpm))
+            }
+            _ = try? store.ingest(toIngest)
+        }
+
         let hasRoute = !routeLocations.isEmpty && selectedSport.isOutdoor
         let summary = agg.finalize(
             sport: selectedSport,
@@ -273,6 +295,7 @@ final class WorkoutSessionManager: NSObject {
         timerTask?.cancel(); timerTask = nil
         session?.endWorkoutHR()
         session = nil
+        store = nil   // discarded session — nothing to persist
         locationManager?.stopUpdatingLocation()
         locationManager?.delegate = nil
         locationPurpose = nil
@@ -421,20 +444,6 @@ final class WorkoutSessionManager: NSObject {
                     metadata: [HKMetadataKeyWasUserEntered: false])
             }
             try? await builder.addSamples(hkHRSamples)
-        }
-
-        // Add active energy (ESTIMATE — HR-TRIMP or, when HR didn't lock, a distance estimate;
-        // labeled in metadata). The daily step/distance active-energy estimate nets this out via
-        // the foot-distance recorded below, so it isn't double-counted in Health's Move total.
-        if let kcal = summary.estimatedActiveKcal, kcal > 0 {
-            let energyType = HKQuantityType(.activeEnergyBurned)
-            let q = HKQuantity(unit: .kilocalorie(), doubleValue: kcal)
-            let energySample = HKQuantitySample(
-                type: energyType, quantity: q,
-                start: summary.startDate, end: summary.endDate,
-                metadata: ["OpenCircuitCaloriesEstimated": true,
-                           HKMetadataKeyWasUserEntered: false])
-            try? await builder.addSamples([energySample])
         }
 
         // Add distance (GPS — only for outdoor with route). Pick the correct HK type by sport:
