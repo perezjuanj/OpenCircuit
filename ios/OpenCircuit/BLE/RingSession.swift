@@ -16,10 +16,13 @@ let ringLog = Logger(subsystem: "com.standardsoftwaresolutions.opencircuit", cat
 // OpenCircuitKit's confirmed codec. Spec-supported behavior implemented:
 //   • live-HR poll (0x95 → 0x15, LiveHR.decode 🟡)
 //   • history sync: drain 0x4c activity/sleep pages → BulkSleep → HR/HRV/SpO2
-//     samples (PROTOCOL.md §5.3, 🟢 fields). 0x47 PPG pages are acked but not yet
-//     decoded (their payload is 🔴 — issue #8).
+//     samples (PROTOCOL.md §5.3, 🟢 fields). 0x47 pages decode only to a sparse
+//     optical/perfusion trend for diagnostics; they are not pulse-resolution PPG
+//     and do not feed HealthKit, HRV, SpO2, or sleep staging.
 //   • Layer-A epoch page routing (0x47/0x4c/0x50) also feeds EpochSyncSession in
-//     parallel, gated behind `epochDecodingEnabled` (#24).
+//     parallel for timestamp/page diagnostics, gated behind `epochDecodingEnabled`
+//     (#24). Metric persistence remains off because this path has no confirmed
+//     non-placeholder metrics beyond the production BulkSleep decoder.
 
 @Observable
 @MainActor
@@ -74,7 +77,7 @@ final class RingSession: NSObject {
     private(set) var lastFrame: String?
     private(set) var decodedEpochRecords = 0
     private(set) var storedMetricSamples = 0
-    /// Diagnostic-only decode of the most recent `0x47` PPG/optical-trend page (issue #8 —
+    /// Diagnostic-only decode of the most recent `0x47` optical/perfusion-trend page (#8 resolved;
     /// PROTOCOL.md §5.2). Bit-width (10-bit BE) and cadence (900s) are settled offline, but
     /// channel identity and absolute units are NOT — so this is surfaced for inspection (e.g.
     /// the Debug card) only, never written to HealthKit or fed into any analytic.
@@ -476,6 +479,10 @@ final class RingSession: NSObject {
     private var lastDiscoveryKick: Date?
     private var localStore: LocalStore?
     private var syncSession = EpochSyncSession()
+    // Disabled by design: BulkSleep is the production 0x4c metrics decoder, while
+    // 0x47 is only a diagnostic optical trend. Keep EpochSyncSession from persisting
+    // metrics until it carries confirmed, non-placeholder values that are not already
+    // handled by BulkSleep.
     private let epochDecodingEnabled = false
     /// Rolling archive of recent raw epochs (incl. the motion channel staging needs) + the last-drain
     /// timestamp, persisted across sessions. Lets `finalizeSync` re-stage the night from the UNION of
@@ -2523,7 +2530,7 @@ extension RingSession: CBPeripheralDelegate {
         decodedEpochRecords += syncSession.appendPPGPage(data).count
     }
 
-    /// Diagnostic-only decode of a `0x47` page's optical-trend samples (issue #8 —
+    /// Diagnostic-only decode of a `0x47` page's sparse optical/perfusion trend (#8 resolved;
     /// PROTOCOL.md §5.2). Surfaces a summary for inspection (`lastPPGTrendSummary`, e.g. the
     /// Debug card); never feeds HealthKit or any analytic — channel identity and absolute
     /// units are still unconfirmed (see `PPGTrend.swift`'s header).
