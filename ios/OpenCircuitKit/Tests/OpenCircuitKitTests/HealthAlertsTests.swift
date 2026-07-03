@@ -77,6 +77,31 @@ final class HealthAlertsTests: XCTestCase {
                                                           feverSuspected: false).isEmpty)
     }
 
+    func testFreshForNightDropsAlreadyNotifiedNight() {
+        let night = cal.startOfDay(for: at(3))          // this overnight's summary
+        let cands: [HealthNotification] = [.skinTempFluctuationDrop, .fever]
+        // Same night already notified for the fluctuation drop → drop it, keep the unnotified fever.
+        let fresh = TempFeverNotifications.freshForNight(
+            cands, night: night, lastNotifiedNight: [.skinTempFluctuationDrop: night])
+        XCTAssertEqual(fresh, [.fever], "same night must not re-fire the same flag")
+        // No prior night for either → both survive.
+        XCTAssertEqual(TempFeverNotifications.freshForNight(cands, night: night, lastNotifiedNight: [:]),
+                       cands)
+    }
+
+    func testFreshForNightReArmsOnNewerNight() {
+        let lastNight = cal.startOfDay(for: at(3))
+        let newerNight = cal.date(byAdding: .day, value: 1, to: lastNight)!
+        let fresh = TempFeverNotifications.freshForNight(
+            [.skinTempFluctuationDrop], night: newerNight,
+            lastNotifiedNight: [.skinTempFluctuationDrop: lastNight])
+        XCTAssertEqual(fresh, [.skinTempFluctuationDrop], "a new night's summary re-arms the alert")
+        // A stale (older) recompute of a night we've moved past must not re-fire.
+        XCTAssertTrue(TempFeverNotifications.freshForNight(
+            [.skinTempFluctuationDrop], night: lastNight,
+            lastNotifiedNight: [.skinTempFluctuationDrop: newerNight]).isEmpty)
+    }
+
     // MARK: Quiet hours (DND)
 
     func testQuietHoursWrapsMidnight() {

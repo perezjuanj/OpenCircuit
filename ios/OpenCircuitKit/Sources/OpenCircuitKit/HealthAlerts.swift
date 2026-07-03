@@ -224,4 +224,19 @@ public enum TempFeverNotifications {
         if feverSuspected { out.append(.fever) }
         return out
     }
+
+    /// Per-NIGHT de-dupe for the skin-temp/fever notifications. Each of these flags pertains to ONE
+    /// overnight summary, so once we've notified for a given night it must NOT re-fire on later
+    /// syncs of the same night — the 2h anti-spam backoff alone would re-raise the same night's flag
+    /// every couple hours all day (the user sees the same "skin temperature dropped" alert after
+    /// every sync). Keeps only the flags whose night is strictly newer than the last night already
+    /// notified for that flag; a fresh night's summary re-arms it. `night` and the map values are the
+    /// summary's start-of-day.
+    public static func freshForNight(_ candidates: [HealthNotification], night: Date,
+                                     lastNotifiedNight: [HealthNotification: Date]) -> [HealthNotification] {
+        candidates.filter { n in
+            guard let last = lastNotifiedNight[n] else { return true }
+            return night > last
+        }
+    }
 }
