@@ -2406,7 +2406,7 @@ extension RingSession: CBPeripheralDelegate {
             case 0x47:
                 self.drainSawPage = true
                 if self.syncing { self.syncQuietTicks = 0 }
-                ringLog.debug("← 0x47 PPG page (\(bytes.count)B), ack")
+                ringLog.debug("← 0x47 optical-trend page (\(bytes.count)B), ack")
                 self.write(Command.pageAck47)
                 self.handlePPGPage(data)   // Layer-A epoch decode, gated (#24)
                 self.logPPGTrend(bytes)    // diagnostic-only optical-trend decode (issue #8)

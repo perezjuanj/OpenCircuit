@@ -207,6 +207,16 @@ check(rolledSteps.deltaValue == 12 && rolledSteps.dailyTotal == 262, "counter ro
 // HRV / RMSSD
 check(HRV.rmssd([800, 900, 1000]) == 100, "rmssd([800,900,1000]) = 100")
 check(HRV.rmssd([800]) == nil, "rmssd single sample = nil")
+check(HRV.sdnn([800, 900, 1000]) == 81, "sdnn([800,900,1000]) = 81")
+let ibiWindow = HRV.ValidatedIBIWindow(start: t0, end: t1, intervalsMs: [800, 900, 1000])
+check(ibiWindow != nil, "validated IBI window accepts positive intervals")
+if let ibiWindow {
+    check(HRV.metrics(from: ibiWindow) == HRV.IBIWindowMetrics(rmssdMs: 100, sdnnMs: 81),
+          "IBI window metrics include RMSSD + SDNN")
+    let hrvSample = HRV.rmssdSample(from: ibiWindow)
+    check(hrvSample?.kind == .hrvSDNN && hrvSample?.value == 100,
+          "validated IBI window emits RMSSD HRV sample")
+}
 check(HRV.cleanRR([[800, 900], [1000], []]) == [800, 900, 1000], "cleanRR flattens")
 check(HRV.cleanRR([[0, 900], [0]]) == [900], "cleanRR drops non-positive")
 check(HRV.rollingRMSSD([1, 2, 3], windowSize: 2) == [1, 1], "rollingRMSSD windows of 2")

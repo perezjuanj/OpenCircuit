@@ -27,7 +27,7 @@ public enum EpochRecord {
         }
     }
 
-    // 0x47 PPG/waveform record - 47 bytes.
+    // 0x47 optical/perfusion-trend record - 47 bytes.
     public struct PPGRecord: Equatable, Sendable {
         public let timestamp: Date
         public let rawPayload: Data

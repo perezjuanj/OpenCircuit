@@ -93,14 +93,17 @@ Remaining for end-to-end into Apple Health: the paid-account HealthKit entitleme
       early — HR alone can't place cycles, and the deepest HR fell before sleep-onset).
       Shown in-app as "experimental"; **only the coarse segments are written to
       HealthKit**. A faithful hypnogram needs richer signal / per-epoch ground truth.
-- [ ] Wire **HRV/stress/strain** to real metrics (still gated: those assume per-beat
-      RR intervals; the ring sends per-epoch HRV(ms)/HR, not RR — see note below).
+- [~] Wire **HRV/stress/strain** to real metrics. Raw pulse-resolution PPG discovery is no
+      longer blocked: PR #121 / build 18 added the `0x13` calibration capture path and
+      desktop PPG tooling. Closing continuous HRV still requires a validated Swift
+      PPG→IBI extractor, a periodic capture policy, and HealthKit wiring from those
+      windows; `HRV.ValidatedIBIWindow` is the pure adapter once the extractor exists.
 - [ ] Write derived metrics to HealthKit / app UI (Phase 4 dependency).
 
 > ⚠️ The ported analytics assume per-beat **RR intervals** and ~1 Hz HR (Whoop's
-> stream shape). Whether RingConn exposes RR at all is unconfirmed — the math is
-> ready, but its inputs must be validated against a real capture before trusting
-> derived HRV/stress/strain numbers.
+> stream shape). RingConn now exposes raw `0x13` optical PPG windows, but the iOS app
+> does not yet extract or validate beat-to-beat IBI from them. Do not derive HRV from
+> `0x15` averaged HR or the sparse `0x47` optical trend.
 
 ## Known risks
 - **Encryption / auth.** If the BLE link or app layer is encrypted with a

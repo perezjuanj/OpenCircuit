@@ -1,25 +1,52 @@
-// HRV (RMSSD) — ported from openwhoop's openwhoop-algos/src/sleep.rs
-// (calculate_rmssd / rolling_hrv / clean_rr). Device-agnostic time-series math.
+// HRV (RMSSD / SDNN) over per-beat inter-beat intervals (IBI, also called RR or
+// NN intervals) in milliseconds.
 //
-// ⚠️ Whoop-specific INPUT assumption (CLAUDE.md: only analytics port across):
-// these consume per-beat R-R INTERVALS in milliseconds (the time between
-// heartbeats) — NOT to be confused with "respiratory rate" (breaths/min), which
-// IS now 🟢 confirmed and wired (0x4c[7]÷8 → `BulkRecord.respiratoryRate` →
-// HealthKit, PROTOCOL.md §5.3). The ring never exposes raw per-beat R-R
-// intervals: it only ever sends the firmware-FINISHED RMSSD value
-// (`BulkRecord.hrvRMSSD`), so this math has no real input to consume — still
-// 🔴, unrelated to the respiratory-rate decode. Wiring these to real ring data
-// would need a future capture that exposes the raw IBI stream (see #8's
-// `0x47` characterization — close, but not proven to be per-beat); the math
-// itself is general and ready if that ever surfaces.
+// RingConn input status:
+// - 0x4c[5] gives firmware-finished RMSSD on sleep-vitals epochs.
+// - 0x13 gives raw pulse-resolution optical PPG windows, but Swift does not yet
+//   contain a validated beat/foot detector or a periodic capture policy for #38.
+// - 0x15 live HR is a windowed scalar, and 0x47 is a sparse optical trend; neither
+//   is a valid source for IBI-derived HRV.
 //
-// Note vs HealthKit: HealthKit stores HRV as SDNN, but openwhoop computes RMSSD
-// (see HEALTHKIT_MAPPING.md). We port RMSSD faithfully; conversion/choice of what
-// to write to HealthKit is a Phase 4 decision, not made here.
+// Keep this file pure: feed it only validated IBI windows from a proven PPG/IBI
+// extractor. Do not synthesize intervals from averaged HR.
+//
+// HealthKit note: OpenCircuit currently writes RMSSD values into
+// `.heartRateVariabilitySDNN` with metadata `OpenCircuitHRVStatistic = "RMSSD"`
+// (see HEALTHKIT_MAPPING.md). The adapter below follows that convention until the
+// writer can distinguish true SDNN from RMSSD per sample.
 
 import Foundation
 
 public enum HRV {
+    /// A quality-gated IBI window from an upstream beat detector. The initializer
+    /// enforces only structural validity; signal quality, contact, ectopic-beat
+    /// filtering, and PPG-vs-reference validation belong in the extractor.
+    public struct ValidatedIBIWindow: Equatable, Sendable {
+        public let start: Date
+        public let end: Date
+        public let intervalsMs: [Int]
+
+        public init?(start: Date, end: Date, intervalsMs: [Int]) {
+            guard end >= start,
+                  intervalsMs.count >= 2,
+                  intervalsMs.allSatisfy({ $0 > 0 })
+            else { return nil }
+            self.start = start
+            self.end = end
+            self.intervalsMs = intervalsMs
+        }
+    }
+
+    public struct IBIWindowMetrics: Equatable, Sendable {
+        public let rmssdMs: Int
+        public let sdnnMs: Int
+
+        public init(rmssdMs: Int, sdnnMs: Int) {
+            self.rmssdMs = rmssdMs
+            self.sdnnMs = sdnnMs
+        }
+    }
 
     /// RMSSD over one window of RR intervals (ms): sqrt(mean of squared successive
     /// differences). nil for windows shorter than 2. Integer result truncates
@@ -33,6 +60,36 @@ public enum HRV {
         }
         let mean = sumSq / Double(window.count - 1)
         return Int(mean.squareRoot())
+    }
+
+    /// SDNN over one window of NN/IBI intervals (ms): population standard deviation
+    /// of the intervals themselves. nil for windows shorter than 2.
+    public static func sdnn(_ window: [Int]) -> Int? {
+        guard window.count >= 2 else { return nil }
+        let mean = Double(window.reduce(0, +)) / Double(window.count)
+        let variance = window.reduce(0.0) { partial, value in
+            let d = Double(value) - mean
+            return partial + d * d
+        } / Double(window.count)
+        return Int(variance.squareRoot())
+    }
+
+    public static func metrics(from window: ValidatedIBIWindow) -> IBIWindowMetrics? {
+        guard let rmssd = rmssd(window.intervalsMs),
+              let sdnn = sdnn(window.intervalsMs)
+        else { return nil }
+        return IBIWindowMetrics(rmssdMs: rmssd, sdnnMs: sdnn)
+    }
+
+    /// Convert a validated IBI window into the HRV sample shape the app already
+    /// persists and mirrors to HealthKit. The value is RMSSD, matching existing
+    /// HealthKit metadata; `metrics(from:)` also exposes true SDNN for future writers.
+    public static func rmssdSample(from window: ValidatedIBIWindow) -> QuantitySample? {
+        guard let metrics = metrics(from: window) else { return nil }
+        return QuantitySample(kind: .hrvSDNN,
+                              start: window.start,
+                              end: window.end,
+                              value: Double(metrics.rmssdMs))
     }
 
     /// Rolling RMSSD over consecutive windows of `windowSize` (openwhoop uses 300).

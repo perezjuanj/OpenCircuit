@@ -667,7 +667,7 @@ at cursor≈now returned **8 all-day epochs** (Debug card readout "sleep 0 · al
 answers our ≈now open and streams the daytime pages — not just the official app's own-cursor open (§3).
 Across all 14 captures the official app sends **only two** `byte[6]` values,
 `0x00` and `0x03`, and they are **two parallel history channels** — each with its own advancing resume
-cursor, interleaved over the same time span, both delivering `0x4c` epoch + `0x47` PPG pages. The app
+cursor, interleaved over the same time span, both delivering `0x4c` epoch + `0x47` optical-trend pages. The app
 drains **both** every sync; we had hardcoded `0x00`, so we missed everything `0x03` carries.
 - **`0x00`** — sleep/overnight log (+ idle epochs). Overnight-weighted SpO₂. (What we always pulled.)
 - **`0x03`** — awake/all-day log: activity-HR epochs (`[8]=0x12/0x13`) **plus a periodic (~10 min)
@@ -757,45 +757,49 @@ key exchange to replicate for the bond** — the replicable gate is the `f(chal)
 
 ## 6. Ground-truth captures needed (prioritized)
 
-Each names the single capture that converts a 🟡/🔴 field into a decoded metric.
-1. **`0x47` → real PPG (issue #8 — PARTIAL):** offline RE (§5.2, `analyze_0x47_bitwidth.py`) has
-   **settled bit-width = 10-bit BE 🟢, record cadence = 900 s/15 min 🟢, single-channel + not
-   pulse-resolution 🟢/🟡, `[4:6]`=optical DC/baseline 🟡.** Still open and needing the app's
-   **realtime/exported PPG trace over the same btsnoop window**: channel **identity** (which LED;
-   AC vs DC) 🔴, exact within-record sample spacing 🟡, and absolute physical units. (`0x47` is a
-   *sparse 15-min perfusion trend* — live HR rides `0x15`, not this — so finger-on/off alignment
-   needs the app trace, not just a fresh capture.)
-2. ✅ **`0x4c` → sleep/HR/HRV/SpO2 epochs — DECODED.** `captures/sleep_sync_btsnoop.log`
+Each names the single capture or validation step that converts a 🟡/🔴 field into a decoded metric.
+1. **`0x13` raw PPG → IBI/continuous HRV (#38):** PR #121 / build 18 found the real raw
+   pulse-resolution optical stream: `0x13` frames at 25 Hz after the mode10+mode01 sequence
+   (see `docs/ppg-stage1-complete-handoff-2026-06-26.md`). This unblocks waveform capture,
+   but not issue #38 by itself. Remaining work is a validated Swift PPG→beat/IBI extractor,
+   comparison against an independent HR/IBI reference, and a periodic capture policy that
+   does not burn battery. `0x15` averaged HR and the sparse `0x47` trend must not be used to
+   fabricate HRV.
+2. **`0x47` sparse optical/perfusion trend (#8 — DECODED FOR DIAGNOSTICS):** offline RE
+   (§5.2, `analyze_0x47_bitwidth.py`) settled bit-width = 10-bit BE 🟢, record cadence =
+   900 s/15 min 🟢, single-channel + not pulse-resolution 🟢/🟡, `[4:6]`=optical DC/baseline
+   🟡. It is diagnostic-only, not a beat source and not a HealthKit/analytics input.
+3. ✅ **`0x4c` → sleep/HR/HRV/SpO2 epochs — DECODED.** `captures/sleep_sync_btsnoop.log`
    (2026-06-13 night) aligned to the app's readout: sleep-vitals epoch `[4]`=HR,
    `[5]`=HRV(ms), `[8]`=SpO2(%) confirmed (§5.3); `[10:20]`=`acti_counts`. The APK map
    cross-confirmed these and resolved `[6]`=confidence, `[7]`=RR×8 (#93). Skin temp +
    RR-summary still not in this stream. Stages are app-computed, not on the wire. (Issue
    #7/#9.) The **steps/distance/activeSeconds/powerLevel activity record (#93) is a
    separate, un-captured stream** — see §5.3.1; blocked on a `byte[6]`-activity capture.
-3. ✅ **Counter→wall-clock — PINNED.** Counter is seconds (§5.6 epoch); the bulk-record
+4. ✅ **Counter→wall-clock — PINNED.** Counter is seconds (§5.6 epoch); the bulk-record
    step `+0x96` = **150 s**, so each `0x4c` record is a 2.5-min epoch and `0x47` records
    span `0x0384`=900 s. Cross-checked: last session ends 6 min before the sync.
    `morning_temp_20260615` re-confirms: 28/29 `0x4c` steps=150 (1×151 rounding), 19/19
    `0x47` steps=900, across 752 `0x4c` and 128 `0x47` records. (Issue #3 ✅ closed.)
-4. ✅ **`0x10`/`0x87` `[15]` — RESOLVED.** `[15]` is the **low byte of the 16-bit battery
+5. ✅ **`0x10`/`0x87` `[15]` — RESOLVED.** `[15]` is the **low byte of the 16-bit battery
    voltage `[14:16]`** (§5.4, #89), ground-truthed by the 2026-06-19 charger A/B (`4001→4384`
    mV across a charge). Its "declines over an evening/days" behaviour was just the voltage
    sagging — not a separate quantity. `[14]` likewise = voltage high byte.
-5. ✅ **`0x81 00` byte[2] — NOT battery; per-session nonce 🟡.** `morning_temp_20260615`
+6. ✅ **`0x81 00` byte[2] — NOT battery; per-session nonce 🟡.** `morning_temp_20260615`
    shows 20 sessions, byte[2] spans 31–249, non-monotonic, exceeds 100% repeatedly.
    Definitively not battery %. Likely a per-session ring-state nonce (source unknown 🔴).
    To settle: capture `01 00 00` responses across a full battery discharge cycle from 100%
    to <20% — if byte[2] shows no correlation with battery level, the nonce hypothesis is
    confirmed. (Issue #4 partially answered — battery ruled out; nonce still 🔴.)
-6. ✅ **`0x02` epoch / 12 h offset — RESOLVED.** The epoch is noon UTC on 2019-12-31;
+7. ✅ **`0x02` epoch / 12 h offset — RESOLVED.** The epoch is noon UTC on 2019-12-31;
    the "12 h" is the epoch constant, not a decode error. 20 sync-open events confirm
    decoded UTC matches capture wall-clock to < 0.5 s. No 12 h offset in decoded data.
    (Issue #5 ✅ closed; see §5.6.)
-7. **Auth function `f(challenge)` (issue #54 — the activation gate):** `01 01 <nonce>` is a
+8. **Auth function `f(challenge)` (issue #54 — the activation gate):** `01 01 <nonce>` is a
    deterministic challenge→response, NOT arbitrary (§5.8). 24/256 entries known from captures;
    recover the full `f` by decompiling the official APK (`com.gdjztech.ringconn`) — needed to make
    OpenCircuit stream standalone (without the official app activating the ring).
-8. **Skin temp + its transport:** temp is measured only at night yet is absent from a full
+9. **Skin temp + its transport:** temp is measured only at night yet is absent from a full
    activity/sleep/PPG sync, from `0x0900`, and from a capture with the Temperature screen
    open (that screen reads cache, no BLE). **Mac active-probing is ruled out** — data
    commands need a bond (§0). Remaining lead: a **from-scratch phone resync** — `adb shell

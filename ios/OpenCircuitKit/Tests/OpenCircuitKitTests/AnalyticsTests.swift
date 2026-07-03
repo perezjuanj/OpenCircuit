@@ -13,6 +13,37 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertNil(HRV.rmssd([800]))
     }
 
+    func testSDNN() {
+        XCTAssertEqual(HRV.sdnn([800, 900, 1000]), 81)
+        XCTAssertEqual(HRV.sdnn([750, 750, 750]), 0)
+        XCTAssertNil(HRV.sdnn([800]))
+    }
+
+    func testValidatedIBIWindowMetricsAndSample() throws {
+        let start = Date(timeIntervalSince1970: 1_000)
+        let end = start.addingTimeInterval(60)
+        let window = try XCTUnwrap(HRV.ValidatedIBIWindow(start: start,
+                                                          end: end,
+                                                          intervalsMs: [800, 900, 1000]))
+
+        XCTAssertEqual(HRV.metrics(from: window), HRV.IBIWindowMetrics(rmssdMs: 100, sdnnMs: 81))
+
+        let sample = try XCTUnwrap(HRV.rmssdSample(from: window))
+        XCTAssertEqual(sample.kind, .hrvSDNN)
+        XCTAssertEqual(sample.start, start)
+        XCTAssertEqual(sample.end, end)
+        XCTAssertEqual(sample.value, 100)
+    }
+
+    func testValidatedIBIWindowRejectsUnusableInput() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        XCTAssertNil(HRV.ValidatedIBIWindow(start: start, end: start, intervalsMs: [800]))
+        XCTAssertNil(HRV.ValidatedIBIWindow(start: start, end: start, intervalsMs: [800, 0]))
+        XCTAssertNil(HRV.ValidatedIBIWindow(start: start,
+                                            end: start.addingTimeInterval(-1),
+                                            intervalsMs: [800, 900]))
+    }
+
     func testCleanRR() {
         XCTAssertEqual(HRV.cleanRR([[800, 900], [1000], []]), [800, 900, 1000])
         XCTAssertEqual(HRV.cleanRR([[0, 900], [0]]), [900])

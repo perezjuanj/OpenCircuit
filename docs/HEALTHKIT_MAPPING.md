@@ -52,7 +52,7 @@ hardened to drop the temperature type rather than poison the whole share request
 ever refused. Trade-off: third-party apps simply cannot populate the sleeping-wrist chart,
 so a wrist-temp baseline reader won't see ring temperature there. Values stay in °C.
 
-### HRV: RMSSD stored in the SDNN field, labeled via metadata (#37)
+### HRV: RMSSD stored in the SDNN field, labeled via metadata (#37, #38)
 
 The ring reports HRV as **RMSSD** (`BulkSleep` / `HRV.rmssd`), but HealthKit only has a
 single HRV field, `.heartRateVariabilitySDNN`. RMSSD and SDNN are **not** related by a
@@ -61,6 +61,12 @@ conversion. Instead each HRV sample is written to the SDNN field with metadata
 `OpenCircuitHRVStatistic = "RMSSD"` (`HealthKitWriter.metadata(for:)`), so the value is
 honest and a reader can tell which statistic it actually is. If a future capture shows the
 ring also reports true SDNN, switch to writing that directly and drop the tag.
+
+PR #121 / build 18 unblocked raw pulse-resolution PPG discovery via `0x13` calibration
+captures, but iOS still needs a validated beat/IBI extractor and a capture cadence before
+continuous daytime HRV can be written. `HRV.ValidatedIBIWindow` can already turn a
+quality-gated IBI window into the existing RMSSD-tagged `.heartRateVariabilitySDNN` sample
+shape; do not synthesize HRV from `0x15` averaged HR or the sparse `0x47` optical trend.
 
 ### Resting HR: derived daily, idempotent (#18, #37)
 

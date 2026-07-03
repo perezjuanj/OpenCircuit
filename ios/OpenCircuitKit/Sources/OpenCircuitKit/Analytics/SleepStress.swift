@@ -1,14 +1,15 @@
 // Overnight / sleep stress score from sleep-window HRV — #71.
 //
 // ⚠️ This is a NEW mapping, NOT the ported `Analytics/Stress.swift`. That file is Baevsky's
-// Stress Index over RR INTERVALS (0…10), and we do NOT decode RR intervals (PROTOCOL §5 🔴),
-// so it is unusable here. The ONLY HRV we decode is the per-epoch RMSSD at `0x4c[5]` 🟢 during
-// the sleep window — so this builds a defensible RMSSD→stress-band mapping from that single
-// statistic instead.
+// Stress Index over RR/IBI intervals (0...10). Raw `0x13` PPG capture now exists, but Swift
+// does not yet have a validated PPG->IBI extractor or a continuous capture cadence, so the
+// Baevsky path is not wired to real ring data. The ONLY HRV we decode today is the per-epoch
+// RMSSD at `0x4c[5]` during the sleep window, so this builds a defensible RMSSD->stress-band
+// mapping from that single statistic instead.
 //
-// SCOPE: OVERNIGHT / SLEEP stress only. All-day/daytime stress needs daytime HRV, which lives
-// in the UNDECODED activity-epoch `[15:22]` payload (or 0x47 PPG, #38) — a separate, blocked
-// ticket (#94). Label this "overnight/sleeping stress (estimate)", never all-day.
+// SCOPE: OVERNIGHT / SLEEP stress only. All-day/daytime stress needs daytime IBI-derived HRV
+// from validated raw PPG windows (#38/#94), not averaged `0x15` HR and not the sparse `0x47`
+// optical trend. Label this "overnight/sleeping stress (estimate)", never all-day.
 //
 // Bands follow the app's own thresholds (pp.txt:45236 / 0x12678): a 1–100 score where
 //   1–29  = relaxed/low, 30–59 = normal, 60–79 = medium, 80–100 = high,
