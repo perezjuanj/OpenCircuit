@@ -15,6 +15,7 @@ struct TaskRecord: Codable, Identifiable, Equatable {
         case appRefresh   // BGAppRefreshTask (short ~30 s window)
         case processing   // BGProcessingTask (longer window — gives background HR a chance, #45)
         case foreground   // a sync the user triggered / a foreground auto-refresh
+        case cbWake       // a drain triggered by a BLE event while suspended (0x11 wake, #119)
     }
     var id = UUID()
     var date: Date

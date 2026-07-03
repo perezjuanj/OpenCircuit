@@ -3,6 +3,8 @@ import CoreBluetooth
 import Observation
 import OpenCircuitKit
 import os
+import UIKit
+import UserNotifications
 
 /// Unified-logging channel for the BLE/sync path. Stream live from a connected device with:
 ///   log stream --device --predicate 'subsystem == "com.standardsoftwaresolutions.opencircuit"'
@@ -262,6 +264,14 @@ final class RingSession: NSObject {
     /// Debug card can show that channel `0x03` (all-day) actually returned data (#99 verification).
     private(set) var lastDrainSummary: String?
     private var drainCountsByLabel: [String: Int] = [:]
+    /// What kicked the drain now in flight, when it was a BACKGROUND BLE-event wake (#119) —
+    /// e.g. "0x11-wake". nil for foreground/keepalive/manual/BGTask drains. Read (and cleared)
+    /// by `performHistoryDrain` to decide whether the drain must deliver its own results.
+    private var pendingDrainTrigger: String?
+    /// Background-task assertion held across a backgrounded drain (#119): 0x4c pages renew the
+    /// BLE wake on their own, but the channel opens, the 3 s quiet tail, and finalize + Health
+    /// flush have no BLE traffic — without this, iOS can suspend us mid-commit.
+    private var drainAssertion: UIBackgroundTaskIdentifier = .invalid
 
     private var bulkRecords: [BulkRecord] = []
     private var bulkFinalized = false    // captured pages already committed (sleep/vitals) — stop-time safety net skips re-commit
@@ -426,6 +436,7 @@ final class RingSession: NSObject {
         autoMeasureTask?.cancel(); autoMeasureTask = nil
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
         syncTask?.cancel(); syncTask = nil
+        endDrainAssertion()   // a cancelled drain must not leak its assertion (#119)
         monitoring = false
         livePreparing = false
         syncing = false
@@ -632,44 +643,74 @@ final class RingSession: NSObject {
                 // tightens/relaxes as the window rolls over, not just at connect.
                 await self.refreshNightWindowIfNeeded()
                 if self.ready, !self.monitoring, !self.livePreparing, self.syncTask == nil {
-                    // Connected+idle: either drain the ring's 0x4c history on a cadence, or just keep the
-                    // link warm. Gated on `gotDataFrame` so we never poke a non-streaming ring (#54). The
-                    // cadence clock is persisted (EpochArchiveStore.lastDrainAt), so a fresh session
-                    // drains shortly after (re)connect (lastDrainAt nil ⇒ due) yet a flapping link can't
-                    // re-drain more often than the interval.
-                    let saver = UserDefaults.standard.bool(forKey: Self.batterySaverEnabledKey)
-                    let night = self.isInSleepWindow
-                    // OVERNIGHT-QUIET (#111/#119): inside the sleep window we DO NOT drain at all. Each
-                    // drain's cursor≈now open + per-channel `0x07` fetch contends the ring's single resume
-                    // pointer; cadenced overnight drains were thought safe (only the old 60 s temp `fetch`
-                    // heartbeat shredded the night), but Randy's 6/30 capture disproved it — draining every
-                    // ~30 min, the ring still stopped handing off 0x4c sleep history at ~02:35 and lost the
-                    // back ~3 h. So overnight we keep the link warm with `0xD0` statusQuery (status only —
-                    // does NOT walk the pointer) and let the night accumulate UNTOUCHED on the ring (it
-                    // buffers for days), then drain the whole night in ONE pass at WAKE: when `night` flips
-                    // false, `lastDrainAt` is hours old ⇒ `isDue` ⇒ `shouldDrain` ⇒ one catch-up drain.
-                    // TRADEOFFS (honest): (1) overnight skin temp is ELIMINATED, not merely lower-res —
-                    // statusQuery elicits no 0x10/0x87 descriptor, so the only night temp is at wake, and
-                    // the #41 sleep wear-gate reverts to MOTION-ONLY overnight (can re-expose the
-                    // still/charging-reads-as-sleep over-count). (2) the phone banks NOTHING overnight, so
-                    // a co-installed official RingConn app that syncs first in the morning can take the
-                    // WHOLE night (shared resume pointer, §3). Accepted because the night's SLEEP data —
-                    // the reported loss — is recovered; revisit if temp/over-count regress on device.
-                    let cadenceDue = self.gotDataFrame
-                        && HistoryDrainCadence.isDue(lastDrainAt: self.epochArchiveStore.lastDrainAt,
-                                                     now: Date(), isNight: night, batterySaver: saver)
-                    if HistoryDrainCadence.shouldDrain(manual: false, inSleepWindow: night, isDue: cadenceDue) {
-                        ringLog.notice("sync: periodic history drain (\(night ? "night?!" : "daytime / wake catch-up", privacy: .public))")
-                        self.syncHistory()
-                    } else if night {
-                        self.write(Command.statusQuery)  // D0 00 00 → 0x50: keep warm WITHOUT walking the history pointer
-                    } else {
-                        self.write(Command.fetch)        // 07 00 00 → fresh 0x10/0x87 descriptor (steps/temp/battery)
+                    // Connected+idle: either drain the ring's 0x4c history on a cadence
+                    // (`evaluatePeriodicDrain` — shared with the background BLE-wake path,
+                    // #119), or just keep the link warm.
+                    if !self.evaluatePeriodicDrain(trigger: nil) {
+                        if self.isInSleepWindow {
+                            self.write(Command.statusQuery)  // D0 00 00 → 0x50: keep warm WITHOUT walking the history pointer
+                        } else {
+                            self.write(Command.fetch)        // 07 00 00 → fresh 0x10/0x87 descriptor (steps/temp/battery)
+                        }
                     }
                 }
                 try? await Task.sleep(for: .seconds(self.keepaliveInterval))
             }
         }
+    }
+
+    /// One shot of the periodic-drain policy — shared by the keepalive loop (whose `Task.sleep`
+    /// cadence only runs while the process has runtime) and the background BLE-event wake path
+    /// (`maybeDrainOnBackgroundWake`, #119). Returns true when a drain was started.
+    ///
+    /// Gated on `gotDataFrame` so we never poke a non-streaming ring (#54). The cadence clock is
+    /// persisted (`EpochArchiveStore.lastDrainAt`), so a fresh session drains shortly after
+    /// (re)connect (lastDrainAt nil ⇒ due) yet a flapping link can't re-drain more often than
+    /// the interval.
+    ///
+    /// OVERNIGHT-QUIET (#111/#119): inside the sleep window we DO NOT drain at all. Each
+    /// drain's cursor≈now open + per-channel `0x07` fetch contends the ring's single resume
+    /// pointer; cadenced overnight drains were thought safe (only the old 60 s temp `fetch`
+    /// heartbeat shredded the night), but Randy's 6/30 capture disproved it — draining every
+    /// ~30 min, the ring still stopped handing off 0x4c sleep history at ~02:35 and lost the
+    /// back ~3 h. So overnight we keep the link warm with `0xD0` statusQuery (status only —
+    /// does NOT walk the pointer) and let the night accumulate UNTOUCHED on the ring (it
+    /// buffers for days), then drain the whole night in ONE pass at WAKE: when `night` flips
+    /// false, `lastDrainAt` is hours old ⇒ `isDue` ⇒ `shouldDrain` ⇒ one catch-up drain.
+    /// TRADEOFFS (honest): (1) overnight skin temp is ELIMINATED, not merely lower-res —
+    /// statusQuery elicits no 0x10/0x87 descriptor, so the only night temp is at wake, and
+    /// the #41 sleep wear-gate reverts to MOTION-ONLY overnight (can re-expose the
+    /// still/charging-reads-as-sleep over-count). (2) the phone banks NOTHING overnight, so
+    /// a co-installed official RingConn app that syncs first in the morning can take the
+    /// WHOLE night (shared resume pointer, §3). Accepted because the night's SLEEP data —
+    /// the reported loss — is recovered; revisit if temp/over-count regress on device.
+    @discardableResult
+    private func evaluatePeriodicDrain(trigger: String?) -> Bool {
+        guard ready, !monitoring, !livePreparing, syncTask == nil else { return false }
+        let saver = UserDefaults.standard.bool(forKey: Self.batterySaverEnabledKey)
+        let night = isInSleepWindow
+        let cadenceDue = gotDataFrame
+            && HistoryDrainCadence.isDue(lastDrainAt: epochArchiveStore.lastDrainAt,
+                                         now: Date(), isNight: night, batterySaver: saver)
+        guard HistoryDrainCadence.shouldDrain(manual: false, inSleepWindow: night, isDue: cadenceDue)
+        else { return false }
+        ringLog.notice("sync: periodic history drain (\(night ? "night?!" : "daytime / wake catch-up", privacy: .public), trigger=\(trigger ?? "keepalive", privacy: .public))")
+        pendingDrainTrigger = trigger
+        syncHistory()
+        return true
+    }
+
+    /// Drain-on-wake (#119): while the app is suspended, an unsolicited BLE event (the ring's
+    /// ~2.5 min `0x11` heartbeat) is often the ONLY runtime we get (~10 s per event), and the
+    /// keepalive loop's `Task.sleep` is frozen — its cadence cannot fire on time. So the drain
+    /// cadence is ALSO evaluated on the wake event itself; once a drain starts, its own 0x4c
+    /// pages keep renewing the wake window until it completes, and `performHistoryDrain` holds
+    /// a background-task assertion across the gaps. In the foreground this defers to the
+    /// keepalive loop (same cadence, no double-drain — `syncHistory` is `syncTask`-guarded
+    /// regardless).
+    private func maybeDrainOnBackgroundWake(trigger: String) {
+        guard UIApplication.shared.applicationState != .active else { return }
+        evaluatePeriodicDrain(trigger: trigger)
     }
 
     /// UserDefaults key for the battery-saver toggle — stretches the idle keepalive cadence (#31).
@@ -1265,6 +1306,13 @@ final class RingSession: NSObject {
     /// the daytime channel never overwrites a sleep epoch's motion/HRV. `finalizeSync` clears
     /// `syncing`/`syncTask` on exit.
     private func performHistoryDrain() async {
+        // Backgrounded drain (#119): hold an assertion and remember what woke us — this drain
+        // must deliver its own results (Health flush + morning notification) because the
+        // foreground pipelines (ContentView's onChange(syncing) mirror) don't run suspended.
+        let wakeTrigger = pendingDrainTrigger
+        pendingDrainTrigger = nil
+        let inBackground = UIApplication.shared.applicationState != .active
+        if inBackground { beginDrainAssertion() }
         flushDrainedToArchive()                  // bank any pages a prior interrupted drain left uncommitted (#119)
         bulkRecords.removeAll()
         bulkFinalized = false                    // fresh capture — uncommitted until finalizeSync
@@ -1289,6 +1337,93 @@ final class RingSession: NSObject {
         }
         lastDrainSummary = "sleep \(drainCountsByLabel["sleep"] ?? 0) · all-day \(drainCountsByLabel["all-day"] ?? 0) epochs"
         finalizeSync()
+        if inBackground { await deliverBackgroundResults(trigger: wakeTrigger) }
+        endDrainAssertion()
+    }
+
+    // MARK: Background drain delivery (#119)
+
+    private func beginDrainAssertion() {
+        endDrainAssertion()
+        drainAssertion = UIApplication.shared.beginBackgroundTask(withName: "ring.history.drain") { [weak self] in
+            // iOS is ending the window mid-drain: bank the captured pages (the next commit
+            // re-stages them from the archive — nothing is lost) and release the assertion.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.flushDrainedToArchive()
+                self.endDrainAssertion()
+            }
+        }
+    }
+
+    private func endDrainAssertion() {
+        guard drainAssertion != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(drainAssertion)
+        drainAssertion = .invalid
+    }
+
+    /// A drain that ran while backgrounded delivers its own results (#119). For BLE-wake drains
+    /// (`trigger != nil`) that means the Health flush the foreground would have done, plus an
+    /// attributed Diagnostics record ("Last background run" finally means something). BGTask
+    /// drains (trigger == nil) skip both — `RingBackgroundSyncService`/AppDelegate own their
+    /// flush and record. EVERY background drain gets a shot at the morning notification; it's
+    /// per-night deduped, so whichever path lands the finished night first posts it.
+    private func deliverBackgroundResults(trigger: String?) async {
+        if let trigger {
+            let epochs = drainCountsByLabel.values.reduce(0, +)
+            var wrote = false
+            if HealthKitWriter.isAvailable, let localStore {
+                let result = await HealthKitWriter().flushToHealth(store: localStore,
+                                                                   sleepSegments: healthSleepSegments)
+                wrote = result.wroteAnything
+                if wrote { ObservabilityStore().recordHealthWrite() }
+            }
+            ObservabilityStore().recordSyncOutcome(
+                kind: .cbWake,
+                success: epochs > 0 || wrote,
+                detail: "\(trigger): \(lastDrainSummary ?? "no summary")")
+        }
+        await postMorningSummaryIfNeeded()
+    }
+
+    /// UserDefaults key: the `night` stamp of the last sleep summary announced by notification.
+    static let lastNotifiedNightKey = "morning.lastNotifiedNight"
+
+    /// One lock-screen notification per night (#119 UX): "Last night: 7 h 25 min asleep",
+    /// posted by the first background drain that lands the finished night — the user sees
+    /// their sleep synced BEFORE opening the app, and opening it renders instantly from the
+    /// store. Morning-only (never mid-night or afternoon), per-night deduped, quiet
+    /// (provisional) authorization so it never interrupts.
+    private func postMorningSummaryIfNeeded() async {
+        guard let window = nightWindow else { return }
+        let now = Date()
+        let sinceWake = now.timeIntervalSince(window.end)
+        guard sinceWake >= 0, sinceWake <= 6 * 3600 else { return }
+        guard let localStore,
+              let summary = try? localStore.recentSleepSummaries(limit: 1).first,
+              summary.asleepMin > 0,
+              now.timeIntervalSince(summary.updatedAt) < 15 * 60   // committed by THIS morning's drain
+        else { return }
+        let defaults = UserDefaults.standard
+        let nightKey = summary.night.timeIntervalSince1970
+        guard defaults.double(forKey: Self.lastNotifiedNightKey) != nightKey else { return }
+
+        let center = UNUserNotificationCenter.current()
+        switch await center.notificationSettings().authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+            break
+        case .notDetermined:
+            let granted = (try? await center.requestAuthorization(options: [.alert, .sound, .provisional])) ?? false
+            guard granted else { return }
+        default:
+            return
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "Last night"
+        content.body = "\(summary.asleepMin / 60) h \(summary.asleepMin % 60) min asleep — synced from your ring."
+        try? await center.add(UNNotificationRequest(identifier: "morning.summary",
+                                                    content: content, trigger: nil))
+        defaults.set(nightKey, forKey: Self.lastNotifiedNightKey)
     }
 
     /// Open ONE history channel at cursor ≈ now and drain its 0x4c/0x47 pages — the frame handler
@@ -1704,6 +1839,9 @@ extension RingSession: CBPeripheralDelegate {
                 self.lastHeartbeatAt = Date()
                 ringLog.debug("← 0x11 heartbeat, ack 91 00 00")
                 self.write(Command.heartbeatAck)
+                // This heartbeat is the app's steady background wake source — use it (#119):
+                // previously it was spent ack-only, so a suspended app never drained all day.
+                self.maybeDrainOnBackgroundWake(trigger: "0x11-wake")
                 return
             case 0x81:
                 // Auth handshake (#54, §5.8). `81 00 <chal>` (← our `01 00 00`) is the ring's

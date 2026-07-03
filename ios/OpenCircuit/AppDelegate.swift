@@ -41,9 +41,22 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         MainActor.assumeIsolated {
             RingScanner.shared.reconnectKnownPeripheral()
         }
+        // Bootstrap the BGTask chain AT LAUNCH (#119). Registration alone launches nothing — a
+        // request must be SUBMITTED, and until build 17 the only initial submission point was
+        // `applicationDidEnterBackground` below, which iOS never delivers to a scene-based
+        // SwiftUI app (backgrounding goes to `scenePhase`; see OpenCircuitApp). Device-
+        // confirmed consequence: no BGTask had EVER run — `obs.bgLastScheduled` was absent
+        // after weeks of use. Submitting here also re-arms the chain after a force-quit or
+        // reboot, both of which cancel every pending request.
+        scheduler.schedule()
+        scheduler.scheduleProcessing()
+        ObservabilityStore().recordScheduled()
         return true
     }
 
+    /// NOT delivered under the SwiftUI scene lifecycle — kept only as belt-and-braces against a
+    /// future lifecycle change. The live submission points are `didFinishLaunching` above and
+    /// OpenCircuitApp's `scenePhase == .background` handler. (#119)
     func applicationDidEnterBackground(_ application: UIApplication) {
         scheduler.schedule()
         scheduler.scheduleProcessing()

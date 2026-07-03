@@ -35,10 +35,18 @@ public enum HistoryDrainCadence {
     /// Minimum seconds between periodic drains while connected+idle.
     /// - `isNight`: inside the sleep window — tightened to 30–45 min so each drain also lands a
     ///   skin-temp reading (the 60 s `fetch` temp heartbeat no longer runs overnight; see header).
+    ///   NOTE: with the overnight-quiet gate (`shouldDrain`) the night arm now only matters for
+    ///   `isDue` bookkeeping — in-window drains are suppressed outright.
     /// - `batterySaver`: user opted into the battery-saver toggle — relax both arms.
+    ///
+    /// Day arm: 1 h (was 3–4 h). Background drains are now actually driven while the app is
+    /// suspended (the 0x11 heartbeat wake evaluates this cadence, #119), and the point of that
+    /// is all-day steps/HR/RR freshness in Apple Health — a 3 h staleness defeats it. Each drain
+    /// hands off only the slice since the last, so a tighter cadence costs seconds of radio per
+    /// hour, not a re-download.
     public static func interval(isNight: Bool, batterySaver: Bool) -> TimeInterval {
         if isNight { return (batterySaver ? 45 : 30) * 60 }    // 30–45 min: each drain also carries a temp read
-        return (batterySaver ? 240 : 180) * 60                 // 3–4 h by day
+        return (batterySaver ? 180 : 60) * 60                  // 1 h by day (3 h in battery saver)
     }
 
     /// Whether a periodic drain is due: nothing drained yet, or `interval` has elapsed since the

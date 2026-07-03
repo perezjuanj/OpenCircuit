@@ -1,5 +1,6 @@
 import BackgroundTasks
 import Foundation
+import OpenCircuitKit
 
 protocol BGTaskScheduling {
     func register(forTaskWithIdentifier identifier: String,
@@ -54,18 +55,35 @@ struct BackgroundRefreshScheduler {
 
     func makeRequest() -> BGAppRefreshTaskRequest {
         let request = BGAppRefreshTaskRequest(identifier: Self.identifier)
-        request.earliestBeginDate = now().addingTimeInterval(Self.refreshInterval)
+        request.earliestBeginDate = aimedDate(fallbackInterval: Self.refreshInterval)
         return request
     }
 
     func makeProcessingRequest() -> BGProcessingTaskRequest {
         let request = BGProcessingTaskRequest(identifier: Self.processingIdentifier)
-        request.earliestBeginDate = now().addingTimeInterval(Self.processingInterval)
+        request.earliestBeginDate = aimedDate(fallbackInterval: Self.processingInterval)
         // It needs the longer WINDOW, not the charger — a daytime HR read shouldn't require power.
         // (iOS still tends to defer processing tasks to charging/idle, but we don't mandate it.)
         request.requiresExternalPower = false
         request.requiresNetworkConnectivity = false
         return request
+    }
+
+    /// Aim the request at the moment it's worth granting (#119): the normal interval by day, but
+    /// once bedtime is near (or in progress) the coming morning instead — an in-window grant does
+    /// no drain (overnight-quiet gate) and a wasted run deprioritizes the next. The window comes
+    /// from the manual/default schedule (`SleepScheduleDefaults`) — the same fallback
+    /// `RingSession.isInSleepWindow` uses before its async learned-window resolution; a rough
+    /// window is fine here because `earliestBeginDate` is only a lower bound.
+    private func aimedDate(fallbackInterval: TimeInterval) -> Date {
+        let defaults = UserDefaults.standard
+        SleepScheduleDefaults.register(defaults)
+        let window = BackgroundSyncPolicy.relevantWindow(
+            now: now(),
+            bedMinutes: defaults.integer(forKey: SleepScheduleDefaults.bedMinutes),
+            wakeMinutes: defaults.integer(forKey: SleepScheduleDefaults.wakeMinutes))
+        return BackgroundSyncPolicy.aimedFireDate(now: now(), sleepWindow: window,
+                                                  fallbackInterval: fallbackInterval)
     }
 
     func schedule() {

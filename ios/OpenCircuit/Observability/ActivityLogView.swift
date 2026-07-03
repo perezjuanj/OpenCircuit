@@ -84,6 +84,7 @@ struct ActivityLogView: View {
         case .appRefresh: return "App refresh"
         case .processing: return "Processing"
         case .foreground: return "Foreground sync"
+        case .cbWake: return "Bluetooth wake"
         }
     }
 

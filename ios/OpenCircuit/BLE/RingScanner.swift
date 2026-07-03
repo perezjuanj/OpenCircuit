@@ -2,6 +2,7 @@ import Foundation
 import CoreBluetooth
 import Observation
 import OpenCircuitKit
+import UIKit
 
 // Scans for the RingConn ring and connects. On iOS there are NO raw ATT handles
 // (docs/HANDOFF_MACOS_IOS.md) — everything is addressed by characteristic UUID,
@@ -110,6 +111,10 @@ final class RingScanner: NSObject {
     /// The pending backoff timer: sleeps the computed delay, then re-issues a single standing
     /// pending connect. Cancelled on connect / user stop so we never stack timers.
     private var reconnectTask: Task<Void, Never>?
+    /// Background-task assertion held across a BACKGROUNDED backoff wait (#119), so the process
+    /// survives to re-issue the pending connect (or its expiration handler does). `.invalid`
+    /// when none is held; ended via `endReconnectAssertion()` on every backoff-retiring path.
+    private var reconnectAssertion: UIBackgroundTaskIdentifier = .invalid
     /// After a fresh connect, this waits a beat and only resets the backoff if the link SURVIVED
     /// and delivered a real frame — the "successful data frame" reset signal (#35). Guards the
     /// connect/reject loop a charging ring produces (resetting on `didConnect` alone would pin
@@ -324,6 +329,7 @@ final class RingScanner: NSObject {
     /// "STOP auto-reconnecting" intent. (Reviewer MINOR.)
     private func resetReconnectBackoff() {
         reconnectTask?.cancel(); reconnectTask = nil
+        endReconnectAssertion()
         connectStableTask?.cancel(); connectStableTask = nil
         reconnectAttempts = 0
         reconnectStalled = false
@@ -341,7 +347,16 @@ final class RingScanner: NSObject {
     @discardableResult
     func reconnectKnownPeripheral() -> Bool {
         switch state {
-        case .connected, .connecting: return true   // already (re)connecting — nothing to do
+        case .connected: return true   // live link — nothing to do
+        case .connecting:
+            // Trust `.connecting` only while something real backs it: CoreBluetooth actually
+            // holds a connect for the target, or a backoff timer is still alive to issue one.
+            // After a background suspension mid-backoff the app-level state can wedge at
+            // `.connecting` with NEITHER — a standing pending connect was never issued — and
+            // this early-return then blocked every later re-arm (launch, BGTask, foreground),
+            // leaving the app un-wakeable all night (#119). Fall through and re-arm instead.
+            if let t = target, t.state == .connecting || t.state == .connected { return true }
+            if reconnectTask != nil { return true }   // backoff timer owns the retry
         default: break
         }
         guard central.state == .poweredOn else {
@@ -445,6 +460,13 @@ final class RingScanner: NSObject {
                     // overnight BGTask leaves the ring fully alone to log the night for one morning sync.
                     session.startMonitoring(mode: .hr, userInitiated: false, quickLiveRead: true)
                     startedLiveRead = true
+                } else if session.syncing == false && !startedLiveRead && session.isInSleepWindow {
+                    // In-window BGTask run (overnight-quiet, #119): the drain was gated off inside
+                    // `syncHistory` and the live read is skipped above — nothing more will arrive.
+                    // Exit instead of idling out the budget: the run still repairs the wake chain
+                    // (the defer re-arms the pending connect) and the caller flushes any pending
+                    // Health backlog, so a mid-night grant is cheap, not wasted.
+                    break
                 }
                 // Snapshot the decoded history as it lands; the drain completes before the
                 // first live HR, so this captures sleep/steps even if HR never locks. Use the
@@ -606,6 +628,7 @@ extension RingScanner: CBCentralManagerDelegate {
             // note. (We don't reset the attempt COUNT yet: a charging ring can connect then
             // immediately drop, so the backoff only truly resets once the link proves stable.) #35
             self.reconnectTask?.cancel(); self.reconnectTask = nil
+            self.endReconnectAssertion()
             self.reconnectStalled = false
             self.state = .connected(peripheral.name ?? "RingConn")
             // Tear down any prior session before replacing it so its keepalive/auto-measure/sync
@@ -680,24 +703,73 @@ extension RingScanner {
     /// the delay (1 s → 5 s → 30 s cap); a stable, frame-delivering connect resets it. We keep the
     /// cheap standing pending connect — we just delay re-issuing it and do NOT actively re-scan
     /// during the wait. After a few failures the UI switches to a calm "unreachable" note.
+    ///
+    /// BACKGROUND (#119): iOS suspends us ~10 s after the disconnect wake, so a 30 s backoff dies
+    /// mid-wait having issued NOTHING — no standing pending connect, `state` wedged at
+    /// `.connecting` — and the ring coming back in range wakes nobody (device-confirmed: a 17.5 h
+    /// zero-frame overnight hole). So while backgrounded the wait is capped at 8 s and held open
+    /// by a background-task assertion; if iOS still ends the window early, the expiration handler
+    /// re-issues the pending connect BEFORE suspension. The invariant this enforces: never
+    /// suspended with `wantConnection` and no standing pending connect.
     private func scheduleReconnect(_ peripheral: CBPeripheral) {
         reconnectTask?.cancel()
+        endReconnectAssertion()   // a superseded backoff's assertion must not leak
         reconnectAttempts += 1
-        let delay = ReconnectBackoff.delay(forAttempt: reconnectAttempts)
+        let inBackground = UIApplication.shared.applicationState != .active
+        let delay = ReconnectBackoff.delay(forAttempt: reconnectAttempts, inBackground: inBackground)
         reconnectStalled = ReconnectBackoff.shouldSurfaceCalmState(attempts: reconnectAttempts)
         target = peripheral
         state = .connecting(peripheral.name ?? "RingConn")
-        reconnectTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
-            guard let self, !Task.isCancelled, self.wantConnection else { return }
-            // Don't fight a link that already came back during the wait.
-            if case .connected = self.state { return }
-            if self.central.state == .poweredOn {
-                self.central.connect(peripheral)   // single standing pending connect (no scan)
-            } else {
-                // Radio not up yet — let the poweredOn handler complete the reconnect-by-identifier.
-                self.reconnectWhenPoweredOn = true
+        if inBackground {
+            reconnectAssertion = UIApplication.shared.beginBackgroundTask(
+                withName: "ring.reconnect.backoff"
+            ) { [weak self] in
+                // Expiration runs on the main thread. Last chance before suspension: arm the
+                // pending connect NOW (it survives suspension; an unissued one does not).
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.issueReconnectNow(peripheral)
+                    self.endReconnectAssertion()
+                }
             }
         }
+        let assertion = reconnectAssertion
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self else { return }
+            defer {
+                // Release OUR assertion only — a newer scheduleReconnect may hold its own.
+                if assertion != .invalid && self.reconnectAssertion == assertion {
+                    self.endReconnectAssertion()
+                }
+            }
+            guard !Task.isCancelled, self.wantConnection else { return }
+            // Don't fight a link that already came back during the wait.
+            if case .connected = self.state { return }
+            self.issueReconnectNow(peripheral)   // single standing pending connect (no scan)
+        }
+    }
+
+    /// Arm the standing pending connect right now (idempotent: CoreBluetooth ignores a connect
+    /// to a peripheral that is already connecting/connected). Shared by the backoff timer and
+    /// its assertion-expiration handler, so the two racing is harmless.
+    private func issueReconnectNow(_ peripheral: CBPeripheral) {
+        guard wantConnection else { return }
+        if case .connected = state { return }
+        if central.state == .poweredOn {
+            central.connect(peripheral)
+        } else {
+            // Radio not up yet — let the poweredOn handler complete the reconnect-by-identifier.
+            reconnectWhenPoweredOn = true
+        }
+    }
+
+    /// Release the backoff's background-task assertion (#119). Idempotent; must run on every
+    /// path that retires a backoff (timer fired, superseded, connect landed, user stop) — a
+    /// leaked assertion is a watchdog kill.
+    private func endReconnectAssertion() {
+        guard reconnectAssertion != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(reconnectAssertion)
+        reconnectAssertion = .invalid
     }
 }
