@@ -26,8 +26,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TRIGGER_SECRET: ${{ secrets.BLUNA_TRIGGER_SECRET }}
           TRIGGER_URL: https://bluna-gh-webhook.standardsoftware.workers.dev/dispatch
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
+
+          # Allowlist: only these GitHub users can trigger Bluna
+          ALLOWED_SENDERS="perezjuanj"
+          if [[ " ${ALLOWED_SENDERS} " != *" ${ACTOR} "* ]]; then
+            echo "Sender ${ACTOR} not in allowlist; skipping."
+            exit 0
+          fi
 
           event_name="${GITHUB_EVENT_NAME}"
           event_path="${GITHUB_EVENT_PATH}"
@@ -88,7 +96,8 @@ jobs:
               --arg complexity "$complexity" \
               --arg repo "$repo" \
               --arg subjectType "$subject_type" \
-              '{number:$number,title:$title,body:$body,commentBody:$commentBody,url:$url,labels:$labels,complexity:$complexity,repo:$repo,subjectType:$subjectType}'
+              --arg sender "${ACTOR}" \
+              '{number:$number,title:$title,body:$body,commentBody:$commentBody,url:$url,labels:$labels,complexity:$complexity,repo:$repo,subjectType:$subjectType,sender:$sender}'
           )"
 
           sig="$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$TRIGGER_SECRET" -binary | xxd -p -c 256)"
