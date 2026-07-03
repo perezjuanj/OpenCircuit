@@ -98,6 +98,29 @@ final class HealthKitWriter {
             && store.authorizationStatus(for: HKQuantityType(.heartRate)) == .sharingAuthorized
     }
 
+    /// Deep link into the Health app — the recovery path once the one-time permission sheet
+    /// has been used up (see `authorizationPromptAvailable`). There is no per-app deep link to
+    /// Health's privacy page; the app root is as close as iOS allows.
+    static let healthAppURL = URL(string: "x-apple-health://")!
+
+    /// Whether calling `requestAuthorization()` would actually present the iOS permission
+    /// sheet. iOS shows the HealthKit sheet ONCE per app for a given type set: after the user
+    /// responds — even declining everything — later requests return immediately with no UI,
+    /// which reads as a dead "Connect" button. `false` (while unauthorized) means the only
+    /// path left is the Health app's own toggles, so the UI must route there instead. `nil` =
+    /// status unknown (the entitlement-stripped sideload case) — treat as promptable so the
+    /// tap path can throw and surface `healthUnavailable` as before. A new shareable type
+    /// added in an update flips this back to `true` (the sheet re-appears for the new types
+    /// only), so the prompt path self-heals across upgrades.
+    func authorizationPromptAvailable() async -> Bool? {
+        guard Self.isAvailable else { return false }
+        let read: Set<HKObjectType> = [HKCategoryType(.sleepAnalysis)]
+        guard let status = try? await store.statusForAuthorizationRequest(toShare: allTypes,
+                                                                          read: read)
+        else { return nil }
+        return status == .shouldRequest
+    }
+
     /// What a `flushToHealth` pass actually wrote (for a status line); all-zero when there
     /// was nothing pending or share access isn't granted.
     struct FlushResult: Equatable {
