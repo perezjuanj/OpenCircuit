@@ -24,6 +24,13 @@ struct UserProfileSettingsView: View {
     private let health = HealthKitWriter()
     @State private var healthAuthorized = false
     @State private var healthUnavailable = false
+    /// The one-time iOS permission sheet was already used (declined) — `requestAuthorization`
+    /// would silently no-op, so the button must route to the Health app instead. Re-probed on
+    /// appear, on foreground return (the user may have just flipped the toggles), and after a
+    /// live decline.
+    @State private var healthPromptExhausted = false
+    @Environment(\.openURL) private var openURL
+    @Environment(\.scenePhase) private var scenePhase
 
     // Periodic auto-measure toggle — same UserDefaults key RingSession reads. Default true
     // (the user opted into periodic measuring); flip off to save ring battery.
@@ -133,40 +140,58 @@ struct UserProfileSettingsView: View {
                     Text("OpenCircuit is writing your ring's metrics into Apple Health.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else if HealthKitWriter.isAvailable {
-                    Button {
-                        Task {
-                            do {
-                                try await health.requestAuthorization()
-                            } catch {
-                                // Thrown only when the HealthKit entitlement is absent — the
-                                // signature of a free-Apple-ID sideload (the entitlement is paid-
-                                // account only and is stripped on re-sign). Surface it; the app
-                                // still works as a local dashboard. (#104)
-                                healthUnavailable = true
-                            }
-                            healthAuthorized = health.isShareAuthorized
-                            if healthAuthorized { healthUnavailable = false }
+                    if healthPromptExhausted {
+                        // iOS shows the permission sheet once, ever — after a decline,
+                        // requestAuthorization is a silent no-op (the "dead button" bug). The
+                        // only remaining path is Health's own toggles, so take the user there.
+                        Button {
+                            openURL(HealthKitWriter.healthAppURL)
+                        } label: {
+                            Label("Turn On in the Health App", systemImage: "heart.text.square")
                         }
-                    } label: {
-                        Label("Connect Apple Health", systemImage: "heart.text.square")
-                    }
-                    if healthUnavailable {
-                        Text("This build can't write to Apple Health — that needs the TestFlight "
-                             + "build. (Free side-loaded builds can't use HealthKit.) OpenCircuit "
-                             + "still works as a local dashboard.")
+                        Text("Health access was declined earlier, and iOS only shows that "
+                             + "prompt once. Tap above to open Health, then: profile picture "
+                             + "▸ Privacy ▸ Apps ▸ OpenCircuit — switch on what you'd like to "
+                             + "share. It takes effect the moment you come back.")
                             .font(.caption).foregroundStyle(.secondary)
                     } else {
-                        Text("Write your ring's heart rate, HRV, SpO₂, temperature, sleep and more "
-                             + "into Apple Health. If you previously declined, turn OpenCircuit on in "
-                             + "Settings ▸ Health ▸ Data Access & Devices.")
-                            .font(.caption).foregroundStyle(.secondary)
+                        Button {
+                            Task {
+                                do {
+                                    try await health.requestAuthorization()
+                                } catch {
+                                    // Thrown only when the HealthKit entitlement is absent — the
+                                    // signature of a free-Apple-ID sideload (the entitlement is paid-
+                                    // account only and is stripped on re-sign). Surface it; the app
+                                    // still works as a local dashboard. (#104)
+                                    healthUnavailable = true
+                                }
+                                await refreshHealthAuthState()
+                            }
+                        } label: {
+                            Label("Connect Apple Health", systemImage: "heart.text.square")
+                        }
+                        if healthUnavailable {
+                            Text("This build can't write to Apple Health — that needs the TestFlight "
+                                 + "build. (Free side-loaded builds can't use HealthKit.) OpenCircuit "
+                                 + "still works as a local dashboard.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text("Write your ring's heart rate, HRV, SpO₂, temperature, sleep and more "
+                                 + "into Apple Health.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 } else {
                     Text("Apple Health isn't available on this device.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            .task { healthAuthorized = health.isShareAuthorized }
+            .task { await refreshHealthAuthState() }
+            .onChange(of: scenePhase) { _, phase in
+                // Coming back from the Health app: reflect freshly-flipped toggles immediately.
+                if phase == .active { Task { await refreshHealthAuthState() } }
+            }
 
             Section("Tracking") {
                 Toggle("Auto-measure HR & SpO₂", isOn: $autoMeasureEnabled)
@@ -347,6 +372,21 @@ struct UserProfileSettingsView: View {
     }
 
     // MARK: Goal helpers
+
+    /// Re-probe Health share status and whether the one-time permission sheet is still
+    /// available. A live decline flips the button to the Health-app route on the spot; flipping
+    /// the toggles in Health and returning flips it back to Connected.
+    private func refreshHealthAuthState() async {
+        healthAuthorized = health.isShareAuthorized
+        if healthAuthorized {
+            healthUnavailable = false
+            healthPromptExhausted = false
+        } else if HealthKitWriter.isAvailable {
+            // nil = status unknown (entitlement-stripped sideload): keep the Connect button so
+            // its tap path can throw and surface the sideload notice, as before.
+            healthPromptExhausted = (await health.authorizationPromptAvailable()) == false
+        }
+    }
 
     private func formatGoalSleep(_ minutes: Int) -> String {
         let h = minutes / 60, m = minutes % 60

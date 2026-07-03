@@ -98,6 +98,29 @@ final class HealthKitWriter {
             && store.authorizationStatus(for: HKQuantityType(.heartRate)) == .sharingAuthorized
     }
 
+    /// Deep link into the Health app — the recovery path once the one-time permission sheet
+    /// has been used up (see `authorizationPromptAvailable`). There is no per-app deep link to
+    /// Health's privacy page; the app root is as close as iOS allows.
+    static let healthAppURL = URL(string: "x-apple-health://")!
+
+    /// Whether calling `requestAuthorization()` would actually present the iOS permission
+    /// sheet. iOS shows the HealthKit sheet ONCE per app for a given type set: after the user
+    /// responds — even declining everything — later requests return immediately with no UI,
+    /// which reads as a dead "Connect" button. `false` (while unauthorized) means the only
+    /// path left is the Health app's own toggles, so the UI must route there instead. `nil` =
+    /// status unknown (the entitlement-stripped sideload case) — treat as promptable so the
+    /// tap path can throw and surface `healthUnavailable` as before. A new shareable type
+    /// added in an update flips this back to `true` (the sheet re-appears for the new types
+    /// only), so the prompt path self-heals across upgrades.
+    func authorizationPromptAvailable() async -> Bool? {
+        guard Self.isAvailable else { return false }
+        let read: Set<HKObjectType> = [HKCategoryType(.sleepAnalysis)]
+        guard let status = try? await store.statusForAuthorizationRequest(toShare: allTypes,
+                                                                          read: read)
+        else { return nil }
+        return status == .shouldRequest
+    }
+
     /// What a `flushToHealth` pass actually wrote (for a status line); all-zero when there
     /// was nothing pending or share access isn't granted.
     struct FlushResult: Equatable {
@@ -156,22 +179,27 @@ final class HealthKitWriter {
         let profile = Self.storedUserProfile()
 
         // Steps + distance estimate (#81): write both atomically from the same pending delta.
-        // HealthKit SUMS stepCount / distanceWalkingRunning, so writing the delta lands the
-        // day's running total without re-adding on every sync. Distance is an ESTIMATE
-        // (steps × height-based stride — not GPS) and is labeled as such in HealthKit metadata.
+        // HealthKit stepCount is cumulative, but Apple Health resolves overlapping sources by
+        // priority. Writing the ring delta as an all-day sample can shadow Watch/iPhone steps for
+        // that whole day, so the delta is saved over a narrow window near the latest observation.
+        // Distance is an ESTIMATE (steps × height-based stride — not GPS) and is labeled as such.
         // To avoid double counting against a recorded foot-based workout's GPS distance (which
         // also writes .distanceWalkingRunning), the estimate is netted by any uncredited workout
         // GPS distance for today — preferring the accurate GPS measurement (#).
-        if let delta = try? store.pendingStepDelta(), delta > 0 {
+        if let pendingSteps = try? store.pendingStepWrite() {
             let now = Date()
+            let delta = pendingSteps.delta
             let startOfDay = Calendar.current.startOfDay(for: now)
+            let observedAt = Swift.min(Swift.max(pendingSteps.observedAt, startOfDay), now)
+            let writeStart = Swift.max(startOfDay, observedAt.addingTimeInterval(-60))
+            let writeEnd = observedAt
             let rawDistanceM = DistanceEstimate.meters(steps: delta, profile: profile)
             let (netDistanceM, gpsReduction) = Self.netDistanceEstimate(rawDistanceM, day: startOfDay)
             var toWrite: [QuantitySample] = [
-                QuantitySample(kind: .steps, start: startOfDay, end: now, value: Double(delta))
+                QuantitySample(kind: .steps, start: writeStart, end: writeEnd, value: Double(delta))
             ]
             if netDistanceM > 0 {
-                toWrite.append(QuantitySample(kind: .distance, start: startOfDay, end: now, value: netDistanceM))
+                toWrite.append(QuantitySample(kind: .distance, start: writeStart, end: writeEnd, value: netDistanceM))
             }
             do {
                 try await write(toWrite)

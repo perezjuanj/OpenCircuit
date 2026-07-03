@@ -11,6 +11,11 @@ struct ContentView: View {
     /// HealthKit entitlement (e.g. a free-Apple-ID sideload, which strips it). Drives the "needs the
     /// TestFlight build" note. Never set on a properly-provisioned build, where the request succeeds. (#104)
     @State private var healthUnavailable = false
+    /// The one-time iOS Health permission sheet was already used (declined) — a plain
+    /// `requestAuthorization` would silently no-op, so the authorize button must route to the
+    /// Health app instead. Re-probed at launch, on foreground return, and after a live decline.
+    @State private var healthPromptExhausted = false
+    @Environment(\.openURL) private var openURL
     @State private var lastWrite: String?
     @State private var showDebug = false
     @State private var showWorkout = false
@@ -114,7 +119,13 @@ struct ContentView: View {
                 healthAuthorized = health.isShareAuthorized
                 if healthAuthorized { observability.markHealthEverAuthorized() }
                 refreshObservability()
-                if healthAuthorized { flushHealth() }
+                if healthAuthorized {
+                    flushHealth()
+                } else {
+                    // Declined-before detection: the one-time sheet may be used up, in which
+                    // case the authorize button must deep-link to Health instead of no-opping.
+                    healthPromptExhausted = (await health.authorizationPromptAvailable()) == false
+                }
             }
             // Foreground auto-refresh: reconnect to the last-known ring and pull fresh data
             // when the app becomes active, so opening it after a while shows updated vitals
@@ -319,9 +330,19 @@ struct ContentView: View {
     /// in Settings while we were away is caught). Latches "ever authorized" so an auth-lost alert
     /// can be told apart from a user who simply never opted into Health.
     private func evaluateForegroundAlerts() {
+        let wasAuthorized = healthAuthorized
         let authorized = health.isShareAuthorized
         healthAuthorized = authorized
-        if authorized { observability.markHealthEverAuthorized() }
+        if authorized {
+            observability.markHealthEverAuthorized()
+            healthPromptExhausted = false
+            // The user just enabled OpenCircuit in the Health app and came back (the only way
+            // authorization flips on outside the button) — backfill the whole store now so
+            // Health fills in immediately rather than on the next sync.
+            if !wasAuthorized { flushHealth() }
+        } else {
+            Task { healthPromptExhausted = (await health.authorizationPromptAvailable()) == false }
+        }
         let battery = session?.batteryPercent
         Task { await LocalAlertCenter().evaluate(batteryPercent: battery, healthAuthorized: authorized) }
         evaluateHealthAlerts()
@@ -826,7 +847,23 @@ struct ContentView: View {
 
     private var healthRow: some View {
         VStack(spacing: 8) {
-            if !healthAuthorized {
+            if !healthAuthorized, healthPromptExhausted {
+                // iOS shows the Health permission sheet once, ever — after a decline,
+                // requestAuthorization is a silent no-op (the "dead button" bug). Route to the
+                // Health app's own toggles instead; foreground return re-probes and backfills.
+                Button {
+                    openURL(HealthKitWriter.healthAppURL)
+                } label: {
+                    Label("Turn On Access in Health", systemImage: "heart.text.square")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                Text("Health access was declined earlier, and iOS only shows that prompt once. "
+                     + "In Health: profile picture ▸ Privacy ▸ Apps ▸ OpenCircuit — switch on "
+                     + "what you'd like to share, then come back. Syncing resumes automatically.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if !healthAuthorized {
                 Button {
                     Task {
                         do {
@@ -842,6 +879,11 @@ struct ContentView: View {
                         if healthAuthorized {
                             healthUnavailable = false
                             observability.markHealthEverAuthorized()
+                        } else {
+                            // A decline just now uses up the one-time sheet — flip the button
+                            // to the Health-app route immediately, not on the next launch.
+                            healthPromptExhausted =
+                                (await health.authorizationPromptAvailable()) == false
                         }
                         flushHealth()   // backfill everything already in the store
                     }

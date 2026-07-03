@@ -24,6 +24,22 @@ public enum ReconnectBackoff {
         return delays[min(attempt - 1, delays.count - 1)]
     }
 
+    /// Cap on the backoff delay while the app is BACKGROUNDED (#119). The full 30 s cap assumes
+    /// the process stays alive to finish the wait — true in the foreground, false in the
+    /// background, where iOS suspends us ~10 s after the disconnect event. A suspension
+    /// mid-backoff leaves NO standing pending connect, so the ring coming back in range wakes
+    /// nothing and the rest of the night is lost. 8 s fits inside a background-task assertion
+    /// with margin, so the pending connect is always re-issued before suspension.
+    public static let backgroundDelayCap: TimeInterval = 8
+
+    /// Backoff delay for attempt `attempt`, capped at `backgroundDelayCap` when backgrounded —
+    /// the #35 charger-flap damping is a foreground luxury; in the background, re-arming the
+    /// wake path before suspension always wins.
+    public static func delay(forAttempt attempt: Int, inBackground: Bool) -> TimeInterval {
+        let d = delay(forAttempt: attempt)
+        return inBackground ? min(d, backgroundDelayCap) : d
+    }
+
     /// After this many consecutive failed reconnect attempts, the UI should swap the permanent
     /// "Connecting…" for a calm "ring unreachable / charging — will reconnect automatically".
     public static let calmStateAttemptThreshold = 3

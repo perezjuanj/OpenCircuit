@@ -70,6 +70,39 @@ final class SkinTempBaselineTests: XCTestCase {
         XCTAssertFalse(drop.abnormalDrop, "no baseline → no abnormal classification")
     }
 
+    /// Regression (user-reported, 2026-07-03): one artifact night (86 °F ≈ 30 °C — a cold
+    /// object held while asleep) must alert ONCE, on the artifact night. The next night —
+    /// back at baseline, i.e. normal — must NOT alert "rose sharply vs the previous night":
+    /// tonight being ON the baseline means the previous night was the outlier, and it
+    /// already had its alert.
+    func testArtifactNightAlertsButRecoveryNightStaysQuiet() {
+        let baseline = 34.4                       // ~93.9 °F habitual sleeping skin temp
+
+        // Artifact night: far below baseline AND far below the previous (normal) night —
+        // both the abnormal and fluctuation drops fire. This is the expected alert.
+        let artifact = SkinTempBaseline.anomalyFlags(tonight: 30.0, baseline: baseline,
+                                                     previousNight: 34.5)
+        XCTAssertTrue(artifact.abnormalDrop)
+        XCTAssertTrue(artifact.fluctuationDrop)
+        XCTAssertFalse(artifact.fluctuationRise)
+
+        // Recovery night: dead on baseline (the 30-night mean barely moves from one
+        // outlier), but +4.5 °C vs the artifact night. Previously flagged fluctuationRise
+        // ("rose sharply") — wrong; the baseline gate must keep it quiet.
+        let recovery = SkinTempBaseline.anomalyFlags(tonight: 34.5, baseline: 34.25,
+                                                     previousNight: 30.0)
+        XCTAssertFalse(recovery.any, "a return to baseline is normal, not a sharp rise")
+    }
+
+    /// The gate must NOT swallow a genuine rapid rise: +0.8 °C overnight that lands well
+    /// above baseline (but still inside the ±1 °C abnormal band) is exactly what the
+    /// fluctuation flag exists to catch early.
+    func testGenuineRapidRiseStillFlagged() {
+        let f = SkinTempBaseline.anomalyFlags(tonight: 35.2, baseline: 34.4, previousNight: 34.4)
+        XCTAssertTrue(f.fluctuationRise, "+0.8 °C overnight and +0.8 °C over baseline → early-warning flag")
+        XCTAssertFalse(f.abnormalRise, "still inside the ±1 °C band — fluctuation is the early signal")
+    }
+
     func testReportWithAndWithoutBaseline() {
         let prior = [night(1, 30.8), night(2, 31.0), night(3, 31.2)]   // baseline 31.0
         let r = SkinTempBaseline.report(tonight: 32.5, priorNights: prior, previousNight: 31.0)

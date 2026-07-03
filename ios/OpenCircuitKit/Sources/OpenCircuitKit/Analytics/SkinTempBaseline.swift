@@ -32,6 +32,16 @@ public enum SkinTempBaseline {
     /// Night-to-night change beyond ±this °C is a "fluctuation" rise/drop (the 0x10/0x11
     /// flags). Distinct from the baseline deviation (0x12/0x13). Heuristic — labeled as such.
     public static let fluctuationC = 0.6
+    /// BASELINE GATE for the fluctuation flags: a night-over-night change only counts when
+    /// tonight ALSO sits beyond ±this °C from the baseline, in the same direction. Without
+    /// this, one artifact night (e.g. a 30 °C reading from holding something cold) alerts
+    /// twice: correctly on the artifact night ("fell sharply"), then WRONGLY on the recovery
+    /// night — which is at baseline, i.e. normal, yet reads "+4 °C vs last night". A sharp
+    /// change that lands ON the baseline means the PREVIOUS night was the outlier, and that
+    /// night already got its alert. Half the fluctuation threshold: small enough to still
+    /// catch a genuine rapid rise before it crosses the ±1 °C abnormal band, big enough to
+    /// stay quiet on a plain return-to-normal.
+    public static let fluctuationBaselineGateC = fluctuationC / 2
 
     /// One night's mean sleeping skin temperature, keyed by the night it belongs to.
     public struct NightlyTemp: Equatable, Sendable {
@@ -88,8 +98,10 @@ public enum SkinTempBaseline {
 
     /// The five raw temperature anomaly flags the app exposes, computed app-side (#69 owns
     /// these; fever 0x14 does not live here). `abnormal*` compare tonight to the BASELINE;
-    /// `fluctuation*` compare tonight to the PREVIOUS night. All are honest derivations of
-    /// the decoded skin temp — none is fabricated.
+    /// `fluctuation*` compare tonight to the PREVIOUS night, gated on the baseline
+    /// (`fluctuationBaselineGateC`) so a recovery back TO baseline after an artifact night
+    /// never reads as a "sharp rise". All are honest derivations of the decoded skin temp —
+    /// none is fabricated.
     public struct AnomalyFlags: Equatable, Sendable {
         public var abnormalRise = false        // 0x12 — well above baseline
         public var abnormalDrop = false        // 0x13 — well below baseline
@@ -100,6 +112,15 @@ public enum SkinTempBaseline {
     }
 
     /// Classify tonight against an optional baseline and an optional previous night.
+    ///
+    /// The fluctuation flags are BASELINE-GATED: the night-over-night delta alone can't fire
+    /// them unless tonight is also beyond ±`fluctuationBaselineGateC` from the baseline in the
+    /// same direction. Rationale (user-reported): an 86 °F artifact night (cold object held
+    /// while asleep) correctly alerted "fell sharply"; the NEXT night — dead on baseline —
+    /// then wrongly alerted "rose sharply vs the previous night". Tonight-at-baseline means
+    /// tonight is the normal one; the outlier already had its alert. With no baseline yet
+    /// (< `minBaselineNights` of history) the previous night is the only reference we have,
+    /// so the ungated comparison is kept.
     public static func anomalyFlags(tonight: Double,
                                     baseline: Double?,
                                     previousNight: Double?,
@@ -115,8 +136,12 @@ public enum SkinTempBaseline {
         }
         if let prev = previousNight {
             let d = tonight - prev
-            if d > fluctC { flags.fluctuationRise = true }
-            else if d < -fluctC { flags.fluctuationDrop = true }
+            let offsetFromBase = baseline.map { tonight - $0 }
+            if d > fluctC, offsetFromBase.map({ $0 > fluctuationBaselineGateC }) ?? true {
+                flags.fluctuationRise = true
+            } else if d < -fluctC, offsetFromBase.map({ $0 < -fluctuationBaselineGateC }) ?? true {
+                flags.fluctuationDrop = true
+            }
         }
         return flags
     }

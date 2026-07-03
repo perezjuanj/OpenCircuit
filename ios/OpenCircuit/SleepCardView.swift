@@ -258,10 +258,12 @@ struct SleepCardView: View {
         }
     }
 
-    /// True when last night looks LIMITED BY THE RING'S ~4.75 h memory (early hours overwritten before
-    /// any overnight drain) — positive evidence only (see `SleepCaptureCoverage`). Shared by the capture
-    /// tip and the confidence note so the two stay MUTUALLY EXCLUSIVE: a truncated night is
-    /// UNDER-captured, the exact opposite of the "duration may read high" case.
+    /// True when last night looks TRUNCATED — the synced window starts late / runs short vs the scheduled
+    /// bedtime — positive evidence only (see `SleepCaptureCoverage`). Shared by the capture tip and the
+    /// confidence note so the two stay MUTUALLY EXCLUSIVE: a truncated night is UNDER-captured, the exact
+    /// opposite of the "duration may read high" case. (The cause is the ring not handing off the whole
+    /// night — a contended/interrupted resume pointer, NOT a ~4.75 h buffer overflow: the ring buffers
+    /// for days, PROTOCOL §3.)
     private func isLikelyTruncated(_ night: Night) -> Bool {
         // Scheduled bedtime for this night, only when the user enabled a manual schedule — without it
         // we can't tell a truncated night from a genuinely short one, so no hint (see SleepCaptureCoverage).
@@ -275,13 +277,14 @@ struct SleepCardView: View {
                                              scheduledBedtime: bedtime) == .likelyTruncated
     }
 
-    /// Actionable tip when last night looks limited by the ring's ~4.75 h memory: iOS runs the overnight
-    /// drain far more reliably while charging, the one lever the user controls.
+    /// Actionable tip when last night looks truncated: the ring didn't hand off the whole night. The
+    /// levers the user controls are keeping the official RingConn app from grabbing the ring (only one
+    /// app can pull it) and opening OpenCircuit in the morning so the night syncs in one pass.
     @ViewBuilder
     private func captureHint(_ night: Night) -> some View {
         if let onset = night.inBedStart, isLikelyTruncated(night) {
             hintRow(systemImage: "bolt.badge.clock", tint: .orange,
-                    "Synced only from \(onset.formatted(date: .omitted, time: .shortened)) — the ring holds ~4.75h of memory and overwrites the oldest. Keep your phone charging nearby overnight so OpenCircuit can capture the whole night.")
+                    "Synced only from \(onset.formatted(date: .omitted, time: .shortened)) — the rest of the night didn’t transfer off the ring. Make sure the official RingConn app isn’t connected (only one app can pull the ring), then open OpenCircuit in the morning to sync the full night.")
         }
     }
 

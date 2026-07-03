@@ -1,12 +1,14 @@
 // Rolling archive of recent 0x4c epoch records — the foundation for stitching a night that the
 // ring hands off in MORE THAN ONE drain.
 //
-// WHY THIS EXISTS. The ring's onboard history buffer holds only ~114 epochs (~4.75 h) and drops the
-// oldest when full (see ring-history-buffer notes / PROTOCOL §5.3). To stop overnight sleep being
-// lost we must drain that buffer periodically — but each drain returns only the slice since the last
-// one (the ring advances its resume pointer on ACK), and sleep STAGING needs the per-epoch motion
-// channel `[10:15]`, which is NOT recoverable from the derived HR/HRV/SpO₂ samples we persist. So we
-// keep the raw records around and re-stage the night from the UNION of all of them.
+// WHY THIS EXISTS. A night can be handed off in MORE THAN ONE drain — and sleep STAGING needs the
+// per-epoch motion channel `[10:15]`, which is NOT recoverable from the derived HR/HRV/SpO₂ samples we
+// persist — so we keep the raw records around and re-stage the night from the UNION of all of them.
+// (Buffer note: the ring buffers history for DAYS, not hours — PROTOCOL §3 ground-truths a 19-day
+// backlog drained in one shot. The "~114 epochs / ~4.75 h drop-oldest" figure repeated in a few older
+// comments was the pre-§3 belief and is wrong for the sleep channel; do NOT use it to justify
+// re-enabling overnight cadenced drains — those contend the resume pointer and truncate the night,
+// #111/#119. Overnight is now quiet with one wake drain; see HistoryDrainCadence.)
 //
 // The on-disk form is dead simple: a `0x4c` record is a fixed 23 bytes, so the archive serializes as
 // the records' raw bytes concatenated, and decodes with the same `BulkSleep.records(fromStream:)`

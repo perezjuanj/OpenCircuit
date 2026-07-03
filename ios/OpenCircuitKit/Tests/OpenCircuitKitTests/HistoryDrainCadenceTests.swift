@@ -46,4 +46,31 @@ final class HistoryDrainCadenceTests: XCTestCase {
         XCTAssertTrue(HistoryDrainCadence.isDue(lastDrainAt: last, now: now,
                                                 isNight: false, batterySaver: false))
     }
+
+    // MARK: - Overnight-quiet gate (#111/#119)
+
+    /// Inside the sleep window an AUTOMATIC drain is suppressed regardless of how overdue it is — the
+    /// night must accumulate untouched on the ring and be pulled in one pass at wake (Randy 6/30:
+    /// cadenced overnight drains made the ring stop handing off 0x4c history mid-night).
+    func testOvernightSuppressesAutomaticDrainEvenWhenDue() {
+        XCTAssertFalse(HistoryDrainCadence.shouldDrain(manual: false, inSleepWindow: true, isDue: true),
+                       "an automatic drain inside the sleep window must be suppressed")
+    }
+
+    /// A user-initiated sync ALWAYS drains — even mid-window, even if the cadence isn't due.
+    func testManualSyncAlwaysDrains() {
+        XCTAssertTrue(HistoryDrainCadence.shouldDrain(manual: true, inSleepWindow: true, isDue: false),
+                      "a manual sync bypasses the overnight-quiet gate")
+        XCTAssertTrue(HistoryDrainCadence.shouldDrain(manual: true, inSleepWindow: false, isDue: false))
+    }
+
+    /// Outside the window the gate is transparent: `shouldDrain` mirrors `isDue` exactly, so daytime
+    /// cadence is unchanged — and the WAKE catch-up works because at wake `isDue` is true (lastDrainAt
+    /// is hours old) and `inSleepWindow` is false.
+    func testDaytimeIsUnchangedAndWakeCatchUpDrains() {
+        XCTAssertTrue(HistoryDrainCadence.shouldDrain(manual: false, inSleepWindow: false, isDue: true),
+                      "daytime / wake catch-up: due + out-of-window → drain")
+        XCTAssertFalse(HistoryDrainCadence.shouldDrain(manual: false, inSleepWindow: false, isDue: false),
+                       "daytime not-due → no drain (mirrors isDue)")
+    }
 }

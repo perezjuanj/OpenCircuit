@@ -21,6 +21,8 @@ struct TrendsView: View {
     @Environment(\.modelContext) private var modelContext
     @State private var points: [TrendsEngine.DailyPoint] = []
     @State private var loading = true
+    // Display units (#83): values are stored in °C; only the display layer converts.
+    @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
 
     var body: some View {
         ScrollView {
@@ -94,12 +96,17 @@ struct TrendsView: View {
                       formatAvg: { String(format: "%.1f", $0) })
 
             if avgs.skinTempC != nil {
-                chartCard(title: "Skin Temp (nightly)", unit: "°C",
+                // Absolute nightly temps → full conversion (`convert`, not `convertDelta`) into
+                // the user's display unit; was hardcoded °C while Settings said °F (cf. #118).
+                let tempUnit = TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius
+                chartCard(title: "Skin Temp (nightly)", unit: tempUnit.symbol,
                           color: .orange,
                           data: points.compactMap { p in
-                              p.skinTempC.flatMap { t in t > 0 ? (p.date, t) : nil }
+                              p.skinTempC.flatMap { t in
+                                  t > 0 ? (p.date, tempUnit.convert(fromCelsius: t)) : nil
+                              }
                           },
-                          avg: avgs.skinTempC,
+                          avg: avgs.skinTempC.map { tempUnit.convert(fromCelsius: $0) },
                           formatAvg: { String(format: "%.1f", $0) })
             }
 

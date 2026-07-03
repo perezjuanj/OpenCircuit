@@ -4,6 +4,7 @@ import SwiftData
 @main
 struct OpenCircuitApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.scenePhase) private var scenePhase
     private let container = OpenCircuitApp.makeContainer()
 
     var body: some Scene {
@@ -18,6 +19,19 @@ struct OpenCircuitApp: App {
                 .task { OpenCircuitApp.purgeImplausibleHeartRateOnce(container) }
         }
         .modelContainer(container)
+        // (Re)submit the BGTask requests on every backgrounding (#119). This is the scene-based
+        // replacement for `applicationDidEnterBackground`, which iOS does NOT deliver to a
+        // SwiftUI-lifecycle app — relying on it meant no request was EVER submitted, so no
+        // background task ever ran (device-confirmed). Re-submitting here also refreshes
+        // `earliestBeginDate` toward the coming morning as bedtime nears
+        // (`BackgroundSyncPolicy.aimedFireDate`).
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            let scheduler = BackgroundRefreshScheduler()
+            scheduler.schedule()
+            scheduler.scheduleProcessing()
+            ObservabilityStore().recordScheduled()
+        }
     }
 
     // MARK: Schema versioning (#40)

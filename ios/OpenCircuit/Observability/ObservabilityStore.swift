@@ -15,6 +15,7 @@ struct TaskRecord: Codable, Identifiable, Equatable {
         case appRefresh   // BGAppRefreshTask (short ~30 s window)
         case processing   // BGProcessingTask (longer window — gives background HR a chance, #45)
         case foreground   // a sync the user triggered / a foreground auto-refresh
+        case cbWake       // a drain triggered by a BLE event while suspended (0x11 wake, #119)
     }
     var id = UUID()
     var date: Date
@@ -29,7 +30,9 @@ struct ObservabilityStore {
     init(_ defaults: UserDefaults = .standard) { self.defaults = defaults }
 
     /// Keep the last N outcomes (newest survive — see `BoundedLog`). Small: this is a debug aid.
-    static let logLimit = 40
+    /// Sized for the wake-driven world (#119): hourly `.cbWake` records ≈ 16/day, and the log
+    /// must still cover a few nights back for "did last night sync?" diagnostics.
+    static let logLimit = 80
 
     private enum Key {
         static let lastSync = "obs.lastSuccessfulSync"
