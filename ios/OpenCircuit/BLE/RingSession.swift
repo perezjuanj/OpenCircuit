@@ -1845,6 +1845,10 @@ final class RingSession: NSObject {
     private func maybeRequestDeviceStatusRefresh(reason: String) {
         guard pendingDeviceStatusRefresh, postSyncStatusTask == nil else { return }
         guard ready else { return }
+        guard !isInSleepWindow else {
+            ringLog.notice("status: defer device snapshot (\(reason, privacy: .public)) — inside sleep window, would walk the history pointer (0x07)")
+            return
+        }
         guard !syncing, !monitoring, !livePreparing, !workoutHolding, !calibrationCapturing else {
             ringLog.notice("status: defer device snapshot (\(reason, privacy: .public)) — busy (sync=\(self.syncing), monitor=\(self.monitoring), preparing=\(self.livePreparing), workout=\(self.workoutHolding), calibration=\(self.calibrationCapturing))")
             return
