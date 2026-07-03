@@ -25,7 +25,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TRIGGER_SECRET: ${{ secrets.BLUNA_TRIGGER_SECRET }}
-          TRIGGER_URL: https://trigger.standardsoftware.io/trigger
+          TRIGGER_URL: https://bluna-gh-webhook.standardsoftware.workers.dev/dispatch
         run: |
           set -euo pipefail
 
