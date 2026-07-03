@@ -156,22 +156,27 @@ final class HealthKitWriter {
         let profile = Self.storedUserProfile()
 
         // Steps + distance estimate (#81): write both atomically from the same pending delta.
-        // HealthKit SUMS stepCount / distanceWalkingRunning, so writing the delta lands the
-        // day's running total without re-adding on every sync. Distance is an ESTIMATE
-        // (steps × height-based stride — not GPS) and is labeled as such in HealthKit metadata.
+        // HealthKit stepCount is cumulative, but Apple Health resolves overlapping sources by
+        // priority. Writing the ring delta as an all-day sample can shadow Watch/iPhone steps for
+        // that whole day, so the delta is saved over a narrow window near the latest observation.
+        // Distance is an ESTIMATE (steps × height-based stride — not GPS) and is labeled as such.
         // To avoid double counting against a recorded foot-based workout's GPS distance (which
         // also writes .distanceWalkingRunning), the estimate is netted by any uncredited workout
         // GPS distance for today — preferring the accurate GPS measurement (#).
-        if let delta = try? store.pendingStepDelta(), delta > 0 {
+        if let pendingSteps = try? store.pendingStepWrite() {
             let now = Date()
+            let delta = pendingSteps.delta
             let startOfDay = Calendar.current.startOfDay(for: now)
+            let observedAt = Swift.min(Swift.max(pendingSteps.observedAt, startOfDay), now)
+            let writeStart = Swift.max(startOfDay, observedAt.addingTimeInterval(-60))
+            let writeEnd = observedAt
             let rawDistanceM = DistanceEstimate.meters(steps: delta, profile: profile)
             let (netDistanceM, gpsReduction) = Self.netDistanceEstimate(rawDistanceM, day: startOfDay)
             var toWrite: [QuantitySample] = [
-                QuantitySample(kind: .steps, start: startOfDay, end: now, value: Double(delta))
+                QuantitySample(kind: .steps, start: writeStart, end: writeEnd, value: Double(delta))
             ]
             if netDistanceM > 0 {
-                toWrite.append(QuantitySample(kind: .distance, start: startOfDay, end: now, value: netDistanceM))
+                toWrite.append(QuantitySample(kind: .distance, start: writeStart, end: writeEnd, value: netDistanceM))
             }
             do {
                 try await write(toWrite)
