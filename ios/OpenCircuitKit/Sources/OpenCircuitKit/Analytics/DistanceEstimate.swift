@@ -1,43 +1,29 @@
-// Estimate walking/running distance from decoded step count × stride length (#81).
+// Estimate walking/running distance from decoded step count (#81).
 //
-// Stride length is derived from the user's height and biological sex using standard
-// anthropometric ratios (ACSM reference). This is an ESTIMATE — NOT GPS distance and
-// NOT decoded device distance. Labeled as such in HealthKit metadata and UI.
+// PROTOCOL.md §5.3.1: distance is NEVER on the wire — the official RingConn app
+// computes it client-side as `steps × ~0.248 m` (`pp.txt` L102573, `distCal`), a
+// FIXED per-step constant, not personalized by the wearer's height or sex. (The
+// earlier height-based ACSM stride formula this file used was a reasonable guess
+// before that decompile finding, but it doesn't match what the app itself shows.)
+// This is still an ESTIMATE, not a decoded device value — just the same estimate
+// the official app makes, instead of a generic anthropometric one.
 //
-// HealthKit target: `.distanceWalkingRunning` (written by HealthKitWriter, not stored
-// as a ring sample in LocalStore).
-//
-// Replaced by true decoded distance once the 0x4c activity-epoch [15:22] payload is
-// decoded (#93) — that payload carries `HistoryActivitySyncInfo.distance`.
+// HealthKit target: `.distanceWalkingRunning` (written by HealthKitWriter, not
+// stored as a ring sample in LocalStore).
 
 import Foundation
 
 public enum DistanceEstimate {
 
-    /// Stride length ratio (step / height) for walking, by sex.
-    /// Source: ACSM walking stride-length normative data.
-    /// Male:   ~0.415 × height
-    /// Female: ~0.413 × height
-    static let strideRatioMale   = 0.415
-    static let strideRatioFemale = 0.413
+    /// RingConn's own per-step distance constant (🟢 confirmed via APK decompile,
+    /// PROTOCOL.md §5.3.1) — fixed, not derived from the user's height or sex.
+    public static let metersPerStep = 0.248
 
-    /// Estimated stride length in centimetres from height and sex.
-    public static func strideCm(heightCm: Double, sex: BiologicalSex) -> Double {
-        let ratio = sex == .male ? strideRatioMale : strideRatioFemale
-        return max(heightCm, 0) * ratio
-    }
-
-    /// Estimated distance in metres from step count and user profile.
-    /// Returns 0 for non-positive step counts.
-    /// ESTIMATE — height-based stride, not GPS or decoded ring data.
-    public static func meters(steps: Int, profile: UserProfile) -> Double {
+    /// Estimated distance in metres from step count. ESTIMATE — mirrors the
+    /// official app's own derivation (steps × `metersPerStep`), not GPS or a
+    /// decoded device value. Returns 0 for non-positive step counts.
+    public static func meters(steps: Int) -> Double {
         guard steps > 0 else { return 0 }
-        return Double(steps) * strideCm(heightCm: profile.heightCm, sex: profile.sex) / 100.0
-    }
-
-    /// Convenience overload with explicit height and sex.
-    public static func meters(steps: Int, heightCm: Double, sex: BiologicalSex) -> Double {
-        guard steps > 0 else { return 0 }
-        return Double(steps) * strideCm(heightCm: heightCm, sex: sex) / 100.0
+        return Double(steps) * metersPerStep
     }
 }

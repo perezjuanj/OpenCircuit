@@ -17,6 +17,14 @@ struct OpenCircuitApp: App {
                 // One-time scrub of out-of-band heart-rate samples persisted before the decoder
                 // band-guard (the "Resting HR 4 bpm" bug). Gated so it scans at most once.
                 .task { OpenCircuitApp.purgeImplausibleHeartRateOnce(container) }
+                // One-time scrub of samples with a corrupted/implausible timestamp (e.g. a
+                // misaligned bulk-page decode dated years off — surfaces as "13y ago").
+                .task { OpenCircuitApp.purgeImplausibleTimestampsOnce(container) }
+                // Repair of any SyncCursor watermark stuck in the future by a corrupted-timestamp
+                // sample, BEFORE `ingest` guarded plausibility ahead of the cursor advance — run
+                // every launch (not one-time; see the function doc), after the sample scrubs so
+                // its "latest stored sample" lookup sees the already-cleaned table.
+                .task { OpenCircuitApp.repairFutureSyncCursorsAtLaunch(container) }
         }
         .modelContainer(container)
         // (Re)submit the BGTask requests on every backgrounding (#119). This is the scene-based
@@ -48,9 +56,34 @@ struct OpenCircuitApp: App {
         }
     }
 
+    /// Adds `StoredDaytimeTemp` (Trends-only intraday skin temp, kept separate from #41's
+    /// nightly baseline). Purely additive — no existing model changed — so this is a
+    /// lightweight migration, not a custom stage.
+    enum SchemaV2: VersionedSchema {
+        static var versionIdentifier = Schema.Version(2, 0, 0)
+        static var models: [any PersistentModel.Type] {
+            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
+             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self]
+        }
+    }
+
+    /// Adds `StoredStepSample` (timestamped step DELTAS — #steps-history) alongside the existing
+    /// `StoredDaily` running total, so a step reading's actual observation window survives
+    /// instead of being folded away. Purely additive — lightweight migration.
+    enum SchemaV3: VersionedSchema {
+        static var versionIdentifier = Schema.Version(3, 0, 0)
+        static var models: [any PersistentModel.Type] {
+            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
+             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self]
+        }
+    }
+
     enum MigrationPlan: SchemaMigrationPlan {
-        static var schemas: [any VersionedSchema.Type] { [SchemaV1.self] }
-        static var stages: [MigrationStage] { [] }
+        static var schemas: [any VersionedSchema.Type] { [SchemaV1.self, SchemaV2.self, SchemaV3.self] }
+        static var stages: [MigrationStage] {
+            [.lightweight(fromVersion: SchemaV1.self, toVersion: SchemaV2.self),
+             .lightweight(fromVersion: SchemaV2.self, toVersion: SchemaV3.self)]
+        }
     }
 
     /// UserDefaults flag the UI can read to tell the user their local cache was rebuilt (raw
@@ -78,7 +111,7 @@ struct OpenCircuitApp: App {
                                          appropriateFor: nil, create: true)
         let schema = Schema([StoredSample.self, StoredCursor.self,
                              StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
-                             StoredPeriodEntry.self])
+                             StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self])
         let config = ModelConfiguration(schema: schema)
 
         do {
@@ -122,6 +155,32 @@ struct OpenCircuitApp: App {
             _ = try LocalStore(container.mainContext).purgeImplausibleHeartRate()
             UserDefaults.standard.set(true, forKey: hrPurgeDoneKey)
         } catch { /* leave the flag unset so it retries next launch */ }
+    }
+
+    /// Run the one-time implausible-TIMESTAMP scrub (`LocalStore.purgeImplausibleTimestamps`) at
+    /// most once — same gating pattern as the HR purge above. Clears any pre-existing sample dated
+    /// before the ring's counter epoch (or implausibly far future) so it can't surface as e.g.
+    /// "13y ago" in a relative-time caption; new out-of-band timestamps are blocked at `ingest`.
+    private static let timestampPurgeDoneKey = "store.purgedImplausibleTimestamps.v1"
+    @MainActor
+    static func purgeImplausibleTimestampsOnce(_ container: ModelContainer) {
+        guard !UserDefaults.standard.bool(forKey: timestampPurgeDoneKey) else { return }
+        do {
+            _ = try LocalStore(container.mainContext).purgeImplausibleTimestamps()
+            UserDefaults.standard.set(true, forKey: timestampPurgeDoneKey)
+        } catch { /* leave the flag unset so it retries next launch */ }
+    }
+
+    /// Run the `SyncCursor` future-watermark repair (`LocalStore.repairFutureSyncCursors`) on
+    /// EVERY launch — deliberately NOT gated to once like the scrubs above. A single one-time run
+    /// was observed to NOT reliably clear the `hk:heartRate` mirror cursor (still stuck after the
+    /// first launch of the fix; exact cause unconfirmed, suspected ordering against the other
+    /// one-time launch tasks below, which all touch the same SwiftData context concurrently). The
+    /// repair itself is cheap (a handful of cursor rows) and a no-op once nothing's stuck, so
+    /// re-running it every launch is the reliable fix rather than chasing the ordering theory.
+    @MainActor
+    static func repairFutureSyncCursorsAtLaunch(_ container: ModelContainer) {
+        try? LocalStore(container.mainContext).repairFutureSyncCursors()
     }
 
     /// Delete the SQLite store plus its `-shm`/`-wal` sidecar files.

@@ -30,11 +30,12 @@ public enum Calories {
         return (meters / 1000.0) * profile.weightKg * walkKcalPerKgPerKm
     }
 
-    /// Active kcal estimate from a STEP count, via the height-based stride distance estimate
-    /// (`DistanceEstimate`). ESTIMATE — the same derived-not-decoded basis as distance (#81) and
-    /// exercise minutes (#82). Zero for non-positive steps.
+    /// Active kcal estimate from a STEP count, via the decoded-step distance estimate
+    /// (`DistanceEstimate`, RingConn's own fixed per-step constant — PROTOCOL.md §5.3.1).
+    /// ESTIMATE — the same derived-not-decoded basis as distance (#81) and exercise
+    /// minutes (#82). Zero for non-positive steps.
     public static func activeKcalFromSteps(steps: Int, profile: UserProfile) -> Double {
-        activeKcalFromDistance(meters: DistanceEstimate.meters(steps: steps, profile: profile),
+        activeKcalFromDistance(meters: DistanceEstimate.meters(steps: steps),
                                profile: profile)
     }
 

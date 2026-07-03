@@ -16,6 +16,7 @@ struct VitalsTableView: View {
     @Query private var latestTempSample: [StoredSample]
     @Query private var latestHRV: [StoredSample]
     @Query private var latestRR: [StoredSample]
+    @Query private var latestDaytimeTemp: [StoredDaytimeTemp]
     /// Heart-rate samples over the last 24 h — the window resting HR (the sleep low) scans.
     @Query private var recentHR: [StoredSample]
     /// Temperature samples over the last few days — narrowed in memory to the precise night
@@ -72,6 +73,11 @@ struct VitalsTableView: View {
         _latestTempSample = Query(Self.latestDescriptor(temp))
         _latestHRV = Query(Self.latestDescriptor(hrv))
         _latestRR = Query(Self.latestDescriptor(rr))
+        var latestDaytimeTempDesc = FetchDescriptor<StoredDaytimeTemp>(
+            predicate: #Predicate { $0.celsius > 0 },
+            sortBy: [SortDescriptor(\.time, order: .reverse)])
+        latestDaytimeTempDesc.fetchLimit = 1
+        _latestDaytimeTemp = Query(latestDaytimeTempDesc)
         _recentHR = Query(FetchDescriptor<StoredSample>(
             predicate: #Predicate { $0.kindRaw == hr && $0.start > dayAgo && $0.value > 0 },
             sortBy: [SortDescriptor(\.start, order: .reverse)]))
@@ -191,24 +197,26 @@ struct VitalsTableView: View {
         return OvernightAverages.mean(points, window: window)
     }
 
-    /// A nightly-metric row whose value is the overnight MEAN (HRV / Respiratory Rate). Value AND
-    /// caption derive from the SAME source: when there's no overnight mean the value shows "—" and
-    /// the caption shows "after overnight sync" — so a stray latest-epoch timestamp can't pair a
-    /// dated caption with an empty value.
+    /// Nightly metrics (HRV / Respiratory Rate) on the HOME screen follow the same "latest recorded
+    /// reading + its timestamp" rule as the other vitals. Overnight means still matter for the Sleep
+    /// card and Trends, but making Home prefer the overnight aggregate caused it to look stale even
+    /// when a newer recorded spot reading already existed in the store and Trends showed it.
     @ViewBuilder
     private func nightlyMeanRow(_ label: String, _ kind: MetricKind,
                                _ fmt: (Double) -> String) -> some View {
-        let mean = overnightMean(kind)
-        row(label, value: mean.map(fmt) ?? "—",
-            time: mean == nil ? "after overnight sync" : (nightlyWhen(kind) ?? "after overnight sync"))
+        if let latestPoint = latestReading(kind) {
+            row(label, value: fmt(latestPoint.value),
+                time: Self.rel.localizedString(for: latestPoint.start, relativeTo: Date()))
+        } else if let mean = overnightMean(kind) {
+            row(label, value: fmt(mean), time: nightlyWhen(kind) ?? "last night")
+        } else {
+            row(label, value: "—", time: "after overnight sync")
+        }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            measurableRow("Heart Rate", value: hrText, mode: .hr, active: hrActive,
-                          time: hrActive && session?.liveHR == nil
-                              ? (session?.livePreparing == true ? "preparing…" : "measuring…")
-                              : timeFor(.heartRate, live: hrLive))
+            row("Heart Rate", value: hrText, time: timeFor(.heartRate))
             divider
             spo2Row
             divider
@@ -234,9 +242,8 @@ struct VitalsTableView: View {
         }
     }
 
-    /// SpO₂ row with estimate caveat: live SpO₂ is a single-window measurement (🟡),
-    /// not multi-sample ground-truthed. Label it consistently with sleep stages ("est.").
-    /// Time logic mirrors `measurableRow` so the #55 "preparing…/measuring…" split is preserved.
+    /// SpO₂ row with estimate caveat. The home screen shows the latest RECORDED reading and when
+    /// it was recorded, not an in-progress measurement session.
     @ViewBuilder private var spo2Row: some View {
         HStack(spacing: 10) {
             Text("SpO₂").font(.subheadline).foregroundStyle(.primary)
@@ -244,13 +251,10 @@ struct VitalsTableView: View {
             VStack(alignment: .trailing, spacing: 1) {
                 Text(spo2Text).font(.subheadline.weight(.semibold)).monospacedDigit()
                 Text("est.").font(.caption2).foregroundStyle(.tertiary)
-                if let time = (spo2Active && session?.liveSpO2 == nil
-                    ? (session?.livePreparing == true ? "preparing…" : "measuring…")
-                    : timeFor(.spo2, live: spo2Live)) {
+                if let time = timeFor(.spo2) {
                     Text(time).font(.caption2).foregroundStyle(.secondary)
                 }
             }
-            measureButton(.spo2, active: spo2Active)
         }
         .padding(.vertical, 8)
     }
@@ -269,73 +273,14 @@ struct VitalsTableView: View {
         .padding(.vertical, 8)
     }
 
-    // MARK: On-demand metrics (HR / SpO₂) — an inline Measure control replaces the old big cards
-
-    private var hrActive: Bool { session?.monitoring == true && session?.liveMode == .hr }
-    private var spo2Active: Bool { session?.monitoring == true && session?.liveMode == .spo2 }
-
-    /// True when the link has gone quiet so a lingering live value must NOT read as "live" (#36).
-    /// A silently-dropped link keeps its last HR/SpO₂/steps/temp until CoreBluetooth fires
-    /// `didDisconnect`; staleness lets us show "Xm ago" instead of a minutes-old value as current.
-    private var liveStale: Bool { session?.liveReadingsStale == true }
-
-    /// A vitals row carrying an inline start/stop measure control for an on-demand metric.
-    private func measurableRow(_ label: String, value: String, mode: RingSession.LiveMode,
-                               active: Bool, time: String?) -> some View {
-        HStack(spacing: 10) {
-            Text(label).font(.subheadline).foregroundStyle(.primary)
-            Spacer()
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(value).font(.subheadline.weight(.semibold)).monospacedDigit()
-                if let time { Text(time).font(.caption2).foregroundStyle(.secondary) }
-            }
-            measureButton(mode, active: active)
-        }
-        .padding(.vertical, 8)
-    }
-
-    /// Small circular start/stop control. Appears only when the ring link is ready; disabled
-    /// while a history sync holds the link. Starting one metric stops the other (the ring
-    /// measures one at a time); tapping the active one stops it.
-    @ViewBuilder
-    private func measureButton(_ mode: RingSession.LiveMode, active: Bool) -> some View {
-        if session?.ready == true {
-            let color: Color = mode == .hr ? .red : .blue
-            let icon = mode == .hr ? "heart.fill" : "lungs.fill"
-            Button {
-                if active { session?.stopLiveMonitoring() }
-                else { session?.startMonitoring(mode: mode) }
-            } label: {
-                Image(systemName: active ? "stop.fill" : icon)
-                    .font(.caption2.weight(.bold))
-                    .frame(width: 30, height: 30)
-                    .background(Circle().fill(active ? color : Color(.systemGray5)))
-                    .foregroundStyle(active ? .white : color)
-                    .symbolEffect(.pulse, isActive: active)
-            }
-            .buttonStyle(.plain)
-            // Disable while a sync holds the link, OR when the ring isn't streaming (#54) — a measure
-            // would only spin until timeout; the activation hint tells the user what to do.
-            .disabled(session?.syncing == true || session?.notStreaming == true)
-        }
-    }
-
     private var divider: some View { Divider().opacity(0.4) }
 
-    // MARK: value formatting (live overrides stored)
-
-    /// HR/SpO₂ count as "live" only while we're actively measuring that metric AND frames are
-    /// still arriving. A leftover value after monitoring stops, or a silently-dropped link, falls
-    /// back to the stored sample's timestamp instead of a false "live" caption (#36).
-    private var hrLive: Bool { hrActive && session?.liveHR != nil && !liveStale }
-    private var spo2Live: Bool { spo2Active && session?.liveSpO2 != nil && !liveStale }
+    // MARK: value formatting (recorded values only on the home screen)
 
     private var hrText: String {
-        if hrLive, let hr = session?.liveHR { return "\(hr) bpm" }
         return valueText(.heartRate) { "\(Int($0)) bpm" }
     }
     private var spo2Text: String {
-        if spo2Live, let s = session?.liveSpO2 { return "\(s) %" }
         return valueText(.spo2) { "\(Int(($0 * 100).rounded())) %" }
     }
     // MARK: Skin temp (headline = latest reading; overnight average shown as context)
@@ -359,21 +304,34 @@ struct VitalsTableView: View {
         .padding(.vertical, 8)
     }
 
-    /// Latest skin-temp reading for the headline: the live value when connected, else the most
-    /// recent stored sample (ignoring zero/invalid placeholders), or nil if we have none.
+    /// Latest skin-temp reading for the headline: prefer the newest available source across
+    /// the live descriptor, the canonical overnight/sample lane, and the daytime Trends-only
+    /// lane. Without the `StoredDaytimeTemp` comparison the home screen could show a stale
+    /// "5 h ago" overnight value while Trends already had a newer daytime reading.
+    private var latestTempReading: (value: Double, start: Date)? {
+        var candidates: [(value: Double, start: Date)] = []
+        if let live = session?.liveTemperature, let at = session?.lastFrameAt {
+            candidates.append((live, at))
+        }
+        if let sample = latest[.temperature], sample.value > 0 {
+            candidates.append((sample.value, sample.start))
+        }
+        if let daytime = latestDaytimeTemp.first, daytime.celsius > 0 {
+            candidates.append((daytime.celsius, daytime.time))
+        }
+        return candidates.max { $0.start < $1.start }
+    }
+
     private var latestTemp: Double? {
-        if let live = session?.liveTemperature { return live }
-        return latest[.temperature].map(\.value).flatMap { $0 > 0 ? $0 : nil }
+        latestTempReading?.value
     }
 
     /// Secondary caption under the Skin Temp headline: how fresh the headline reading is
     /// ("live" when connected, else relative time) and the overnight average for context.
     private var skinTempSecondary: String? {
         var parts: [String] = []
-        if session?.liveTemperature != nil, !liveStale {
-            parts.append("live")
-        } else if latestTemp != nil, let s = latest[.temperature] {
-            parts.append(Self.rel.localizedString(for: s.start, relativeTo: Date()))
+        if let temp = latestTempReading {
+            parts.append(Self.rel.localizedString(for: temp.start, relativeTo: Date()))
         }
         if let night = nightTemp {
             parts.append("overnight \(tempString(night))")
@@ -411,7 +369,7 @@ struct VitalsTableView: View {
             return (s.inBedStart, s.inBedEnd)
         }
         // Fallback: 00:00–06:00 of the most recent date that has temperature samples.
-        guard let lastTemp = latest[.temperature]?.start else { return nil }
+        guard let lastTemp = latestTempReading?.start else { return nil }
         let dayStart = Calendar.current.startOfDay(for: lastTemp)
         return (dayStart, dayStart.addingTimeInterval(6 * 3600))
     }
@@ -425,7 +383,6 @@ struct VitalsTableView: View {
     /// if the only stored count is from a prior day — `effectiveSteps` shows "—" then). A quiet
     /// link no longer reads as "live" (#36) — it shows when the count was last updated instead.
     private var stepsTime: String? {
-        if session?.steps != nil, !liveStale { return "live" }
         let today = Calendar.current.startOfDay(for: Date())
         guard let d = storedDaily.first, d.day == today, d.steps > 0 else { return nil }
         return Self.rel.localizedString(for: d.updatedAt, relativeTo: Date())
@@ -445,8 +402,7 @@ struct VitalsTableView: View {
     private static let rel: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter(); f.unitsStyle = .abbreviated; return f
     }()
-    private func timeFor(_ kind: MetricKind, live: Bool = false) -> String? {
-        if live { return "live" }
+    private func timeFor(_ kind: MetricKind) -> String? {
         guard let r = latestReading(kind) else { return nil }
         return Self.rel.localizedString(for: r.start, relativeTo: Date())
     }

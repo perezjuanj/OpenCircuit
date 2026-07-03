@@ -27,6 +27,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>OpenCircuit connects to your RingConn Gen 2 ring over Bluetooth Low Energy.</string>
 	<key>NSHealthShareUsageDescription</key>
@@ -42,6 +44,8 @@
 		<string>fetch</string>
 		<string>processing</string>
 	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
 </dict>

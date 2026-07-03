@@ -9,6 +9,9 @@ import OpenCircuitKit
 @MainActor
 final class HealthKitWriter {
     private let store = HKHealthStore()
+    private static let systolicType = HKQuantityType(.bloodPressureSystolic)
+    private static let diastolicType = HKQuantityType(.bloodPressureDiastolic)
+    private static let bloodPressureType = HKCorrelationType.correlationType(forIdentifier: .bloodPressure)!
     /// Reentrancy guard for `flushToHealth`: the method suspends on each HealthKit `save`,
     /// and it's triggered from several UI/lifecycle points — without this, two overlapping
     /// flushes could both read the same pending set before either advanced its watermark and
@@ -38,9 +41,9 @@ final class HealthKitWriter {
         case .temperature: id = .basalBodyTemperature
         case .respiratoryRate: id = .respiratoryRate
         case .steps: id = .stepCount
-        case .activeEnergy: id = .activeEnergyBurned
+        case .activeEnergy: return nil
         case .sleep: return nil
-        // ESTIMATE — steps × stride. See DistanceEstimate.swift for the derivation (#81).
+        // ESTIMATE — steps × RingConn's own per-step constant. See DistanceEstimate.swift (#81).
         case .distance: id = .distanceWalkingRunning
         // Apple Exercise Time is an Apple-COMPUTED Activity-ring metric — NOT third-party
         // shareable or writable. Listing it in `requestAuthorization(toShare:)` raises an Obj-C
@@ -64,7 +67,7 @@ final class HealthKitWriter {
         case .steps: return .count()
         case .activeEnergy: return .kilocalorie()
         case .sleep: return .count()                  // unused
-        case .distance: return .meter()              // ESTIMATE — steps × stride
+        case .distance: return .meter()              // ESTIMATE — steps × RingConn's per-step constant
         case .exerciseMinutes: return .minute()      // ESTIMATE — elevated HR minutes
         }
     }
@@ -74,7 +77,6 @@ final class HealthKitWriter {
         for k in MetricKind.allCases {
             if let t = Self.quantityType(for: k) { set.insert(t) }
         }
-        set.insert(HKQuantityType(.basalEnergyBurned))
         set.insert(HKCategoryType(.sleepAnalysis))
         // Workout types (#75): HKWorkout + GPS route (workout sessions feature).
         set.insert(HKWorkoutType.workoutType())
@@ -86,6 +88,9 @@ final class HealthKitWriter {
         // NOTE: temperature is NOT added here — it already ships via the canonical
         // `.basalBodyTemperature` path (MetricKind.temperature). No triple-write.
         set.insert(HKCategoryType(.menstrualFlow))
+        set.insert(Self.systolicType)
+        set.insert(Self.diastolicType)
+        set.insert(Self.bloodPressureType)
         return set
     }
 
@@ -125,15 +130,14 @@ final class HealthKitWriter {
     /// was nothing pending or share access isn't granted.
     struct FlushResult: Equatable {
         var samples = 0, sleepSegments = 0, steps = 0
-        var restingDays = 0, passiveHours = 0
-        var activeKcal = 0.0
+        var restingDays = 0
         var naps = 0
         var distanceM = 0.0         // estimated distance written (#81)
         var exerciseMinutes = 0.0   // estimated exercise minutes written (#82)
         var menstrualFlowEntries = 0  // user-logged period entries written (#78)
         var wroteAnything: Bool {
             samples > 0 || sleepSegments > 0 || steps > 0
-                || restingDays > 0 || passiveHours > 0 || activeKcal > 0 || naps > 0
+                || restingDays > 0 || naps > 0
                 || distanceM > 0 || exerciseMinutes > 0 || menstrualFlowEntries > 0
         }
     }
@@ -173,50 +177,48 @@ final class HealthKitWriter {
         // Gated by each entry's own `healthWritten` flag — independent of all other writes.
         result.menstrualFlowEntries = await flushMenstrualFlow(localStore: store)
 
-        // Profile is used for distance stride + calorie TRIMP — resolved once here so all three
-        // derived writes use the same snapshot. Body inputs come from the shared profile defaults;
-        // the ring transmits none of them.
+        // Profile is used for active-kcal weight + exercise-minute thresholds — resolved once here
+        // so the derived writes use the same snapshot. Body inputs come from the shared profile
+        // defaults; the ring transmits none of them. Distance (below) no longer needs it — PROTOCOL.md
+        // §5.3.1 confirms RingConn's distance derivation is a fixed per-step constant, not height/sex.
         let profile = Self.storedUserProfile()
 
-        // Steps + distance estimate (#81): write both atomically from the same pending delta.
-        // HealthKit stepCount is cumulative, but Apple Health resolves overlapping sources by
-        // priority. Writing the ring delta as an all-day sample can shadow Watch/iPhone steps for
-        // that whole day, so the delta is saved over a narrow window near the latest observation.
-        // Distance is an ESTIMATE (steps × height-based stride — not GPS) and is labeled as such.
-        // To avoid double counting against a recorded foot-based workout's GPS distance (which
-        // also writes .distanceWalkingRunning), the estimate is netted by any uncredited workout
-        // GPS distance for today — preferring the accurate GPS measurement (#).
-        if let pendingSteps = try? store.pendingStepWrite() {
-            let now = Date()
-            let delta = pendingSteps.delta
-            let startOfDay = Calendar.current.startOfDay(for: now)
-            let observedAt = Swift.min(Swift.max(pendingSteps.observedAt, startOfDay), now)
-            let writeStart = Swift.max(startOfDay, observedAt.addingTimeInterval(-60))
-            let writeEnd = observedAt
-            let rawDistanceM = DistanceEstimate.meters(steps: delta, profile: profile)
-            let (netDistanceM, gpsReduction) = Self.netDistanceEstimate(rawDistanceM, day: startOfDay)
-            var toWrite: [QuantitySample] = [
-                QuantitySample(kind: .steps, start: writeStart, end: writeEnd, value: Double(delta))
-            ]
-            if netDistanceM > 0 {
-                toWrite.append(QuantitySample(kind: .distance, start: writeStart, end: writeEnd, value: netDistanceM))
+        // Steps + distance estimate (#81, #steps-history): write each pending TIMESTAMPED step
+        // snapshot as its OWN narrow-window stepCount sample (its real observed start/end), not
+        // one `startOfDay→now` lump. HealthKit's stepCount type apportions a sample across every
+        // hour it overlaps, so the old single-window write smeared a whole day's steps evenly
+        // across every elapsed hour instead of landing them near when they actually happened —
+        // per-snapshot writes fix that while HealthKit's SUM still lands the correct daily total.
+        // Distance is netted/credited per CALENDAR DAY (the GPS-credit ledger in UserDefaults is
+        // day-keyed), so snapshots are grouped by day rather than assuming one day's worth.
+        if let pending = try? store.pendingStepSamples(), !pending.isEmpty {
+            var toWrite: [QuantitySample] = pending.map {
+                QuantitySample(kind: .steps, start: $0.start, end: $0.end, value: Double($0.delta))
+            }
+            var gpsCommits: [(reduction: Double, day: Date)] = []
+            let byDay = Dictionary(grouping: pending) { Calendar.current.startOfDay(for: $0.end) }
+            for (day, rows) in byDay {
+                let dayDelta = rows.reduce(0) { $0 + $1.delta }
+                let rawDistanceM = DistanceEstimate.meters(steps: dayDelta)
+                let (netDistanceM, gpsReduction) = Self.netDistanceEstimate(rawDistanceM, day: day)
+                if netDistanceM > 0 {
+                    let dayEnd = rows.map(\.end).max() ?? day
+                    toWrite.append(QuantitySample(kind: .distance, start: day, end: dayEnd, value: netDistanceM))
+                }
+                gpsCommits.append((gpsReduction, day))
             }
             do {
                 try await write(toWrite)
-                try store.advanceStepsWritten(by: delta)
-                Self.commitDistanceGPSCredit(gpsReduction, day: startOfDay)
-                result.steps = delta
-                result.distanceM = netDistanceM
+                try store.markStepSamplesWritten(pending)
+                for commit in gpsCommits { Self.commitDistanceGPSCredit(commit.reduction, day: commit.day) }
+                result.steps = pending.reduce(0) { $0 + $1.delta }
+                result.distanceM = toWrite.filter { $0.kind == .distance }.reduce(0) { $0 + $1.value }
             } catch { /* leave the watermark; retry next flush */ }
         }
         // Derived daily resting HR — one sample per finalized day (#18, #37). Idempotency is a
         // UserDefaults day-watermark, NOT the store cursor: RHR isn't a stored sample, and the
         // `hk:` cursor rows belong to the raw-sample mirror above.
         result.restingDays = await flushRestingHR(local: store, sleepSegments: sleepSegments)
-
-        // Energy: passive (hourly BMR) + active (HR-derived Edwards TRIMP). Watermark-gated (#37).
-        result.passiveHours = await flushPassiveCalories(profile: profile)
-        result.activeKcal = await flushActiveCalories(local: store, profile: profile)
 
         // Exercise minutes estimate (#82): elevated-HR minutes outside the sleep window.
         // ESTIMATE — basic 50% maxHR threshold. Full 4-level intensity follows #93 decode.
@@ -326,7 +328,11 @@ final class HealthKitWriter {
         // Read sleepAnalysis so the iOS Sleep-schedule window (HealthKitSleepSchedule) works
         // the moment the HealthKit entitlement is enabled — no further auth change needed.
         // (No effect today: without the entitlement the request is a no-op, so it can't prompt.)
-        let read: Set<HKObjectType> = [HKCategoryType(.sleepAnalysis)]
+        var read: Set<HKObjectType> = [HKCategoryType(.sleepAnalysis)]
+        for type in allTypes {
+            if type is HKWorkoutType || type is HKSeriesType { continue }
+            read.insert(type)
+        }
         // Every type in `allTypes` is deliberately third-party-WRITABLE (that's why `.temperature`
         // maps to `.basalBodyTemperature`, not the read-only `.appleSleepingWristTemperature`) —
         // an unshareable type here would poison the whole request. Defensive isolation: if the
@@ -696,6 +702,40 @@ final class HealthKitWriter {
         case .asleepCore: return .asleepCore
         case .asleepDeep: return .asleepDeep
         case .asleepREM: return .asleepREM
+        }
+    }
+
+    /// Write one correlated blood-pressure estimate to Apple Health.
+    @discardableResult
+    func writeBPEstimate(sbp: Double, dbp: Double, at date: Date) async -> Bool {
+        let metadata: [String: Any] = ["OpenCircuitBPSource": "RingPPGCalibration"]
+        let mmHg = HKUnit.millimeterOfMercury()
+        let systolic = HKQuantitySample(
+            type: Self.systolicType,
+            quantity: HKQuantity(unit: mmHg, doubleValue: sbp),
+            start: date,
+            end: date,
+            metadata: metadata
+        )
+        let diastolic = HKQuantitySample(
+            type: Self.diastolicType,
+            quantity: HKQuantity(unit: mmHg, doubleValue: dbp),
+            start: date,
+            end: date,
+            metadata: metadata
+        )
+        let correlation = HKCorrelation(
+            type: Self.bloodPressureType,
+            start: date,
+            end: date,
+            objects: [systolic, diastolic],
+            metadata: metadata
+        )
+        do {
+            try await store.save(correlation)
+            return true
+        } catch {
+            return false
         }
     }
 }

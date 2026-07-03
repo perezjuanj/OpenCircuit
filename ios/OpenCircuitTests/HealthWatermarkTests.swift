@@ -14,8 +14,13 @@ final class HealthWatermarkTests: XCTestCase {
         return LocalStore(container.mainContext)
     }
 
+    /// `t` offsets from the ring's own counter epoch (not raw Unix time, 1970, which `ingest`'s
+    /// plausibility guard rejects as predating `Command.syncEpoch`) — keeps these dates plausible
+    /// while preserving the tests' relative ordering.
     private func hr(_ value: Double, _ t: TimeInterval) -> QuantitySample {
-        QuantitySample(kind: .heartRate, start: Date(timeIntervalSince1970: t), value: value)
+        QuantitySample(kind: .heartRate,
+                       start: Date(timeIntervalSince1970: TimeInterval(Command.syncEpoch) + t),
+                       value: value)
     }
 
     /// The dashboard auto-persist (`ingest`) must NOT starve the Health write: samples

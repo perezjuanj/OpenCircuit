@@ -12,12 +12,16 @@
 //
 // Two record layouts, keyed on byte [8]:
 //   • Sleep-vitals epoch ([8] in 0x57…0x63): [4]=HR bpm 🟢, [5]=HRV/RMSSD ms 🟢,
-//     [8]=SpO2 % 🟢, [10:15]=motion. [6]/[7] unresolved 🟡.
+//     [6]=confidence 🟢, [7]=RR×8 🟢 (respiratoryRate below), [8]=SpO2 % 🟢, [10:20]=acti_counts.
 //   • Activity/awake epoch ([8]=0x12/0x13): [4]=HR bpm 🟢 (ALL-DAY HR — same head as sleep;
 //     confirmed 2026-06-17 by sleep↔activity continuity across all captures, ±4.6 bpm / corr +0.76),
-//     [10:15]=motion, activity payload in [15:22] 🟡 (#93). No valid HRV/SpO2 under motion.
-// Respiratory rate + skin temp are NOT per-epoch (derived/summary). Sleep stages are
-// not on the wire — compute them in Swift (Analytics/SleepDetection), per Phase 5.
+//     [10:20]=acti_counts (motion/intensity blob; [15:20] is just its tail, NOT a separate
+//     steps/distance payload — that claim was retracted, PROTOCOL.md §5.3 #93). No valid HRV/SpO2
+//     under motion. The real steps/distance/activeSeconds record (历史活动响应) is a SEPARATE,
+//     still-uncaptured stream — §5.3.1, `RingSession.probeActivityChannels`.
+// Respiratory rate IS per-epoch ([7]÷8, ground-truthed). Skin temp is NOT per-epoch here (it's
+// read live off the 0x10/0x87 descriptor, §5.4). Sleep stages are not on the wire — compute them
+// in Swift (Analytics/SleepDetection), per Phase 5.
 //
 // Do not add behavior that isn't in PROTOCOL.md. New facts go into the spec (and
 // desktop/decode_bulk.py) first, then get ported here.
@@ -123,6 +127,25 @@ public struct BulkRecord: Equatable {
 
     /// `[10:15]` — 5 per-30 s motion/activity counts (🟢 role). `01` baseline = still.
     public var motion: [UInt8] { Array(raw[10..<15]) }
+
+    /// Confidence / signal quality, `[6]` (🟢 named, PROTOCOL.md §5.3 — range ~0...12,
+    /// not yet bounded precisely). Decoded but NOT currently consumed by any analytic —
+    /// available for the supervised sleep-stage fitter (`desktop/ringconn_sleep_fit.py`)
+    /// to test as a confidence-weighting cue once real ground truth is captured
+    /// (`docs/RUNBOOK_SLEEP_GROUNDTRUTH.md`); do not bake an untested weighting into
+    /// `SleepStaging` ahead of that.
+    public var confidence: Int? {
+        guard layout != .idle else { return nil }
+        return Int(raw[6])
+    }
+
+    /// `[10:20]` — the FULL 10-byte `acti_counts` blob (🟢 role, PROTOCOL.md §5.3): `motion`
+    /// above only exposes its first 5 bytes (`[10:15]`); bytes `[15:20]` are its "intensity
+    /// tail" (PROTOCOL.md's #93 reconciliation — non-zero iff moving, NOT a separate
+    /// steps/distance payload). Exposed here because it's already decoded and currently fed
+    /// to nothing — like `confidence`, it's a candidate cue for the supervised sleep-stage
+    /// fitter to test empirically, not a license to hand-tune `SleepStaging` with it.
+    public var activityCounts: [UInt8] { Array(raw[10..<20]) }
 }
 
 /// Reassembles `0x4c` pages into records and maps sleep-vitals epochs to samples.

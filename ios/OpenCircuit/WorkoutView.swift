@@ -12,6 +12,7 @@
 //   fabricated or interpolated. A disclaimer note is shown during active sessions.
 
 import SwiftUI
+import SwiftData
 import OpenCircuitKit
 
 // MARK: - Main view
@@ -20,6 +21,7 @@ struct WorkoutView: View {
     let session: RingSession?
     @State private var manager = WorkoutSessionManager()
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
 
     // Distance display unit (#83) — same key/default as UserProfileSettingsView. Storage stays in
     // metres (manager.distanceMeters); only the display converts. @AppStorage re-renders the live
@@ -120,7 +122,7 @@ struct WorkoutView: View {
             Button {
                 guard let session else { return }
                 manager.selectedSport = manager.selectedSport
-                manager.start(session: session)
+                manager.start(session: session, store: LocalStore(modelContext))
             } label: {
                 Label("Start Workout", systemImage: "play.fill")
                     .frame(maxWidth: .infinity)
@@ -279,11 +281,6 @@ struct WorkoutView: View {
                     } else {
                         statCell("Max HR", "--")
                     }
-                    if let kcal = summary.estimatedActiveKcal {
-                        statCell("Active Cal (est.)", "\(Int(kcal.rounded())) kcal")
-                    } else {
-                        statCell("Active Cal (est.)", "--")
-                    }
                     statCell("HR Readings", "\(summary.hrSampleCount)")
                     if let dist = summary.distanceMeters {
                         statCell("Distance", UnitsFormatter.distance(dist, unit: distanceUnit, fractionDigits: 2))
@@ -314,14 +311,6 @@ struct WorkoutView: View {
                     if summary.hrSampleCount < 30 {
                         noteRow(icon: "exclamationmark.triangle", color: .orange,
                                 text: "Few HR readings captured (\(summary.hrSampleCount)). Live HR polling is best-effort — the ring may have missed updates (issue #45).")
-                    }
-                    if summary.estimatedActiveKcal != nil {
-                        // Label the ACTUAL source: HR-TRIMP when HR locked, else the GPS-distance
-                        // fallback (a zero-HR walk's calories come from distance × body mass).
-                        noteRow(icon: "info.circle", color: .secondary,
-                                text: summary.hrSampleCount > 0
-                                    ? "Active calories are an ESTIMATE (Edwards-TRIMP from HR — not ring sensor data)."
-                                    : "Active calories are an ESTIMATE (from GPS distance × body mass — HR didn't lock; not ring sensor data).")
                     }
                     if summary.hasRoute {
                         noteRow(icon: "location.fill", color: .blue,

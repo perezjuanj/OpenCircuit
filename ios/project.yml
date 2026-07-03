@@ -32,6 +32,11 @@ targets:
         # Export compliance: only crypto is SM3 hashing for ring auth (exempt) → declare no
         # non-exempt encryption, so TestFlight uploads skip the manual compliance prompt.
         ITSAppUsesNonExemptEncryption: false
+        # Diagnostics export (Device Info ▸ Diagnostics): expose the app's Documents dir over
+        # iTunes/Finder file sharing + the Files app, so tester logs can be pulled off-device.
+        # MUST live here — XcodeGen regenerates Info.plist and would otherwise strip these.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         # HealthKit auth strings (Phase 4) — required or the app crashes on request. Shown verbatim
         # in the iOS permission dialogs, so they use the user-facing name "OpenCircuit".
         NSHealthShareUsageDescription: "OpenCircuit reads health metrics from your ring to display them."

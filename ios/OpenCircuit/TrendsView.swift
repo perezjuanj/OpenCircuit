@@ -1,12 +1,19 @@
-// 7-day rolling trends for available decoded metrics (#74).
+// Rolling daily trends for every tracked metric (#74), plus a per-day time-of-day
+// breakdown (`DayDetailView`, tap a day chip) for the continuously-monitored ones.
 //
 // SCOPE — AVAILABLE DATA ONLY.
-// Shows trends for: sleep-window HR / HRV / SpO₂ / RR, steps, nightly skin temp,
-// sleep score, overnight stress score.
+// Shows trends for: all-day AND sleep-window HR / HRV / SpO₂ / RR, steps, active
+// energy / distance / exercise minutes (estimates, same basis as HealthKitWriter),
+// nightly AND daytime skin temp, sleep score, overnight stress score.
 //
-// ⚠️ Daytime/waking HR, HRV, SpO₂ aggregates are NOT shown — they need the
-// undecoded activity-epoch [15:22] payload (#93). When that decode lands, those
-// aggregates extend this view. Do NOT add daytime vitals charts here yet.
+// All-day vitals use the SAME stored samples as the sleep-window figures, just over
+// the whole calendar day rather than the night's in-bed window — HR is on every worn
+// epoch (sleep AND activity), HRV/SpO₂/RR are on whichever epochs land .sleepVitals,
+// which is not exclusively overnight (see BulkSleep.swift). Daytime skin temp comes
+// from a SEPARATE table (`StoredDaytimeTemp`) kept apart from the nightly baseline and
+// Apple Health — #41's guarantee (daytime readings must never skew the nightly
+// cycle-tracking baseline) is unchanged; this is purely an additional, Trends-only view
+// of the same live descriptor reads.
 //
 // Data loading: synchronous on-main-thread fetch from SwiftData (no background
 // context needed; ModelContext is already main-actor). Computed in `.task` on
@@ -18,11 +25,25 @@ import Charts
 import OpenCircuitKit
 
 struct TrendsView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    private struct RecentMetricRow: Identifiable {
+        let metricKey: String
+        let title: String
+        let unit: String
+        let color: Color
+        let rows: [(time: Date, value: String)]
+
+        var id: String { metricKey }
+        var latest: (time: Date, value: String)? { rows.first }
+    }
+
     @Environment(\.modelContext) private var modelContext
     @State private var points: [TrendsEngine.DailyPoint] = []
+    @State private var recentMetricRows: [RecentMetricRow] = []
     @State private var loading = true
     // Display units (#83): values are stored in °C; only the display layer converts.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
+    @State private var selectedDay: Date?
 
     var body: some View {
         ScrollView {
@@ -34,7 +55,10 @@ struct TrendsView: View {
                     emptyState
                 } else {
                     availableMetricsNote
+                    recentReadingsSection
+                    dayPicker
                     let avgs = TrendsEngine.rollingAverages(points)
+                    allDaySection(avgs: avgs)
                     sleepSection(avgs: avgs)
                     activitySection(avgs: avgs)
                 }
@@ -42,8 +66,31 @@ struct TrendsView: View {
             .padding()
         }
         .background(Color(.systemGroupedBackground))
-        .navigationTitle("7-Day Trends")
+        .navigationTitle("Trends")
+        .navigationDestination(item: $selectedDay) { day in DayDetailView(day: day) }
         .task { loadData() }
+        .refreshable { loadData() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { loadData() }
+        }
+    }
+
+    /// Tap a day to drill into its time-of-day breakdown (`DayDetailView`) — the bars above
+    /// answer "how was this day on average"; this answers "WHEN during the day".
+    private var dayPicker: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(points.reversed(), id: \.date) { p in
+                    Button { selectedDay = p.date } label: {
+                        Text(p.date, format: .dateTime.weekday(.abbreviated).day())
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Capsule().fill(Color(.secondarySystemGroupedBackground)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
     }
 
     // MARK: - Sections
@@ -65,10 +112,61 @@ struct TrendsView: View {
     private var availableMetricsNote: some View {
         HStack(spacing: 6) {
             Image(systemName: "info.circle").foregroundStyle(.secondary)
-            Text("Showing sleep-window vitals only. Daytime HR/HRV/SpO₂ trends follow the ring activity-payload decode (#93).")
+            Text("Active Energy / Distance / Exercise Time are estimates derived from steps and heart rate, the same basis Apple Health writes use. Tap a day below to see a time-of-day breakdown.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(.horizontal, 4)
+    }
+
+    private var recentReadingsSection: some View {
+        VStack(spacing: 12) {
+            sectionHeader("Recent Readings")
+            Text("Shows the newest stored timestamped readings per metric, including each step delta's own observation window.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ForEach(recentMetricRows) { metric in
+                recentReadingsCard(metric)
+            }
+        }
+    }
+
+    private func allDaySection(avgs: TrendsEngine.RollingAverages) -> some View {
+        VStack(spacing: 12) {
+            sectionHeader("All-Day Vitals")
+
+            chartCard(title: "Heart Rate", unit: "bpm",
+                      color: .red,
+                      data: points.compactMap { p in
+                          p.dayHRAvg.flatMap { hr in hr > TrendsEngine.minValidHR ? (p.date, hr) : nil }
+                      },
+                      avg: avgs.dayHRAvg,
+                      formatAvg: { "\(Int($0.rounded()))" })
+
+            chartCard(title: "HRV (RMSSD est.)", unit: "ms",
+                      color: .green,
+                      data: points.compactMap { p in p.dayHRVAvg.map { (p.date, $0) } },
+                      avg: avgs.dayHRVAvg,
+                      formatAvg: { "\(Int($0.rounded()))" })
+
+            chartCard(title: "SpO₂", unit: "%",
+                      color: .cyan,
+                      data: points.compactMap { p in p.daySpO2Avg.map { (p.date, $0 * 100) } },
+                      avg: avgs.daySpO2Avg.map { $0 * 100 },
+                      formatAvg: { String(format: "%.1f", $0) })
+
+            chartCard(title: "Respiratory Rate", unit: "brpm",
+                      color: .teal,
+                      data: points.compactMap { p in p.dayRRAvg.map { (p.date, $0) } },
+                      avg: avgs.dayRRAvg,
+                      formatAvg: { String(format: "%.1f", $0) })
+
+            chartCard(title: "Skin Temp (daytime)", unit: "°C",
+                      color: .orange,
+                      data: points.compactMap { p in p.dayTempC.map { (p.date, $0) } },
+                      avg: avgs.dayTempC,
+                      formatAvg: { String(format: "%.1f", $0) })
+        }
     }
 
     private func sleepSection(avgs: TrendsEngine.RollingAverages) -> some View {
@@ -146,6 +244,24 @@ struct TrendsView: View {
                       data: points.compactMap { p in p.steps.map { (p.date, Double($0)) } },
                       avg: avgs.steps,
                       formatAvg: { "\(Int($0.rounded()).formatted())" })
+
+            chartCard(title: "Active Energy (est.)", unit: "kcal",
+                      color: .orange,
+                      data: points.compactMap { p in p.activeEnergyKcal.map { (p.date, $0) } },
+                      avg: avgs.activeEnergyKcal,
+                      formatAvg: { "\(Int($0.rounded()))" })
+
+            chartCard(title: "Distance (est.)", unit: "km",
+                      color: .indigo,
+                      data: points.compactMap { p in p.distanceM.map { (p.date, $0 / 1000.0) } },
+                      avg: avgs.distanceM.map { $0 / 1000.0 },
+                      formatAvg: { String(format: "%.1f", $0) })
+
+            chartCard(title: "Exercise Time (est.)", unit: "min",
+                      color: .mint,
+                      data: points.compactMap { p in p.exerciseMin.map { (p.date, $0) } },
+                      avg: avgs.exerciseMin,
+                      formatAvg: { "\(Int($0.rounded()))" })
         }
     }
 
@@ -182,12 +298,18 @@ struct TrendsView: View {
                     .frame(maxWidth: .infinity)
             } else {
                 Chart(data, id: \.0) { (date, value) in
-                    BarMark(
+                    LineMark(
                         x: .value("Day", date, unit: .day),
                         y: .value(title, value)
                     )
-                    .foregroundStyle(color.gradient)
-                    .cornerRadius(3)
+                    .foregroundStyle(color)
+                    .interpolationMethod(.catmullRom)
+                    PointMark(
+                        x: .value("Day", date, unit: .day),
+                        y: .value(title, value)
+                    )
+                    .foregroundStyle(color)
+                    .symbolSize(24)
                 }
                 .frame(height: 80)
                 .chartXAxis {
@@ -212,6 +334,60 @@ struct TrendsView: View {
         Text(title)
             .font(.headline)
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func recentReadingsCard(_ metric: RecentMetricRow) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(metric.title.uppercased())
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    if let latest = metric.latest {
+                        Text(latest.value)
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(metric.color)
+                        Text(Self.recentTimestamp.string(from: latest.time))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("No readings")
+                            .font(.subheadline)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                Spacer()
+                if !metric.unit.isEmpty {
+                    Text(metric.unit)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            if metric.rows.isEmpty {
+                Text("No readings in the recent lookback window")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(Array(metric.rows.enumerated()), id: \.offset) { _, row in
+                    HStack {
+                        Text(row.value)
+                            .font(.subheadline.weight(.medium))
+                            .monospacedDigit()
+                        Spacer()
+                        Text(Self.recentTimestamp.string(from: row.time))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if row.time != metric.rows.last?.time {
+                        Divider().opacity(0.3)
+                    }
+                }
+            }
+        }
+        .padding()
+        .background(RoundedRectangle(cornerRadius: 16)
+            .fill(Color(.secondarySystemGroupedBackground)))
     }
 
     // MARK: - Data loading
@@ -242,19 +418,42 @@ struct TrendsView: View {
         let hrvSamples  = (try? store.samples(kind: .hrvSDNN,         from: lookbackStart, to: now)) ?? []
         let spo2Samples = (try? store.samples(kind: .spo2,            from: lookbackStart, to: now)) ?? []
         let rrSamples   = (try? store.samples(kind: .respiratoryRate, from: lookbackStart, to: now)) ?? []
+        let daytimeTemps = (try? store.daytimeTemperatures(from: lookbackStart, to: now)) ?? []
+        let stepSamples = (try? store.stepSamples(from: lookbackStart, to: now)) ?? []
+        recentMetricRows = buildRecentMetricRows(
+            hrSamples: hrSamples,
+            hrvSamples: hrvSamples,
+            spo2Samples: spo2Samples,
+            rrSamples: rrSamples,
+            daytimeTemps: daytimeTemps,
+            stepSamples: stepSamples
+        )
+        var daytimeTempsByDay: [Date: [Double]] = [:]
+        for t in daytimeTemps { daytimeTempsByDay[cal.startOfDay(for: t.time), default: []].append(t.celsius) }
 
-        // Build one point per day across the UNION of sleep-summary nights and daily-step days,
-        // so the Activity/Steps chart renders from step history even on days with no overnight
-        // sleep summary (e.g. the user wore the ring by day but not to bed). Both keys are
-        // start-of-day, so they align.
-        let allDays = Set(summaryByNight.keys).union(stepsByDay.keys).sorted()
+        // Profile for the same step/HR-derived activity ESTIMATES HealthKitWriter writes
+        // (active energy, distance, exercise minutes) — so the trend matches Apple Health.
+        let profile = HealthKitWriter.storedUserProfile()
+        let maxHR = max(220 - profile.age, 1)
+
+        // Build one point per day across the UNION of sleep-summary nights, daily-step days,
+        // and any day with a vitals sample — so a chart renders even on a day with no overnight
+        // sleep summary and no step rollup (e.g. only a couple of live HR readings). All keys
+        // are start-of-day, so they align.
+        var vitalsDays: Set<Date> = []
+        for s in hrSamples + hrvSamples + spo2Samples + rrSamples {
+            vitalsDays.insert(cal.startOfDay(for: s.start))
+        }
+        let allDays = Set(summaryByNight.keys).union(stepsByDay.keys).union(vitalsDays)
+            .union(daytimeTempsByDay.keys).sorted()
         points = allDays.map { day in
             let s = summaryByNight[day]
             let window = (s?.inBedStart ?? .distantPast) > Date.distantPast
                 ? DateInterval(start: s!.inBedStart, end: s!.inBedEnd) : nil
+            let dayWindow = DateInterval(start: day, end: cal.date(byAdding: .day, value: 1, to: day) ?? day)
 
-            func avg(_ samples: [QuantitySample], minVal: Double = 0) -> Double? {
-                guard let w = window else { return nil }
+            func avg(_ samples: [QuantitySample], in w: DateInterval?, minVal: Double = 0) -> Double? {
+                guard let w else { return nil }
                 let vals = samples
                     .filter { w.contains($0.start) && $0.value > minVal }
                     .map(\.value)
@@ -262,20 +461,123 @@ struct TrendsView: View {
                 return vals.reduce(0, +) / Double(vals.count)
             }
 
+            let daySteps = stepsByDay[day]
+            let dayHRSamples = hrSamples.filter { dayWindow.contains($0.start) }
+                .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+
             return TrendsEngine.DailyPoint(
                 date:          day,
-                steps:         stepsByDay[day],
+                steps:         daySteps,
                 sleepMinutes:  (s?.asleepMin ?? 0) > 0 ? s?.asleepMin : nil,
                 sleepScore:    (s?.sleepScore ?? 0) > 0 ? s?.sleepScore : nil,
                 stressScore:   (s?.stressScore ?? 0) > 0 ? s?.stressScore : nil,
                 skinTempC:     (s?.skinTempC ?? 0) > 0 ? s?.skinTempC : nil,
-                sleepHRAvg:    avg(hrSamples, minVal: TrendsEngine.minValidHR),
-                sleepHRVAvg:   avg(hrvSamples),
-                sleepSpO2Avg:  avg(spo2Samples),
-                sleepRRAvg:    avg(rrSamples)
+                dayTempC:      daytimeTempsByDay[day].flatMap { vals in
+                    vals.isEmpty ? nil : vals.reduce(0, +) / Double(vals.count)
+                },
+                sleepHRAvg:    avg(hrSamples, in: window, minVal: TrendsEngine.minValidHR),
+                sleepHRVAvg:   avg(hrvSamples, in: window),
+                sleepSpO2Avg:  avg(spo2Samples, in: window),
+                sleepRRAvg:    avg(rrSamples, in: window),
+                dayHRAvg:      avg(hrSamples, in: dayWindow, minVal: TrendsEngine.minValidHR),
+                dayHRVAvg:     avg(hrvSamples, in: dayWindow),
+                daySpO2Avg:    avg(spo2Samples, in: dayWindow),
+                dayRRAvg:      avg(rrSamples, in: dayWindow),
+                activeEnergyKcal: daySteps.map { Calories.activeKcalFromSteps(steps: $0, profile: profile) },
+                distanceM:        daySteps.map { DistanceEstimate.meters(steps: $0) },
+                exerciseMin:      dayHRSamples.isEmpty ? nil : ExerciseMinutes.estimate(
+                    hrSamples: dayHRSamples, maxHR: maxHR, sleepWindow: window
+                )
             )
         }
 
         loading = false
     }
+
+    private func buildRecentMetricRows(
+        hrSamples: [QuantitySample],
+        hrvSamples: [QuantitySample],
+        spo2Samples: [QuantitySample],
+        rrSamples: [QuantitySample],
+        daytimeTemps: [StoredDaytimeTemp],
+        stepSamples: [StoredStepSample]
+    ) -> [RecentMetricRow] {
+        [
+            RecentMetricRow(
+                metricKey: "steps",
+                title: "Steps",
+                unit: "",
+                color: .mint,
+                rows: Array(stepSamples
+                    .filter { $0.delta > 0 }
+                    .suffix(Self.recentRowsLimit)
+                    .reversed())
+                    .map { (time: $0.end, value: "+\($0.delta) steps") }
+            ),
+            RecentMetricRow(
+                metricKey: "heartRate",
+                title: "Heart Rate",
+                unit: "bpm",
+                color: .red,
+                rows: recentRows(from: hrSamples.filter { $0.value > TrendsEngine.minValidHR }) {
+                    "\(Int($0.value.rounded())) bpm"
+                }
+            ),
+            RecentMetricRow(
+                metricKey: "spo2",
+                title: "SpO₂",
+                unit: "%",
+                color: .cyan,
+                rows: recentRows(from: spo2Samples.filter { $0.value > 0 }) {
+                    "\(Int(($0.value * 100).rounded())) %"
+                }
+            ),
+            RecentMetricRow(
+                metricKey: "temperature",
+                title: "Skin Temp",
+                unit: "°C",
+                color: .orange,
+                rows: Array(daytimeTemps
+                    .filter { $0.celsius > 0 }
+                    .suffix(Self.recentRowsLimit)
+                    .reversed())
+                    .map { (time: $0.time, value: String(format: "%.1f °C", $0.celsius)) }
+            ),
+            RecentMetricRow(
+                metricKey: "hrv",
+                title: "HRV",
+                unit: "ms",
+                color: .green,
+                rows: recentRows(from: hrvSamples.filter { $0.value > 0 }) {
+                    "\(Int($0.value.rounded())) ms"
+                }
+            ),
+            RecentMetricRow(
+                metricKey: "rr",
+                title: "Respiratory Rate",
+                unit: "brpm",
+                color: .teal,
+                rows: recentRows(from: rrSamples.filter { $0.value > 0 }) {
+                    String(format: "%.1f /min", $0.value)
+                }
+            )
+        ]
+        .filter { !$0.rows.isEmpty }
+    }
+
+    private func recentRows(
+        from samples: [QuantitySample],
+        format: (QuantitySample) -> String
+    ) -> [(time: Date, value: String)] {
+        Array(samples.suffix(Self.recentRowsLimit).reversed())
+            .map { (time: $0.start, value: format($0)) }
+    }
+
+    private static let recentRowsLimit = 12
+    private static let recentTimestamp: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
 }

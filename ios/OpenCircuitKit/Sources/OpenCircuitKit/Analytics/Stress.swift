@@ -1,9 +1,15 @@
 // Stress — Baevsky Stress Index, ported from openwhoop-algos/src/stress.rs.
-// Pure function of RR intervals (ms); result is a 0…10 scale. Device-agnostic.
+// Pure function of R-R INTERVALS in ms (time between heartbeats) — result is a
+// 0…10 scale. Device-agnostic.
 //
-// ⚠️ Same RR-availability caveat as HRV (PROTOCOL.md §5 🔴). openwhoop falls back
-// to BPM-derived RR when real RR is scarce; that fallback lives at the call site
-// (it needs the per-reading bpm/rr split), so this file ports only the core index.
+// ⚠️ Same R-R-interval-availability caveat as HRV.swift (still 🔴 — see that file's
+// header). NOTE: this is NOT the same "RR" as the now-confirmed respiratory rate
+// (breaths/min, 0x4c[7]÷8, 🟢 — see BulkRecord.respiratoryRate); that's wired and
+// shipping. This file's input (per-beat R-R intervals) is a different, still-
+// unavailable signal — the ring never exposes raw beat-to-beat timing, only the
+// firmware-finished RMSSD value. openwhoop falls back to BPM-derived RR when real
+// RR is scarce; that fallback lives at the call site (it needs the per-reading
+// bpm/rr split), so this file ports only the core index.
 
 import Foundation
 
