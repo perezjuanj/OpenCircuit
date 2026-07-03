@@ -136,6 +136,30 @@ struct HealthNotificationStore {
         for n in notifs { raw[n.rawValue] = now.timeIntervalSince1970 }
         defaults.set(raw, forKey: Self.key)
     }
+
+    // Per-night ledger for the skin-temp/fever notifications (#85). Separate from `lastFired` (the
+    // rolling anti-spam backoff) because these flags describe ONE overnight summary and must fire at
+    // most once per night regardless of how many syncs land that day — see
+    // `TempFeverNotifications.freshForNight`. Stores each flag's already-notified night start-of-day.
+    private static let nightKey = "alerts.health.lastNight"   // [HealthNotification.rawValue: yyyymmdd dayKey]
+
+    func lastNotifiedNight() -> [HealthNotification: Int] {
+        // A pre-migration install stored fractional epoch instants here; those fail the `[String: Int]`
+        // cast so the ledger reads empty and re-arms once — a bounded, one-time re-fire on upgrade.
+        let raw = defaults.dictionary(forKey: Self.nightKey) as? [String: Int] ?? [:]
+        var out: [HealthNotification: Int] = [:]
+        for (k, v) in raw where v > 0 {
+            if let n = HealthNotification(rawValue: k) { out[n] = v }
+        }
+        return out
+    }
+
+    func markNight(_ notifs: [HealthNotification], night: Int) {
+        guard !notifs.isEmpty else { return }
+        var raw = defaults.dictionary(forKey: Self.nightKey) as? [String: Int] ?? [:]
+        for n in notifs { raw[n.rawValue] = night }
+        defaults.set(raw, forKey: Self.nightKey)
+    }
 }
 
 // MARK: - The engine
@@ -195,23 +219,52 @@ struct HealthNotificationCenter {
         }
 
         // --- #85: skin-temp anomaly flags + suspected fever ------------------------------------
+        // These flags describe ONE overnight summary, so they de-dupe per night (not by the 2h
+        // backoff): once a night is notified, later syncs of the same night are dropped here so the
+        // user doesn't get the same "skin temperature dropped" alert after every sync. A new night's
+        // summary re-arms them.
+        var tempNightKey: Int?
         if HealthAlertDefaults.tempFeverEnabledValue() {
-            candidates += tempFeverCandidates(store: localStore)
+            let (tempCandidates, night) = tempFeverCandidates(store: localStore)
+            if let night {
+                let key = TempFeverNotifications.dayKey(for: night)
+                tempNightKey = key
+                candidates += TempFeverNotifications.freshForNight(
+                    tempCandidates, night: key, lastNotifiedNight: store.lastNotifiedNight())
+            }
         }
 
         // --- Route survivors through the ONE shared gate (quiet hours + backoff) ---------------
         let quiet = HealthAlertDefaults.quietHours()
         let fire = gate.filter(candidates, now: now, lastFired: lastFired, quietHours: quiet)
-        guard !fire.isEmpty, await ensureAuthorized() else { return }
-        for n in fire { await post(n, hit: hitByNotif[n]) }
+        guard !fire.isEmpty else { return }
+        // Reserve the survivors against the anti-spam backoff SYNCHRONOUSLY — there is no `await`
+        // between reading `lastFired` above and this write, so on the main actor a second concurrent
+        // evaluate() (the app-open scene-active probe and the sync-complete trigger both fire and
+        // each starts its own Task) reads the mark and is gated out, instead of both passing and
+        // double-posting the same alert. This must stay BEFORE the ensureAuthorized() suspension —
+        // that's what closes the window. `markNight`, by contrast, is deferred until AFTER auth
+        // succeeds: unlike the 2h backoff the night ledger has no time-based self-heal (it only
+        // re-arms on a strictly newer night), so claiming a night here would silently swallow a
+        // real fever/skin-temp flag for the whole day if auth was denied and nothing was posted.
         store.markFired(fire, at: now)
+        guard await ensureAuthorized() else { return }
+        if let tempNightKey { store.markNight(fire.filter(Self.isTempFever), night: tempNightKey) }
+        for n in fire { await post(n, hit: hitByNotif[n]) }
+    }
+
+    /// Whether `n` is one of the #85 skin-temp/fever notifications that de-dupe per night (see
+    /// `markNight`). Membership is the single `TempFeverNotifications.notificationSet` source of
+    /// truth, so a new skin-temp case can't silently miss the ledger and regress to every-2h re-fire.
+    private static func isTempFever(_ n: HealthNotification) -> Bool {
+        TempFeverNotifications.notificationSet.contains(n)
     }
 
     /// Compute the latest night's skin-temp anomaly flags (#69) + suspected fever (#72), then map
     /// them to notifications (#85). Reuses the SAME canonical SkinTempBaseline offset the Sleep card
     /// shows — temperature is not recomputed for fever.
-    private func tempFeverCandidates(store: LocalStore) -> [HealthNotification] {
-        guard let latest = try? store.latestSleepSummary(), latest.skinTempC > 0 else { return [] }
+    private func tempFeverCandidates(store: LocalStore) -> (candidates: [HealthNotification], night: Date?) {
+        guard let latest = try? store.latestSleepSummary(), latest.skinTempC > 0 else { return ([], nil) }
         let nights = ((try? store.recentSleepSummaries(limit: 40)) ?? []).filter { $0.skinTempC > 0 }
         let cal = Calendar.current
         let tonightDay = cal.startOfDay(for: latest.night)
@@ -224,7 +277,8 @@ struct HealthNotificationCenter {
 
         // Fever: resting-HR baseline vs today + the canonical temp offset (#72 owns the logic).
         let fever = suspectedFever(store: store, tempOffsetC: report.offsetC)
-        return TempFeverNotifications.notifications(flags: report.flags, feverSuspected: fever)
+        let notifs = TempFeverNotifications.notifications(flags: report.flags, feverSuspected: fever)
+        return (notifs, tonightDay)
     }
 
     /// Resting-HR daily series → personal baseline, cross-referenced with the temp offset for the
@@ -338,13 +392,16 @@ struct HealthNotificationCenter {
     /// stated intent in `copy(for:)` ("no medical disclaimer appended — they're lifestyle
     /// reminders"), which the previous unconditional append in `post` contradicted.
     private static func appendsDisclaimer(_ n: HealthNotification) -> Bool {
+        // Exhaustive (no `default`) so a new enum case forces a compile-time decision here. The
+        // temp/fever cases resolve through the shared `TempFeverNotifications.notificationSet` so
+        // this and `isTempFever` can never drift.
         switch n {
-        case .highHR, .lowSpO2, .elevatedHRInactive,
-             .skinTempRise, .skinTempDrop, .skinTempFluctuationRise, .skinTempFluctuationDrop,
-             .fever:
+        case .highHR, .lowSpO2, .elevatedHRInactive:
             return true
         case .sedentaryReminder, .wearReminder, .bedtimeReminder, .chargingComplete:
             return false
+        case .skinTempRise, .skinTempDrop, .skinTempFluctuationRise, .skinTempFluctuationDrop, .fever:
+            return TempFeverNotifications.notificationSet.contains(n)
         }
     }
 
