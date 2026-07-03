@@ -88,10 +88,12 @@ final class GoalProgressTests: XCTestCase {
     func testDailyProgressSummary() {
         let p = DailyGoalProgress(
             steps: GoalProgress(current: 6000, goal: 8000),
+            activeKcal: GoalProgress(current: 150, goal: 300),
             activityMinutes: GoalProgress(current: 20, goal: 30),
             sleepMinutes: GoalProgress(current: 420, goal: 480)
         )
         XCTAssertEqual(p.steps.fraction, 0.75, accuracy: 0.0001)
+        XCTAssertEqual(p.activeKcal.fraction, 0.5, accuracy: 0.0001)
         XCTAssertFalse(p.activityMinutes.met)
         XCTAssertFalse(p.sleepMinutes.met)
     }
