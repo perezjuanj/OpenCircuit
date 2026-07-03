@@ -77,6 +77,51 @@ final class HealthAlertsTests: XCTestCase {
                                                           feverSuspected: false).isEmpty)
     }
 
+    func testFreshForNightDropsAlreadyNotifiedNight() {
+        let night = TempFeverNotifications.dayKey(for: at(3), calendar: cal)   // this overnight's summary
+        let cands: [HealthNotification] = [.skinTempFluctuationDrop, .fever]
+        // Same night already notified for the fluctuation drop → drop it, keep the unnotified fever.
+        let fresh = TempFeverNotifications.freshForNight(
+            cands, night: night, lastNotifiedNight: [.skinTempFluctuationDrop: night])
+        XCTAssertEqual(fresh, [.fever], "same night must not re-fire the same flag")
+        // No prior night for either → both survive.
+        XCTAssertEqual(TempFeverNotifications.freshForNight(cands, night: night, lastNotifiedNight: [:]),
+                       cands)
+    }
+
+    func testFreshForNightReArmsOnNewerNight() {
+        let lastNightDate = cal.startOfDay(for: at(3))
+        let lastNight = TempFeverNotifications.dayKey(for: lastNightDate, calendar: cal)
+        let newerNight = TempFeverNotifications.dayKey(
+            for: cal.date(byAdding: .day, value: 1, to: lastNightDate)!, calendar: cal)
+        let fresh = TempFeverNotifications.freshForNight(
+            [.skinTempFluctuationDrop], night: newerNight,
+            lastNotifiedNight: [.skinTempFluctuationDrop: lastNight])
+        XCTAssertEqual(fresh, [.skinTempFluctuationDrop], "a new night's summary re-arms the alert")
+        // A stale (older) recompute of a night we've moved past must not re-fire.
+        XCTAssertTrue(TempFeverNotifications.freshForNight(
+            [.skinTempFluctuationDrop], night: lastNight,
+            lastNotifiedNight: [.skinTempFluctuationDrop: newerNight]).isEmpty)
+    }
+
+    func testDayKeyIsTimezoneStableAcrossWestwardTravel() {
+        // The SAME night instant, keyed after westward travel (offset decreasing) between two syncs.
+        // The old ledger stored `startOfDay(...).timeIntervalSince1970`, whose instant shifts later
+        // under that travel and re-fires the duplicate; the yyyymmdd day key must stay put.
+        var east = Calendar(identifier: .gregorian)
+        east.timeZone = TimeZone(identifier: "America/New_York")!    // UTC-4 in June
+        var west = Calendar(identifier: .gregorian)
+        west.timeZone = TimeZone(identifier: "America/Los_Angeles")! // UTC-7 in June
+        // 2026-06-17 12:00 UTC → 08:00 in ET, 05:00 in PT: same calendar day in both zones.
+        var utc = Calendar(identifier: .gregorian); utc.timeZone = TimeZone(identifier: "UTC")!
+        let night = utc.date(from: DateComponents(year: 2026, month: 6, day: 17, hour: 12))!
+        XCTAssertEqual(TempFeverNotifications.dayKey(for: night, calendar: east),
+                       TempFeverNotifications.dayKey(for: night, calendar: west),
+                       "day key must be stable across timezone shifts of the same night")
+        // Sanity: the discarded start-of-day instants really do differ across the two zones.
+        XCTAssertNotEqual(east.startOfDay(for: night), west.startOfDay(for: night))
+    }
+
     // MARK: Quiet hours (DND)
 
     func testQuietHoursWrapsMidnight() {

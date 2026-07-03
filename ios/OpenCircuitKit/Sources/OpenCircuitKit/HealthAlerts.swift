@@ -211,6 +211,22 @@ public enum HealthAlertEvaluator {
 // MARK: - #85 routing (temp flags + fever → notifications)
 
 public enum TempFeverNotifications {
+    /// The #85 skin-temp/fever notifications — the ones that de-dupe per night. Single source of
+    /// truth so every classifier (`notifications` routing, the app-side `isTempFever` filter, and
+    /// the disclaimer logic) stays in lock-step; adding a skin-temp case means adding it here once.
+    public static let notificationSet: Set<HealthNotification> = [
+        .skinTempRise, .skinTempDrop, .skinTempFluctuationRise, .skinTempFluctuationDrop, .fever,
+    ]
+
+    /// Timezone-stable `yyyymmdd` day key for a night's start-of-day. Used as the per-night ledger
+    /// key instead of a raw instant: an instant (`timeIntervalSince1970`) shifts under westward
+    /// travel between two syncs of the same night, which could re-fire the duplicate; the calendar
+    /// day components do not.
+    public static func dayKey(for night: Date, calendar: Calendar = .current) -> Int {
+        let c = calendar.dateComponents([.year, .month, .day], from: night)
+        return (c.year ?? 0) * 10_000 + (c.month ?? 0) * 100 + (c.day ?? 0)
+    }
+
     /// Map the four `SkinTempBaseline` anomaly flags (#69) + the suspected-fever flag (#72) to the
     /// notifications they should raise. Pure flag→notification routing; the de-dupe/DND gate and
     /// posting happen in the shared app-side center. (#85)
@@ -223,5 +239,20 @@ public enum TempFeverNotifications {
         if flags.fluctuationDrop { out.append(.skinTempFluctuationDrop) }
         if feverSuspected { out.append(.fever) }
         return out
+    }
+
+    /// Per-NIGHT de-dupe for the skin-temp/fever notifications. Each of these flags pertains to ONE
+    /// overnight summary, so once we've notified for a given night it must NOT re-fire on later
+    /// syncs of the same night — the 2h anti-spam backoff alone would re-raise the same night's flag
+    /// every couple hours all day (the user sees the same "skin temperature dropped" alert after
+    /// every sync). Keeps only the flags whose night is strictly newer than the last night already
+    /// notified for that flag; a fresh night's summary re-arms it. `night` and the map values are
+    /// timezone-stable `yyyymmdd` day keys (see `dayKey(for:)`).
+    public static func freshForNight(_ candidates: [HealthNotification], night: Int,
+                                     lastNotifiedNight: [HealthNotification: Int]) -> [HealthNotification] {
+        candidates.filter { n in
+            guard let last = lastNotifiedNight[n] else { return true }
+            return night > last
+        }
     }
 }
