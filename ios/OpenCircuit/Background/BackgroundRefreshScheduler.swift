@@ -28,11 +28,27 @@ struct BackgroundRefreshScheduler {
 
     private let scheduler: BGTaskScheduling
     private let now: () -> Date
+    private let window: (Date) -> DateInterval?
 
     init(scheduler: BGTaskScheduling = BGTaskScheduler.shared,
-         now: @escaping () -> Date = Date.init) {
+         now: @escaping () -> Date = Date.init,
+         window: @escaping (Date) -> DateInterval? = BackgroundRefreshScheduler.defaultWindow) {
         self.scheduler = scheduler
         self.now = now
+        self.window = window
+    }
+
+    /// Tonight's (or the in-progress) sleep window from the manual/default schedule
+    /// (`SleepScheduleDefaults`) — the same fallback `RingSession.isInSleepWindow` uses before
+    /// its async learned-window resolution. A rough window is fine: `earliestBeginDate` is only
+    /// a lower bound. Injectable so tests stay deterministic.
+    static func defaultWindow(now: Date) -> DateInterval? {
+        let defaults = UserDefaults.standard
+        SleepScheduleDefaults.register(defaults)
+        return BackgroundSyncPolicy.relevantWindow(
+            now: now,
+            bedMinutes: defaults.integer(forKey: SleepScheduleDefaults.bedMinutes),
+            wakeMinutes: defaults.integer(forKey: SleepScheduleDefaults.wakeMinutes))
     }
 
     @discardableResult
@@ -71,19 +87,10 @@ struct BackgroundRefreshScheduler {
 
     /// Aim the request at the moment it's worth granting (#119): the normal interval by day, but
     /// once bedtime is near (or in progress) the coming morning instead — an in-window grant does
-    /// no drain (overnight-quiet gate) and a wasted run deprioritizes the next. The window comes
-    /// from the manual/default schedule (`SleepScheduleDefaults`) — the same fallback
-    /// `RingSession.isInSleepWindow` uses before its async learned-window resolution; a rough
-    /// window is fine here because `earliestBeginDate` is only a lower bound.
+    /// no drain (overnight-quiet gate) and a wasted run deprioritizes the next.
     private func aimedDate(fallbackInterval: TimeInterval) -> Date {
-        let defaults = UserDefaults.standard
-        SleepScheduleDefaults.register(defaults)
-        let window = BackgroundSyncPolicy.relevantWindow(
-            now: now(),
-            bedMinutes: defaults.integer(forKey: SleepScheduleDefaults.bedMinutes),
-            wakeMinutes: defaults.integer(forKey: SleepScheduleDefaults.wakeMinutes))
-        return BackgroundSyncPolicy.aimedFireDate(now: now(), sleepWindow: window,
-                                                  fallbackInterval: fallbackInterval)
+        BackgroundSyncPolicy.aimedFireDate(now: now(), sleepWindow: window(now()),
+                                           fallbackInterval: fallbackInterval)
     }
 
     func schedule() {

@@ -697,6 +697,10 @@ final class RingSession: NSObject {
         ringLog.notice("sync: periodic history drain (\(night ? "night?!" : "daytime / wake catch-up", privacy: .public), trigger=\(trigger ?? "keepalive", privacy: .public))")
         pendingDrainTrigger = trigger
         syncHistory()
+        // Never leave the trigger dangling: if syncHistory declined after all (its gates re-check
+        // the same state, so today this can't diverge — this guards future gate changes), a LATER
+        // unrelated drain must not inherit this wake's attribution.
+        if syncTask == nil { pendingDrainTrigger = nil; return false }
         return true
     }
 
@@ -710,7 +714,15 @@ final class RingSession: NSObject {
     /// regardless).
     private func maybeDrainOnBackgroundWake(trigger: String) {
         guard UIApplication.shared.applicationState != .active else { return }
-        evaluatePeriodicDrain(trigger: trigger)
+        // Refresh the night window BEFORE the gate check (self-throttled to ≤ every 30 min, so
+        // usually instant). The keepalive loop always refreshes before evaluating; this path must
+        // too — on the first wake after a long suspension the cached `nightWindow` can be hours
+        // stale, and evaluating against yesterday's window could drain INSIDE tonight's (#111).
+        Task { [weak self] in
+            guard let self else { return }
+            await self.refreshNightWindowIfNeeded()
+            self.evaluatePeriodicDrain(trigger: trigger)
+        }
     }
 
     /// UserDefaults key for the battery-saver toggle — stretches the idle keepalive cadence (#31).

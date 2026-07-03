@@ -30,7 +30,9 @@ struct ObservabilityStore {
     init(_ defaults: UserDefaults = .standard) { self.defaults = defaults }
 
     /// Keep the last N outcomes (newest survive — see `BoundedLog`). Small: this is a debug aid.
-    static let logLimit = 40
+    /// Sized for the wake-driven world (#119): hourly `.cbWake` records ≈ 16/day, and the log
+    /// must still cover a few nights back for "did last night sync?" diagnostics.
+    static let logLimit = 80
 
     private enum Key {
         static let lastSync = "obs.lastSuccessfulSync"
