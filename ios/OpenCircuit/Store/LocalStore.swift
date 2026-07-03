@@ -708,6 +708,18 @@ struct LocalStore {
         return max(row.steps - row.healthWrittenSteps, 0)
     }
 
+    /// Pending step delta plus the most recent ring-step observation timestamp. HealthKit step
+    /// samples should use a narrow observation window, not an all-day range, otherwise Apple
+    /// Health's source-priority handling can let OpenCircuit shadow Watch/iPhone steps all day.
+    func pendingStepWrite(day: Date = Date()) throws -> (delta: Int, observedAt: Date)? {
+        let dayStart = Calendar.current.startOfDay(for: day)
+        let descriptor = FetchDescriptor<StoredDaily>(predicate: #Predicate { $0.day == dayStart })
+        guard let row = try? context.fetch(descriptor).first else { return nil }
+        let delta = max(row.steps - row.healthWrittenSteps, 0)
+        guard delta > 0 else { return nil }
+        return (delta, row.updatedAt)
+    }
+
     /// Record that `delta` more of today's steps are now reflected in Apple Health. Advancing
     /// by the delta just written (rather than to an external total) keeps the watermark exactly
     /// in step with what was pushed, so the next `pendingStepDelta` is correct.
