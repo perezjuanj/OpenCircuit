@@ -1266,8 +1266,11 @@ struct CaloriesCardView: View {
     init() {
         let hr = MetricKind.heartRate.rawValue
         let dayStart = Calendar.current.startOfDay(for: Date())
+        // Match GoalsCardView's HR query exactly: same start-of-day lower bound AND the `value > 0`
+        // guard, so a stray 0-bpm sample can't skew the active-calorie estimate and the two cards
+        // read the same today's-HR set.
         _hrSamples = Query(
-            filter: #Predicate { $0.kindRaw == hr && $0.start >= dayStart },
+            filter: #Predicate { $0.kindRaw == hr && $0.start >= dayStart && $0.value > 0 },
             sort: \.start)
         _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
     }

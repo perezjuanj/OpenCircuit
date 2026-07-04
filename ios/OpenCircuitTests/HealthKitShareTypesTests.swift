@@ -63,15 +63,30 @@ final class HealthKitShareTypesTests: XCTestCase {
         XCTAssertEqual(defaults.double(forKey: HealthKitWriter.workoutActiveKcalKey), 30)
     }
 
-    func testDailyActiveEnergyNetsWorkoutCaloriesOnlyFromHRSide() {
+    func testDailyActiveEnergyNetsWorkoutCaloriesFromChosenDailyEstimate() {
+        // HR channel dominates → credit nets the HR-derived daily estimate.
         XCTAssertEqual(
             HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 300, stepKcal: 80, workoutActiveKcal: 125),
             175,
             accuracy: 0.001
         )
+        // HR channel dominates but the workout kcal exceeds it → clamp at 0 (never negative).
         XCTAssertEqual(
             HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 100, stepKcal: 80, workoutActiveKcal: 125),
+            0,
+            accuracy: 0.001
+        )
+        // Step channel dominates (indoor/treadmill: steps counted, HR sparse) → credit STILL nets
+        // the step-derived estimate. The old "HR side only" netting left this double-counted.
+        XCTAssertEqual(
+            HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 50, stepKcal: 200, workoutActiveKcal: 120),
             80,
+            accuracy: 0.001
+        )
+        // No workout → the plain daily estimate (larger of the two channels) passes through.
+        XCTAssertEqual(
+            HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 90, stepKcal: 140, workoutActiveKcal: 0),
+            140,
             accuracy: 0.001
         )
     }
