@@ -151,4 +151,80 @@ final class SleepDetectionTests: XCTestCase {
         XCTAssertEqual(ActivityPeriod.detectFromMotion(motion, temperatureSamples: [], heartRateSamples: hr).first?.activity,
                        .sleep, "too few HR readings → gate stays out, block remains sleep")
     }
+
+    // MARK: Sleep-vitals rescue (moving-but-asleep morning) — the SYMMETRIC counterpart to the HR gate.
+
+    /// A restless morning (motion spikes so the motion detector scores it `.active`) while the sleeper
+    /// is still down — HR near the night's floor and the ring still emitting sleep-vitals (HRV). This is
+    /// the 2026-07-04 Gen-2 night, where motion cut a real 7h32m night at the first stir (06:48).
+    private func spikyMotion(_ startMin: Int, _ endMin: Int) -> [MotionSample] {
+        // Alternate near-still and a big spike every 5 min so the rolling p10 floor stays low and the
+        // burst reads as movement → the whole stretch classifies `.active` motion-only.
+        stride(from: startMin, to: endMin, by: 5).enumerated().map { i, m in
+            MotionSample(time: base.addingTimeInterval(Double(m) * 60), movement: i % 2 == 0 ? 2 : 260)
+        }
+    }
+    private func hrvTimes(_ startMin: Int, _ endMin: Int) -> [Date] {
+        stride(from: startMin, to: endMin, by: 5).map { base.addingTimeInterval(Double($0) * 60) }
+    }
+    private func lastSleepEnd(_ periods: [ActivityPeriod]) -> Date? {
+        periods.filter { $0.activity == .sleep }.map(\.end).max()
+    }
+
+    /// The fix: a still low-HR night followed by a restless-but-asleep morning. Motion-only cuts the
+    /// night at the first stir; with sleep-vitals coverage the tail extends through the morning.
+    func testSleepVitalsRescueExtendsMovingButAsleepMorning() {
+        let motion = stillMotion(0, 360) + spikyMotion(360, 480)
+        let hr = hrSeries(0, 480, bpm: 55)                     // low all night incl. the restless morning
+        let hrv = hrvTimes(0, 470)                             // ring still measuring sleep vitals to ~470
+
+        let motionOnly = ActivityPeriod.detectFromMotion(motion, temperatureSamples: [], heartRateSamples: hr)
+        let cutEnd = lastSleepEnd(motionOnly)!
+        XCTAssertLessThan(cutEnd.timeIntervalSince(base) / 60, 380,
+                          "motion-only cuts the night at the first morning stir (~360)")
+
+        let rescued = ActivityPeriod.detectFromMotion(motion, temperatureSamples: [],
+                                                      heartRateSamples: hr, sleepVitalTimes: hrv)
+        let rescuedEnd = lastSleepEnd(rescued)!
+        XCTAssertGreaterThan(rescuedEnd.timeIntervalSince(base) / 60, 450,
+                             "sleep-vitals rescue extends the night's tail through the restless morning")
+    }
+
+    /// Guard: a genuine morning WAKE (motion + HR climbs above the sleeping floor + margin) is NOT
+    /// rescued — the HR gate on the rescue keeps it from swallowing real wakefulness.
+    func testSleepVitalsRescueDoesNotRescueElevatedHRWake() {
+        let motion = stillMotion(0, 360) + spikyMotion(360, 480)
+        let hr = hrSeries(0, 360, bpm: 55) + hrSeries(360, 480, bpm: 95)   // awake HR after 360
+        let hrv = hrvTimes(0, 470)
+
+        let rescued = ActivityPeriod.detectFromMotion(motion, temperatureSamples: [],
+                                                      heartRateSamples: hr, sleepVitalTimes: hrv)
+        let end = lastSleepEnd(rescued)!
+        XCTAssertLessThan(end.timeIntervalSince(base) / 60, 380,
+                          "elevated-HR morning is real wake, not rescued sleep")
+    }
+
+    /// Guard: no sleep-vitals coverage in the morning (ring stopped emitting HRV = awake) → no rescue,
+    /// so a low-HR-but-awake lie-in isn't over-counted as sleep on motion+HR alone.
+    func testSleepVitalsRescueRequiresSleepVitalsCoverage() {
+        let motion = stillMotion(0, 360) + spikyMotion(360, 480)
+        let hr = hrSeries(0, 480, bpm: 55)
+        let hrv = hrvTimes(0, 360)     // sleep vitals STOP at the stir — nothing to extend through
+
+        let rescued = ActivityPeriod.detectFromMotion(motion, temperatureSamples: [],
+                                                      heartRateSamples: hr, sleepVitalTimes: hrv)
+        let end = lastSleepEnd(rescued)!
+        XCTAssertLessThan(end.timeIntervalSince(base) / 60, 380,
+                          "without sleep-vitals coverage the morning stays active (no HR-only over-count)")
+    }
+
+    /// No regression: with no sleep-vitals times passed, detection is identical to before the rescue.
+    func testSleepVitalsRescueNoOpWithoutCoverage() {
+        let motion = stillMotion(0, 300)
+        let hr = hrSeries(0, 300, bpm: 60)
+        XCTAssertEqual(
+            ActivityPeriod.detectFromMotion(motion, temperatureSamples: [], heartRateSamples: hr, sleepVitalTimes: []),
+            ActivityPeriod.detectFromMotion(motion, temperatureSamples: [], heartRateSamples: hr),
+            "no sleep-vitals coverage → identical to the pre-rescue result")
+    }
 }
