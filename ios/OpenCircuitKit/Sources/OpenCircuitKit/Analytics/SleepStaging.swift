@@ -393,18 +393,30 @@ public enum SleepStaging {
         let sleepFloor = percentile(hr.sorted(), tuning.sleepFloorPercentile)
         let wakeThreshold = sleepFloor + tuning.wakeHRMarginBPM
         let smHR = rollingMedian(hr, half: tuning.hrWakeHalfWindow)
-        // MOTION-awake, softened for MOVING-BUT-ASLEEP epochs (the same signal `sleepVitalsRescue` uses
-        // to keep such a morning IN the night — without this, staging would re-trim the rescued tail
-        // right back off via `sleepSpan`). An epoch is NOT marked awake on motion alone when the ring is
-        // still emitting sleep-vitals nearby (windowed HRV coverage, robust to the sleepV/activity epoch
-        // interleave) AND its HR is below the wake threshold — i.e. the device is measuring sleep and the
-        // heart agrees. Genuine wake is unaffected: the HR term below still fires on elevated HR, and the
-        // sleep-vitals stream thins at true wake so the coverage drops. Still-night motion is < threshold,
-        // so this is a no-op there.
+        // MOTION-awake, softened for MOVING-BUT-ASLEEP epochs — but ONLY across the MORNING TAIL, the
+        // trailing stretch after the last sustained asleep run. This mirrors the coarse `sleepVitalsRescue`,
+        // which only ever extends the block's END forward: the softening exists so staging doesn't re-trim
+        // the rescued pre-wake morning back off via `sleepSpan`. Scoping it to the tail is what keeps a
+        // genuine mid-night WASO (an interior awakening with sustained sleep AFTER it) from being absorbed
+        // as sleep — only the morning is rescued, not every restless mid-night.
+        let motionAwakeStrict = rows.map { $0.motion > tuning.awakeMotion }
+        // Tail boundary from the STRICT (un-softened) span: the epoch just after the end of the last
+        // sustained asleep run. `motionAwakeVitalsHalfWindow <= 0` disables the rescue entirely (tail =
+        // end of night → no epoch is softened → byte-identical to the pre-rescue staging).
+        let awakeStrict = rows.indices.map { smHR[$0] >= wakeThreshold || motionAwakeStrict[$0] }
+        let tailStart = tuning.motionAwakeVitalsHalfWindow > 0
+            ? (sleepSpan(awakeStrict, sustain: tuning.onsetSustainEpochs).map { $0.1 + 1 } ?? rows.count)
+            : rows.count
         let vitalsNearby = windowedVitalsCoverage(times: rows.map(\.time), hasVitals: rows.map(\.vitals),
                                                   halfWindow: tuning.motionAwakeVitalsHalfWindow)
         let motionAwake = rows.indices.map { i in
-            rows[i].motion > tuning.awakeMotion && !(vitalsNearby[i] && smHR[i] < wakeThreshold)
+            // Soften only within the trailing morning tail: the ring is still emitting sleep-vitals nearby
+            // (windowed HRV coverage, robust to the sleepV/activity epoch interleave) AND HR is below the
+            // wake threshold — device measuring sleep, heart agreeing. Genuine wake is unaffected: the HR
+            // term below still fires on elevated HR, and sleep-vitals thin at true wake. Still nights and
+            // interior WASO are untouched (motion < threshold, or i < tailStart).
+            let softenTail = i >= tailStart && vitalsNearby[i] && smHR[i] < wakeThreshold
+            return motionAwakeStrict[i] && !softenTail
         }
         var awake = rows.indices.map { smHR[$0] >= wakeThreshold || motionAwake[$0] }
         // Erode HR-only awake runs shorter than the floor so a transient REM-ish HR bump

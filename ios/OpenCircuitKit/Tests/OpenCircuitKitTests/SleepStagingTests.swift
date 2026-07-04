@@ -103,6 +103,43 @@ final class SleepStagingTests: XCTestCase {
         XCTAssertLessThan(asleepNoVitals, 380, "without sleep-vitals coverage the restless morning stays awake")
     }
 
+    /// A 6h still night with a ~40-min restless-but-low-HR episode in the MIDDLE (sustained sleep on
+    /// BOTH sides) — the same spiky-motion + lingering-sleep-vitals shape as `stillThenRestlessMorning`,
+    /// only its POSITION differs. A genuine mid-night WASO the rescue must NOT absorb.
+    private func stillWithMidNightRestless(episodeHR: UInt8, episodeVitals: Bool) -> [BulkRecord] {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 10_000
+        for _ in 0..<72 { recs.append(vrec(c, hr: 55, hrv: 60, motion: 1)); c += step }   // 3h still sleep
+        for i in 0..<16 {                                                                   // ~40-min episode
+            if i % 2 == 0 { recs.append(vrec(c, hr: episodeHR, hrv: episodeVitals ? 60 : 0, motion: 2)) }
+            else          { recs.append(arec(c, motion: 60)) }                              // spiky motion
+            c += step
+        }
+        for _ in 0..<72 { recs.append(vrec(c, hr: 55, hrv: 60, motion: 1)); c += step }   // 3h still sleep
+        return recs
+    }
+
+    /// The reviewer's watch-item: the morning-tail rescue is SCOPED to the trailing tail, so a mid-night
+    /// restless-but-low-HR episode surrounded by sustained sleep is still detected as WASO — not absorbed
+    /// as sleep the way an un-scoped (whole-night) softening would. The proof is positional: the mid-night
+    /// episode is IMMUNE to the softening knob (halfWindow 3 vs 0 stage identically), whereas the SAME
+    /// shape at the morning tail IS rescued by it — so the softening still works, it just no longer reaches
+    /// interior awakenings.
+    func testMidNightWASOIsImmuneToTheRescueButTheMorningTailIsNot() {
+        func asleep(_ recs: [BulkRecord], halfWindow: Int) -> Double {
+            asleepMinutes(SleepStaging.classify(
+                from: BulkSleep.latestNightRecords(from: recs),
+                tuning: .init(motionAwakeVitalsHalfWindow: halfWindow)))
+        }
+        let mid = stillWithMidNightRestless(episodeHR: 55, episodeVitals: true)
+        XCTAssertEqual(asleep(mid, halfWindow: 3), asleep(mid, halfWindow: 0), accuracy: 5,
+                       "a mid-night WASO is interior, so the trailing-tail rescue must not change it")
+
+        let morning = stillThenRestlessMorning(morningHR: 55, morningVitals: true)
+        XCTAssertGreaterThan(asleep(morning, halfWindow: 3), asleep(morning, halfWindow: 0) + 20,
+                             "the morning tail must still be rescued when the softening is on")
+    }
+
     // MARK: - Single-stage recovery
 
     func testStillFlatLowHRIsMostlyDeep() {
