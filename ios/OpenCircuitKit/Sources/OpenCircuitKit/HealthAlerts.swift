@@ -150,6 +150,12 @@ public struct HealthAlertHit: Equatable, Sendable {
     }
 }
 
+// NOTE: HR alerts intentionally have NO device-timestamp "freshness" gate. All-day HR reaches the
+// phone via ~hourly background drains whose device timestamps are routinely 30–60+ min old on
+// arrival, evaluated ONCE right after each drain; a freshness window would permanently silence the
+// older half of every drain. De-dupe is done here by the per-notification `lastFired` filter in
+// `evaluate` (a crossing fires once on first sight and never replays), not by the sample's age.
+
 public enum HealthAlertEvaluator {
 
     /// The worst (highest) HR reading at/above the threshold, or nil. "High heart rate detected at
@@ -190,16 +196,23 @@ public enum HealthAlertEvaluator {
     /// Evaluate all three #73 rules and return the hits (disabled rules are skipped). `inactiveHR`
     /// is the HR series for the sustained-while-inactive rule; the instantaneous rules use `hr`.
     public static func evaluate(hr: [HRSample], spo2: [SpO2Reading], inactiveHR: [HRSample],
-                                thresholds: HealthAlertThresholds) -> [HealthAlertHit] {
+                                thresholds: HealthAlertThresholds,
+                                lastFired: [HealthNotification: Date] = [:]) -> [HealthAlertHit] {
         var hits: [HealthAlertHit] = []
-        if thresholds.highHREnabled, let s = highHR(hr, thresholdBpm: thresholds.highHRBpm) {
+        let freshHR = hr.filter { $0.start > (lastFired[.highHR] ?? .distantPast) }
+        let freshSpO2 = spo2.filter { $0.time > (lastFired[.lowSpO2] ?? .distantPast) }
+        let freshInactiveHR = inactiveHR.filter {
+            $0.start > (lastFired[.elevatedHRInactive] ?? .distantPast)
+        }
+
+        if thresholds.highHREnabled, let s = highHR(freshHR, thresholdBpm: thresholds.highHRBpm) {
             hits.append(HealthAlertHit(notification: .highHR, value: Double(s.bpm), time: s.start))
         }
-        if thresholds.lowSpO2Enabled, let s = lowSpO2(spo2, thresholdPercent: thresholds.lowSpO2Percent) {
+        if thresholds.lowSpO2Enabled, let s = lowSpO2(freshSpO2, thresholdPercent: thresholds.lowSpO2Percent) {
             hits.append(HealthAlertHit(notification: .lowSpO2, value: Double(s.percent), time: s.time))
         }
         if thresholds.elevatedHREnabled,
-           let s = elevatedHRInactive(inactiveHR, thresholdBpm: thresholds.elevatedHRBpm,
+           let s = elevatedHRInactive(freshInactiveHR, thresholdBpm: thresholds.elevatedHRBpm,
                                       minDuration: thresholds.elevatedSustained,
                                       maxGap: thresholds.elevatedMaxGap) {
             hits.append(HealthAlertHit(notification: .elevatedHRInactive, value: Double(s.bpm), time: s.start))

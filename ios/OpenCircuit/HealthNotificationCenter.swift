@@ -170,11 +170,14 @@ struct HealthNotificationCenter {
     var gate = NotificationGate()
     private var center: UNUserNotificationCenter { .current() }
 
-    /// How far back instantaneous HR/SpO2 alerts (#73) look for a threshold crossing. Covers an
-    /// overnight sync that finishes in the morning; the de-dupe backoff stops it from re-nagging.
+    /// How far back the instantaneous HR / SpO2 alerts (#73) look for a threshold crossing. Wide on
+    /// purpose: all-day HR (and overnight SpO2) reaches the phone via ~hourly background drains whose
+    /// device timestamps are routinely 30–60+ min old on arrival, and the phone evaluates ONCE right
+    /// after each drain. A narrower device-timestamp "freshness" fetch window would permanently
+    /// silence the older half of every drain — the legitimate background alerts we most need to
+    /// deliver. De-dupe is NOT done here by sample age: the evaluator's per-notification `lastFired`
+    /// filter is the sole guard that stops an already-alerted crossing from replaying on later syncs.
     static let instantLookback: TimeInterval = 12 * 3600
-    /// Window for the sustained-elevated-HR-while-inactive rule.
-    static let inactiveLookback: TimeInterval = 24 * 3600
 
     /// Evaluate ALL health-alert conditions (#73 + #85) from the store (+ optional live session),
     /// then post a debounced notification for each survivor. Safe to call liberally — a no-op when
@@ -186,34 +189,35 @@ struct HealthNotificationCenter {
         // --- #73: high HR / low SpO2 / elevated-HR-while-inactive --------------------------------
         let thresholds = HealthAlertDefaults.thresholds()
         let instantSince = now.addingTimeInterval(-Self.instantLookback)
-        let inactiveSince = now.addingTimeInterval(-Self.inactiveLookback)
         let lastFired = store.lastFired()
-        // Only consider HR/SpO2 readings NEWER than the last time that notification fired, so a
-        // single morning spike alerts ONCE rather than re-firing every backoff window (the 2h
-        // backoff is shorter than the 12h lookback, so without this the worst reading in the
-        // window would keep being re-returned and re-announced for hours). (#73 fix)
-        let hrSince = max(instantSince, lastFired[.highHR] ?? .distantPast)
-        let spo2Since = max(instantSince, lastFired[.lowSpO2] ?? .distantPast)
-
-        // Stored readings + the just-synced in-memory batch (so a fresh sync is reflected at once).
+        // Fetch the whole recent window (stored + the just-synced in-memory batch) and let the pure
+        // evaluator's per-notification `lastFired` filter do the de-dupe. HR is fetched over the SAME
+        // wide window as SpO2 — never a 30-min device-timestamp freshness window — so a crossing that
+        // rode in on the older half of an hourly background drain (timestamps 30–60+ min old) still
+        // alerts once. The future guard (`start <= now`) is applied uniformly to HR and SpO2.
         var hr = ((try? localStore.recentSamples(kind: .heartRate, since: instantSince)) ?? [])
-            .filter { $0.start > hrSince }
+            .filter { $0.start <= now }
             .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
         var spo2 = ((try? localStore.recentSamples(kind: .spo2, since: instantSince)) ?? [])
-            .filter { $0.start > spo2Since }
+            .filter { $0.start <= now }
             .map { SpO2Reading(percent: Int(($0.value * 100).rounded()), time: $0.start) }
-        let inactiveHR = ((try? localStore.recentSamples(kind: .heartRate, since: inactiveSince)) ?? [])
-            .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
 
         if let synced = session?.historySamples {
-            hr += synced.filter { $0.kind == .heartRate && $0.value > 0 && $0.start > hrSince }
+            hr += synced.filter {
+                $0.kind == .heartRate && $0.value > 0 && $0.start >= instantSince && $0.start <= now
+            }
                 .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-            spo2 += synced.filter { $0.kind == .spo2 && $0.value > 0 && $0.start > spo2Since }
+            spo2 += synced.filter {
+                $0.kind == .spo2 && $0.value > 0 && $0.start >= instantSince && $0.start <= now
+            }
                 .map { SpO2Reading(percent: Int(($0.value * 100).rounded()), time: $0.start) }
         }
 
-        for hit in HealthAlertEvaluator.evaluate(hr: hr, spo2: spo2, inactiveHR: inactiveHR,
-                                                 thresholds: thresholds) {
+        // The sustained-while-inactive rule reads the same HR series over the same wide window; its
+        // own `lastFired` filter inside the evaluator gives it once-per-event de-dupe.
+        for hit in HealthAlertEvaluator.evaluate(hr: hr, spo2: spo2, inactiveHR: hr,
+                                                 thresholds: thresholds,
+                                                 lastFired: lastFired) {
             candidates.append(hit.notification)
             hitByNotif[hit.notification] = hit
         }
