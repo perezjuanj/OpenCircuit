@@ -1414,7 +1414,10 @@ final class RingSession: NSObject {
         case .ignore:
             break                // auto refresh in the same mode — don't disturb a converging read
         case .switchMode(let armDeadline):
-            setLiveMode(mode)
+            // `armDeadline` is set iff the switch is user-initiated, so it doubles as the stale-clear
+            // signal: a user switch drops the target mode's prior lock (#125), an auto switch keeps
+            // its last value on screen until the new one re-locks.
+            setLiveMode(mode, clearStaleValue: armDeadline)
             // `userMeasuring` is already true when the switch is user-initiated (a user tap only
             // reaches here having skipped the takeover branch, which falls through only when a user
             // measurement was already in flight). Just re-arm the deadline for the new mode (#125).
@@ -1499,11 +1502,23 @@ final class RingSession: NSObject {
     /// Switch live measurement between HR (`06 01 00`) and SpO2 (`06 02 00`). The ring
     /// measures one at a time; the other metric keeps its last value. No-op until the
     /// next start if not currently monitoring.
-    func setLiveMode(_ mode: LiveMode) {
+    func setLiveMode(_ mode: LiveMode, clearStaleValue: Bool = false) {
         guard liveMode != mode else { return }
         liveMode = mode
         liveHRTrend.removeAll()   // restarting the HR window
         liveHRWarmup = nil
+        if clearStaleValue {
+            // User switched INTO this mode for a fresh read — the SpO2→HR→SpO2 toggle path that
+            // `startLiveMonitoring(clearStaleValue:)` / `rearmUserMeasure` don't cover (#125). Drop
+            // the TARGET mode's prior lock so it can't masquerade as live before the ring re-enters
+            // the mode (skipping preparing/measuring) or count as a lock at the user-measure deadline
+            // — without this, an off-finger read after the toggle times out with no failure banner.
+            // Only on a user switch (`armDeadline`); auto keeps its prior value on screen.
+            switch mode {
+            case .hr:   liveHR = nil;   liveHRAt = nil
+            case .spo2: liveSpO2 = nil; liveSpO2At = nil
+            }
+        }
         userMeasureFailed = false   // mode switch = fresh start, dismiss any prior failure (#55)
         userMeasureFailedMessage = nil
         guard monitoring else { return }
