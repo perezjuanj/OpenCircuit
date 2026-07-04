@@ -53,6 +53,56 @@ final class SleepStagingTests: XCTestCase {
         return (totals[stage] ?? 0) / asleep
     }
 
+    // MARK: - Sleep-vitals rescue reaches the STAGED (summary/Health) path
+
+    /// Builds a still 6h night followed by a ~100-min restless-but-asleep morning: HR stays at the
+    /// sleeping level and the ring keeps emitting sleep-vitals, but motion spikes (a still sleep-vitals
+    /// epoch alternating with a high-motion activity epoch) so the motion detector alone scores the
+    /// morning "active". This exercises `SleepStaging.classify` — the path that feeds the summary card
+    /// and Apple Health — NOT just the coarse `detectFromMotion` layer.
+    private func stillThenRestlessMorning(morningHR: UInt8, morningVitals: Bool) -> [BulkRecord] {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 10_000
+        for _ in 0..<144 { recs.append(vrec(c, hr: 55, hrv: 60, motion: 1)); c += step }   // 6h still sleep
+        for i in 0..<40 {                                                                    // ~100-min morning
+            if i % 2 == 0 { recs.append(vrec(c, hr: morningHR, hrv: morningVitals ? 60 : 0, motion: 2)) }
+            else          { recs.append(arec(c, motion: 60)) }                               // spiky motion
+            c += step
+        }
+        return recs
+    }
+    private func asleepMinutes(_ segs: [SleepSegment]) -> Double {
+        let t = SleepStaging.stageTotals(segs)
+        return ((t[.asleepCore] ?? 0) + (t[.asleepDeep] ?? 0) + (t[.asleepREM] ?? 0)) / 60
+    }
+
+    /// The fix reaches the summary: a moving-but-asleep morning (low HR, sleep-vitals present) is
+    /// counted as sleep by the STAGED classifier, not re-trimmed back to awake-in-bed. Regression guard
+    /// for the 2026-07-04 truncated night (5h44m → real 7h32m). The 6h still block alone is ~360 min, so
+    /// asleep well past that proves the restless morning is honored end-to-end.
+    func testStagedClassifierHonorsMovingButAsleepMorning() {
+        let segs = SleepStaging.classify(from: BulkSleep.latestNightRecords(
+            from: stillThenRestlessMorning(morningHR: 55, morningVitals: true)))
+        XCTAssertGreaterThan(asleepMinutes(segs), 400,
+                             "staged summary must count the moving-but-asleep morning, not trim it off")
+    }
+
+    /// Guard: a genuine morning WAKE (HR climbs above the sleeping floor + margin) is NOT counted, even
+    /// with the same spiky motion — the staged softening is HR-gated, so it can't over-count wakefulness.
+    func testStagedClassifierDoesNotCountElevatedHRMorning() {
+        let asleepWake = asleepMinutes(SleepStaging.classify(from: BulkSleep.latestNightRecords(
+            from: stillThenRestlessMorning(morningHR: 95, morningVitals: true))))
+        XCTAssertLessThan(asleepWake, 380, "an elevated-HR (awake) morning must not be counted as sleep")
+    }
+
+    /// Guard: no sleep-vitals in the morning (ring stopped measuring = awake) → the morning is NOT
+    /// counted, so a low-HR-but-awake lie-in isn't over-counted on motion+HR alone.
+    func testStagedClassifierRequiresSleepVitalsToCountRestlessMorning() {
+        let asleepNoVitals = asleepMinutes(SleepStaging.classify(from: BulkSleep.latestNightRecords(
+            from: stillThenRestlessMorning(morningHR: 55, morningVitals: false))))
+        XCTAssertLessThan(asleepNoVitals, 380, "without sleep-vitals coverage the restless morning stays awake")
+    }
+
     // MARK: - Single-stage recovery
 
     func testStillFlatLowHRIsMostlyDeep() {
