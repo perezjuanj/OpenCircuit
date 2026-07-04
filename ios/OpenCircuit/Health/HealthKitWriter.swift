@@ -41,7 +41,7 @@ final class HealthKitWriter {
         case .temperature: id = .basalBodyTemperature
         case .respiratoryRate: id = .respiratoryRate
         case .steps: id = .stepCount
-        case .activeEnergy: return nil
+        case .activeEnergy: id = .activeEnergyBurned
         case .sleep: return nil
         // ESTIMATE — steps × RingConn's own per-step constant. See DistanceEstimate.swift (#81).
         case .distance: id = .distanceWalkingRunning
@@ -78,6 +78,7 @@ final class HealthKitWriter {
         for k in MetricKind.allCases {
             if let t = Self.quantityType(for: k) { set.insert(t) }
         }
+        set.insert(HKQuantityType(.basalEnergyBurned))
         set.insert(HKCategoryType(.sleepAnalysis))
         // Workout types (#75): HKWorkout + GPS route (workout sessions feature).
         set.insert(HKWorkoutType.workoutType())
@@ -138,14 +139,15 @@ final class HealthKitWriter {
     /// was nothing pending or share access isn't granted.
     struct FlushResult: Equatable {
         var samples = 0, sleepSegments = 0, steps = 0
-        var restingDays = 0
+        var restingDays = 0, passiveHours = 0
+        var activeKcal = 0.0
         var naps = 0
         var distanceM = 0.0         // estimated distance written (#81)
         var exerciseMinutes = 0.0   // estimated exercise minutes written (#82)
         var menstrualFlowEntries = 0  // user-logged period entries written (#78)
         var wroteAnything: Bool {
             samples > 0 || sleepSegments > 0 || steps > 0
-                || restingDays > 0 || naps > 0
+                || restingDays > 0 || passiveHours > 0 || activeKcal > 0 || naps > 0
                 || distanceM > 0 || exerciseMinutes > 0 || menstrualFlowEntries > 0
         }
     }
@@ -185,10 +187,10 @@ final class HealthKitWriter {
         // Gated by each entry's own `healthWritten` flag — independent of all other writes.
         result.menstrualFlowEntries = await flushMenstrualFlow(localStore: store)
 
-        // Profile is used for active-kcal weight + exercise-minute thresholds — resolved once here
-        // so the derived writes use the same snapshot. Body inputs come from the shared profile
-        // defaults; the ring transmits none of them. Distance (below) no longer needs it — PROTOCOL.md
-        // §5.3.1 confirms RingConn's distance derivation is a fixed per-step constant, not height/sex.
+        // Profile is used for calories + exercise-minute thresholds — resolved once here so the
+        // derived writes use the same snapshot. Body inputs come from the shared profile defaults;
+        // the ring transmits none of them. Distance (below) no longer needs it — PROTOCOL.md §5.3.1
+        // confirms RingConn's distance derivation is a fixed per-step constant, not height/sex.
         let profile = Self.storedUserProfile()
 
         // Steps + distance estimate (#81, #steps-history): write each pending TIMESTAMPED step
@@ -227,6 +229,11 @@ final class HealthKitWriter {
         // UserDefaults day-watermark, NOT the store cursor: RHR isn't a stored sample, and the
         // `hk:` cursor rows belong to the raw-sample mirror above.
         result.restingDays = await flushRestingHR(local: store, sleepSegments: sleepSegments)
+
+        // Energy: passive (hourly BMR) + active (HR-derived or steps-derived estimate).
+        // Watermark-gated (#37) and labeled as derived estimates in HealthKit metadata.
+        result.passiveHours = await flushPassiveCalories(profile: profile)
+        result.activeKcal = await flushActiveCalories(local: store, profile: profile)
 
         // Exercise minutes estimate (#82): elevated-HR minutes outside the sleep window.
         // ESTIMATE — basic 50% maxHR threshold. Full 4-level intensity follows #93 decode.
@@ -388,6 +395,10 @@ final class HealthKitWriter {
         }
     }
 
+    /// Metadata flag marking basal (passive) energy samples as a derived ESTIMATE — a BMR formula
+    /// prorated per hour, NOT a value the ring measured — so Health readers can label or filter it.
+    static let basalEnergyEstimateMetadataKey = "OpenCircuitBasalEnergyEstimated"
+
     func writePassiveCalories(profile: UserProfile, date: Date) async throws {
         let type = HKQuantityType(.basalEnergyBurned)
         let quantity = HKQuantity(
@@ -398,7 +409,9 @@ final class HealthKitWriter {
             type: type,
             quantity: quantity,
             start: date,
-            end: date.addingTimeInterval(3600)
+            end: date.addingTimeInterval(3600),
+            metadata: [Self.basalEnergyEstimateMetadataKey: true,
+                       HKMetadataKeyWasUserEntered: false]
         )
         try await store.save(sample)
     }
@@ -460,6 +473,8 @@ final class HealthKitWriter {
     // accurate measurement is kept; only the estimate is reduced for the overlapping window).
     static let workoutWalkRunDistanceDayKey    = "hk.workoutWalkRunDistance.day"
     static let workoutWalkRunDistanceMetersKey = "hk.workoutWalkRunDistance.meters"
+    static let workoutActiveKcalDayKey         = "hk.workoutActiveKcal.day"
+    static let workoutActiveKcalKey            = "hk.workoutActiveKcal.kcal"
     private static let estimateGPSCreditedDayKey    = "hk.distanceEstimate.gpsCreditedDay"
     private static let estimateGPSCreditedMetersKey = "hk.distanceEstimate.gpsCreditedMeters"
 
@@ -476,6 +491,45 @@ final class HealthKitWriter {
         total += meters
         defaults.set(today.timeIntervalSince1970, forKey: workoutWalkRunDistanceDayKey)
         defaults.set(total, forKey: workoutWalkRunDistanceMetersKey)
+    }
+
+    /// Record workout active energy that was successfully committed to HealthKit. The daily
+    /// active-energy estimate uses this to avoid double-counting workout HR that #121 now also
+    /// persists into LocalStore for Goals/Trends.
+    static func recordWorkoutActiveKcal(_ kcal: Double, day: Date = Date(),
+                                        _ defaults: UserDefaults = .standard) {
+        guard kcal > 0 else { return }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: day)
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutActiveKcalDayKey))
+        let prior = cal.startOfDay(for: storedDay) == today
+            ? defaults.double(forKey: workoutActiveKcalKey) : 0
+        defaults.set(today.timeIntervalSince1970, forKey: workoutActiveKcalDayKey)
+        defaults.set(prior + kcal, forKey: workoutActiveKcalKey)
+    }
+
+    private static func workoutActiveKcalCredited(day today: Date,
+                                                  _ defaults: UserDefaults = .standard) -> Double {
+        let cal = Calendar.current
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutActiveKcalDayKey))
+        return cal.startOfDay(for: storedDay) == today
+            ? defaults.double(forKey: workoutActiveKcalKey) : 0
+    }
+
+    /// Net a completed workout's committed active energy out of today's daily active-energy
+    /// estimate. The daily estimate is `max(hrKcal, stepKcal)` — whichever channel is larger for
+    /// the day — and the workout ALREADY wrote its own `activeEnergyBurned` sample to Health. So we
+    /// subtract the committed workout kcal from the CHOSEN daily estimate, not from one channel:
+    ///   • HR-locked outdoor run → HR channel dominates → credit nets the HR side,
+    ///   • indoor/treadmill (steps counted, HR sparse) → step channel dominates → credit STILL nets
+    ///     (the old "HR side only" netting left indoor sessions double-counted — reviewer #1),
+    ///   • distance-derived workout (HR never locked) → credit nets whichever channel is chosen,
+    ///     never over-subtracting a channel that never held the workout (reviewer #2).
+    /// Clamped at 0 so a workout larger than the whole-day estimate can't push it negative.
+    static func netDailyActiveKcalEstimate(hrKcal: Double, stepKcal: Double,
+                                           workoutActiveKcal: Double) -> Double {
+        let dailyEstimate = max(max(hrKcal, 0), max(stepKcal, 0))
+        return max(0, dailyEstimate - max(workoutActiveKcal, 0))
     }
 
     /// Reduce a raw steps×stride distance estimate by however much workout GPS walk/run distance
@@ -508,25 +562,6 @@ final class HealthKitWriter {
         defaults.set(credited + reduction, forKey: estimateGPSCreditedMetersKey)
     }
 
-    /// Reduce a raw step/distance active-kcal estimate by the active-energy a recorded foot-based
-    /// workout already contributed to Health today, expressed in the SAME step/distance economy as
-    /// `raw`. We net the workout's WALK/RUN DISTANCE energy (reusing the committed `workoutWalkRun
-    /// Distance` accumulator), NOT its full intensity kcal — so:
-    ///   • a walk nets out exactly its own step energy (no double count),
-    ///   • cycling (records no walk/run distance) never erases genuine walking energy,
-    ///   • an intense run's HR-bonus kcal isn't over-subtracted from the daily step estimate.
-    /// Residual note: the daily estimate is written against a monotonic per-day accumulator
-    /// (`writtenKcal`), so if step energy is banked BEFORE a same-day workout commits its distance,
-    /// a small pre-workout overlap can't be retracted — a bounded over-count on a labeled estimate.
-    private static func netActiveKcalEstimate(_ raw: Double, profile: UserProfile, day today: Date,
-                                              _ defaults: UserDefaults = .standard) -> Double {
-        let cal = Calendar.current
-        let wDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutWalkRunDistanceDayKey))
-        let wMeters = cal.startOfDay(for: wDay) == today
-            ? defaults.double(forKey: workoutWalkRunDistanceMetersKey) : 0
-        let workoutStepEnergy = Calories.activeKcalFromDistance(meters: wMeters, profile: profile)
-        return max(0, raw - workoutStepEnergy)
-    }
     /// A day's resting HR is finalized once the day is ~half over, so a pre-dawn flush can't
     /// freeze a partial-night value, yet last night's RHR still lands the same day (by midday).
     private static let restingFinalizationDelay: TimeInterval = 12 * 3600
@@ -610,15 +645,21 @@ final class HealthKitWriter {
         let maxHR = max(220 - profile.age, 1)
         let hrKcal = hrSamples.isEmpty ? 0 : Calories.activeKcal(hrSamples: hrSamples, maxHR: maxHR)
 
-        // Step/distance-derived estimate — works even with no HR — NETTED against any in-app
-        // workout's own active-energy already written to Health today (HealthKit SUMS active
-        // energy, so the recorded walk/run must not be counted twice). Mirrors the steps×stride
-        // distance netting. Day total minus workout total ⇒ stable, no separate credit ledger.
+        // Step/distance-derived estimate — works even with no HR. The workout's foot-distance is
+        // netted out of the daily estimate below (via the committed workout kcal), so no per-channel
+        // distance netting is needed here.
         let steps = (try? local.todaySteps(day: today)) ?? 0
-        let stepKcal = Self.netActiveKcalEstimate(
-            Calories.activeKcalFromSteps(steps: steps, profile: profile), profile: profile, day: today)
+        let stepKcal = Calories.activeKcalFromSteps(steps: steps, profile: profile)
 
-        let total = Swift.max(hrKcal, stepKcal)
+        // #121 started persisting workout HR into LocalStore for Goals/Trends, and workouts also
+        // write their own activeEnergyBurned sample. Subtract the committed workout active kcal from
+        // whichever daily channel (HR or step) is chosen, so both HR-locked and indoor/step-only
+        // workouts are netted exactly once (see `netDailyActiveKcalEstimate`).
+        let total = Self.netDailyActiveKcalEstimate(
+            hrKcal: hrKcal,
+            stepKcal: stepKcal,
+            workoutActiveKcal: Self.workoutActiveKcalCredited(day: today)
+        )
         let delta = total - written
         guard delta >= 1.0 else {  // ignore sub-kcal churn; still persist the (reset) day marker
             defaults.set(today.timeIntervalSince1970, forKey: Self.activeDayKey)

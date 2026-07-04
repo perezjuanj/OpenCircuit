@@ -54,6 +54,7 @@ struct UserProfileSettingsView: View {
     // Daily goals (#77). Keys/defaults shared with GoalsCardView via `GoalDefaults`.
     @AppStorage(GoalDefaults.workdaySteps)    private var workdaySteps    = GoalDefaults.defaultWorkdaySteps
     @AppStorage(GoalDefaults.weekendSteps)    private var weekendSteps    = GoalDefaults.defaultWeekendSteps
+    @AppStorage(GoalDefaults.activeKcal)      private var activeKcalGoal  = GoalDefaults.defaultActiveKcal
     @AppStorage(GoalDefaults.activityMinutes) private var actMinGoal      = GoalDefaults.defaultActivityMinutes
     @AppStorage(GoalDefaults.workdaySleepMin) private var workdaySleepMin = GoalDefaults.defaultWorkdaySleepMin
     @AppStorage(GoalDefaults.weekendSleepMin) private var weekendSleepMin = GoalDefaults.defaultWeekendSleepMin
@@ -267,6 +268,9 @@ struct UserProfileSettingsView: View {
                 Stepper(value: $weekendSteps, in: 1_000...30_000, step: 500) {
                     LabeledContent("Weekend steps", value: weekendSteps.formatted())
                 }
+                Stepper(value: $activeKcalGoal, in: 50...1_500, step: 25) {
+                    LabeledContent("Active calories", value: "\(Int(activeKcalGoal)) kcal")
+                }
                 Stepper(value: $actMinGoal, in: 5...180, step: 5) {
                     LabeledContent("Exercise minutes", value: "\(Int(actMinGoal)) min")
                 }
@@ -276,7 +280,7 @@ struct UserProfileSettingsView: View {
                 Stepper(value: $weekendSleepMin, in: 240...600, step: 15) {
                     LabeledContent("Weekend sleep", value: formatGoalSleep(weekendSleepMin))
                 }
-                Text("Progress rings on the dashboard show today's goal vs. actual. Exercise minutes = elevated-HR minutes (basic threshold estimate).")
+                Text("Progress rings on the dashboard show today's goal vs. actual. Exercise minutes = elevated-HR minutes (basic threshold estimate), independent of steps/calories.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

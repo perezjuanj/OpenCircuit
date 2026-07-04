@@ -37,4 +37,57 @@ final class HealthKitShareTypesTests: XCTestCase {
             XCTAssertNotNil(HealthKitWriter.quantityType(for: kind), "\(kind) should be writable")
         }
     }
+
+    func testEnergyWritesCountAsFlushOutput() {
+        var basal = HealthKitWriter.FlushResult()
+        basal.passiveHours = 1
+        XCTAssertTrue(basal.wroteAnything)
+
+        var active = HealthKitWriter.FlushResult()
+        active.activeKcal = 12.5
+        XCTAssertTrue(active.wroteAnything)
+    }
+
+    func testWorkoutActiveKcalLedgerIsDayScopedAndAccumulates() {
+        let suite = "HealthKitShareTypesTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let day = Date(timeIntervalSince1970: 10_000)
+        HealthKitWriter.recordWorkoutActiveKcal(80, day: day, defaults)
+        HealthKitWriter.recordWorkoutActiveKcal(20, day: day.addingTimeInterval(60), defaults)
+
+        XCTAssertEqual(defaults.double(forKey: HealthKitWriter.workoutActiveKcalKey), 100)
+
+        HealthKitWriter.recordWorkoutActiveKcal(30, day: day.addingTimeInterval(86_400), defaults)
+        XCTAssertEqual(defaults.double(forKey: HealthKitWriter.workoutActiveKcalKey), 30)
+    }
+
+    func testDailyActiveEnergyNetsWorkoutCaloriesFromChosenDailyEstimate() {
+        // HR channel dominates → credit nets the HR-derived daily estimate.
+        XCTAssertEqual(
+            HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 300, stepKcal: 80, workoutActiveKcal: 125),
+            175,
+            accuracy: 0.001
+        )
+        // HR channel dominates but the workout kcal exceeds it → clamp at 0 (never negative).
+        XCTAssertEqual(
+            HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 100, stepKcal: 80, workoutActiveKcal: 125),
+            0,
+            accuracy: 0.001
+        )
+        // Step channel dominates (indoor/treadmill: steps counted, HR sparse) → credit STILL nets
+        // the step-derived estimate. The old "HR side only" netting left this double-counted.
+        XCTAssertEqual(
+            HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 50, stepKcal: 200, workoutActiveKcal: 120),
+            80,
+            accuracy: 0.001
+        )
+        // No workout → the plain daily estimate (larger of the two channels) passes through.
+        XCTAssertEqual(
+            HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 90, stepKcal: 140, workoutActiveKcal: 0),
+            140,
+            accuracy: 0.001
+        )
+    }
 }

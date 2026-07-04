@@ -259,19 +259,6 @@ final class WorkoutSessionManager: NSObject {
             agg.backfill(backfillHR, window: DateInterval(start: start, end: max(endDate, start)))
         }
 
-        // Persist this workout's continuous HR into LocalStore — same store the ring's history
-        // sync writes to. These samples carry REAL start/end spans (unlike the zero-duration point
-        // samples live-monitoring/history-sync persist elsewhere), so GoalsCardView's
-        // ExerciseMinutes estimate can credit them directly without needing two elevated point
-        // samples within one epoch of each other. `ingest` is cursor-gated, so re-running a workout
-        // (or this code path firing twice) can't double-count.
-        if let store {
-            let toIngest = agg.collectedSamples.map {
-                QuantitySample(kind: .heartRate, start: $0.start, end: $0.end, value: Double($0.bpm))
-            }
-            _ = try? store.ingest(toIngest)
-        }
-
         let hasRoute = !routeLocations.isEmpty && selectedSport.isOutdoor
         let summary = agg.finalize(
             sport: selectedSport,
@@ -285,6 +272,29 @@ final class WorkoutSessionManager: NSObject {
         await writeWorkout(summary: summary,
                            hrSamples: agg.collectedSamples,
                            routeLocations: hasRoute ? routeLocations : [])
+
+        // Persist this workout's continuous HR into LocalStore — same store the ring's history
+        // sync writes to. These samples carry REAL start/end spans (unlike the zero-duration point
+        // samples live-monitoring/history-sync persist elsewhere), so GoalsCardView's
+        // ExerciseMinutes estimate can credit them directly without needing two elevated point
+        // samples within one epoch of each other. `ingest` is cursor-gated, so re-running a workout
+        // (or this code path firing twice) can't double-count.
+        //
+        // ORDERING (double-count guard): this ingest MUST run AFTER `writeWorkout` returns — i.e.
+        // after the workout's active-energy credit is banked via `recordWorkoutActiveKcal` — and in
+        // this suspension-free stretch. `endWorkoutHR()` above flipped `monitoring` false, which
+        // fires ContentView's `flushHealth()`. That flush computes the day's active-energy delta
+        // from LocalStore HR. If we ingested the workout HR BEFORE the credit was banked, a flush
+        // could observe the workout HR with `workoutActiveKcalCredited == 0`, write the workout's
+        // TRIMP kcal as the daily active-energy delta AND let the workout's own `activeEnergyBurned`
+        // sample land too — a permanent, unretractable double-count. Ingesting only now guarantees
+        // any flush that sees the workout HR also sees the banked credit and nets it out.
+        if let store {
+            let toIngest = agg.collectedSamples.map {
+                QuantitySample(kind: .heartRate, start: $0.start, end: $0.end, value: Double($0.bpm))
+            }
+            _ = try? store.ingest(toIngest)
+        }
 
         recordingState = .finished(summary: summary)
     }
@@ -446,6 +456,33 @@ final class WorkoutSessionManager: NSObject {
             try? await builder.addSamples(hkHRSamples)
         }
 
+        // Add active energy (ESTIMATE — HR-TRIMP or, when HR didn't lock, a distance estimate).
+        // The daily active-energy estimate nets this workout's committed kcal out below, so
+        // Health's Move total does not double-count the same workout energy.
+        //
+        // Track whether the sample actually landed: the daily estimate is netted by the credit
+        // `recordWorkoutActiveKcal` banks AFTER `finishWorkout`. If we banked that credit while the
+        // energy sample silently failed to write (the old unconditional `try?`), the workout's kcal
+        // would be subtracted from the daily estimate WITHOUT any workout sample in Health — a
+        // permanent under-count. So credit only when the sample was accepted by the builder.
+        var energySampleWritten = false
+        if let kcal = summary.estimatedActiveKcal, kcal > 0 {
+            let energyType = HKQuantityType(.activeEnergyBurned)
+            let q = HKQuantity(unit: .kilocalorie(), doubleValue: kcal)
+            let energySample = HKQuantitySample(
+                type: energyType, quantity: q,
+                start: summary.startDate, end: summary.endDate,
+                metadata: [HealthKitWriter.activeEnergyEstimateMetadataKey: true,
+                           HKMetadataKeyWasUserEntered: false])
+            do {
+                try await builder.addSamples([energySample])
+                energySampleWritten = true
+            } catch {
+                // Energy sample failed to add — leave `energySampleWritten` false so the credit
+                // below is skipped and the daily estimate isn't netted for energy never written.
+            }
+        }
+
         // Add distance (GPS — only for outdoor with route). Pick the correct HK type by sport:
         // cycling → .distanceCycling; walking/running/hiking → .distanceWalkingRunning. Writing
         // a cycling ride to the walk/run type would pollute that total (and never show as cycling
@@ -480,6 +517,12 @@ final class WorkoutSessionManager: NSObject {
         // Health permanently under-counted for the day).
         if walkRunDistanceToCredit > 0 {
             HealthKitWriter.recordWorkoutWalkRunDistance(walkRunDistanceToCredit)
+        }
+        // Credit the daily estimate ONLY when the active-energy sample actually landed in Health
+        // (see `energySampleWritten` above) — otherwise netting would subtract energy Health never
+        // received, permanently under-counting the day.
+        if energySampleWritten, let kcal = summary.estimatedActiveKcal, kcal > 0 {
+            HealthKitWriter.recordWorkoutActiveKcal(kcal, day: summary.endDate)
         }
 
         // Write GPS route if available

@@ -234,6 +234,7 @@ struct ContentView: View {
         case .vitals:       vitalsCard
         case .vitalsStatus: vitalsStatusCard
         case .sleep:        sleepCard
+        case .calories:     caloriesCard
         case .goals:        card { GoalsCardView() }
         case .workout:      workoutCard
         case .cycle:        cycleCalendarCard
@@ -790,6 +791,12 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
+    /// Calories on the home page. Headline is today's estimated burn; secondary lines break out
+    /// resting BMR + active energy so the app stays honest about derived calories.
+    private var caloriesCard: some View {
+        card { CaloriesCardView() }
+    }
+
     // MARK: Sync + Health
 
     /// Prominent "is this thing actually working?" line (#44): when we last pulled from the ring
@@ -1185,6 +1192,8 @@ struct ContentView: View {
                     + (r.steps > 0 ? ", \(r.steps) steps" : "")
                     + (r.distanceM > 0 ? ", \(Int(r.distanceM.rounded()))m est." : "")
                     + (r.restingDays > 0 ? ", \(r.restingDays) resting HR" : "")
+                    + (r.passiveHours > 0 ? ", \(r.passiveHours)h basal" : "")
+                    + (r.activeKcal > 0 ? ", \(Int(r.activeKcal.rounded())) active kcal" : "")
                     + (r.exerciseMinutes > 0 ? ", \(Int(r.exerciseMinutes.rounded()))min exercise est." : "")
                     + (r.naps > 0 ? ", \(r.naps) nap\(r.naps == 1 ? "" : "s")" : "")
             } else {
@@ -1226,7 +1235,7 @@ struct ContentView: View {
 /// `dashboard.sectionOrder`, so keep these stable across releases; `allCases` order is the default
 /// (first-run) layout.
 private enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
-    case vitals, vitalsStatus, sleep, goals, workout, cycle, trends, sync
+    case vitals, vitalsStatus, sleep, calories, goals, workout, cycle, trends, sync
     var id: String { rawValue }
 }
 
@@ -1235,4 +1244,78 @@ private enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
 /// cards' custom ones.
 private enum Route: Hashable {
     case trends, cycle, deviceInfo, activityLog
+}
+
+/// Home-page calories card. Headline = today's estimated burn; secondary lines break it
+/// into resting (BMR prorated over the elapsed day) + active (HR/step estimate), then the
+/// static BMR/max-HR reference figures. Body inputs come from the profile page — the ring
+/// transmits none of them.
+struct CaloriesCardView: View {
+    // Shared @AppStorage keys with UserProfileSettingsView (single source of truth).
+    @AppStorage("userProfile.age") private var age = 35
+    @AppStorage("userProfile.weightKg") private var weightKg = 70.0
+    @AppStorage("userProfile.heightCm") private var heightCm = 170.0
+    @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
+
+    /// Today's HR samples (for the active-calorie TRIMP estimate). Predicate-limited to
+    /// heart rate since start-of-day so the fetch stays small.
+    @Query private var hrSamples: [StoredSample]
+    /// Today's step rollup — drives the step/distance active-calorie fallback when HR is sparse.
+    @Query private var todayDaily: [StoredDaily]
+
+    init() {
+        let hr = MetricKind.heartRate.rawValue
+        let dayStart = Calendar.current.startOfDay(for: Date())
+        // Match GoalsCardView's HR query exactly: same start-of-day lower bound AND the `value > 0`
+        // guard, so a stray 0-bpm sample can't skew the active-calorie estimate and the two cards
+        // read the same today's-HR set.
+        _hrSamples = Query(
+            filter: #Predicate { $0.kindRaw == hr && $0.start >= dayStart && $0.value > 0 },
+            sort: \.start)
+        _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
+    }
+
+    private var profile: UserProfile {
+        UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
+                    sex: BiologicalSex(rawValue: sexRaw) ?? .male)
+    }
+    private var maxHR: Int { max(220 - age, 1) }
+
+    /// Resting kcal accrued so far today: full-day BMR scaled by the elapsed fraction of today.
+    private var restingToday: Double {
+        let dayStart = Calendar.current.startOfDay(for: Date())
+        let fraction = Date().timeIntervalSince(dayStart) / 86_400
+        return Calories.bmrKcalPerDay(profile: profile) * fraction
+    }
+
+    /// Active kcal today — the larger of the HR-TRIMP estimate (sparse; ~0 without dense HR) and a
+    /// step/distance estimate, so a day with walking still shows honest active calories instead of
+    /// 0. Both are clearly-labeled estimates (the ring transmits no active-energy value).
+    private var activeToday: Double {
+        let samples = hrSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+        let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
+        let stepKcal = Calories.activeKcalFromSteps(steps: todayDaily.first?.steps ?? 0, profile: profile)
+        return max(hrKcal, stepKcal)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "flame.fill").foregroundStyle(.orange)
+                Text("CALORIES").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("\(Int((restingToday + activeToday).rounded()))")
+                    .font(.system(size: 40, weight: .bold, design: .rounded))
+                    .monospacedDigit().contentTransition(.numericText())
+                Text("kcal today").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            }
+            Text("resting \(Int(restingToday.rounded())) · active \(Int(activeToday.rounded()))")
+                .font(.caption).foregroundStyle(.secondary)
+            // "max HR" here is the 220-age zone/calorie reference, NOT an observed peak.
+            Text("BMR \(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day · est. max HR \(maxHR) bpm (220-age)")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
 }
