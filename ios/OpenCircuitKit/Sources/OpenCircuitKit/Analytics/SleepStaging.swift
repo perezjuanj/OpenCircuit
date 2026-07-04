@@ -115,6 +115,12 @@ public enum SleepStaging {
         /// Half-window (epochs each side) for the rolling-MEDIAN HR used by the wake gate,
         /// so a one-epoch HR spike doesn't read as an awakening.
         public var hrWakeHalfWindow: Int
+        /// Half-window (in epochs) for the sleep-vitals coverage that softens MOTION-awake: an epoch
+        /// with a sleep-vitals (HRV) epoch within this many epochs on either side AND sub-wake HR is
+        /// treated as moving-but-ASLEEP, not motion-awake — so the `sleepVitalsRescue` tail survives
+        /// staging's re-trim. Sized to bridge the sleepV/activity epoch interleave (~1 sleepV per 2
+        /// epochs). 0 disables the softening (byte-identical to the pre-rescue staging).
+        public var motionAwakeVitalsHalfWindow: Int
         /// A sustained asleep run of at least this many epochs anchors sleep ONSET (its
         /// start) and OFFSET (the end of the last such run). Leading/trailing awake outside
         /// that span is trimmed from the in-bed window — this is what shrinks an over-wide
@@ -203,6 +209,7 @@ public enum SleepStaging {
                     sleepFloorPercentile: Double = 0.12,
                     wakeHRMarginBPM: Double = 18,
                     hrWakeHalfWindow: Int = 2,
+                    motionAwakeVitalsHalfWindow: Int = 3,
                     onsetSustainEpochs: Int = 6,
                     minHRWakeRunEpochs: Int = 5,
                     onsetSettleFraction: Double = 0.35,
@@ -227,6 +234,7 @@ public enum SleepStaging {
             self.sleepFloorPercentile = sleepFloorPercentile
             self.wakeHRMarginBPM = wakeHRMarginBPM
             self.hrWakeHalfWindow = hrWakeHalfWindow
+            self.motionAwakeVitalsHalfWindow = motionAwakeVitalsHalfWindow
             self.onsetSustainEpochs = onsetSustainEpochs
             self.minHRWakeRunEpochs = minHRWakeRunEpochs
             self.onsetSettleFraction = onsetSettleFraction
@@ -334,7 +342,11 @@ public enum SleepStaging {
             .filter { $0.date(epoch: epoch) >= block.start && $0.date(epoch: epoch) <= block.end }
             .sorted { $0.counter < $1.counter }
         var lastHR: Int?, lastHRV: Int?, lastSpo2: Int?, lastRR: Double?
-        var rows: [(time: Date, hr: Int, hrv: Int?, motion: Int, spo2: Int?, rr: Double?)] = []
+        // `vitals` is the RAW (not forward-filled) "this epoch carried sleep-vitals HRV" flag — the
+        // ring-measured-sleep signal the motion-awake softening below uses. Kept distinct from `hrv`
+        // (forward-filled for variability) because forward-fill would make every post-onset epoch read
+        // as sleep-vitals.
+        var rows: [(time: Date, hr: Int, hrv: Int?, motion: Int, spo2: Int?, rr: Double?, vitals: Bool)] = []
         // Per-epoch motion energy is measured ABOVE a LOCAL idle floor (same rolling estimate as
         // detection). Gen 2 idles at ~1, Gen 3 at ~15–16 and DRIFTS across the night with posture
         // (16→24→39, 🟢 FR05.008 capture 2026-06-23). The old `$1 == 1 ? 0 : …` hard-coded Gen 2's
@@ -353,7 +365,7 @@ public enum SleepStaging {
             if let rr = r.respiratoryRate { lastRR = rr }   // forward-filled like HRV
             guard let hr = lastHR else { continue }   // skip until the first HR reading
             let motion = max(0, Int(rawMotion[idx] - floor[idx]))
-            rows.append((r.date(epoch: epoch), hr, lastHRV, motion, lastSpo2, lastRR))
+            rows.append((r.date(epoch: epoch), hr, lastHRV, motion, lastSpo2, lastRR, r.hrvRMSSD != nil))
         }
         guard rows.count >= 2 else { return [] }
 
@@ -381,7 +393,31 @@ public enum SleepStaging {
         let sleepFloor = percentile(hr.sorted(), tuning.sleepFloorPercentile)
         let wakeThreshold = sleepFloor + tuning.wakeHRMarginBPM
         let smHR = rollingMedian(hr, half: tuning.hrWakeHalfWindow)
-        let motionAwake = rows.map { $0.motion > tuning.awakeMotion }
+        // MOTION-awake, softened for MOVING-BUT-ASLEEP epochs — but ONLY across the MORNING TAIL, the
+        // trailing stretch after the last sustained asleep run. This mirrors the coarse `sleepVitalsRescue`,
+        // which only ever extends the block's END forward: the softening exists so staging doesn't re-trim
+        // the rescued pre-wake morning back off via `sleepSpan`. Scoping it to the tail is what keeps a
+        // genuine mid-night WASO (an interior awakening with sustained sleep AFTER it) from being absorbed
+        // as sleep — only the morning is rescued, not every restless mid-night.
+        let motionAwakeStrict = rows.map { $0.motion > tuning.awakeMotion }
+        // Tail boundary from the STRICT (un-softened) span: the epoch just after the end of the last
+        // sustained asleep run. `motionAwakeVitalsHalfWindow <= 0` disables the rescue entirely (tail =
+        // end of night → no epoch is softened → byte-identical to the pre-rescue staging).
+        let awakeStrict = rows.indices.map { smHR[$0] >= wakeThreshold || motionAwakeStrict[$0] }
+        let tailStart = tuning.motionAwakeVitalsHalfWindow > 0
+            ? (sleepSpan(awakeStrict, sustain: tuning.onsetSustainEpochs).map { $0.1 + 1 } ?? rows.count)
+            : rows.count
+        let vitalsNearby = windowedVitalsCoverage(times: rows.map(\.time), hasVitals: rows.map(\.vitals),
+                                                  halfWindow: tuning.motionAwakeVitalsHalfWindow)
+        let motionAwake = rows.indices.map { i in
+            // Soften only within the trailing morning tail: the ring is still emitting sleep-vitals nearby
+            // (windowed HRV coverage, robust to the sleepV/activity epoch interleave) AND HR is below the
+            // wake threshold — device measuring sleep, heart agreeing. Genuine wake is unaffected: the HR
+            // term below still fires on elevated HR, and sleep-vitals thin at true wake. Still nights and
+            // interior WASO are untouched (motion < threshold, or i < tailStart).
+            let softenTail = i >= tailStart && vitalsNearby[i] && smHR[i] < wakeThreshold
+            return motionAwakeStrict[i] && !softenTail
+        }
         var awake = rows.indices.map { smHR[$0] >= wakeThreshold || motionAwake[$0] }
         // Erode HR-only awake runs shorter than the floor so a transient REM-ish HR bump
         // doesn't read as an awakening (motion-driven awakes are kept, however brief).
@@ -559,6 +595,21 @@ public enum SleepStaging {
             let s = max(0, i - half), e = min(n - 1, i + half)
             var w = Array(xs[s ... e]); w.sort()
             out[i] = w[w.count / 2]
+        }
+        return out
+    }
+
+    /// Per-epoch "the ring is still emitting sleep-vitals nearby" flag: true when a sleep-vitals
+    /// (HRV-bearing) epoch sits within `halfWindow` epochs on either side. Robust to the sleepV/activity
+    /// epoch interleave (only ~1 in 2 epochs carries HRV), so a single missed slot doesn't read as wake.
+    /// `halfWindow <= 0` disables it (all false → motion-awake softening is a no-op).
+    private static func windowedVitalsCoverage(times: [Date], hasVitals: [Bool], halfWindow: Int) -> [Bool] {
+        let n = times.count
+        guard n > 0, hasVitals.count == n, halfWindow > 0 else { return [Bool](repeating: false, count: n) }
+        var out = [Bool](repeating: false, count: n)
+        for i in 0 ..< n {
+            let s = max(0, i - halfWindow), e = min(n - 1, i + halfWindow)
+            out[i] = (s ... e).contains { hasVitals[$0] }
         }
         return out
     }

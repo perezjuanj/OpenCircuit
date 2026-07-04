@@ -110,6 +110,34 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// stray reading can neither set a bogus floor nor flip a block.
     static let minHRSamplesForGate = 3
 
+    /// Sleep-vitals rescue (the SYMMETRIC counterpart to the HR gate). The motion detector is blind
+    /// to a still-but-AWAKE period (→ HR gate). It is EQUALLY blind the other way: a MOVING-but-ASLEEP
+    /// stretch — a restless pre-wake morning of posture shifts and limb movement — reads as motion and
+    /// is classified `.active`, truncating the night at the first stir even though the sleeper is still
+    /// down. The `motionAboveLocalFloor` normaliser makes this worse: a night that is dead-still for
+    /// hours then moves more before waking has a very low floor, so the morning plateau is measured as
+    /// large motion. HR/HRV catch what motion can't — during that stretch the ring keeps emitting
+    /// sleep-vitals epochs (HRV present, PROTOCOL §5.3) at a heart rate still near the night's resting
+    /// floor, whereas true wake shows the sleep-vitals stream thin out AND HR climb. 🟢 grounded on the
+    /// 2026-07-04 night (Gen 2): the ring recorded continuous sleep-vitals 06:49→08:30 (HR ~53, HRV on
+    /// ~half the epochs) that motion mis-scored as 1h40m of "active", cutting a real 7h32m night to
+    /// 5h44m. So we EXTEND the detected night's tail forward one epoch at a time while the trailing
+    /// window still looks like sleep-vitals sleep, and stop at the first sustained wake. Like the wear
+    /// and HR gates this is conservative and one-directional — it only ever grows the night's TAIL from
+    /// where motion already found sleep; it never seeds a new block, never touches the pre-onset
+    /// evening, and is gated by HR so it cannot rescue a genuine (elevated-HR) wake.
+    ///
+    /// Trailing window over which the tail-extension tests "still sleeping": short enough to stop
+    /// promptly at true wake, long enough to bridge the ~2.5-min activity/sleep-vitals epoch interleave.
+    static let rescueWindow: TimeInterval = 15 * 60
+    /// Minimum sleep-vitals (HRV-bearing) epochs required inside the trailing window for the tail to
+    /// keep extending. Below this the ring is no longer measuring sleep vitals at cadence → treat as
+    /// awake and stop. Two epochs ≈ the sleep-vitals cadence across a 15-min window.
+    static let rescueMinHRVInWindow = 2
+    /// Nominal epoch cadence used to step the tail extension. Kept local so this detector stays
+    /// device-agnostic (openwhoop port); the RingConn 0x4c step is 150 s (BulkRecord.epochSeconds).
+    static let rescueEpochStep: TimeInterval = 150
+
     private struct Temp { var activity: Activity; var start: Date; var end: Date }
 
     /// First Sleep period longer than `minSleepDuration`, removed from `events`.
@@ -260,11 +288,23 @@ public struct ActivityPeriod: Equatable, Sendable {
     public static func detectFromMotion(_ history: [MotionSample],
                                         temperatureSamples: [TemperatureSample],
                                         heartRateSamples: [HeartRateSample] = [],
+                                        sleepVitalTimes: [Date] = [],
                                         wornMinC: Double = wornMinTemperatureC,
                                         awakeHRMargin: Int = awakeHRMarginBPM) -> [ActivityPeriod] {
         let base = detectFromMotion(history)
         let wearGated = wearGate(base, temperatureSamples, wornMinC: wornMinC)
-        return heartRateGate(wearGated, heartRateSamples, marginBPM: awakeHRMargin)
+        let hrGated = heartRateGate(wearGated, heartRateSamples, marginBPM: awakeHRMargin)
+        return sleepVitalsRescue(hrGated, heartRateSamples, sleepVitalTimes, marginBPM: awakeHRMargin)
+    }
+
+    /// The night's resting-floor HR estimate: `sleepHRFloorPercentile` over the DISTINCT HR levels
+    /// seen tonight (deduped so a long high-HR stretch can't drag the floor up by sheer count — see
+    /// `heartRateGate`). `nil` when there aren't enough readings to judge.
+    static func sleepHRFloor(_ hr: [HeartRateSample]) -> Int? {
+        guard hr.count >= minHRSamplesForGate else { return nil }
+        let levels = Array(Set(hr.map(\.bpm))).sorted()
+        guard !levels.isEmpty else { return nil }
+        return levels[Int((Double(levels.count - 1) * sleepHRFloorPercentile).rounded())]
     }
 
     /// Reclassify a `.sleep` block whose median skin temperature reads unworn (< `wornMinC`) as
@@ -294,7 +334,6 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// reported with sparse/zero HR.
     private static func heartRateGate(_ periods: [ActivityPeriod], _ hr: [HeartRateSample],
                                       marginBPM: Int) -> [ActivityPeriod] {
-        guard hr.count >= minHRSamplesForGate else { return periods }
         // Resting-floor estimate over the DISTINCT HR levels seen tonight, NOT the raw samples: a long
         // awake-still stretch contributes many high readings that would drag a count-weighted percentile
         // up and so hide itself. Deduping to levels gives the night's few low readings equal weight, so
@@ -302,8 +341,7 @@ public struct ActivityPeriod: Equatable, Sendable {
         // 2026-06-23 night this yields ~74 bpm vs ~102 for a raw p10 — the difference between catching
         // the 108 bpm evening block and missing it.) Block medians below stay count-weighted: "typical
         // HR in this block" is the right question there, "lowest level reached tonight" the right one here.
-        let levels = Array(Set(hr.map(\.bpm))).sorted()
-        let floor = levels[Int((Double(levels.count - 1) * sleepHRFloorPercentile).rounded())]
+        guard let floor = sleepHRFloor(hr) else { return periods }
         let threshold = floor + marginBPM
         return periods.map { p in
             guard p.activity == .sleep else { return p }
@@ -314,6 +352,61 @@ public struct ActivityPeriod: Equatable, Sendable {
                 ? ActivityPeriod(activity: .active, start: p.start, end: p.end)
                 : p
         }
+    }
+
+    /// Extend the detected night's TAIL forward through a moving-but-asleep morning (see `rescueWindow`
+    /// doc). Grows the main sleep block's end epoch-by-epoch across the `.active` period that abuts it,
+    /// for as long as the trailing `rescueWindow` still looks like sleep-vitals sleep — HR at/near the
+    /// night's resting floor AND the ring still emitting ≥ `rescueMinHRVInWindow` sleep-vitals epochs —
+    /// then stops at the first sustained wake. One-directional and HR-gated: it only ever converts
+    /// `.active`→`.sleep` starting from where motion already found the night, so it can neither seed a
+    /// spurious block nor rescue a genuine elevated-HR wake. No HR or no sleep-vitals coverage → no-op.
+    private static func sleepVitalsRescue(_ periods: [ActivityPeriod], _ hr: [HeartRateSample],
+                                          _ sleepVitalTimes: [Date], marginBPM: Int) -> [ActivityPeriod] {
+        guard !sleepVitalTimes.isEmpty, let floor = sleepHRFloor(hr),
+              let block = mainSleepBlock(periods) else { return periods }
+        let threshold = floor + marginBPM
+        let hrv = sleepVitalTimes.sorted()
+
+        // The active period that begins (within one epoch step) at the main block's end — the morning
+        // stretch right after detected sleep. Nothing else is eligible: not the pre-onset evening, not a
+        // disconnected daytime block.
+        let step = rescueEpochStep
+        guard let tail = periods.first(where: {
+            $0.activity == .active && $0.end > block.end
+                && abs($0.start.timeIntervalSince(block.end)) <= step * 2
+        }) else { return periods }
+
+        // Walk the tail one epoch at a time; keep extending while the trailing window is sleep-like.
+        func windowIsSleeplike(endingAt t: Date) -> Bool {
+            let lo = t.addingTimeInterval(-rescueWindow)
+            let hrInWin = hr.filter { $0.time > lo && $0.time <= t }.map(\.bpm).sorted()
+            guard hrInWin.count >= minHRSamplesForGate else { return false }
+            let median = hrInWin[hrInWin.count / 2]
+            let hrvInWin = hrv.filter { $0 > lo && $0 <= t }.count
+            return median <= threshold && hrvInWin >= rescueMinHRVInWindow
+        }
+        var wakeEnd = block.end
+        var t = block.end.addingTimeInterval(step)
+        while t <= tail.end {
+            if windowIsSleeplike(endingAt: t) { wakeEnd = t; t = t.addingTimeInterval(step) }
+            else { break }
+        }
+        guard wakeEnd > block.end else { return periods }
+
+        // Rewrite the tail: [tail.start, wakeEnd] becomes sleep; any remainder stays active.
+        var out: [ActivityPeriod] = []
+        for p in periods {
+            if p == tail {
+                out.append(ActivityPeriod(activity: .sleep, start: p.start, end: wakeEnd))
+                if p.end > wakeEnd {
+                    out.append(ActivityPeriod(activity: .active, start: wakeEnd, end: p.end))
+                }
+            } else {
+                out.append(p)
+            }
+        }
+        return out
     }
 
     /// Shared core: classify a stillness-magnitude timeline into Sleep/Active runs.
