@@ -98,75 +98,64 @@ final class HealthAlertsTests: XCTestCase {
         XCTAssertEqual(hits.first?.value, 112)
     }
 
-    func testHRFreshnessDropsStaleSyncedHighAndSustainedHR() {
-        let now = at(12)
-        let freshness = HealthAlertFreshness(maxAge: 30 * 60)
-        let thresholds = HealthAlertThresholds(
-            highHREnabled: true,
-            highHRBpm: 110,
-            lowSpO2Enabled: false,
-            elevatedHREnabled: true,
-            elevatedHRBpm: 110,
-            elevatedSustained: 10 * 60)
-        let staleHigh = [hr(132, 8)]
-        let staleRun = [hr(112, 8, 0), hr(115, 8, 3), hr(118, 8, 6),
-                        hr(116, 8, 9), hr(114, 8, 12)]
+    // MARK: Background-drain latency (30–60 min old timestamps) — de-dupe is the ONLY gate
 
+    func testDrainLatencyOldHighHRCrossingFiresOnFirstSight() {
+        // All-day HR arrives via an ~hourly background drain: the phone evaluates ONCE, right after
+        // the drain, and the crossing's device timestamp is already ~45 min old on arrival. With the
+        // 30-min device-timestamp freshness window removed, a not-yet-fired crossing must still alert
+        // once — otherwise every legitimate background high-HR event in the older half of a drain is
+        // permanently silenced.
+        let thresholds = HealthAlertThresholds(highHRBpm: 120,
+                                               lowSpO2Enabled: false,
+                                               elevatedHREnabled: false)
         let hits = HealthAlertEvaluator.evaluate(
-            hr: freshness.freshInstantHR(staleHigh, now: now),
+            hr: [hr(145, 9, 15)],   // ~45 min before the post-drain evaluation at ~10:00
             spo2: [],
-            inactiveHR: freshness.freshSustainedHR(
-                staleRun, now: now, minDuration: thresholds.elevatedSustained),
-            thresholds: thresholds)
-
-        XCTAssertTrue(hits.isEmpty, "hours-old synced HR must update history without replaying a phone alert")
+            inactiveHR: [],
+            thresholds: thresholds,
+            lastFired: [:])
+        XCTAssertEqual(hits.map(\.notification), [.highHR])
+        XCTAssertEqual(hits.first?.value, 145)
     }
 
-    func testHRFreshnessKeepsFreshHighAndSustainedHR() {
-        let now = at(12)
-        let freshness = HealthAlertFreshness(maxAge: 30 * 60)
-        let thresholds = HealthAlertThresholds(
-            highHREnabled: true,
-            highHRBpm: 120,
-            lowSpO2Enabled: false,
-            elevatedHREnabled: true,
-            elevatedHRBpm: 110,
-            elevatedSustained: 10 * 60)
-        let freshHigh = [hr(132, 11, 50)]
-        let freshRun = [hr(112, 11, 35), hr(115, 11, 38), hr(118, 11, 41),
-                        hr(116, 11, 45)]
-
-        let hits = HealthAlertEvaluator.evaluate(
-            hr: freshness.freshInstantHR(freshHigh, now: now),
-            spo2: [],
-            inactiveHR: freshness.freshSustainedHR(
-                freshRun, now: now, minDuration: thresholds.elevatedSustained),
-            thresholds: thresholds)
-
-        XCTAssertEqual(Set(hits.map(\.notification)), [.highHR, .elevatedHRInactive])
-    }
-
-    func testHRFreshnessKeepsSustainedRunLeadInBeforeFreshWindow() {
-        let now = at(12)
-        let freshness = HealthAlertFreshness(maxAge: 30 * 60)
-        let thresholds = HealthAlertThresholds(
-            highHREnabled: false,
-            lowSpO2Enabled: false,
-            elevatedHREnabled: true,
-            elevatedHRBpm: 110,
-            elevatedSustained: 10 * 60)
-        // The run starts 35 minutes ago but completes 25 minutes ago, so it is still a fresh
-        // completion. The freshness helper keeps the 10-minute lead-in needed to prove it.
-        let run = [hr(112, 11, 25), hr(115, 11, 28), hr(118, 11, 31), hr(116, 11, 35)]
-
+    func testDrainLatencyOldSustainedRunFiresOnFirstSight() {
+        // A sustained elevated-while-inactive run whose 10-min completion is ~40 min old on arrival.
+        // The previous 40-min fetch window collapsed the 24h lookback to now-40min and silenced
+        // exactly this run; over the restored wide window it must alert once.
+        let thresholds = HealthAlertThresholds(highHREnabled: false,
+                                               lowSpO2Enabled: false,
+                                               elevatedHRBpm: 100,
+                                               elevatedSustained: 10 * 60)
+        let run = [hr(105, 9, 0), hr(108, 9, 3), hr(110, 9, 6), hr(106, 9, 9), hr(112, 9, 12)]
         let hits = HealthAlertEvaluator.evaluate(
             hr: [],
             spo2: [],
-            inactiveHR: freshness.freshSustainedHR(
-                run, now: now, minDuration: thresholds.elevatedSustained),
-            thresholds: thresholds)
-
+            inactiveHR: run,
+            thresholds: thresholds,
+            lastFired: [:])
         XCTAssertEqual(hits.map(\.notification), [.elevatedHRInactive])
+        XCTAssertEqual(hits.first?.value, 112)
+    }
+
+    func testDrainLatencyFiredCrossingDoesNotReplayOnNextDrain() {
+        // Once a crossing has fired (its time recorded in `lastFired`), the next hourly drain
+        // re-delivers the SAME hours-old samples. The per-notification `lastFired` filter — now the
+        // entire stale-replay guard — must drop them so they don't post a second phone alert.
+        let thresholds = HealthAlertThresholds(highHRBpm: 120,
+                                               lowSpO2Enabled: false,
+                                               elevatedHRBpm: 100,
+                                               elevatedSustained: 10 * 60)
+        let redeliveredHigh = [hr(145, 9, 15)]
+        let redeliveredRun = [hr(105, 9, 0), hr(108, 9, 3), hr(110, 9, 6),
+                              hr(106, 9, 9), hr(112, 9, 12)]
+        let hits = HealthAlertEvaluator.evaluate(
+            hr: redeliveredHigh,
+            spo2: [],
+            inactiveHR: redeliveredRun,
+            thresholds: thresholds,
+            lastFired: [.highHR: at(9, 15), .elevatedHRInactive: at(9, 12)])
+        XCTAssertTrue(hits.isEmpty, "already-fired crossings must not replay on the next drain")
     }
 
     // MARK: #85 flag routing

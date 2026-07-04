@@ -150,54 +150,11 @@ public struct HealthAlertHit: Equatable, Sendable {
     }
 }
 
-/// Freshness guard for event-like HR alerts. History sync can legitimately backfill hours-old HR
-/// samples; those belong in the charts/HealthKit, but they must not replay as "just happened"
-/// phone notifications. The sustained rule needs `minDuration` of lead-in samples so a run that
-/// started just before the freshness window and completed inside it still alerts.
-public struct HealthAlertFreshness: Equatable, Sendable {
-    public var maxAge: TimeInterval
-
-    public init(maxAge: TimeInterval = 30 * 60) {
-        self.maxAge = maxAge
-    }
-
-    public func contains(_ date: Date, now: Date) -> Bool {
-        date <= now && now.timeIntervalSince(date) <= maxAge
-    }
-
-    public func instantSince(now: Date, lastFired: Date? = nil) -> Date {
-        max(now.addingTimeInterval(-maxAge), lastFired ?? .distantPast)
-    }
-
-    public func sustainedSince(now: Date, minDuration: TimeInterval,
-                               lastFired: Date? = nil) -> Date {
-        let freshLeadIn = now.addingTimeInterval(-(maxAge + minDuration))
-        let firedLeadIn = lastFired?.addingTimeInterval(-minDuration) ?? .distantPast
-        return max(freshLeadIn, firedLeadIn)
-    }
-
-    public func freshInstantHR(_ samples: [HRSample], now: Date,
-                               lastFired: Date? = nil) -> [HRSample] {
-        let since = instantSince(now: now, lastFired: lastFired)
-        return samples.filter { $0.start > since && contains($0.start, now: now) }
-    }
-
-    public func freshSustainedHR(_ samples: [HRSample], now: Date,
-                                 minDuration: TimeInterval,
-                                 lastFired: Date? = nil) -> [HRSample] {
-        let since = sustainedSince(now: now, minDuration: minDuration, lastFired: lastFired)
-        return samples.filter { $0.start > since && $0.start <= now }
-    }
-
-    public func freshHRHit(_ hit: HealthAlertHit, now: Date) -> Bool {
-        switch hit.notification {
-        case .highHR, .elevatedHRInactive:
-            return contains(hit.time, now: now)
-        default:
-            return true
-        }
-    }
-}
+// NOTE: HR alerts intentionally have NO device-timestamp "freshness" gate. All-day HR reaches the
+// phone via ~hourly background drains whose device timestamps are routinely 30–60+ min old on
+// arrival, evaluated ONCE right after each drain; a freshness window would permanently silence the
+// older half of every drain. De-dupe is done here by the per-notification `lastFired` filter in
+// `evaluate` (a crossing fires once on first sight and never replays), not by the sample's age.
 
 public enum HealthAlertEvaluator {
 
