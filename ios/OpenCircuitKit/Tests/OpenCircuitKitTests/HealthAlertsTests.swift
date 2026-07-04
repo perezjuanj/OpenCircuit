@@ -65,6 +65,110 @@ final class HealthAlertsTests: XCTestCase {
         XCTAssertEqual(hits.map(\.notification), [.highHR])
     }
 
+    func testEvaluateSuppressesReadingsAtOrBeforeLastFired() {
+        let thresholds = HealthAlertThresholds(highHRBpm: 120,
+                                               lowSpO2Percent: 90,
+                                               elevatedHRBpm: 100)
+        let oldInactiveRun = [hr(105, 1, 0), hr(108, 1, 3), hr(110, 1, 6),
+                              hr(106, 1, 9), hr(112, 1, 12)]
+        let hits = HealthAlertEvaluator.evaluate(
+            hr: [hr(130, 2)],
+            spo2: [SpO2Reading(percent: 85, time: at(2))],
+            inactiveHR: oldInactiveRun,
+            thresholds: thresholds,
+            lastFired: [.highHR: at(3), .lowSpO2: at(3), .elevatedHRInactive: at(3)])
+
+        XCTAssertTrue(hits.isEmpty, "old threshold crossings must not replay after the backoff expires")
+    }
+
+    func testEvaluateAllowsFreshInactiveRunAfterLastFired() {
+        let thresholds = HealthAlertThresholds(highHREnabled: false,
+                                               lowSpO2Enabled: false,
+                                               elevatedHRBpm: 100)
+        let freshRun = [hr(105, 4, 0), hr(108, 4, 3), hr(110, 4, 6),
+                        hr(106, 4, 9), hr(112, 4, 12)]
+        let hits = HealthAlertEvaluator.evaluate(
+            hr: [],
+            spo2: [],
+            inactiveHR: freshRun,
+            thresholds: thresholds,
+            lastFired: [.elevatedHRInactive: at(3)])
+
+        XCTAssertEqual(hits.map(\.notification), [.elevatedHRInactive])
+        XCTAssertEqual(hits.first?.value, 112)
+    }
+
+    func testHRFreshnessDropsStaleSyncedHighAndSustainedHR() {
+        let now = at(12)
+        let freshness = HealthAlertFreshness(maxAge: 30 * 60)
+        let thresholds = HealthAlertThresholds(
+            highHREnabled: true,
+            highHRBpm: 110,
+            lowSpO2Enabled: false,
+            elevatedHREnabled: true,
+            elevatedHRBpm: 110,
+            elevatedSustained: 10 * 60)
+        let staleHigh = [hr(132, 8)]
+        let staleRun = [hr(112, 8, 0), hr(115, 8, 3), hr(118, 8, 6),
+                        hr(116, 8, 9), hr(114, 8, 12)]
+
+        let hits = HealthAlertEvaluator.evaluate(
+            hr: freshness.freshInstantHR(staleHigh, now: now),
+            spo2: [],
+            inactiveHR: freshness.freshSustainedHR(
+                staleRun, now: now, minDuration: thresholds.elevatedSustained),
+            thresholds: thresholds)
+
+        XCTAssertTrue(hits.isEmpty, "hours-old synced HR must update history without replaying a phone alert")
+    }
+
+    func testHRFreshnessKeepsFreshHighAndSustainedHR() {
+        let now = at(12)
+        let freshness = HealthAlertFreshness(maxAge: 30 * 60)
+        let thresholds = HealthAlertThresholds(
+            highHREnabled: true,
+            highHRBpm: 120,
+            lowSpO2Enabled: false,
+            elevatedHREnabled: true,
+            elevatedHRBpm: 110,
+            elevatedSustained: 10 * 60)
+        let freshHigh = [hr(132, 11, 50)]
+        let freshRun = [hr(112, 11, 35), hr(115, 11, 38), hr(118, 11, 41),
+                        hr(116, 11, 45)]
+
+        let hits = HealthAlertEvaluator.evaluate(
+            hr: freshness.freshInstantHR(freshHigh, now: now),
+            spo2: [],
+            inactiveHR: freshness.freshSustainedHR(
+                freshRun, now: now, minDuration: thresholds.elevatedSustained),
+            thresholds: thresholds)
+
+        XCTAssertEqual(Set(hits.map(\.notification)), [.highHR, .elevatedHRInactive])
+    }
+
+    func testHRFreshnessKeepsSustainedRunLeadInBeforeFreshWindow() {
+        let now = at(12)
+        let freshness = HealthAlertFreshness(maxAge: 30 * 60)
+        let thresholds = HealthAlertThresholds(
+            highHREnabled: false,
+            lowSpO2Enabled: false,
+            elevatedHREnabled: true,
+            elevatedHRBpm: 110,
+            elevatedSustained: 10 * 60)
+        // The run starts 35 minutes ago but completes 25 minutes ago, so it is still a fresh
+        // completion. The freshness helper keeps the 10-minute lead-in needed to prove it.
+        let run = [hr(112, 11, 25), hr(115, 11, 28), hr(118, 11, 31), hr(116, 11, 35)]
+
+        let hits = HealthAlertEvaluator.evaluate(
+            hr: [],
+            spo2: [],
+            inactiveHR: freshness.freshSustainedHR(
+                run, now: now, minDuration: thresholds.elevatedSustained),
+            thresholds: thresholds)
+
+        XCTAssertEqual(hits.map(\.notification), [.elevatedHRInactive])
+    }
+
     // MARK: #85 flag routing
 
     func testTempFeverRouting() {

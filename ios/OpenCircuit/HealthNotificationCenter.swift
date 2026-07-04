@@ -170,11 +170,12 @@ struct HealthNotificationCenter {
     var gate = NotificationGate()
     private var center: UNUserNotificationCenter { .current() }
 
-    /// How far back instantaneous HR/SpO2 alerts (#73) look for a threshold crossing. Covers an
+    /// How far back instantaneous SpO2 alerts (#73) look for a threshold crossing. Covers an
     /// overnight sync that finishes in the morning; the de-dupe backoff stops it from re-nagging.
     static let instantLookback: TimeInterval = 12 * 3600
-    /// Window for the sustained-elevated-HR-while-inactive rule.
-    static let inactiveLookback: TimeInterval = 24 * 3600
+    /// HR notifications are event-like: synced history may contain valid but hours-old HR, and that
+    /// should update charts/HealthKit without replaying as a fresh phone alert.
+    static let hrFreshness = HealthAlertFreshness(maxAge: 30 * 60)
 
     /// Evaluate ALL health-alert conditions (#73 + #85) from the store (+ optional live session),
     /// then post a debounced notification for each survivor. Safe to call liberally — a no-op when
@@ -186,34 +187,35 @@ struct HealthNotificationCenter {
         // --- #73: high HR / low SpO2 / elevated-HR-while-inactive --------------------------------
         let thresholds = HealthAlertDefaults.thresholds()
         let instantSince = now.addingTimeInterval(-Self.instantLookback)
-        let inactiveSince = now.addingTimeInterval(-Self.inactiveLookback)
         let lastFired = store.lastFired()
-        // Only consider HR/SpO2 readings NEWER than the last time that notification fired, so a
-        // single morning spike alerts ONCE rather than re-firing every backoff window (the 2h
-        // backoff is shorter than the 12h lookback, so without this the worst reading in the
-        // window would keep being re-returned and re-announced for hours). (#73 fix)
-        let hrSince = max(instantSince, lastFired[.highHR] ?? .distantPast)
-        let spo2Since = max(instantSince, lastFired[.lowSpO2] ?? .distantPast)
-
+        let hrSince = Self.hrFreshness.instantSince(now: now, lastFired: lastFired[.highHR])
+        let inactiveSince = Self.hrFreshness.sustainedSince(
+            now: now,
+            minDuration: thresholds.elevatedSustained,
+            lastFired: lastFired[.elevatedHRInactive])
         // Stored readings + the just-synced in-memory batch (so a fresh sync is reflected at once).
-        var hr = ((try? localStore.recentSamples(kind: .heartRate, since: instantSince)) ?? [])
-            .filter { $0.start > hrSince }
+        var hr = ((try? localStore.recentSamples(kind: .heartRate, since: hrSince)) ?? [])
+            .filter { $0.start > hrSince && $0.start <= now }
             .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
         var spo2 = ((try? localStore.recentSamples(kind: .spo2, since: instantSince)) ?? [])
-            .filter { $0.start > spo2Since }
             .map { SpO2Reading(percent: Int(($0.value * 100).rounded()), time: $0.start) }
         let inactiveHR = ((try? localStore.recentSamples(kind: .heartRate, since: inactiveSince)) ?? [])
+            .filter { $0.start > inactiveSince && $0.start <= now }
             .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
 
         if let synced = session?.historySamples {
-            hr += synced.filter { $0.kind == .heartRate && $0.value > 0 && $0.start > hrSince }
+            hr += synced.filter {
+                $0.kind == .heartRate && $0.value > 0 && $0.start > hrSince && $0.start <= now
+            }
                 .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-            spo2 += synced.filter { $0.kind == .spo2 && $0.value > 0 && $0.start > spo2Since }
+            spo2 += synced.filter { $0.kind == .spo2 && $0.value > 0 && $0.start >= instantSince }
                 .map { SpO2Reading(percent: Int(($0.value * 100).rounded()), time: $0.start) }
         }
 
         for hit in HealthAlertEvaluator.evaluate(hr: hr, spo2: spo2, inactiveHR: inactiveHR,
-                                                 thresholds: thresholds) {
+                                                 thresholds: thresholds,
+                                                 lastFired: lastFired) {
+            guard Self.hrFreshness.freshHRHit(hit, now: now) else { continue }
             candidates.append(hit.notification)
             hitByNotif[hit.notification] = hit
         }

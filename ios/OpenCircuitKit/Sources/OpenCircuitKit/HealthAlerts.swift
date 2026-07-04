@@ -150,6 +150,55 @@ public struct HealthAlertHit: Equatable, Sendable {
     }
 }
 
+/// Freshness guard for event-like HR alerts. History sync can legitimately backfill hours-old HR
+/// samples; those belong in the charts/HealthKit, but they must not replay as "just happened"
+/// phone notifications. The sustained rule needs `minDuration` of lead-in samples so a run that
+/// started just before the freshness window and completed inside it still alerts.
+public struct HealthAlertFreshness: Equatable, Sendable {
+    public var maxAge: TimeInterval
+
+    public init(maxAge: TimeInterval = 30 * 60) {
+        self.maxAge = maxAge
+    }
+
+    public func contains(_ date: Date, now: Date) -> Bool {
+        date <= now && now.timeIntervalSince(date) <= maxAge
+    }
+
+    public func instantSince(now: Date, lastFired: Date? = nil) -> Date {
+        max(now.addingTimeInterval(-maxAge), lastFired ?? .distantPast)
+    }
+
+    public func sustainedSince(now: Date, minDuration: TimeInterval,
+                               lastFired: Date? = nil) -> Date {
+        let freshLeadIn = now.addingTimeInterval(-(maxAge + minDuration))
+        let firedLeadIn = lastFired?.addingTimeInterval(-minDuration) ?? .distantPast
+        return max(freshLeadIn, firedLeadIn)
+    }
+
+    public func freshInstantHR(_ samples: [HRSample], now: Date,
+                               lastFired: Date? = nil) -> [HRSample] {
+        let since = instantSince(now: now, lastFired: lastFired)
+        return samples.filter { $0.start > since && contains($0.start, now: now) }
+    }
+
+    public func freshSustainedHR(_ samples: [HRSample], now: Date,
+                                 minDuration: TimeInterval,
+                                 lastFired: Date? = nil) -> [HRSample] {
+        let since = sustainedSince(now: now, minDuration: minDuration, lastFired: lastFired)
+        return samples.filter { $0.start > since && $0.start <= now }
+    }
+
+    public func freshHRHit(_ hit: HealthAlertHit, now: Date) -> Bool {
+        switch hit.notification {
+        case .highHR, .elevatedHRInactive:
+            return contains(hit.time, now: now)
+        default:
+            return true
+        }
+    }
+}
+
 public enum HealthAlertEvaluator {
 
     /// The worst (highest) HR reading at/above the threshold, or nil. "High heart rate detected at
@@ -190,16 +239,23 @@ public enum HealthAlertEvaluator {
     /// Evaluate all three #73 rules and return the hits (disabled rules are skipped). `inactiveHR`
     /// is the HR series for the sustained-while-inactive rule; the instantaneous rules use `hr`.
     public static func evaluate(hr: [HRSample], spo2: [SpO2Reading], inactiveHR: [HRSample],
-                                thresholds: HealthAlertThresholds) -> [HealthAlertHit] {
+                                thresholds: HealthAlertThresholds,
+                                lastFired: [HealthNotification: Date] = [:]) -> [HealthAlertHit] {
         var hits: [HealthAlertHit] = []
-        if thresholds.highHREnabled, let s = highHR(hr, thresholdBpm: thresholds.highHRBpm) {
+        let freshHR = hr.filter { $0.start > (lastFired[.highHR] ?? .distantPast) }
+        let freshSpO2 = spo2.filter { $0.time > (lastFired[.lowSpO2] ?? .distantPast) }
+        let freshInactiveHR = inactiveHR.filter {
+            $0.start > (lastFired[.elevatedHRInactive] ?? .distantPast)
+        }
+
+        if thresholds.highHREnabled, let s = highHR(freshHR, thresholdBpm: thresholds.highHRBpm) {
             hits.append(HealthAlertHit(notification: .highHR, value: Double(s.bpm), time: s.start))
         }
-        if thresholds.lowSpO2Enabled, let s = lowSpO2(spo2, thresholdPercent: thresholds.lowSpO2Percent) {
+        if thresholds.lowSpO2Enabled, let s = lowSpO2(freshSpO2, thresholdPercent: thresholds.lowSpO2Percent) {
             hits.append(HealthAlertHit(notification: .lowSpO2, value: Double(s.percent), time: s.time))
         }
         if thresholds.elevatedHREnabled,
-           let s = elevatedHRInactive(inactiveHR, thresholdBpm: thresholds.elevatedHRBpm,
+           let s = elevatedHRInactive(freshInactiveHR, thresholdBpm: thresholds.elevatedHRBpm,
                                       minDuration: thresholds.elevatedSustained,
                                       maxGap: thresholds.elevatedMaxGap) {
             hits.append(HealthAlertHit(notification: .elevatedHRInactive, value: Double(s.bpm), time: s.start))
