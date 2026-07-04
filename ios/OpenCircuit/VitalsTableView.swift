@@ -218,7 +218,7 @@ struct VitalsTableView: View {
         VStack(alignment: .leading, spacing: 0) {
             measurableRow("Heart Rate", value: hrText, mode: .hr, active: hrActive,
                           time: hrActive && session?.liveHR == nil
-                              ? (session?.livePreparing == true ? "preparing..." : "measuring...")
+                              ? (session?.livePreparing == true ? "preparing…" : "measuring…")
                               : timeFor(.heartRate, live: hrLive))
             divider
             spo2Row
@@ -246,7 +246,7 @@ struct VitalsTableView: View {
     }
 
     /// SpO₂ row with estimate caveat. Time logic mirrors `measurableRow` so the
-    /// "preparing..."/"measuring..." split is preserved for user-initiated reads.
+    /// "preparing…"/"measuring…" split is preserved for user-initiated reads.
     @ViewBuilder private var spo2Row: some View {
         HStack(spacing: 10) {
             Text("SpO₂").font(.subheadline).foregroundStyle(.primary)
@@ -255,7 +255,7 @@ struct VitalsTableView: View {
                 Text(spo2Text).font(.subheadline.weight(.semibold)).monospacedDigit()
                 Text("est.").font(.caption2).foregroundStyle(.tertiary)
                 if let time = (spo2Active && session?.liveSpO2 == nil
-                    ? (session?.livePreparing == true ? "preparing..." : "measuring...")
+                    ? (session?.livePreparing == true ? "preparing…" : "measuring…")
                     : timeFor(.spo2, live: spo2Live)) {
                     Text(time).font(.caption2).foregroundStyle(.secondary)
                 }

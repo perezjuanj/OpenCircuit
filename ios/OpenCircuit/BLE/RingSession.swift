@@ -666,7 +666,14 @@ final class RingSession: NSObject {
         monitoring = true
         monitoringStartedAt = Date()
         livePreparing = true
-        if clearStaleValue { liveHR = nil; liveHRAt = nil }   // fresh user read — don't let a stale value look live (#45 C)
+        if clearStaleValue {
+            // Fresh user read — don't let a stale value look live (#45 C). Clear BOTH metrics: an
+            // old liveSpO2 lock (never cleared while monitoring) would otherwise masquerade as live
+            // before the ring enters SpO2 mode, skipping preparing/measuring, and count as a lock at
+            // the deadline check so an off-finger read never surfaces the failure banner (#125).
+            liveHR = nil; liveHRAt = nil
+            liveSpO2 = nil; liveSpO2At = nil
+        }
         liveHRTrend.removeAll()   // fresh convergence window
         liveHRWarmup = nil
         flushDrainedToArchive()   // an in-flight sync just cancelled above — bank its pages before the wipe (#119)
@@ -1057,8 +1064,12 @@ final class RingSession: NSObject {
         let deadline = Date().addingTimeInterval(timeout)
         var locked = false
         while !Task.isCancelled && Date() < deadline {
-            // Bail if a user tap took ownership or switched the mode out from under us — don't fight them.
-            if !autoMeasuring || !monitoring || liveMode != mode || calibrationCapturing {
+            // Bail if a user tap took ownership or switched the mode out from under us — don't fight
+            // them. Same test-locked ownership model as `startMonitoring` (#125).
+            if LiveMeasureOwnership.autoShouldStandDown(autoMeasuring: autoMeasuring,
+                                                        monitoring: monitoring,
+                                                        modeMatches: liveMode == mode,
+                                                        calibrationCapturing: calibrationCapturing) {
                 autoMeasuring = false
                 return nil
             }
@@ -1380,29 +1391,35 @@ final class RingSession: NSObject {
     /// - `quickLiveRead`: prompt live-read entry (the default for foreground/auto). The overnight
     ///   background capture passes `false` for the full sleep drain (see `startLiveMonitoring`).
     func startMonitoring(mode: LiveMode, userInitiated: Bool = true, quickLiveRead: Bool = true) {
-        if monitoring {
-            if userInitiated, !userMeasuring {
-                // Promote an auto/background live read into an explicit user measurement so the
-                // progress/failure UX and deadline belong to the tap instead of the previous owner.
-                autoMeasuring = false
-                stopLiveMonitoring(scheduleStatusRefresh: false)
-                liveMode = mode
-                userMeasuring = true
-                userMeasureFailed = false
-                userMeasureFailedMessage = nil
-                startLiveMonitoring(quickLiveRead: quickLiveRead, clearStaleValue: true)
-                return
-            }
-            if liveMode == mode {
-                if userInitiated { rearmUserMeasure() }   // re-poll on demand; auto leaves it alone
-            } else {
-                setLiveMode(mode)
-                if userInitiated {
-                    userMeasuring = true
-                    armUserMeasureDeadline()
-                }
-            }
-        } else {
+        // Ownership decision lives in a pure, test-locked model (`LiveMeasureOwnership`) so the
+        // "don't fight the current owner" contract can't silently regress (#125).
+        let action = LiveMeasureOwnership.decide(monitoring: monitoring,
+                                                 userInitiated: userInitiated,
+                                                 userMeasuring: userMeasuring,
+                                                 workoutHolding: workoutHolding,
+                                                 sameMode: liveMode == mode)
+        switch action {
+        case .takeover:
+            // Promote an auto/background live read into an explicit user measurement so the
+            // progress/failure UX and deadline belong to the tap instead of the previous owner.
+            autoMeasuring = false
+            stopLiveMonitoring(scheduleStatusRefresh: false)
+            liveMode = mode
+            userMeasuring = true
+            userMeasureFailed = false
+            userMeasureFailedMessage = nil
+            startLiveMonitoring(quickLiveRead: quickLiveRead, clearStaleValue: true)
+        case .rearm:
+            rearmUserMeasure()   // re-poll on demand; auto leaves it alone
+        case .ignore:
+            break                // auto refresh in the same mode — don't disturb a converging read
+        case .switchMode(let armDeadline):
+            setLiveMode(mode)
+            // `userMeasuring` is already true when the switch is user-initiated (a user tap only
+            // reaches here having skipped the takeover branch, which falls through only when a user
+            // measurement was already in flight). Just re-arm the deadline for the new mode (#125).
+            if armDeadline { armUserMeasureDeadline() }
+        case .start(let clearStale):
             liveMode = mode
             // User-initiated: arm the timeout UX state so the poll loop can self-terminate (#55).
             if userInitiated {
@@ -1410,7 +1427,7 @@ final class RingSession: NSObject {
                 userMeasureFailed = false
                 userMeasureFailedMessage = nil
             }
-            startLiveMonitoring(quickLiveRead: quickLiveRead, clearStaleValue: userInitiated)
+            startLiveMonitoring(quickLiveRead: quickLiveRead, clearStaleValue: clearStale)
         }
     }
 
@@ -1462,6 +1479,9 @@ final class RingSession: NSObject {
         liveHRAt = nil
         liveHRTrend.removeAll()
         liveHRWarmup = nil
+        // Re-tap on a live SpO2 read: drop the prior SpO2 lock too, else it counts as live/locked
+        // for the fresh cycle (skips measuring UX; a failed retry never times out) (#125).
+        if liveMode == .spo2 { liveSpO2 = nil; liveSpO2At = nil }
         userMeasureFailed = false        // retry: dismiss the prior error naturally (#55)
         userMeasureFailedMessage = nil
         armUserMeasureDeadline()         // fresh budget from THIS re-tap, not the original (#65)
