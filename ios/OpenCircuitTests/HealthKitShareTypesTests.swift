@@ -37,4 +37,42 @@ final class HealthKitShareTypesTests: XCTestCase {
             XCTAssertNotNil(HealthKitWriter.quantityType(for: kind), "\(kind) should be writable")
         }
     }
+
+    func testEnergyWritesCountAsFlushOutput() {
+        var basal = HealthKitWriter.FlushResult()
+        basal.passiveHours = 1
+        XCTAssertTrue(basal.wroteAnything)
+
+        var active = HealthKitWriter.FlushResult()
+        active.activeKcal = 12.5
+        XCTAssertTrue(active.wroteAnything)
+    }
+
+    func testWorkoutActiveKcalLedgerIsDayScopedAndAccumulates() {
+        let suite = "HealthKitShareTypesTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let day = Date(timeIntervalSince1970: 10_000)
+        HealthKitWriter.recordWorkoutActiveKcal(80, day: day, defaults)
+        HealthKitWriter.recordWorkoutActiveKcal(20, day: day.addingTimeInterval(60), defaults)
+
+        XCTAssertEqual(defaults.double(forKey: HealthKitWriter.workoutActiveKcalKey), 100)
+
+        HealthKitWriter.recordWorkoutActiveKcal(30, day: day.addingTimeInterval(86_400), defaults)
+        XCTAssertEqual(defaults.double(forKey: HealthKitWriter.workoutActiveKcalKey), 30)
+    }
+
+    func testDailyActiveEnergyNetsWorkoutCaloriesOnlyFromHRSide() {
+        XCTAssertEqual(
+            HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 300, stepKcal: 80, workoutActiveKcal: 125),
+            175,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            HealthKitWriter.netDailyActiveKcalEstimate(hrKcal: 100, stepKcal: 80, workoutActiveKcal: 125),
+            80,
+            accuracy: 0.001
+        )
+    }
 }

@@ -446,6 +446,20 @@ final class WorkoutSessionManager: NSObject {
             try? await builder.addSamples(hkHRSamples)
         }
 
+        // Add active energy (ESTIMATE — HR-TRIMP or, when HR didn't lock, a distance estimate).
+        // The daily step/distance active-energy estimate nets this workout's foot-distance out
+        // below, so Health's Move total does not double-count the same walking/running distance.
+        if let kcal = summary.estimatedActiveKcal, kcal > 0 {
+            let energyType = HKQuantityType(.activeEnergyBurned)
+            let q = HKQuantity(unit: .kilocalorie(), doubleValue: kcal)
+            let energySample = HKQuantitySample(
+                type: energyType, quantity: q,
+                start: summary.startDate, end: summary.endDate,
+                metadata: ["OpenCircuitActiveEnergyEstimated": true,
+                           HKMetadataKeyWasUserEntered: false])
+            try? await builder.addSamples([energySample])
+        }
+
         // Add distance (GPS — only for outdoor with route). Pick the correct HK type by sport:
         // cycling → .distanceCycling; walking/running/hiking → .distanceWalkingRunning. Writing
         // a cycling ride to the walk/run type would pollute that total (and never show as cycling
@@ -480,6 +494,9 @@ final class WorkoutSessionManager: NSObject {
         // Health permanently under-counted for the day).
         if walkRunDistanceToCredit > 0 {
             HealthKitWriter.recordWorkoutWalkRunDistance(walkRunDistanceToCredit)
+        }
+        if let kcal = summary.estimatedActiveKcal, kcal > 0 {
+            HealthKitWriter.recordWorkoutActiveKcal(kcal, day: summary.endDate)
         }
 
         // Write GPS route if available
