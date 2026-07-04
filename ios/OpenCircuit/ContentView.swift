@@ -705,7 +705,7 @@ struct ContentView: View {
         card {
             Text("VITALS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             VitalsTableView(session: session)
-            Text("Home shows the latest recorded readings and when they were recorded. New heart-rate and SpO₂ samples arrive from ring syncs, periodic background recording while connected, and workouts rather than a live stream on this screen.")
+            Text("Home shows the latest recorded readings and when they were recorded. Heart-rate and SpO₂ also support on-demand reads while the ring link is ready.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .padding(.top, 8)

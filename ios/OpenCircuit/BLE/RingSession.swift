@@ -666,7 +666,14 @@ final class RingSession: NSObject {
         monitoring = true
         monitoringStartedAt = Date()
         livePreparing = true
-        if clearStaleValue { liveHR = nil; liveHRAt = nil }   // fresh user read — don't let a stale value look live (#45 C)
+        if clearStaleValue {
+            // Fresh user read — don't let a stale value look live (#45 C). Clear BOTH metrics: an
+            // old liveSpO2 lock (never cleared while monitoring) would otherwise masquerade as live
+            // before the ring enters SpO2 mode, skipping preparing/measuring, and count as a lock at
+            // the deadline check so an off-finger read never surfaces the failure banner (#125).
+            liveHR = nil; liveHRAt = nil
+            liveSpO2 = nil; liveSpO2At = nil
+        }
         liveHRTrend.removeAll()   // fresh convergence window
         liveHRWarmup = nil
         flushDrainedToArchive()   // an in-flight sync just cancelled above — bank its pages before the wipe (#119)
@@ -674,7 +681,6 @@ final class RingSession: NSObject {
         bulkFinalized = false
         drainSawPage = false
         drainDone = false
-        let modeCmd = liveMode == .hr ? Command.liveHRMode : Command.liveSpO2Mode
         // Quick live reads no longer open a synthetic history session first. The device log showed
         // frequent reads repeatedly entering through `syncAll` (`02 .. ff ff ff ff ..`) before live
         // mode, entangling dense sampling with history/open-state churn. Overnight/background reads
@@ -726,6 +732,7 @@ final class RingSession: NSObject {
                 self.commitDrainedRecords()   // archive merge + stitched re-stage + persist (shared path)
             }
             // 3. Leave bulk mode and enter the selected live mode.
+            let modeCmd = s0.liveMode == .hr ? Command.liveHRMode : Command.liveSpO2Mode
             for cmd in [Command.statusQuery, modeCmd, Command.fetch] {
                 guard let self, !Task.isCancelled else { return }
                 self.write(cmd)
@@ -1057,10 +1064,17 @@ final class RingSession: NSObject {
         let deadline = Date().addingTimeInterval(timeout)
         var locked = false
         while !Task.isCancelled && Date() < deadline {
+            // Bail if a user tap took ownership or switched the mode out from under us — don't fight
+            // them. Same test-locked ownership model as `startMonitoring` (#125).
+            if LiveMeasureOwnership.autoShouldStandDown(autoMeasuring: autoMeasuring,
+                                                        monitoring: monitoring,
+                                                        modeMatches: liveMode == mode,
+                                                        calibrationCapturing: calibrationCapturing) {
+                autoMeasuring = false
+                return nil
+            }
             if mode == .hr, liveHR != nil { locked = true; break }
             if mode == .spo2, liveSpO2 != nil { locked = true; break }
-            // Bail if a user tap switched the mode out from under us — don't fight them.
-            if !monitoring || liveMode != mode || calibrationCapturing { autoMeasuring = false; return nil }
             try? await Task.sleep(for: .seconds(1))
         }
         // Only tear down if WE still own the live read (user didn't take over).
@@ -1377,13 +1391,38 @@ final class RingSession: NSObject {
     /// - `quickLiveRead`: prompt live-read entry (the default for foreground/auto). The overnight
     ///   background capture passes `false` for the full sleep drain (see `startLiveMonitoring`).
     func startMonitoring(mode: LiveMode, userInitiated: Bool = true, quickLiveRead: Bool = true) {
-        if monitoring {
-            if liveMode == mode {
-                if userInitiated { rearmUserMeasure() }   // re-poll on demand; auto leaves it alone
-            } else {
-                setLiveMode(mode)
-            }
-        } else {
+        // Ownership decision lives in a pure, test-locked model (`LiveMeasureOwnership`) so the
+        // "don't fight the current owner" contract can't silently regress (#125).
+        let action = LiveMeasureOwnership.decide(monitoring: monitoring,
+                                                 userInitiated: userInitiated,
+                                                 userMeasuring: userMeasuring,
+                                                 workoutHolding: workoutHolding,
+                                                 sameMode: liveMode == mode)
+        switch action {
+        case .takeover:
+            // Promote an auto/background live read into an explicit user measurement so the
+            // progress/failure UX and deadline belong to the tap instead of the previous owner.
+            autoMeasuring = false
+            stopLiveMonitoring(scheduleStatusRefresh: false)
+            liveMode = mode
+            userMeasuring = true
+            userMeasureFailed = false
+            userMeasureFailedMessage = nil
+            startLiveMonitoring(quickLiveRead: quickLiveRead, clearStaleValue: true)
+        case .rearm:
+            rearmUserMeasure()   // re-poll on demand; auto leaves it alone
+        case .ignore:
+            break                // auto refresh in the same mode — don't disturb a converging read
+        case .switchMode(let armDeadline):
+            // `armDeadline` is set iff the switch is user-initiated, so it doubles as the stale-clear
+            // signal: a user switch drops the target mode's prior lock (#125), an auto switch keeps
+            // its last value on screen until the new one re-locks.
+            setLiveMode(mode, clearStaleValue: armDeadline)
+            // `userMeasuring` is already true when the switch is user-initiated (a user tap only
+            // reaches here having skipped the takeover branch, which falls through only when a user
+            // measurement was already in flight). Just re-arm the deadline for the new mode (#125).
+            if armDeadline { armUserMeasureDeadline() }
+        case .start(let clearStale):
             liveMode = mode
             // User-initiated: arm the timeout UX state so the poll loop can self-terminate (#55).
             if userInitiated {
@@ -1391,7 +1430,7 @@ final class RingSession: NSObject {
                 userMeasureFailed = false
                 userMeasureFailedMessage = nil
             }
-            startLiveMonitoring(quickLiveRead: quickLiveRead, clearStaleValue: userInitiated)
+            startLiveMonitoring(quickLiveRead: quickLiveRead, clearStaleValue: clearStale)
         }
     }
 
@@ -1443,6 +1482,9 @@ final class RingSession: NSObject {
         liveHRAt = nil
         liveHRTrend.removeAll()
         liveHRWarmup = nil
+        // Re-tap on a live SpO2 read: drop the prior SpO2 lock too, else it counts as live/locked
+        // for the fresh cycle (skips measuring UX; a failed retry never times out) (#125).
+        if liveMode == .spo2 { liveSpO2 = nil; liveSpO2At = nil }
         userMeasureFailed = false        // retry: dismiss the prior error naturally (#55)
         userMeasureFailedMessage = nil
         armUserMeasureDeadline()         // fresh budget from THIS re-tap, not the original (#65)
@@ -1460,11 +1502,23 @@ final class RingSession: NSObject {
     /// Switch live measurement between HR (`06 01 00`) and SpO2 (`06 02 00`). The ring
     /// measures one at a time; the other metric keeps its last value. No-op until the
     /// next start if not currently monitoring.
-    func setLiveMode(_ mode: LiveMode) {
+    func setLiveMode(_ mode: LiveMode, clearStaleValue: Bool = false) {
         guard liveMode != mode else { return }
         liveMode = mode
         liveHRTrend.removeAll()   // restarting the HR window
         liveHRWarmup = nil
+        if clearStaleValue {
+            // User switched INTO this mode for a fresh read — the SpO2→HR→SpO2 toggle path that
+            // `startLiveMonitoring(clearStaleValue:)` / `rearmUserMeasure` don't cover (#125). Drop
+            // the TARGET mode's prior lock so it can't masquerade as live before the ring re-enters
+            // the mode (skipping preparing/measuring) or count as a lock at the user-measure deadline
+            // — without this, an off-finger read after the toggle times out with no failure banner.
+            // Only on a user switch (`armDeadline`); auto keeps its prior value on screen.
+            switch mode {
+            case .hr:   liveHR = nil;   liveHRAt = nil
+            case .spo2: liveSpO2 = nil; liveSpO2At = nil
+            }
+        }
         userMeasureFailed = false   // mode switch = fresh start, dismiss any prior failure (#55)
         userMeasureFailedMessage = nil
         guard monitoring else { return }
