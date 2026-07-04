@@ -674,7 +674,6 @@ final class RingSession: NSObject {
         bulkFinalized = false
         drainSawPage = false
         drainDone = false
-        let modeCmd = liveMode == .hr ? Command.liveHRMode : Command.liveSpO2Mode
         // Quick live reads no longer open a synthetic history session first. The device log showed
         // frequent reads repeatedly entering through `syncAll` (`02 .. ff ff ff ff ..`) before live
         // mode, entangling dense sampling with history/open-state churn. Overnight/background reads
@@ -726,6 +725,7 @@ final class RingSession: NSObject {
                 self.commitDrainedRecords()   // archive merge + stitched re-stage + persist (shared path)
             }
             // 3. Leave bulk mode and enter the selected live mode.
+            let modeCmd = s0.liveMode == .hr ? Command.liveHRMode : Command.liveSpO2Mode
             for cmd in [Command.statusQuery, modeCmd, Command.fetch] {
                 guard let self, !Task.isCancelled else { return }
                 self.write(cmd)
@@ -1057,10 +1057,13 @@ final class RingSession: NSObject {
         let deadline = Date().addingTimeInterval(timeout)
         var locked = false
         while !Task.isCancelled && Date() < deadline {
+            // Bail if a user tap took ownership or switched the mode out from under us — don't fight them.
+            if !autoMeasuring || !monitoring || liveMode != mode || calibrationCapturing {
+                autoMeasuring = false
+                return nil
+            }
             if mode == .hr, liveHR != nil { locked = true; break }
             if mode == .spo2, liveSpO2 != nil { locked = true; break }
-            // Bail if a user tap switched the mode out from under us — don't fight them.
-            if !monitoring || liveMode != mode || calibrationCapturing { autoMeasuring = false; return nil }
             try? await Task.sleep(for: .seconds(1))
         }
         // Only tear down if WE still own the live read (user didn't take over).
@@ -1378,10 +1381,26 @@ final class RingSession: NSObject {
     ///   background capture passes `false` for the full sleep drain (see `startLiveMonitoring`).
     func startMonitoring(mode: LiveMode, userInitiated: Bool = true, quickLiveRead: Bool = true) {
         if monitoring {
+            if userInitiated, !userMeasuring {
+                // Promote an auto/background live read into an explicit user measurement so the
+                // progress/failure UX and deadline belong to the tap instead of the previous owner.
+                autoMeasuring = false
+                stopLiveMonitoring(scheduleStatusRefresh: false)
+                liveMode = mode
+                userMeasuring = true
+                userMeasureFailed = false
+                userMeasureFailedMessage = nil
+                startLiveMonitoring(quickLiveRead: quickLiveRead, clearStaleValue: true)
+                return
+            }
             if liveMode == mode {
                 if userInitiated { rearmUserMeasure() }   // re-poll on demand; auto leaves it alone
             } else {
                 setLiveMode(mode)
+                if userInitiated {
+                    userMeasuring = true
+                    armUserMeasureDeadline()
+                }
             }
         } else {
             liveMode = mode
