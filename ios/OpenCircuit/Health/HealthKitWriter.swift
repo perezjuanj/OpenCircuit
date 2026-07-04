@@ -72,7 +72,8 @@ final class HealthKitWriter {
         }
     }
 
-    private var allTypes: Set<HKSampleType> {
+    // Internal (not private) so HealthKitShareTypesTests can guard the set's contents.
+    var allTypes: Set<HKSampleType> {
         var set = Set<HKSampleType>()
         for k in MetricKind.allCases {
             if let t = Self.quantityType(for: k) { set.insert(t) }
@@ -88,9 +89,16 @@ final class HealthKitWriter {
         // NOTE: temperature is NOT added here — it already ships via the canonical
         // `.basalBodyTemperature` path (MetricKind.temperature). No triple-write.
         set.insert(HKCategoryType(.menstrualFlow))
+        // Blood pressure (#121): authorization is granted on the two CONSTITUENT quantity
+        // types only. The `bloodPressureType` HKCorrelationType must NEVER be added here:
+        // correlation types are not authorizable, and their presence in the `toShare` set of
+        // `requestAuthorization`/`statusForAuthorizationRequest` raises an uncatchable Obj-C
+        // NSInvalidArgumentException — which crashed the app whenever the auth path ran, e.g.
+        // right after the user revoked Health access in the Health app (the #119 auth-recovery
+        // path re-requests). Saving the HKCorrelation itself needs no correlation-level grant;
+        // it is authorized through systolic + diastolic.
         set.insert(Self.systolicType)
         set.insert(Self.diastolicType)
-        set.insert(Self.bloodPressureType)
         return set
     }
 

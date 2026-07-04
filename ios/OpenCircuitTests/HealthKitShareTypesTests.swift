@@ -1,9 +1,24 @@
+import HealthKit
 import XCTest
 import OpenCircuitKit
 @testable import OpenCircuit
 
 @MainActor
 final class HealthKitShareTypesTests: XCTestCase {
+    /// Correlation types (blood pressure) are NOT authorizable: putting one in the `toShare`
+    /// set of `requestAuthorization`/`statusForAuthorizationRequest` raises the same
+    /// uncatchable NSInvalidArgumentException as #110 — it crashed the app whenever the auth
+    /// path ran after PR #121 added it (e.g. right after the user revoked Health access in the
+    /// Health app, when the auth-recovery path re-requests). BP auth rides on the two
+    /// constituent quantity types instead; guard against the correlation type creeping back.
+    func testAuthTypeSetContainsNoCorrelationTypes() {
+        let types = HealthKitWriter().allTypes
+        XCTAssertFalse(types.contains { $0 is HKCorrelationType },
+                       "correlation types must never enter the HealthKit auth set")
+        XCTAssertTrue(types.contains(HKQuantityType(.bloodPressureSystolic)))
+        XCTAssertTrue(types.contains(HKQuantityType(.bloodPressureDiastolic)))
+    }
+
     /// Apple Exercise Time is an Apple-COMPUTED Activity-ring metric and is NOT third-party
     /// shareable. Listing it in HealthKit's auth `toShare` set raises an Obj-C
     /// NSInvalidArgumentException (-[HKHealthStore _throwIfAuthorizationDisallowedForSharing:])
