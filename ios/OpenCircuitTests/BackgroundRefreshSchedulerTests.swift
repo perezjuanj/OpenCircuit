@@ -1,5 +1,6 @@
 import BackgroundTasks
 import XCTest
+import OpenCircuitKit
 @testable import OpenCircuit
 
 final class BackgroundRefreshSchedulerTests: XCTestCase {
