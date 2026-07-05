@@ -112,6 +112,70 @@ final class HealthKitWriter {
             && store.authorizationStatus(for: HKQuantityType(.heartRate)) == .sharingAuthorized
     }
 
+    /// The shareable, AUTHORIZABLE types the user has explicitly DENIED (turned off in the iOS
+    /// permission sheet or later in Settings ▸ Health ▸ Data Access). SHARE status is reportable
+    /// per-type (unlike READ status), so this is a trustworthy signal. `allTypes` already excludes
+    /// the non-authorizable `bloodPressureType` HKCorrelationType (querying it throws an uncatchable
+    /// Obj-C exception), so this never touches it. Includes `.sleepAnalysis` and `.menstrualFlow`.
+    func deniedShareTypes() -> [HKSampleType] {
+        guard Self.isAvailable else { return [] }
+        return allTypes.filter { store.authorizationStatus(for: $0) == .sharingDenied }
+    }
+
+    /// Tri-state Health share status so the UI can tell "never granted" from "some granted, some
+    /// denied" — the partial case is the trap #132 fixes: `isShareAuthorized` (heart rate) is `true`
+    /// yet other metrics silently never reach Health. `isShareAuthorized` stays as-is so the flush
+    /// keeps writing the metrics that ARE granted; this only drives the honest status copy.
+    enum ShareState: Equatable {
+        case unauthorized
+        case partial([HKSampleType])   // HR granted, but these types are denied
+        case authorized
+    }
+
+    var shareState: ShareState {
+        guard Self.isAvailable else { return .unauthorized }
+        return Self.resolveShareState(authorizableTypes: allTypes) {
+            store.authorizationStatus(for: $0)
+        }
+    }
+
+    /// Pure share-state resolution over an injected authorization-status lookup — testable without a
+    /// live `HKHealthStore` (the simulator reports every type `.notDetermined`). Heart rate is the
+    /// representative "did the user grant anything" gate, mirroring `isShareAuthorized`.
+    static func resolveShareState(authorizableTypes: Set<HKSampleType>,
+                                  status: (HKSampleType) -> HKAuthorizationStatus) -> ShareState {
+        guard status(HKQuantityType(.heartRate)) == .sharingAuthorized else { return .unauthorized }
+        let denied = authorizableTypes.filter { status($0) == .sharingDenied }
+        return denied.isEmpty ? .authorized : .partial(Array(denied))
+    }
+
+    /// User-facing name for a share type, for the partial-grant / failure warnings. Maps quantity
+    /// types back through `MetricKind` where possible; a small table covers the non-`MetricKind`
+    /// extras (sleep, energy, cycle tracking, blood pressure, workouts).
+    static func friendlyName(for type: HKSampleType) -> String {
+        for k in MetricKind.allCases {
+            if let qt = quantityType(for: k), qt.isEqual(type) { return k.displayName }
+        }
+        if type.isEqual(HKCategoryType(.sleepAnalysis)) { return "Sleep" }
+        if type.isEqual(HKQuantityType(.basalEnergyBurned)) { return "Resting Energy" }
+        if type.isEqual(HKCategoryType(.menstrualFlow)) { return "Cycle Tracking" }
+        if type.isEqual(systolicType) || type.isEqual(diastolicType) { return "Blood Pressure" }
+        if type.isEqual(HKQuantityType(.distanceCycling)) { return "Cycling Distance" }
+        if type is HKWorkoutType || type is HKSeriesType { return "Workouts" }
+        return type.identifier
+    }
+
+    /// De-duplicated, stably-sorted friendly names for a set of denied/failed types (both BP
+    /// constituents collapse to one "Blood Pressure", etc.).
+    static func friendlyNames(for types: [HKSampleType]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for name in types.map({ friendlyName(for: $0) }).sorted() where seen.insert(name).inserted {
+            out.append(name)
+        }
+        return out
+    }
+
     /// Deep link into the Health app — the recovery path once the one-time permission sheet
     /// has been used up (see `authorizationPromptAvailable`). There is no per-app deep link to
     /// Health's privacy page; the app root is as close as iOS allows.
@@ -145,10 +209,47 @@ final class HealthKitWriter {
         var distanceM = 0.0         // estimated distance written (#81)
         var exerciseMinutes = 0.0   // estimated exercise minutes written (#82)
         var menstrualFlowEntries = 0  // user-logged period entries written (#78)
+        /// Metrics whose HealthKit `save` actually THREW this pass (#135) — distinct from "nothing
+        /// pending". Persisted per-metric so the UI can surface an honest "X hasn't synced" warning
+        /// instead of the blanket "Auto-syncing" line. Empty on a clean/idle flush.
+        var failures: Set<MetricKind> = []
         var wroteAnything: Bool {
             samples > 0 || sleepSegments > 0 || steps > 0
                 || restingDays > 0 || passiveHours > 0 || activeKcal > 0 || naps > 0
                 || distanceM > 0 || exerciseMinutes > 0 || menstrualFlowEntries > 0
+        }
+    }
+
+    /// Metrics whose HealthKit `save` threw during the CURRENT flush pass. Reset at the top of
+    /// `flushToHealth`; the inline blocks and per-helper flushes add to it on a caught save error.
+    /// Rolled into `FlushResult.failures` and persisted (below) so all three flush entry points
+    /// (foreground, RingSession, background task) surface a consistent failure state. (#135)
+    private var pendingFlushFailures: Set<MetricKind> = []
+
+    // MARK: Persisted per-metric write-failure map (#135)
+    //
+    // Flushes run from three entry points on SEPARATE `HealthKitWriter` instances, so the last
+    // failure per metric lives in UserDefaults (mirroring the `hk.*` watermark pattern) where all
+    // three can write it and the UI can read it. Set on a caught save error, CLEARED on the next
+    // successful write of that metric — so "nothing pending" and "writes failing" stay distinct.
+    private static let failureMapKey = "hk.failures.byMetric"   // [MetricKind.rawValue : since1970]
+
+    /// Merge one flush pass into the persisted failure map: stamp `failed` metrics with `now`, and
+    /// clear any `written` metric's flag (a later success wins, so a re-enabled type self-heals).
+    static func recordFlushOutcome(written: Set<MetricKind>, failed: Set<MetricKind>,
+                                   now: Date = Date(), _ defaults: UserDefaults = .standard) {
+        var map = (defaults.dictionary(forKey: failureMapKey) as? [String: Double]) ?? [:]
+        for m in failed { map[m.rawValue] = now.timeIntervalSince1970 }
+        for m in written { map.removeValue(forKey: m.rawValue) }
+        if map.isEmpty { defaults.removeObject(forKey: failureMapKey) }
+        else { defaults.set(map, forKey: failureMapKey) }
+    }
+
+    /// The persisted per-metric write failures (metric → last failure time), for the UI warning.
+    static func healthWriteFailures(_ defaults: UserDefaults = .standard) -> [MetricKind: Date] {
+        guard let map = defaults.dictionary(forKey: failureMapKey) as? [String: Double] else { return [:] }
+        return map.reduce(into: [:]) { acc, kv in
+            if let kind = MetricKind(rawValue: kv.key) { acc[kind] = Date(timeIntervalSince1970: kv.value) }
         }
     }
 
@@ -164,10 +265,20 @@ final class HealthKitWriter {
         Self.isFlushing = true
         defer { Self.isFlushing = false }
 
-        // Scalars: write, THEN advance the watermark, so a failed save backfills next time.
+        pendingFlushFailures = []            // per-pass failure accumulator (#135)
+        var writtenKinds: Set<MetricKind> = []  // metrics that landed at least one sample this pass
+
+        // Scalars: write, THEN advance the watermark, so a failed save backfills next time. The
+        // write is SPLIT per metric (#132): a single denied type (e.g. SpO₂) no longer sinks the
+        // whole batch — the granted metrics still land and only the denied one is left pending.
         if let pending = try? store.pendingHealthSamples(), !pending.isEmpty {
-            do { try await write(pending); try store.markHealthWritten(pending); result.samples = pending.count }
-            catch { /* leave the watermark; retry next flush */ }
+            let outcome = await write(pending)
+            if !outcome.written.isEmpty {
+                try? store.markHealthWritten(outcome.written)   // advance ONLY for what actually saved
+                result.samples = outcome.written.count
+                writtenKinds.formUnion(outcome.written.map(\.kind))
+            }
+            pendingFlushFailures.formUnion(outcome.failed)
         }
         // Sleep: same write-then-mark order (a failed save must not lose the night). Only mirror a
         // SETTLED night (SleepHealthGate): with periodic overnight draining the staged night grows
@@ -176,12 +287,20 @@ final class HealthKitWriter {
         // stopped advancing (sleeper is up), it writes once and the `.sleep` cursor blocks re-writes.
         if SleepHealthGate.isSettled(latestSegmentEnd: sleepSegments.map(\.end).max(), now: Date()),
            let pendingSleep = try? store.pendingHealthSleep(sleepSegments), !pendingSleep.isEmpty {
-            do { try await write(sleep: pendingSleep); try store.markSleepWritten(pendingSleep); result.sleepSegments = pendingSleep.count }
-            catch { /* leave the .sleep cursor; retry next flush */ }
+            do {
+                try await write(sleep: pendingSleep); try store.markSleepWritten(pendingSleep)
+                result.sleepSegments = pendingSleep.count
+                writtenKinds.insert(.sleep)
+            } catch {
+                // A denied .sleepAnalysis type throws here forever — surface it (#135) instead of
+                // silently retrying, so the card can say "Sleep hasn't synced". Cursor stays put.
+                pendingFlushFailures.insert(.sleep)
+            }
         }
         // Naps (#76): each carries its own `healthWritten` flag (NOT the night's `.sleep` cursor),
         // so a daytime nap and the overnight night write independently and never collide.
         result.naps = await flushNaps(store: store)
+        if result.naps > 0 { writtenKinds.insert(.sleep) }
 
         // Women's health (#78): write pending user-logged period flow entries to Health.
         // Gated by each entry's own `healthWritten` flag — independent of all other writes.
@@ -217,28 +336,57 @@ final class HealthKitWriter {
                 }
                 gpsCommits.append((gpsReduction, day))
             }
-            do {
-                try await write(toWrite)
-                try store.markStepSamplesWritten(pending)
-                for commit in gpsCommits { Self.commitDistanceGPSCredit(commit.reduction, day: commit.day) }
+            // Scalar KINDS split independently (#132), but steps and the DERIVED distance stay
+            // COUPLED: distance has no watermark of its own — it's re-derived from the same
+            // `StoredStepSample` rows every flush and rides their `healthWritten` flag (advanced only
+            // by `markStepSamplesWritten`). So distance may only be written/committed when the step
+            // rows are being marked written THIS pass (i.e. steps saved). Otherwise a granted-distance
+            // sample would re-derive + re-write on every subsequent flush while the rows stay pending,
+            // and HealthKit SUMS it → the day's distance inflates ~N×. If steps failed, skip distance
+            // entirely (no write, no GPS credit) so it's deferred, not duplicated.
+            let outcome = await write(toWrite)
+            if !outcome.failed.contains(.steps) {
+                try? store.markStepSamplesWritten(pending)
                 result.steps = pending.reduce(0) { $0 + $1.delta }
-                result.distanceM = toWrite.filter { $0.kind == .distance }.reduce(0) { $0 + $1.value }
-            } catch { /* leave the watermark; retry next flush */ }
+                writtenKinds.insert(.steps)
+                // Steps landed → the rows won't be re-derived, so it's safe to write/commit distance.
+                if Self.distanceMayWrite(stepsFailed: false, distanceFailed: outcome.failed.contains(.distance)) {
+                    for commit in gpsCommits { Self.commitDistanceGPSCredit(commit.reduction, day: commit.day) }
+                    let distanceWritten = outcome.written.filter { $0.kind == .distance }.reduce(0) { $0 + $1.value }
+                    result.distanceM = distanceWritten
+                    if distanceWritten > 0 { writtenKinds.insert(.distance) }
+                } else {
+                    pendingFlushFailures.insert(.distance)
+                }
+            }
+            // TRADEOFF (accepted): steps granted + distance denied → that window's distance estimate
+            // is skipped and won't backfill if the user later enables Distance, because the step rows
+            // are already marked written. Distance is a DERIVED estimate (steps × stride), not measured
+            // data; a separate `distanceWritten` flag + migration to make it independently backfillable
+            // is out of scope. If steps FAILED, distance failure isn't recorded — it's simply deferred.
+            pendingFlushFailures.formUnion(outcome.failed.subtracting([.distance]))
         }
         // Derived daily resting HR — one sample per finalized day (#18, #37). Idempotency is a
         // UserDefaults day-watermark, NOT the store cursor: RHR isn't a stored sample, and the
         // `hk:` cursor rows belong to the raw-sample mirror above.
         result.restingDays = await flushRestingHR(local: store, sleepSegments: sleepSegments)
+        if result.restingDays > 0 { writtenKinds.insert(.restingHeartRate) }
 
         // Energy: passive (hourly BMR) + active (HR-derived or steps-derived estimate).
         // Watermark-gated (#37) and labeled as derived estimates in HealthKit metadata.
         result.passiveHours = await flushPassiveCalories(profile: profile)
         result.activeKcal = await flushActiveCalories(local: store, profile: profile)
+        if result.activeKcal > 0 { writtenKinds.insert(.activeEnergy) }
 
         // Exercise minutes estimate (#82): elevated-HR minutes outside the sleep window.
         // ESTIMATE — basic 50% maxHR threshold. Full 4-level intensity follows #93 decode.
         result.exerciseMinutes = await flushExerciseMinutes(local: store, profile: profile)
 
+        // Roll the per-pass failures into the result and persist the per-metric failure map so all
+        // three flush entry points surface a consistent "X hasn't synced" state; a same-pass success
+        // clears a prior failure so a re-enabled type self-heals. (#135)
+        result.failures = pendingFlushFailures
+        Self.recordFlushOutcome(written: writtenKinds, failed: pendingFlushFailures)
         return result
     }
 
@@ -258,7 +406,7 @@ final class HealthKitWriter {
                 try await write(sleep: segs)
                 try store.markNapWritten(start: nap.start)
                 written += 1
-            } catch { break }   // stop on first failure; unwritten naps retry next flush
+            } catch { pendingFlushFailures.insert(.sleep); break }   // surface + stop; naps retry next flush
         }
         return written
     }
@@ -364,16 +512,47 @@ final class HealthKitWriter {
         }
     }
 
-    /// Write scalar samples. Caller filters with SyncCursor first.
-    func write(_ samples: [QuantitySample]) async throws {
-        let hkSamples: [HKQuantitySample] = samples.compactMap { s in
-            guard let type = Self.quantityType(for: s.kind) else { return nil }
-            let q = HKQuantity(unit: Self.unit(for: s.kind), doubleValue: s.value)
-            return HKQuantitySample(type: type, quantity: q, start: s.start, end: s.end,
-                                    metadata: Self.metadata(for: s.kind))
+    /// Outcome of a split scalar write (#132): which input samples actually LANDED (so the caller
+    /// advances only their watermark) and which metric KINDS threw (so they're surfaced + retried).
+    struct ScalarWriteOutcome {
+        var written: [QuantitySample] = []
+        var failed: Set<MetricKind> = []
+    }
+
+    /// Whether the derived distance estimate may be WRITTEN + GPS-credited this pass. Distance rides
+    /// the step rows' single `healthWritten` flag, so it may only land when steps saved (rows marked
+    /// written, so nothing re-derives) AND distance itself wasn't denied — else a granted distance
+    /// re-writes every flush while steps stay pending and HealthKit sums the duplicate (#132 fix).
+    static func distanceMayWrite(stepsFailed: Bool, distanceFailed: Bool) -> Bool {
+        !stepsFailed && !distanceFailed
+    }
+
+    /// Write scalar samples, SPLIT per metric kind. Caller filters with SyncCursor first.
+    ///
+    /// The batch is grouped by `MetricKind` and each group saved on its own, so a single DENIED
+    /// type (which makes `store.save` throw `errorAuthorizationDenied` for everything in one call)
+    /// no longer sinks the whole batch — the granted metrics still reach Health and only the denied
+    /// kind is reported as failed and left pending (#132). Non-throwing: failures are returned, not
+    /// raised, so the caller can advance watermarks per surviving kind.
+    func write(_ samples: [QuantitySample]) async -> ScalarWriteOutcome {
+        var outcome = ScalarWriteOutcome()
+        let byKind = Dictionary(grouping: samples, by: \.kind)
+        for (kind, group) in byKind {
+            let hk: [HKQuantitySample] = group.compactMap { s in
+                guard let type = Self.quantityType(for: s.kind) else { return nil }
+                let q = HKQuantity(unit: Self.unit(for: s.kind), doubleValue: s.value)
+                return HKQuantitySample(type: type, quantity: q, start: s.start, end: s.end,
+                                        metadata: Self.metadata(for: s.kind))
+            }
+            guard !hk.isEmpty else { continue }   // no writable HK type for this kind — nothing to save
+            do {
+                try await store.save(hk)
+                outcome.written.append(contentsOf: group)
+            } catch {
+                outcome.failed.insert(kind)   // this metric is denied/failing; others still land
+            }
         }
-        guard !hkSamples.isEmpty else { return }
-        try await store.save(hkSamples)
+        return outcome
     }
 
     /// Metadata key on HRV samples flagging which statistic the value actually is.
@@ -591,7 +770,7 @@ final class HealthKitWriter {
                 try await writeRestingHR(bpm: d.bpm, day: d.day)
                 written += 1
                 newWatermark = d.day
-            } catch { break }  // stop at the first failure; already-written days stay covered
+            } catch { pendingFlushFailures.insert(.restingHeartRate); break }  // surface; stop, already-written days stay covered
         }
         if newWatermark > lastWritten {
             defaults.set(newWatermark.timeIntervalSince1970, forKey: Self.rhrWatermarkKey)
@@ -671,7 +850,7 @@ final class HealthKitWriter {
             defaults.set(today.timeIntervalSince1970, forKey: Self.activeDayKey)
             defaults.set(total, forKey: Self.activeWrittenKey)
             return delta
-        } catch { return 0 }
+        } catch { pendingFlushFailures.insert(.activeEnergy); return 0 }
     }
 
     /// The user's body profile, read from the shared `@AppStorage` keys (the same keys

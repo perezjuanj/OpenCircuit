@@ -63,6 +63,100 @@ final class HealthKitShareTypesTests: XCTestCase {
         XCTAssertEqual(defaults.double(forKey: HealthKitWriter.workoutActiveKcalKey), 30)
     }
 
+    // MARK: Partial-grant share state (#132)
+
+    /// A PARTIAL grant (heart rate on, other types off) must resolve to `.partial` with exactly the
+    /// denied set — not the blanket "authorized" that silently drops those metrics.
+    func testShareStatePartialListsDeniedTypes() {
+        let types = HealthKitWriter().allTypes
+        let spo2 = HKQuantityType(.oxygenSaturation)
+        let temp = HKQuantityType(.basalBodyTemperature)
+        let state = HealthKitWriter.resolveShareState(authorizableTypes: types) { type in
+            (type.isEqual(spo2) || type.isEqual(temp)) ? .sharingDenied : .sharingAuthorized
+        }
+        guard case .partial(let denied) = state else {
+            return XCTFail("expected .partial, got \(state)")
+        }
+        XCTAssertEqual(Set(denied), [spo2, temp])
+    }
+
+    func testShareStateAuthorizedWhenAllGranted() {
+        let types = HealthKitWriter().allTypes
+        let state = HealthKitWriter.resolveShareState(authorizableTypes: types) { _ in .sharingAuthorized }
+        XCTAssertEqual(state, .authorized)
+    }
+
+    /// Heart rate itself not granted ⇒ unauthorized regardless of the rest (mirrors isShareAuthorized).
+    func testShareStateUnauthorizedWhenHeartRateNotGranted() {
+        let types = HealthKitWriter().allTypes
+        let state = HealthKitWriter.resolveShareState(authorizableTypes: types) { type in
+            type.isEqual(HKQuantityType(.heartRate)) ? .notDetermined : .sharingAuthorized
+        }
+        XCTAssertEqual(state, .unauthorized)
+    }
+
+    /// Friendly names map through MetricKind, collapse both BP constituents to one label, and sort.
+    func testFriendlyNamesMapAndDedupe() {
+        let names = HealthKitWriter.friendlyNames(for: [
+            HKQuantityType(.oxygenSaturation),
+            HKQuantityType(.basalBodyTemperature),
+            HKQuantityType(.bloodPressureSystolic),
+            HKQuantityType(.bloodPressureDiastolic),   // collapses with systolic → one "Blood Pressure"
+            HKCategoryType(.sleepAnalysis),
+        ])
+        XCTAssertEqual(names, ["Blood Pressure", "Skin Temp", "Sleep", "SpO₂"])
+    }
+
+    // MARK: Persisted per-metric write-failure map (#135)
+
+    /// The failure map stamps failed metrics, clears a metric on its next successful write, and
+    /// keeps "nothing pending" (empty map) distinct from "writes failing".
+    func testWriteFailureMapPersistsAndClearsPerMetric() {
+        let suite = "HealthKitShareTypesTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertTrue(HealthKitWriter.healthWriteFailures(defaults).isEmpty)
+
+        // SpO₂ + Sleep fail this pass; HR wrote fine.
+        HealthKitWriter.recordFlushOutcome(written: [.heartRate], failed: [.spo2, .sleep],
+                                           now: Date(timeIntervalSince1970: 1000), defaults)
+        XCTAssertEqual(Set(HealthKitWriter.healthWriteFailures(defaults).keys), [.spo2, .sleep])
+
+        // Next pass: SpO₂ recovers (a later success wins), Sleep still failing → only Sleep remains.
+        HealthKitWriter.recordFlushOutcome(written: [.spo2], failed: [.sleep],
+                                           now: Date(timeIntervalSince1970: 2000), defaults)
+        XCTAssertEqual(Set(HealthKitWriter.healthWriteFailures(defaults).keys), [.sleep])
+
+        // Sleep recovers → map empties (back to a clean "nothing failing" state).
+        HealthKitWriter.recordFlushOutcome(written: [.sleep], failed: [],
+                                           now: Date(timeIntervalSince1970: 3000), defaults)
+        XCTAssertTrue(HealthKitWriter.healthWriteFailures(defaults).isEmpty)
+    }
+
+    /// A FlushResult with a failure but no writes is still NOT "wrote anything" — the UI must be able
+    /// to tell an idle store (no failures) from a failing one.
+    func testFlushResultFailuresDefaultEmptyAndDoNotCountAsWrite() {
+        var r = HealthKitWriter.FlushResult()
+        XCTAssertTrue(r.failures.isEmpty)
+        XCTAssertFalse(r.wroteAnything)
+        r.failures = [.sleep]
+        XCTAssertFalse(r.wroteAnything)
+    }
+
+    /// Distance is DERIVED from step rows and rides their single watermark, so it must only write
+    /// when steps saved — else a granted distance re-derives + re-writes every flush while the rows
+    /// stay pending and HealthKit sums the duplicate (~N× inflation). Guards that regression.
+    func testDistanceOnlyWritesWhenStepsSucceeded() {
+        // Steps failed → distance must NOT write/commit, regardless of distance's own status.
+        XCTAssertFalse(HealthKitWriter.distanceMayWrite(stepsFailed: true, distanceFailed: false))
+        XCTAssertFalse(HealthKitWriter.distanceMayWrite(stepsFailed: true, distanceFailed: true))
+        // Steps ok + distance denied → skip distance (deferred with the rows).
+        XCTAssertFalse(HealthKitWriter.distanceMayWrite(stepsFailed: false, distanceFailed: true))
+        // Both ok → distance writes.
+        XCTAssertTrue(HealthKitWriter.distanceMayWrite(stepsFailed: false, distanceFailed: false))
+    }
+
     func testDailyActiveEnergyNetsWorkoutCaloriesFromChosenDailyEstimate() {
         // HR channel dominates → credit nets the HR-derived daily estimate.
         XCTAssertEqual(
