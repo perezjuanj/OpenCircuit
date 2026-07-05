@@ -235,7 +235,9 @@ struct VitalsTableView: View {
             divider
             row("Steps (today)", value: stepsText, time: stepsTime)
             divider
-            nightlyMeanRow("Respiratory Rate", .respiratoryRate) { String(format: "%.1f /min", $0) }
+            nightlyMeanRow("Respiratory Rate", .respiratoryRate) {
+                String(format: "%.1f \(UnitsFormatter.respiratoryRateUnit)", $0)
+            }
         }
         .padding(.vertical, 4)
         // Resolve the (async) sleep-schedule window once the view appears. The selector

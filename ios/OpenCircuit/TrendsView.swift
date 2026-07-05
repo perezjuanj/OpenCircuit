@@ -41,8 +41,9 @@ struct TrendsView: View {
     @State private var points: [TrendsEngine.DailyPoint] = []
     @State private var recentMetricRows: [RecentMetricRow] = []
     @State private var loading = true
-    // Display units (#83): values are stored in °C; only the display layer converts.
+    // Display units (#83): values are stored in SI (°C, metres); only the display layer converts.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
+    @AppStorage("units.distance") private var distUnitRaw = DistanceUnit.localeDefault.rawValue
     @State private var selectedDay: Date?
 
     var body: some View {
@@ -155,16 +156,19 @@ struct TrendsView: View {
                       avg: avgs.daySpO2Avg.map { $0 * 100 },
                       formatAvg: { String(format: "%.1f", $0) })
 
-            chartCard(title: "Respiratory Rate", unit: "brpm",
+            chartCard(title: "Respiratory Rate", unit: UnitsFormatter.respiratoryRateUnit,
                       color: .teal,
                       data: points.compactMap { p in p.dayRRAvg.map { (p.date, $0) } },
                       avg: avgs.dayRRAvg,
                       formatAvg: { String(format: "%.1f", $0) })
 
-            chartCard(title: "Skin Temp (daytime)", unit: "°C",
+            // Daytime skin temp is an absolute temperature — full convert (incl. +32 for °F), not
+            // convertDelta (that's for the nightly baseline offset). Matches the nightly chart below.
+            let tempUnit = TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius
+            chartCard(title: "Skin Temp (daytime)", unit: tempUnit.symbol,
                       color: .orange,
-                      data: points.compactMap { p in p.dayTempC.map { (p.date, $0) } },
-                      avg: avgs.dayTempC,
+                      data: points.compactMap { p in p.dayTempC.map { (p.date, tempUnit.convert(fromCelsius: $0)) } },
+                      avg: avgs.dayTempC.map { tempUnit.convert(fromCelsius: $0) },
                       formatAvg: { String(format: "%.1f", $0) })
         }
     }
@@ -228,7 +232,7 @@ struct TrendsView: View {
                       avg: avgs.sleepSpO2Avg.map { $0 * 100 },
                       formatAvg: { String(format: "%.1f", $0) })
 
-            chartCard(title: "Sleep-Window RR", unit: "brpm",
+            chartCard(title: "Sleep-Window RR", unit: UnitsFormatter.respiratoryRateUnit,
                       color: .teal,
                       data: points.compactMap { p in p.sleepRRAvg.map { (p.date, $0) } },
                       avg: avgs.sleepRRAvg,
@@ -251,10 +255,11 @@ struct TrendsView: View {
                       avg: avgs.activeEnergyKcal,
                       formatAvg: { "\(Int($0.rounded()))" })
 
-            chartCard(title: "Distance (est.)", unit: "km",
+            let distUnit = DistanceUnit(rawValue: distUnitRaw) ?? .metric
+            chartCard(title: "Distance (est.)", unit: distUnit.symbol,
                       color: .indigo,
-                      data: points.compactMap { p in p.distanceM.map { (p.date, $0 / 1000.0) } },
-                      avg: avgs.distanceM.map { $0 / 1000.0 },
+                      data: points.compactMap { p in p.distanceM.map { (p.date, distUnit.convert(fromMeters: $0)) } },
+                      avg: avgs.distanceM.map { distUnit.convert(fromMeters: $0) },
                       formatAvg: { String(format: "%.1f", $0) })
 
             chartCard(title: "Exercise Time (est.)", unit: "min",
@@ -502,7 +507,8 @@ struct TrendsView: View {
         daytimeTemps: [StoredDaytimeTemp],
         stepSamples: [StoredStepSample]
     ) -> [RecentMetricRow] {
-        [
+        let tempUnit = TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius
+        return [
             RecentMetricRow(
                 metricKey: "steps",
                 title: "Steps",
@@ -535,13 +541,14 @@ struct TrendsView: View {
             RecentMetricRow(
                 metricKey: "temperature",
                 title: "Skin Temp",
-                unit: "°C",
+                unit: tempUnit.symbol,
                 color: .orange,
                 rows: Array(daytimeTemps
                     .filter { $0.celsius > 0 }
                     .suffix(Self.recentRowsLimit)
                     .reversed())
-                    .map { (time: $0.time, value: String(format: "%.1f °C", $0.celsius)) }
+                    .map { (time: $0.time,
+                            value: String(format: "%.1f \(tempUnit.symbol)", tempUnit.convert(fromCelsius: $0.celsius))) }
             ),
             RecentMetricRow(
                 metricKey: "hrv",
@@ -555,10 +562,10 @@ struct TrendsView: View {
             RecentMetricRow(
                 metricKey: "rr",
                 title: "Respiratory Rate",
-                unit: "brpm",
+                unit: UnitsFormatter.respiratoryRateUnit,
                 color: .teal,
                 rows: recentRows(from: rrSamples.filter { $0.value > 0 }) {
-                    String(format: "%.1f /min", $0.value)
+                    String(format: "%.1f \(UnitsFormatter.respiratoryRateUnit)", $0.value)
                 }
             )
         ]
