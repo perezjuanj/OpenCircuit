@@ -321,9 +321,14 @@ final class HealthKitWriter {
         // Distance is netted/credited per CALENDAR DAY (the GPS-credit ledger in UserDefaults is
         // day-keyed), so snapshots are grouped by day rather than assuming one day's worth.
         if let pending = try? store.pendingStepSamples(), !pending.isEmpty {
-            var toWrite: [QuantitySample] = pending.map {
+            let stepSamples: [QuantitySample] = pending.map {
                 QuantitySample(kind: .steps, start: $0.start, end: $0.end, value: Double($0.delta))
             }
+            // Derive the per-day distance samples (and their GPS-credit reductions) up front, but do
+            // NOT fold them into the step write — see the coupling note below. `netDistanceEstimate`
+            // only COMPUTES the net (reading the day-keyed GPS ledger); the ledger is mutated solely
+            // by `commitDistanceGPSCredit`, which we defer until distance actually writes.
+            var distanceSamples: [QuantitySample] = []
             var gpsCommits: [(reduction: Double, day: Date)] = []
             let byDay = Dictionary(grouping: pending) { Calendar.current.startOfDay(for: $0.end) }
             for (day, rows) in byDay {
@@ -332,39 +337,49 @@ final class HealthKitWriter {
                 let (netDistanceM, gpsReduction) = Self.netDistanceEstimate(rawDistanceM, day: day)
                 if netDistanceM > 0 {
                     let dayEnd = rows.map(\.end).max() ?? day
-                    toWrite.append(QuantitySample(kind: .distance, start: day, end: dayEnd, value: netDistanceM))
+                    distanceSamples.append(QuantitySample(kind: .distance, start: day, end: dayEnd, value: netDistanceM))
                 }
                 gpsCommits.append((gpsReduction, day))
             }
-            // Scalar KINDS split independently (#132), but steps and the DERIVED distance stay
-            // COUPLED: distance has no watermark of its own — it's re-derived from the same
-            // `StoredStepSample` rows every flush and rides their `healthWritten` flag (advanced only
-            // by `markStepSamplesWritten`). So distance may only be written/committed when the step
-            // rows are being marked written THIS pass (i.e. steps saved). Otherwise a granted-distance
-            // sample would re-derive + re-write on every subsequent flush while the rows stay pending,
-            // and HealthKit SUMS it → the day's distance inflates ~N×. If steps failed, skip distance
-            // entirely (no write, no GPS credit) so it's deferred, not duplicated.
-            let outcome = await write(toWrite)
-            if !outcome.failed.contains(.steps) {
+            // Scalar KINDS split independently (#132), but steps and the DERIVED distance stay COUPLED:
+            // distance has no watermark of its own — it's re-derived from the same `StoredStepSample`
+            // rows every flush and rides their `healthWritten` flag (advanced only by
+            // `markStepSamplesWritten`). So distance is written in a SEPARATE pass that runs ONLY after
+            // the step rows are marked written this flush. Folding distance into the step batch would
+            // let a granted-distance sample LAND even when the steps save fails (the per-kind split
+            // saves each kind independently) — and, with the rows still pending, re-derive + re-write
+            // every subsequent flush → HealthKit SUMS it → the day's distance inflates ~N×. Writing
+            // distance only after a successful step save defers it instead of duplicating it.
+            let stepsOutcome = await write(stepSamples)
+            if !stepsOutcome.failed.contains(.steps) {
                 try? store.markStepSamplesWritten(pending)
                 result.steps = pending.reduce(0) { $0 + $1.delta }
                 writtenKinds.insert(.steps)
-                // Steps landed → the rows won't be re-derived, so it's safe to write/commit distance.
-                if Self.distanceMayWrite(stepsFailed: false, distanceFailed: outcome.failed.contains(.distance)) {
-                    for commit in gpsCommits { Self.commitDistanceGPSCredit(commit.reduction, day: commit.day) }
-                    let distanceWritten = outcome.written.filter { $0.kind == .distance }.reduce(0) { $0 + $1.value }
-                    result.distanceM = distanceWritten
-                    if distanceWritten > 0 { writtenKinds.insert(.distance) }
-                } else {
-                    pendingFlushFailures.insert(.distance)
+                // Steps landed and the rows are now marked written → safe to write/commit distance.
+                if !distanceSamples.isEmpty {
+                    let distanceOutcome = await write(distanceSamples)
+                    if Self.distanceMayWrite(stepsFailed: false,
+                                             distanceFailed: distanceOutcome.failed.contains(.distance)) {
+                        for commit in gpsCommits { Self.commitDistanceGPSCredit(commit.reduction, day: commit.day) }
+                        let distanceWritten = distanceOutcome.written
+                            .filter { $0.kind == .distance }.reduce(0) { $0 + $1.value }
+                        result.distanceM = distanceWritten
+                        if distanceWritten > 0 { writtenKinds.insert(.distance) }
+                    } else {
+                        // TRADEOFF (accepted): steps granted + distance denied → this window's distance
+                        // estimate is skipped and won't backfill if the user later enables Distance,
+                        // because the step rows are already marked written. Distance is a DERIVED
+                        // estimate (steps × stride), not measured data; a separate `distanceWritten`
+                        // flag + migration to make it independently backfillable is out of scope. The
+                        // GPS credit is NOT committed here, so it isn't consumed against a write that
+                        // didn't happen.
+                        pendingFlushFailures.insert(.distance)
+                    }
                 }
             }
-            // TRADEOFF (accepted): steps granted + distance denied → that window's distance estimate
-            // is skipped and won't backfill if the user later enables Distance, because the step rows
-            // are already marked written. Distance is a DERIVED estimate (steps × stride), not measured
-            // data; a separate `distanceWritten` flag + migration to make it independently backfillable
-            // is out of scope. If steps FAILED, distance failure isn't recorded — it's simply deferred.
-            pendingFlushFailures.formUnion(outcome.failed.subtracting([.distance]))
+            // If steps FAILED, distance was never written (deferred with the rows), so no distance
+            // failure is recorded here.
+            pendingFlushFailures.formUnion(stepsOutcome.failed.subtracting([.distance]))
         }
         // Derived daily resting HR — one sample per finalized day (#18, #37). Idempotency is a
         // UserDefaults day-watermark, NOT the store cursor: RHR isn't a stored sample, and the
