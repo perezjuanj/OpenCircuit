@@ -1,6 +1,7 @@
 import Foundation
 import OpenCircuitKit
 import UserNotifications
+import UIKit
 
 // THE shared local-notification service for health alerts (#73) and skin-temp/fever
 // notifications (#85). There is exactly ONE of these engines: a single quiet-hours/DND window,
@@ -417,18 +418,75 @@ struct HealthNotificationCenter {
         store.markFired(fire)
     }
 
+    /// UserDefaults flag: we've already attempted the one-time provisional→full upgrade prompt for
+    /// the opted-in body-vital alerts (#133). iOS only ever presents that upgrade prompt once, so
+    /// this stops us re-attempting on every toggle/alert fire and makes the user's choice stick —
+    /// "Keep Delivering Quietly" stays provisional (silent), "Turn Off" → `.denied` (the #136 banner
+    /// then surfaces so they can re-enable). Shared by the engine's `ensureAuthorized()`
+    /// and the Settings opt-in path (`requestFullAuthorizationIfNeeded`).
+    static let fullAuthRequestedKey = "alerts.health.fullAuthRequested"
+
     /// Request notification authorization LAZILY — only the first time there's actually something
     /// to post, so a user who never crosses a threshold is never prompted. These are alerts the
     /// user opted into in Settings, so we request a standard (visible) authorization.
     private func ensureAuthorized() async -> Bool {
         let settings = await center.notificationSettings()
         switch settings.authorizationStatus {
-        case .authorized, .provisional, .ephemeral:
+        case .authorized, .ephemeral:
+            return true
+        case .provisional:
+            // A provisional-only grant (won first by the nightly morning-summary / observability
+            // paths, #133) delivers EVERY notification silently — including the high-HR / low-SpO2 /
+            // fever alerts the user opted into. Attempt the one-time upgrade to full alert+sound+badge
+            // so those surface with a banner + sound, then deliver regardless of the outcome:
+            // provisional delivery still beats dropping the alert. This does NOT touch the provisional
+            // REQUEST sites in RingSession / ObservabilityStore — those stay quiet by design.
+            await requestFullAuthorizationIfNeeded()
             return true
         case .notDetermined:
             return (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
         default:
             return false
+        }
+    }
+
+    /// Escalate a provisional (or not-yet-determined) grant to FULL alert+sound+badge notification
+    /// authorization for the opted-in body-vital alerts (#133). Call from a FOREGROUND consent
+    /// moment — the Settings ▸ Health-alerts opt-in toggles — where iOS can actually present the
+    /// prompt (a background wake-drain cannot). This pre-empts the provisional grant that the
+    /// morning-summary / observability paths would otherwise win first, so an enabled alert delivers
+    /// loudly instead of silently.
+    ///
+    /// Idempotent + flag-guarded (`fullAuthRequestedKey`): attempts the upgrade at most once, since
+    /// iOS shows the provisional→explicit prompt only a single time. A prior choice is respected
+    /// (we don't nag): "Keep Delivering Quietly" stays provisional, "Turn Off" → `.denied`.
+    /// Already-authorized/ephemeral is a no-op.
+    /// Deliberately leaves the morning-summary (`RingSession`) / observability (`ObservabilityStore`)
+    /// request sites untouched — those are SUPPOSED to stay provisional.
+    func requestFullAuthorizationIfNeeded() async {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.fullAuthRequestedKey) else { return }
+        switch await center.notificationSettings().authorizationStatus {
+        case .notDetermined, .provisional:
+            // iOS can only present the permission prompt while the app is FOREGROUND-ACTIVE. If we
+            // requested here in the background — e.g. an opted-in alert firing during an hourly
+            // wake-drain, and these alerts are ON BY DEFAULT — no prompt would appear, yet the
+            // one-shot flag below would still be burned, permanently stranding a provisional user
+            // (#133). So gate on `.active`: a background provisional fire still DELIVERS (the caller
+            // `ensureAuthorized()` returns true for `.provisional`), and the flag stays unburned so
+            // the next foreground eval or the Settings toggle presents the real upgrade prompt.
+            guard UIApplication.shared.applicationState == .active else { return }
+            // Foreground: iOS presents the standard opt-in prompt (or the provisional→explicit
+            // upgrade prompt). Mark attempted regardless of the result — the prompt is one-shot.
+            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+            defaults.set(true, forKey: Self.fullAuthRequestedKey)
+        case .authorized, .ephemeral:
+            // Already delivering visibly — record so we skip the probe next time.
+            defaults.set(true, forKey: Self.fullAuthRequestedKey)
+        default:
+            // .denied: respect it (the Settings banner, #136, is where the user re-enables). Leave
+            // the flag unset so a later re-enable can still upgrade to full when it next fires.
+            break
         }
     }
 
