@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import OpenCircuitKit
+import UIKit   // UIApplication.openSettingsURLString for the Bluetooth-off / denied deep link (#134)
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
@@ -17,6 +18,10 @@ struct ContentView: View {
     @State private var healthPromptExhausted = false
     @Environment(\.openURL) private var openURL
     @State private var lastWrite: String?
+    /// Drives the "Bluetooth is off" explainer alert from the connect card's Turn-on-Bluetooth
+    /// control (#134). iOS offers no programmatic BT toggle, so we explain + optionally deep-link
+    /// to Settings rather than a silent no-op.
+    @State private var showBluetoothOffAlert = false
     @State private var showDebug = false
     @State private var showWorkout = false
     @State private var showCalibration = false
@@ -515,25 +520,127 @@ struct ContentView: View {
                         }
                     }
                 case .connecting:
-                    // The status line above already says "Connecting…", but a pending connect has no
-                    // timeout — give the user an escape hatch so a ring that's out of range can't wedge
-                    // the card forever.
+                    // The status line above already says "Connecting…" (or, after repeated failures,
+                    // "Ring unreachable — reconnecting automatically"). A pending connect has no
+                    // timeout, so give the user an escape hatch. Cancel is now STICKY (#140): it calls
+                    // forgetActiveRing() so hasSavedRing → false and the foreground auto-refresh won't
+                    // silently re-arm the reconnect (the old disconnect() left it re-armable). When the
+                    // reconnect has stalled, relabel it "Stop reconnecting" to match the calmer status.
                     HStack {
                         Spacer()
-                        Button("Cancel") { scanner.disconnect() }.font(.subheadline)
+                        Button(scanner.reconnectStalled ? "Stop reconnecting" : "Cancel") {
+                            scanner.forgetActiveRing()
+                        }.font(.subheadline)
                     }
+                case .noRingFound:
+                    noRingFoundCard   // #139: terminal, actionable "no ring found" with hints
                 default:
-                    Button {
-                        scanner.start()
-                    } label: {
-                        Label("Scan & connect", systemImage: "dot.radiowaves.left.and.right")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
+                    // .idle / .poweredOff / .unauthorized — the actionable connect control depends on
+                    // whether Bluetooth is usable RIGHT NOW (#134), not just the scanner's own state,
+                    // so a tap gives feedback instead of a silent no-op when BT is off/denied/ungranted.
+                    connectControl
                 }
             }
         }
+        // iOS exposes no programmatic Bluetooth toggle, so the "Turn on Bluetooth" control explains
+        // where to enable it and (optionally) deep-links to Settings, rather than doing nothing (#134).
+        .alert("Bluetooth is off", isPresented: $showBluetoothOffAlert) {
+            Button("Open Settings") { openURL(Self.settingsURL) }
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Turn Bluetooth on in Control Center or Settings, then tap Scan & connect.")
+        }
     }
+
+    // MARK: Connect control (#134/#139) — the actionable button(s) shown when not connected
+
+    /// The connect control shown when no ring is connected and we're not mid-scan/connect. Switches on
+    /// the live Bluetooth availability (#134) so the user gets a real next step — a system prompt, a
+    /// Settings deep-link, or an explainer — instead of a silent no-op. `.ready`/`.notDetermined` both
+    /// route through `scanner.start()`: it lazily creates the central (firing the system prompt on
+    /// first use, #142) and the pending-scan path runs the scan once Bluetooth reports `.poweredOn`.
+    @ViewBuilder
+    private var connectControl: some View {
+        switch scanner.btAvailability {
+        case .ready, .notDetermined:
+            scanButton
+        case .poweredOff:
+            Button {
+                showBluetoothOffAlert = true
+            } label: {
+                Label("Turn on Bluetooth", systemImage: "dot.radiowaves.left.and.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+        case .denied:
+            VStack(spacing: 6) {
+                Button {
+                    openURL(Self.settingsURL)
+                } label: {
+                    Label("Allow Bluetooth in Settings", systemImage: "gear")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                Text("OpenCircuit needs Bluetooth to find your ring. Enable it in Settings ▸ OpenCircuit ▸ Bluetooth, then come back and tap Scan & connect.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// The standard "Scan & connect" button. Extracted so the availability switch above can reuse it
+    /// for both `.ready` and `.notDetermined` (a first-run tap creates the central and prompts).
+    private var scanButton: some View {
+        Button {
+            scanner.start()
+        } label: {
+            Label("Scan & connect", systemImage: "dot.radiowaves.left.and.right")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+    }
+
+    /// Terminal "no ring found" card (#139): a scan that turned up nothing is now an actionable dead
+    /// end — headline + product-accurate hints + a prominent "Search again" — instead of silently
+    /// reverting to "Ready". BT-off/denied is handled earlier by the availability branches, so this
+    /// copy assumes Bluetooth is fine and points at the real culprits (charging case / official app /
+    /// range).
+    private var noRingFoundCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("No ring found").font(.subheadline.weight(.medium))
+            VStack(alignment: .leading, spacing: 4) {
+                noRingHint("Take the ring out of its charging case and put it on.")
+                noRingHint("Close the official RingConn app — it can hold the Bluetooth connection (only one app can pull the ring).")
+                noRingHint("Keep the ring within a few feet of your phone.")
+                if scanner.hasSavedRing {
+                    noRingHint("A ring you’ve paired before reconnects automatically once it’s back in range.")
+                }
+            }
+            Button {
+                scanner.start()
+            } label: {
+                Label("Search again", systemImage: "arrow.clockwise")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.top, 2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// One bulleted hint row for the no-ring-found card.
+    private func noRingHint(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "circle.fill").font(.system(size: 5)).foregroundStyle(.tertiary)
+                .padding(.top, 6)
+            Text(text).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// App-settings deep link (`UIApplication.openSettingsURLString`) — the app's own Settings page,
+    /// which exposes its Bluetooth permission toggle. iOS doesn't allow deep-linking straight to the
+    /// system BT switch, so the poweredOff alert also mentions Control Center. (#134)
+    private static let settingsURL = URL(string: UIApplication.openSettingsURLString)!
 
     /// The ring list shown on the dashboard when a fresh "Scan & connect" finds more than one ring.
     /// (Switching rings later uses the dedicated picker sheet in Device Info.) Tapping a row connects
@@ -600,7 +707,7 @@ struct ContentView: View {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Ring isn't streaming").font(.subheadline.weight(.medium))
-                Text("Connected, but the ring isn't sending data. Open the official RingConn app once to activate it, then return here.")
+                Text("Connected, but the ring isn't sending data. Open the official RingConn app once to activate it, then fully close it (swipe it away) and return here — only one app can pull the ring at a time.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -1205,6 +1312,7 @@ struct ContentView: View {
     private var statusText: String {
         switch scanner.state {
         case .idle: return "Ready"
+        case .noRingFound: return "No ring found"
         case .poweredOff: return "Bluetooth off"
         case .unauthorized: return "Bluetooth not authorized"
         case .scanning: return "Scanning…"

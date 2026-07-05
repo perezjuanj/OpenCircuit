@@ -19,6 +19,21 @@ final class RingScanner: NSObject {
 
     enum State: Equatable {
         case poweredOff, unauthorized, scanning, connecting(String), connected(String), idle
+        /// A foreground scan finished without finding any ring (#139). Terminal + actionable — the
+        /// connection card shows hints + a "Search again" button instead of silently reverting to
+        /// "Ready". Self-clearing: `start()` moves back to `.scanning`. Treated like `.idle` (a
+        /// disconnected, actionable state) by every "are we connected?" check.
+        case noRingFound
+    }
+
+    /// The actionable Bluetooth condition surfaced to the connect UI (#134). Distinguishes the four
+    /// states the user can (or can't) act on, so "Scan & connect" gives feedback instead of a silent
+    /// no-op when Bluetooth is off / denied / not-yet-granted.
+    enum BTAvailability: Equatable {
+        case ready          // powered on (or authorized but the central isn't created yet) → a tap scans
+        case poweredOff     // BT hardware/toggle is off → the user must enable it in Settings / Control Center
+        case denied         // the app was denied BT permission → the user must allow it in Settings
+        case notDetermined  // permission never requested → a tap should create the central and prompt
     }
 
     /// Shared instance. State restoration + background relaunch require a SINGLE
@@ -31,7 +46,12 @@ final class RingScanner: NSObject {
     private(set) var state: State = .idle
     private(set) var session: RingSession?
 
-    private var central: CBCentralManager!
+    /// LAZY (#142): created only when Bluetooth is actually needed (first connect / saved-ring
+    /// restore), NOT at app launch. Allocating a `CBCentralManager` is what triggers the iOS
+    /// Bluetooth permission prompt, so eager creation in `init()` fired the prompt before onboarding
+    /// even explained it. `ensureCentral()` creates it on demand; every access is `central?.…` and
+    /// no-ops safely when it's still nil (e.g. a fresh install that never tapped connect).
+    private var central: CBCentralManager?
     private var target: CBPeripheral?
     private var localStore: LocalStore?
 
@@ -99,9 +119,64 @@ final class RingScanner: NSObject {
     /// The active ring's id, for the connect UI (the "Last used" picker badge).
     var activeRingID: String? { Self.activePeripheralID }
 
+    /// True when a ring was connected at least once (persisted in the remembered set), read WITHOUT
+    /// touching `.shared` or creating the central (#142). The AppDelegate launch gate uses this to
+    /// decide whether to arm reconnection early — which creates the central for state restoration —
+    /// so a fresh install (nothing saved) never allocates a central at launch and never fires the BT
+    /// prompt before onboarding. Gated on "any ring ever saved" (not `onboardingCompleted`, not only
+    /// `activePeripheralID`: an explicit Stop clears the active ring but the ring stays remembered and
+    /// should still restore). Also honours the legacy single-ring key so a not-yet-migrated returning
+    /// user still restores on their first post-update launch.
+    nonisolated static var hasSavedRingToRestore: Bool {
+        let d = UserDefaults.standard
+        if let ids = d.stringArray(forKey: savedPeripheralIDsKey), !ids.isEmpty { return true }
+        if d.string(forKey: activePeripheralIDKey) != nil { return true }
+        if d.string(forKey: legacyPeripheralKey) != nil { return true }   // pre-multi-ring, not yet migrated
+        return false
+    }
+
+    /// The actionable Bluetooth condition for the connect UI (#134). Reading this must NOT create a
+    /// central: it bases denied/notDetermined purely on the STATIC `CBCentralManager.authorization`
+    /// (iOS 13.1+), and poweredOff/ready on `central?.state` ONLY when the central already exists. So
+    /// a fresh install reads `.notDetermined` (a tap then creates the central and prompts) without any
+    /// allocation.
+    var btAvailability: BTAvailability {
+        Self.btAvailability(centralState: central?.state,
+                            authorization: CBCentralManager.authorization)
+    }
+
+    /// Pure, testable mapping (#134). Authorization gates denied/notDetermined; the live central state
+    /// (present only once the central is created) gates poweredOff/ready. When the app is authorized
+    /// but the central doesn't exist yet, treat as `.ready` so a tap creates it and — if BT is on —
+    /// scans immediately (the pending-scan path completes it once `.poweredOn` arrives).
+    nonisolated static func btAvailability(centralState: CBManagerState?,
+                                           authorization: CBManagerAuthorization) -> BTAvailability {
+        switch authorization {
+        case .denied, .restricted:
+            return .denied
+        case .notDetermined:
+            return .notDetermined
+        case .allowedAlways:
+            // Authorized: the central's power state decides ready vs. off. A nil central (not created
+            // yet) or a mid-transition (.unknown/.resetting) is treated as ready — let the tap proceed.
+            return centralState == .poweredOff ? .poweredOff : .ready
+        @unknown default:
+            return .notDetermined
+        }
+    }
+
     /// Set when a reconnect was requested before Bluetooth finished powering on; retried
     /// from `centralManagerDidUpdateState` once `.poweredOn` arrives.
     private var reconnectWhenPoweredOn = false
+
+    /// A scan requested before the (freshly-created, lazy) central finished powering on (#142). A
+    /// cold-created central is `.unknown` until `centralManagerDidUpdateState`, so the first "Scan &
+    /// connect" tap after the central is created would find `central?.state != .poweredOn` and
+    /// silently no-op — forcing a second tap. We stash the request here and run it from the
+    /// `.poweredOn` branch, mirroring `reconnectWhenPoweredOn`. Cleared on any non-poweredOn terminal
+    /// state (denied/off) and on user cancel/stop/disconnect so a stale scan never fires later.
+    private enum PendingScan { case start(services: [CBUUID]?), browse }
+    private var pendingScan: PendingScan?
 
     /// Consecutive failed auto-reconnect attempts since the last frame-delivering connect (#35).
     /// Drives the backoff delay (`ReconnectBackoff`); reset to 0 once a reconnected link proves
@@ -132,9 +207,21 @@ final class RingScanner: NSObject {
     private override init() {
         Self.migrateLegacyRingStateIfNeeded()
         super.init()
-        // Opting into state restoration: iOS preserves this central's connections/pending
-        // connects while the app is suspended and relaunches the app (into the background)
-        // when a relevant BLE event fires — delivered via `willRestoreState`.
+        // Deliberately does NOT create the CBCentralManager — that's deferred to `ensureCentral()`
+        // (#142) so merely constructing the shared scanner never triggers the Bluetooth permission
+        // prompt. The AppDelegate launch path only arms reconnection (which creates the central) for
+        // a returning user with a saved ring; a fresh install creates nothing until the user taps
+        // "Scan & connect".
+    }
+
+    /// Create the shared `CBCentralManager` on demand (#142). Opting into state restoration: iOS
+    /// preserves this central's connections/pending connects while the app is suspended and relaunches
+    /// the app (into the background) when a relevant BLE event fires — delivered via `willRestoreState`.
+    /// The restore identifier is constant so the SAME central is re-adopted across relaunches. Called
+    /// from every path that genuinely needs Bluetooth (scan / connect / reconnect-known / background
+    /// capture); idempotent — a no-op once the central exists.
+    private func ensureCentral() {
+        guard central == nil else { return }
         central = CBCentralManager(
             delegate: self,
             queue: .main,
@@ -175,7 +262,12 @@ final class RingScanner: NSObject {
     /// surfaces BEFORE a lone-ring auto-connect would fire — i.e. the picker isn't silently skipped.
     /// This only adds latency to the explicit "Scan & connect" tap, never to the silent reconnect path.
     private static let selectionQuietWindow: TimeInterval = 2.5
-    private static let scanTimeout: TimeInterval = 25
+    /// Foreground scan give-up window. Shortened from 25 s to 15 s (#139): the timeout now lands on the
+    /// actionable `.noRingFound` state (hints + "Search again") rather than silently reverting to
+    /// "Ready", so faster feedback beats a long spin. Still generous — rings advertise ~1 Hz, so 15 s
+    /// is many discovery chances. Only the explicit "Scan & connect" tap waits this out; the silent
+    /// reconnect-by-identifier path has no such timeout.
+    private static let scanTimeout: TimeInterval = 15
 
     /// Service filter for background scans. iOS only delivers scan results to a
     /// backgrounded app when `scanForPeripherals` filters by explicit service UUIDs;
@@ -190,7 +282,15 @@ final class RingScanner: NSObject {
     /// service, so filtering there could miss it. The background path passes
     /// `backgroundScanServices` because nil-filtered scans are dropped while backgrounded.
     func start(services: [CBUUID]? = nil) {
-        guard central.state == .poweredOn else { return }
+        ensureCentral()   // create the central on demand (#142); this is where the BT prompt fires
+        guard central?.state == .poweredOn else {
+            // The central was just created (state `.unknown` until `centralManagerDidUpdateState`) or
+            // BT is mid-power-on. Stash the request and run it from the `.poweredOn` branch so a
+            // SINGLE tap scans — without this, the first tap after a cold create silently no-ops. (#142)
+            wantConnection = true
+            pendingScan = .start(services: services)
+            return
+        }
         wantConnection = true
         resetReconnectBackoff()   // a fresh user scan starts clean — no lingering backoff/calm state
         // Foreground scans (nil filter) accumulate matches and let the user pick when >1 ring is in
@@ -202,7 +302,7 @@ final class RingScanner: NSObject {
             armScanTimeout()
         }
         state = .scanning
-        central.scanForPeripherals(withServices: services)
+        central?.scanForPeripherals(withServices: services)
     }
 
     /// Scan for OTHER nearby rings for the in-app "Connect a different ring" picker, WITHOUT dropping
@@ -211,24 +311,30 @@ final class RingScanner: NSObject {
     /// `discovered`, taps call `connect(to:)`, and dismissing calls `stopBrowsing()`. We deliberately
     /// do NOT enter the `.scanning` state — the existing connection (and its UI) stays as-is.
     func startBrowsing() {
-        guard central.state == .poweredOn else { return }
+        ensureCentral()   // create the central on demand (#142)
+        guard central?.state == .poweredOn else {
+            pendingScan = .browse   // run once the cold-created central powers on (#142)
+            return
+        }
         allowPicker = true     // didDiscover accumulates into `discovered` instead of connect-on-first
         choosingRing = true    // never auto-connect a lone ring — the user is explicitly choosing
         clearDiscovery()
-        central.scanForPeripherals(withServices: nil)
+        central?.scanForPeripherals(withServices: nil)
     }
 
     /// Stop the in-app picker scan (sheet dismissed / ring chosen). Leaves any current link intact.
     func stopBrowsing() {
         choosingRing = false
         clearDiscovery()
-        if central.state == .poweredOn { central.stopScan() }   // CB calls are UB before powered-on
+        pendingScan = nil
+        if central?.state == .poweredOn { central?.stopScan() }   // CB calls are UB before powered-on
     }
 
     /// Connect to a specific discovered ring — a picker tap, or the auto-connect of a lone match.
     /// Makes it the active ring on a successful connect (`didConnect` → `rememberRing`).
     func connect(to id: UUID) {
         guard let peripheral = discoveredPeripherals[id] else { return }
+        ensureCentral()   // a discovered ring implies a live central, but be explicit (#142)
         choosingRing = false
         resetReconnectBackoff()   // drop any pending backoff reconnect to the previous ring (#multi-ring)
         selectionDebounce?.cancel(); selectionDebounce = nil
@@ -236,19 +342,19 @@ final class RingScanner: NSObject {
         // CB calls are UB before powered-on — guard them (same as stop()/disconnect()). This is a
         // user picker tap: Bluetooth could have been toggled off in the gap between discovery and
         // the tap, unlike the other call sites here whose calling context already implies poweredOn.
-        guard central.state == .poweredOn else { return }
-        central.stopScan()
+        guard central?.state == .poweredOn else { return }
+        central?.stopScan()
         // Switching from a DIFFERENT live ring (the in-app picker scans without dropping the current
         // link): tear the old one down first so we don't leak its connection / run two sessions. The
         // identity guards in didDisconnect/didFailToConnect ignore the old ring's late callbacks.
         if let current = target, current.identifier != id {
-            central.cancelPeripheralConnection(current)
+            central?.cancelPeripheralConnection(current)
             teardownSession()
         }
         wantConnection = true
         target = peripheral
         state = .connecting(peripheral.name ?? "RingConn")
-        central.connect(peripheral)
+        central?.connect(peripheral)
     }
 
     /// Drop the discovery set and cancel its timers. Called on a fresh scan, on connect, and on stop.
@@ -284,8 +390,11 @@ final class RingScanner: NSObject {
             guard let self, !Task.isCancelled else { return }
             guard case .scanning = self.state, self.discovered.isEmpty else { return }
             self.selectionDebounce?.cancel(); self.selectionDebounce = nil
-            if self.central.state == .poweredOn { self.central.stopScan() }
-            self.state = .idle
+            if self.central?.state == .poweredOn { self.central?.stopScan() }
+            // Terminal, actionable state instead of silently reverting to "Ready" (#139): the card
+            // shows "No ring found" with hints + a "Search again" button. A scan that DID find rings
+            // keeps the picker up (this fires only when `discovered.isEmpty`).
+            self.state = .noRingFound
         }
     }
 
@@ -293,14 +402,15 @@ final class RingScanner: NSObject {
         wantConnection = false
         resetReconnectBackoff()   // user stop: cancel any pending backoff reconnect
         clearDiscovery()          // abandon any in-flight foreground scan / picker
+        pendingScan = nil         // drop any stashed cold-start scan (#142)
         choosingRing = false
         // Explicit user stop: clear the ACTIVE ring so we don't silently auto-reconnect on the next
         // launch (reconnect-by-identifier only re-arms while a ring is active). The ring stays in the
         // remembered set so it's still one tap away in the picker. (Reviewer MINOR.)
         Self.activePeripheralID = nil
-        if central.state == .poweredOn {   // CB calls are UB before powered-on
-            central.stopScan()
-            if let target { central.cancelPeripheralConnection(target) }
+        if central?.state == .poweredOn {   // CB calls are UB before powered-on
+            central?.stopScan()
+            if let target { central?.cancelPeripheralConnection(target) }
         }
         if case .scanning = state { state = .idle }
     }
@@ -311,8 +421,9 @@ final class RingScanner: NSObject {
     func cancelScan() {
         resetReconnectBackoff()
         clearDiscovery()
+        pendingScan = nil         // drop any stashed cold-start scan (#142)
         choosingRing = false
-        if central.state == .poweredOn { central.stopScan() }   // CB calls are UB before powered-on
+        if central?.state == .poweredOn { central?.stopScan() }   // CB calls are UB before powered-on
         if case .scanning = state { state = .idle }
     }
 
@@ -365,22 +476,29 @@ final class RingScanner: NSObject {
             if reconnectTask != nil { return true }   // backoff timer owns the retry
         default: break
         }
-        guard central.state == .poweredOn else {
-            // Bluetooth not ready yet (common on a cold/background launch). Retry from
-            // centralManagerDidUpdateState once we reach `.poweredOn`.
+        // No active saved ring → nothing to reconnect to. Return WITHOUT `ensureCentral()` so a fresh
+        // install (which reaches here via the AppDelegate gate only when a ring is saved, but also via
+        // `captureForBackground`) never allocates a central — the allocation is what fires the BT
+        // prompt. (#142) The early-return branches above read no central state, so this is the first
+        // point that could touch it.
+        guard Self.activePeripheralID != nil else { return false }
+        ensureCentral()   // we have a ring to reconnect to — create the central on demand (#142)
+        guard central?.state == .poweredOn else {
+            // Bluetooth not ready yet (common on a cold/background launch, or a just-created central
+            // still at `.unknown`). Retry from centralManagerDidUpdateState once we reach `.poweredOn`.
             reconnectWhenPoweredOn = true
             return false
         }
         reconnectWhenPoweredOn = false
         guard let idString = Self.activePeripheralID,
               let uuid = UUID(uuidString: idString),
-              let peripheral = central.retrievePeripherals(withIdentifiers: [uuid]).first
+              let peripheral = central?.retrievePeripherals(withIdentifiers: [uuid]).first
         else { return false }
         wantConnection = true
         target = peripheral
         state = .connecting(peripheral.name ?? "RingConn")
-        guard central.state == .poweredOn else { return false }
-        central.connect(peripheral)
+        guard central?.state == .poweredOn else { return false }
+        central?.connect(peripheral)
         return true
     }
 
@@ -396,19 +514,35 @@ final class RingScanner: NSObject {
         wantConnection = false
         resetReconnectBackoff()   // user stop: drop any pending backoff reconnect (#35)
         clearDiscovery()          // abandon any in-flight foreground scan / picker
+        pendingScan = nil         // drop any stashed cold-start scan (#142)
         choosingRing = false
         // CB commands are UB (API-MISUSE-logged, no-op) before `.poweredOn` — guard them; the local
         // intent flags above/below still apply regardless, so a pre-power-on call still tears down
         // our own state correctly, it just has nothing live to tell the radio to stop/cancel.
-        if central.state == .poweredOn {
-            central.stopScan()
+        if central?.state == .poweredOn {
+            central?.stopScan()
             if let target {
-                central.cancelPeripheralConnection(target)
+                central?.cancelPeripheralConnection(target)
             }
         }
         teardownSession()         // cancel all of the session's tasks, not just the live poll (#42)
         target = nil
         state = .idle
+    }
+
+    /// Forget the ACTIVE ring (#140): the single user-driven "let go of this ring" action. Clears
+    /// `activePeripheralID` (so `hasSavedRing` → false and the foreground auto-refresh stops re-arming
+    /// reconnection) and tears down the live/pending link via `disconnect()`. The ring stays in
+    /// `savedPeripheralIDs`, so the picker still lists it for a one-tap reconnect. Never automatic —
+    /// a transient "Connecting…" is normal; only an explicit tap (Device Info ▸ Disconnect, the
+    /// connect-card Cancel, or "Stop reconnecting") lands here.
+    func forgetActiveRing() {
+        Self.activePeripheralID = nil   // stop the foreground re-arm (hasSavedRing → false)
+        disconnect()                    // wantConnection=false, full teardown; disconnect() sets state=.idle
+        // `disconnect()` lands `.idle` from BOTH a live and a connecting link (verified above — it
+        // sets `state = .idle` unconditionally), so the card drops any frozen "Connecting…". Re-assert
+        // it defensively so a future disconnect() change can't silently wedge a gone ring on screen.
+        if state != .idle { state = .idle }
     }
 
     /// End-of-background-read teardown that RE-ARMS reconnection. The bounded read must not
@@ -422,8 +556,8 @@ final class RingScanner: NSObject {
         // CB calls are UB before powered-on — guard them, same as stop()/disconnect() (API MISUSE
         // otherwise: this runs at the end of a background read, exactly when the radio's power
         // state is most likely to be in flux).
-        if central.state == .poweredOn, let target {
-            central.cancelPeripheralConnection(target)
+        if central?.state == .poweredOn, let target {
+            central?.cancelPeripheralConnection(target)
         }
         target = nil
         state = .idle
@@ -469,6 +603,16 @@ final class RingScanner: NSObject {
     /// caller to mirror into Apple Health. Always tears the link down (re-arming the standing
     /// reconnect) on the way out so nothing is held open in the background.
     func captureForBackground(timeout: TimeInterval) async -> BackgroundCapture {
+        // No active saved ring → nothing to reconnect to or capture. Bail BEFORE ensureCentral() so a
+        // fresh install that never connected a ring (BGTasks are scheduled unconditionally at launch)
+        // doesn't allocate a CBCentralManager in the background — which would defeat #142's deferred BT
+        // prompt AND fall through to the service-filtered `start(services:)` below, whose no-picker path
+        // connect-on-first-matches and `rememberRing`s ANY nearby ring (a stranger's RingConn). A
+        // returning user always has an active ring (rememberRing/willRestoreState set it), so the guard
+        // passes and background sync is unchanged; an explicit Stop clears it and deliberately opts out
+        // of silent background reconnection. (#142 reviewer MAJOR)
+        guard Self.activePeripheralID != nil else { return BackgroundCapture() }
+        ensureCentral()   // background sync legitimately needs the central (#142)
         let deadline = Date().addingTimeInterval(timeout)
         var didDrain = false
         var startedLiveRead = false
@@ -513,7 +657,10 @@ final class RingScanner: NSObject {
                 if !session.healthSleepSegments.isEmpty { capture.sleepSegments = session.healthSleepSegments }
                 if let s = session.steps { capture.steps = s }
                 if let liveHR = session.liveHR { capture.heartRate = liveHR; break }
-            } else if case .idle = state {
+            } else if state == .idle || state == .noRingFound {
+                // `.noRingFound` can't arise from a background (service-filtered) scan — its timeout
+                // isn't armed there — but treat it like `.idle` for robustness: a disconnected,
+                // retry-able state. (#139)
                 if !reconnectKnownPeripheral() {
                     start(services: Self.backgroundScanServices)
                 }
@@ -552,9 +699,18 @@ extension RingScanner: CBCentralManagerDelegate {
                 if self.reconnectWhenPoweredOn {
                     self.reconnectWhenPoweredOn = false
                     if let target = self.target {
-                        if self.central.state == .poweredOn { self.central.connect(target) }
+                        if self.central?.state == .poweredOn { self.central?.connect(target) }
                     } else {
                         self.reconnectKnownPeripheral()
+                    }
+                }
+                // Run a scan requested before the (lazy, cold-created) central finished powering on,
+                // so a single "Scan & connect" tap connects instead of no-opping the first time (#142).
+                if let scan = self.pendingScan {
+                    self.pendingScan = nil
+                    switch scan {
+                    case .start(let services): self.start(services: services)
+                    case .browse:              self.startBrowsing()
                     }
                 }
                 // A session restored before the radio was up may have fired its discovery
@@ -563,9 +719,15 @@ extension RingScanner: CBCentralManagerDelegate {
                 if let session = self.session, session.ready != true {
                     session.rediscoverIfNeeded()
                 }
-            case .poweredOff: self.state = .poweredOff
-            case .unauthorized: self.state = .unauthorized
-            default: self.state = .idle
+            case .poweredOff:
+                self.pendingScan = nil   // a stashed scan can't run with BT off — drop it (#142)
+                self.state = .poweredOff
+            case .unauthorized:
+                self.pendingScan = nil   // permission denied — the stashed scan is moot (#142)
+                self.state = .unauthorized
+            default:
+                self.pendingScan = nil
+                self.state = .idle
             }
         }
     }
@@ -599,8 +761,8 @@ extension RingScanner: CBCentralManagerDelegate {
             default:
                 // Re-issue the pending connect so we reconnect when the ring is in range.
                 self.state = .connecting(peripheral.name ?? "RingConn")
-                if self.central.state == .poweredOn {
-                    self.central.connect(peripheral)
+                if self.central?.state == .poweredOn {
+                    self.central?.connect(peripheral)
                 } else {
                     // Radio not up yet on a cold restoration — retry once powered on.
                     self.reconnectWhenPoweredOn = true
@@ -630,10 +792,10 @@ extension RingScanner: CBCentralManagerDelegate {
         Task { @MainActor in
             guard self.allowPicker else {
                 // Background / service-filtered scan: no UI — connect on the first match.
-                if self.central.state == .poweredOn { self.central.stopScan() }
+                if self.central?.state == .poweredOn { self.central?.stopScan() }
                 self.target = peripheral
                 self.state = .connecting(name)
-                if self.central.state == .poweredOn { self.central.connect(peripheral) }
+                if self.central?.state == .poweredOn { self.central?.connect(peripheral) }
                 return
             }
             // Foreground: accumulate distinct rings, then debounce → auto-connect one / show a picker.
@@ -660,7 +822,7 @@ extension RingScanner: CBCentralManagerDelegate {
             // after a cold launch or background relaunch.
             self.target = peripheral
             Self.rememberRing(peripheral.identifier.uuidString)
-            if self.central.state == .poweredOn { self.central.stopScan() }  // defensive: a reconnect/restoration connect may land mid-scan
+            if self.central?.state == .poweredOn { self.central?.stopScan() }  // defensive: a reconnect/restoration connect may land mid-scan
             self.clearDiscovery()    // scan succeeded — drop the discovery set / picker
             // A connect landed — stop any pending backoff timer and clear the calm "unreachable"
             // note. (We don't reset the attempt COUNT yet: a charging ring can connect then
@@ -794,8 +956,8 @@ extension RingScanner {
     private func issueReconnectNow(_ peripheral: CBPeripheral) {
         guard wantConnection else { return }
         if case .connected = state { return }
-        if central.state == .poweredOn {
-            central.connect(peripheral)
+        if central?.state == .poweredOn {
+            central?.connect(peripheral)
         } else {
             // Radio not up yet — let the poweredOn handler complete the reconnect-by-identifier.
             reconnectWhenPoweredOn = true

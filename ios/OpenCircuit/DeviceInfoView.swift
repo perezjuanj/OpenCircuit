@@ -13,6 +13,11 @@ import OpenCircuitKit
 struct DeviceInfoView: View {
     var session: RingSession?
     @State private var showRingPicker = false
+    /// Shared scanner — used for the "Disconnect ring" control (#140) so it works even when `session`
+    /// is nil (i.e. the app is stuck "Connecting…" to a ring that's gone).
+    @State private var scanner = RingScanner.shared
+    /// Confirmation gate for the destructive Disconnect action (#140).
+    @State private var showDisconnectConfirm = false
     @Environment(\.modelContext) private var modelContext
     @AppStorage(RingSession.diagnosticsCaptureKey) private var captureEnabled = false
     @State private var diagnosticsURL: URL?
@@ -76,10 +81,35 @@ struct DeviceInfoView: View {
                      + "shared health timeline — switching never erases the other's data.")
             }
 
+            // Disconnect / forget the ACTIVE ring (#140). Reads the SHARED scanner (not `session`) so
+            // it's reachable even while the app is wedged "Connecting…" to a ring that's out of range /
+            // gone. Only shown when there's an active ring to let go of (`hasSavedRing`). Non-destructive
+            // to the remembered set: the ring stays in the picker for a one-tap reconnect.
+            if scanner.hasSavedRing {
+                Section {
+                    Button(role: .destructive) {
+                        showDisconnectConfirm = true
+                    } label: {
+                        Label("Disconnect ring", systemImage: "wifi.slash")
+                    }
+                } footer: {
+                    Text("Stops automatically reconnecting and drops the current link. The ring stays "
+                         + "in your list, so you can reconnect with one tap from “Connect a different ring.”")
+                }
+            }
+
             diagnosticsSection
         }
         .navigationTitle("Device Info")
         .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("Disconnect this ring?", isPresented: $showDisconnectConfirm,
+                            titleVisibility: .visible) {
+            Button("Disconnect", role: .destructive) { scanner.forgetActiveRing() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("OpenCircuit will stop reconnecting to this ring. It stays in your list for a one-tap "
+                 + "reconnect from “Connect a different ring.”")
+        }
         .sheet(isPresented: $showRingPicker) { RingPickerSheet() }
         .sheet(isPresented: $showDiagnosticShare) {
             if let url = diagnosticsURL { DiagnosticShareView(url: url) }
