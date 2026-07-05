@@ -325,12 +325,29 @@ struct CalibrationSessionView: View {
             Text(message)
                 .font(.subheadline)
                 .padding(.horizontal)
-            Button("Start over") {
-                manager.step = .idle
-                manager.statusMessage = ""
+            // #138: if the user already entered cuff readings (i.e. they failed at/after PPG capture),
+            // offer a "Try again" that returns to the capture step with those readings intact instead
+            // of forcing a full restart. "Start over" (fresh session) stays available as a secondary.
+            if !manager.session.bpReadings.isEmpty {
+                Button("Try again") {
+                    manager.retryCapture()
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(.horizontal)
+                Button("Start over") {
+                    manager.step = .idle
+                    manager.statusMessage = ""
+                }
+                .buttonStyle(.bordered)
+                .padding(.horizontal)
+            } else {
+                Button("Start over") {
+                    manager.step = .idle
+                    manager.statusMessage = ""
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(.horizontal)
             }
-            .buttonStyle(.borderedProminent)
-            .padding(.horizontal)
         }
     }
 

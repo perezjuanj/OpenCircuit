@@ -262,10 +262,30 @@ final class CalibrationSessionManager: ObservableObject {
                 await fetchAppleWatchHeartRate(start: start, end: end)
                 step = .appleWatchECG
             } catch {
+                // #138: stop the wall-clock countdown the instant the capture throws (a mid-capture
+                // disconnect resolves the continuation immediately, so the countdown must not run on
+                // to 0). The thrown calibration errors are already self-contained, user-facing
+                // messages ("Ring disconnected — try again", "The ring streamed too few PPG
+                // samples…"), so surface them directly rather than double-wrapping.
                 countdownTimer?.invalidate()
-                step = .failed("PPG capture failed: \(error.localizedDescription)")
+                step = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// #138: retry after a mid-capture failure (e.g. the ring dropped during PPG streaming) WITHOUT
+    /// discarding the SpO2 reference and cuff readings the user already entered — return to the
+    /// blood-pressure step, whose "Start raw PPG capture" button re-runs only the capture once the
+    /// ring reconnects. A full reset stays available via "Start over" (→ `.idle`).
+    func retryCapture() {
+        session.ppgFrames = []
+        session.ppgCaptureStartedAt = nil
+        session.ppgCaptureEndedAt = nil
+        ppgFrameCount = 0
+        step = .bloodPressure
+        statusMessage = session.bpReadings.isEmpty
+            ? "Enter at least one cuff reading before capturing raw PPG."
+            : "\(session.bpReadings.count) blood-pressure reading(s) recorded. Tap Start raw PPG capture to try again."
     }
 
     func skipAppleWatchECG() {
