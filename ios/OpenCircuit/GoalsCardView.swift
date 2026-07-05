@@ -89,7 +89,21 @@ struct GoalsCardView: View {
         return ExerciseMinutes.estimate(hrSamples: samples, maxHR: maxHR, sleepWindow: sleepWindow)
     }
 
-    private var lastNightSleepMin: Int { latestSleep.first?.asleepMin ?? 0 }
+    /// True when the newest stored night actually ended TODAY, so its minutes may be credited to
+    /// today's Sleep ring. A days-old night (no overnight sync landed) is NOT credited — the ring
+    /// stays empty rather than silently reading a stale night as last night (#147). Uses the SAME
+    /// recency test as the Sleep card's missed-night banner (`MissedNight.endedToday`), so the two
+    /// surfaces can never disagree about what counts as last night.
+    private var sleepCredited: Bool {
+        guard let s = latestSleep.first else { return false }
+        let inBedEnd = s.inBedEnd > s.inBedStart ? s.inBedEnd : nil
+        return MissedNight.endedToday(inBedEnd: inBedEnd, nightKey: s.night)
+    }
+
+    /// Asleep minutes credited to today's ring — the stored night's `asleepMin` only when it ended
+    /// today, else 0 (empty ring). Don't gate on `asleepMin > 0`: a stale night has positive
+    /// minutes too, so recency (not magnitude) is what decides.
+    private var creditedLastNightMin: Int { sleepCredited ? (latestSleep.first?.asleepMin ?? 0) : 0 }
 
     private var sleepGoalMin: Int {
         GoalDefaults.isWeekend() ? weekendSleepMin : workdaySleepMin
@@ -100,7 +114,7 @@ struct GoalsCardView: View {
             steps:           GoalProgress(current: Double(currentSteps),     goal: Double(stepsGoal)),
             activeKcal:      GoalProgress(current: currentActiveKcal,        goal: activeKcalGoal),
             activityMinutes: GoalProgress(current: currentActivityMin,       goal: actMinGoal),
-            sleepMinutes:    GoalProgress(current: Double(lastNightSleepMin), goal: Double(sleepGoalMin))
+            sleepMinutes:    GoalProgress(current: Double(creditedLastNightMin), goal: Double(sleepGoalMin))
         )
     }
 
@@ -130,7 +144,9 @@ struct GoalsCardView: View {
                          color: .blue)
                 goalRing(progress: progress.sleepMinutes,
                          label: "Sleep",
-                         current: formatDuration(lastNightSleepMin),
+                         // "—" (not "0m") when no night ended today, so an empty ring reads as
+                         // "no data yet", never "0 minutes slept" (#147).
+                         current: sleepCredited ? formatDuration(creditedLastNightMin) : "—",
                          goal: formatDuration(sleepGoalMin),
                          color: .purple)
             }
