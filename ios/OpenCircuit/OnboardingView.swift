@@ -66,8 +66,9 @@ struct OnboardingView: View {
 
     private var prerequisite: some View {
         page(icon: "1.circle", tint: .indigo, title: "One-time setup") {
-            bullet("If your ring is new, set it up once in the official RingConn app to activate it. "
-                 + "After that, OpenCircuit connects on its own.")
+            bullet("If your ring is new, set it up once in the official RingConn app to activate it — "
+                 + "then fully close that app (swipe it away). Only one app can talk to the ring at a "
+                 + "time. After that, OpenCircuit connects on its own.")
             bullet("Keep your phone nearby — especially overnight — so OpenCircuit can capture your "
                  + "full night of sleep and skin-temperature data.")
             bullet("Charge the ring as usual; OpenCircuit picks up where it left off.")

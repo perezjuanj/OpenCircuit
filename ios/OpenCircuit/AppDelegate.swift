@@ -35,11 +35,20 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
         // Re-instantiate the CBCentralManager (with its restore identifier) during launch so
         // iOS can deliver state restoration — including when it relaunches us in the
-        // background because the ring came back in range. Touching `.shared` creates the
-        // central; `reconnectKnownPeripheral` then arms a pending connect-by-identifier to the
-        // last ring (no scan — background scans without a service filter are dropped). (#7)
-        MainActor.assumeIsolated {
-            RingScanner.shared.reconnectKnownPeripheral()
+        // background because the ring came back in range. Touching `.shared` + `ensureCentral()`
+        // (inside `reconnectKnownPeripheral`) creates the central; it then arms a pending
+        // connect-by-identifier to the last ring (no scan — background scans without a service
+        // filter are dropped). (#7)
+        //
+        // GATED (#142): only for a RETURNING user (any ring ever saved). A fresh install has nothing
+        // to restore, and allocating the central here would fire the Bluetooth permission prompt at
+        // launch — before onboarding says the prompt comes later. `hasSavedRingToRestore` reads
+        // UserDefaults WITHOUT touching `.shared`, so the check itself creates no central. A saved
+        // ring implies a restorable central, so a state-restoration relaunch is covered by this gate.
+        if RingScanner.hasSavedRingToRestore {
+            MainActor.assumeIsolated {
+                RingScanner.shared.reconnectKnownPeripheral()
+            }
         }
         // Bootstrap the BGTask chain AT LAUNCH (#119). Registration alone launches nothing — a
         // request must be SUBMITTED, and until build 17 the only initial submission point was
