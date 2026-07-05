@@ -167,6 +167,11 @@ struct ContentView: View {
                     recordForegroundSync()
                     flushHealth()
                     evaluateHealthAlerts()   // #73/#85: a fresh sync may cross a threshold
+                    // #145: evaluate the sedentary reminder only now, against the freshly-synced
+                    // `lastActivityAt` — so it can't fire on stale pre-sync data right after a walk.
+                    // This runs whenever syncing flips to false (even if no new frames), so a
+                    // genuinely-inactive user still gets the nudge.
+                    evaluateReminders(includeSedentary: true)
                 }
             }
             .onChange(of: session?.monitoring) { _, monitoring in
@@ -366,13 +371,18 @@ struct ContentView: View {
         let battery = session?.batteryPercent
         Task { await LocalAlertCenter().evaluate(batteryPercent: battery, healthAuthorized: authorized) }
         evaluateHealthAlerts()
-        evaluateReminders()
+        // Pre-sync pass: wear + bedtime only. The sedentary rule is deferred to the post-sync
+        // handler so it never fires on a stale `lastActivityAt` right after activity (#145).
+        evaluateReminders(includeSedentary: false)
     }
 
-    /// Evaluate the three app-side reminders (#84: sedentary / wear / bedtime) against the
-    /// current session and persisted UserDefaults state, routing survivors through the shared
-    /// notification engine (quiet hours + anti-spam backoff).
-    private func evaluateReminders() {
+    /// Evaluate the app-side reminders (#84: sedentary / wear / bedtime) against the current
+    /// session and persisted UserDefaults state, routing survivors through the shared notification
+    /// engine (quiet hours + anti-spam backoff). `includeSedentary` is `false` on the pre-sync
+    /// scene-active pass so the move reminder never fires on a stale `lastActivityAt` (#145); it is
+    /// evaluated with `true` only after a foreground sync lands fresh step data. Wear + bedtime run
+    /// on every pass since they don't depend on fresh steps.
+    private func evaluateReminders(includeSedentary: Bool) {
         let d = UserDefaults.standard
         SleepScheduleDefaults.register(d)
         let bedMinutes  = d.integer(forKey: SleepScheduleDefaults.bedMinutes)
@@ -384,7 +394,8 @@ struct ContentView: View {
                 session: s,
                 sleepBedMinutes: bedMinutes,
                 sleepWakeMinutes: wakeMinutes,
-                sleepEnabled: sleepEnabled)
+                sleepEnabled: sleepEnabled,
+                includeSedentary: includeSedentary)
         }
     }
 

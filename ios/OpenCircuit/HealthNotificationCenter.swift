@@ -213,9 +213,30 @@ struct HealthNotificationCenter {
                 .map { SpO2Reading(percent: Int(($0.value * 100).rounded()), time: $0.start) }
         }
 
-        // The sustained-while-inactive rule reads the same HR series over the same wide window; its
-        // own `lastFired` filter inside the evaluator gives it once-per-event de-dupe.
-        for hit in HealthAlertEvaluator.evaluate(hr: hr, spo2: spo2, inactiveHR: hr,
+        // --- #144: activity gate for the HR rules ------------------------------------------------
+        // Exercise HR routinely crosses 120 bpm, so the raw high-HR / elevated-while-inactive rules
+        // would fire a false "high heart rate" alarm after every workout. Gate them on concurrent
+        // step activity. Steps live ONLY in `StoredStepSample` (persisted by `addDailySteps`), NOT in
+        // the `StoredSample` table that `recentSamples`/`historySamples` read — those carry only
+        // HR/HRV/SpO2/RR/temp — so the windows MUST come from `stepSamples(from:to:)`. By the time we
+        // evaluate (post-sync in the foreground, post-drain in the background) the sync has already
+        // committed the same-window step rows, so this reads the freshly-synced activity.
+        //
+        // `activeStepIntervals` drops zero-delta windows AND the day-wide `[startOfDay, sampleDate]`
+        // fallback window that a fresh-baseline / rollover reading records (that guard is
+        // safety-critical — a multi-hour window would suppress a genuine resting crossing). Steps and
+        // HR share device timestamps, so they line up by device time. SpO2 is NOT gated. With no
+        // step windows the series is returned unchanged, so a real resting crossing still alerts.
+        let stepWindows = ((try? localStore.stepSamples(from: instantSince, to: now)) ?? [])
+            .map { StepWindow(start: $0.start, end: $0.end, delta: $0.delta) }
+        let stepIntervals = HealthAlertEvaluator.activeStepIntervals(stepWindows)
+        let nonExercisingHR = HealthAlertEvaluator.nonExercising(hr, activeIntervals: stepIntervals)
+
+        // Both the instantaneous high-HR and the sustained-while-inactive rule read the non-exercising
+        // series over the same wide window; the evaluator's own `lastFired` filter gives once-per-event
+        // de-dupe. SpO2 (`spo2`) is passed unfiltered — its rule is unaffected by the activity gate.
+        for hit in HealthAlertEvaluator.evaluate(hr: nonExercisingHR, spo2: spo2,
+                                                 inactiveHR: nonExercisingHR,
                                                  thresholds: thresholds,
                                                  lastFired: lastFired) {
             candidates.append(hit.notification)
@@ -306,15 +327,24 @@ struct HealthNotificationCenter {
     /// call liberally — a no-op when nothing crosses a threshold or everything is held by
     /// the gate. Pass `sleepEnabled = true` and the configured bed/wake minutes to enable
     /// the bedtime reminder; pass `sleepEnabled = false` to skip it.
+    ///
+    /// `includeSedentary` (#145): the sedentary rule reads the persisted `lastActivityAt`, which is
+    /// STALE before a foreground sync lands the walk's step delta — so evaluating it pre-sync fires a
+    /// false "time to move!" right after activity (and the 2h backoff then suppresses the real one).
+    /// The caller passes `false` on the plain scene-active pass (wear + bedtime still evaluate there,
+    /// since they don't need fresh step data) and `true` only after a sync completes, so the rule
+    /// runs against fresh data.
     func evaluateReminders(session: RingSession?,
                            sleepBedMinutes: Int, sleepWakeMinutes: Int, sleepEnabled: Bool,
+                           includeSedentary: Bool = true,
                            now: Date = Date()) async {
         ReminderDefaults.register()
         let d = UserDefaults.standard
         var candidates: [HealthNotification] = []
 
-        // Sedentary / move reminder
-        if d.bool(forKey: ReminderDefaults.sedentaryEnabled) {
+        // Sedentary / move reminder — only when `includeSedentary` (post-sync), so it never fires on
+        // a stale pre-sync `lastActivityAt` reading (#145).
+        if includeSedentary, d.bool(forKey: ReminderDefaults.sedentaryEnabled) {
             let interval = TimeInterval(d.integer(forKey: ReminderDefaults.sedentaryIntervalMin)) * 60
             let r = SedentaryReminder(interval: max(interval, 10 * 60))
             let lastActivityEpoch = d.double(forKey: ReminderDefaults.lastActivityAt)
@@ -356,7 +386,18 @@ struct HealthNotificationCenter {
 
         guard !candidates.isEmpty else { return }
         let quiet = HealthAlertDefaults.quietHours()
-        let fire = gate.filter(candidates, now: now, lastFired: store.lastFired(), quietHours: quiet)
+        let lastFired = store.lastFired()
+        // #137: the bedtime reminder is a user-SCHEDULED wind-down self-reminder, not a body-vital
+        // alert the user is trying to mute overnight. Its only firing window is
+        // [bed − minutesBefore, bed), which for a typical post-22:00 bedtime falls entirely inside the
+        // default 22:00–07:00 quiet window — so routing it through the shared quiet gate would suppress
+        // it every single night. Split it out: bedtime bypasses the quiet-hours mute but STILL gets the
+        // anti-spam backoff (via `lastFired`), so it fires at most once per night. Every OTHER reminder
+        // (wear / sedentary) stays under the quiet gate unchanged — no regression to the overnight mute.
+        let bedtime = candidates.filter { $0 == .bedtimeReminder }
+        let others  = candidates.filter { $0 != .bedtimeReminder }
+        var fire = gate.filter(others, now: now, lastFired: lastFired, quietHours: quiet)
+        fire += gate.filter(bedtime, now: now, lastFired: lastFired, quietHours: QuietHours(enabled: false))
         guard !fire.isEmpty, await ensureAuthorized() else { return }
         for n in fire { await post(n, hit: nil) }
         store.markFired(fire, at: now)

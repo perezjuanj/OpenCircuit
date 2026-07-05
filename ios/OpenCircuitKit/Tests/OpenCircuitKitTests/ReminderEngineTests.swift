@@ -51,6 +51,15 @@ final class ReminderEngineTests: XCTestCase {
         XCTAssertFalse(r.shouldFire(lastActivityAt: nil, now: now1000, calendar: cal))
     }
 
+    func testSedentaryDoesNotFireWithFreshActivityWithinInterval() {
+        // #145: once a foreground sync lands a fresh step delta, the gap is < interval → no nudge.
+        // The bug was evaluating this rule PRE-sync against a stale `lastActivityAt` (gap ≥ interval);
+        // the app-layer fix defers the evaluation to post-sync so `lastActivityAt` is fresh like this.
+        let r = SedentaryReminder(interval: 50 * 60, activeStartMinutes: 8 * 60, activeEndMinutes: 21 * 60)
+        let fresh = now1000.addingTimeInterval(-(5 * 60))   // moved 5 min ago
+        XCTAssertFalse(r.shouldFire(lastActivityAt: fresh, now: now1000, calendar: cal))
+    }
+
     // MARK: - WearReminder
 
     func testWearFiresAfterInterval() {

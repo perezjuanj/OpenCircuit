@@ -140,6 +140,19 @@ public struct HealthAlertThresholds: Equatable, Sendable {
     }
 }
 
+/// One step-count snapshot's observation window + delta, carrying the device's own timestamps.
+/// A pure value type so the #144 activity-gate math is testable off the app's SwiftData
+/// `StoredStepSample` model (which is app-target-only). The app maps each `StoredStepSample` to one
+/// of these before handing them to `activeStepIntervals`.
+public struct StepWindow: Equatable, Sendable {
+    public let start: Date
+    public let end: Date
+    public let delta: Int
+    public init(start: Date, end: Date, delta: Int) {
+        self.start = start; self.end = end; self.delta = delta
+    }
+}
+
 /// One fired alert with the reading that triggered it (for the "… detected at [time]" copy).
 public struct HealthAlertHit: Equatable, Sendable {
     public let notification: HealthNotification
@@ -191,6 +204,55 @@ public enum HealthAlertEvaluator {
             if let rs = runStart, s.start.timeIntervalSince(rs) >= minDuration { return s }
         }
         return nil
+    }
+
+    /// Default cap on a step snapshot's window width still treated as a discrete activity burst
+    /// (#144). Normal per-reading step windows are the gap between two step readings — seconds on the
+    /// live poll, up to a few minutes across a background drain — comfortably under this. A window
+    /// WIDER than this is the day-wide `[startOfDay, sampleDate]` FALLBACK that `StoredStepSample`
+    /// records on a fresh baseline / day rollover (no prior same-day reading to anchor to); those run
+    /// to multiple hours and must be excluded from the gate (see `activeStepIntervals`). Chosen short
+    /// on purpose: it cleanly excludes every hours-long fallback, and erring short only risks
+    /// under-gating (an occasional post-workout false alarm) — never the catastrophic direction of
+    /// suppressing a real cardiac crossing.
+    public static let maxActivityWindow: TimeInterval = 30 * 60
+
+    /// Build the concurrent-activity intervals for the HR gate (#144) from step snapshots, dropping:
+    ///  - zero/negative-`delta` windows (no actual movement), and
+    ///  - windows WIDER than `maxActivityWindow` — the day-wide `[startOfDay, sampleDate]` FALLBACK
+    ///    `StoredStepSample` records on a fresh baseline / day rollover. This exclusion is
+    ///    SAFETY-CRITICAL: feeding a multi-hour fallback window into `nonExercising` would suppress
+    ///    EVERY HR crossing since midnight — including a genuine resting tachycardia — a health-safety
+    ///    false negative, the worst outcome. Excluding it costs at most an occasional missed gate (a
+    ///    post-workout false alarm), which is the far safer failure direction.
+    public static func activeStepIntervals(_ steps: [StepWindow],
+                                           maxActivityWindow: TimeInterval = maxActivityWindow)
+    -> [(Date, Date)] {
+        steps.filter { $0.delta > 0 && $0.end.timeIntervalSince($0.start) <= maxActivityWindow }
+             .map { ($0.start, $0.end) }
+    }
+
+    /// Drop HR samples that overlap concurrent step activity (or its `pad`-long recovery tail), so
+    /// exercise heart rate can't trip the resting high-HR / elevated-while-inactive alarms (#144).
+    /// A sample is EXCLUDED when its device timestamp `start` lies inside any `activeIntervals`
+    /// window `[from, to]` — or within `pad` after `to`, covering the post-exercise HR recovery
+    /// tail. Match is by the DEVICE timestamps carried on BOTH series (never wall-clock arrival):
+    /// all-day HR and steps ride in on the same ~hourly background drains with timestamps 30–60+
+    /// min old, so only their device times line up.
+    ///
+    /// KEY SAFETY PROPERTY: this only ever SUPPRESSES on positive evidence of concurrent activity.
+    /// An empty `activeIntervals` (no step data synced for the window) returns the series unchanged,
+    /// so a genuine resting tachycardia with no steps still fires and missing step data can never
+    /// silence a real alert. It never narrows the lookback window — it filters by activity overlap,
+    /// not recency.
+    public static func nonExercising(_ hr: [HRSample], activeIntervals: [(Date, Date)],
+                                     pad: TimeInterval = 10 * 60) -> [HRSample] {
+        guard !activeIntervals.isEmpty else { return hr }
+        return hr.filter { sample in
+            !activeIntervals.contains { interval in
+                sample.start >= interval.0 && sample.start <= interval.1.addingTimeInterval(pad)
+            }
+        }
     }
 
     /// Evaluate all three #73 rules and return the hits (disabled rules are skipped). `inactiveHR`
