@@ -25,6 +25,12 @@ struct UserProfileSettingsView: View {
     private let historyInspector = HealthKitHistoryInspector()
     @State private var healthAuthorized = false
     @State private var healthUnavailable = false
+    /// Tri-state Health share status (#132): a PARTIAL grant (heart rate on, another type off) must
+    /// not read as a plain "Connected" while those metrics silently never reach Health.
+    @State private var healthShareState: HealthKitWriter.ShareState = .unauthorized
+    /// Persisted per-metric Health write failures (#135), surfaced here alongside the partial-grant
+    /// state so Profile and the dashboard tell one consistent story.
+    @State private var healthWriteFailures: [MetricKind] = []
     /// The one-time iOS permission sheet was already used (declined) — `requestAuthorization`
     /// would silently no-op, so the button must route to the Health app instead. Re-probed on
     /// appear, on foreground return (the user may have just flipped the toggles), and after a
@@ -142,13 +148,31 @@ struct UserProfileSettingsView: View {
 
             Section("Apple Health") {
                 if healthAuthorized {
-                    LabeledContent("Status") {
-                        Label("Connected", systemImage: "checkmark.circle.fill")
-                            .labelStyle(.titleAndIcon)
-                            .foregroundStyle(.green)
+                    let missing = healthAttentionNames
+                    if missing.isEmpty {
+                        LabeledContent("Status") {
+                            Label("Connected", systemImage: "checkmark.circle.fill")
+                                .labelStyle(.titleAndIcon)
+                                .foregroundStyle(.green)
+                        }
+                        Text("OpenCircuit is writing your ring's metrics into Apple Health.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        // A partial grant (#132) or a persisted write failure (#135): don't claim a
+                        // blanket "Connected" while these metrics silently never reach Health.
+                        LabeledContent("Status") {
+                            Label("Partial", systemImage: "exclamationmark.triangle.fill")
+                                .labelStyle(.titleAndIcon)
+                                .foregroundStyle(.orange)
+                        }
+                        Text("These aren't reaching Apple Health: \(missing.joined(separator: ", ")).")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button {
+                            openURL(HealthKitWriter.healthAppURL)
+                        } label: {
+                            Label("Review in the Health App", systemImage: "heart.text.square")
+                        }
                     }
-                    Text("OpenCircuit is writing your ring's metrics into Apple Health.")
-                        .font(.caption).foregroundStyle(.secondary)
                 } else if HealthKitWriter.isAvailable {
                     if healthPromptExhausted {
                         // iOS shows the permission sheet once, ever — after a decline,
@@ -425,6 +449,10 @@ struct UserProfileSettingsView: View {
     /// the toggles in Health and returning flips it back to Connected.
     private func refreshHealthAuthState() async {
         healthAuthorized = health.isShareAuthorized
+        // Recompute the honest partial-grant (#132) + persisted write-failure (#135) surfaces at the
+        // same points, since the user can flip a type off in the Health app while away.
+        healthShareState = health.shareState
+        healthWriteFailures = HealthKitWriter.healthWriteFailures().keys.sorted { $0.rawValue < $1.rawValue }
         if healthAuthorized {
             healthUnavailable = false
             healthPromptExhausted = false
@@ -433,6 +461,17 @@ struct UserProfileSettingsView: View {
             // its tap path can throw and surface the sideload notice, as before.
             healthPromptExhausted = (await health.authorizationPromptAvailable()) == false
         }
+    }
+
+    /// Friendly names of metrics not reaching Health: partial-grant denied types (#132) unioned with
+    /// persisted per-metric write failures (#135), de-duplicated and sorted. Empty ⇒ fully connected.
+    private var healthAttentionNames: [String] {
+        var names = Set<String>()
+        if case .partial(let denied) = healthShareState {
+            names.formUnion(HealthKitWriter.friendlyNames(for: denied))
+        }
+        names.formUnion(healthWriteFailures.map(\.displayName))
+        return names.sorted()
     }
 
     private func formatGoalSleep(_ minutes: Int) -> String {
