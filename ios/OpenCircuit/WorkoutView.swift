@@ -110,7 +110,7 @@ struct WorkoutView: View {
             // Best-effort HR note (#45)
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "info.circle").foregroundStyle(.secondary)
-                Text("Live heart rate during workouts is best-effort (issue #45: on-demand polling, no background refresh). HR gaps will be shown honestly — data is never fabricated.")
+                Text("Live heart rate during workouts is best-effort (on-demand polling, no background refresh). HR gaps will be shown honestly — data is never fabricated.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(10)
@@ -241,7 +241,7 @@ struct WorkoutView: View {
             }
 
             // #45 disclaimer
-            Text("Live HR is best-effort (polling, no background refresh — issue #45). Gaps are shown honestly.")
+            Text("Live HR is best-effort (polling, no background refresh). Gaps are shown honestly.")
                 .font(.caption2).foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
@@ -313,7 +313,7 @@ struct WorkoutView: View {
                             )
                         }
                     } else {
-                        Text("No HR zone data captured (insufficient readings — see issue #45).")
+                        Text("No HR zone data captured (insufficient readings).")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -323,7 +323,7 @@ struct WorkoutView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     if summary.hrSampleCount < 30 {
                         noteRow(icon: "exclamationmark.triangle", color: .orange,
-                                text: "Few HR readings captured (\(summary.hrSampleCount)). Live HR polling is best-effort — the ring may have missed updates (issue #45).")
+                                text: "Few HR readings captured (\(summary.hrSampleCount)). Live HR polling is best-effort — the ring may have missed updates.")
                     }
                     if summary.estimatedActiveKcal != nil {
                         // Label the ACTUAL source: HR-TRIMP when HR locked, else the GPS-distance
