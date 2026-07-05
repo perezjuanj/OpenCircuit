@@ -152,7 +152,11 @@ struct ContentView: View {
                     // case the authorize button must deep-link to Health instead of no-opping.
                     healthPromptExhausted = (await health.authorizationPromptAvailable()) == false
                 }
+#if DEBUG
+                // #152: the BP estimate is served by the localhost desktop estimator (127.0.0.1:8765),
+                // so only poll it in DEBUG — a Release build makes no loopback request on launch.
                 await calibration.refreshLatestEstimateIfNeeded(minInterval: 0)
+#endif
             }
             // Foreground auto-refresh: reconnect to the last-known ring and pull fresh data
             // when the app becomes active, so opening it after a while shows updated vitals
@@ -162,7 +166,10 @@ struct ContentView: View {
                     handleForegroundActivation()
                     refreshObservability()        // pick up anything a background run wrote
                     evaluateForegroundAlerts()    // live battery + Health-auth check (#44)
+#if DEBUG
+                    // #152: dev-only localhost BP-estimate poll; never runs in Release.
                     Task { await calibration.refreshLatestEstimateIfNeeded() }
+#endif
                 } else if phase == .background {
                     // Don't leave a user-initiated foreground scan/picker running once we leave the
                     // foreground — a nil-filtered scan yields nothing in the background and just keeps
@@ -981,6 +988,12 @@ struct ContentView: View {
                       || session?.monitoring == true        // stop live before syncing
                       || session?.notStreaming == true)     // a not-streaming ring would sync nothing (#54)
 
+#if DEBUG
+            // #152: "One-time historic pull" and "Forensic sweep" are reverse-engineering capture
+            // tools — they dump the raw BLE exchange / probe unresolved channel selectors for Mac-side
+            // decoding, not something an end user can act on. Keep them out of Release. The legitimate
+            // "Sync from ring" button + freshness above and the sync-status/Health-mirror rows below
+            // stay visible. `.disabled(...)` guards preserved for the DEBUG build.
             Button {
                 session?.captureHistoricPull()
             } label: {
@@ -1009,10 +1022,17 @@ struct ContentView: View {
                       || session?.monitoring == true
                       || session?.probing == true
                       || session?.notStreaming == true)
+#endif
 
             if session?.monitoring == true {
                 Text("Stop live HR/SpO₂ before syncing.").font(.caption2).foregroundStyle(.secondary)
             }
+#if DEBUG
+            // #152: the calibration/BP block is a developer tool — it talks to the localhost desktop
+            // estimator (CalibrationSupport.defaultBaseURL = http://127.0.0.1:8765) and the BP number
+            // is produced by that server, not on-device. Keep it out of Release so production users
+            // never see a "Start calibration session" button they can't make work. (The shipping user
+            // rows above — freshness, Sync from ring, Health mirror — are untouched.)
             Divider()
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
@@ -1066,9 +1086,13 @@ struct ContentView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+#endif
             if let status = session?.syncStatus, session?.syncing != true {
                 Text(status).font(.caption).foregroundStyle(.secondary)
             }
+#if DEBUG
+            // #152: status/log surfaces for the DEBUG-only RE capture tools above (historic pull +
+            // forensic sweep, incl. the raw-BLE-log share button). Gated so Release shows none of them.
             if let status = session?.historicPullStatus, session?.capturingHistoricPull != true {
                 Text(status).font(.caption).foregroundStyle(.secondary)
             }
@@ -1079,15 +1103,21 @@ struct ContentView: View {
                 Button("Share raw history capture") { shareProbeCapture(log) }
                     .font(.caption)
             }
+#endif
             Text("Use OpenCircuit as the sole sync app for this ring. Overnight sleep and heart-rate history are written after the morning history sync rather than as a live overnight stream on the home screen.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+#if DEBUG
+            // #152: these two captions describe the DEBUG-only RE capture tools ("raw BLE exchange" /
+            // "probes the unresolved channel selectors … for Mac-side reverse engineering"). Gated with
+            // the buttons they explain so Release never mentions them.
             Text("The one-time historic pull uses the same known two-channel drain as normal sync, but also records the raw BLE exchange so you can map exactly what was present on the ring at pull time.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Text("Forensic sweep goes further: it drains the known history channels first, then probes the unresolved channel selectors into the same raw log for Mac-side reverse engineering.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+#endif
 
             // Health mirror STATUS lives here once authorized (the first-run authorize prompt now
             // lives in the top-of-dashboard banner — #143 — so it isn't duplicated here). Show the

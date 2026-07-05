@@ -2545,6 +2545,18 @@ extension RingSession: CBPeripheralDelegate {
                 // Sync-open ACK. At NOTICE so an ACCEPTED open (0x82 arrives) is distinguishable
                 // from a refused one (silence — cursor out of range); debug writes don't persist.
                 ringLog.notice("← 0x82 sync-open ACK: \(self.lastFrame ?? "", privacy: .public)")
+                // #157: the sync-open ACK marks the START of a fresh drain and always precedes this
+                // drain's first 0x47/0x4c page, so re-seed the (gated, #24) epoch-decode session here.
+                // Otherwise its raw page buffers accumulate for the whole life of the connection and
+                // every 0x50 re-parses ALL pages ever seen (O(n²) CPU, unbounded memory). Re-seeding at
+                // the open bounds the buffers to a single drain AND discards a previous drain's partial
+                // pages when it ended without a 0x50 (dropped link / watchdog-terminated sync). Safe:
+                // `syncSession` is a parallel decode SINK only — the drain's cursor/resume is driven by
+                // the ring's self-advancing resume pointer + the persisted SyncCursor, and real history
+                // records flow into the separate `bulkRecords` buffer (untouched here), so clearing this
+                // can neither drop drain data nor disturb a resume. The correct stream-high byte is
+                // recomputed from each drain's own 0x50 in `complete(with:)`, so a plain re-seed is fine.
+                self.syncSession = EpochSyncSession()
                 return
             case 0x50:
                 // End-of-history cursor report (§5.5) — NO XOR trailer, so it never

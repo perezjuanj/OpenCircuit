@@ -3,6 +3,23 @@ import UIKit
 import UserNotifications
 import OpenCircuitKit
 
+/// Body-measurement ENTRY unit for the Profile section (#151). Storage stays canonical kg/cm
+/// (OpenCircuitKit's BMR math expects metric); this only picks which units the weight/height fields
+/// present and edit in. Defaults to the locale's measurement system so a metric-region user enters
+/// kg/cm out of the box. Kept local to this settings screen and mirrors the `DistanceUnit` shape in
+/// OpenCircuitKit's `UnitPreferences`.
+private enum BodyUnit: String, CaseIterable {
+    case metric   = "metric"    // kg / cm
+    case imperial = "imperial"  // lb + ft/in
+
+    static var localeDefault: BodyUnit {
+        if #available(iOS 16, *) {
+            return Locale.current.measurementSystem == .us ? .imperial : .metric
+        }
+        return Locale.current.regionCode == "US" ? .imperial : .metric
+    }
+}
+
 @MainActor
 struct UserProfileSettingsView: View {
     @AppStorage("userProfile.age") private var age = 35
@@ -74,6 +91,9 @@ struct UserProfileSettingsView: View {
     // Unit preferences (#83). Default to locale-appropriate units out of the box.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
     @AppStorage("units.distance")    private var distUnitRaw = DistanceUnit.localeDefault.rawValue
+    // Body-measurement entry unit (#151). Storage stays kg/cm; only the Profile weight/height
+    // fields switch between kg/cm and lb + ft/in. Defaults to the locale's measurement system.
+    @AppStorage("units.body")        private var bodyUnitRaw = BodyUnit.localeDefault.rawValue
 
     // Local calibration server + BP estimate Health writeback.
     @AppStorage(CalibrationDefaults.baseURLKey) private var calibrationBaseURL = CalibrationDefaults.defaultBaseURL
@@ -120,33 +140,58 @@ struct UserProfileSettingsView: View {
                 }
                 LabeledContent("Weight") {
                     HStack(spacing: 4) {
-                        TextField("lb", value: weightLb, format: .number.precision(.fractionLength(0)))
-                            .keyboardType(.decimalPad)
-                            .multilineTextAlignment(.trailing)
-                        Text("lb").foregroundStyle(.secondary)
+                        if bodyUnit == .metric {
+                            // Metric path (#151): bind straight to the canonical kg store, no conversion.
+                            TextField("kg", value: $weightKg, format: .number.precision(.fractionLength(1)))
+                                .keyboardType(.decimalPad)
+                                .multilineTextAlignment(.trailing)
+                            Text("kg").foregroundStyle(.secondary)
+                        } else {
+                            TextField("lb", value: weightLb, format: .number.precision(.fractionLength(0)))
+                                .keyboardType(.decimalPad)
+                                .multilineTextAlignment(.trailing)
+                            Text("lb").foregroundStyle(.secondary)
+                        }
                     }
                 }
                 LabeledContent("Height") {
                     HStack(spacing: 4) {
-                        TextField("ft", value: $heightFeetInput, format: .number)
-                            .keyboardType(.numberPad)
-                            .multilineTextAlignment(.trailing)
-                            .frame(maxWidth: 36)
-                            .onChange(of: heightFeetInput) { _, _ in commitHeight() }
-                        Text("ft").foregroundStyle(.secondary)
-                        TextField("in", value: $heightInchesInput, format: .number)
-                            .keyboardType(.numberPad)
-                            .multilineTextAlignment(.trailing)
-                            .frame(maxWidth: 36)
-                            .onChange(of: heightInchesInput) { _, newValue in
-                                // A typed value ≥12 (or negative) snaps back into 0...11.
-                                let clamped = min(max(newValue, 0), 11)
-                                if clamped != newValue { heightInchesInput = clamped }
-                                commitHeight()
-                            }
-                        Text("in").foregroundStyle(.secondary)
+                        if bodyUnit == .metric {
+                            // Metric path (#151): a single cm field bound to the canonical store. No
+                            // ft/in local buffers, so `commitHeight()` can't clobber a cm entry.
+                            TextField("cm", value: $heightCm, format: .number.precision(.fractionLength(0)))
+                                .keyboardType(.decimalPad)
+                                .multilineTextAlignment(.trailing)
+                                .frame(maxWidth: 64)
+                            Text("cm").foregroundStyle(.secondary)
+                        } else {
+                            TextField("ft", value: $heightFeetInput, format: .number)
+                                .keyboardType(.numberPad)
+                                .multilineTextAlignment(.trailing)
+                                .frame(maxWidth: 36)
+                                .onChange(of: heightFeetInput) { _, _ in commitHeight() }
+                            Text("ft").foregroundStyle(.secondary)
+                            TextField("in", value: $heightInchesInput, format: .number)
+                                .keyboardType(.numberPad)
+                                .multilineTextAlignment(.trailing)
+                                .frame(maxWidth: 36)
+                                .onChange(of: heightInchesInput) { _, newValue in
+                                    // A typed value ≥12 (or negative) snaps back into 0...11.
+                                    let clamped = min(max(newValue, 0), 11)
+                                    if clamped != newValue { heightInchesInput = clamped }
+                                    commitHeight()
+                                }
+                            Text("in").foregroundStyle(.secondary)
+                        }
                     }
-                    .onAppear { seedHeightInputs() }
+                    // Seed the ft/in buffers from the current `heightCm` when the imperial fields are
+                    // (or become) visible — on first appear AND when the user flips the unit picker to
+                    // imperial — so switching shows the converted value rather than a stale 0 ft 0 in
+                    // (which would immediately commit and wipe the stored height). No-op for metric.
+                    .onAppear { if bodyUnit == .imperial { seedHeightInputs() } }
+                    .onChange(of: bodyUnitRaw) { _, newRaw in
+                        if newRaw == BodyUnit.imperial.rawValue { seedHeightInputs() }
+                    }
                 }
                 Picker("Sex", selection: $sexRaw) {
                     ForEach(BiologicalSex.allCases, id: \.rawValue) { sex in
@@ -418,8 +463,12 @@ struct UserProfileSettingsView: View {
                     Text("km").tag(DistanceUnit.metric.rawValue)
                     Text("mi").tag(DistanceUnit.imperial.rawValue)
                 }
-                Text("Affects how temperature and distance values are shown throughout the app. "
-                     + "Values are always stored in metric internally.")
+                Picker("Body measurements", selection: $bodyUnitRaw) {
+                    Text("kg, cm").tag(BodyUnit.metric.rawValue)
+                    Text("lb, ft/in").tag(BodyUnit.imperial.rawValue)
+                }
+                Text("Affects how temperature, distance, and body measurements are shown throughout "
+                     + "the app. Values are always stored in metric internally.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -561,7 +610,11 @@ struct UserProfileSettingsView: View {
 
     // MARK: Imperial display over metric storage
     // Storage stays kg/cm (OpenCircuitKit's BMR math expects metric); these bindings present
-    // and edit it in lb / ft+in, converting on the way through.
+    // and edit it in lb / ft+in, converting on the way through. The imperial path is used only
+    // when `bodyUnit == .imperial` (#151); the metric path binds the kg/cm stores directly.
+
+    /// Resolved body-measurement entry unit (#151), defaulting to metric if the stored raw is unknown.
+    private var bodyUnit: BodyUnit { BodyUnit(rawValue: bodyUnitRaw) ?? .metric }
 
     private static let lbPerKg = 2.2046226218
     private static let cmPerIn = 2.54
