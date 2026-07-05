@@ -23,6 +23,11 @@ struct WorkoutView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
 
+    // Headline metrics scale with Dynamic Type while keeping their deliberately-large base size
+    // (was fixed .system(size:), so the numbers users came to read stayed frozen while labels grew).
+    @ScaledMetric(relativeTo: .largeTitle) private var timerSize: CGFloat = 56
+    @ScaledMetric(relativeTo: .title) private var hrSize: CGFloat = 40
+
     // Distance display unit (#83) — same key/default as UserProfileSettingsView. Storage stays in
     // metres (manager.distanceMeters); only the display converts. @AppStorage re-renders the live
     // and summary distance when the user flips the toggle. `?? .metric` mirrors the temp sites.
@@ -146,9 +151,10 @@ struct WorkoutView: View {
             // Duration
             VStack(spacing: 4) {
                 Text(formattedElapsed)
-                    .font(.system(size: 56, weight: .bold, design: .monospaced))
+                    .font(.system(size: timerSize, weight: .bold, design: .monospaced))
                     .monospacedDigit()
                     .contentTransition(.numericText())
+                    .lineLimit(1).minimumScaleFactor(0.5)
                 Text(manager.selectedSport.displayName.uppercased())
                     .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             }
@@ -161,12 +167,14 @@ struct WorkoutView: View {
                         // Show the last REAL reading; dim it once it ages out (the ring's spot-read
                         // can't lock under motion — we never pretend a held value is live, #45).
                         if let hr = manager.currentHR {
-                            Text("\(hr)").font(.system(size: 40, weight: .bold, design: .rounded))
+                            Text("\(hr)").font(.system(size: hrSize, weight: .bold, design: .rounded))
                                 .monospacedDigit().contentTransition(.numericText())
+                                .lineLimit(1).minimumScaleFactor(0.5)
                                 .foregroundStyle(manager.currentHRIsStale ? AnyShapeStyle(.secondary)
                                                                           : AnyShapeStyle(.red))
                         } else {
-                            Text("--").font(.system(size: 40, weight: .bold, design: .rounded))
+                            Text("--").font(.system(size: hrSize, weight: .bold, design: .rounded))
+                                .lineLimit(1).minimumScaleFactor(0.5)
                                 .foregroundStyle(.secondary)
                         }
                         Text("bpm").font(.subheadline).foregroundStyle(.secondary)

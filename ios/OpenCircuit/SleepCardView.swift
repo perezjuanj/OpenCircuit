@@ -204,8 +204,9 @@ struct SleepCardView: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text("\(m.asleep / 60)h \(m.asleep % 60)m")
-                        .font(.system(size: 36, weight: .bold, design: .rounded))
+                        .font(.system(.largeTitle, design: .rounded).weight(.bold))
                         .monospacedDigit().contentTransition(.numericText())
+                        .lineLimit(1).minimumScaleFactor(0.6)
                     Text("asleep").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
                 }
                 Text("\(m.inBed / 60)h \(m.inBed % 60)m in bed")
@@ -328,7 +329,8 @@ struct SleepCardView: View {
     private func scoreBadge(_ score: Int) -> some View {
         VStack(spacing: 0) {
             Text("\(score)")
-                .font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
+                .font(.system(.title2, design: .rounded).weight(.bold)).monospacedDigit()
+                .lineLimit(1).minimumScaleFactor(0.6)
             Text("score").font(.system(size: 9)).foregroundStyle(.secondary)
         }
         .padding(.horizontal, 10).padding(.vertical, 4)
@@ -476,7 +478,21 @@ struct SleepCardView: View {
                 }
             }
             .frame(height: 24)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Skin temperature vs baseline, last \(points.count) nights")
+            .accessibilityValue(tempChartSummary(points))
         }
+    }
+
+    /// VoiceOver summary for the skin-temp baseline chart: tonight's offset direction/size and how
+    /// many of the shown nights fell outside the normal band. `offsets` are °C from the rolling baseline.
+    private func tempChartSummary(_ offsets: [Double]) -> String {
+        guard let tonight = offsets.last else { return "" }
+        let abnormal = offsets.filter { SkinTempBaseline.deviationBand(offset: $0) != .normal }.count
+        // Reuse the unit-aware delta formatter (signed, °C/°F per the user's setting) so a °F user
+        // doesn't hear a raw Celsius magnitude.
+        return "Tonight \(skinTempDeltaString(tonight)) from baseline; "
+            + "\(abnormal) of \(offsets.count) nights outside the normal band"
     }
 
     // MARK: Body-movement chart (#70)
@@ -485,20 +501,53 @@ struct SleepCardView: View {
     private func movementSection() -> some View {
         let levels = latest?.movementLevels ?? []
         if !levels.isEmpty {
+            let summary = movementSummary(levels)
             VStack(alignment: .leading, spacing: 4) {
                 Text("Movement").font(.caption2).foregroundStyle(.secondary)
+                // Encode level in BAR HEIGHT as well as colour (still=short, light=mid, active=full)
+                // so the strip is legible in greyscale — yellow-vs-orange is a hard colourblind pair.
                 GeometryReader { geo in
-                    HStack(spacing: 1) {
+                    HStack(alignment: .bottom, spacing: 1) {
                         ForEach(Array(levels.enumerated()), id: \.offset) { _, lvl in
                             Rectangle().fill(movementColor(lvl))
-                                .frame(width: max(geo.size.width / CGFloat(levels.count) - 1, 0.5))
+                                .frame(width: max(geo.size.width / CGFloat(levels.count) - 1, 0.5),
+                                       height: max(geo.size.height * movementHeightFraction(lvl), 1))
                         }
                     }
+                    .frame(maxHeight: .infinity, alignment: .bottom)
                 }
                 .frame(height: 16)
                 .clipShape(RoundedRectangle(cornerRadius: 3))
+                // Text summary for sighted colourblind users (and the VoiceOver value below).
+                Text(summary).font(.caption2).foregroundStyle(.tertiary)
             }
             .padding(.top, 2)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Movement")
+            .accessibilityValue(summary)
+        }
+    }
+
+    /// One-line movement summary (dominant level + count of restless runs) shared by the visible
+    /// caption and the VoiceOver value. `levels`: 0=still, 1=light, 2=active (may be a partial night).
+    private func movementSummary(_ levels: [Int]) -> String {
+        let still = levels.filter { $0 == 0 }.count
+        let moving = levels.count - still
+        guard moving > 0 else { return "Still all night" }
+        var runs = 0, inRun = false
+        for l in levels {
+            if l >= 1 { if !inRun { runs += 1; inRun = true } } else { inRun = false }
+        }
+        let lead = still >= moving ? "Mostly still" : "Restless"
+        return "\(lead) · \(runs) restless period\(runs == 1 ? "" : "s")"
+    }
+
+    /// Bar-height fraction per movement level (the non-colour cue): still low, active full.
+    private func movementHeightFraction(_ level: Int) -> CGFloat {
+        switch level {
+        case 2: return 1.0     // active
+        case 1: return 0.65    // light
+        default: return 0.35   // still
         }
     }
 
@@ -534,14 +583,32 @@ struct SleepCardView: View {
         if let latest {
             VStack(alignment: .leading, spacing: 4) {
                 Text("How did you sleep?").font(.caption2).foregroundStyle(.secondary)
-                HStack(spacing: 6) {
+                // Each dot is a Button filling an equal share of the row at ≥44pt tall so the whole
+                // cell is a valid tap target (was a 16pt circle at 22pt pitch); maxWidth:.infinity keeps
+                // all 9 reachable without clipping on the narrowest device (SE), edge-to-edge (no dead
+                // gaps). Selection carries a non-color ring + VoiceOver label/value/selected trait.
+                HStack(spacing: 0) {
                     ForEach(1...9, id: \.self) { n in
-                        Circle()
-                            .fill(n <= latest.feelScore ? Color.indigo : Color.secondary.opacity(0.18))
-                            .frame(width: 16, height: 16)
-                            .overlay(Text("\(n)").font(.system(size: 9))
-                                .foregroundStyle(n <= latest.feelScore ? .white : .secondary))
-                            .onTapGesture { setFeel(n, night: latest.night) }
+                        let filled = n <= latest.feelScore
+                        let isCurrent = n == latest.feelScore
+                        Button {
+                            setFeel(n, night: latest.night)
+                        } label: {
+                            Circle()
+                                .fill(filled ? Color.indigo : Color.secondary.opacity(0.18))
+                                .frame(width: 16, height: 16)
+                                .overlay(Text("\(n)").font(.system(size: 9))
+                                    .foregroundStyle(filled ? .white : .secondary))
+                                .overlay(isCurrent
+                                    ? Circle().stroke(Color.primary, lineWidth: 2).frame(width: 24, height: 24)
+                                    : nil)
+                                .frame(maxWidth: .infinity, minHeight: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Sleep quality")
+                        .accessibilityValue("\(n) of 9")
+                        .accessibilityAddTraits(isCurrent ? .isSelected : [])
                     }
                 }
             }

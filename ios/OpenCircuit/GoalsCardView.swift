@@ -143,6 +143,13 @@ struct GoalsCardView: View {
     @ViewBuilder
     private func goalRing(progress p: GoalProgress, label: String,
                           current: String, goal: String, color: Color) -> some View {
+        // Percent computed independently of the `p.met` branch below, so a met goal (which swaps the
+        // percent Text for a checkmark) still exposes an accessible progress value instead of silence.
+        // Truncate (not round) to match the visible ring percent (Int(p.fraction * 100)) exactly.
+        let pct = Int(p.fraction * 100)
+        let percentText = p.met ? "goal met" : "\(pct) percent"
+        // Spoken metric name without the estimate superscript (¹), which VoiceOver reads awkwardly.
+        let spokenLabel = label.replacingOccurrences(of: "\u{B9}", with: "")
         VStack(spacing: 4) {
             ZStack {
                 Circle()
@@ -175,6 +182,10 @@ struct GoalsCardView: View {
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity)
+        // One VoiceOver stop per ring: "Steps, 4,321 of 10,000, 47 percent" (was ~4 orphaned tokens).
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(spokenLabel)
+        .accessibilityValue("\(current) of \(goal), \(percentText)")
     }
 
     private func formatDuration(_ minutes: Int) -> String {
