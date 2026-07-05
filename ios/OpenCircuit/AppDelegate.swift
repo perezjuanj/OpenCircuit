@@ -76,7 +76,16 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
         let operation = Task { @MainActor in
             do {
-                let container = OpenCircuitApp.makeContainer()
+                // #131: NEVER build the container via the destructive `makeContainer()` here — its
+                // wipe-and-recover fallback would silently delete un-resyncable raw sample/cursor
+                // history on a transient open failure during a routine background wake, with no UI
+                // to surface the reset. Reuse the process-wide container the foreground `App` built
+                // at launch (it is populated before iOS invokes this handler on a later run-loop
+                // turn — see OpenCircuitApp.sharedContainer). In the rare case it isn't built yet,
+                // fall back to the NON-destructive `makeContainerOrThrow()`, whose throw is caught
+                // below → the run aborts, the scheduler chain stays armed, and the next wake retries;
+                // the store is never touched.
+                let container = try OpenCircuitApp.sharedContainer ?? OpenCircuitApp.makeContainerOrThrow()
                 let service = RingBackgroundSyncService(
                     store: LocalStore(container.mainContext),
                     health: HealthKitWriter()

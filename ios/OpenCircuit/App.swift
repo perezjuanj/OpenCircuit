@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import UIKit
 
 @main
 struct OpenCircuitApp: App {
@@ -91,6 +92,61 @@ struct OpenCircuitApp: App {
     /// last-resort wipe runs; the UI clears it after showing the notice. (#40)
     static let historyResetDefaultsKey = "localHistoryWasReset"
 
+    /// The one process-wide SwiftData container, published the moment the foreground `App` builds
+    /// it (see `makeContainer()`), so the background BGTask handler can REUSE it instead of opening
+    /// a second `ModelContainer` over the same store file. (#131)
+    ///
+    /// Why this is safe to publish and read across the launch: the `@main App` struct's stored
+    /// `container` property (`App.swift` line 8) is initialized when SwiftUI instantiates the App
+    /// type at process launch — which happens for a background launch too (iOS always creates the
+    /// App instance to establish the scene graph, even when no scene will connect). That
+    /// initializer runs `makeContainer()`, which assigns this static WHEN the on-disk store opens
+    /// (the normal case). The BGTask launch handler is only ever *invoked by BGTaskScheduler on a
+    /// later run-loop turn*, never synchronously during launch — so by the time the handler reads
+    /// this, the App init has already populated it.
+    ///
+    /// It is deliberately left `nil` when a background launch can't open the on-disk store (see
+    /// `resolveContainer`): the handler then falls through to `makeContainerOrThrow()`, which
+    /// re-throws → the run aborts-and-retries rather than draining into a throwaway in-memory
+    /// container. The `makeContainerOrThrow()` fallback also covers the theoretical gap where the
+    /// App init hasn't run yet.
+    ///
+    /// It is written exactly once, from the main thread, during the single-threaded App init
+    /// before any concurrent reader exists; `ModelContainer` is itself `Sendable` and thread-safe
+    /// to use from the `@MainActor` background handler.
+    static var sharedContainer: ModelContainer?
+
+    /// The schema + default configuration shared by BOTH container builders, so the foreground
+    /// (recovering) and background (non-destructive) paths can never drift apart. (#131)
+    private static func makeSchemaAndConfig() -> (Schema, ModelConfiguration) {
+        let schema = Schema([StoredSample.self, StoredCursor.self,
+                             StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
+                             StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self])
+        return (schema, ModelConfiguration(schema: schema))
+    }
+
+    /// Build the SwiftData container with NO destructive fallback: create the Application Support
+    /// directory, open the store through the `MigrationPlan`, and rethrow on any failure. This is
+    /// the ONLY builder the background BGTask drain may reach (#131) — a transient open failure
+    /// during a routine background wake must abort-and-retry, NEVER wipe the un-resyncable raw
+    /// sample/cursor history. It deliberately contains no `exportBeforeWipe`, no `removeStoreFiles`,
+    /// and no `fatalError`; the wipe-and-recover recovery lives only in `makeContainer()`, where the
+    /// `historyResetDefaultsKey` UI notice can be surfaced to the user.
+    ///
+    /// `storeURL` is a test-only seam (default nil → the app's default store); production always
+    /// calls it with no argument.
+    static func makeContainerOrThrow(storeURL: URL? = nil) throws -> ModelContainer {
+        // A brand-new app container (fresh install / new bundle id) has no
+        // `Library/Application Support` directory, where SwiftData's default store lives. If it's
+        // missing, store creation fails, so create it up front. (#fresh-install-crash)
+        _ = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                         appropriateFor: nil, create: true)
+        let (schema, defaultConfig) = makeSchemaAndConfig()
+        let config = storeURL.map { ModelConfiguration(schema: schema, url: $0) } ?? defaultConfig
+        return try ModelContainer(for: schema, migrationPlan: MigrationPlan.self,
+                                  configurations: config)
+    }
+
     /// Build the SwiftData container, recovering from an incompatible on-disk store.
     ///
     /// The default `.modelContainer(for:)` modifier traps if the container can't be created —
@@ -100,40 +156,114 @@ struct OpenCircuitApp: App {
     /// rollups (sleep summaries + daily steps) to a JSON backup and restore them into the fresh
     /// store, and raise `historyResetDefaultsKey` so the UI can tell the user. Raw epoch samples
     /// are not backed up — they're already in Apple Health. (#40)
+    ///
+    /// #131: the destructive wipe MUST be unreachable on a background (no-scene) launch. The
+    /// `@main App` struct's stored `container` initializer runs `makeContainer()` on EVERY cold
+    /// launch — including the background cold launches iOS performs for `bluetooth-central` /
+    /// `fetch` / `processing` BGTasks and CoreBluetooth state restoration. On such a launch,
+    /// post-reboot / pre-first-unlock, the store file is temporarily unreadable under Data
+    /// Protection (`CompleteUntilFirstUserAuthentication`), so the open throws transiently — and
+    /// wiping then would be the exact #131 silent data-loss, just relocated from the BGTask handler
+    /// to App.init. We therefore gate the wipe on real foreground presence: at launch,
+    /// `UIApplication.shared.applicationState == .background` iff the process was launched into the
+    /// background. Only a genuine foreground launch (`.inactive`) may wipe+recover (and surface the
+    /// notice); a background launch defers recovery to the next foreground launch — see
+    /// `resolveContainer`.
     static func makeContainer() -> ModelContainer {
-        // A brand-new app container (fresh install / new bundle id) has no
-        // `Library/Application Support` directory, where SwiftData's default store lives. If it's
-        // missing, store creation fails — and because `exportBeforeWipe` bails before it would
-        // create the directory, BOTH the initial and the post-wipe `ModelContainer` attempts below
-        // fail and hit the `fatalError` → black screen on first launch. Create it up front so a
-        // fresh install opens cleanly. (#fresh-install-crash)
-        _ = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                         appropriateFor: nil, create: true)
-        let schema = Schema([StoredSample.self, StoredCursor.self,
-                             StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
-                             StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self])
-        let config = ModelConfiguration(schema: schema)
+        // `UIApplication.shared.applicationState` is main-actor state. `makeContainer()` is invoked
+        // from the App struct's stored-property initializer, which runs on the main thread at
+        // launch, so this read is valid. (`assumeIsolated` would trap only if called off-main,
+        // which no caller does — AppDelegate no longer calls `makeContainer()`.)
+        let isBackground = MainActor.assumeIsolated {
+            UIApplication.shared.applicationState == .background
+        }
+        let (schema, config) = makeSchemaAndConfig()
+        let (container, publishAsShared) = resolveContainer(
+            isBackground: isBackground,
+            build: { try makeContainerOrThrow() },
+            wipeAndRecover: { wipeAndRecoverForeground(schema: schema, config: config) },
+            inMemoryFallback: { inMemoryContainer(schema: schema) })
+        if publishAsShared {
+            sharedContainer = container   // publish for the background handler to reuse (#131)
+        }
+        return container
+    }
 
+    /// The container-recovery decision, factored out of `makeContainer()` so the #131 rule — the
+    /// destructive wipe is UNREACHABLE on a background (no-scene) launch — is unit-testable without
+    /// a real launch context. Returns the container to use and whether it may be published as the
+    /// process-wide `sharedContainer`.
+    ///
+    /// - Successful open → use it, publish it.
+    /// - Open FAILS in the FOREGROUND (`isBackground == false`) → `wipeAndRecover` (export →
+    ///   removeStoreFiles → fresh + restore + reset notice), publish it. Foreground first-launch /
+    ///   migration recovery is UNCHANGED.
+    /// - Open FAILS in the BACKGROUND (`isBackground == true`) → do NOT wipe and do NOT touch the
+    ///   on-disk files; return a throwaway in-memory container (so the App struct's non-optional
+    ///   `container` stays valid) and do NOT publish it. Leaving `sharedContainer` nil makes the
+    ///   BGTask handler fall through to `makeContainerOrThrow()`, which re-throws against the still-
+    ///   unreadable store → `AppDelegate.handle`'s do/catch aborts the run with `success:false`,
+    ///   keeps the scheduler armed, and retries on the next wake. The `.store`/`-shm`/`-wal` files
+    ///   are left intact for the next FOREGROUND launch to open cleanly (once Data Protection is
+    ///   available) or to wipe+recover WITH the UI notice.
+    ///
+    /// Rare edge (documented, not over-engineered): if the process was background-launched onto the
+    /// in-memory fallback and the user then foregrounds THAT SAME process without a relaunch, they'd
+    /// see empty data until the next full relaunch, which recovers. Acceptable — no data is lost.
+    static func resolveContainer(
+        isBackground: Bool,
+        build: () throws -> ModelContainer,
+        wipeAndRecover: () -> ModelContainer,
+        inMemoryFallback: () -> ModelContainer
+    ) -> (container: ModelContainer, publishAsShared: Bool) {
         do {
-            return try ModelContainer(for: schema, migrationPlan: MigrationPlan.self,
-                                      configurations: config)
+            return (try build(), true)
         } catch {
             #if DEBUG
-            print("SwiftData store unusable (\(error)); backing up rollups, resetting cache, retrying.")
+            print("SwiftData store unusable (\(error)); isBackground=\(isBackground).")
             #endif
-            let backup = RollupBackup.exportBeforeWipe(config: config)
-            removeStoreFiles(at: config.url)
-            let fresh: ModelContainer
-            do {
-                fresh = try ModelContainer(for: schema, migrationPlan: MigrationPlan.self,
-                                           configurations: config)
-            } catch {
-                // A fresh store still failed — genuinely unrecoverable (e.g. no disk).
-                fatalError("Unrecoverable SwiftData store error: \(error)")
+            if isBackground {
+                // Post-reboot / pre-first-unlock background launch: the store file is temporarily
+                // unreadable (Data Protection). Wiping now would be catastrophic AND pointless, so
+                // defer recovery to the next foreground launch and leave the on-disk store untouched.
+                return (inMemoryFallback(), false)
             }
-            backup?.restore(into: fresh)
-            UserDefaults.standard.set(true, forKey: historyResetDefaultsKey)
-            return fresh
+            return (wipeAndRecover(), true)
+        }
+    }
+
+    /// The destructive FOREGROUND-ONLY recovery: back up durable rollups, wipe the store files,
+    /// rebuild a fresh store, restore the rollups, and raise `historyResetDefaultsKey`. Only reached
+    /// from `resolveContainer` when `isBackground == false`. (#40/#131)
+    private static func wipeAndRecoverForeground(schema: Schema, config: ModelConfiguration) -> ModelContainer {
+        // The app-support directory was already created by the failed `makeContainerOrThrow()`, so
+        // `exportBeforeWipe` (which won't create it) can still read the old store.
+        let backup = RollupBackup.exportBeforeWipe(config: config)
+        removeStoreFiles(at: config.url)
+        let fresh: ModelContainer
+        do {
+            fresh = try ModelContainer(for: schema, migrationPlan: MigrationPlan.self,
+                                       configurations: config)
+        } catch {
+            // A fresh store still failed — genuinely unrecoverable (e.g. no disk).
+            fatalError("Unrecoverable SwiftData store error: \(error)")
+        }
+        backup?.restore(into: fresh)
+        UserDefaults.standard.set(true, forKey: historyResetDefaultsKey)
+        return fresh
+    }
+
+    /// A throwaway in-memory container (same schema) that satisfies the App struct's non-optional
+    /// `container` on a background launch where the on-disk store is temporarily unreadable. Never
+    /// published as `sharedContainer`, never written to disk. (#131)
+    private static func inMemoryContainer(schema: Schema) -> ModelContainer {
+        do {
+            return try ModelContainer(for: schema,
+                                      configurations: ModelConfiguration(schema: schema,
+                                                                         isStoredInMemoryOnly: true))
+        } catch {
+            // In-memory creation essentially never fails; only here is a last resort acceptable.
+            fatalError("Unrecoverable in-memory SwiftData store error: \(error)")
         }
     }
 
