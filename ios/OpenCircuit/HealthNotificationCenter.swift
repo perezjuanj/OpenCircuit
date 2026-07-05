@@ -451,11 +451,13 @@ struct HealthNotificationCenter {
                     + (pct.map { " (\($0)%)" } ?? "")
                     + (at.isEmpty ? "" : " at \(at)") + " (estimate).")
         case .elevatedHRInactive:
-            let bpm = hit.map { Int($0.value) }
+            // Cite the user's CONFIGURED threshold, not the completing sample's bpm. `hit.value` here is
+            // the reading that finished the 10-min run (HealthAlerts elevatedHRInactive), NOT the peak
+            // and NOT the threshold — phrasing it as "above N bpm" misrepresented N as the trigger.
+            let threshold = HealthAlertDefaults.thresholds().elevatedHRBpm
             return ("Elevated heart rate while inactive",
-                    "Your heart rate stayed elevated"
-                    + (bpm.map { " (above \($0) bpm)" } ?? "")
-                    + " for over 10 minutes while you were inactive. This can indicate a change in how you feel.")
+                    "Your heart rate stayed above your \(threshold) bpm threshold "
+                    + "for over 10 minutes while you were inactive. This can indicate a change in how you feel.")
         case .skinTempRise:
             return ("Skin temperature elevated",
                     "Your overnight skin temperature is well above your personal baseline (estimate).")

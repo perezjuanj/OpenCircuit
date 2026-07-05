@@ -27,6 +27,8 @@ struct DayDetailView: View {
     @State private var stepSamples: [StoredStepSample] = []
     @State private var nightWindow: DateInterval?
     @State private var loading = true
+    // Display unit for skin temp: stored samples are °C, the chart converts (matches TrendsView #83).
+    @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
 
     private static let dayTitle: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "EEEE, MMM d"; return f
@@ -47,10 +49,16 @@ struct DayDetailView: View {
                                   samples: hrvSamples)
                     timeSeriesCard(title: "SpO₂", unit: "%", color: .cyan,
                                   samples: spo2Samples, scale: 100)
-                    timeSeriesCard(title: "Respiratory Rate", unit: "brpm", color: .teal,
-                                  samples: rrSamples)
-                    timeSeriesCard(title: "Skin Temp", unit: "°C", color: .orange,
-                                  samples: daytimeTemps)
+                    timeSeriesCard(title: "Respiratory Rate", unit: UnitsFormatter.respiratoryRateUnit,
+                                  color: .teal, samples: rrSamples)
+                    // Convert in the body (not at load) so switching the unit re-renders live; the
+                    // card's `scale` is multiply-only and °F needs an offset, so convert upstream here.
+                    let tempUnit = TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius
+                    timeSeriesCard(title: "Skin Temp", unit: tempUnit.symbol, color: .orange,
+                                  samples: daytimeTemps.map {
+                                      QuantitySample(kind: .temperature, start: $0.start,
+                                                     value: tempUnit.convert(fromCelsius: $0.value))
+                                  })
                     stepsChartCard()
                 }
             }

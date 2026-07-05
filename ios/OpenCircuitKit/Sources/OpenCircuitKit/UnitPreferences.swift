@@ -86,6 +86,12 @@ public enum DistanceUnit: String, CaseIterable, Codable, Sendable {
 /// Stateless helpers that turn raw SI values into localised display strings.
 public enum UnitsFormatter {
 
+    /// Canonical on-screen unit for respiratory rate (breaths per minute). Single source of truth so
+    /// every RR surface — home Vitals row, Trends card badge + rows, trend charts, Day Detail — reads
+    /// the same string (they used to disagree: "brpm" on charts vs "/min" on rows). This is DISPLAY
+    /// copy only; the HealthKit unit identifier stays `MetricKind.respiratoryRate.unit` ("count/min").
+    public static let respiratoryRateUnit = "brpm"
+
     /// Format a Celsius value in the requested unit, e.g. "36.5 °C" or "97.7 °F".
     public static func temperature(_ celsius: Double, unit: TemperatureUnit,
                                    fractionDigits: Int = 1) -> String {
