@@ -1,4 +1,6 @@
 import SwiftUI
+import UIKit
+import UserNotifications
 import OpenCircuitKit
 
 @MainActor
@@ -96,6 +98,13 @@ struct UserProfileSettingsView: View {
     @AppStorage(HealthAlertDefaults.quietEnabled) private var quietEnabled = false
     @AppStorage(HealthAlertDefaults.quietStartMinutes) private var quietStart = HealthAlertDefaults.defaultQuietStart
     @AppStorage(HealthAlertDefaults.quietEndMinutes) private var quietEnd = HealthAlertDefaults.defaultQuietEnd
+
+    /// System notification-authorization status, surfaced so the alert / quiet-hours / reminder
+    /// settings warn when delivery is off (#136). Refreshed on appear + on scene-active (the user
+    /// may flip it in iOS Settings while away). `.provisional`/`.ephemeral` still deliver (quietly),
+    /// so they are treated as OK — no banner. Read-only here: opening Settings never itself requests
+    /// authorization (the lazy-prompt design is preserved).
+    @State private var notifStatus: UNAuthorizationStatus = .notDetermined
 
     var body: some View {
         Form {
@@ -285,19 +294,23 @@ struct UserProfileSettingsView: View {
             }
 
             Section("Health alerts") {
+                notifAuthBanner
                 Toggle("High heart rate", isOn: $highHREnabled)
+                    .onChange(of: highHREnabled) { _, on in escalateNotifAuth(enabled: on) }
                 if highHREnabled {
                     Stepper(value: $highHRBpm, in: 80...200, step: 5) {
                         LabeledContent("Notify above", value: "\(highHRBpm) bpm")
                     }
                 }
                 Toggle("Low blood oxygen", isOn: $lowSpO2Enabled)
+                    .onChange(of: lowSpO2Enabled) { _, on in escalateNotifAuth(enabled: on) }
                 if lowSpO2Enabled {
                     Stepper(value: $lowSpO2Percent, in: 80...99) {
                         LabeledContent("Notify below", value: "\(lowSpO2Percent)%")
                     }
                 }
                 Toggle("Elevated HR while inactive", isOn: $elevatedHREnabled)
+                    .onChange(of: elevatedHREnabled) { _, on in escalateNotifAuth(enabled: on) }
                 if elevatedHREnabled {
                     Stepper(value: $elevatedHRBpm, in: 80...160, step: 5) {
                         LabeledContent("Sustained above", value: "\(elevatedHRBpm) bpm")
@@ -307,10 +320,17 @@ struct UserProfileSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Toggle("Skin-temp & fever alerts", isOn: $tempFeverEnabled)
+                    .onChange(of: tempFeverEnabled) { _, on in escalateNotifAuth(enabled: on) }
                 Text("Note: OpenCircuit is not a medical device. These reminders are based on ring "
                      + "sensor data only and are not a diagnosis. If you feel unwell, consult a "
                      + "qualified medical professional.")
                     .font(.caption2).foregroundStyle(.secondary)
+            }
+            .task { await refreshNotifAuthState() }
+            .onChange(of: scenePhase) { _, phase in
+                // Coming back from iOS Settings: reflect a freshly-flipped notification switch
+                // (enabled or disabled) in the banner without an app relaunch (#136).
+                if phase == .active { Task { await refreshNotifAuthState() } }
             }
 
             Section("Women's health") {
@@ -432,6 +452,56 @@ struct UserProfileSettingsView: View {
             // nil = status unknown (entitlement-stripped sideload): keep the Connect button so
             // its tap path can throw and surface the sideload notice, as before.
             healthPromptExhausted = (await health.authorizationPromptAvailable()) == false
+        }
+    }
+
+    // MARK: Notification-auth banner (#136) + full-auth escalation (#133)
+
+    /// Warns when notifications can't reach the user so the alert / quiet-hours / reminder controls
+    /// below don't read as "armed" when they're silently dropped (#136). Shown once at the top of the
+    /// "Health alerts" section — it visually covers Quiet hours and Reminders too, which share the
+    /// same app-wide authorization. `.authorized`/`.provisional`/`.ephemeral` all still deliver, so
+    /// no banner then. Mirrors the "dead button" precedent in the Apple Health section above.
+    @ViewBuilder private var notifAuthBanner: some View {
+        switch notifStatus {
+        case .denied:
+            Label {
+                Text("Notifications are turned off for OpenCircuit, so no alerts or reminders "
+                     + "can be delivered.")
+            } icon: {
+                Image(systemName: "bell.slash.fill").foregroundStyle(.orange)
+            }
+            Button {
+                if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+            } label: {
+                Label("Turn On in Settings", systemImage: "arrow.up.forward.app")
+            }
+        case .notDetermined:
+            // Soft hint only — matches the lazy-authorization design (the engine prompts on the
+            // first real post, #133). Do NOT eagerly request auth from this screen.
+            Text("iOS will ask permission the first time an alert needs to fire.")
+                .font(.caption).foregroundStyle(.secondary)
+        default:
+            EmptyView()
+        }
+    }
+
+    /// Read (never request) the system notification-authorization status for the banner (#136).
+    private func refreshNotifAuthState() async {
+        notifStatus = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    /// Opting into a body-vital alert is a foreground consent moment: escalate a provisional (or
+    /// not-yet-determined) grant to FULL alert+sound+badge auth so the alert the user JUST enabled
+    /// won't deliver silently under a provisional grant the morning-summary/observability paths won
+    /// first (#133). No-op when the toggle is turned OFF. The one-time flag guard + the actual
+    /// request live in `HealthNotificationCenter.requestFullAuthorizationIfNeeded()` so the engine
+    /// and the UI share one policy. Refreshes the banner afterward to reflect the new grant.
+    private func escalateNotifAuth(enabled: Bool) {
+        guard enabled else { return }
+        Task {
+            await HealthNotificationCenter().requestFullAuthorizationIfNeeded()
+            await refreshNotifAuthState()
         }
     }
 
