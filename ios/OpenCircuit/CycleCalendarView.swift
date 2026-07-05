@@ -136,6 +136,27 @@ struct CycleCalendarView: View {
         return .primary
     }
 
+    /// A day's cycle state as (spoken description, non-colour glyph), or nil for a plain day. Same
+    /// first-match priority as `tileFill` so the tile fill, the glyph, and the VoiceOver label always
+    /// agree even when a day matches several predicates (e.g. an ovulation day inside the fertile
+    /// window). Glyphs are shape-distinct so the four states read in greyscale / with colour filters:
+    /// drops = period (fill=logged, outline=predicted), diamond = ovulation peak, dot = fertile.
+    private func dayState(_ date: Date) -> (desc: String, glyph: String)? {
+        if isLoggedPeriod(date) { return ("Logged period", "drop.fill") }
+        if isPredictedPeriod(date) { return ("Predicted period", "drop") }
+        if isOvulation(date) { return ("Ovulation estimate", "diamond.fill") }
+        if isFertile(date) { return ("Fertile", "circle.fill") }
+        return nil
+    }
+
+    /// VoiceOver label for a day tile: full date (was just the bare day number) + Today + cycle state.
+    private func dayAccessibilityLabel(_ date: Date, state: (desc: String, glyph: String)?) -> String {
+        var parts = [date.formatted(.dateTime.weekday(.wide).month(.wide).day())]
+        if isToday(date) { parts.append("Today") }
+        if let s = state { parts.append(s.desc) }
+        return parts.joined(separator: ", ")
+    }
+
     // MARK: Body
 
     var body: some View {
@@ -225,6 +246,7 @@ struct CycleCalendarView: View {
         let dayNum = cal.component(.day, from: date)
         let fill = tileFill(date)
         let textColor = tileTextColor(date)
+        let state = dayState(date)
 
         return ZStack {
             // Today gets a solid circle
@@ -246,27 +268,41 @@ struct CycleCalendarView: View {
                 .foregroundStyle(textColor)
         }
         .frame(width: 36, height: 36)
+        // Non-colour cue: a small shape badge per state so the four states are distinguishable in
+        // greyscale / under a colour-blindness filter, not by hue alone.
+        .overlay(alignment: .bottomTrailing) {
+            if let glyph = state?.glyph {
+                Image(systemName: glyph)
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(isLoggedPeriod(date) ? Color.white : Color.primary)
+                    .padding(1)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(dayAccessibilityLabel(date, state: state))
     }
 
     private var legendRow: some View {
         HStack(spacing: 12) {
-            legendItem(color: .red.opacity(0.75), label: "Period")
-            legendItem(color: .orange.opacity(0.25), label: "Predicted", outlined: .orange)
-            legendItem(color: .green.opacity(0.15), label: "Fertile")
-            legendItem(color: .green.opacity(0.35), label: "Ovulation est.")
+            legendItem(color: .red.opacity(0.75), glyph: "drop.fill", label: "Period")
+            legendItem(color: .orange.opacity(0.25), glyph: "drop", label: "Predicted", outlined: .orange)
+            legendItem(color: .green.opacity(0.15), glyph: "circle.fill", label: "Fertile")
+            legendItem(color: .green.opacity(0.35), glyph: "diamond.fill", label: "Ovulation est.")
         }
         .font(.caption2)
         .foregroundStyle(.secondary)
     }
 
-    private func legendItem(color: Color, label: String,
+    private func legendItem(color: Color, glyph: String, label: String,
                              outlined: Color? = nil) -> some View {
         HStack(spacing: 4) {
+            // Swatch carries the SAME shape glyph as the tiles, so the key works without colour too.
             ZStack {
-                Circle().fill(color).frame(width: 12, height: 12)
+                Circle().fill(color).frame(width: 14, height: 14)
                 if let outline = outlined {
-                    Circle().stroke(outline.opacity(0.8), lineWidth: 1).frame(width: 12, height: 12)
+                    Circle().stroke(outline.opacity(0.8), lineWidth: 1).frame(width: 14, height: 14)
                 }
+                Image(systemName: glyph).font(.system(size: 8, weight: .bold)).foregroundStyle(.primary)
             }
             Text(label)
         }
