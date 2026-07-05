@@ -158,6 +158,124 @@ final class HealthAlertsTests: XCTestCase {
         XCTAssertTrue(hits.isEmpty, "already-fired crossings must not replay on the next drain")
     }
 
+    // MARK: #144 activity gate (nonExercising)
+
+    func testNonExercisingDropsHROverlappingSteps() {
+        // A high HR concurrent with a stepping window is dropped; a high HR in a still window survives.
+        let stepping = (at(10, 0), at(10, 20))          // 20-min walk
+        let series = [hr(165, 10, 10),                  // during the walk → excluded
+                      hr(122, 14, 0)]                   // still period → kept
+        let filtered = HealthAlertEvaluator.nonExercising(series, activeIntervals: [stepping], pad: 10 * 60)
+        XCTAssertEqual(filtered.map(\.bpm), [122])
+    }
+
+    func testNonExercisingExcludesRecoveryTail() {
+        // A crossing within the `pad` recovery tail AFTER the walk ends is still excluded…
+        let stepping = (at(10, 0), at(10, 20))
+        let inTail = [hr(150, 10, 25)]                  // 5 min after the walk, inside the 10-min pad
+        XCTAssertTrue(HealthAlertEvaluator.nonExercising(inTail, activeIntervals: [stepping], pad: 10 * 60).isEmpty)
+        // …but beyond the pad it survives (recovery is over).
+        let afterTail = [hr(150, 10, 35)]               // 15 min after → outside the 10-min pad
+        XCTAssertEqual(HealthAlertEvaluator.nonExercising(afterTail, activeIntervals: [stepping], pad: 10 * 60).count, 1)
+    }
+
+    func testNonExercisingNoStepDataSuppressesNothing() {
+        // Missing step data must NEVER silence a real crossing — empty intervals returns the series as-is.
+        let series = [hr(165, 10, 10), hr(122, 14, 0)]
+        XCTAssertEqual(HealthAlertEvaluator.nonExercising(series, activeIntervals: [], pad: 10 * 60), series)
+    }
+
+    func testNonExercisingGatedEvaluateOnlyAlertsStillCrossing() {
+        // End-to-end: gate a mixed series then evaluate. The exercising 165 bpm is suppressed while the
+        // still-period resting crossing (128 bpm, no concurrent steps) still fires exactly once (#144).
+        let thresholds = HealthAlertThresholds(highHRBpm: 120, lowSpO2Enabled: false, elevatedHREnabled: false)
+        let stepping = (at(10, 0), at(10, 20))
+        let mixed = [hr(165, 10, 10),                   // exercising → suppressed
+                     hr(128, 14, 0)]                    // resting crossing → alerts
+        let gated = HealthAlertEvaluator.nonExercising(mixed, activeIntervals: [stepping])
+        let hits = HealthAlertEvaluator.evaluate(hr: gated, spo2: [], inactiveHR: gated, thresholds: thresholds)
+        XCTAssertEqual(hits.map(\.notification), [.highHR])
+        XCTAssertEqual(hits.first?.value, 128)
+    }
+
+    // MARK: #144 activeStepIntervals — the production step-source path + day-wide fallback guard
+
+    func testActiveStepIntervalsKeepsNarrowNonzeroWindows() {
+        // A normal per-reading window (a few minutes, nonzero delta) becomes a gate interval.
+        let w = [StepWindow(start: at(10, 0), end: at(10, 3), delta: 40)]
+        let intervals = HealthAlertEvaluator.activeStepIntervals(w)
+        XCTAssertEqual(intervals.count, 1)
+        XCTAssertEqual(intervals.first?.0, at(10, 0))
+        XCTAssertEqual(intervals.first?.1, at(10, 3))
+    }
+
+    func testActiveStepIntervalsDropsZeroDeltaWindow() {
+        let w = [StepWindow(start: at(10, 0), end: at(10, 3), delta: 0)]
+        XCTAssertTrue(HealthAlertEvaluator.activeStepIntervals(w).isEmpty)
+    }
+
+    func testActiveStepIntervalsExcludesDayWideFallbackWindow() {
+        // SAFETY GUARD: a fresh-baseline / rollover reading records a day-wide [startOfDay, sampleDate]
+        // window. It MUST NOT become a gate interval — otherwise it blankets the whole day.
+        let dayWide = [StepWindow(start: at(0, 0), end: at(10, 15), delta: 900)]   // 10h15m fallback
+        XCTAssertTrue(HealthAlertEvaluator.activeStepIntervals(dayWide).isEmpty,
+                      "day-wide fallback window must not become a gate interval")
+        // The boundary: a window exactly at the cap is kept; just over it is dropped.
+        let atCap  = [StepWindow(start: at(10, 0), end: at(10, 30), delta: 5)]     // == 30 min
+        let overCap = [StepWindow(start: at(10, 0), end: at(10, 31), delta: 5)]    // 31 min
+        XCTAssertEqual(HealthAlertEvaluator.activeStepIntervals(atCap).count, 1)
+        XCTAssertTrue(HealthAlertEvaluator.activeStepIntervals(overCap).isEmpty)
+    }
+
+    func testDayWideFallbackWindowCannotSuppressGenuineCrossing() {
+        // End-to-end safety: a resting crossing at 08:30 (no narrow activity) must STILL fire even
+        // when a day-wide fallback step window [00:00, 10:15] is present — the guard drops that window
+        // so it can't blanket-suppress the morning (the catastrophic false-negative this guards).
+        let thresholds = HealthAlertThresholds(highHRBpm: 120, lowSpO2Enabled: false, elevatedHREnabled: false)
+        let steps = [StepWindow(start: at(0, 0), end: at(10, 15), delta: 900)]     // day-wide fallback only
+        let intervals = HealthAlertEvaluator.activeStepIntervals(steps)
+        let crossing = [hr(150, 8, 30)]                                            // resting, no concurrent steps
+        let gated = HealthAlertEvaluator.nonExercising(crossing, activeIntervals: intervals)
+        let hits = HealthAlertEvaluator.evaluate(hr: gated, spo2: [], inactiveHR: gated, thresholds: thresholds)
+        XCTAssertEqual(hits.map(\.notification), [.highHR],
+                       "a day-wide fallback window must never silence a real crossing")
+    }
+
+    func testNarrowWindowGateEngagesOnRealStepData() {
+        // The gate DOES engage on real narrow windows (proving it's not a no-op): 165 bpm concurrent
+        // with a 3-min stepping window is suppressed, while a resting 128 bpm in a still period fires.
+        let thresholds = HealthAlertThresholds(highHRBpm: 120, lowSpO2Enabled: false, elevatedHREnabled: false)
+        let steps = [StepWindow(start: at(10, 0), end: at(10, 3), delta: 60)]
+        let intervals = HealthAlertEvaluator.activeStepIntervals(steps)
+        let mixed = [hr(165, 10, 1),   // exercising → suppressed
+                     hr(128, 14, 0)]   // resting crossing → alerts
+        let gated = HealthAlertEvaluator.nonExercising(mixed, activeIntervals: intervals)
+        let hits = HealthAlertEvaluator.evaluate(hr: gated, spo2: [], inactiveHR: gated, thresholds: thresholds)
+        XCTAssertEqual(hits.map(\.notification), [.highHR])
+        XCTAssertEqual(hits.first?.value, 128)
+    }
+
+    // MARK: #137 bedtime reminder bypasses the quiet-hours gate (caller-side split)
+
+    func testBedtimeReminderBypassesQuietHoursWhileVitalsStayMuted() {
+        // Reproduces the `evaluateReminders` split: `now` is 22:45 — inside BOTH the default
+        // 22:00–07:00 quiet window AND a typical [22:30, 23:00) bedtime window. A body-vital alert
+        // stays muted (no regression), while the bedtime reminder — gated with quiet DISABLED —
+        // survives, and the anti-spam backoff still de-dupes it so it fires at most once per night.
+        let gate = NotificationGate()
+        let quiet = QuietHours(enabled: true, startMinutes: 22 * 60, endMinutes: 7 * 60)
+        let now = at(22, 45)
+        // Body-vital alert: still suppressed during quiet hours.
+        XCTAssertTrue(gate.filter([.highHR], now: now, lastFired: [:], quietHours: quiet).isEmpty)
+        // Bedtime reminder: gated with quiet disabled → fires even though `now` is inside quiet hours.
+        XCTAssertEqual(gate.filter([.bedtimeReminder], now: now, lastFired: [:],
+                                   quietHours: QuietHours(enabled: false)), [.bedtimeReminder])
+        // Backoff still applies: a second eval later in the same window is suppressed (fires once/night).
+        XCTAssertTrue(gate.filter([.bedtimeReminder], now: at(22, 50),
+                                  lastFired: [.bedtimeReminder: now],
+                                  quietHours: QuietHours(enabled: false)).isEmpty)
+    }
+
     // MARK: #85 flag routing
 
     func testTempFeverRouting() {

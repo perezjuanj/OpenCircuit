@@ -38,6 +38,12 @@ struct SleepCardView: View {
     /// Freshly staged segments from the just-finished sync (empty when none / after disconnect).
     /// Preferred over the store so a completed sync updates the card immediately.
     var liveSegments: [SleepSegment]
+    /// Completion time of the most recent successful sync/drain (from `ObservabilityStore`), used to
+    /// tell "last night hasn't drained yet" from "you didn't sleep" (#148). A drain that lands AFTER
+    /// this morning's wake yet stages no night ending today is a genuine miss; before that, the
+    /// missing-night banner is suppressed in favour of a soft "not synced yet" note. nil ⇒ never
+    /// synced. Uses the SYNC time, not a sample timestamp (device timestamps can be 60+ min stale).
+    var lastSyncAt: Date?
     /// Sleep-vitals samples (HR / HRV / SpO₂) over the last few days — narrowed in memory to the
     /// resolved night window for the "overnight average" row under the stage breakdown. Bounded
     /// (value-positive + windowed) so it never scans all history (#32), mirroring
@@ -50,8 +56,9 @@ struct SleepCardView: View {
     /// Trailing nights queried for the baseline + temp chart (#69). 35 ≥ the 30-night baseline.
     private static let historyNights = 35
 
-    init(liveSegments: [SleepSegment] = []) {
+    init(liveSegments: [SleepSegment] = [], lastSyncAt: Date? = nil) {
         self.liveSegments = liveSegments
+        self.lastSyncAt = lastSyncAt
         var d = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
         d.fetchLimit = Self.historyNights
         _storedSleep = Query(d)
@@ -141,18 +148,47 @@ struct SleepCardView: View {
         }
     }
 
-    /// True when we're past this morning's expected wake yet the night on screen did NOT end today —
-    /// i.e. last night wasn't captured and we're falling back to an older recorded night. Gated on
-    /// being past the scheduled wake so a mid-sleep glance (e.g. 3 a.m., the night still in progress)
-    /// never claims a miss. Uses the same manual/default schedule the rest of the night gating uses.
-    /// Drives `missedNightNotice` so a stale total never silently reads as last night (the
-    /// overnight-self-contention failure mode).
-    private var lastNightMissing: Bool {
-        guard let night, night.wakeKnown else { return false }
-        let now = Date()
-        let wakeRef = SleepWindow.interval(bedMinutes: bedMinutes, wakeMinutes: wakeMinutes,
-                                           nightEndingNear: now)?.end ?? now
-        return now > wakeRef && !Calendar.current.isDateInToday(night.when)
+    /// Recency of the night on screen, resolved by the shared kit predicate so this card and the
+    /// Daily-Goals Sleep ring (`GoalsCardView`) can never disagree about what counts as last night.
+    /// `.missing` (orange banner) requires: past THIS MORNING'S wake (fixed all day, so it doesn't
+    /// vanish in the evening — #148 Bug 2), the shown night did NOT end today, AND a sync completed
+    /// after wake yet staged no today night. Before such a sync it's `.notSyncedYet` (soft note, not
+    /// an alarming false negative — #148 Bug 1). A legacy rollup with no clock time is never judged.
+    private var recencyStatus: MissedNight.Status {
+        guard let night else { return .ok }
+        return MissedNight.status(now: Date(), bedMinutes: bedMinutes, wakeMinutes: wakeMinutes,
+                                  nightWake: night.wakeKnown ? night.when : nil,
+                                  wakeKnown: night.wakeKnown, lastSyncAt: lastSyncAt)
+    }
+
+    /// True when last night is a genuine miss (drives the orange banner + the Goals-ring agreement
+    /// invariant: whenever this is true the Goals Sleep ring is empty).
+    private var lastNightMissing: Bool { recencyStatus == .missing }
+
+    /// The recency note to show above the stage details, if any: the orange miss banner, the soft
+    /// "not synced yet" note, or nothing.
+    @ViewBuilder
+    private var recencyNotice: some View {
+        switch recencyStatus {
+        case .missing:      missedNightNotice
+        case .notSyncedYet: notSyncedYetNotice
+        case .ok:           EmptyView()
+        }
+    }
+
+    /// Soft, NON-alarming note for the pre-morning-sync gap: last night simply hasn't drained off
+    /// the ring yet (the app stays quiet during sleep and drains are ~hourly), so we don't yet know
+    /// if it was missed. Deliberately not orange — a normal wake-and-open morning must not be told
+    /// "No sleep recorded" (#148 Bug 1).
+    private var notSyncedYetNotice: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "arrow.triangle.2.circlepath").font(.caption2).foregroundStyle(.secondary)
+            Text("Last night hasn’t synced yet. Open OpenCircuit near the ring to pull it in — showing your most recent recorded night until then.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 6).padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.10)))
     }
 
     /// Honest fallback banner shown above the stage details when `lastNightMissing`: last night didn't
@@ -181,7 +217,7 @@ struct SleepCardView: View {
                 }
             }
             if let night {
-                if lastNightMissing { missedNightNotice }
+                recencyNotice
                 content(night)
             } else {
                 emptyState

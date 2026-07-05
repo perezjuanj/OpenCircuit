@@ -16,6 +16,14 @@ struct ContentView: View {
     /// `requestAuthorization` would silently no-op, so the authorize button must route to the
     /// Health app instead. Re-probed at launch, on foreground return, and after a live decline.
     @State private var healthPromptExhausted = false
+    /// Tri-state Health share status (#132): distinguishes a full grant from a PARTIAL one (heart
+    /// rate granted, another type — SpO₂/temp/sleep — denied), so the card can warn honestly instead
+    /// of a blanket "Auto-syncing" that silently drops the denied metrics. Recomputed alongside
+    /// `healthAuthorized` (launch / foreground / post-authorize / post-flush).
+    @State private var healthShareState: HealthKitWriter.ShareState = .unauthorized
+    /// Persisted per-metric Health write failures (#135) — a metric whose `save` actually threw
+    /// (e.g. a category toggled off in Settings ▸ Health). Surfaced as an amber "hasn't synced" line.
+    @State private var healthWriteFailures: [MetricKind] = []
     @Environment(\.openURL) private var openURL
     @State private var lastWrite: String?
     /// Drives the "Bluetooth is off" explainer alert from the connect card's Turn-on-Bluetooth
@@ -82,6 +90,13 @@ struct ContentView: View {
             List {
                 Group {
                     connectionCard
+                    // First-run Health authorization banner (#143): routes a new user to authorize
+                    // Health right under the connection card, instead of burying the only authorize
+                    // button beneath the RE tooling at the bottom of the last card. Disappears the
+                    // moment auth succeeds (`healthAuthorized` is refreshed in `.task`/on foreground).
+                    if !healthAuthorized, HealthKitWriter.isAvailable {
+                        healthAuthBanner
+                    }
                     ForEach(visibleSections) { section in
                         sectionView(section)
                     }
@@ -128,6 +143,7 @@ struct ContentView: View {
                 // read there once blocked the launch render into a black screen. #14
                 healthAuthorized = health.isShareAuthorized
                 if healthAuthorized { observability.markHealthEverAuthorized() }
+                refreshHealthShareState()   // partial-grant (#132) + persisted write failures (#135)
                 refreshObservability()
                 if healthAuthorized {
                     flushHealth()
@@ -167,6 +183,11 @@ struct ContentView: View {
                     recordForegroundSync()
                     flushHealth()
                     evaluateHealthAlerts()   // #73/#85: a fresh sync may cross a threshold
+                    // #145: evaluate the sedentary reminder only now, against the freshly-synced
+                    // `lastActivityAt` — so it can't fire on stale pre-sync data right after a walk.
+                    // This runs whenever syncing flips to false (even if no new frames), so a
+                    // genuinely-inactive user still gets the nudge.
+                    evaluateReminders(includeSedentary: true)
                 }
             }
             .onChange(of: session?.monitoring) { _, monitoring in
@@ -353,6 +374,7 @@ struct ContentView: View {
         let wasAuthorized = healthAuthorized
         let authorized = health.isShareAuthorized
         healthAuthorized = authorized
+        refreshHealthShareState()   // a partial grant or a toggle flipped in Health while away (#132/#135)
         if authorized {
             observability.markHealthEverAuthorized()
             healthPromptExhausted = false
@@ -366,13 +388,18 @@ struct ContentView: View {
         let battery = session?.batteryPercent
         Task { await LocalAlertCenter().evaluate(batteryPercent: battery, healthAuthorized: authorized) }
         evaluateHealthAlerts()
-        evaluateReminders()
+        // Pre-sync pass: wear + bedtime only. The sedentary rule is deferred to the post-sync
+        // handler so it never fires on a stale `lastActivityAt` right after activity (#145).
+        evaluateReminders(includeSedentary: false)
     }
 
-    /// Evaluate the three app-side reminders (#84: sedentary / wear / bedtime) against the
-    /// current session and persisted UserDefaults state, routing survivors through the shared
-    /// notification engine (quiet hours + anti-spam backoff).
-    private func evaluateReminders() {
+    /// Evaluate the app-side reminders (#84: sedentary / wear / bedtime) against the current
+    /// session and persisted UserDefaults state, routing survivors through the shared notification
+    /// engine (quiet hours + anti-spam backoff). `includeSedentary` is `false` on the pre-sync
+    /// scene-active pass so the move reminder never fires on a stale `lastActivityAt` (#145); it is
+    /// evaluated with `true` only after a foreground sync lands fresh step data. Wear + bedtime run
+    /// on every pass since they don't depend on fresh steps.
+    private func evaluateReminders(includeSedentary: Bool) {
         let d = UserDefaults.standard
         SleepScheduleDefaults.register(d)
         let bedMinutes  = d.integer(forKey: SleepScheduleDefaults.bedMinutes)
@@ -384,7 +411,8 @@ struct ContentView: View {
                 session: s,
                 sleepBedMinutes: bedMinutes,
                 sleepWakeMinutes: wakeMinutes,
-                sleepEnabled: sleepEnabled)
+                sleepEnabled: sleepEnabled,
+                includeSedentary: includeSedentary)
         }
     }
 
@@ -828,7 +856,7 @@ struct ContentView: View {
     /// so the most recent night stays on screen all day — across reconnects and syncs — and
     /// reflects a just-finished sync instantly via the live staged segments. (See SleepCardView.)
     private var sleepCard: some View {
-        SleepCardView(liveSegments: session?.stagedSegments ?? [])
+        SleepCardView(liveSegments: session?.stagedSegments ?? [], lastSyncAt: lastSyncAt)
     }
 
     /// Workout session card — taps through to WorkoutView (#75).
@@ -1061,84 +1089,157 @@ struct ContentView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-            // The Health mirror controls. Show the Authorize button whenever Health isn't yet
-            // authorized — regardless of whether the current sync had records — so a first-time
-            // user (or one whose syncs all return empty) can still enable Health mirroring.
-            // Once authorized, only show the "auto-syncing" line when there are recent records
-            // (avoids a persistent green banner while the ring is empty).
-            if !healthAuthorized || session?.historySamples.isEmpty == false {
+            // Health mirror STATUS lives here once authorized (the first-run authorize prompt now
+            // lives in the top-of-dashboard banner — #143 — so it isn't duplicated here). Show the
+            // status line when there are recent records OR something needs attention (a partial
+            // grant — #132 — or a persisted write failure — #135), so the honest amber warning
+            // surfaces even on an empty-ring day; stay silent otherwise (no persistent green banner).
+            if healthAuthorized, session?.historySamples.isEmpty == false || healthNeedsAttention {
                 Divider()
                 healthRow
             }
         }
     }
 
+    /// The authorized-state Health status line + the last-write detail. The unauthorized authorize
+    /// prompt is `healthAuthPrompt`, rendered by the top-of-dashboard banner (#143), not here.
     private var healthRow: some View {
         VStack(spacing: 8) {
-            if !healthAuthorized, healthPromptExhausted {
-                // iOS shows the Health permission sheet once, ever — after a decline,
-                // requestAuthorization is a silent no-op (the "dead button" bug). Route to the
-                // Health app's own toggles instead; foreground return re-probes and backfills.
-                Button {
-                    openURL(HealthKitWriter.healthAppURL)
-                } label: {
-                    Label("Turn On Access in Health", systemImage: "heart.text.square")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                Text("Health access was declined earlier, and iOS only shows that prompt once. "
-                     + "In Health: profile picture ▸ Privacy ▸ Apps ▸ OpenCircuit — switch on "
-                     + "what you'd like to share, then come back. Syncing resumes automatically.")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else if !healthAuthorized {
-                Button {
-                    Task {
-                        do {
-                            try await health.requestAuthorization()
-                        } catch {
-                            // The request throws when the HealthKit entitlement is absent — the
-                            // signature of a free-Apple-ID sideload (the entitlement is paid-account
-                            // only and gets stripped on re-sign). Surface it instead of failing
-                            // silently; the app still works as a local dashboard. (#104)
-                            healthUnavailable = true
-                        }
-                        healthAuthorized = health.isShareAuthorized
-                        if healthAuthorized {
-                            healthUnavailable = false
-                            observability.markHealthEverAuthorized()
-                        } else {
-                            // A decline just now uses up the one-time sheet — flip the button
-                            // to the Health-app route immediately, not on the next launch.
-                            healthPromptExhausted =
-                                (await health.authorizationPromptAvailable()) == false
-                        }
-                        flushHealth()   // backfill everything already in the store
-                    }
-                } label: {
-                    Label("Authorize Apple Health", systemImage: "heart.text.square")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!HealthKitWriter.isAvailable)
-                if healthUnavailable {
-                    Text("This build can't write to Apple Health — that needs the TestFlight build. "
-                         + "(Free side-loaded builds can't use HealthKit.) OpenCircuit still works "
-                         + "as a local dashboard.")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            } else {
-                // Mirroring is automatic after every sync; this is just a reassurance line
-                // plus a manual nudge for the impatient.
-                Label("Auto-syncing to Apple Health", systemImage: "checkmark.seal.fill")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .center)
-            }
+            healthStatusLine
             if let lastWrite {
                 Text(lastWrite).font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// Authorized-state status: the honest amber warning when a metric is denied (#132) or its
+    /// write is failing (#135), otherwise the green "auto-syncing" reassurance. Tapping the warning
+    /// deep-links into the Health app so the user can flip the missing type back on.
+    @ViewBuilder private var healthStatusLine: some View {
+        let attention = healthAttentionNames
+        if attention.isEmpty {
+            // Mirroring is automatic after every sync; this is just a reassurance line.
+            Label("Auto-syncing to Apple Health", systemImage: "checkmark.seal.fill")
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .center)
+        } else {
+            Button {
+                openURL(HealthKitWriter.healthAppURL)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Some metrics aren't reaching Apple Health",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                    Text("\(attention.joined(separator: ", ")) — tap to turn them on in Health.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    /// The state-driven Health authorize control (#143 extraction): the deep-link when the one-time
+    /// iOS sheet is exhausted, the normal request path otherwise, and the sideload "unavailable"
+    /// note. Reused by both the top-of-dashboard banner and (historically) the sync card, so the
+    /// request/probe logic lives in exactly one place. Callers gate it on `!healthAuthorized`.
+    @ViewBuilder private var healthAuthPrompt: some View {
+        if healthPromptExhausted {
+            // iOS shows the Health permission sheet once, ever — after a decline,
+            // requestAuthorization is a silent no-op (the "dead button" bug). Route to the
+            // Health app's own toggles instead; foreground return re-probes and backfills.
+            Button {
+                openURL(HealthKitWriter.healthAppURL)
+            } label: {
+                Label("Turn On Access in Health", systemImage: "heart.text.square")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            Text("Health access was declined earlier, and iOS only shows that prompt once. "
+                 + "In Health: profile picture ▸ Privacy ▸ Apps ▸ OpenCircuit — switch on "
+                 + "what you'd like to share, then come back. Syncing resumes automatically.")
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Button {
+                Task {
+                    do {
+                        try await health.requestAuthorization()
+                    } catch {
+                        // The request throws when the HealthKit entitlement is absent — the
+                        // signature of a free-Apple-ID sideload (the entitlement is paid-account
+                        // only and gets stripped on re-sign). Surface it instead of failing
+                        // silently; the app still works as a local dashboard. (#104)
+                        healthUnavailable = true
+                    }
+                    healthAuthorized = health.isShareAuthorized
+                    if healthAuthorized {
+                        healthUnavailable = false
+                        observability.markHealthEverAuthorized()
+                    } else {
+                        // A decline just now uses up the one-time sheet — flip the button
+                        // to the Health-app route immediately, not on the next launch.
+                        healthPromptExhausted =
+                            (await health.authorizationPromptAvailable()) == false
+                    }
+                    refreshHealthShareState()   // reflect a partial grant / cleared failures (#132/#135)
+                    flushHealth()   // backfill everything already in the store
+                }
+            } label: {
+                Label("Authorize Apple Health", systemImage: "heart.text.square")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!HealthKitWriter.isAvailable)
+            if healthUnavailable {
+                Text("This build can't write to Apple Health — that needs the TestFlight build. "
+                     + "(Free side-loaded builds can't use HealthKit.) OpenCircuit still works "
+                     + "as a local dashboard.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// First-run Health authorization banner (#143). Directly under the connection card so a new
+    /// user is routed to authorize Health — the app's entire purpose — WITHOUT scrolling past the
+    /// Sync / historic-pull / forensic-sweep / calibration tooling to the buried authorize button.
+    /// Gated on `!healthAuthorized` at the call site, so it vanishes the moment auth succeeds.
+    private var healthAuthBanner: some View {
+        card {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Connect Apple Health", systemImage: "heart.text.square")
+                    .font(.headline)
+                Text("Turn on Apple Health to start saving your ring's data.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                healthAuthPrompt
+            }
+        }
+    }
+
+    /// True when Health is authorized but a metric is either DENIED (partial grant, #132) or has a
+    /// persisted write FAILURE (#135) — drives the amber warning instead of the green line.
+    private var healthNeedsAttention: Bool { !healthAttentionNames.isEmpty }
+
+    /// Friendly names of the metrics not reaching Health: the partial-grant denied types (#132)
+    /// unioned with the persisted per-metric write failures (#135), de-duplicated and sorted.
+    private var healthAttentionNames: [String] {
+        var names = Set<String>()
+        if case .partial(let denied) = healthShareState {
+            names.formUnion(HealthKitWriter.friendlyNames(for: denied))
+        }
+        names.formUnion(healthWriteFailures.map(\.displayName))
+        return names.sorted()
+    }
+
+    /// Recompute the honest Health status surfaces (#132/#135): the partial-grant tri-state and the
+    /// persisted per-metric write failures. Cheap; called wherever `healthAuthorized` is refreshed
+    /// (launch, foreground return, post-authorize, post-flush), since the user can toggle types in
+    /// the Health app while away.
+    private func refreshHealthShareState() {
+        healthShareState = health.shareState
+        healthWriteFailures = HealthKitWriter.healthWriteFailures().keys.sorted { $0.rawValue < $1.rawValue }
     }
 
     // MARK: Device Info (#79)
@@ -1280,6 +1381,9 @@ struct ContentView: View {
         }
         Task {
             let r = await health.flushToHealth(store: store, sleepSegments: segments)
+            // Reflect any per-metric write failure (or its clearing) this flush just persisted, so
+            // the sync card's amber warning is accurate without waiting for a foreground return (#135).
+            refreshHealthShareState()
             if r.sleepSegments > 0 {
                 // Clear the persisted segments now that they're confirmed written to HealthKit.
                 scanner.clearLastCommittedSleepSegments()
