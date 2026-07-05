@@ -319,6 +319,22 @@ final class RingSession: NSObject {
     private var calibrationSampleCount = 0
     private var calibrationLastFrameAt = Date.distantPast
     private var calibrationMissCount = 0
+    /// #138: how many times the stall watchdog has re-entered PPG mode WITHOUT a frame arriving
+    /// since. Reset to 0 whenever a real frame lands (`handleCalibrationPPGFrame`). If it crosses
+    /// `calibrationMaxReenters` the link is up but permanently silent → fail the capture instead of
+    /// looping `enterCalibrationPPGMode()` forever.
+    private var calibrationReenterCount = 0
+    /// Ceiling of consecutive stall re-entries with no recovered frames before we declare the
+    /// capture dead. Each re-entry follows 5 misses × 1.5 s ≈ 7.5 s of silence, so this is
+    /// ~30 s of continuous, unrecovered silence — unreachable by a healthy capture (which streams
+    /// continuously and resets the counter on every frame).
+    private static let calibrationMaxReenters = 4
+    /// #138: minimum average sample rate a genuine capture sustains, used only as a stop-time
+    /// backstop against a link that limped to the duration mark with a trickle of frames. The
+    /// watchdog's liveness contract already requires a 25-sample frame at least every ~1.4 s
+    /// (≈18 samples/s) or it acts; this floor is ~20 % of that (a 5× margin) so a real capture can
+    /// never trip it — only one that streamed for a tiny fraction of the window.
+    private static let calibrationMinSamplesPerSecond: Double = 3.5
 
     // MARK: Activity-channel probe (debug / RE — issue #93)
     //
@@ -617,6 +633,17 @@ final class RingSession: NSObject {
     /// reading via `stopLiveMonitoring()` BEFORE this where that matters; `invalidate()` itself is
     /// a pure cancel + detach. Idempotent.
     func invalidate() {
+        // #138: a ring drop mid raw-PPG calibration capture MUST fail the in-flight capture. Without
+        // this the fixed-duration `calibrationStopTask` survives teardown and still fires
+        // `success: true` on whatever partial/zero frames arrived, so the flow advances to upload a
+        // bogus (or empty) capture. Route through the (previously dead) failure branch so the awaiting
+        // `startPPGCalibrationCapture` throws "ring disconnected". Do this FIRST, before the task
+        // cancels below, so any device-status refresh it schedules is torn down with the rest. Gated
+        // on `calibrationCapturing`, so a NORMAL finish (which already cleared the flag and resumed
+        // the continuation) is untouched — this only fires for a genuine mid-capture teardown.
+        if calibrationCapturing {
+            finishCalibrationPPGCapture(success: false)
+        }
         // Persist the charging inference BEFORE cancelling tasks (#60): the session is about
         // to be nil-ed by the scanner; ContentView reads from UserDefaults during the
         // reconnect-backoff window so the hint stays live while reconnecting.
@@ -1618,6 +1645,7 @@ final class RingSession: NSObject {
             calibrationFrameSink = onFrame
             calibrationSampleCount = 0
             calibrationMissCount = 0
+            calibrationReenterCount = 0
             calibrationLastFrameAt = Date()
             calibrationCapturing = true
             syncTask?.cancel(); syncTask = nil
@@ -1645,12 +1673,28 @@ final class RingSession: NSObject {
                 while let self, !Task.isCancelled, self.calibrationCapturing {
                     try? await Task.sleep(for: .milliseconds(1500))
                     guard !Task.isCancelled, self.calibrationCapturing else { return }
+                    // #138: the ring dropped but CoreBluetooth hasn't fired `didDisconnect` yet (or
+                    // frames just stopped on a half-open link). Fail promptly instead of re-entering
+                    // PPG mode against a dead peripheral forever (its writes only no-op).
+                    if self.peripheral.state != .connected {
+                        ringLog.notice("calibration: link down mid-capture (state != connected) — failing")
+                        self.finishCalibrationPPGCapture(success: false)
+                        return
+                    }
                     let silentFor = Date().timeIntervalSince(self.calibrationLastFrameAt)
                     if silentFor < 1.4 { continue }
                     self.calibrationMissCount += 1
                     self.write([0x96, 0x01, 0x00, 0x00, 0x00])
                     if self.calibrationMissCount >= 5 {
-                        ringLog.notice("calibration: raw PPG stalled; re-enter mode10+mode01")
+                        // #138: give up after too many re-entries with no recovered frames — the link
+                        // reads as connected but the ring stopped streaming for good (~30 s silence).
+                        self.calibrationReenterCount += 1
+                        if self.calibrationReenterCount > Self.calibrationMaxReenters {
+                            ringLog.notice("calibration: raw PPG stalled through \(Self.calibrationMaxReenters) re-entries with no frames — failing")
+                            self.finishCalibrationPPGCapture(success: false)
+                            return
+                        }
+                        ringLog.notice("calibration: raw PPG stalled; re-enter mode10+mode01 (\(self.calibrationReenterCount)/\(Self.calibrationMaxReenters))")
                         await self.enterCalibrationPPGMode()
                         self.calibrationMissCount = 0
                         self.calibrationLastFrameAt = Date()
@@ -1659,7 +1703,24 @@ final class RingSession: NSObject {
             }
             self.calibrationStopTask = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(duration))
-                self?.finishCalibrationPPGCapture(success: true)
+                guard let self else { return }
+                // #138: don't report success blindly at the duration mark. If the link silently
+                // dropped near the end (no `didDisconnect` yet) or the capture only trickled a few
+                // frames, this is not a usable capture — fail so it isn't uploaded as valid.
+                if self.peripheral.state != .connected {
+                    ringLog.notice("calibration: stop mark reached but link is down — failing")
+                    self.finishCalibrationPPGCapture(success: false)
+                    return
+                }
+                let minSamples = Int(duration * Self.calibrationMinSamplesPerSecond)
+                if self.calibrationSampleCount < minSamples {
+                    ringLog.notice("calibration: stop mark reached with only \(self.calibrationSampleCount) samples (< \(minSamples)) — failing (partial)")
+                    self.finishCalibrationPPGCapture(
+                        success: false,
+                        failureReason: "The ring streamed too few PPG samples — try again and keep still.")
+                    return
+                }
+                self.finishCalibrationPPGCapture(success: true)
             }
         }
     }
@@ -1762,6 +1823,18 @@ final class RingSession: NSObject {
                 kind: .cbWake,
                 success: epochs > 0 || wrote,
                 detail: "\(trigger): \(lastDrainSummary ?? "no summary")")
+            // #146: evaluate body-vital alerts on THIS background wake-drain's data. The BGTask path
+            // (AppDelegate) already evaluates after its drain; the hourly 0x11-wake path — the primary
+            // all-day delivery — did not, so an over-threshold HR/SpO2/temp crossing that arrives on a
+            // wake-drain would otherwise sit silent in the store until app-open. Pass `session: self`
+            // so the evaluator also sees this drain's freshly-decoded `historySamples` on top of the
+            // just-committed store batch. Placed OUTSIDE the HealthKit-available guard: alerts post
+            // local notifications and are independent of Health-mirror authorization. The evaluator's
+            // quiet-hours gate + per-notification `lastFired` backoff dedupe any overlap with the
+            // BGTask path, and the whole await is covered by the surrounding drain assertion.
+            if let localStore {
+                await HealthNotificationCenter().evaluate(store: localStore, session: self)
+            }
         }
         await postMorningSummaryIfNeeded()
     }
@@ -2609,6 +2682,7 @@ extension RingSession: CBPeripheralDelegate {
         guard bytes.count >= 156 else { return }
         calibrationLastFrameAt = Date()
         calibrationMissCount = 0
+        calibrationReenterCount = 0   // #138: a real frame recovered the stream — re-arm the stall ceiling
         let seq = bytes[2]
         let wallClockS = Date().timeIntervalSince1970
         var chA: [Int] = []
@@ -2631,14 +2705,18 @@ extension RingSession: CBPeripheralDelegate {
         calibrationFrameSink?(frame)
     }
 
-    private func finishCalibrationPPGCapture(success: Bool) {
+    private func finishCalibrationPPGCapture(success: Bool, failureReason: String? = nil) {
         calibrationKeepaliveTask?.cancel()
         calibrationKeepaliveTask = nil
         calibrationWatchdogTask?.cancel()
         calibrationWatchdogTask = nil
         calibrationStopTask?.cancel()
         calibrationStopTask = nil
-        if calibrationCapturing {
+        // #138: only exit raw-PPG mode on the ring if the link is still up. On a disconnect the
+        // peripheral is gone and `invalidate()` may have already nil-ed the delegate, so this write
+        // would just no-op with a noisy "unusable link" warning. (`write()` itself also guards on
+        // `.connected`; this makes the intent explicit and keeps the failure path quiet.)
+        if calibrationCapturing, peripheral.state == .connected {
             write([0x06, 0x00, 0x00])
         }
         calibrationCapturing = false
@@ -2646,11 +2724,16 @@ extension RingSession: CBPeripheralDelegate {
         let count = calibrationSampleCount
         calibrationSampleCount = 0
         calibrationMissCount = 0
+        calibrationReenterCount = 0
         calibrationLastFrameAt = .distantPast
         if success {
             calibrationContinuation?.resume(returning: count)
         } else {
-            calibrationContinuation?.resume(throwing: NSError(domain: "OpenCircuit.Calibration", code: 3, userInfo: [NSLocalizedDescriptionKey: "PPG capture failed"]))
+            // #138: make the (previously dead) failure branch real and specific. Default to the
+            // disconnect message — that is the dominant failure (official-app contention, charger,
+            // out of range) — but let callers pass a more precise reason (e.g. a partial capture).
+            let message = failureReason ?? "Ring disconnected — try again"
+            calibrationContinuation?.resume(throwing: NSError(domain: "OpenCircuit.Calibration", code: 3, userInfo: [NSLocalizedDescriptionKey: message]))
         }
         calibrationContinuation = nil
         scheduleDeviceStatusRefresh(reason: "calibration-stop")
