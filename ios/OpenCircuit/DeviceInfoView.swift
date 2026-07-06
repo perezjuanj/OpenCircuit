@@ -71,8 +71,8 @@ struct DeviceInfoView: View {
             // Ring hardware actions (#96, reverse-engineered from the official app): find-my-ring
             // blinks the LED to locate the ring; airplane mode turns its radio off to save power.
             Section {
-                Button {
-                    session?.findRing()
+                NavigationLink {
+                    FindMyRingView(session: session)
                 } label: {
                     Label("Find My Ring", systemImage: "wave.3.right")
                 }
@@ -86,9 +86,10 @@ struct DeviceInfoView: View {
             } header: {
                 Text("Ring actions")
             } footer: {
-                Text("Find My Ring flashes the ring's LED so you can locate it. Airplane mode turns off "
-                     + "the ring's Bluetooth to save power — the ring reconnects only after you put it "
-                     + "back in the charging case (there's no way to turn it back on over Bluetooth).")
+                Text("Find My Ring shows how close the ring is over Bluetooth and can flash its LED so "
+                     + "you can locate it. Airplane mode turns off the ring's Bluetooth to save power — "
+                     + "the ring reconnects only after you put it back in the charging case (there's no "
+                     + "way to turn it back on over Bluetooth).")
             }
 
             // Switching rings is uncommon (most people have one ring), so it lives here rather than

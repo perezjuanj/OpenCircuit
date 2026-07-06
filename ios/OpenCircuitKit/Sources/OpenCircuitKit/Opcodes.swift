@@ -58,8 +58,18 @@ public enum Command {
     // MARK: Device actions (🟢 FR02.018, #96)
     /// Find My Ring — enter proximity/search mode. `24 01 00` → resp `a4 00 a4`.
     public static let findRingSearch: [UInt8] = [0x24, 0x01, 0x00]
+    /// Find My Ring — exit proximity/search mode (sent on screen-close). `24 00 00`.
+    /// 🟡 PROBABLE (not yet snoop-captured): follows this protocol's universal `<opcode> 01=on / 00=off`
+    /// convention (same shape as `findRingSearch` with param 0). Harmless if the ring ignores it.
+    public static let findRingSearchStop: [UInt8] = [0x24, 0x00, 0x00]
     /// Find My Ring — light up the LED. `20 01 00` → resp `a0 00 a0`.
     public static let findRingLight: [UInt8] = [0x20, 0x01, 0x00]
+    /// Find My Ring — turn the locator LED back off. `20 00 00` (light opcode, param 0 = off).
+    /// 🟡 PROBABLE (not yet snoop-captured): follows the same `01=on / 00=off` convention as every
+    /// other paired command here (sport `06 03`/`06 00`, detection `05 23 01`/`05 23 00`). It is
+    /// self-validating on-device — the LED visibly goes dark — so confirm against real behaviour, and
+    /// capture the exact bytes in an isolated find-ring snoop when convenient.
+    public static let findRingLightOff: [UInt8] = [0x20, 0x00, 0x00]
     /// Ring airplane mode ON (drops the BLE link — the ring re-wakes only via the charging case;
     /// there is no "off" command). `08 04 00` → resp `88 00 88`.
     public static let airplaneModeOn: [UInt8] = [0x08, 0x04, 0x00]

@@ -655,6 +655,7 @@ final class RingSession: NSObject {
         postSyncStatusTask?.cancel(); postSyncStatusTask = nil
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
         syncTask?.cancel(); syncTask = nil
+        rssiPollTask?.cancel(); rssiPollTask = nil   // Find My Ring RSSI poll (#96)
         endDrainAssertion()   // a cancelled drain must not leak its assertion (#119)
         monitoring = false
         livePreparing = false
@@ -1519,17 +1520,67 @@ final class RingSession: NSObject {
         return sportSteps
     }
 
-    // MARK: - Device actions (#96)
+    // MARK: - Find My Ring (#96)
+    //
+    // Mirrors the official app's locator screen: enter the ring's proximity/search mode, poll the BLE
+    // link RSSI (~1 Hz) so the UI can show an approximate distance, and blink the LED on/off on demand.
+    // CoreBluetooth exposes RSSI on a CONNECTED peripheral via `readRSSI()` → `didReadRSSI`, so we can
+    // gauge proximity without scanning. The LED-off / search-stop bytes are 🟡 probable (on/off
+    // convention), self-validating on-device — see Command.findRingLightOff.
 
-    /// Find My Ring: enter proximity search, then light the LED so the user can locate the ring.
-    /// There is no explicit stop (the ring/app auto-stops the blink).
-    func findRing() {
-        Task { [weak self] in
-            guard let self else { return }
-            self.write(Command.findRingSearch)
-            try? await Task.sleep(for: .milliseconds(300))
-            self.write(Command.findRingLight)
+    /// True while the Find My Ring screen is open (ring in proximity mode + RSSI polling running).
+    private(set) var findRingActive = false
+    /// Whether the ring's locator LED is currently lit.
+    private(set) var findRingLightOn = false
+    /// Smoothed link RSSI (dBm), refreshed ~1 Hz while `findRingActive`; nil = no read yet / no signal.
+    private(set) var ringRSSI: Int?
+    /// Short window of raw RSSI reads, averaged into `ringRSSI` to tame the jitter.
+    private var rssiSamples: [Int] = []
+    private var rssiPollTask: Task<Void, Never>?
+
+    /// Open Find My Ring: enter proximity/search mode and start polling link RSSI. The LED stays off
+    /// until the user taps "light up".
+    func startFindingRing() {
+        findRingActive = true
+        findRingLightOn = false
+        rssiSamples.removeAll()
+        ringRSSI = nil
+        write(Command.findRingSearch)
+        rssiPollTask?.cancel()
+        rssiPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if self.peripheral.state == .connected { self.peripheral.readRSSI() }
+                try? await Task.sleep(for: .seconds(1))
+            }
         }
+    }
+
+    /// Turn the ring's locator LED on or off (#96). On = `20 01 00` (🟢); off = `20 00 00` (🟡 probable).
+    func setFindRingLight(on: Bool) {
+        findRingLightOn = on
+        write(on ? Command.findRingLight : Command.findRingLightOff)
+    }
+
+    /// Close Find My Ring: turn the LED off, exit proximity mode, and stop polling RSSI.
+    func stopFindingRing() {
+        rssiPollTask?.cancel()
+        rssiPollTask = nil
+        if findRingLightOn { write(Command.findRingLightOff) }
+        write(Command.findRingSearchStop)
+        findRingActive = false
+        findRingLightOn = false
+        ringRSSI = nil
+        rssiSamples.removeAll()
+    }
+
+    /// Fold one raw RSSI read into the smoothed `ringRSSI` (5-sample moving average). Drops
+    /// CoreBluetooth's out-of-range sentinel (127) and any implausible value.
+    private func recordRSSI(_ value: Int) {
+        guard value < 0, value > -120 else { return }
+        rssiSamples.append(value)
+        if rssiSamples.count > 5 { rssiSamples.removeFirst(rssiSamples.count - 5) }
+        ringRSSI = Int((Double(rssiSamples.reduce(0, +)) / Double(rssiSamples.count)).rounded())
     }
 
     /// Put the ring into airplane mode. This DROPS the BLE link immediately — the ring re-wakes ONLY
@@ -2311,6 +2362,14 @@ final class RingSession: NSObject {
 }
 
 extension RingSession: CBPeripheralDelegate {
+    /// Link RSSI for Find My Ring (#96). Polled ~1 Hz while the locator screen is open; folded into
+    /// the smoothed `ringRSSI` on the main actor.
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        guard error == nil else { return }
+        let value = RSSI.intValue
+        Task { @MainActor in self.recordRSSI(value) }
+    }
+
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         for service in peripheral.services ?? [] {
             peripheral.discoverCharacteristics(nil, for: service)

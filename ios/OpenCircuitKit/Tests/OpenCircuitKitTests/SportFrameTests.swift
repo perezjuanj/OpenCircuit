@@ -52,7 +52,9 @@ final class SportFrameTests: XCTestCase {
         XCTAssertEqual(Command.sportStop, [0x06, 0x00, 0x00])
         XCTAssertEqual(Command.sportStreamAck, [0xCE, 0x00, 0x00])
         XCTAssertEqual(Command.findRingLight, [0x20, 0x01, 0x00])
+        XCTAssertEqual(Command.findRingLightOff, [0x20, 0x00, 0x00])   // 🟡 probable off (on/off convention)
         XCTAssertEqual(Command.findRingSearch, [0x24, 0x01, 0x00])
+        XCTAssertEqual(Command.findRingSearchStop, [0x24, 0x00, 0x00]) // 🟡 probable
         XCTAssertEqual(Command.airplaneModeOn, [0x08, 0x04, 0x00])
     }
 
