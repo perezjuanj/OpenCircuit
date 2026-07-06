@@ -4,6 +4,7 @@
     python -m opencircuit enumerate --addr AA:BB:CC:DD:EE:FF
     python -m opencircuit listen --addr AA:BB:CC:DD:EE:FF [--keepalive]
     python -m opencircuit replay --addr ... --hex 950095 --handle 0x0802
+    python -m opencircuit probe-channels [--addr ...] [--channels 0x02,0x04]
     python -m opencircuit decode-log captures/btsnoop_hci.log
     python -m opencircuit guess-checksum --hex "0e00....crc"
 """
@@ -54,6 +55,26 @@ def main(argv: list[str] | None = None) -> int:
     sr.add_argument("--response", action="store_true", help="write-with-response")
     sr.add_argument("--wait", type=float, default=5.0)
 
+    spc = sub.add_parser("probe-channels",
+                         help="sweep the 0x02 byte[6] history-channel selector to "
+                              "discover undecoded streams (activity/stress/temp)")
+    spc.add_argument("--addr", default=None,
+                     help="ring address/UUID; omit to scan by name")
+    spc.add_argument("--channels", default=None,
+                     help="comma-separated hex channels, e.g. 0x02,0x04; "
+                          "default sweeps 0x00-0x1f (0x00/0x03 are controls)")
+    spc.add_argument("--timeout", type=float, default=8.0,
+                     help="max seconds to drain per channel (default 8)")
+    spc.add_argument("--max-frames", type=int, default=120,
+                     help="stop a channel after this many record/page frames")
+    spc.add_argument("--no-ack", action="store_true",
+                     help="don't auto-ACK pages (a channel with data may under-report)")
+    spc.add_argument("--no-warmup", action="store_true",
+                     help="skip the pre-sweep residual drain, so the FIRST channel receives the "
+                          "full pending queue — use for a selector test on a loaded ring")
+    spc.add_argument("--out", default=None,
+                     help="raw log path (default desktop/captures/probe_<ts>.log)")
+
     sd = sub.add_parser("decode-log", help="parse an Android btsnoop HCI capture")
     sd.add_argument("path")
     sd.add_argument("--addr", default=None)
@@ -66,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
 
-    if args.cmd in ("scan", "enumerate", "listen", "replay"):
+    if args.cmd in ("scan", "enumerate", "listen", "replay", "probe-channels"):
         from . import session  # lazy: only these need bleak
         if args.cmd == "scan":
             asyncio.run(session.scan(args.timeout))
@@ -78,6 +99,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "replay":
             asyncio.run(session.replay(args.addr, _parse_hex(args.hex), args.char,
                                        args.response, args.wait))
+        elif args.cmd == "probe-channels":
+            channels = None
+            if args.channels:
+                channels = [_parse_handle(c) for c in args.channels.split(",")]
+            asyncio.run(session.probe_channels(
+                args.addr, channels, args.timeout,
+                max_frames=args.max_frames, ack=not args.no_ack,
+                warmup=not args.no_warmup, out_path=args.out))
     elif args.cmd == "decode-log":
         handles = None
         if args.handles:
