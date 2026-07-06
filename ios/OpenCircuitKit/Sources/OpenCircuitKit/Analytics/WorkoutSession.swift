@@ -256,8 +256,9 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
     public let avgHR: Int?
     /// Maximum BPM recorded during the session (nil if no readings).
     public let maxHR: Int?
-    /// Estimated active calories from Edwards-TRIMP (ESTIMATE — labeled as such in the UI).
-    /// nil if insufficient HR data for a meaningful estimate.
+    /// Estimated active calories (ESTIMATE — labeled as such in the UI): Keytel HR→energy over the
+    /// workout duration when HR was captured, else a distance×body-mass estimate. nil only when there
+    /// is NEITHER any HR reading NOR a distance — never fabricated.
     public let estimatedActiveKcal: Double?
     /// 5-zone HR breakdown from actual sample durations.
     public let zoneBreakdown: WorkoutZoneBreakdown
@@ -361,14 +362,17 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
             let sum = samples.reduce(0) { $0 + $1.bpm }
             avgHR = sum / samples.count
             maxHRValue = samples.map(\.bpm).max()
-            // Active calories: Edwards-TRIMP. Requires ≥ 600 samples (Strain.minReadings)
-            // to produce a meaningful estimate; returns nil otherwise. LABELED as estimate.
-            let trimp = Strain.edwardsTRIMP(
-                hrSamples: samples,
-                maxHR: formulaMaxHR,
-                restingHR: Calories.defaultRestingHR
+            // Active calories: Keytel HR→energy over the workout's TRUE duration (endDate−startDate).
+            // Positive for any real exertion — unlike Edwards-TRIMP, which zeroes below 50% HR-reserve
+            // (so easy/moderate sessions read 0 kcal) and needs ≥600 samples (the sparse ~10 s sport
+            // stream never reaches that in a normal workout, so it returned nil → "--"). LABELED an
+            // estimate in the UI. Numeric (incl. 0) whenever HR was captured, so we never show "--"
+            // for a workout with real readings.
+            hrKcal = Calories.workoutActiveKcal(
+                avgHR: avgHR!,
+                durationSeconds: endDate.timeIntervalSince(startDate),
+                profile: profile
             )
-            hrKcal = trimp.map { $0 * Calories.trimpKcalFactor }
         }
         // Distance-based active-energy fallback: a GPS walk/run/hike/cycle whose HR never locked
         // (the live-HR path rarely locks in motion, #45) would otherwise show "--" active calories.
