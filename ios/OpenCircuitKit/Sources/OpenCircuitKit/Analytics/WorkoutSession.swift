@@ -28,7 +28,10 @@ import Foundation
 public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     case walkingOutdoor
     case runningOutdoor
+    case runningIndoor
     case cyclingOutdoor
+    case cyclingIndoor
+    case rowing
     case hiking
     case strengthTraining
     case yoga
@@ -38,7 +41,10 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
         switch self {
         case .walkingOutdoor: return "Outdoor Walking"
         case .runningOutdoor: return "Outdoor Running"
+        case .runningIndoor:  return "Indoor Running"
         case .cyclingOutdoor: return "Outdoor Cycling"
+        case .cyclingIndoor:  return "Indoor Cycling"
+        case .rowing:         return "Indoor Rowing"
         case .hiking:         return "Hiking"
         case .strengthTraining: return "Strength"
         case .yoga:           return "Yoga"
@@ -51,7 +57,7 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     public var isOutdoor: Bool {
         switch self {
         case .walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .hiking: return true
-        case .strengthTraining, .yoga, .other: return false
+        case .runningIndoor, .cyclingIndoor, .rowing, .strengthTraining, .yoga, .other: return false
         }
     }
 
@@ -59,11 +65,31 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
         switch self {
         case .walkingOutdoor:    return "figure.walk"
         case .runningOutdoor:    return "figure.run"
+        case .runningIndoor:     return "figure.run.treadmill"
         case .cyclingOutdoor:    return "bicycle"
+        case .cyclingIndoor:     return "figure.indoor.cycle"
+        case .rowing:            return "figure.rower"
         case .hiking:            return "mountain.2"
         case .strengthTraining:  return "dumbbell"
         case .yoga:              return "figure.yoga"
         case .other:             return "heart.circle"
+        }
+    }
+
+    /// The ring's native sport-mode type byte for `Command.sportStart` (🟢 #90). Types the ring
+    /// doesn't natively support (hiking/strength/other) map to the closest ring mode — the byte
+    /// only tunes the ring's own HR sampling; the HealthKit activity type is chosen separately.
+    public var firmwareByte: UInt8 {
+        switch self {
+        case .runningOutdoor:   return SportType.outdoorRunning.rawValue   // 0x01
+        case .walkingOutdoor:   return SportType.outdoorWalking.rawValue   // 0x02
+        case .runningIndoor:    return SportType.indoorRunning.rawValue    // 0x03
+        case .cyclingOutdoor:   return SportType.outdoorCycling.rawValue   // 0x04
+        case .cyclingIndoor:    return SportType.indoorCycling.rawValue    // 0x05
+        case .rowing:           return SportType.indoorRowing.rawValue     // 0x06
+        case .yoga:             return SportType.yoga.rawValue             // 0x07
+        case .hiking:           return SportType.outdoorWalking.rawValue   // ≈ outdoor walk
+        case .strengthTraining, .other: return SportType.yoga.rawValue     // ≈ generic indoor
         }
     }
 }
@@ -242,6 +268,9 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
     public let hasRoute: Bool
     /// Count of actual HR readings captured during the session.
     public let hrSampleCount: Int
+    /// Steps counted by the ring during the workout (native sport-mode `0x4e` stream, #90).
+    /// nil when the workout wasn't recorded in native sport mode (e.g. the legacy live-HR path).
+    public let steps: Int?
     /// True when the user's max HR (220 − age) was used for zone calculations.
     /// Always true for this implementation (formula from APK).
     public let usedFormulaMaxHR: Bool
@@ -257,6 +286,7 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
         distanceMeters: Double?,
         hasRoute: Bool,
         hrSampleCount: Int,
+        steps: Int? = nil,
         usedFormulaMaxHR: Bool = true
     ) {
         self.sport = sport
@@ -269,6 +299,7 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
         self.distanceMeters = distanceMeters
         self.hasRoute = hasRoute
         self.hrSampleCount = hrSampleCount
+        self.steps = steps
         self.usedFormulaMaxHR = usedFormulaMaxHR
     }
 }
@@ -314,7 +345,8 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
         endDate: Date,
         distanceMeters: Double?,
         hasRoute: Bool,
-        profile: UserProfile
+        profile: UserProfile,
+        steps: Int? = nil
     ) -> WorkoutSummary {
         let avgHR: Int?
         let maxHRValue: Int?
@@ -360,6 +392,7 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
             distanceMeters: distanceMeters,
             hasRoute: hasRoute,
             hrSampleCount: samples.count,
+            steps: steps,
             usedFormulaMaxHR: true
         )
     }

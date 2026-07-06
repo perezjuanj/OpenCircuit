@@ -129,7 +129,10 @@ final class WorkoutSessionManager: NSObject {
         switch sport {
         case .walkingOutdoor:    return .walking
         case .runningOutdoor:    return .running
+        case .runningIndoor:     return .running
         case .cyclingOutdoor:    return .cycling
+        case .cyclingIndoor:     return .cycling
+        case .rowing:            return .rowing
         case .hiking:            return .hiking
         case .strengthTraining:  return .traditionalStrengthTraining
         case .yoga:              return .yoga
@@ -164,9 +167,12 @@ final class WorkoutSessionManager: NSObject {
 
         recordingState = .starting
 
-        // Take exclusive ownership of the ring's live-HR link for this workout (a fresh, owned
-        // monitoring cycle that the periodic auto-measure can't tear down mid-session).
-        session.beginWorkoutHR()
+        // Enter the ring's NATIVE sport mode for this workout (#90): SportStart → the ring streams
+        // `0x4e` HR+steps frames (~10 s) which RingSession routes into `liveHR`/`liveHRAt` (picked up
+        // by `collectHRSnapshot` below) and sums into `sportSteps`. This is the ring's dedicated
+        // workout HR path (and the only source of per-workout step counts), replacing the generic
+        // live-HR poll for the session's duration.
+        session.beginSportSession(typeByte: selectedSport.firmwareByte)
 
         // Keep the screen awake while a workout is foregrounded so it doesn't auto-dim → lock →
         // suspend (which would stall the poll loops). Background tracking is handled by the
@@ -233,8 +239,8 @@ final class WorkoutSessionManager: NSObject {
             .filter { $0.kind == .heartRate }
             .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
 
-        // Release the workout's hold on the ring and stop its live cycle (auto-measure resumes).
-        session?.endWorkoutHR()
+        // End the ring's native sport mode (SportStop) and capture the ring-counted step total (#90).
+        let sportSteps = session?.endSportSession() ?? 0
         session = nil
 
         // Stop the location session (route or keep-alive) and let the screen sleep again.
@@ -265,7 +271,8 @@ final class WorkoutSessionManager: NSObject {
             endDate: endDate,
             distanceMeters: hasRoute ? distanceMeters : nil,
             hasRoute: hasRoute,
-            profile: profile
+            profile: profile,
+            steps: sportSteps > 0 ? sportSteps : nil
         )
 
         // Write to HealthKit (best-effort; gracefully silent on failure).
@@ -303,7 +310,7 @@ final class WorkoutSessionManager: NSObject {
     func cancel() {
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
-        session?.endWorkoutHR()
+        session?.endSportSession()   // SportStop — discarded session, nothing persisted
         session = nil
         store = nil   // discarded session — nothing to persist
         locationManager?.stopUpdatingLocation()
@@ -338,7 +345,7 @@ final class WorkoutSessionManager: NSObject {
     /// interpolated. The displayed `currentHR` is kept (UI marks it stale via `currentHRIsStale`)
     /// so it doesn't flicker; what we never do is COUNT or PERSIST a held value as a new reading.
     private func collectHRSnapshot() {
-        guard let session, session.monitoring else { return }
+        guard let session, session.sportSessionActive else { return }
         guard WorkoutHRGate.shouldRecord(liveHRAt: session.liveHRAt,
                                          sessionStart: sessionStart,
                                          lastRecordedAt: lastRecordedHRAt,
@@ -454,6 +461,19 @@ final class WorkoutSessionManager: NSObject {
                     metadata: [HKMetadataKeyWasUserEntered: false])
             }
             try? await builder.addSamples(hkHRSamples)
+        }
+
+        // Add the ring-counted step total for the workout window (#90 native sport-mode `0x4e`
+        // stream — the ring reports real per-interval steps, unlike the generic live-HR path).
+        // Best-effort: silent if step-count share auth isn't granted.
+        if let steps = summary.steps, steps > 0 {
+            let stepType = HKQuantityType(.stepCount)
+            let q = HKQuantity(unit: .count(), doubleValue: Double(steps))
+            let stepSample = HKQuantitySample(
+                type: stepType, quantity: q,
+                start: summary.startDate, end: summary.endDate,
+                metadata: [HKMetadataKeyWasUserEntered: false])
+            try? await builder.addSamples([stepSample])
         }
 
         // Add active energy (ESTIMATE — HR-TRIMP or, when HR didn't lock, a distance estimate).

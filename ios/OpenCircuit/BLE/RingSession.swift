@@ -1485,6 +1485,59 @@ final class RingSession: NSObject {
         stopLiveMonitoring()
     }
 
+    // MARK: - Native sport / workout mode (#90)
+
+    /// True while a native workout is running (SportStart..SportStop), during which the ring
+    /// pushes `0x4e` HR+steps frames (~10 s) instead of answering the `0x95` live-HR poll.
+    private(set) var sportSessionActive = false
+    /// Ring-counted steps during the current/last native workout (Σ of `0x4e` byte[6], #90).
+    private(set) var sportSteps = 0
+
+    /// Enter the ring's native workout mode for `typeByte` (`WorkoutSportType.firmwareByte`). The
+    /// ring then STREAMS `0x4e` HR+steps frames unsolicited — the `0x4e` handler acks each, routes
+    /// HR into `liveHR`/`liveHRAt` (so the workout's existing HR pipeline + live UI pick it up), and
+    /// sums steps into `sportSteps`. Independent of the `0x95` live-HR poll (none is sent here).
+    func beginSportSession(typeByte: UInt8) {
+        sportSessionActive = true
+        sportSteps = 0
+        liveHR = nil
+        liveHRAt = nil
+        monitoringStartedAt = Date()   // gate: only in-session locks seed the workout (WorkoutHRGate)
+        Task { [weak self] in
+            guard let self else { return }
+            self.write(Command.sportStart(typeByte))
+            try? await Task.sleep(for: .milliseconds(250))
+            self.write(Command.statusQuery)   // `d0 00 00` — mirrors the official app's enter sequence
+        }
+    }
+
+    /// End the native workout mode; returns the ring-counted step total. Sends `SportStop` (`06 00 00`).
+    @discardableResult
+    func endSportSession() -> Int {
+        sportSessionActive = false
+        write(Command.sportStop)
+        return sportSteps
+    }
+
+    // MARK: - Device actions (#96)
+
+    /// Find My Ring: enter proximity search, then light the LED so the user can locate the ring.
+    /// There is no explicit stop (the ring/app auto-stops the blink).
+    func findRing() {
+        Task { [weak self] in
+            guard let self else { return }
+            self.write(Command.findRingSearch)
+            try? await Task.sleep(for: .milliseconds(300))
+            self.write(Command.findRingLight)
+        }
+    }
+
+    /// Put the ring into airplane mode. This DROPS the BLE link immediately — the ring re-wakes ONLY
+    /// via the charging case (there is no BLE "off" command). The link will disconnect right after.
+    func setAirplaneModeOn() {
+        write(Command.airplaneModeOn)
+    }
+
     /// Per-mode user-measure budget (seconds): HR needs longer stillness to converge than SpO₂.
     private func userMeasureBudget(for mode: LiveMode) -> TimeInterval {
         mode == .spo2 ? 45 : 90
@@ -2580,6 +2633,22 @@ extension RingSession: CBPeripheralDelegate {
             case 0x13:
                 if self.calibrationCapturing {
                     self.handleCalibrationPPGFrame(bytes)
+                    return
+                }
+            case 0x4E:
+                // Native sport-mode stream (#90): HR (byte[5]) + steps (byte[6]) every ~10 s, each
+                // acked with `ce 00 00` to keep it flowing. Decode HR into `liveHR`/`liveHRAt` so the
+                // workout's existing HR pipeline (WorkoutHRGate → aggregator) and the live UI pick it
+                // up, and sum steps into `sportSteps`. Ignored unless a native sport session is active.
+                if self.sportSessionActive, let sample = SportFrame.decode(bytes) {
+                    self.write(Command.sportStreamAck)
+                    self.sportSteps += sample.steps
+                    if let hr = sample.hr {
+                        self.liveHR = hr
+                        self.liveHRAt = Date()   // true capture time (drives the workout dedup gate)
+                        self.liveHRWarmup = nil
+                        ringLog.notice("← 0x4e sport: HR \(hr) bpm, +\(sample.steps) steps (Σ \(self.sportSteps))")
+                    }
                     return
                 }
             case 0x81:

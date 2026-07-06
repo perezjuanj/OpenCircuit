@@ -23,6 +23,8 @@ struct DeviceInfoView: View {
     @State private var diagnosticsURL: URL?
     @State private var showDiagnosticShare = false
     @State private var diagnosticsError: String?
+    /// Confirmation gate for airplane mode — it turns the ring's radio off and drops the link (#96).
+    @State private var showAirplaneConfirm = false
 
     private var info: FirmwareInfo { session?.firmwareInfo ?? FirmwareInfo() }
 
@@ -64,6 +66,29 @@ struct DeviceInfoView: View {
                      + "(DIS 0x2A23 System ID). CoreBluetooth hides the live MAC on iOS; "
                      + "this is the only way to recover it without Bluetooth scanning permissions.")
                     .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            // Ring hardware actions (#96, reverse-engineered from the official app): find-my-ring
+            // blinks the LED to locate the ring; airplane mode turns its radio off to save power.
+            Section {
+                Button {
+                    session?.findRing()
+                } label: {
+                    Label("Find My Ring", systemImage: "wave.3.right")
+                }
+                .disabled(session?.ready != true)
+                Button(role: .destructive) {
+                    showAirplaneConfirm = true
+                } label: {
+                    Label("Turn on airplane mode", systemImage: "airplane")
+                }
+                .disabled(session?.ready != true)
+            } header: {
+                Text("Ring actions")
+            } footer: {
+                Text("Find My Ring flashes the ring's LED so you can locate it. Airplane mode turns off "
+                     + "the ring's Bluetooth to save power — the ring reconnects only after you put it "
+                     + "back in the charging case (there's no way to turn it back on over Bluetooth).")
             }
 
             // Switching rings is uncommon (most people have one ring), so it lives here rather than
@@ -109,6 +134,14 @@ struct DeviceInfoView: View {
         } message: {
             Text("OpenCircuit will stop reconnecting to this ring. It stays in your list for a one-tap "
                  + "reconnect from “Connect a different ring.”")
+        }
+        .confirmationDialog("Turn on airplane mode?", isPresented: $showAirplaneConfirm,
+                            titleVisibility: .visible) {
+            Button("Turn on airplane mode", role: .destructive) { session?.setAirplaneModeOn() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This turns off the ring's Bluetooth and disconnects it. To turn it back on, put the "
+                 + "ring in its charging case — there's no way to re-enable Bluetooth remotely.")
         }
         .sheet(isPresented: $showRingPicker) { RingPickerSheet() }
         .sheet(isPresented: $showDiagnosticShare) {
