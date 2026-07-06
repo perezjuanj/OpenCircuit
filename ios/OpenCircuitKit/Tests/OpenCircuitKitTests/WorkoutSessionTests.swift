@@ -133,6 +133,52 @@ final class WorkoutSessionTests: XCTestCase {
         XCTAssertEqual(total, 1.0, accuracy: 0.001)
     }
 
+    // MARK: - Held (step-function) zone attribution — fixes the "0:50 for a 5:05 ride" undercount
+
+    /// Periodic ~10 s readings stamped with a 2 s span must be HELD to the next reading, so the zone
+    /// total tracks real elapsed time (not 5× short). 6 readings @150 bpm, 10 s apart, end at 65 s.
+    func testHeldAttributionTracksElapsedTime() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let samples = (0..<6).map { i in
+            HRSample(bpm: 150, start: t0.addingTimeInterval(Double(i) * 10),
+                     end: t0.addingTimeInterval(Double(i) * 10 + 2))   // 2 s stamp, like the real path
+        }
+        let b = HRZoneClassifier.timeInZonesHeld(hrSamples: samples, maxHR: 200,
+                                                 sessionEnd: t0.addingTimeInterval(65))
+        // 5 gaps × 10 s + last reading held 15 s to sessionEnd (65−50) = 65 s (vs old per-span 6×2 = 12 s).
+        XCTAssertEqual(b.totalZoneSeconds, 65, accuracy: 0.001)
+        XCTAssertEqual(b.seconds(in: .aerobic), 65, accuracy: 0.001)  // 150/200 = 75% → aerobic
+    }
+
+    /// A genuine dropout must NOT be fabricated into zone time: each held interval caps at maxGap.
+    func testHeldAttributionCapsDropoutGaps() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let samples = [
+            HRSample(bpm: 150, start: t0, end: t0.addingTimeInterval(2)),
+            HRSample(bpm: 150, start: t0.addingTimeInterval(100), end: t0.addingTimeInterval(102)), // 100 s gap
+        ]
+        let b = HRZoneClassifier.timeInZonesHeld(hrSamples: samples, maxHR: 200,
+                                                 sessionEnd: t0.addingTimeInterval(130), maxGapSeconds: 30)
+        // First reading capped at 30 (not 100); last capped at 30 (not 28→ok, 130-100=30). Total 60, not 130.
+        XCTAssertEqual(b.totalZoneSeconds, 60, accuracy: 0.001)
+    }
+
+    /// Time before the first reading is not attributed (no zone assumed before any data); sub-50% reads
+    /// contribute nothing.
+    func testHeldAttributionSkipsPreFirstAndSubThreshold() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let samples = [
+            HRSample(bpm: 80,  start: t0.addingTimeInterval(10), end: t0.addingTimeInterval(12)),  // 80/200=40% → none
+            HRSample(bpm: 150, start: t0.addingTimeInterval(20), end: t0.addingTimeInterval(22)),  // aerobic
+        ]
+        let b = HRZoneClassifier.timeInZonesHeld(hrSamples: samples, maxHR: 200,
+                                                 sessionEnd: t0.addingTimeInterval(30))
+        // [0,10) before first reading: not counted. First reading sub-50%: 0. Second held 10 s → aerobic.
+        XCTAssertEqual(b.totalZoneSeconds, 10, accuracy: 0.001)
+        XCTAssertEqual(b.seconds(in: .aerobic), 10, accuracy: 0.001)
+        XCTAssertEqual(b.seconds(in: .warmUp), 0, accuracy: 0.001)
+    }
+
     // MARK: - WorkoutSessionAggregator
 
     func testAggregatorEmptySessionProducesNilHR() {
@@ -285,6 +331,9 @@ final class WorkoutSessionTests: XCTestCase {
         XCTAssertNotNil(summary.estimatedActiveKcal, "sparse HR must still estimate calories, not '--'")
         // Keytel (male, 75 kg, 35 y, 101 bpm) ≈ 7.3 kcal/min × 5.08 min ≈ 37 kcal — a sane, honest number.
         XCTAssertEqual(summary.estimatedActiveKcal ?? 0, 37, accuracy: 4)
+        // Held zone attribution: the total tracks the real elapsed time (~305 s), NOT the ~60 s the old
+        // per-span sum gave (30 readings × the 2 s stamp) — the 0:50-for-a-5:05-ride bug.
+        XCTAssertEqual(summary.zoneBreakdown.totalZoneSeconds, 305, accuracy: 15)
     }
 
     /// An empty session (no HR, no distance) still reports nil calories — never fabricated.

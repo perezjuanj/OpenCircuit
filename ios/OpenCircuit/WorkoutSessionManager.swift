@@ -363,11 +363,12 @@ final class WorkoutSessionManager: NSObject {
         currentHR = bpm
         currentHRAt = at
 
-        // Update live zone breakdown.
+        // Update live zone breakdown. Held (step-function) attribution so the live totals track the
+        // real elapsed time each reading covers (~10 s cadence), not just the stamped ~2 s windows.
         if let agg = aggregator {
             let maxHR = max(220 - HealthKitWriter.storedUserProfile().age, 1)
-            liveZoneBreakdown = HRZoneClassifier.timeInZones(
-                hrSamples: agg.collectedSamples, maxHR: maxHR)
+            liveZoneBreakdown = HRZoneClassifier.timeInZonesHeld(
+                hrSamples: agg.collectedSamples, maxHR: maxHR, sessionEnd: Date())
         }
     }
 

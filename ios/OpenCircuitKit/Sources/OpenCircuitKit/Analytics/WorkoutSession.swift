@@ -183,6 +183,40 @@ public enum HRZoneClassifier {
         }
         return WorkoutZoneBreakdown(secondsInZone: seconds)
     }
+
+    /// Default cap for a single reading's held interval (seconds). The sport stream lands ~every 10 s,
+    /// so 30 s absorbs a missed reading or jitter while refusing to invent zone time across a genuine
+    /// dropout (ring off-wrist / lost link).
+    public static let defaultHoldCapSeconds: Double = 30
+
+    /// Time-in-zone using STEP-FUNCTION (last-value-held) attribution — the fix for zone totals reading
+    /// far short of the workout (e.g. 0:50 for a 5:05 ride). The ring reports HR PERIODICALLY (~every
+    /// 10 s in sport mode), so each reading represents the interval it covers, not just the ~2 s poll
+    /// window it was stamped with. Each sample is held until the NEXT sample's timestamp; the final
+    /// sample is held until `sessionEnd`.
+    ///
+    /// Every held interval is CAPPED at `maxGapSeconds` (default `defaultHoldCapSeconds`) so a real
+    /// dropout is never fabricated into zone time — the total stays honest: ≈ the workout duration when
+    /// HR is continuous, and legitimately less when readings were actually missed. Time before the
+    /// first reading is not attributed (no zone is assumed before any data). Sub-50%-maxHR readings
+    /// contribute no zone time. Samples are sorted by start; pure and unit-testable.
+    public static func timeInZonesHeld(
+        hrSamples: [HRSample],
+        maxHR: Int,
+        sessionEnd: Date,
+        maxGapSeconds: Double = defaultHoldCapSeconds
+    ) -> WorkoutZoneBreakdown {
+        var seconds = [HRZone: Double]()
+        for z in HRZone.allCases { seconds[z] = 0 }
+        let sorted = hrSamples.sorted { $0.start < $1.start }
+        for (i, sample) in sorted.enumerated() {
+            let nextAnchor = (i + 1 < sorted.count) ? sorted[i + 1].start : sessionEnd
+            let held = min(max(nextAnchor.timeIntervalSince(sample.start), 0), maxGapSeconds)
+            guard held > 0, let zone = zone(bpm: sample.bpm, maxHR: maxHR) else { continue }
+            seconds[zone, default: 0] += held
+        }
+        return WorkoutZoneBreakdown(secondsInZone: seconds)
+    }
 }
 
 // MARK: - Zone breakdown
@@ -260,7 +294,8 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
     /// workout duration when HR was captured, else a distance×body-mass estimate. nil only when there
     /// is NEITHER any HR reading NOR a distance — never fabricated.
     public let estimatedActiveKcal: Double?
-    /// 5-zone HR breakdown from actual sample durations.
+    /// 5-zone HR breakdown using held (step-function) attribution — each periodic reading covers the
+    /// interval until the next (capped so real dropouts aren't fabricated). See `timeInZonesHeld`.
     public let zoneBreakdown: WorkoutZoneBreakdown
     /// GPS distance in meters (phone-side CoreLocation). nil for indoor sports or when
     /// location permission was denied.
@@ -384,7 +419,8 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
             : nil
         estimatedKcal = [hrKcal, distKcal].compactMap { $0 }.max()
 
-        let zones = HRZoneClassifier.timeInZones(hrSamples: samples, maxHR: formulaMaxHR)
+        let zones = HRZoneClassifier.timeInZonesHeld(
+            hrSamples: samples, maxHR: formulaMaxHR, sessionEnd: endDate)
         return WorkoutSummary(
             sport: sport,
             startDate: startDate,
