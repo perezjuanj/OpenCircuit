@@ -1538,14 +1538,15 @@ final class RingSession: NSObject {
     private var rssiSamples: [Int] = []
     private var rssiPollTask: Task<Void, Never>?
 
-    /// Open Find My Ring: enter proximity/search mode and start polling link RSSI. The LED stays off
-    /// until the user taps "light up".
+    /// Open Find My Ring: just start polling link RSSI for the distance readout. We send NO command to
+    /// the ring on open — proximity comes from CoreBluetooth RSSI, and the ring must stay DARK until the
+    /// user taps "light up" (the LED command `24 01 00` lit the ring the instant it was sent on open,
+    /// which is why entering here used to auto-light it).
     func startFindingRing() {
         findRingActive = true
         findRingLightOn = false
         rssiSamples.removeAll()
         ringRSSI = nil
-        write(Command.findRingSearch)
         rssiPollTask?.cancel()
         rssiPollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -1556,18 +1557,18 @@ final class RingSession: NSObject {
         }
     }
 
-    /// Turn the ring's locator LED on or off (#96). On = `20 01 00` (🟢); off = `20 00 00` (🟡 probable).
+    /// Turn the ring's locator LED on or off (#96). On = `24 01 00` (🟢 device-verified); off =
+    /// `24 00 00` (🟡 probable, same opcode param 0).
     func setFindRingLight(on: Bool) {
         findRingLightOn = on
         write(on ? Command.findRingLight : Command.findRingLightOff)
     }
 
-    /// Close Find My Ring: turn the LED off, exit proximity mode, and stop polling RSSI.
+    /// Close Find My Ring: turn the LED off (if lit) and stop polling RSSI.
     func stopFindingRing() {
         rssiPollTask?.cancel()
         rssiPollTask = nil
         if findRingLightOn { write(Command.findRingLightOff) }
-        write(Command.findRingSearchStop)
         findRingActive = false
         findRingLightOn = false
         ringRSSI = nil
