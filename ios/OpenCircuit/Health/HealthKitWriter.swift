@@ -381,16 +381,21 @@ final class HealthKitWriter {
             // failure is recorded here.
             pendingFlushFailures.formUnion(stepsOutcome.failed.subtracting([.distance]))
         }
+        // Pre-fetch HR samples for the 32-day basal-energy lookback — the widest window needed
+        // by both resting HR and passive-calorie flushes. Fetched once and shared so we don't
+        // query LocalStore twice for overlapping ranges (#172 review, fix #2).
+        let basalHR = Self.prefetchHRSamples(local: store, lookbackDays: Self.basalRHRLookbackDays,
+                                              now: Date())
+
         // Derived daily resting HR — one sample per finalized day (#18, #37). Idempotency is a
         // UserDefaults day-watermark, NOT the store cursor: RHR isn't a stored sample, and the
         // `hk:` cursor rows belong to the raw-sample mirror above.
-        result.restingDays = await flushRestingHR(local: store, sleepSegments: sleepSegments)
+        result.restingDays = await flushRestingHR(prefetchedHR: basalHR, sleepSegments: sleepSegments)
         if result.restingDays > 0 { writtenKinds.insert(.restingHeartRate) }
 
         // Energy: passive (hourly BMR) + active (HR-derived or steps-derived estimate).
         // Watermark-gated (#37) and labeled as derived estimates in HealthKit metadata.
-        result.passiveHours = await flushPassiveCalories(profile: profile, local: store,
-                                                         sleepSegments: sleepSegments)
+        result.passiveHours = await flushPassiveCalories(profile: profile, prefetchedHR: basalHR)
         result.activeKcal = await flushActiveCalories(local: store, profile: profile)
         if result.activeKcal > 0 { writtenKinds.insert(.activeEnergy) }
 
@@ -776,9 +781,23 @@ final class HealthKitWriter {
     /// freeze a partial-night value, yet last night's RHR still lands the same day (by midday).
     private static let restingFinalizationDelay: TimeInterval = 12 * 3600
 
+    /// Pre-fetch HR samples from LocalStore for a given lookback, returning mapped HRSamples.
+    /// Called once per flush cycle; the result is shared across `flushRestingHR` and
+    /// `flushPassiveCalories` to avoid redundant LocalStore queries (#172 review, fix #2).
+    private static func prefetchHRSamples(local: LocalStore, lookbackDays: Int,
+                                           now: Date) -> [HRSample] {
+        let cal = Calendar.current
+        let from = cal.date(byAdding: .day, value: -lookbackDays, to: cal.startOfDay(for: now))
+            ?? now.addingTimeInterval(-Double(lookbackDays) * 86_400)
+        guard let stored = try? local.samples(kind: .heartRate, from: from, to: now),
+              !stored.isEmpty else { return [] }
+        return stored.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+    }
+
     /// Write one resting-HR sample per finalized day not yet covered by the day-watermark.
-    /// Reads HR straight from the store (the dashboard's source) via its public accessor.
-    private func flushRestingHR(local: LocalStore, sleepSegments: [SleepSegment]) async -> Int {
+    /// Uses pre-fetched HR samples (shared with `flushPassiveCalories`) to avoid a redundant
+    /// LocalStore query.
+    private func flushRestingHR(prefetchedHR: [HRSample], sleepSegments: [SleepSegment]) async -> Int {
         let cal = Calendar.current
         let now = Date()
         let defaults = UserDefaults.standard
@@ -789,9 +808,8 @@ final class HealthKitWriter {
         let lookback = cal.date(byAdding: .day, value: -7, to: cal.startOfDay(for: now))
             ?? now.addingTimeInterval(-7 * 86_400)
         let scanStart = max(lookback, lastWritten)
-        guard let stored = try? local.samples(kind: .heartRate, from: scanStart, to: now),
-              !stored.isEmpty else { return 0 }
-        let hr = stored.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+        let hr = prefetchedHR.filter { $0.start >= scanStart }
+        guard !hr.isEmpty else { return 0 }
         let days = RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal)
 
         var written = 0
@@ -819,12 +837,12 @@ final class HealthKitWriter {
     ///
     /// Basal energy is no longer a static per-profile constant: each hour is nudged by the MEASURED
     /// resting HR for the calendar day it belongs to, judged against the person's own prior-day
-    /// baseline. RHR is read from the SAME LocalStore source the daily resting-HR sample uses — so
-    /// energy responds the SAME day, without waiting for the (12h-delayed) finalized RHR sample.
+    /// baseline. Uses pre-fetched HR samples (shared with `flushRestingHR`) and derives daily RHR
+    /// WITHOUT sleep segments so all days in the window use the same `lowestSustained` method —
+    /// ensuring derivation parity between today and the baseline (#172 review, fix #1).
     /// Days with no RHR or too little baseline history fall back to the static per-hour BMR.
     private func flushPassiveCalories(profile: UserProfile,
-                                      local: LocalStore,
-                                      sleepSegments: [SleepSegment]) async -> Int {
+                                      prefetchedHR: [HRSample]) async -> Int {
         let cal = Calendar.current
         let defaults = UserDefaults.standard
         let now = Date()
@@ -835,8 +853,7 @@ final class HealthKitWriter {
 
         // Per-calendar-day resting HR over the baseline window (empty on missing/thin data → the
         // loop below simply degrades to static BMR for those hours).
-        let dailyRHR = Self.dailyRestingHR(local: local, sleepSegments: sleepSegments,
-                                           now: now, calendar: cal)
+        let dailyRHR = Self.dailyRestingHR(prefetchedHR: prefetchedHR, now: now, calendar: cal)
 
         var written = 0
         while hour < currentHour {
@@ -856,23 +873,24 @@ final class HealthKitWriter {
         return written
     }
 
-    /// Per-calendar-day resting HR (bpm), oldest day first — the same derivation the daily
-    /// resting-HR sample uses (`RestingHR.dailyValues`), read straight from the store so basal
-    /// energy can respond the same day. Bounded lookback keeps the query cheap.
-    private static func dailyRestingHR(local: LocalStore, sleepSegments: [SleepSegment],
+    /// Per-calendar-day resting HR (bpm), oldest day first. Derives daily RHR from pre-fetched
+    /// HR samples using the `lowestSustained` path for ALL days (sleep segments intentionally
+    /// omitted). This ensures derivation parity between today's RHR and the baseline: the flush
+    /// receives `sleepSegments` covering only the most recent night, so passing them would make
+    /// today use `sleepMean` while baseline days fall to `lowestSustained` — a systematic offset
+    /// in the (today − baseline) delta that the ±20% clamp bounds but doesn't eliminate.
+    /// By using `lowestSustained` uniformly, both sides of the comparison are on the same basis.
+    static func dailyRestingHR(prefetchedHR: [HRSample],
                                        now: Date, calendar cal: Calendar) -> [RestingHR.DailyValue] {
-        let from = cal.date(byAdding: .day, value: -basalRHRLookbackDays, to: cal.startOfDay(for: now))
-            ?? now.addingTimeInterval(-Double(basalRHRLookbackDays) * 86_400)
-        guard let stored = try? local.samples(kind: .heartRate, from: from, to: now),
-              !stored.isEmpty else { return [] }
-        let hr = stored.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        return RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal)
+        guard !prefetchedHR.isEmpty else { return [] }
+        return RestingHR.dailyValues(hr: prefetchedHR, sleep: [], calendar: cal)
     }
 
     /// Resolve `(day's measured RHR, personal baseline)` for one calendar `day` from ascending
-    /// daily values. RHR is that day's value (nil when the day has none); baseline is the mean of
-    /// PRIOR days' values, or nil below the trusted minimum. Either nil ⇒ caller uses static BMR.
-    private static func restingEnergyInputs(forDay day: Date,
+    /// daily values. RHR is that day's value (nil when the day has none); baseline is the trimmed
+    /// mean of PRIOR days' values, or nil below the trusted minimum. Either nil ⇒ caller uses
+    /// static BMR.
+    static func restingEnergyInputs(forDay day: Date,
                                             from daily: [RestingHR.DailyValue])
         -> (restingHR: Double?, baseline: Double?) {
         guard let today = daily.first(where: { $0.day == day })?.bpm else { return (nil, nil) }

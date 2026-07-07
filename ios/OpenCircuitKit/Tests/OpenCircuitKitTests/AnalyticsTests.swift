@@ -170,6 +170,113 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(Calories.activeKcalFromSteps(steps: 0, profile: profile), 0.0, accuracy: 0.001)
     }
 
+    // MARK: Trimmed-mean baseline robustness (#172 review, fix #4)
+
+    func testRestingBaselineTrimmedMeanResistsOutlier() {
+        // 10 days at ~60 bpm with one outlier at 100. Plain mean would be ~64; trimmed mean
+        // drops the outlier and the lowest, yielding ~60.
+        let prior: [Double] = [59, 60, 60, 61, 60, 59, 61, 60, 60, 100]
+        let baseline = try XCTUnwrap(Calories.restingBaselineBpm(prior: prior))
+        XCTAssertEqual(baseline, 60, accuracy: 1.0,
+                       "trimmed mean resists a single outlier day")
+    }
+
+    func testRestingBaselineTrimmedMeanSmallWindow() {
+        // At exactly minRestingBaselineDays (3), no trimming is possible — all values kept.
+        let prior: [Double] = [58, 60, 62]
+        XCTAssertEqual(try XCTUnwrap(Calories.restingBaselineBpm(prior: prior)), 60, accuracy: 1e-9)
+    }
+
+    // MARK: Integration — daily RHR → energy inputs → dynamic basal kcal (#172 review, fix #3)
+
+    func testDailyRHRToBasalEnergyEndToEnd() throws {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+
+        // Synthesize 5 days of HR data: ~300 readings per day, each day at a different sustained
+        // resting level. Day 0–3 baseline around 60 bpm; day 4 (today) elevated at 70 bpm.
+        var allHR: [HRSample] = []
+        for dayOffset in 0..<5 {
+            guard let dayStart = cal.date(byAdding: .day, value: dayOffset - 4, to: today) else { continue }
+            let bpm = dayOffset < 4 ? 60 : 70
+            for minute in stride(from: 0, to: 300, by: 5) {
+                let t = dayStart.addingTimeInterval(Double(minute * 60))
+                allHR.append(HRSample(bpm: bpm, start: t, end: t.addingTimeInterval(60)))
+            }
+        }
+
+        // Derive daily RHR WITHOUT sleep segments (the lowestSustained path for all days —
+        // matches the fix for derivation parity, #172 review fix #1).
+        let daily = RestingHR.dailyValues(hr: allHR, sleep: [], calendar: cal)
+        XCTAssertEqual(daily.count, 5, "5 days of HR data → 5 daily RHR values")
+
+        // All baseline days should be ~60 bpm (lowestSustained of constant 60).
+        for d in daily.prefix(4) {
+            XCTAssertEqual(d.bpm, 60, accuracy: 1,
+                           "baseline day should derive ~60 bpm via lowestSustained")
+        }
+        // Today should be ~70 bpm.
+        XCTAssertEqual(daily.last?.bpm ?? 0, 70, accuracy: 1,
+                       "today should derive ~70 bpm via lowestSustained")
+
+        // Verify the baseline uses the trimmed mean of prior days (all ~60 → trimmed mean ~60).
+        let prior = daily.filter { $0.day < today }.map(\.bpm)
+        let baseline = try XCTUnwrap(Calories.restingBaselineBpm(prior: prior))
+        XCTAssertEqual(baseline, 60, accuracy: 1)
+
+        // The scale factor for today: +10 bpm over 60 → +10%.
+        let scale = Calories.restingEnergyScale(restingHR: 70, baselineRestingHR: baseline)
+        XCTAssertEqual(scale, 1.10, accuracy: 0.02)
+
+        // Dynamic basal energy should exceed static.
+        let profile = Self.male30
+        let dynamicKcal = Calories.basalKcalPerHour(profile: profile, restingHR: 70,
+                                                     baselineRestingHR: baseline)
+        let staticKcal = Calories.bmrKcalPerHour(profile: profile)
+        XCTAssertGreaterThan(dynamicKcal, staticKcal,
+                             "elevated RHR day should produce higher basal energy than static BMR")
+    }
+
+    func testDerivationParityWithoutSleep() {
+        // Verify that omitting sleep segments gives ALL days the same derivation method
+        // (lowestSustained), so the comparison today-vs-baseline is fair.
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let yesterday = cal.date(byAdding: .day, value: -1, to: today)!
+
+        // Both days have the same HR pattern: readings at 60 bpm with a dip to 55.
+        var hr: [HRSample] = []
+        for dayStart in [yesterday, today] {
+            for minute in stride(from: 0, to: 300, by: 5) {
+                let t = dayStart.addingTimeInterval(Double(minute * 60))
+                let bpm = minute < 30 ? 55 : 60
+                hr.append(HRSample(bpm: bpm, start: t, end: t.addingTimeInterval(60)))
+            }
+        }
+
+        // Sleep segments covering ONLY today's night.
+        let sleepStart = today.addingTimeInterval(1 * 3600)
+        let sleepEnd = today.addingTimeInterval(4 * 3600)
+        let sleep = [SleepSegment(start: sleepStart, end: sleepEnd, stage: .asleepCore)]
+
+        let withSleep = RestingHR.dailyValues(hr: hr, sleep: sleep, calendar: cal)
+        let withoutSleep = RestingHR.dailyValues(hr: hr, sleep: [], calendar: cal)
+
+        // Without sleep: both days should produce the same RHR (same HR pattern, same method).
+        XCTAssertEqual(withoutSleep.count, 2)
+        XCTAssertEqual(withoutSleep[0].bpm, withoutSleep[1].bpm, accuracy: 1e-9,
+                       "without sleep, identical HR patterns yield identical daily RHR — no method offset")
+
+        // With sleep: today may differ from yesterday (sleep-mean vs lowestSustained).
+        // This is the bias the fix eliminates.
+        if withSleep.count == 2 {
+            let diff = abs(withSleep[0].bpm - withSleep[1].bpm)
+            let noDiff = abs(withoutSleep[0].bpm - withoutSleep[1].bpm)
+            XCTAssertLessThanOrEqual(noDiff, diff,
+                                     "dropping sleep should not increase inter-day offset")
+        }
+    }
+
     // MARK: Sleep score (sleep.rs)
 
     func testSleepScore() {

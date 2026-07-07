@@ -234,7 +234,11 @@ check(Calories.bmrKcalPerDay(profile: femaleProfile) == 1320.25, "female BMR Mif
 // Resting-HR–adjusted basal energy (#dynamic-resting-calories): dynamic when RHR+baseline given,
 // static fallback otherwise, clamped to ±20%.
 check(Calories.restingBaselineBpm(prior: [60, 62]) == nil, "RHR baseline nil below min days")
-check(Calories.restingBaselineBpm(prior: [58, 60, 62]) == 60, "RHR baseline mean")
+check(Calories.restingBaselineBpm(prior: [58, 60, 62]) == 60, "RHR baseline trimmed mean (small window)")
+// Trimmed mean: 10 values, outlier at 100 — trim drops extremes, result stays near 60.
+let trimPrior: [Double] = [59, 60, 60, 61, 60, 59, 61, 60, 60, 100]
+check(abs((Calories.restingBaselineBpm(prior: trimPrior) ?? 0) - 60) < 1.0,
+      "RHR trimmed mean resists single outlier")
 check(abs(Calories.restingEnergyScale(restingHR: 68, baselineRestingHR: 60) - 1.08) < 1e-9, "RHR scale +8 bpm -> +8%")
 check(Calories.restingEnergyScale(restingHR: 200, baselineRestingHR: 60) == 1.20, "RHR scale clamped +20%")
 check(Calories.restingEnergyScale(restingHR: 10, baselineRestingHR: 60) == 0.80, "RHR scale clamped -20%")

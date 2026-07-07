@@ -66,8 +66,9 @@ public enum Calories {
     /// Fractional change in resting energy per bpm of resting-HR deviation from baseline.
     /// Order-of-magnitude anchor: the fever relationship (~10–13% RMR rise per +1 °C, and
     /// ~8–10 bpm HR rise per +1 °C) ⇒ ≈1% RMR per bpm. We use that as a defensible, deliberately
-    /// conservative slope for autonomic-driven RMR shifts generally, NOT a claim of clinical
-    /// precision (hence the ESTIMATE label and the cap below).
+    /// conservative slope for autonomic-driven RMR shifts generally (stress, fitness, dehydration,
+    /// stimulants — not only fever), NOT a claim of clinical precision (hence the ESTIMATE label
+    /// and the cap below).
     public static let restingEnergyFractionPerBpm = 0.01
 
     /// Hard cap on how far measured RHR may move basal energy off the formula value, either way.
@@ -81,15 +82,23 @@ public enum Calories {
     /// so this sits below `VitalsBaseline`'s 7-day minimum on purpose.
     public static let minRestingBaselineDays = 3
 
-    /// Personal resting-HR baseline (mean bpm) from a person's PRIOR daily resting-HR values.
-    /// `prior` is chronological (oldest→newest); returns nil below `minRestingBaselineDays` so the
-    /// caller degrades to the static BMR rather than adjust off a baseline we can't yet trust.
+    /// Personal resting-HR baseline (trimmed mean bpm) from a person's PRIOR daily resting-HR
+    /// values. `prior` is chronological (oldest→newest); returns nil below `minRestingBaselineDays`
+    /// so the caller degrades to the static BMR rather than adjust off a baseline we can't yet
+    /// trust. Uses a 10% trimmed mean (drops the top and bottom 10% of values) to resist single
+    /// outlier days from skewing the window — the ±20% clamp limits per-hour damage, but a robust
+    /// baseline prevents systematic drift from a single sick or mis-measured day.
     public static func restingBaselineBpm(
         prior: [Double],
         minDays: Int = minRestingBaselineDays
     ) -> Double? {
         guard prior.count >= minDays, minDays > 0 else { return nil }
-        return prior.reduce(0, +) / Double(prior.count)
+        let sorted = prior.sorted()
+        let trimCount = max(1, sorted.count / 10)
+        let trimmed = sorted.count > 2 * trimCount
+            ? Array(sorted[trimCount ..< (sorted.count - trimCount)])
+            : sorted
+        return trimmed.reduce(0, +) / Double(trimmed.count)
     }
 
     /// Multiplier on the static Mifflin-St Jeor BMR from the day's MEASURED resting HR vs the
