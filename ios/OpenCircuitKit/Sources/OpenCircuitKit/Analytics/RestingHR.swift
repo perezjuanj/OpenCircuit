@@ -59,17 +59,31 @@ public enum RestingHR {
     static func lowestSustained(hr: [HRSample], window: TimeInterval) -> Double? {
         guard !hr.isEmpty else { return nil }
         let sorted = hr.sorted { $0.start < $1.start }
+        let n = sorted.count
         var best: Double?
-        for i in sorted.indices {
-            let cutoff = sorted[i].start.addingTimeInterval(window)
-            var bucket: [HRSample] = []
-            var j = i
-            while j < sorted.count, sorted[j].start < cutoff {
-                bucket.append(sorted[j]); j += 1
+        // Two-pointer sliding window (was O(m²): a fresh forward bucket + mean rebuilt from EVERY
+        // index — a dense same-day cluster, e.g. a workout, is the worst case and hung the main
+        // thread past the 10 s scene-update watchdog on backgrounding). `cutoff` is monotonic in
+        // `left`, so `right` only advances → O(m log m) (the sort) overall.
+        //
+        // BYTE-IDENTICAL: the window mean is `windowSum / count`; every bpm ≤ 220 and a window's sum
+        // stays far below 2⁵³, so the running Double sum (add on right-advance, subtract on left-
+        // advance) is the EXACT integer sum of the window — bit-for-bit equal to the old per-bucket
+        // `reduce`. Regression-locked in RestingHRLowestSustainedTests.
+        var right = 0
+        var windowSum = 0.0   // Σ Double(bpm) over [left, right)
+        for left in 0..<n {
+            let cutoff = sorted[left].start.addingTimeInterval(window)
+            while right < n, sorted[right].start < cutoff {
+                windowSum += Double(sorted[right].bpm)
+                right += 1
             }
-            guard bucket.count >= 2 || sorted.count == 1 else { continue }
-            let m = mean(bucket)
-            best = best.map { Swift.min($0, m) } ?? m
+            let count = right - left   // == the old bucket.count
+            if count >= 2 || n == 1 {
+                let m = windowSum / Double(count)
+                best = best.map { Swift.min($0, m) } ?? m
+            }
+            windowSum -= Double(sorted[left].bpm)   // `left` leaves the window before the next step
         }
         // Readings existed but none formed a sustained window (all isolated): fall back to
         // the single lowest reading so the day still produces a value.

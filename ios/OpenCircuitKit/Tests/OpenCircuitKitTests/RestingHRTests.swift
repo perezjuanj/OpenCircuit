@@ -111,4 +111,59 @@ final class RestingHRTests: XCTestCase {
     func testDailyValuesEmptyForNoReadings() {
         XCTAssertEqual(RestingHR.dailyValues(hr: []), [])
     }
+
+    // MARK: - lowestSustained O(m)→byte-identical regression (watchdog-hang fix)
+
+    /// Inline copy of the ORIGINAL O(m²) algorithm — the reference the fast two-pointer version
+    /// must reproduce bit-for-bit.
+    private func referenceLowestSustained(_ hr: [HRSample], window: TimeInterval) -> Double? {
+        guard !hr.isEmpty else { return nil }
+        let sorted = hr.sorted { $0.start < $1.start }
+        var best: Double?
+        for i in sorted.indices {
+            let cutoff = sorted[i].start.addingTimeInterval(window)
+            var bucket: [HRSample] = []
+            var j = i
+            while j < sorted.count, sorted[j].start < cutoff { bucket.append(sorted[j]); j += 1 }
+            guard bucket.count >= 2 || sorted.count == 1 else { continue }
+            let m = bucket.reduce(0.0) { $0 + Double($1.bpm) } / Double(bucket.count)
+            best = best.map { Swift.min($0, m) } ?? m
+        }
+        if best == nil { best = sorted.map { Double($0.bpm) }.min() }
+        return best
+    }
+
+    private func assertIdentical(_ hr: [HRSample], _ file: StaticString = #filePath, _ line: UInt = #line) {
+        let ref = referenceLowestSustained(hr, window: RestingHR.sustainedWindow)
+        let got = RestingHR.lowestSustained(hr: hr, window: RestingHR.sustainedWindow)
+        // Exact equality (bit-for-bit) — window sums are exact integers in Double, so no epsilon.
+        XCTAssertEqual(got, ref, "fast lowestSustained diverged from the O(m²) reference", file: file, line: line)
+    }
+
+    func testLowestSustainedByteIdenticalAcrossShapes() {
+        // Edge cases.
+        assertIdentical([])
+        assertIdentical([HRSample(bpm: 61, start: t0)])                                  // single reading
+        assertIdentical([HRSample(bpm: 61, start: t0),                                    // isolated (>window apart)
+                         HRSample(bpm: 70, start: t0.addingTimeInterval(3600))])
+        assertIdentical([HRSample(bpm: 60, start: t0),                                    // exactly 2 in-window
+                         HRSample(bpm: 50, start: t0.addingTimeInterval(60))])
+
+        // Deterministic pseudo-random sets (seeded LCG) incl. a DENSE same-day cluster (the workout
+        // worst case: hundreds of readings inside a few 5-min windows).
+        var seed: UInt64 = 0x9E3779B97F4A7C15
+        func next() -> UInt64 { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return seed }
+        for shape in 0..<8 {
+            var samples: [HRSample] = []
+            let count = [1, 2, 5, 50, 200, 600, 1000, 3][shape]
+            // Dense shapes pack readings ~2 s apart (many per 5-min window); sparse ones ~2–8 min.
+            let dense = shape >= 3 && shape != 7
+            for k in 0..<count {
+                let step = dense ? Double(next() % 4) : Double(120 + next() % 360)
+                let t = t0.addingTimeInterval(Double(k) * (dense ? 2 : 1) + step)
+                samples.append(HRSample(bpm: 40 + Int(next() % 130), start: t))   // 40…169 bpm
+            }
+            assertIdentical(samples)
+        }
+    }
 }

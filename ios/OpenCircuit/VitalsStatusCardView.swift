@@ -19,6 +19,21 @@ struct VitalsStatusCardView: View {
     private let healthBaselineReader = HealthKitVitalsBaselineReader()
     @State private var healthBaselineReport: HealthKitVitalsBaselineReader.Report?
 
+    /// The assembled report, held as STATE and recomputed off the render path in `.task(id:)` below.
+    /// It was a computed `var` read TWICE per `body` pass, so the full 32-day baseline analysis (incl.
+    /// the resting-HR derivation) ran ~2× on every SwiftUI invalidation — and, fatally, SYNCHRONOUSLY
+    /// inside the background scene-update layout when a workout's `stop()` batch-ingest invalidated the
+    /// @Query. That blew the 10 s scene-update watchdog (0x8BADF00D). As @State it renders instantly and
+    /// the analysis runs once per data change, after layout.
+    @State private var report: VitalsBaseline.Report?
+
+    /// Identity for the recompute `.task`: changes only when an input that affects the report changes,
+    /// so the analysis re-runs on new data (not on every unrelated re-render).
+    private var reportInputsKey: String {
+        "\(hrSamples.count)|\(spo2Samples.count)|\(hrvSamples.count)|"
+        + "\(sleepNights.first?.night.timeIntervalSince1970 ?? 0)|\(healthBaselineReport == nil ? 0 : 1)"
+    }
+
     /// User's temperature-unit preference (#83), so the skin-temp delta matches the rest of the app.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
 
@@ -83,13 +98,18 @@ struct VitalsStatusCardView: View {
             guard healthBaselineReport == nil else { return }
             healthBaselineReport = try? await healthBaselineReader.loadReport(lookbackDays: Self.historyDays)
         }
+        // Recompute the report OFF the synchronous render/layout path whenever an input changes — this
+        // is what keeps a workout's big HR ingest from hanging the main thread during a scene-update.
+        .task(id: reportInputsKey) {
+            report = computeReport()
+        }
     }
 
     // MARK: Report
 
     /// The Vitals Status report for the latest day, or nil until at least one vital has enough
     /// baseline history. Pure logic lives in OpenCircuitKit.VitalsBaseline; this assembles its inputs.
-    private var report: VitalsBaseline.Report? {
+    private func computeReport() -> VitalsBaseline.Report? {
         let config = VitalsBaseline.Config()
         var inputs: [VitalsBaseline.VitalInput] = []
         if let i = vitalInput(.restingHR, localDays: restingHRDaily(),
