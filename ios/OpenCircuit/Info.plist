@@ -37,6 +37,8 @@
 	<string>OpenCircuit writes your ring's metrics into Apple Health.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>OpenCircuit uses your location during an active workout to map outdoor routes and to keep recording your heart rate while your phone is locked. It is never used outside of a workout.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>

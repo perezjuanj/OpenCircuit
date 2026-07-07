@@ -86,6 +86,15 @@ final class WorkoutSessionManager: NSObject {
     private var aggregator: WorkoutSessionAggregator?
     private var sessionStart: Date?
 
+    /// Drives the workout Live Activity (Lock Screen + Dynamic Island: time / calories / BPM). Owns
+    /// all ActivityKit calls so this manager stays a plain state machine. No-op when the user has
+    /// Live Activities disabled — the workout is unaffected. See WorkoutLiveActivityController.
+    private let liveActivity = WorkoutLiveActivityController()
+    /// Profile captured at session start (weight/age/sex) for the live Keytel calorie estimate. The
+    /// user's profile can't change mid-workout, so snapshotting it avoids re-reading UserDefaults on
+    /// every Live Activity update.
+    private var profileSnapshot: UserProfile?
+
     /// Capture time of the last HR sample we actually recorded — the dedupe key that stops a held
     /// latch from being re-recorded every poll (the "stuck at 98" climbing-counter bug, #45).
     private var lastRecordedHRAt: Date?
@@ -151,8 +160,9 @@ final class WorkoutSessionManager: NSObject {
         self.store = store
         let start = Date()
         sessionStart = start
-        let age = HealthKitWriter.storedUserProfile().age
-        aggregator = WorkoutSessionAggregator(startDate: start, userAge: age)
+        let profile = HealthKitWriter.storedUserProfile()
+        profileSnapshot = profile
+        aggregator = WorkoutSessionAggregator(startDate: start, userAge: profile.age)
         elapsedSeconds = 0
         currentHR = nil
         currentHRAt = nil
@@ -198,19 +208,31 @@ final class WorkoutSessionManager: NSObject {
                 await MainActor.run { self.collectHRSnapshot() }
             }
         }
-        // Elapsed-time ticker (1 s resolution).
+        // Elapsed-time ticker (1 s resolution). Also refreshes the Live Activity's calories/BPM on a
+        // slower heartbeat (~every 10 s); the elapsed CLOCK self-ticks in the widget via
+        // Text(timerInterval:), so it stays live between these updates. Fresh HR readings push their
+        // own immediate update from collectHRSnapshot, so BPM never waits a full heartbeat.
         timerTask = Task { [weak self] in
+            var tick = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { break }   // self-terminate if the manager went away
-                await MainActor.run {
-                    guard let start = self.sessionStart else { return }
-                    self.elapsedSeconds = Date().timeIntervalSince(start)
-                }
+                self.elapsedSeconds = self.sessionStart.map { Date().timeIntervalSince($0) } ?? self.elapsedSeconds
+                tick += 1
+                if tick % 10 == 0 { await self.pushLiveActivityUpdate() }
             }
         }
 
         recordingState = .active
+
+        // Present the Live Activity now that the session is live. Initial state: zeroed metrics, no HR
+        // yet (honest — the ring hasn't locked a reading). No-op if Live Activities are disabled.
+        liveActivity.start(
+            sport: selectedSport,
+            startDate: start,
+            initial: WorkoutActivityAttributes.ContentState(
+                elapsedSeconds: 0, activeKcal: 0, bpm: nil, hrIsStale: true)
+        )
     }
 
     /// Stop the session, write to HealthKit, transition to `.finished`.
@@ -275,6 +297,14 @@ final class WorkoutSessionManager: NSObject {
             steps: sportSteps > 0 ? sportSteps : nil
         )
 
+        // Dismiss the Live Activity now (before the slower HealthKit write) so it clears as the
+        // summary screen appears. Publish a final coherent state from the finalized summary.
+        await liveActivity.end(final: WorkoutActivityAttributes.ContentState(
+            elapsedSeconds: summary.durationSeconds,
+            activeKcal: Int((summary.estimatedActiveKcal ?? 0).rounded()),
+            bpm: summary.avgHR,
+            hrIsStale: true))
+
         // Write to HealthKit (best-effort; gracefully silent on failure).
         await writeWorkout(summary: summary,
                            hrSamples: agg.collectedSamples,
@@ -310,6 +340,10 @@ final class WorkoutSessionManager: NSObject {
     func cancel() {
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
+        // Tear down the Live Activity too — a discarded session should leave nothing on the Lock
+        // Screen. Fire-and-forget (cancel() is synchronous); end() no-ops if none is presented.
+        let finalState = currentLiveActivityState()
+        Task { await liveActivity.end(final: finalState) }
         session?.endSportSession()   // SportStop — discarded session, nothing persisted
         session = nil
         store = nil   // discarded session — nothing to persist
@@ -370,6 +404,33 @@ final class WorkoutSessionManager: NSObject {
             liveZoneBreakdown = HRZoneClassifier.timeInZonesHeld(
                 hrSamples: agg.collectedSamples, maxHR: maxHR, sessionEnd: Date())
         }
+
+        // A genuinely fresh reading is a meaningful change — refresh the Live Activity's BPM (and the
+        // running calorie estimate) immediately, rather than waiting for the ~10 s timer heartbeat.
+        Task { await pushLiveActivityUpdate() }
+    }
+
+    // MARK: - Live Activity feed
+
+    /// Build the Live Activity's dynamic state from the current live fields: self-reported elapsed
+    /// seconds (fallback for surfaces that can't self-tick), the running Keytel calorie ESTIMATE
+    /// (HR-only; the distance fallback is a finalize-time concern), the last GENUINE BPM, and its
+    /// staleness. Never fabricates HR — `currentHR`/`currentHRIsStale` carry the #45 honesty through.
+    private func currentLiveActivityState() -> WorkoutActivityAttributes.ContentState {
+        let kcal = aggregator?.liveActiveKcal(
+            profile: profileSnapshot ?? HealthKitWriter.storedUserProfile(),
+            asOf: Date()) ?? 0
+        return WorkoutActivityAttributes.ContentState(
+            elapsedSeconds: elapsedSeconds,
+            activeKcal: Int(kcal.rounded()),
+            bpm: currentHR,
+            hrIsStale: currentHRIsStale
+        )
+    }
+
+    /// Push the current state to the Live Activity (no-op when none is presented).
+    private func pushLiveActivityUpdate() async {
+        await liveActivity.update(currentLiveActivityState())
     }
 
     // MARK: - GPS / CoreLocation

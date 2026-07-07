@@ -439,6 +439,41 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
 
     /// All samples collected so far (for HealthKit HR series write).
     public var collectedSamples: [HRSample] { samples }
+
+    // MARK: Live snapshot (for the in-progress Live Activity / UI)
+
+    /// Running average BPM across all readings captured so far, or nil if none yet. Same integer
+    /// truncation as `finalize` so the live number matches the final summary once the session ends.
+    public var currentAvgHR: Int? {
+        guard !samples.isEmpty else { return nil }
+        return samples.reduce(0) { $0 + $1.bpm } / samples.count
+    }
+
+    /// High-water mark backing `liveActiveKcal` so the DISPLAYED estimate never ticks DOWN. The
+    /// instantaneous avg-HR×elapsed model can dip when a lower reading pulls the running average down
+    /// (e.g. 8→6 kcal after a low lock), but physically calories burned only accumulate. Per-session:
+    /// a fresh aggregator (one per workout) starts at 0.
+    private var liveKcalHighWater: Double = 0
+
+    /// Live active-calorie estimate as of `asOf` (wall clock), using the same Keytel HR→energy model
+    /// as `finalize` — running avg HR over the elapsed session so far — CLAMPED to a monotonic
+    /// high-water so the Live Activity's number never ticks down. Returns the high-water (initially 0)
+    /// when no HR has locked yet — honest: no readings ⇒ no HR-based estimate. HR-only: the distance
+    /// fallback `finalize` applies is not included here. Unit-testable (no CoreLocation).
+    ///
+    /// SIDE EFFECT: advances the internal high-water; call it as the live progressive read, not as a
+    /// pure query. With constant HR it equals the instantaneous value, so at session end it matches
+    /// `finalize`'s HR-based estimate for a distance-less (indoor) workout.
+    public func liveActiveKcal(profile: UserProfile, asOf: Date) -> Double {
+        guard let avg = currentAvgHR else { return liveKcalHighWater }
+        let instantaneous = Calories.workoutActiveKcal(
+            avgHR: avg,
+            durationSeconds: asOf.timeIntervalSince(startDate),
+            profile: profile
+        )
+        liveKcalHighWater = max(liveKcalHighWater, instantaneous)
+        return liveKcalHighWater
+    }
 }
 
 // MARK: - HR backfill

@@ -26,6 +26,9 @@ struct OpenCircuitApp: App {
                 // every launch (not one-time; see the function doc), after the sample scrubs so
                 // its "latest stored sample" lookup sees the already-cleaned table.
                 .task { OpenCircuitApp.repairFutureSyncCursorsAtLaunch(container) }
+                // Clear any workout Live Activity orphaned by a force-quit/crash mid-workout — a
+                // session lives only in memory, so at a cold launch none can still be running.
+                .task { WorkoutLiveActivityController.endOrphanedActivitiesAtLaunch() }
         }
         .modelContainer(container)
         // (Re)submit the BGTask requests on every backgrounding (#119). This is the scene-based
