@@ -1495,6 +1495,11 @@ final class RingSession: NSObject {
     private(set) var sportSessionActive = false
     /// Ring-counted steps during the current/last native workout (Σ of `0x4e` byte[6], #90).
     private(set) var sportSteps = 0
+    /// Set true once the ring streams its FIRST `0x4e` frame this session — stops the SportStart
+    /// retry watchdog. Cleared at each `beginSportSession`.
+    private var sportGotFirstFrame = false
+    /// The SportStart-with-retry watchdog task (re-sends SportStart until the ring starts streaming).
+    private var sportStartTask: Task<Void, Never>?
 
     /// Enter the ring's native workout mode for `typeByte` (`WorkoutSportType.firmwareByte`). The
     /// ring then STREAMS `0x4e` HR+steps frames unsolicited — the `0x4e` handler acks each, routes
@@ -1514,18 +1519,36 @@ final class RingSession: NSObject {
         sportSteps = 0
         liveHR = nil
         liveHRAt = nil
+        sportGotFirstFrame = false
         monitoringStartedAt = Date()   // gate: only in-session locks seed the workout (WorkoutHRGate)
-        Task { [weak self] in
-            guard let self else { return }
-            self.write(Command.sportStart(typeByte))
-            try? await Task.sleep(for: .milliseconds(250))
-            self.write(Command.statusQuery)   // `d0 00 00` — mirrors the official app's enter sequence
+        // SportStart-with-retry (2026-07-07): a SportStart IDENTICAL to the official app's got the ring
+        // to stream `0x4e` in an Android snoop (`86 00 86` ACK → `10 xx 06` sport-active descriptor →
+        // `0x4e` HR), but on-device our single SportStart was sometimes silently IGNORED by the ring
+        // (no ACK, no `0x4e`). So re-send SportStart until the ring actually starts streaming — the app
+        // gets its first frame ~7-10 s after SportStart, so we wait ~12 s per attempt, up to 4 tries.
+        sportStartTask?.cancel()
+        sportStartTask = Task { [weak self] in
+            for attempt in 1...4 {
+                guard let self, self.sportSessionActive, !self.sportGotFirstFrame else { return }
+                if attempt > 1 {
+                    ringLog.notice("sport: SportStart retry #\(attempt) — ring hadn't streamed 0x4e yet")
+                }
+                self.write(Command.sportStart(typeByte))
+                try? await Task.sleep(for: .milliseconds(300))
+                guard self.sportSessionActive else { return }   // ended/cancelled during the pause
+                self.write(Command.statusQuery)   // `d0 00 00` — mirrors the official app's enter sequence
+                try? await Task.sleep(for: .seconds(12))   // give the ring time to lock + stream
+            }
+            if let self, self.sportSessionActive, !self.sportGotFirstFrame {
+                ringLog.notice("sport: ring never streamed 0x4e after 4 SportStart attempts — workout HR unavailable")
+            }
         }
     }
 
     /// End the native workout mode; returns the ring-counted step total. Sends `SportStop` (`06 00 00`).
     @discardableResult
     func endSportSession() -> Int {
+        sportStartTask?.cancel(); sportStartTask = nil   // stop the retry watchdog
         sportSessionActive = false
         workoutHolding = false   // release the contention hold taken in beginSportSession
         write(Command.sportStop)
@@ -2644,7 +2667,10 @@ extension RingSession: CBPeripheralDelegate {
                 self.pendingDeviceStatusRefresh = false
                 self.postSyncStatusTask?.cancel(); self.postSyncStatusTask = nil
                 let tempText = self.liveTemperature.map { String(format: "%.2f", $0) } ?? "-"
-                ringLog.notice("status frame: stepsRaw=\(stepCounter ?? -1) total=\(self.steps ?? -1) batt=\(self.batteryPercent ?? -1)% charging=\(self.charging) case=\(self.caseBattery?.percent ?? -1)% temp=\(tempText, privacy: .public)")
+                // `mode` = descriptor byte[2]: 0x02/0x03 idle, 0x06 = SPORT MODE ACTIVE. Surfaced so a
+                // workout capture shows whether the ring entered sport mode after our SportStart (#90).
+                let mode = bytes.count > 2 ? String(format: "0x%02x", bytes[2]) : "-"
+                ringLog.notice("status frame: mode=\(mode, privacy: .public) stepsRaw=\(stepCounter ?? -1) total=\(self.steps ?? -1) batt=\(self.batteryPercent ?? -1)% charging=\(self.charging) case=\(self.caseBattery?.percent ?? -1)% temp=\(tempText, privacy: .public)")
             }
             // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).
             switch bytes.first {
@@ -2712,14 +2738,17 @@ extension RingSession: CBPeripheralDelegate {
                 // acked with `ce 00 00` to keep it flowing. Decode HR into `liveHR`/`liveHRAt` so the
                 // workout's existing HR pipeline (WorkoutHRGate → aggregator) and the live UI pick it
                 // up, and sum steps into `sportSteps`. Ignored unless a native sport session is active.
-                if self.sportSessionActive, let sample = SportFrame.decode(bytes) {
-                    self.write(Command.sportStreamAck)
-                    self.sportSteps += sample.steps
-                    if let hr = sample.hr {
-                        self.liveHR = hr
-                        self.liveHRAt = Date()   // true capture time (drives the workout dedup gate)
-                        self.liveHRWarmup = nil
-                        ringLog.notice("← 0x4e sport: HR \(hr) bpm, +\(sample.steps) steps (Σ \(self.sportSteps))")
+                if self.sportSessionActive {
+                    self.sportGotFirstFrame = true   // stream is live → stop the SportStart retry watchdog
+                    if let sample = SportFrame.decode(bytes) {
+                        self.write(Command.sportStreamAck)
+                        self.sportSteps += sample.steps
+                        if let hr = sample.hr {
+                            self.liveHR = hr
+                            self.liveHRAt = Date()   // true capture time (drives the workout dedup gate)
+                            self.liveHRWarmup = nil
+                            ringLog.notice("← 0x4e sport: HR \(hr) bpm, +\(sample.steps) steps (Σ \(self.sportSteps))")
+                        }
                     }
                     return
                 }
@@ -2734,6 +2763,12 @@ extension RingSession: CBPeripheralDelegate {
                     ringLog.notice("← 0x81 challenge=0x\(String(format: "%02x", chal), privacy: .public), reply \(self.ringMAC == nil ? "legacy-fixed" : "SM3 auth", privacy: .public)")
                     self.write(auth)
                 }
+                return
+            case 0x86:
+                // Response to a `0x06` sport-mode command (SportStart `06 03 …` / SportStop `06 00 …`).
+                // Logging it makes visible whether the ring ACCEPTED our SportStart — its ABSENCE is
+                // the workout-HR-failure signature (2026-07-07: the ring silently ignored SportStart).
+                ringLog.notice("← 0x86 sport-cmd resp: \(self.lastFrame ?? "", privacy: .public)")
                 return
             default: break
             }
