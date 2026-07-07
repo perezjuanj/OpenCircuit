@@ -381,15 +381,21 @@ final class HealthKitWriter {
             // failure is recorded here.
             pendingFlushFailures.formUnion(stepsOutcome.failed.subtracting([.distance]))
         }
+        // Pre-fetch HR samples for the 32-day basal-energy lookback — the widest window needed
+        // by both resting HR and passive-calorie flushes. Fetched once and shared so we don't
+        // query LocalStore twice for overlapping ranges (#172 review, fix #2).
+        let basalHR = Self.prefetchHRSamples(local: store, lookbackDays: Self.basalRHRLookbackDays,
+                                              now: Date())
+
         // Derived daily resting HR — one sample per finalized day (#18, #37). Idempotency is a
         // UserDefaults day-watermark, NOT the store cursor: RHR isn't a stored sample, and the
         // `hk:` cursor rows belong to the raw-sample mirror above.
-        result.restingDays = await flushRestingHR(local: store, sleepSegments: sleepSegments)
+        result.restingDays = await flushRestingHR(prefetchedHR: basalHR, sleepSegments: sleepSegments)
         if result.restingDays > 0 { writtenKinds.insert(.restingHeartRate) }
 
         // Energy: passive (hourly BMR) + active (HR-derived or steps-derived estimate).
         // Watermark-gated (#37) and labeled as derived estimates in HealthKit metadata.
-        result.passiveHours = await flushPassiveCalories(profile: profile)
+        result.passiveHours = await flushPassiveCalories(profile: profile, prefetchedHR: basalHR)
         result.activeKcal = await flushActiveCalories(local: store, profile: profile)
         if result.activeKcal > 0 { writtenKinds.insert(.activeEnergy) }
 
@@ -593,18 +599,33 @@ final class HealthKitWriter {
     /// prorated per hour, NOT a value the ring measured — so Health readers can label or filter it.
     static let basalEnergyEstimateMetadataKey = "OpenCircuitBasalEnergyEstimated"
 
-    func writePassiveCalories(profile: UserProfile, date: Date) async throws {
+    /// Metadata flag on a basal-energy sample recording whether the day's MEASURED resting HR
+    /// actually modulated the formula BMR this hour (true), or it fell back to the static value
+    /// (false — new user / no baseline yet). Lets Health readers and QA see which path ran.
+    static let basalEnergyRHRAdjustedMetadataKey = "OpenCircuitBasalEnergyRHRAdjusted"
+
+    /// Write one hour of basal (passive) energy. Previously this was a STATIC per-profile constant
+    /// (Mifflin-St Jeor ÷ 24) — identical every hour of every day. It's now nudged by how far the
+    /// day's MEASURED resting HR (`restingHR`) sits from the person's own recent baseline
+    /// (`baselineRestingHR`); pass either as nil to fall back to the static BMR (never zero). Still
+    /// an ESTIMATE, labeled as such in metadata.
+    func writePassiveCalories(profile: UserProfile, date: Date,
+                              restingHR: Double? = nil, baselineRestingHR: Double? = nil) async throws {
         let type = HKQuantityType(.basalEnergyBurned)
         let quantity = HKQuantity(
             unit: .kilocalorie(),
-            doubleValue: Calories.bmrKcalPerHour(profile: profile)
+            doubleValue: Calories.basalKcalPerHour(profile: profile,
+                                                   restingHR: restingHR,
+                                                   baselineRestingHR: baselineRestingHR)
         )
+        let adjusted = restingHR != nil && baselineRestingHR != nil
         let sample = HKQuantitySample(
             type: type,
             quantity: quantity,
             start: date,
             end: date.addingTimeInterval(3600),
             metadata: [Self.basalEnergyEstimateMetadataKey: true,
+                       Self.basalEnergyRHRAdjustedMetadataKey: adjusted,
                        HKMetadataKeyWasUserEntered: false]
         )
         try await store.save(sample)
@@ -760,9 +781,23 @@ final class HealthKitWriter {
     /// freeze a partial-night value, yet last night's RHR still lands the same day (by midday).
     private static let restingFinalizationDelay: TimeInterval = 12 * 3600
 
+    /// Pre-fetch HR samples from LocalStore for a given lookback, returning mapped HRSamples.
+    /// Called once per flush cycle; the result is shared across `flushRestingHR` and
+    /// `flushPassiveCalories` to avoid redundant LocalStore queries (#172 review, fix #2).
+    private static func prefetchHRSamples(local: LocalStore, lookbackDays: Int,
+                                           now: Date) -> [HRSample] {
+        let cal = Calendar.current
+        let from = cal.date(byAdding: .day, value: -lookbackDays, to: cal.startOfDay(for: now))
+            ?? now.addingTimeInterval(-Double(lookbackDays) * 86_400)
+        guard let stored = try? local.samples(kind: .heartRate, from: from, to: now),
+              !stored.isEmpty else { return [] }
+        return stored.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+    }
+
     /// Write one resting-HR sample per finalized day not yet covered by the day-watermark.
-    /// Reads HR straight from the store (the dashboard's source) via its public accessor.
-    private func flushRestingHR(local: LocalStore, sleepSegments: [SleepSegment]) async -> Int {
+    /// Uses pre-fetched HR samples (shared with `flushPassiveCalories`) to avoid a redundant
+    /// LocalStore query.
+    private func flushRestingHR(prefetchedHR: [HRSample], sleepSegments: [SleepSegment]) async -> Int {
         let cal = Calendar.current
         let now = Date()
         let defaults = UserDefaults.standard
@@ -773,9 +808,8 @@ final class HealthKitWriter {
         let lookback = cal.date(byAdding: .day, value: -7, to: cal.startOfDay(for: now))
             ?? now.addingTimeInterval(-7 * 86_400)
         let scanStart = max(lookback, lastWritten)
-        guard let stored = try? local.samples(kind: .heartRate, from: scanStart, to: now),
-              !stored.isEmpty else { return 0 }
-        let hr = stored.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+        let hr = prefetchedHR.filter { $0.start >= scanStart }
+        guard !hr.isEmpty else { return 0 }
         let days = RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal)
 
         var written = 0
@@ -793,10 +827,23 @@ final class HealthKitWriter {
         return written
     }
 
+    /// How far back the basal-energy path reads daily resting HR: enough to hold the personal
+    /// baseline window plus the couple of days an hourly backfill can touch. Bounds the query.
+    private static let basalRHRLookbackDays = 32
+
     /// Write basal (passive) energy for each completed hour since the watermark, returning the
     /// count. First run starts the meter at the current hour (no historical flood); a long gap
     /// is clamped to the last ~24 hours.
-    private func flushPassiveCalories(profile: UserProfile) async -> Int {
+    ///
+    /// Basal energy is no longer a static per-profile constant: each hour is nudged by the MEASURED
+    /// resting HR for the calendar day it belongs to, judged against the person's own prior-day
+    /// baseline. Uses pre-fetched HR samples (shared with `flushRestingHR`) and derives daily RHR
+    /// WITHOUT sleep segments so all days in the window use the same `lowestSustained` method —
+    /// ensuring derivation parity between today and the baseline (#172 review, fix #1).
+    /// Days with no RHR or too little baseline history fall back to the static per-hour BMR.
+    private func flushPassiveCalories(profile: UserProfile,
+                                      prefetchedHR: [HRSample]) async -> Int {
+        let cal = Calendar.current
         let defaults = UserDefaults.standard
         let now = Date()
         let currentHour = Self.startOfHour(now)
@@ -804,10 +851,17 @@ final class HealthKitWriter {
         var hour = stored == 0 ? currentHour : Date(timeIntervalSince1970: stored)
         hour = max(hour, currentHour.addingTimeInterval(-24 * 3600))  // clamp a long gap
 
+        // Per-calendar-day resting HR over the baseline window (empty on missing/thin data → the
+        // loop below simply degrades to static BMR for those hours).
+        let dailyRHR = Self.dailyRestingHR(prefetchedHR: prefetchedHR, now: now, calendar: cal)
+
         var written = 0
         while hour < currentHour {
+            let (rhr, baseline) = Self.restingEnergyInputs(forDay: cal.startOfDay(for: hour),
+                                                           from: dailyRHR)
             do {
-                try await writePassiveCalories(profile: profile, date: hour)
+                try await writePassiveCalories(profile: profile, date: hour,
+                                               restingHR: rhr, baselineRestingHR: baseline)
                 written += 1
                 hour = hour.addingTimeInterval(3600)
             } catch { break }  // leave the watermark at the failed hour; retry next flush
@@ -817,6 +871,39 @@ final class HealthKitWriter {
             defaults.set(hour.timeIntervalSince1970, forKey: Self.basalWatermarkKey)
         }
         return written
+    }
+
+    /// Per-calendar-day resting HR (bpm), oldest day first. Derives daily RHR from pre-fetched
+    /// HR samples using the `lowestSustained` path for ALL days (sleep segments intentionally
+    /// omitted). This ensures derivation parity between today's RHR and the baseline: the flush
+    /// receives `sleepSegments` covering only the most recent night, so passing them would make
+    /// today use `sleepMean` while baseline days fall to `lowestSustained` — a systematic offset
+    /// in the (today − baseline) delta that the ±20% clamp bounds but doesn't eliminate.
+    /// By using `lowestSustained` uniformly, both sides of the comparison are on the same basis.
+    ///
+    /// NOTE (expected, not a bug): the RHR this produces to SCALE basal energy (`lowestSustained`,
+    /// sleep omitted) intentionally will NOT match the daily resting-HR SAMPLE written to Health by
+    /// `flushRestingHR`, which passes `sleepSegments` and so uses the sleep-mean for the most recent
+    /// night. Basal-energy scaling wants a uniform, sleep-independent signal across the whole
+    /// baseline window (derivation parity, above); the displayed daily RHR wants the clinically
+    /// familiar sleeping resting-HR. So the internal driver and the shown metric are two different
+    /// derivations by design — the divergence is expected, not a discrepancy to reconcile.
+    static func dailyRestingHR(prefetchedHR: [HRSample],
+                                       now: Date, calendar cal: Calendar) -> [RestingHR.DailyValue] {
+        guard !prefetchedHR.isEmpty else { return [] }
+        return RestingHR.dailyValues(hr: prefetchedHR, sleep: [], calendar: cal)
+    }
+
+    /// Resolve `(day's measured RHR, personal baseline)` for one calendar `day` from ascending
+    /// daily values. RHR is that day's value (nil when the day has none); baseline is the trimmed
+    /// mean of PRIOR days' values, or nil below the trusted minimum. Either nil ⇒ caller uses
+    /// static BMR.
+    static func restingEnergyInputs(forDay day: Date,
+                                            from daily: [RestingHR.DailyValue])
+        -> (restingHR: Double?, baseline: Double?) {
+        guard let today = daily.first(where: { $0.day == day })?.bpm else { return (nil, nil) }
+        let prior = daily.filter { $0.day < day }.map(\.bpm)
+        return (today, Calories.restingBaselineBpm(prior: prior))
     }
 
     /// Write today's active-energy DELTA (today's HR-derived TRIMP kcal minus what's already

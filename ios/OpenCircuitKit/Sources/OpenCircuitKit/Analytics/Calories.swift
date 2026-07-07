@@ -53,6 +53,97 @@ public enum Calories {
         bmrKcalPerDay(profile: profile) / 24.0
     }
 
+    // MARK: Resting-HR–adjusted basal energy (#dynamic-resting-calories)
+    //
+    // Mifflin-St Jeor gives one number for a fixed profile — the same basal (passive) energy
+    // every hour of every day, regardless of how the person actually is. Resting energy
+    // expenditure tracks autonomic tone, and so does resting heart rate: an acutely elevated
+    // RHR (illness, poor recovery, stress, dehydration, stimulants) rides with a raised RMR.
+    // So we NUDGE the formula BMR by how far the day's MEASURED resting HR sits from the
+    // person's own recent baseline, instead of shipping an identical value daily. Still an
+    // ESTIMATE — labeled as such at every write site — but one that moves with real data.
+
+    /// Fractional change in resting energy per bpm of resting-HR deviation from baseline.
+    /// Order-of-magnitude anchor: the fever relationship (~10–13% RMR rise per +1 °C, and
+    /// ~8–10 bpm HR rise per +1 °C) ⇒ ≈1% RMR per bpm. We use that as a defensible, deliberately
+    /// conservative slope for autonomic-driven RMR shifts generally (stress, fitness, dehydration,
+    /// stimulants — not only fever), NOT a claim of clinical precision (hence the ESTIMATE label
+    /// and the cap below).
+    public static let restingEnergyFractionPerBpm = 0.01
+
+    /// Hard cap on how far measured RHR may move basal energy off the formula value, either way.
+    /// Bounds a garbage/outlier RHR (and honest but extreme physiology) to ±20% so a bad reading
+    /// can never produce an absurd basal-energy sample in Apple Health.
+    public static let maxRestingEnergyAdjustment = 0.20
+
+    /// Fewest PRIOR daily RHR readings needed before we trust a personal baseline. Below this we
+    /// don't adjust at all (new user / too little history) and callers fall back to static BMR —
+    /// never to zero. A plain baseline mean needs less history than SD-based anomaly detection,
+    /// so this sits below `VitalsBaseline`'s 7-day minimum on purpose.
+    public static let minRestingBaselineDays = 3
+
+    /// Fewest PRIOR days before the trimmed mean actually trims. The trim floors at one value off
+    /// each end (`max(1, count/10)`), so on a thin window it discards a disproportionate slice: at
+    /// n=3 it would keep only the median day, at n=4 only the middle two — the baseline collapses
+    /// toward a single day instead of averaging the window. At n=5 the same 1-in/1-out trim still
+    /// keeps the middle three (60% of the window), enough to resist one outlier while staying
+    /// representative. So below 5 prior days we skip the trim and take the plain mean of every day
+    /// (the ±`maxRestingEnergyAdjustment` clamp still bounds any single bad day); at/above 5 the
+    /// trim earns its outlier resistance.
+    public static let minTrimmedBaselineDays = 5
+
+    /// Personal resting-HR baseline (mean bpm) from a person's PRIOR daily resting-HR values.
+    /// `prior` is chronological (oldest→newest); returns nil below `minRestingBaselineDays` so the
+    /// caller degrades to the static BMR rather than adjust off a baseline we can't yet trust.
+    ///
+    /// With `< minTrimmedBaselineDays` prior days the window is too thin to trim without collapsing
+    /// toward a single day (see `minTrimmedBaselineDays`), so we take the plain mean of all values.
+    /// At/above that threshold we use a 10% trimmed mean (drops the top and bottom 10%, at least one
+    /// value off each end) to resist a single outlier day from skewing the window — the ±20% clamp
+    /// limits per-hour damage, but a robust baseline prevents systematic drift from one sick or
+    /// mis-measured day.
+    public static func restingBaselineBpm(
+        prior: [Double],
+        minDays: Int = minRestingBaselineDays
+    ) -> Double? {
+        guard prior.count >= minDays, minDays > 0 else { return nil }
+        let sorted = prior.sorted()
+        // Thin window: plain mean of every prior day — trimming here would collapse the baseline
+        // toward a single median day rather than average the window.
+        guard sorted.count >= minTrimmedBaselineDays else {
+            return sorted.reduce(0, +) / Double(sorted.count)
+        }
+        let trimCount = max(1, sorted.count / 10)
+        let trimmed = sorted.count > 2 * trimCount
+            ? Array(sorted[trimCount ..< (sorted.count - trimCount)])
+            : sorted
+        return trimmed.reduce(0, +) / Double(trimmed.count)
+    }
+
+    /// Multiplier on the static Mifflin-St Jeor BMR from the day's MEASURED resting HR vs the
+    /// personal baseline. 1.0 == no change. Returns 1.0 when either input is missing (so the
+    /// caller degrades to static BMR), and is clamped to ±`maxRestingEnergyAdjustment`. ESTIMATE.
+    public static func restingEnergyScale(restingHR: Double?, baselineRestingHR: Double?) -> Double {
+        guard let rhr = restingHR, let base = baselineRestingHR, base > 0 else { return 1.0 }
+        let raw = 1.0 + restingEnergyFractionPerBpm * (rhr - base)
+        let lo = 1.0 - maxRestingEnergyAdjustment
+        let hi = 1.0 + maxRestingEnergyAdjustment
+        return Swift.min(hi, Swift.max(lo, raw))
+    }
+
+    /// Dynamic basal (passive) energy for ONE hour: the per-hour Mifflin-St Jeor BMR scaled by the
+    /// resting-HR deviation from the personal baseline. Falls back to the exact static per-hour BMR
+    /// when RHR or baseline are unavailable (new user, no nights of data yet). ESTIMATE — labeled at
+    /// the HealthKit write site. Pure math — unit-testable on macOS.
+    public static func basalKcalPerHour(
+        profile: UserProfile,
+        restingHR: Double? = nil,
+        baselineRestingHR: Double? = nil
+    ) -> Double {
+        bmrKcalPerHour(profile: profile)
+            * restingEnergyScale(restingHR: restingHR, baselineRestingHR: baselineRestingHR)
+    }
+
     public static func activeKcal(hrSamples: [HRSample], maxHR: Int) -> Double {
         guard let trimp = Strain.edwardsTRIMP(
             hrSamples: hrSamples,
