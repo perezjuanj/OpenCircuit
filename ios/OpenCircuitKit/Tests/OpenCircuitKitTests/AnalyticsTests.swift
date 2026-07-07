@@ -182,9 +182,24 @@ final class AnalyticsTests: XCTestCase {
     }
 
     func testRestingBaselineTrimmedMeanSmallWindow() throws {
-        // At exactly minRestingBaselineDays (3), no trimming is possible — all values kept.
-        let prior: [Double] = [58, 60, 62]
-        XCTAssertEqual(try XCTUnwrap(Calories.restingBaselineBpm(prior: prior)), 60, accuracy: 1e-9)
+        // Below minTrimmedBaselineDays (5) we do NOT trim: trimming a thin window collapses the
+        // baseline toward a single median day (n=3 → the middle value alone), so we take the plain
+        // mean of every prior day instead. These assertions pin the ACTUAL small-window behavior.
+
+        // n=3, skewed: plain mean (72.33…), NOT the median (59). Proves it isn't collapsing to
+        // sorted[1] the way the pre-fix 1-in/1-out trim did.
+        XCTAssertEqual(try XCTUnwrap(Calories.restingBaselineBpm(prior: [58, 59, 100])),
+                       (58 + 59 + 100) / 3.0, accuracy: 1e-9)
+        // n=3, symmetric: mean == median here, both 60.
+        XCTAssertEqual(try XCTUnwrap(Calories.restingBaselineBpm(prior: [58, 60, 62])),
+                       60, accuracy: 1e-9)
+        // n=4, skewed: plain mean of all four (65), NOT a trimmed-to-middle-two 60.
+        XCTAssertEqual(try XCTUnwrap(Calories.restingBaselineBpm(prior: [50, 60, 60, 90])),
+                       (50 + 60 + 60 + 90) / 4.0, accuracy: 1e-9)
+        // n=5: trimming kicks in — drop one high + one low, mean the middle three.
+        // [50, 59, 60, 61, 100] → drop 50 & 100 → mean(59, 60, 61) = 60, NOT the plain mean (66).
+        XCTAssertEqual(try XCTUnwrap(Calories.restingBaselineBpm(prior: [50, 59, 60, 61, 100])),
+                       60, accuracy: 1e-9)
     }
 
     // MARK: Integration — daily RHR → energy inputs → dynamic basal kcal (#172 review, fix #3)

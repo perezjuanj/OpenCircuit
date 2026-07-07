@@ -82,18 +82,37 @@ public enum Calories {
     /// so this sits below `VitalsBaseline`'s 7-day minimum on purpose.
     public static let minRestingBaselineDays = 3
 
-    /// Personal resting-HR baseline (trimmed mean bpm) from a person's PRIOR daily resting-HR
-    /// values. `prior` is chronological (oldest→newest); returns nil below `minRestingBaselineDays`
-    /// so the caller degrades to the static BMR rather than adjust off a baseline we can't yet
-    /// trust. Uses a 10% trimmed mean (drops the top and bottom 10% of values) to resist single
-    /// outlier days from skewing the window — the ±20% clamp limits per-hour damage, but a robust
-    /// baseline prevents systematic drift from a single sick or mis-measured day.
+    /// Fewest PRIOR days before the trimmed mean actually trims. The trim floors at one value off
+    /// each end (`max(1, count/10)`), so on a thin window it discards a disproportionate slice: at
+    /// n=3 it would keep only the median day, at n=4 only the middle two — the baseline collapses
+    /// toward a single day instead of averaging the window. At n=5 the same 1-in/1-out trim still
+    /// keeps the middle three (60% of the window), enough to resist one outlier while staying
+    /// representative. So below 5 prior days we skip the trim and take the plain mean of every day
+    /// (the ±`maxRestingEnergyAdjustment` clamp still bounds any single bad day); at/above 5 the
+    /// trim earns its outlier resistance.
+    public static let minTrimmedBaselineDays = 5
+
+    /// Personal resting-HR baseline (mean bpm) from a person's PRIOR daily resting-HR values.
+    /// `prior` is chronological (oldest→newest); returns nil below `minRestingBaselineDays` so the
+    /// caller degrades to the static BMR rather than adjust off a baseline we can't yet trust.
+    ///
+    /// With `< minTrimmedBaselineDays` prior days the window is too thin to trim without collapsing
+    /// toward a single day (see `minTrimmedBaselineDays`), so we take the plain mean of all values.
+    /// At/above that threshold we use a 10% trimmed mean (drops the top and bottom 10%, at least one
+    /// value off each end) to resist a single outlier day from skewing the window — the ±20% clamp
+    /// limits per-hour damage, but a robust baseline prevents systematic drift from one sick or
+    /// mis-measured day.
     public static func restingBaselineBpm(
         prior: [Double],
         minDays: Int = minRestingBaselineDays
     ) -> Double? {
         guard prior.count >= minDays, minDays > 0 else { return nil }
         let sorted = prior.sorted()
+        // Thin window: plain mean of every prior day — trimming here would collapse the baseline
+        // toward a single median day rather than average the window.
+        guard sorted.count >= minTrimmedBaselineDays else {
+            return sorted.reduce(0, +) / Double(sorted.count)
+        }
         let trimCount = max(1, sorted.count / 10)
         let trimmed = sorted.count > 2 * trimCount
             ? Array(sorted[trimCount ..< (sorted.count - trimCount)])

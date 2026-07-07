@@ -880,6 +880,14 @@ final class HealthKitWriter {
     /// today use `sleepMean` while baseline days fall to `lowestSustained` — a systematic offset
     /// in the (today − baseline) delta that the ±20% clamp bounds but doesn't eliminate.
     /// By using `lowestSustained` uniformly, both sides of the comparison are on the same basis.
+    ///
+    /// NOTE (expected, not a bug): the RHR this produces to SCALE basal energy (`lowestSustained`,
+    /// sleep omitted) intentionally will NOT match the daily resting-HR SAMPLE written to Health by
+    /// `flushRestingHR`, which passes `sleepSegments` and so uses the sleep-mean for the most recent
+    /// night. Basal-energy scaling wants a uniform, sleep-independent signal across the whole
+    /// baseline window (derivation parity, above); the displayed daily RHR wants the clinically
+    /// familiar sleeping resting-HR. So the internal driver and the shown metric are two different
+    /// derivations by design — the divergence is expected, not a discrepancy to reconcile.
     static func dailyRestingHR(prefetchedHR: [HRSample],
                                        now: Date, calendar cal: Calendar) -> [RestingHR.DailyValue] {
         guard !prefetchedHR.isEmpty else { return [] }
