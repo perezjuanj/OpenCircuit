@@ -655,6 +655,7 @@ final class RingSession: NSObject {
         postSyncStatusTask?.cancel(); postSyncStatusTask = nil
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
         syncTask?.cancel(); syncTask = nil
+        rssiPollTask?.cancel(); rssiPollTask = nil   // Find My Ring RSSI poll (#96)
         endDrainAssertion()   // a cancelled drain must not leak its assertion (#119)
         monitoring = false
         livePreparing = false
@@ -1485,6 +1486,110 @@ final class RingSession: NSObject {
         stopLiveMonitoring()
     }
 
+    // MARK: - Native sport / workout mode (#90)
+
+    /// True while a native workout is running (SportStart..SportStop), during which the ring
+    /// pushes `0x4e` HR+steps frames (~10 s) instead of answering the `0x95` live-HR poll.
+    private(set) var sportSessionActive = false
+    /// Ring-counted steps during the current/last native workout (Σ of `0x4e` byte[6], #90).
+    private(set) var sportSteps = 0
+
+    /// Enter the ring's native workout mode for `typeByte` (`WorkoutSportType.firmwareByte`). The
+    /// ring then STREAMS `0x4e` HR+steps frames unsolicited — the `0x4e` handler acks each, routes
+    /// HR into `liveHR`/`liveHRAt` (so the workout's existing HR pipeline + live UI pick it up), and
+    /// sums steps into `sportSteps`. Independent of the `0x95` live-HR poll (none is sent here).
+    func beginSportSession(typeByte: UInt8) {
+        sportSessionActive = true
+        sportSteps = 0
+        liveHR = nil
+        liveHRAt = nil
+        monitoringStartedAt = Date()   // gate: only in-session locks seed the workout (WorkoutHRGate)
+        Task { [weak self] in
+            guard let self else { return }
+            self.write(Command.sportStart(typeByte))
+            try? await Task.sleep(for: .milliseconds(250))
+            self.write(Command.statusQuery)   // `d0 00 00` — mirrors the official app's enter sequence
+        }
+    }
+
+    /// End the native workout mode; returns the ring-counted step total. Sends `SportStop` (`06 00 00`).
+    @discardableResult
+    func endSportSession() -> Int {
+        sportSessionActive = false
+        write(Command.sportStop)
+        return sportSteps
+    }
+
+    // MARK: - Find My Ring (#96)
+    //
+    // Mirrors the official app's locator screen: enter the ring's proximity/search mode, poll the BLE
+    // link RSSI (~1 Hz) so the UI can show an approximate distance, and blink the LED on/off on demand.
+    // CoreBluetooth exposes RSSI on a CONNECTED peripheral via `readRSSI()` → `didReadRSSI`, so we can
+    // gauge proximity without scanning. The LED-off / search-stop bytes are 🟡 probable (on/off
+    // convention), self-validating on-device — see Command.findRingLightOff.
+
+    /// True while the Find My Ring screen is open (ring in proximity mode + RSSI polling running).
+    private(set) var findRingActive = false
+    /// Whether the ring's locator LED is currently lit.
+    private(set) var findRingLightOn = false
+    /// Smoothed link RSSI (dBm), refreshed ~1 Hz while `findRingActive`; nil = no read yet / no signal.
+    private(set) var ringRSSI: Int?
+    /// Short window of raw RSSI reads, averaged into `ringRSSI` to tame the jitter.
+    private var rssiSamples: [Int] = []
+    private var rssiPollTask: Task<Void, Never>?
+
+    /// Open Find My Ring: just start polling link RSSI for the distance readout. We send NO command to
+    /// the ring on open — proximity comes from CoreBluetooth RSSI, and the ring must stay DARK until the
+    /// user taps "light up" (the LED command `24 01 00` lit the ring the instant it was sent on open,
+    /// which is why entering here used to auto-light it).
+    func startFindingRing() {
+        findRingActive = true
+        findRingLightOn = false
+        rssiSamples.removeAll()
+        ringRSSI = nil
+        rssiPollTask?.cancel()
+        rssiPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if self.peripheral.state == .connected { self.peripheral.readRSSI() }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    /// Turn the ring's locator LED on or off (#96). On = `24 01 00` (🟢 device-verified); off =
+    /// `24 00 00` (🟡 probable, same opcode param 0).
+    func setFindRingLight(on: Bool) {
+        findRingLightOn = on
+        write(on ? Command.findRingLight : Command.findRingLightOff)
+    }
+
+    /// Close Find My Ring: turn the LED off (if lit) and stop polling RSSI.
+    func stopFindingRing() {
+        rssiPollTask?.cancel()
+        rssiPollTask = nil
+        if findRingLightOn { write(Command.findRingLightOff) }
+        findRingActive = false
+        findRingLightOn = false
+        ringRSSI = nil
+        rssiSamples.removeAll()
+    }
+
+    /// Fold one raw RSSI read into the smoothed `ringRSSI` (5-sample moving average). Drops
+    /// CoreBluetooth's out-of-range sentinel (127) and any implausible value.
+    private func recordRSSI(_ value: Int) {
+        guard value < 0, value > -120 else { return }
+        rssiSamples.append(value)
+        if rssiSamples.count > 5 { rssiSamples.removeFirst(rssiSamples.count - 5) }
+        ringRSSI = Int((Double(rssiSamples.reduce(0, +)) / Double(rssiSamples.count)).rounded())
+    }
+
+    /// Put the ring into airplane mode. This DROPS the BLE link immediately — the ring re-wakes ONLY
+    /// via the charging case (there is no BLE "off" command). The link will disconnect right after.
+    func setAirplaneModeOn() {
+        write(Command.airplaneModeOn)
+    }
+
     /// Per-mode user-measure budget (seconds): HR needs longer stillness to converge than SpO₂.
     private func userMeasureBudget(for mode: LiveMode) -> TimeInterval {
         mode == .spo2 ? 45 : 90
@@ -2258,6 +2363,14 @@ final class RingSession: NSObject {
 }
 
 extension RingSession: CBPeripheralDelegate {
+    /// Link RSSI for Find My Ring (#96). Polled ~1 Hz while the locator screen is open; folded into
+    /// the smoothed `ringRSSI` on the main actor.
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        guard error == nil else { return }
+        let value = RSSI.intValue
+        Task { @MainActor in self.recordRSSI(value) }
+    }
+
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         for service in peripheral.services ?? [] {
             peripheral.discoverCharacteristics(nil, for: service)
@@ -2580,6 +2693,22 @@ extension RingSession: CBPeripheralDelegate {
             case 0x13:
                 if self.calibrationCapturing {
                     self.handleCalibrationPPGFrame(bytes)
+                    return
+                }
+            case 0x4E:
+                // Native sport-mode stream (#90): HR (byte[5]) + steps (byte[6]) every ~10 s, each
+                // acked with `ce 00 00` to keep it flowing. Decode HR into `liveHR`/`liveHRAt` so the
+                // workout's existing HR pipeline (WorkoutHRGate → aggregator) and the live UI pick it
+                // up, and sum steps into `sportSteps`. Ignored unless a native sport session is active.
+                if self.sportSessionActive, let sample = SportFrame.decode(bytes) {
+                    self.write(Command.sportStreamAck)
+                    self.sportSteps += sample.steps
+                    if let hr = sample.hr {
+                        self.liveHR = hr
+                        self.liveHRAt = Date()   // true capture time (drives the workout dedup gate)
+                        self.liveHRWarmup = nil
+                        ringLog.notice("← 0x4e sport: HR \(hr) bpm, +\(sample.steps) steps (Σ \(self.sportSteps))")
+                    }
                     return
                 }
             case 0x81:

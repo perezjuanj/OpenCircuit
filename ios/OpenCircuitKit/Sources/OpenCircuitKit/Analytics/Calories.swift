@@ -63,4 +63,34 @@ public enum Calories {
         }
         return trimp * trimpKcalFactor
     }
+
+    /// Active-energy estimate for a WORKOUT via the Keytel et al. (2005) HR→energy regression — the
+    /// standard heart-rate calorie model. Uses the AVERAGE HR over the workout's true duration:
+    /// Keytel is linear in HR, so avg-HR-over-duration equals the per-sample integral for equal
+    /// intervals, and it is immune to how sparsely the ring streams HR (the `0x4e` sport frame lands
+    /// only ~every 10 s, so a 5-minute session yields ~30 readings).
+    ///
+    /// Chosen over Edwards-TRIMP for CALORIES because TRIMP assigns zero weight below 50% heart-rate
+    /// reserve — an easy/moderate session (e.g. steady cycling at ~100 bpm) would read 0 kcal despite
+    /// real energy spent. (Edwards-TRIMP is still the right model for training STRAIN; see `Strain`.)
+    /// ESTIMATE — not a ring sensor reading; labeled as such at every display/write site.
+    ///
+    /// Keytel 2005 energy expenditure (kJ·min⁻¹), W = body mass kg, A = age years:
+    ///   men:   −55.0969 + 0.6309·HR + 0.1988·W + 0.2017·A
+    ///   women: −20.4022 + 0.4472·HR − 0.1263·W + 0.0740·A
+    /// kcal = kJ / 4.184. The per-minute rate is clamped to ≥ 0 (a very low HR yields a negative raw
+    /// rate). Returns 0 for a non-positive HR or duration.
+    public static func workoutActiveKcal(avgHR: Int, durationSeconds: Double, profile: UserProfile) -> Double {
+        guard avgHR > 0, durationSeconds > 0 else { return 0 }
+        let hr = Double(avgHR)
+        let w = profile.weightKg
+        let a = Double(profile.age)
+        let kJPerMin: Double
+        switch profile.sex {
+        case .male:   kJPerMin = -55.0969 + 0.6309 * hr + 0.1988 * w + 0.2017 * a
+        case .female: kJPerMin = -20.4022 + 0.4472 * hr - 0.1263 * w + 0.0740 * a
+        }
+        let kcalPerMin = max(0, kJPerMin / 4.184)
+        return kcalPerMin * (durationSeconds / 60.0)
+    }
 }

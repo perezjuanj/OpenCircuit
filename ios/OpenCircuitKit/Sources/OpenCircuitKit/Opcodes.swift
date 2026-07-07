@@ -46,6 +46,31 @@ public enum Command {
     /// regardless, but we ACK promptly so an activated ring has no reason to throttle us.
     public static let heartbeatAck: [UInt8] = [0x91, 0x00, 0x00]
 
+    // MARK: Native sport / workout mode (🟢 FR02.018, #90 — see SportFrame.swift)
+    /// Enter the ring's native workout mode for `type` (0x01–0x07, see SportType). The ring then
+    /// streams `0x4e` HR+steps frames (~10 s) until SportStop. `06 03 <type> 04 00` → resp `86 00 86`.
+    public static func sportStart(_ type: UInt8) -> [UInt8] { [0x06, 0x03, type, 0x04, 0x00] }
+    /// End the native workout mode. `06 00 00` (0x06 mode family, mode 0 = off) → resp `86 00 86`.
+    public static let sportStop: [UInt8] = [0x06, 0x00, 0x00]
+    /// Ack a `0x4e` sport-stream frame to keep the stream flowing (0x4e = 0xce ^ 0x80).
+    public static let sportStreamAck: [UInt8] = [0xCE, 0x00, 0x00]
+
+    // MARK: Device actions (#96) — Find My Ring locator LED
+    //
+    // 🟢 DEVICE-VERIFIED 2026-07-06 on FR02.018: sending `24 01 00` LIGHTS the ring. The originally
+    // captured `20 01 00` (attributed to the "light up" tap by snoop timing) had NO visible LED effect
+    // on-device — the snoop's screen-open-vs-tap attribution was reversed, so `24 01 00` is the LED
+    // command, not a separate "search mode". Distance is measured from the CoreBluetooth link RSSI on
+    // our side (see RingProximity), so no ring command is needed just to show proximity.
+    /// Find My Ring — turn the locator LED on. `24 01 00` → resp `a4 00 a4`. 🟢 device-verified.
+    public static let findRingLight: [UInt8] = [0x24, 0x01, 0x00]
+    /// Find My Ring — turn the locator LED off. `24 00 00` (same opcode, param 0 = off). 🟡 PROBABLE
+    /// (on/off convention); self-validating on-device — the LED visibly goes dark.
+    public static let findRingLightOff: [UInt8] = [0x24, 0x00, 0x00]
+    /// Ring airplane mode ON (drops the BLE link — the ring re-wakes only via the charging case;
+    /// there is no "off" command). `08 04 00` → resp `88 00 88`.
+    public static let airplaneModeOn: [UInt8] = [0x08, 0x04, 0x00]
+
     /// Steps to enter live-HR mode, in the order the official app sends them (verified
     /// in the FR02.018 capture: open+drain history, then `d0 00 00` → `06 01 00` → fetch,
     /// then poll `95 00 00` for `15 00 <hr>` frames). The `d0 00 00` is REQUIRED — without

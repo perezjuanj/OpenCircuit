@@ -52,11 +52,17 @@ SYNC_EPOCH = 1577793600
 SYNC_ALL = bytes.fromhex("0200ffffffff000100")  # "everything pending"
 
 
-def sync_cursor_cmd(unix_seconds: float) -> bytes:
-    """Build `02 00 <cursor BE4> 00 01 00` to sync data since unix_seconds."""
+def sync_cursor_cmd(unix_seconds: float, channel: int = 0x00) -> bytes:
+    """Build `02 00 <cursor BE4> <channel> 01 00` to sync `channel` since unix_seconds.
+
+    `channel` is the byte[6] history-channel selector (🟢 §5.6.1): 0x00 = sleep,
+    0x03 = all-day are the only two the official app ever sends. `probe-channels`
+    sweeps the rest to hunt the still-uncaptured activity/step/stress/temp streams
+    (#9/#93/#94). Default 0x00 keeps every existing caller byte-identical.
+    """
     import struct
     cursor = max(0, int(unix_seconds) - SYNC_EPOCH)
-    return bytes([0x02, 0x00]) + struct.pack(">I", cursor) + bytes([0x00, 0x01, 0x00])
+    return bytes([0x02, 0x00]) + struct.pack(">I", cursor) + bytes([channel, 0x01, 0x00])
 
 # Name prefixes to match while scanning (🟢 — observed "RingConn Gen2-<MAC suffix>").
 NAME_PREFIXES = ("RingConn", "Ring")

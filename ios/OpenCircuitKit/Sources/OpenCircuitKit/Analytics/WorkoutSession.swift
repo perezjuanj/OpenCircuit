@@ -28,7 +28,10 @@ import Foundation
 public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     case walkingOutdoor
     case runningOutdoor
+    case runningIndoor
     case cyclingOutdoor
+    case cyclingIndoor
+    case rowing
     case hiking
     case strengthTraining
     case yoga
@@ -38,7 +41,10 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
         switch self {
         case .walkingOutdoor: return "Outdoor Walking"
         case .runningOutdoor: return "Outdoor Running"
+        case .runningIndoor:  return "Indoor Running"
         case .cyclingOutdoor: return "Outdoor Cycling"
+        case .cyclingIndoor:  return "Indoor Cycling"
+        case .rowing:         return "Indoor Rowing"
         case .hiking:         return "Hiking"
         case .strengthTraining: return "Strength"
         case .yoga:           return "Yoga"
@@ -51,7 +57,7 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     public var isOutdoor: Bool {
         switch self {
         case .walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .hiking: return true
-        case .strengthTraining, .yoga, .other: return false
+        case .runningIndoor, .cyclingIndoor, .rowing, .strengthTraining, .yoga, .other: return false
         }
     }
 
@@ -59,11 +65,31 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
         switch self {
         case .walkingOutdoor:    return "figure.walk"
         case .runningOutdoor:    return "figure.run"
+        case .runningIndoor:     return "figure.run.treadmill"
         case .cyclingOutdoor:    return "bicycle"
+        case .cyclingIndoor:     return "figure.indoor.cycle"
+        case .rowing:            return "figure.rower"
         case .hiking:            return "mountain.2"
         case .strengthTraining:  return "dumbbell"
         case .yoga:              return "figure.yoga"
         case .other:             return "heart.circle"
+        }
+    }
+
+    /// The ring's native sport-mode type byte for `Command.sportStart` (🟢 #90). Types the ring
+    /// doesn't natively support (hiking/strength/other) map to the closest ring mode — the byte
+    /// only tunes the ring's own HR sampling; the HealthKit activity type is chosen separately.
+    public var firmwareByte: UInt8 {
+        switch self {
+        case .runningOutdoor:   return SportType.outdoorRunning.rawValue   // 0x01
+        case .walkingOutdoor:   return SportType.outdoorWalking.rawValue   // 0x02
+        case .runningIndoor:    return SportType.indoorRunning.rawValue    // 0x03
+        case .cyclingOutdoor:   return SportType.outdoorCycling.rawValue   // 0x04
+        case .cyclingIndoor:    return SportType.indoorCycling.rawValue    // 0x05
+        case .rowing:           return SportType.indoorRowing.rawValue     // 0x06
+        case .yoga:             return SportType.yoga.rawValue             // 0x07
+        case .hiking:           return SportType.outdoorWalking.rawValue   // ≈ outdoor walk
+        case .strengthTraining, .other: return SportType.yoga.rawValue     // ≈ generic indoor
         }
     }
 }
@@ -157,6 +183,40 @@ public enum HRZoneClassifier {
         }
         return WorkoutZoneBreakdown(secondsInZone: seconds)
     }
+
+    /// Default cap for a single reading's held interval (seconds). The sport stream lands ~every 10 s,
+    /// so 30 s absorbs a missed reading or jitter while refusing to invent zone time across a genuine
+    /// dropout (ring off-wrist / lost link).
+    public static let defaultHoldCapSeconds: Double = 30
+
+    /// Time-in-zone using STEP-FUNCTION (last-value-held) attribution — the fix for zone totals reading
+    /// far short of the workout (e.g. 0:50 for a 5:05 ride). The ring reports HR PERIODICALLY (~every
+    /// 10 s in sport mode), so each reading represents the interval it covers, not just the ~2 s poll
+    /// window it was stamped with. Each sample is held until the NEXT sample's timestamp; the final
+    /// sample is held until `sessionEnd`.
+    ///
+    /// Every held interval is CAPPED at `maxGapSeconds` (default `defaultHoldCapSeconds`) so a real
+    /// dropout is never fabricated into zone time — the total stays honest: ≈ the workout duration when
+    /// HR is continuous, and legitimately less when readings were actually missed. Time before the
+    /// first reading is not attributed (no zone is assumed before any data). Sub-50%-maxHR readings
+    /// contribute no zone time. Samples are sorted by start; pure and unit-testable.
+    public static func timeInZonesHeld(
+        hrSamples: [HRSample],
+        maxHR: Int,
+        sessionEnd: Date,
+        maxGapSeconds: Double = defaultHoldCapSeconds
+    ) -> WorkoutZoneBreakdown {
+        var seconds = [HRZone: Double]()
+        for z in HRZone.allCases { seconds[z] = 0 }
+        let sorted = hrSamples.sorted { $0.start < $1.start }
+        for (i, sample) in sorted.enumerated() {
+            let nextAnchor = (i + 1 < sorted.count) ? sorted[i + 1].start : sessionEnd
+            let held = min(max(nextAnchor.timeIntervalSince(sample.start), 0), maxGapSeconds)
+            guard held > 0, let zone = zone(bpm: sample.bpm, maxHR: maxHR) else { continue }
+            seconds[zone, default: 0] += held
+        }
+        return WorkoutZoneBreakdown(secondsInZone: seconds)
+    }
 }
 
 // MARK: - Zone breakdown
@@ -230,10 +290,12 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
     public let avgHR: Int?
     /// Maximum BPM recorded during the session (nil if no readings).
     public let maxHR: Int?
-    /// Estimated active calories from Edwards-TRIMP (ESTIMATE — labeled as such in the UI).
-    /// nil if insufficient HR data for a meaningful estimate.
+    /// Estimated active calories (ESTIMATE — labeled as such in the UI): Keytel HR→energy over the
+    /// workout duration when HR was captured, else a distance×body-mass estimate. nil only when there
+    /// is NEITHER any HR reading NOR a distance — never fabricated.
     public let estimatedActiveKcal: Double?
-    /// 5-zone HR breakdown from actual sample durations.
+    /// 5-zone HR breakdown using held (step-function) attribution — each periodic reading covers the
+    /// interval until the next (capped so real dropouts aren't fabricated). See `timeInZonesHeld`.
     public let zoneBreakdown: WorkoutZoneBreakdown
     /// GPS distance in meters (phone-side CoreLocation). nil for indoor sports or when
     /// location permission was denied.
@@ -242,6 +304,9 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
     public let hasRoute: Bool
     /// Count of actual HR readings captured during the session.
     public let hrSampleCount: Int
+    /// Steps counted by the ring during the workout (native sport-mode `0x4e` stream, #90).
+    /// nil when the workout wasn't recorded in native sport mode (e.g. the legacy live-HR path).
+    public let steps: Int?
     /// True when the user's max HR (220 − age) was used for zone calculations.
     /// Always true for this implementation (formula from APK).
     public let usedFormulaMaxHR: Bool
@@ -257,6 +322,7 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
         distanceMeters: Double?,
         hasRoute: Bool,
         hrSampleCount: Int,
+        steps: Int? = nil,
         usedFormulaMaxHR: Bool = true
     ) {
         self.sport = sport
@@ -269,6 +335,7 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
         self.distanceMeters = distanceMeters
         self.hasRoute = hasRoute
         self.hrSampleCount = hrSampleCount
+        self.steps = steps
         self.usedFormulaMaxHR = usedFormulaMaxHR
     }
 }
@@ -314,7 +381,8 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
         endDate: Date,
         distanceMeters: Double?,
         hasRoute: Bool,
-        profile: UserProfile
+        profile: UserProfile,
+        steps: Int? = nil
     ) -> WorkoutSummary {
         let avgHR: Int?
         let maxHRValue: Int?
@@ -329,14 +397,17 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
             let sum = samples.reduce(0) { $0 + $1.bpm }
             avgHR = sum / samples.count
             maxHRValue = samples.map(\.bpm).max()
-            // Active calories: Edwards-TRIMP. Requires ≥ 600 samples (Strain.minReadings)
-            // to produce a meaningful estimate; returns nil otherwise. LABELED as estimate.
-            let trimp = Strain.edwardsTRIMP(
-                hrSamples: samples,
-                maxHR: formulaMaxHR,
-                restingHR: Calories.defaultRestingHR
+            // Active calories: Keytel HR→energy over the workout's TRUE duration (endDate−startDate).
+            // Positive for any real exertion — unlike Edwards-TRIMP, which zeroes below 50% HR-reserve
+            // (so easy/moderate sessions read 0 kcal) and needs ≥600 samples (the sparse ~10 s sport
+            // stream never reaches that in a normal workout, so it returned nil → "--"). LABELED an
+            // estimate in the UI. Numeric (incl. 0) whenever HR was captured, so we never show "--"
+            // for a workout with real readings.
+            hrKcal = Calories.workoutActiveKcal(
+                avgHR: avgHR!,
+                durationSeconds: endDate.timeIntervalSince(startDate),
+                profile: profile
             )
-            hrKcal = trimp.map { $0 * Calories.trimpKcalFactor }
         }
         // Distance-based active-energy fallback: a GPS walk/run/hike/cycle whose HR never locked
         // (the live-HR path rarely locks in motion, #45) would otherwise show "--" active calories.
@@ -348,7 +419,8 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
             : nil
         estimatedKcal = [hrKcal, distKcal].compactMap { $0 }.max()
 
-        let zones = HRZoneClassifier.timeInZones(hrSamples: samples, maxHR: formulaMaxHR)
+        let zones = HRZoneClassifier.timeInZonesHeld(
+            hrSamples: samples, maxHR: formulaMaxHR, sessionEnd: endDate)
         return WorkoutSummary(
             sport: sport,
             startDate: startDate,
@@ -360,6 +432,7 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
             distanceMeters: distanceMeters,
             hasRoute: hasRoute,
             hrSampleCount: samples.count,
+            steps: steps,
             usedFormulaMaxHR: true
         )
     }

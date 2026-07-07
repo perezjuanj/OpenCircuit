@@ -326,11 +326,12 @@ struct WorkoutView: View {
                                 text: "Few HR readings captured (\(summary.hrSampleCount)). Live HR polling is best-effort — the ring may have missed updates.")
                     }
                     if summary.estimatedActiveKcal != nil {
-                        // Label the ACTUAL source: HR-TRIMP when HR locked, else the GPS-distance
-                        // fallback (a zero-HR walk's calories come from distance x body mass).
+                        // Label the ACTUAL source: an HR-based energy estimate when HR was captured,
+                        // else the GPS-distance fallback (a zero-HR walk's calories come from
+                        // distance x body mass).
                         noteRow(icon: "info.circle", color: .secondary,
                                 text: summary.hrSampleCount > 0
-                                    ? "Active calories are an ESTIMATE (Edwards-TRIMP from HR — not ring sensor data)."
+                                    ? "Active calories are an ESTIMATE (from your heart rate, duration, age and body mass — not ring sensor data)."
                                     : "Active calories are an ESTIMATE (from GPS distance x body mass — HR didn't lock; not ring sensor data).")
                     }
                     if summary.hasRoute {
