@@ -917,7 +917,9 @@ final class RingSession: NSObject {
     /// the reported loss — is recovered; revisit if temp/over-count regress on device.
     @discardableResult
     private func evaluatePeriodicDrain(trigger: String?) -> Bool {
-        guard ready, !monitoring, !livePreparing, syncTask == nil else { return false }
+        // `!workoutHolding`: never open the history channel during an active workout (native sport
+        // session OR live-HR-poll workout) — it contends with the busy ring (#90 regression fix).
+        guard ready, !monitoring, !livePreparing, !workoutHolding, syncTask == nil else { return false }
         let saver = UserDefaults.standard.bool(forKey: Self.batterySaverEnabledKey)
         let night = isInSleepWindow
         let cadenceDue = gotDataFrame
@@ -1500,6 +1502,15 @@ final class RingSession: NSObject {
     /// sums steps into `sportSteps`. Independent of the `0x95` live-HR poll (none is sent here).
     func beginSportSession(typeByte: UInt8) {
         sportSessionActive = true
+        // Take the shared "a workout owns the ring" hold so the SAME contention gates that already
+        // honor a live-HR-poll workout (`beginWorkoutHR`) also defer during a NATIVE sport session.
+        // Regression fix (#90): the sport-mode path set only `sportSessionActive`, which no gate
+        // checked, so a mid-workout auto-measure / device-status refresh / periodic-or-foreground
+        // history drain would open the busy ring's history channel → "no frames received" AND could
+        // knock the ring's `0x4e` sport stream off, starving the workout's HR. Unlike `beginWorkoutHR`
+        // this must NOT start a `0x95` live poll (the ring streams `0x4e` here), so we set the hold
+        // directly rather than calling `beginWorkoutHR`.
+        workoutHolding = true
         sportSteps = 0
         liveHR = nil
         liveHRAt = nil
@@ -1516,6 +1527,7 @@ final class RingSession: NSObject {
     @discardableResult
     func endSportSession() -> Int {
         sportSessionActive = false
+        workoutHolding = false   // release the contention hold taken in beginSportSession
         write(Command.sportStop)
         return sportSteps
     }

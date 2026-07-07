@@ -339,8 +339,10 @@ struct ContentView: View {
     /// `syncHistory()` is itself bounded (watchdog), and the descriptor stream refreshes
     /// steps/temp meanwhile — so this is a single bounded refresh, not a poll loop.
     private func maybeAutoSyncOnReady() {
+        // `!session.workoutHolding`: don't fire a foreground-return history sync during an active
+        // workout — it contends with the busy ring and can knock the `0x4e` sport stream off (#90).
         guard pendingAutoSync, let session, session.ready,
-              !session.monitoring, !session.syncing else { return }
+              !session.monitoring, !session.syncing, !session.workoutHolding else { return }
         if let last = lastForegroundSync,
            Date().timeIntervalSince(last) < Self.autoSyncInterval {
             pendingAutoSync = false   // too soon — consume the request without syncing
