@@ -6,7 +6,7 @@ final class HistoryFrameCaptureTests: XCTestCase {
     // MARK: - Opcode filtering
 
     func testCapturesHistoryAndDescriptorOpcodes() {
-        for op in [UInt8(0x47), 0x4c, 0x50, 0x82, 0x10, 0x87] {
+        for op in [UInt8(0x47), 0x4c, 0x50, 0x82, 0x10, 0x87, 0x4e] {
             XCTAssertTrue(HistoryFrameCapture.shouldCapture([op, 0x00, 0x01]),
                           "expected 0x\(String(op, radix: 16)) to be captured")
         }
