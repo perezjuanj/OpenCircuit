@@ -1521,15 +1521,21 @@ final class RingSession: NSObject {
         liveHRAt = nil
         sportGotFirstFrame = false
         monitoringStartedAt = Date()   // gate: only in-session locks seed the workout (WorkoutHRGate)
-        // SportStart-with-retry (2026-07-07): a SportStart IDENTICAL to the official app's got the ring
-        // to stream `0x4e` in an Android snoop (`86 00 86` ACK → `10 xx 06` sport-active descriptor →
-        // `0x4e` HR), but on-device our single SportStart was sometimes silently IGNORED by the ring
-        // (no ACK, no `0x4e`). So re-send SportStart until the ring actually starts streaming — the app
-        // gets its first frame ~7-10 s after SportStart, so we wait ~12 s per attempt, up to 4 tries.
+        // ROOT CAUSE of workout-HR failure (2026-07-07, live trace): the ring is SINGLE-MODE — `06 01`
+        // (live-HR), `06 02` (SpO2) and `06 03` (sport) are mutually-exclusive modes of the same family,
+        // and the ring will NOT switch DIRECTLY from live-HR mode into sport mode. Our dashboard live-HR
+        // poll leaves the ring in `06 01`, so SportStart (`06 03`) got NO `86 00 86` ACK and NO `0x4e` —
+        // 4 retries all ignored — while `06 00` (stop) WAS acked. The official app never uses live-HR
+        // mode, so it enters sport mode from idle. FIX: stop the poll loop, then EXIT the current mode
+        // with `06 00` (acked), settle, THEN SportStart (re-sent until the first `0x4e`, ~7-10 s later).
+        if monitoring { stopLiveMonitoring(scheduleStatusRefresh: false) }
         sportStartTask?.cancel()
         sportStartTask = Task { [weak self] in
+            guard let self else { return }
+            self.write(Command.sportStop)   // `06 00 00` — clear live-HR / any lingering mode first
+            try? await Task.sleep(for: .milliseconds(500))
             for attempt in 1...4 {
-                guard let self, self.sportSessionActive, !self.sportGotFirstFrame else { return }
+                guard self.sportSessionActive, !self.sportGotFirstFrame else { return }
                 if attempt > 1 {
                     ringLog.notice("sport: SportStart retry #\(attempt) — ring hadn't streamed 0x4e yet")
                 }
@@ -1539,7 +1545,7 @@ final class RingSession: NSObject {
                 self.write(Command.statusQuery)   // `d0 00 00` — mirrors the official app's enter sequence
                 try? await Task.sleep(for: .seconds(12))   // give the ring time to lock + stream
             }
-            if let self, self.sportSessionActive, !self.sportGotFirstFrame {
+            if self.sportSessionActive, !self.sportGotFirstFrame {
                 ringLog.notice("sport: ring never streamed 0x4e after 4 SportStart attempts — workout HR unavailable")
             }
         }
