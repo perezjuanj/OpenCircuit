@@ -5,6 +5,17 @@ options:
     iOS: "17.0"
   createIntermediateGroups: true
 
+# Project-wide version/build — SINGLE SOURCE OF TRUTH, inherited by BOTH the app and the
+# WorkoutWidget extension. Bump CURRENT_PROJECT_VERSION here for every TestFlight upload
+# (ship-release does this). Keeping it project-level (not per-target) guarantees the app and its
+# embedded extension always share the SAME CFBundleVersion — App Store validation REJECTS an upload
+# whose extension build number differs from the app's. Both Info.plists reference these via
+# $(MARKETING_VERSION)/$(CURRENT_PROJECT_VERSION).
+settings:
+  base:
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "20"
+
 packages:
   OpenCircuitKit:
     path: OpenCircuitKit
@@ -15,9 +26,15 @@ targets:
     platform: iOS
     sources:
       - path: OpenCircuit
+      # Shared/ holds WorkoutActivityAttributes — the ActivityKit contract compiled into BOTH the
+      # app (starts/updates the Live Activity) and the WorkoutWidget extension (renders it).
+      - path: Shared
     dependencies:
       - package: OpenCircuitKit
         product: OpenCircuitKit
+      # Embed the Live Activity / Dynamic Island widget extension into the app's PlugIns.
+      - target: WorkoutWidget
+        embed: true
     info:
       path: OpenCircuit/Info.plist
       properties:
@@ -41,6 +58,9 @@ targets:
         # in the iOS permission dialogs, so they use the user-facing name "OpenCircuit".
         NSHealthShareUsageDescription: "OpenCircuit reads health metrics from your ring to display them."
         NSHealthUpdateUsageDescription: "OpenCircuit writes your ring's metrics into Apple Health."
+        # Live Activities (workout modal): required for the app to start an ActivityKit Live Activity
+        # showing live workout time / calories / heart rate on the Lock Screen + Dynamic Island.
+        NSSupportsLiveActivities: true
         # BLE (Phase 3) — required to connect to the ring.
         NSBluetoothAlwaysUsageDescription: "OpenCircuit connects to your RingConn Gen 2 ring over Bluetooth Low Energy."
         # Location (Phase 3, #75) — used ONLY during an active workout: to map the GPS route
@@ -72,11 +92,9 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.standardsoftwaresolutions.opencircuit
-        # Single source of truth for version/build — Info.plist references these via
-        # $(MARKETING_VERSION)/$(CURRENT_PROJECT_VERSION). Bump CURRENT_PROJECT_VERSION
-        # for EVERY TestFlight upload (build numbers must be unique & increasing).
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "20"
+        # MARKETING_VERSION / CURRENT_PROJECT_VERSION are defined at PROJECT level (top of this file)
+        # so the app and the WorkoutWidget extension always share one build number. The app's
+        # Info.plist references them via $(MARKETING_VERSION)/$(CURRENT_PROJECT_VERSION).
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
@@ -86,6 +104,37 @@ targets:
         # On-device signing. Set here so CLI device builds work after `xcodegen generate`
         # (which would otherwise drop the team and fail signing). Team 765RD9BJ8C =
         # S&S Holdings International LLC (DBA Standard Software Solutions); paid, HealthKit-capable.
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 765RD9BJ8C
+
+  # WidgetKit app-extension that renders the workout Live Activity (Lock Screen + Dynamic Island).
+  # It has NO OpenCircuitKit dependency on purpose: the only shared code is Shared/ (the ActivityKit
+  # attributes), everything else is system frameworks (WidgetKit/SwiftUI/ActivityKit). The app
+  # embeds it via the `WorkoutWidget` dependency above and drives it through ActivityKit.
+  WorkoutWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: WorkoutWidget
+      - path: Shared
+    info:
+      path: WorkoutWidget/Info.plist
+      properties:
+        CFBundleDisplayName: OpenCircuit Workout
+        # MUST match the app's version/build (project-level settings) — App Store validation rejects
+        # an extension whose CFBundleVersion differs from the containing app's.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.standardsoftwaresolutions.opencircuit.WorkoutWidget
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        # Same paid team as the app so automatic signing registers the extension's App ID and the
+        # embedded extension is signed consistently for device builds / TestFlight.
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 765RD9BJ8C
 
@@ -109,6 +158,7 @@ schemes:
     build:
       targets:
         OpenCircuit: all
+        WorkoutWidget: all
         OpenCircuitTests: [test]
     run:
       config: Debug

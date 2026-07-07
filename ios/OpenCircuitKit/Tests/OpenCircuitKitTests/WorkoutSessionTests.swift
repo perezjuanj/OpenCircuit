@@ -376,6 +376,94 @@ final class WorkoutSessionTests: XCTestCase {
         // 94 → below 50% of 190 → nil
         XCTAssertNil(HRZoneClassifier.zone(bpm: 94, maxHR: 190))
     }
+
+    // MARK: - Live snapshot (Live Activity feed)
+
+    func testLiveAvgHRNilBeforeAnyReading() {
+        let agg = WorkoutSessionAggregator(startDate: Date(timeIntervalSince1970: 0), userAge: 30)
+        XCTAssertNil(agg.currentAvgHR, "no readings ⇒ no live avg — never fabricated")
+    }
+
+    func testLiveAvgHRMatchesFinalizeAvg() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 30)
+        agg.add(sample: HRSample(bpm: 100, start: t0.addingTimeInterval(10), end: t0.addingTimeInterval(12)))
+        agg.add(sample: HRSample(bpm: 140, start: t0.addingTimeInterval(20), end: t0.addingTimeInterval(22)))
+        // Same integer truncation as finalize, so the Live Activity number matches the final summary.
+        XCTAssertEqual(agg.currentAvgHR, 120)
+        let profile = UserProfile(age: 30, weightKg: 70, heightCm: 170, sex: .male)
+        let summary = agg.finalize(sport: .runningOutdoor, endDate: t0.addingTimeInterval(300),
+                                   distanceMeters: nil, hasRoute: false, profile: profile)
+        XCTAssertEqual(agg.currentAvgHR, summary.avgHR)
+    }
+
+    func testLiveActiveKcalZeroBeforeAnyReading() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 30)
+        let profile = UserProfile(age: 30, weightKg: 70, heightCm: 170, sex: .male)
+        // No HR yet ⇒ 0 (honest: the Live Activity shows 0, not a made-up number).
+        XCTAssertEqual(agg.liveActiveKcal(profile: profile, asOf: t0.addingTimeInterval(60)), 0)
+    }
+
+    func testLiveActiveKcalMatchesFinalizeHRKcal() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 35)
+        for i in 0..<30 {
+            let s = t0.addingTimeInterval(Double(i) * 10)
+            agg.add(sample: HRSample(bpm: 130, start: s, end: s.addingTimeInterval(2)))
+        }
+        let profile = UserProfile(age: 35, weightKg: 75, heightCm: 178, sex: .male)
+        let end = t0.addingTimeInterval(300)
+        // Live kcal (HR-only) equals the Keytel model over the same window — no distance fallback,
+        // so it matches finalize's HR-based estimate for an indoor (distance-less) session exactly.
+        let live = agg.liveActiveKcal(profile: profile, asOf: end)
+        let expected = Calories.workoutActiveKcal(avgHR: 130, durationSeconds: 300, profile: profile)
+        XCTAssertEqual(live, expected, accuracy: 0.001)
+        XCTAssertGreaterThan(live, 0)
+    }
+
+    func testLiveActiveKcalGrowsWithElapsedTime() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 30)
+        agg.add(sample: HRSample(bpm: 150, start: t0.addingTimeInterval(5), end: t0.addingTimeInterval(7)))
+        let profile = UserProfile(age: 30, weightKg: 70, heightCm: 170, sex: .male)
+        let atOneMin = agg.liveActiveKcal(profile: profile, asOf: t0.addingTimeInterval(60))
+        let atFiveMin = agg.liveActiveKcal(profile: profile, asOf: t0.addingTimeInterval(300))
+        XCTAssertGreaterThan(atFiveMin, atOneMin, "elapsed time grows ⇒ estimate grows monotonically")
+    }
+
+    /// The displayed live calories must NEVER tick down. The raw avg-HR×elapsed model dips when a low
+    /// reading pulls the running average down; the high-water clamp holds the number. Without the clamp
+    /// this fails (a 160→70 bpm drop shrinks the product ~16→~11 kcal for this profile).
+    func testLiveActiveKcalNeverTicksDownWhenAvgDrops() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 35)
+        let profile = UserProfile(age: 35, weightKg: 75, heightCm: 178, sex: .male)
+        agg.add(sample: HRSample(bpm: 160, start: t0.addingTimeInterval(5), end: t0.addingTimeInterval(7)))
+        let k1 = agg.liveActiveKcal(profile: profile, asOf: t0.addingTimeInterval(60))
+        XCTAssertGreaterThan(k1, 0)
+        // A much lower reading pulls the running avg down; raw avg×elapsed would DROP below k1.
+        agg.add(sample: HRSample(bpm: 70, start: t0.addingTimeInterval(65), end: t0.addingTimeInterval(67)))
+        let k2 = agg.liveActiveKcal(profile: profile, asOf: t0.addingTimeInterval(70))
+        XCTAssertGreaterThanOrEqual(k2, k1, "displayed calories must never tick down when avg HR drops")
+    }
+
+    /// With constant HR the live high-water at session end equals `finalize`'s HR-based estimate for a
+    /// distance-less (indoor) workout — the live number and the saved summary agree.
+    func testLiveActiveKcalAtEndMatchesFinalizeIndoor() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 40)
+        let profile = UserProfile(age: 40, weightKg: 80, heightCm: 180, sex: .male)
+        for i in 0..<20 {
+            let s = t0.addingTimeInterval(Double(i) * 10)
+            agg.add(sample: HRSample(bpm: 140, start: s, end: s.addingTimeInterval(2)))
+        }
+        let end = t0.addingTimeInterval(200)
+        let live = agg.liveActiveKcal(profile: profile, asOf: end)
+        let summary = agg.finalize(sport: .cyclingIndoor, endDate: end,
+                                   distanceMeters: nil, hasRoute: false, profile: profile)
+        XCTAssertEqual(live, summary.estimatedActiveKcal ?? -1, accuracy: 0.001)
+    }
 }
 
 // Extension to allow using `.walking` without the full qualified name in the test
