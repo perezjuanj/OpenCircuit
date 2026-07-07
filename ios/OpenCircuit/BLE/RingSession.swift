@@ -1532,18 +1532,24 @@ final class RingSession: NSObject {
         sportStartTask?.cancel()
         sportStartTask = Task { [weak self] in
             guard let self else { return }
-            self.write(Command.sportStop)   // `06 00 00` — clear live-HR / any lingering mode first
-            try? await Task.sleep(for: .milliseconds(500))
             for attempt in 1...4 {
                 guard self.sportSessionActive, !self.sportGotFirstFrame else { return }
                 if attempt > 1 {
-                    ringLog.notice("sport: SportStart retry #\(attempt) — ring hadn't streamed 0x4e yet")
+                    ringLog.notice("sport: SportStart retry #\(attempt) — ring rejected/ignored the prior try")
                 }
-                self.write(Command.sportStart(typeByte))
-                try? await Task.sleep(for: .milliseconds(300))
-                guard self.sportSessionActive else { return }   // ended/cancelled during the pause
-                self.write(Command.statusQuery)   // `d0 00 00` — mirrors the official app's enter sequence
-                try? await Task.sleep(for: .seconds(12))   // give the ring time to lock + stream
+                // Mirror the official app's stop→SETTLE→prepare→start pace. The ring is single-mode and
+                // REJECTS a SportStart that arrives too soon after a stop (86 fd 7b = err 0xfd, seen 500 ms
+                // after 06 00) — it must settle in idle first (the app left 10-60 s + `07` fetches between a
+                // stop and the next start). So per attempt: exit mode → settle → `07` prepare → settle → start.
+                self.write(Command.sportStop)   // 06 00 00 — exit live-HR / any mode → idle
+                try? await Task.sleep(for: .seconds(3))
+                guard self.sportSessionActive else { return }
+                self.write(Command.fetch)        // 07 00 00 — wake/prepare (the app sends this before SportStart)
+                try? await Task.sleep(for: .seconds(3))
+                guard self.sportSessionActive else { return }
+                self.write(Command.sportStart(typeByte))   // 06 03 <type> 04 00
+                self.write(Command.statusQuery)            // d0 00 00 — the app's enter sequence
+                try? await Task.sleep(for: .seconds(12))   // wait for the ring to lock + stream the first 0x4e
             }
             if self.sportSessionActive, !self.sportGotFirstFrame {
                 ringLog.notice("sport: ring never streamed 0x4e after 4 SportStart attempts — workout HR unavailable")
