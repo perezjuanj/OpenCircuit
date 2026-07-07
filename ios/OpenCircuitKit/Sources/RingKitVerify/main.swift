@@ -231,6 +231,17 @@ check(Calories.bmrKcalPerDay(profile: maleProfile) == 1780.0, "male BMR Mifflin-
 check(abs(Calories.bmrKcalPerHour(profile: maleProfile) - 74.166_666) < 0.001, "male BMR hourly")
 let femaleProfile = UserProfile(age: 40, weightKg: 65, heightCm: 165, sex: .female)
 check(Calories.bmrKcalPerDay(profile: femaleProfile) == 1320.25, "female BMR Mifflin-St Jeor")
+// Resting-HR–adjusted basal energy (#dynamic-resting-calories): dynamic when RHR+baseline given,
+// static fallback otherwise, clamped to ±20%.
+check(Calories.restingBaselineBpm(prior: [60, 62]) == nil, "RHR baseline nil below min days")
+check(Calories.restingBaselineBpm(prior: [58, 60, 62]) == 60, "RHR baseline mean")
+check(abs(Calories.restingEnergyScale(restingHR: 68, baselineRestingHR: 60) - 1.08) < 1e-9, "RHR scale +8 bpm -> +8%")
+check(Calories.restingEnergyScale(restingHR: 200, baselineRestingHR: 60) == 1.20, "RHR scale clamped +20%")
+check(Calories.restingEnergyScale(restingHR: 10, baselineRestingHR: 60) == 0.80, "RHR scale clamped -20%")
+check(Calories.basalKcalPerHour(profile: maleProfile) == Calories.bmrKcalPerHour(profile: maleProfile),
+      "basal/hour falls back to static BMR")
+check(abs(Calories.basalKcalPerHour(profile: maleProfile, restingHR: 70, baselineRestingHR: 60)
+          - Calories.bmrKcalPerHour(profile: maleProfile) * 1.10) < 1e-9, "basal/hour varies with measured RHR")
 let hrStart = Date(timeIntervalSince1970: 0)
 let calorieSamples = (0..<600).map { offset in
     HRSample(

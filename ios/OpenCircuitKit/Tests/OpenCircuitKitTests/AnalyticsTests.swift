@@ -88,6 +88,54 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(Calories.bmrKcalPerDay(profile: profile), 1320.25, accuracy: 0.001)
     }
 
+    // MARK: Resting-HR–adjusted basal energy (#dynamic-resting-calories)
+
+    private static let male30 = UserProfile(age: 30, weightKg: 80, heightCm: 180, sex: .male)
+
+    func testRestingBaselineNilBelowMinDays() throws {
+        // Two prior days is below the 3-day minimum → no trusted baseline.
+        XCTAssertNil(Calories.restingBaselineBpm(prior: [60, 62]))
+        // Three days → mean.
+        XCTAssertEqual(try XCTUnwrap(Calories.restingBaselineBpm(prior: [58, 60, 62])), 60, accuracy: 1e-9)
+    }
+
+    func testRestingScaleNoChangeWithoutInputs() {
+        // Missing RHR or baseline ⇒ neutral 1.0 (caller degrades to static BMR).
+        XCTAssertEqual(Calories.restingEnergyScale(restingHR: nil, baselineRestingHR: 60), 1.0)
+        XCTAssertEqual(Calories.restingEnergyScale(restingHR: 70, baselineRestingHR: nil), 1.0)
+        XCTAssertEqual(Calories.restingEnergyScale(restingHR: 70, baselineRestingHR: 0), 1.0)
+        // On-baseline RHR ⇒ no change.
+        XCTAssertEqual(Calories.restingEnergyScale(restingHR: 60, baselineRestingHR: 60), 1.0, accuracy: 1e-9)
+    }
+
+    func testRestingScaleMovesWithDeviation() {
+        // +8 bpm over baseline ⇒ +8% at 1%/bpm; −5 ⇒ −5%.
+        XCTAssertEqual(Calories.restingEnergyScale(restingHR: 68, baselineRestingHR: 60), 1.08, accuracy: 1e-9)
+        XCTAssertEqual(Calories.restingEnergyScale(restingHR: 55, baselineRestingHR: 60), 0.95, accuracy: 1e-9)
+    }
+
+    func testRestingScaleClampedBothWays() {
+        // A garbage/extreme RHR can't push basal energy past ±20%.
+        XCTAssertEqual(Calories.restingEnergyScale(restingHR: 200, baselineRestingHR: 60), 1.20, accuracy: 1e-9)
+        XCTAssertEqual(Calories.restingEnergyScale(restingHR: 10, baselineRestingHR: 60), 0.80, accuracy: 1e-9)
+    }
+
+    func testBasalKcalPerHourFallsBackToStatic() {
+        // No RHR/baseline ⇒ exactly the static per-hour BMR (no regression, never zero).
+        XCTAssertEqual(Calories.basalKcalPerHour(profile: Self.male30),
+                       Calories.bmrKcalPerHour(profile: Self.male30), accuracy: 1e-9)
+    }
+
+    func testBasalKcalPerHourVariesWithMeasuredRHR() {
+        let base = Calories.bmrKcalPerHour(profile: Self.male30)   // 74.1666…
+        let elevated = Calories.basalKcalPerHour(profile: Self.male30, restingHR: 70, baselineRestingHR: 60)
+        let lowered = Calories.basalKcalPerHour(profile: Self.male30, restingHR: 55, baselineRestingHR: 60)
+        XCTAssertEqual(elevated, base * 1.10, accuracy: 1e-9)   // +10 bpm ⇒ +10%
+        XCTAssertEqual(lowered, base * 0.95, accuracy: 1e-9)    // −5 bpm ⇒ −5%
+        XCTAssertGreaterThan(elevated, base)
+        XCTAssertLessThan(lowered, base)
+    }
+
     func testActiveCaloriesFromEdwardsTRIMP() {
         let start = Date(timeIntervalSince1970: 0)
         let samples = (0..<600).map { offset in

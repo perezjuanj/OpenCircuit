@@ -389,7 +389,8 @@ final class HealthKitWriter {
 
         // Energy: passive (hourly BMR) + active (HR-derived or steps-derived estimate).
         // Watermark-gated (#37) and labeled as derived estimates in HealthKit metadata.
-        result.passiveHours = await flushPassiveCalories(profile: profile)
+        result.passiveHours = await flushPassiveCalories(profile: profile, local: store,
+                                                         sleepSegments: sleepSegments)
         result.activeKcal = await flushActiveCalories(local: store, profile: profile)
         if result.activeKcal > 0 { writtenKinds.insert(.activeEnergy) }
 
@@ -593,18 +594,33 @@ final class HealthKitWriter {
     /// prorated per hour, NOT a value the ring measured — so Health readers can label or filter it.
     static let basalEnergyEstimateMetadataKey = "OpenCircuitBasalEnergyEstimated"
 
-    func writePassiveCalories(profile: UserProfile, date: Date) async throws {
+    /// Metadata flag on a basal-energy sample recording whether the day's MEASURED resting HR
+    /// actually modulated the formula BMR this hour (true), or it fell back to the static value
+    /// (false — new user / no baseline yet). Lets Health readers and QA see which path ran.
+    static let basalEnergyRHRAdjustedMetadataKey = "OpenCircuitBasalEnergyRHRAdjusted"
+
+    /// Write one hour of basal (passive) energy. Previously this was a STATIC per-profile constant
+    /// (Mifflin-St Jeor ÷ 24) — identical every hour of every day. It's now nudged by how far the
+    /// day's MEASURED resting HR (`restingHR`) sits from the person's own recent baseline
+    /// (`baselineRestingHR`); pass either as nil to fall back to the static BMR (never zero). Still
+    /// an ESTIMATE, labeled as such in metadata.
+    func writePassiveCalories(profile: UserProfile, date: Date,
+                              restingHR: Double? = nil, baselineRestingHR: Double? = nil) async throws {
         let type = HKQuantityType(.basalEnergyBurned)
         let quantity = HKQuantity(
             unit: .kilocalorie(),
-            doubleValue: Calories.bmrKcalPerHour(profile: profile)
+            doubleValue: Calories.basalKcalPerHour(profile: profile,
+                                                   restingHR: restingHR,
+                                                   baselineRestingHR: baselineRestingHR)
         )
+        let adjusted = restingHR != nil && baselineRestingHR != nil
         let sample = HKQuantitySample(
             type: type,
             quantity: quantity,
             start: date,
             end: date.addingTimeInterval(3600),
             metadata: [Self.basalEnergyEstimateMetadataKey: true,
+                       Self.basalEnergyRHRAdjustedMetadataKey: adjusted,
                        HKMetadataKeyWasUserEntered: false]
         )
         try await store.save(sample)
@@ -793,10 +809,23 @@ final class HealthKitWriter {
         return written
     }
 
+    /// How far back the basal-energy path reads daily resting HR: enough to hold the personal
+    /// baseline window plus the couple of days an hourly backfill can touch. Bounds the query.
+    private static let basalRHRLookbackDays = 32
+
     /// Write basal (passive) energy for each completed hour since the watermark, returning the
     /// count. First run starts the meter at the current hour (no historical flood); a long gap
     /// is clamped to the last ~24 hours.
-    private func flushPassiveCalories(profile: UserProfile) async -> Int {
+    ///
+    /// Basal energy is no longer a static per-profile constant: each hour is nudged by the MEASURED
+    /// resting HR for the calendar day it belongs to, judged against the person's own prior-day
+    /// baseline. RHR is read from the SAME LocalStore source the daily resting-HR sample uses — so
+    /// energy responds the SAME day, without waiting for the (12h-delayed) finalized RHR sample.
+    /// Days with no RHR or too little baseline history fall back to the static per-hour BMR.
+    private func flushPassiveCalories(profile: UserProfile,
+                                      local: LocalStore,
+                                      sleepSegments: [SleepSegment]) async -> Int {
+        let cal = Calendar.current
         let defaults = UserDefaults.standard
         let now = Date()
         let currentHour = Self.startOfHour(now)
@@ -804,10 +833,18 @@ final class HealthKitWriter {
         var hour = stored == 0 ? currentHour : Date(timeIntervalSince1970: stored)
         hour = max(hour, currentHour.addingTimeInterval(-24 * 3600))  // clamp a long gap
 
+        // Per-calendar-day resting HR over the baseline window (empty on missing/thin data → the
+        // loop below simply degrades to static BMR for those hours).
+        let dailyRHR = Self.dailyRestingHR(local: local, sleepSegments: sleepSegments,
+                                           now: now, calendar: cal)
+
         var written = 0
         while hour < currentHour {
+            let (rhr, baseline) = Self.restingEnergyInputs(forDay: cal.startOfDay(for: hour),
+                                                           from: dailyRHR)
             do {
-                try await writePassiveCalories(profile: profile, date: hour)
+                try await writePassiveCalories(profile: profile, date: hour,
+                                               restingHR: rhr, baselineRestingHR: baseline)
                 written += 1
                 hour = hour.addingTimeInterval(3600)
             } catch { break }  // leave the watermark at the failed hour; retry next flush
@@ -817,6 +854,30 @@ final class HealthKitWriter {
             defaults.set(hour.timeIntervalSince1970, forKey: Self.basalWatermarkKey)
         }
         return written
+    }
+
+    /// Per-calendar-day resting HR (bpm), oldest day first — the same derivation the daily
+    /// resting-HR sample uses (`RestingHR.dailyValues`), read straight from the store so basal
+    /// energy can respond the same day. Bounded lookback keeps the query cheap.
+    private static func dailyRestingHR(local: LocalStore, sleepSegments: [SleepSegment],
+                                       now: Date, calendar cal: Calendar) -> [RestingHR.DailyValue] {
+        let from = cal.date(byAdding: .day, value: -basalRHRLookbackDays, to: cal.startOfDay(for: now))
+            ?? now.addingTimeInterval(-Double(basalRHRLookbackDays) * 86_400)
+        guard let stored = try? local.samples(kind: .heartRate, from: from, to: now),
+              !stored.isEmpty else { return [] }
+        let hr = stored.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+        return RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal)
+    }
+
+    /// Resolve `(day's measured RHR, personal baseline)` for one calendar `day` from ascending
+    /// daily values. RHR is that day's value (nil when the day has none); baseline is the mean of
+    /// PRIOR days' values, or nil below the trusted minimum. Either nil ⇒ caller uses static BMR.
+    private static func restingEnergyInputs(forDay day: Date,
+                                            from daily: [RestingHR.DailyValue])
+        -> (restingHR: Double?, baseline: Double?) {
+        guard let today = daily.first(where: { $0.day == day })?.bpm else { return (nil, nil) }
+        let prior = daily.filter { $0.day < day }.map(\.bpm)
+        return (today, Calories.restingBaselineBpm(prior: prior))
     }
 
     /// Write today's active-energy DELTA (today's HR-derived TRIMP kcal minus what's already
