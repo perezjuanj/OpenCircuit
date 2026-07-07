@@ -172,7 +172,7 @@ final class AnalyticsTests: XCTestCase {
 
     // MARK: Trimmed-mean baseline robustness (#172 review, fix #4)
 
-    func testRestingBaselineTrimmedMeanResistsOutlier() {
+    func testRestingBaselineTrimmedMeanResistsOutlier() throws {
         // 10 days at ~60 bpm with one outlier at 100. Plain mean would be ~64; trimmed mean
         // drops the outlier and the lowest, yielding ~60.
         let prior: [Double] = [59, 60, 60, 61, 60, 59, 61, 60, 60, 100]
@@ -181,7 +181,7 @@ final class AnalyticsTests: XCTestCase {
                        "trimmed mean resists a single outlier day")
     }
 
-    func testRestingBaselineTrimmedMeanSmallWindow() {
+    func testRestingBaselineTrimmedMeanSmallWindow() throws {
         // At exactly minRestingBaselineDays (3), no trimming is possible — all values kept.
         let prior: [Double] = [58, 60, 62]
         XCTAssertEqual(try XCTUnwrap(Calories.restingBaselineBpm(prior: prior)), 60, accuracy: 1e-9)
