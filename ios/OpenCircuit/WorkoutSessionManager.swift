@@ -379,7 +379,10 @@ final class WorkoutSessionManager: NSObject {
     /// interpolated. The displayed `currentHR` is kept (UI marks it stale via `currentHRIsStale`)
     /// so it doesn't flicker; what we never do is COUNT or PERSIST a held value as a new reading.
     private func collectHRSnapshot() {
-        guard let session, session.sportSessionActive else { return }
+        // `workoutHRActive` (not `sportSessionActive`): the workout records HR from EITHER the native
+        // `0x4e` sport stream OR the live-HR-poll fallback RingSession switches to when the ring never
+        // streams `0x4e`. Gating on `sportSessionActive` would drop every reading after that fallback.
+        guard let session, session.workoutHRActive else { return }
         guard WorkoutHRGate.shouldRecord(liveHRAt: session.liveHRAt,
                                          sessionStart: sessionStart,
                                          lastRecordedAt: lastRecordedHRAt,

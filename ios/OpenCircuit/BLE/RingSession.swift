@@ -1495,74 +1495,170 @@ final class RingSession: NSObject {
     private(set) var sportSessionActive = false
     /// Ring-counted steps during the current/last native workout (Σ of `0x4e` byte[6], #90).
     private(set) var sportSteps = 0
+    /// True for the WHOLE workout (`beginSportSession`..`endSportSession`), whether HR is coming from
+    /// the native `0x4e` sport stream OR the `0x15` live-poll fallback below. `collectHRSnapshot`
+    /// gates on THIS (not `sportSessionActive`) so the workout keeps recording HR after a fallback.
+    private(set) var workoutHRActive = false
     /// Set true once the ring streams its FIRST `0x4e` frame this session — stops the SportStart
     /// retry watchdog. Cleared at each `beginSportSession`.
     private var sportGotFirstFrame = false
-    /// The SportStart-with-retry watchdog task (re-sends SportStart until the ring starts streaming).
+    /// True once the ring proved it won't stream `0x4e` and we switched the workout to the `0x95`
+    /// live-HR poll. `endSportSession` tears that poll down.
+    private var sportUsingLivePollFallback = false
+    /// Timestamp of the most recent `0x4e` sport frame (any frame, even a warm-up one). The
+    /// whole-session watchdog falls back to the live-HR poll if the stream STALLS after starting —
+    /// the ring streaming one frame then going silent must not leave the workout HR-less (#90).
+    private var lastSportFrameAt: Date?
+    /// Set by the `0x86` handler when the ring REJECTS a `0x06`-family command (`86 <err> …`, err≠0).
+    /// The enter loop resets it before each SportStart and bails to the fallback the instant a `86 fd`
+    /// comes back — on-device the ring rejects SportStart outright (86 fd 7b, even 13 s after `06 00`),
+    /// so waiting the full retry budget just delays real HR. `86 00 86` (accept) leaves it false.
+    private var sportStartRejected = false
+    /// The SportStart-with-retry watchdog task (re-sends SportStart until the ring starts streaming,
+    /// then falls back to the live-HR poll if it never does).
     private var sportStartTask: Task<Void, Never>?
 
     /// Enter the ring's native workout mode for `typeByte` (`WorkoutSportType.firmwareByte`). The
     /// ring then STREAMS `0x4e` HR+steps frames unsolicited — the `0x4e` handler acks each, routes
     /// HR into `liveHR`/`liveHRAt` (so the workout's existing HR pipeline + live UI pick it up), and
-    /// sums steps into `sportSteps`. Independent of the `0x95` live-HR poll (none is sent here).
+    /// sums steps into `sportSteps`. If the ring never streams `0x4e` (or the stream stalls), the
+    /// watchdog falls back to the `0x95` live-HR poll (`fallBackToLivePoll`) so the workout still
+    /// records HR; `workoutHRActive` (not `sportSessionActive`) is what keeps `collectHRSnapshot`
+    /// recording across that switch.
     func beginSportSession(typeByte: UInt8) {
         sportSessionActive = true
+        workoutHRActive = true   // records HR for the whole workout (0x4e stream OR live-poll fallback)
         // Take the shared "a workout owns the ring" hold so the SAME contention gates that already
         // honor a live-HR-poll workout (`beginWorkoutHR`) also defer during a NATIVE sport session.
         // Regression fix (#90): the sport-mode path set only `sportSessionActive`, which no gate
         // checked, so a mid-workout auto-measure / device-status refresh / periodic-or-foreground
         // history drain would open the busy ring's history channel → "no frames received" AND could
         // knock the ring's `0x4e` sport stream off, starving the workout's HR. Unlike `beginWorkoutHR`
-        // this must NOT start a `0x95` live poll (the ring streams `0x4e` here), so we set the hold
-        // directly rather than calling `beginWorkoutHR`.
+        // this must NOT start a `0x95` live poll up front (the ring streams `0x4e` here); we set the
+        // hold directly and only start the poll if the fallback below fires.
         workoutHolding = true
         sportSteps = 0
         liveHR = nil
         liveHRAt = nil
         sportGotFirstFrame = false
+        sportUsingLivePollFallback = false
+        lastSportFrameAt = nil
+        sportStartRejected = false
         monitoringStartedAt = Date()   // gate: only in-session locks seed the workout (WorkoutHRGate)
-        // ROOT CAUSE of workout-HR failure (2026-07-07, live trace): the ring is SINGLE-MODE — `06 01`
-        // (live-HR), `06 02` (SpO2) and `06 03` (sport) are mutually-exclusive modes of the same family,
-        // and the ring will NOT switch DIRECTLY from live-HR mode into sport mode. Our dashboard live-HR
-        // poll leaves the ring in `06 01`, so SportStart (`06 03`) got NO `86 00 86` ACK and NO `0x4e` —
-        // 4 retries all ignored — while `06 00` (stop) WAS acked. The official app never uses live-HR
-        // mode, so it enters sport mode from idle. FIX: stop the poll loop, then EXIT the current mode
-        // with `06 00` (acked), settle, THEN SportStart (re-sent until the first `0x4e`, ~7-10 s later).
+        // Enter sport mode the way the official app does (ground truth: snoop_types_1736, all 7 workout
+        // types). The app is NEVER in live-HR mode, so it enters sport from IDLE: `10 xx 02/03` (idle) →
+        // `06 03 <type> 04 00` → `86 00 86` ACK → `10 xx 06` (sport active) → the first `0x4e` ~6-10 s
+        // later, then one every ~10 s (each acked `ce 00 00`). 7/7 SportStarts were ACKed and streamed;
+        // it never re-sends `06 00` between attempts, and it leaves NOTHING but idle waits between a stop
+        // and the next start. OUR only difference: the dashboard leaves the ring in live-HR mode, which
+        // `stopLiveMonitoring` does NOT command the ring out of — so we send ONE `06 00` to reach idle.
+        //
+        // GUARANTEE (the real fix for "no workout HR"): #90 switched the workout OFF the `0x95` live poll
+        // onto `0x4e` only; when the ring doesn't stream `0x4e` (proven on iOS), HR went to ZERO instead
+        // of the poll's inconsistent-but-nonzero readings. So if no `0x4e` arrives after the attempts,
+        // fall back to the live-HR poll — `workoutHRActive` stays true so recording continues.
         if monitoring { stopLiveMonitoring(scheduleStatusRefresh: false) }
         sportStartTask?.cancel()
         sportStartTask = Task { [weak self] in
             guard let self else { return }
-            for attempt in 1...4 {
+            // Reach idle ONCE, then settle. `06 00` exits live-HR/any 0x06-family mode; the ring rejects
+            // a SportStart sent too soon after it (86 fd 7b), so give it a beat before starting. We send
+            // `06 00` only ONCE — re-sending it per retry (the earlier fix's mistake) resets that settle
+            // and kills a stream that's about to start. The two attempts are spaced so the retry lands on
+            // a LONGER post-`06 00` settle (the one regime the earlier on-device probes hadn't reached).
+            self.write(Command.sportStop)          // 06 00 00 — exit live-HR mode → idle
+            try? await Task.sleep(for: .milliseconds(1500))
+            guard self.sportSessionActive else { return }
+            self.write(Command.fetch)              // 07 00 00 — the app's pre-start "prepare" fetch
+            try? await Task.sleep(for: .milliseconds(500))
+            guard self.sportSessionActive else { return }
+            // Discard any `0x4e` seen DURING the exit/settle above — on a stop→restart within ~10 s those
+            // are STALE frames from the just-ended session (the ring streams one more before it honors our
+            // `06 00`), not OUR stream. Without this reset a stale frame would set `sportGotFirstFrame` and
+            // the attempt loop's guard would `return` before ever sending SportStart → zero HR, no recovery.
+            self.sportGotFirstFrame = false
+            self.lastSportFrameAt = nil
+            // Enter attempts: an ACCEPTED SportStart streams its first `0x4e` within ~6-10 s (snoop:
+            // 6,7,7,9,9,10,6 s across all 7 types), so an ~11 s watch per attempt detects success without
+            // over-waiting. Bail to the fallback fast (~24 s worst case, not 42) so the workout isn't
+            // HR-less for long if the ring refuses sport mode on this link.
+            var streaming = false
+            var rejected = false
+            for attempt in 1...2 {
                 guard self.sportSessionActive, !self.sportGotFirstFrame else { return }
                 if attempt > 1 {
-                    ringLog.notice("sport: SportStart retry #\(attempt) — ring rejected/ignored the prior try")
+                    ringLog.notice("sport: SportStart retry #\(attempt) — ring hadn't streamed 0x4e yet")
                 }
-                // Mirror the official app's stop→SETTLE→prepare→start pace. The ring is single-mode and
-                // REJECTS a SportStart that arrives too soon after a stop (86 fd 7b = err 0xfd, seen 500 ms
-                // after 06 00) — it must settle in idle first (the app left 10-60 s + `07` fetches between a
-                // stop and the next start). So per attempt: exit mode → settle → `07` prepare → settle → start.
-                self.write(Command.sportStop)   // 06 00 00 — exit live-HR / any mode → idle
-                try? await Task.sleep(for: .seconds(3))
-                guard self.sportSessionActive else { return }
-                self.write(Command.fetch)        // 07 00 00 — wake/prepare (the app sends this before SportStart)
-                try? await Task.sleep(for: .seconds(3))
-                guard self.sportSessionActive else { return }
+                self.sportStartRejected = false               // arm rejection detection for THIS SportStart
                 self.write(Command.sportStart(typeByte))   // 06 03 <type> 04 00
                 self.write(Command.statusQuery)            // d0 00 00 — the app's enter sequence
-                try? await Task.sleep(for: .seconds(12))   // wait for the ring to lock + stream the first 0x4e
+                // Watch in 0.5 s ticks; exit the instant a `0x4e` arrives (~11 s cap) OR the ring
+                // explicitly rejects the SportStart (`86 fd`) — no point waiting out the cap for a reject.
+                for _ in 0..<22 {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    guard self.sportSessionActive else { return }   // ended/cancelled
+                    if self.sportGotFirstFrame { streaming = true; break }
+                    if self.sportStartRejected { rejected = true; break }
+                }
+                if streaming { break }
+                if rejected {
+                    // Active refusal (86 fd), not silence — on-device this repeats at 2 s AND 13 s after
+                    // `06 00`, so a second attempt won't help. Go straight to the guaranteed live-HR poll.
+                    ringLog.notice("sport: SportStart rejected (86 fd) — falling back to live-HR poll now")
+                    break
+                }
             }
-            if self.sportSessionActive, !self.sportGotFirstFrame {
-                ringLog.notice("sport: ring never streamed 0x4e after 4 SportStart attempts — workout HR unavailable")
+            guard self.sportSessionActive else { return }
+            if !streaming {
+                // The ring won't stream sport HR on this link (proven iOS behavior — either a `86 fd`
+                // reject, already logged above, or silent). Fall back to the `0x95` live-HR poll so the
+                // workout still records best-effort HR (#45) instead of nothing.
+                if !rejected { ringLog.notice("sport: ring never streamed 0x4e — falling back to live-HR poll") }
+                await self.fallBackToLivePoll()
+                return
+            }
+            // Streaming. Guard against an INTERMITTENT stream (one frame then silence — a documented iOS
+            // failure mode): if `0x4e` stalls for well past its ~10 s cadence, switch to the live poll so
+            // the rest of the workout still records. Re-entry is one-way (the poll then owns the link).
+            while self.sportSessionActive {
+                try? await Task.sleep(for: .seconds(5))
+                guard self.sportSessionActive else { return }
+                if let last = self.lastSportFrameAt, Date().timeIntervalSince(last) > 35 {
+                    ringLog.notice("sport: 0x4e stalled >35 s → falling back to live-HR poll")
+                    await self.fallBackToLivePoll()
+                    return
+                }
             }
         }
+    }
+
+    /// Give up on the native `0x4e` sport stream and drive the workout's HR from the `0x95` live poll
+    /// instead — the pre-#90 source (inconsistent under motion, but non-zero beats zero). `workoutHRActive`
+    /// stays true so `collectHRSnapshot` keeps recording across the switch. Single-mode ring: we must
+    /// return to IDLE with `06 00` before the poll's `06 01` — the ring rejects a direct `06 03`→`06 01`
+    /// switch (the same reason the enter path leaves live-HR via `06 00` first). Idempotent + end-safe.
+    private func fallBackToLivePoll() async {
+        guard workoutHRActive, !sportUsingLivePollFallback else { return }   // ended, or already fell back
+        sportSessionActive = false        // stop arming the 0x4e path
+        sportUsingLivePollFallback = true
+        autoMeasuring = false             // don't let a concurrent auto-measure tear the cycle down
+        write(Command.sportStop)          // 06 00 00 — sport → IDLE before the live-HR mode switch
+        try? await Task.sleep(for: .seconds(1))   // settle in idle so `06 01` is accepted
+        guard workoutHRActive, sportUsingLivePollFallback else { return }   // workout ended during the settle
+        startMonitoring(mode: .hr, userInitiated: false, quickLiveRead: true)
     }
 
     /// End the native workout mode; returns the ring-counted step total. Sends `SportStop` (`06 00 00`).
     @discardableResult
     func endSportSession() -> Int {
-        sportStartTask?.cancel(); sportStartTask = nil   // stop the retry watchdog
+        sportStartTask?.cancel(); sportStartTask = nil   // stop the retry/fallback watchdog
         sportSessionActive = false
+        workoutHRActive = false
         workoutHolding = false   // release the contention hold taken in beginSportSession
+        if sportUsingLivePollFallback {
+            sportUsingLivePollFallback = false
+            if monitoring { stopLiveMonitoring(scheduleStatusRefresh: false) }   // stop the fallback poll
+        }
         write(Command.sportStop)
         return sportSteps
     }
@@ -2752,6 +2848,7 @@ extension RingSession: CBPeripheralDelegate {
                 // up, and sum steps into `sportSteps`. Ignored unless a native sport session is active.
                 if self.sportSessionActive {
                     self.sportGotFirstFrame = true   // stream is live → stop the SportStart retry watchdog
+                    self.lastSportFrameAt = Date()   // stream-health heartbeat (drives the stall watchdog)
                     if let sample = SportFrame.decode(bytes) {
                         self.write(Command.sportStreamAck)
                         self.sportSteps += sample.steps
@@ -2777,9 +2874,10 @@ extension RingSession: CBPeripheralDelegate {
                 }
                 return
             case 0x86:
-                // Response to a `0x06` sport-mode command (SportStart `06 03 …` / SportStop `06 00 …`).
-                // Logging it makes visible whether the ring ACCEPTED our SportStart — its ABSENCE is
-                // the workout-HR-failure signature (2026-07-07: the ring silently ignored SportStart).
+                // Response to a `0x06`-family command (SportStart `06 03 …` / SportStop `06 00 …` /
+                // live-HR `06 01 …`). `86 00 86` = accepted; `86 <err> …` (err≠0, e.g. `86 fd 7b`) =
+                // REJECTED. The enter loop watches `sportStartRejected` to bail to the fallback fast.
+                self.sportStartRejected = bytes.count >= 2 && bytes[1] != 0x00
                 ringLog.notice("← 0x86 sport-cmd resp: \(self.lastFrame ?? "", privacy: .public)")
                 return
             default: break
