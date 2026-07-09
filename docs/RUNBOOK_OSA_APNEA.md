@@ -48,7 +48,37 @@ Raw capture (gitignored — real health data, never commit):
 - `desktop/captures/osa2_extract/FS/data/log/bt/btsnoop_hci.log`
 - `desktop/captures/osa2_decoded.txt` (decoded via `opencircuit decode-log`)
 
-## `0x48` frame envelope (decoded) — sample encoding still UNKNOWN
+## APK findings (2026-07-09) — `0x48` is COMPRESSED PPG; AHI is cloud-side
+
+Dug into `libapp.so` (`/private/tmp/ringconn_apk/lib/arm64-v8a/libapp.so`; the raw APK is
+also at `/private/tmp/ringconn_apk/`, and the app is installed on-device to re-pull). This
+reshapes the difficulty:
+
+- **`0x48` = "offline OSA data" and it is COMPRESSED PPG.** The BLE handler mixins spell it
+  out: `BleGetOfflineOsaRspMixin`, `BleOfflineOsaDataRspMixin`, `BleOnlineOsaDataRspMixin`,
+  `BleAutoOsaDataRspMixin`, `BleOsaCompatibleModeMixin`, and — decisively —
+  **`BleCompressPpgRspMixin` / `BleCompressPpgProgressMixin`** (+ `saveMemoryPPGData`,
+  `ppgDataIncomplete`). This is why blind 3-byte extraction produced high-entropy noise: the
+  payload is compressed, not raw samples. (The stride-3 signal is a weak residual, not the
+  real layout.) **Step 1 is therefore DECOMPRESSION, not byte-layout guessing.**
+- **AHI is computed in the CLOUD.** `osaRecordUrl` / `todayOsaData` — the app uploads the
+  OSA record to a server URL; the 32-events/AHI-4.3 number comes back from there, it is not
+  computed on the ring or locally in the app. So a fully-local AHI means re-implementing an
+  algorithm we can't see.
+- **SpO₂ derivation (field names confirmed).** `HistorySpo2BaseInfo(acIr, piIr, acRl, piRl,
+  spo2, ...)` — SpO₂ is computed from AC + perfusion-index of the **IR** and **Red** channels
+  (standard ratio-of-ratios). `HistoryHrSyncInfo(pr, hrv, mov, resprate, actiCount, ...)` and
+  `SleepSyncModel(sleepPhases, ...)` give the rest of the on-device schema. There is a
+  `PpgSample` table (`INSERT INTO PpgSample (...)`) — its columns are the decompressed-PPG
+  schema worth extracting next.
+
+**Revised difficulty:** local AHI now requires (a) reverse the PPG **compression codec**
+(from Dart AOT — hard without blutter symbol reconstruction), then (b) SpO₂ via
+acIr/piIr/acRl/piRl, then (c) an apnea/desaturation scorer to approximate the **cloud**
+algorithm. This is a large project; the realistic near-term win is decompression + SpO₂
+(local overnight SpO₂/ODI), not a validated AHI.
+
+## `0x48` frame envelope (decoded) — payload is COMPRESSED (see APK findings above)
 
 Each frame is **196 bytes**, one session (cursor `0x0c425adc`):
 
@@ -72,15 +102,17 @@ decoding sample timestamps/rate once the layout is known.
 
 ## Directions forward (the actual work)
 
-**Step 1 — crack the 182-byte sample encoding (APK-assisted; the long pole).**
-Pure guessing is unlikely to be efficient. Use the decompiled app:
-- Decompiled APK / blutter output: `/private/tmp/ringconn_apk/old321_out`;
-  `pp.txt` has the app's `CREATE TABLE` schemas = semantic field names
-  (memory `apk-decompile-sqlite-schemas`).
-- `strings libapp.so | grep -iE "osa|apnea|ahi|odi|spo2|desat|0x48|keyOSA"` — find the
-  OSA model + the PPG/`0x48` parser and its field widths.
-- Cross-check widths on the real bytes: try 7/13/14-byte strides on a mid-stream frame and
-  look for 2–3 slowly-varying channels (PPG DC) with a pulsatile AC component.
+**Step 1 — reverse the PPG COMPRESSION (APK-assisted; the long pole).** The `0x48` payload
+is compressed (see APK findings), so byte-layout guessing won't work — the codec must be
+recovered first.
+- Target the Dart classes named in the mixins: **`BleCompressPpgRspMixin`**,
+  `BleOfflineOsaDataRspMixin`, `BleGetOfflineOsaRspMixin`. Re-run **blutter** on
+  `/private/tmp/ringconn_apk` (the old `old321_out` dump is gone) to get readable Dart for
+  the decompressor; without blutter, the raw ARM64 in `libapp.so` is very hard.
+- Look for the codec signature: likely a delta + entropy scheme (the frame `offset` steps
+  ×4000 = decompressed-chunk size; the `counter` counts down remaining compressed bytes).
+- Validate a candidate decompressor by checking the output forms 2–3 slow-DC PPG channels
+  (Red/IR/Green) with a ~1 Hz pulsatile AC at the true sample rate.
 
 **Step 2 — Red/IR → SpO₂.** Standard pulse-oximetry: per channel split AC/DC, then
 `R = (AC_red/DC_red) / (AC_ir/DC_ir)`, `SpO₂ ≈ a − b·R`. Calibrate `a,b` against the ring's
