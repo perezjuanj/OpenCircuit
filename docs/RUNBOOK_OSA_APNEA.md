@@ -36,6 +36,26 @@ _Historical calibration note: the very first pass (time-domain peak-to-peak AC, 
 read 93 % vs 95 % — that error was the large respiratory/baseline wander leaking into peak-to-peak
 AC. The frequency-domain AC (magnitude at the locked cardiac bin) is what fixed it._
 
+### Two complementary SpO₂ sources (both in every capture — no new capture needed)
+There are **two** SpO₂ streams in the OSA captures; use both:
+
+| Source | Rate | Coverage | SpO₂ | Needs | Best for |
+|---|---|---|---|---|---|
+| **`0x4c` BulkSleep** | 2.5-min epoch | full night, store-and-forward | **ring's OWN per-epoch value** (`byte[8]`) | no DSP, no calibration | shippable full-night avg/baseline |
+| **`0x48` dense PPG** | ~4.15 Hz | full night, store-and-forward | derived (FD ratio-of-ratios + calib) | DSP + artifact rejection | brief event nadirs / ODI |
+
+`0x4c` (`osa_4c.py`) pulls the ring's own per-epoch SpO₂/HR straight off the wire — **avg 95.6
+(osa2) / 95.4 (osa4) vs report 96 / 95, ±1 %, with zero DSP.** It independently corroborates the
+`0x48` pipeline's average. **⚠️ Classify sleep-vitals epochs STRUCTURALLY (not idle AND
+`byte[8]`∉{0x12,0x13}), NOT by the `0x57..0x63` band** — the band gate drops sub-87 % desaturation
+epochs, i.e. exactly the OSA nadirs (PROTOCOL.md §5.3 #39 correction). Caveats: the coarse 2.5-min
+sampling doesn't nail the true nadir (osa2 reads 87 vs the app's 85; osa4 dips to 84 on a motiony
+epoch vs the app's smoothed 87) — the dense `0x48` is still the substrate for real event/ODI work.
+And `0x4c` can rotate out of the snoop buffer (osa3 kept only 2 records) while `0x48` survived — a
+second reason to keep both. **Shipping recommendation: write the `0x4c` per-epoch SpO₂/HR series to
+HealthKit first (ring's own values, matches the app), layer the `0x48`-derived event metrics on
+top once artifact rejection lands.**
+
 ### `0x48` decoded format (🟢 validated)
 Frame after the `0x48` opcode = 196 B:
 - **header 13 B:** `<flag c1> <4B counter, −20/frame> <4B session cursor> <2B> <2B offset ×4000>`
