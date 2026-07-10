@@ -92,6 +92,25 @@ struct DeviceInfoView: View {
                      + "way to turn it back on over Bluetooth).")
             }
 
+            // Sleep-apnea assessment (#91). Arms the ring's dense overnight blood-oxygen recording;
+            // the morning sync drains it and the results land on the Sleep card. Experimental.
+            Section {
+                Toggle(isOn: Binding(
+                    get: { session?.osaAssessmentArmed ?? false },
+                    set: { session?.setOSAAssessment(armed: $0) }
+                )) {
+                    Label("Sleep apnea assessment", systemImage: "lungs.fill")
+                }
+                .disabled(session?.ready != true)
+            } header: {
+                Text("Sleep apnea (experimental)")
+            } footer: {
+                Text("Turn this on before bed and wear the ring overnight — it records a dense "
+                     + "blood-oxygen reading. Open the app in the morning to sync, and the results appear "
+                     + "on the Sleep card. Charge the ring above ~30% first so it lasts the night. This is "
+                     + "an experimental estimate, not a medical diagnosis.")
+            }
+
             // Switching rings is uncommon (most people have one ring), so it lives here rather than
             // on the main screen. Opens a picker that scans for OTHER nearby rings — it keeps the
             // current link until you actually pick another, so cancelling is non-destructive. Data

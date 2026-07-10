@@ -77,6 +77,13 @@ public enum Command {
     /// there is no "off" command). `08 04 00` → resp `88 00 88`.
     public static let airplaneModeOn: [UInt8] = [0x08, 0x04, 0x00]
 
+    /// Arm an overnight OSA (sleep-apnea) assessment (#91, 🟢 captured 2026-07-08). One write; the
+    /// ring then records the dense `0x48` PPG through the night (persistent — survives disconnects)
+    /// and dumps it store-and-forward on the morning sync. Same `05 2x` detection-control family as
+    /// the `05 23` toggles. `05 22 01` = arm, `05 22 02` = stop/disarm.
+    public static let osaAssessmentStart: [UInt8] = [0x05, 0x22, 0x01]
+    public static let osaAssessmentStop: [UInt8]  = [0x05, 0x22, 0x02]
+
     /// Steps to enter live-HR mode, in the order the official app sends them (verified
     /// in the FR02.018 capture: open+drain history, then `d0 00 00` → `06 01 00` → fetch,
     /// then poll `95 00 00` for `15 00 <hr>` frames). The `d0 00 00` is REQUIRED — without

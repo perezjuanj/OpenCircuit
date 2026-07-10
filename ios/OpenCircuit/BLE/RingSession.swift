@@ -325,6 +325,9 @@ final class RingSession: NSObject {
     /// Latest decoded OSA SpO₂ night summary (nil until an assessment burst is drained). `averageSpO2`
     /// is validated (±1 %); `timeBelow90Seconds`/`odi` are ESTIMATES — label EXPERIMENTAL wherever shown.
     private(set) var latestOSASummary: OSASpO2.NightSummary?
+    /// Local hint that we've armed an overnight OSA assessment this session (the ring can't be queried
+    /// for it, so this resets on relaunch/reconnect — it drives the toggle, not ground truth).
+    private(set) var osaAssessmentArmed = false
 
     // MARK: Calibration PPG capture
 
@@ -1938,6 +1941,20 @@ final class RingSession: NSObject {
     /// via the charging case (there is no BLE "off" command). The link will disconnect right after.
     func setAirplaneModeOn() {
         write(Command.airplaneModeOn)
+    }
+
+    /// Arm (or disarm) an overnight OSA sleep-apnea assessment (#91). `05 22 01` tells the ring to
+    /// record the dense `0x48` PPG overnight; it buffers it store-and-forward and our morning sync's
+    /// 0x48 handler drains → OSASpO2 → the Sleep card. Persistent on the ring (survives disconnects),
+    /// so this is a single fire-and-forget write — the user arms it before bed and just wears the ring.
+    /// Returns false (no-op) if the ring isn't ready or a sync is in flight (one-writer).
+    @discardableResult
+    func setOSAAssessment(armed: Bool) -> Bool {
+        guard ready, syncTask == nil else { return false }
+        write(armed ? Command.osaAssessmentStart : Command.osaAssessmentStop)
+        osaAssessmentArmed = armed
+        ringLog.notice("OSA: assessment \(armed ? "ARMED (05 22 01)" : "disarmed (05 22 02)", privacy: .public)")
+        return true
     }
 
     /// Per-mode user-measure budget (seconds): HR needs longer stillness to converge than SpO₂.
