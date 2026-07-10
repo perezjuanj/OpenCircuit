@@ -1,12 +1,40 @@
 # Runbook — OSA sleep-apnea assessment → local AHI/ODI (#91)
 
-**Status: PPG DECODE CRACKED (2026-07-10).** The `0x48` stream is **NOT compressed** (the
-"CompressPpg" naming misled us) — it's lightly-framed **raw 3-channel 18-bit PPG**, now
-decoded and validated (HR 62–69 bpm, perfusion index 1.6–2.5%). A first SpO₂ pass
-(ratio-of-ratios, Red=ch1/IR=ch0) lands the night average at **93%** vs the app's 95% on the
-un-calibrated textbook curve — the remaining gap is calibration. Decoder:
-`desktop/opencircuit/osa_ppg.py`. Remaining: calibrate SpO₂ across the 3 nights → ODI /
-time<90% / min-avg → Swift + HealthKit; AHI (apnea events) stays the stretch (cloud-side).
+**Status: SpO₂ PIPELINE VALIDATED (2026-07-10).** The `0x48` stream is **NOT compressed** (the
+"CompressPpg" naming misled us) — it's lightly-framed **raw 3-channel 18-bit PPG**, decoded and
+validated (HR 62–69 bpm, perfusion index 1.6–2.5%). A full **SpO₂ pipeline** (dedupe →
+frequency-domain ratio-of-ratios → calibrated curve) now reproduces the app's **average SpO₂ to
+±1% across all 3 nights** and the **nadir to within ±3%**. Calibration `SpO₂ = 104.91 − 15.18·R`
+(**IR = ch0, Red = ch1**). Pipeline: `osa_ppg.py` (frame decode) → `osa_spo2.py` (dedupe/channels)
+→ `osa_spo2_fd.py` (FD R-series) → `osa_metrics.py` (metrics). **Remaining tier:** `time<90%`,
+ODI and AHI need the app's proprietary artifact-rejection + event-scoring model (partly cloud-side)
+— locally they come out directionally correct but not yet to-the-second. Next build step: Swift
+port of the pipeline → HealthKit.
+
+### SpO₂ pipeline — validated results (🟢)
+Chain: `0x48` frames → **dedupe by counter** (the morning burst retransmits ~1900 dup frames/night;
+counter steps −20 = 20 samples/ch, ~0 % true loss) → 3 channels → per-128-sample window (~30 s):
+lock the cardiac frequency on the green channel (Goertzel), require a clean pulse in **all three**
+channels (`SNR_IR≥5, SNR_red/green≥4`) and `PI_ir≥0.15 %` (low perfusion ⇒ AC_ir tiny ⇒ R
+unreliable, exactly what clinical oximeters flag) → `R = (AC_red/DC_red)/(AC_ir/DC_ir)` →
+`SpO₂ = 104.91 − 15.18·R`. Sample rate **≈ 4.15 Hz/channel** (pulse-anchored: median cardiac
+f\* ⇒ 47–49 bpm, matches the `0x4c` HR and osa4's 7.05 h = ground-truth duration).
+
+| Night | SpO₂ avg (GT) | SpO₂ min (GT) |
+|---|---|---|
+| osa2 07/08 | 96.0 (96) | 85.6 (85) |
+| osa3 07/09 | 96.5 (96) | 88.4 (87) |
+| osa4 07/10 | 96.7 (95) | 83.7 (87) |
+
+The `A,B` fit is a 3-night least-squares on the (avg, nadir) anchors — a 2-parameter curve, so
+don't over-read the exactness; re-fit when more labeled nights land. **Data-hygiene gotcha:** a
+capture can re-dump the *previous* night's session (osa4 contains osa3's `0x0c43adeb` frames byte
+-for-byte **plus** the new `0x0c44f92a`) — always split `0x48` by the 4-byte session cursor and keep
+only the target night, or you double-count.
+
+_Historical calibration note: the very first pass (time-domain peak-to-peak AC, Red=ch1/IR=ch0)
+read 93 % vs 95 % — that error was the large respiratory/baseline wander leaking into peak-to-peak
+AC. The frequency-domain AC (magnitude at the locked cardiac bin) is what fixed it._
 
 ### `0x48` decoded format (🟢 validated)
 Frame after the `0x48` opcode = 196 B:
@@ -135,31 +163,36 @@ decoding sample timestamps/rate once the layout is known.
 
 ## Directions forward (the actual work)
 
-**Step 1 — reverse the PPG COMPRESSION (APK-assisted; the long pole).** The `0x48` payload
-is compressed (see APK findings), so byte-layout guessing won't work — the codec must be
-recovered first.
-- Target the Dart classes named in the mixins: **`BleCompressPpgRspMixin`**,
-  `BleOfflineOsaDataRspMixin`, `BleGetOfflineOsaRspMixin`. Re-run **blutter** on
-  `/private/tmp/ringconn_apk` (the old `old321_out` dump is gone) to get readable Dart for
-  the decompressor; without blutter, the raw ARM64 in `libapp.so` is very hard.
-- Look for the codec signature: likely a delta + entropy scheme (the frame `offset` steps
-  ×4000 = decompressed-chunk size; the `counter` counts down remaining compressed bytes).
-- Validate a candidate decompressor by checking the output forms 2–3 slow-DC PPG channels
-  (Red/IR/Green) with a ~1 Hz pulsatile AC at the true sample rate.
+**Step 1 — decode the `0x48` PPG. ✅ DONE.** Not compressed; format above; `osa_ppg.py` /
+`osa_spo2.py`. (Superseded the "reverse the compression" plan — blutter is a dead end, and the
+"CompressPpg" Dart naming was a red herring.)
 
-**Step 2 — Red/IR → SpO₂.** Standard pulse-oximetry: per channel split AC/DC, then
-`R = (AC_red/DC_red) / (AC_ir/DC_ir)`, `SpO₂ ≈ a − b·R`. Calibrate `a,b` against the ring's
-own overnight SpO₂ from `0x4c` (already decoded, `BulkSleep`) and the app's reported SpO₂
-nadir.
+**Step 2 — Red/IR → SpO₂. ✅ DONE & VALIDATED.** IR = ch0, Red = ch1; **frequency-domain**
+AC/DC (magnitude at the locked cardiac bin — time-domain peak-to-peak fails on the respiratory
+wander); `R = (AC_red/DC_red)/(AC_ir/DC_ir)`; `SpO₂ = 104.91 − 15.18·R`. Reproduces avg to ±1%,
+nadir to ±3% across 3 nights (`osa_spo2_fd.py`, `osa_metrics.py`). Gating: clean-pulse SNR in all
+3 channels + `PI_ir≥0.15 %`.
 
-**Step 3 — desaturation / apnea → AHI/ODI.** Detect ≥3–4 % SpO₂ desaturations (ODI) and
-apnea events (airflow-cessation proxy from the PPG envelope / HR + SpO₂ pattern). AHI =
-events ÷ sleep-hours. **Validate against 32 events / 7h25m / AHI 4.3.** Expect to need the
-3-night captures for a real fit.
+**Step 3 — desaturation / apnea → ODI / time<90% / AHI. ⚠️ PARTIAL (the hard tier).** The
+SpO₂ *series* is real, but reproducing the app's exact `time<90%` / ODI / AHI needs its
+artifact-rejection + event-scoring model, which is partly cloud-side:
+- Locally, `time<90%` and ODI come out the right order of magnitude but not to-the-second — the
+  knobs (perfusion floor, sustained-min window, ODI %-drop, motion rejection) trade off against
+  each other and over-fitting them to 3 nights is a trap.
+- The gap is dominated by **positional low-perfusion periods** (subject lying on the hand ⇒ IR
+  perfusion collapses ⇒ R inflates ⇒ fake desaturations). Distinguishing those from true desats is
+  the app's decade-tuned secret sauce. Best lead: a smarter positional/motion detector (sustained
+  PI_ir collapse + DC drift) that *excludes* those epochs the way the app's "sleep-only, quality-
+  gated" analysis does.
+- **AHI** additionally needs an airflow/effort model (the app computes it server-side from the PPG
+  envelope + HR pattern). Treat as a research stretch, not a shipping target.
+- Validation targets remain the 3-night table (AHI 4.3/2.2/3.7, ODI 4.2/3.8/4.8).
 
-**Step 4 — ship.** Swift decoder in `OpenCircuitKit` + write to HealthKit. Check the iOS
-breathing-disturbance category types (recent iOS exposes sleep breathing-disturbance
-metrics); otherwise store as a custom metric. Label everything an ESTIMATE (house style).
+**Step 4 — ship. NEXT.** Swift port of the pipeline (`osa_ppg`/`osa_spo2`/`osa_spo2_fd` → an
+`OSASpo2` analyzer in `OpenCircuitKit`) + write the SpO₂ series to HealthKit
+(`HKQuantityType(.oxygenSaturation)`; check the iOS sleep breathing-disturbance category too).
+Ship the **SpO₂ avg/min/series** first (validated); leave ODI/AHI labeled EXPERIMENTAL until the
+positional-artifact model lands. Label everything an ESTIMATE (house style).
 
 ## Reproduce / extend the capture
 
@@ -178,10 +211,14 @@ metrics); otherwise store as a custom metric. Label everything an ESTIMATE (hous
    per-night *result* record (AHI/events) ever appears over BLE after the app computes it
    (a cloud round-trip could write it back — probably not, but confirm).
 
-## Open questions to resolve first
-- Is `0x48` the full night or a windowed/downsampled slice? (Decide before building a
-  scorer — it changes what "events" you can even see.)
-- Does the fuller `0x4d` stream carry per-epoch SpO₂/event flags? If so it may be a far
-  cheaper path than raw-PPG DSP — check in the next capture.
-- Confirm the SpO₂ derivation against the ring's own `0x4c` overnight SpO₂ before trusting
-  any AHI number.
+## Open questions
+- ~~Is `0x48` the full night or a windowed/downsampled slice?~~ **Answered:** full monitoring
+  window at ~4.15 Hz/channel (osa4's 105 400 samples ⇒ 7.05 h = its ground-truth duration).
+  Caveat: osa3 under-captured (~6 h of a 7.7 h night) — its morning dump was short, so a night's
+  `0x48` can be truncated by a late/short reconnect; pull the bugreport promptly.
+- Does the fuller `0x4d` stream carry per-epoch SpO₂/event flags? Still open — only a short
+  start-of-assessment burst was captured. If it holds per-epoch SpO₂/desat flags it could give
+  ODI/AHI far more cheaply than the raw-PPG DSP tier. **Check the `0x4d` payload in the next
+  capture** (this is the most promising lead for the ODI/AHI gap).
+- The positional low-perfusion artifact is the main blocker for `time<90%`/ODI accuracy — see
+  Step 3. A sustained-PI_ir-collapse detector is the next thing to try on the desktop side.
