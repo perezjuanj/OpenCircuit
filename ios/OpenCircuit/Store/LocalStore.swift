@@ -125,6 +125,18 @@ final class StoredSleepSummary {
     /// persist so the movement chart redraws offline.
     var movementLevels: [Int] = []
 
+    // MARK: OSA sleep-apnea SpO₂ (#91) — decoded locally from the dense `0x48` assessment burst.
+    // Every column DEFAULTED for SwiftData lightweight migration (cf. #21). `osaValidWindows == 0`
+    // = no assessment drained that night (the card row stays hidden). `osaAvgSpO2` is validated
+    // (±1 % vs the RingConn app); `osaMinSpO2`/`osaTimeBelow90Sec`/`osaODI` are ESTIMATES — the UI
+    // labels them EXPERIMENTAL. Set post-construction via `LocalStore.applyOSASummary` (the burst
+    // finalizes ~5 s after the sleep drain), so they are NOT init parameters.
+    var osaAvgSpO2: Double = 0
+    var osaMinSpO2: Double = 0
+    var osaTimeBelow90Sec: Double = 0
+    var osaODI: Double = 0
+    var osaValidWindows: Int = 0
+
     init(
         night: Date,
         asleepMin: Int = 0,
@@ -789,6 +801,24 @@ struct LocalStore {
         if let v = extras.hrByStage[.asleepREM] { row.hrRem = v }
         if let v = extras.hrByStage[.awake] { row.hrAwake = v }
         if !extras.movementLevels.isEmpty { row.movementLevels = extras.movementLevels }
+    }
+
+    /// Attach a decoded OSA SpO₂ summary (#91) to the most recent night's stored summary. The
+    /// `0x48` assessment burst finalizes ~5 s AFTER the `0x4c` sleep drain, so the night's row
+    /// already exists — we update it in place rather than routing through `saveSleepSummary`.
+    /// No-op if the summary has no valid windows or there's no stored night yet. Returns whether it
+    /// was applied. `updatedAt` is bumped so the `@Query`-backed card refreshes.
+    @discardableResult
+    func applyOSASummary(_ osa: OSASpO2.NightSummary) -> Bool {
+        guard osa.validWindows > 0, let row = try? latestSleepSummary() else { return false }
+        row.osaAvgSpO2 = osa.averageSpO2
+        row.osaMinSpO2 = osa.minSpO2
+        row.osaTimeBelow90Sec = osa.timeBelow90Seconds
+        row.osaODI = osa.odi
+        row.osaValidWindows = osa.validWindows
+        row.updatedAt = Date()
+        try? context.save()
+        return true
     }
 
     /// Most recent stored sleep summary (latest night), or nil.

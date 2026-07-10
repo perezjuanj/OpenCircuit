@@ -2544,11 +2544,13 @@ final class RingSession: NSObject {
                 self.osaDecoding = false
                 if let summary {
                     self.latestOSASummary = summary
+                    let attached = self.localStore?.applyOSASummary(summary) ?? false
                     ringLog.notice("""
                     OSA: SpO₂ avg=\(String(format: "%.1f", summary.averageSpO2))% \
                     min=\(String(format: "%.1f", summary.minSpO2))% \
                     t<90=\(Int(summary.timeBelow90Seconds))s ODI≈\(String(format: "%.1f", summary.odi)) \
-                    windows=\(summary.validWindows) dur=\(String(format: "%.2f", summary.durationHours))h
+                    windows=\(summary.validWindows) dur=\(String(format: "%.2f", summary.durationHours))h \
+                    persisted=\(attached)
                     """)
                 } else {
                     ringLog.notice("OSA: burst produced no usable SpO₂ series (too few clean windows)")

@@ -343,6 +343,7 @@ struct SleepCardView: View {
         VStack(alignment: .leading, spacing: 8) {
             perStageHR()       // #70 per-stage average HR
             stressRow()        // #71 overnight stress
+            osaRow()           // #91 sleep-apnea SpO₂ (dense 0x48 assessment)
             skinTempSection()  // #69 nightly skin-temp + baseline offset + mini chart
             movementSection()  // #70 2.5-min / 3-level movement chart
             napsRow()          // #76 daytime naps
@@ -405,6 +406,41 @@ struct SleepCardView: View {
                 Text("\(score)").font(.caption.weight(.semibold)).monospacedDigit()
                 Text(band.label).font(.caption2).foregroundStyle(stressColor(band))
                 Text("· est.").font(.caption2).foregroundStyle(.tertiary)
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    // MARK: Sleep-apnea SpO₂ (#91)
+
+    /// Overnight blood-oxygen row from the dense `0x48` sleep-apnea assessment. Hidden unless a
+    /// burst was decoded for this night (`osaValidWindows > 0`). Avg SpO₂ is validated (±1 %); the
+    /// nadir / time-below-90 % / ODI are ESTIMATES, so the whole row is tagged EXPERIMENTAL with a
+    /// not-a-diagnosis caveat (parallels the `· est.` convention on stress/naps).
+    @ViewBuilder
+    private func osaRow() -> some View {
+        if let s = latest, s.osaValidWindows > 0 {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: "lungs.fill").font(.caption2).foregroundStyle(.blue)
+                    Text("Blood oxygen").font(.caption2).foregroundStyle(.secondary)
+                    Text("EXPERIMENTAL")
+                        .font(.system(size: 8).weight(.bold))
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(RoundedRectangle(cornerRadius: 3).fill(Color.orange.opacity(0.18)))
+                        .foregroundStyle(.orange)
+                }
+                HStack(spacing: 16) {
+                    stat("Avg", String(format: "%.0f", s.osaAvgSpO2), "%")
+                    stat("Min", String(format: "%.0f", s.osaMinSpO2), "%")
+                    if s.osaTimeBelow90Sec >= 30 {
+                        stat("<90%", "\(Int((s.osaTimeBelow90Sec / 60).rounded()))", "min")
+                    }
+                    stat("ODI", String(format: "%.1f", s.osaODI), "/h")
+                }
+                Text("Estimate from the ring's overnight PPG — not a medical diagnosis. See a clinician for sleep-apnea evaluation.")
+                    .font(.system(size: 9)).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.top, 2)
         }
