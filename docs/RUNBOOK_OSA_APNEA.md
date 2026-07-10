@@ -40,13 +40,27 @@ single ~3-minute burst on the morning reconnect (08:10:03→08:13:19)**. The rin
 the whole assessment internally and dumps it on reconnect. **We do NOT need to hold a live
 overnight connection — start the assessment, let the ring buffer it, drain in the morning.**
 
-**Ground truth for the captured night** (app-reported): **32 apnea events / 7h25m sleep →
-AHI 4.3, "no abnormalities"** (AHI < 5 = normal; 32 ÷ 7.42 h = 4.3 ✓). This is the number
-a local computation must reproduce.
+**Ground truth — complete 3-night "comprehensive assessment"** (app report, 2026-07-10),
+one matched `0x48` capture per night:
 
-Raw capture (gitignored — real health data, never commit):
-- `desktop/captures/osa2_extract/FS/data/log/bt/btsnoop_hci.log`
-- `desktop/captures/osa2_decoded.txt` (decoded via `opencircuit decode-log`)
+| Night | Capture | 0x48 frames | AHI | ODI | SpO₂ avg | SpO₂ min | time<90% | %<90% |
+|---|---|---|---|---|---|---|---|---|
+| 07/08 | `osa2_*` | 7200  | 4.3 | 4.2 | 96% | 85% | 3m24s | 0.76% |
+| 07/09 | `osa3_*` | 6014  | 2.2 | 3.8 | 96% | 87% | 1m50s | 0.40% |
+| 07/10 | `osa4_*` | 13141 | 3.7 | 4.8 | 95% | 87% | 3m50s | 0.91% |
+
+All internally consistent (AHI = events/hr; %<90% = seconds/duration). These are the numbers a
+local computation must reproduce.
+
+**Value chain the report reveals:** decompress `0x48` → dense **SpO₂ series** → **ODI,
+time<90%, SpO₂ min/avg are then all directly computable locally** (validate against the table).
+Only **AHI** needs an extra apnea-event algorithm on top (cloud-side, unseen). So SpO₂/ODI is the
+achievable tier; AHI is the stretch goal. The brief nadirs (min 85 %, 1–4 min dips) likely require
+the DENSE OSA SpO₂ — coarse normal-sleep sampling would miss them — so this still needs the
+`0x48` decompress, not the existing `0x4c`/Spo2Sync channels.
+
+Raw captures (gitignored — real health data, never commit):
+`desktop/captures/osa{2,3,4}_extract/.../btsnoop_hci.log` + `osa{2,3,4}_decoded.txt`.
 
 ## APK findings (2026-07-09) — `0x48` is COMPRESSED PPG; AHI is cloud-side
 
