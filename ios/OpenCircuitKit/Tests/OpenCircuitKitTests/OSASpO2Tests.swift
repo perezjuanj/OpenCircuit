@@ -57,6 +57,21 @@ final class OSASpO2Tests: XCTestCase {
         XCTAssertEqual(OSAWaveform.sessionCursor(of: hex(frame0)), 0x0c43adeb)
     }
 
+    func testDominantSessionFilterIsolatesOneNight() {
+        // frame0 + frame1 share cursor 0x0c43adeb; forge one frame of a different night.
+        var other = hex(frame0)
+        other[6] = 0x0c; other[7] = 0x44; other[8] = 0xf9; other[9] = 0x2a   // cursor 0x0c44f92a
+        let kept = OSAWaveform.dominantSessionFrames([hex(frame0), hex(frame1), other])
+        XCTAssertEqual(kept.count, 2, "modal cursor 0x0c43adeb wins; the lone other-night frame is dropped")
+        XCTAssertTrue(kept.allSatisfy { OSAWaveform.sessionCursor(of: $0) == 0x0c43adeb })
+    }
+
+    func testSummarizeFramesInsufficientReturnsNil() {
+        XCTAssertNil(OSASpO2.summarize(frames: []))
+        // two frames = 40 samples/ch < one 128-sample window -> no series -> nil
+        XCTAssertNil(OSASpO2.summarize(frames: [hex(frame0), hex(frame1)]))
+    }
+
     // MARK: Goertzel (GOLDEN 2)
 
     func testGoertzelMatchesDesktop() {

@@ -305,6 +305,20 @@ final class RingSession: NSObject {
     private var drainSawPage = false    // a 0x47/0x4c page arrived since last check (live-enter drain)
     private var drainDone = false       // 0x50 end-of-history seen during live-enter drain
 
+    // MARK: OSA dense-PPG burst (#91)
+    /// Raw `0x48` frames collected during the current store-and-forward burst. `0x48` is a
+    /// free-running stream (no per-frame ack) that the ring dumps unprompted during the morning
+    /// sync AFTER the `0x50` end-of-history — so we collect regardless of the `syncing` flag
+    /// (gating on it would drop a burst that lands once the drain loop has exited) and finalize via
+    /// a debounce timer once frames stop arriving. Bounded so a stuck stream can't leak.
+    private var osaFrames: [[UInt8]] = []
+    private var osaDebounceTask: Task<Void, Never>?
+    private static let osaFrameCap = 4000                     // ~2× a full night (~1900 frames)
+    private static let osaBurstQuiet: Duration = .seconds(5)  // finalize this long after the last frame
+    /// Latest decoded OSA SpO₂ night summary (nil until an assessment burst is drained). `averageSpO2`
+    /// is validated (±1 %); `timeBelow90Seconds`/`odi` are ESTIMATES — label EXPERIMENTAL wherever shown.
+    private(set) var latestOSASummary: OSASpO2.NightSummary?
+
     // MARK: Calibration PPG capture
 
     /// Guided calibration uses a dedicated raw PPG push-stream (`0x13`) rather than the ordinary
@@ -2500,6 +2514,34 @@ final class RingSession: NSObject {
         ringLog.notice("sync: re-staged last night from archive union (\(union.count) epochs)")
     }
 
+    /// Decode a completed OSA `0x48` burst into a SpO₂ night summary (#91). Fired ~5 s after the
+    /// last `0x48` frame (debounce). Issues no BLE writes and is off the sync resume-pointer
+    /// contract, so it can neither stall the ring nor truncate a night. The decode (~1900 frames)
+    /// runs off the main actor; the result is published back on the main actor.
+    private func finalizeOSABurst() {
+        osaDebounceTask = nil
+        guard !osaFrames.isEmpty else { return }
+        let frames = osaFrames
+        osaFrames.removeAll(keepingCapacity: false)
+        ringLog.notice("OSA: finalizing 0x48 burst — \(frames.count) frames")
+        Task.detached(priority: .utility) {
+            let summary = OSASpO2.summarize(frames: frames)
+            await MainActor.run {
+                guard let summary else {
+                    ringLog.notice("OSA: burst produced no usable SpO₂ series (too few clean windows)")
+                    return
+                }
+                self.latestOSASummary = summary
+                ringLog.notice("""
+                OSA: SpO₂ avg=\(String(format: "%.1f", summary.averageSpO2))% \
+                min=\(String(format: "%.1f", summary.minSpO2))% \
+                t<90=\(Int(summary.timeBelow90Seconds))s ODI≈\(String(format: "%.1f", summary.odi)) \
+                windows=\(summary.validWindows) dur=\(String(format: "%.2f", summary.durationHours))h
+                """)
+            }
+        }
+    }
+
     private func finalizeSync() {
         guard syncing else { return }
         if bulkRecords.isEmpty {
@@ -3076,6 +3118,21 @@ extension RingSession: CBPeripheralDelegate {
                 self.sportStartRejected = bytes.count >= 2 && bytes[1] != 0x00
                 self.sportStartAccepted = accepted
                 ringLog.notice("← 0x86 sport-cmd resp: \(self.lastFrame ?? "", privacy: .public)")
+                return
+            case 0x48:
+                // OSA dense-PPG store-and-forward burst (#91). Collect raw frames; decode once the
+                // burst goes quiet (debounce). NO ack — unlike the 0x4e sport stream, the ring floods
+                // these unprompted after the 0x50/d0, so sending an unspecified ack risks stalling it.
+                // NOT gated on `syncing`: the burst arrives AFTER the drain's 0x50 (when `syncing` may
+                // already be false), so gating would drop it. Bounded + debounced against any leak.
+                // Read-only wrt the ring and off the resume-pointer contract → cannot truncate a night.
+                if self.osaFrames.count < Self.osaFrameCap { self.osaFrames.append(bytes) }
+                self.osaDebounceTask?.cancel()
+                self.osaDebounceTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: Self.osaBurstQuiet)
+                    guard !Task.isCancelled else { return }
+                    self?.finalizeOSABurst()
+                }
                 return
             default: break
             }

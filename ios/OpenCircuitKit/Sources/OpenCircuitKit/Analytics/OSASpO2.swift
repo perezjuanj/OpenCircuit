@@ -68,6 +68,17 @@ public enum OSAWaveform {
         guard frame.count >= frameLength, frame[0] == opcode else { return nil }
         return UInt32(frame[6]) << 24 | UInt32(frame[7]) << 16 | UInt32(frame[8]) << 8 | UInt32(frame[9])
     }
+
+    /// Keep only the frames of the MODAL (most frequent) session cursor — this night's burst.
+    /// A morning store-and-forward dump can re-emit a previous night's session verbatim; taking
+    /// the dominant cursor isolates the current night so `channels(from:)` doesn't concatenate two
+    /// nights (which would corrupt the SpO₂ series). Frames without a valid cursor are dropped.
+    public static func dominantSessionFrames(_ frames: [[UInt8]]) -> [[UInt8]] {
+        var counts = [UInt32: Int]()
+        for f in frames { if let c = sessionCursor(of: f) { counts[c, default: 0] += 1 } }
+        guard let modal = counts.max(by: { $0.value < $1.value })?.key else { return [] }
+        return frames.filter { sessionCursor(of: $0) == modal }
+    }
 }
 
 public enum OSASpO2 {
@@ -215,6 +226,16 @@ public enum OSASpO2 {
             }
         }
         return events
+    }
+
+    /// Full night summary directly from a collected `0x48` burst: isolate this night's session,
+    /// decode channels, summarize. Returns nil if there aren't enough clean windows. This is the
+    /// single entry point the BLE handler calls once a burst completes.
+    public static func summarize(frames: [[UInt8]], hz: Double = sampleRateHz) -> NightSummary? {
+        let night = OSAWaveform.dominantSessionFrames(frames)
+        guard !night.isEmpty else { return nil }
+        let ch = OSAWaveform.channels(from: night)
+        return summarize(ir: ch[0], red: ch[1], green: ch[2], hz: hz)
     }
 
     /// Full night summary from decoded channels. `hz` sets the time axis for the event metrics.

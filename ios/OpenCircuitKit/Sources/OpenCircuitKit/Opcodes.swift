@@ -17,6 +17,12 @@ public enum Opcode {
     public static let syncOpen: UInt8 = 0x02
     public static let liveHRMode: UInt8 = 0x06
     public static let statusQuery: UInt8 = 0xD0
+
+    /// OSA dense-PPG store-and-forward burst (#91, 🟢). The ring dumps the whole sleep-apnea
+    /// assessment's raw PPG as a flood of `0x48` frames during the morning sync (unprompted,
+    /// right after the `0xd0` fetch-ack), with NO per-frame ack. Decoded by `OSAWaveform`
+    /// (mirrors `OSAWaveform.opcode`). Only present if an assessment was armed the night before.
+    public static let osaPPG: UInt8 = 0x48
 }
 
 /// Exact command byte sequences, sent VERBATIM (🟢 verified live, PROTOCOL.md §3).
