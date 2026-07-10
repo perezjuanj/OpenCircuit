@@ -1,10 +1,29 @@
 # Runbook — OSA sleep-apnea assessment → local AHI/ODI (#91)
 
-**Status: PARKED (capture banked, decode not started).** The overnight snoop on
-2026-07-08 captured a full sleep-apnea assessment — the start command and the dense
-PPG stream are in hand. What remains is a genuine signal-processing + RE project
-(decode the PPG → SpO₂ → apnea/desaturation scoring). This doc records exactly what
-we have and the directions to take it forward so anyone can pick it up cold.
+**Status: PPG DECODE CRACKED (2026-07-10).** The `0x48` stream is **NOT compressed** (the
+"CompressPpg" naming misled us) — it's lightly-framed **raw 3-channel 18-bit PPG**, now
+decoded and validated (HR 62–69 bpm, perfusion index 1.6–2.5%). A first SpO₂ pass
+(ratio-of-ratios, Red=ch1/IR=ch0) lands the night average at **93%** vs the app's 95% on the
+un-calibrated textbook curve — the remaining gap is calibration. Decoder:
+`desktop/opencircuit/osa_ppg.py`. Remaining: calibrate SpO₂ across the 3 nights → ODI /
+time<90% / min-avg → Swift + HealthKit; AHI (apnea events) stays the stretch (cloud-side).
+
+### `0x48` decoded format (🟢 validated)
+Frame after the `0x48` opcode = 196 B:
+- **header 13 B:** `<flag c1> <4B counter, −20/frame> <4B session cursor> <2B> <2B offset ×4000>`
+- **payload 182 B = `[1B marker][30 samples]` × 2** (markers at payload byte 0 and 91;
+  1+90+1+90 = 182). *Missing the second marker was the whole reason blind decoding "looked
+  compressed".*
+- **samples: 3-byte BIG-ENDIAN, ~18-bit (full-scale ≈ 0x7FFFE), 3 LED channels interleaved by
+  `idx % 3`, ~10.35 Hz/channel.** ch0/ch1 = the SpO₂ pair (IR/Red), ch2 = Green (HR).
+
+blutter is a **dead end** here: it builds (Dart 3.11.5) but SIGBUS-crashes on this 82 MB
+`libapp.so`. The decode above was recovered empirically — don't burn time re-running blutter.
+
+---
+_Historical note: the sections below were written when we believed the stream was compressed
+(pre-2026-07-10). They're kept for the APK/OSA-command context; the "compressed" framing is
+superseded by the decoded format above._
 
 See also: [`PROTOCOL.md`](PROTOCOL.md) §5, issue #91, and memory `osa-capture-cracked`,
 `snoop-write-opcodes`, `apk-decompile-sqlite-schemas`, `ring-device-access`.
