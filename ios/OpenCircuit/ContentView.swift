@@ -1519,6 +1519,17 @@ struct CaloriesCardView: View {
         _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
     }
 
+    /// Active kcal HELD AS STATE, recomputed off the render path in `.task(id:)` — NOT read in `body`.
+    /// `activeToday` maps + runs `Calories.activeKcal` over the unbounded today's-HR set and was read
+    /// TWICE per `body` pass; run SYNCHRONOUSLY inside a background scene-update (a workout `stop()`
+    /// batch-ingest invalidates the @Query) that blew the 10 s watchdog (0x8BADF00D, same as
+    /// GoalsCardView / VitalsStatusCardView). As @State the body renders instantly.
+    @State private var cachedActiveKcal: Double = 0
+    /// Identity for the recompute `.task` — the HR count, today's steps, and the profile inputs.
+    private var caloriesInputsKey: String {
+        "\(hrSamples.count)|\(todayDaily.first?.steps ?? 0)|\(age)|\(weightKg)|\(heightCm)|\(sexRaw)"
+    }
+
     private var profile: UserProfile {
         UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
                     sex: BiologicalSex(rawValue: sexRaw) ?? .male)
@@ -1549,17 +1560,22 @@ struct CaloriesCardView: View {
                 Text("CALORIES").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             }
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("\(Int((restingToday + activeToday).rounded()))")
+                Text("\(Int((restingToday + cachedActiveKcal).rounded()))")
                     .font(.system(size: 40, weight: .bold, design: .rounded))
                     .monospacedDigit().contentTransition(.numericText())
                 Text("kcal today").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
             }
-            Text("resting \(Int(restingToday.rounded())) · active \(Int(activeToday.rounded()))")
+            Text("resting \(Int(restingToday.rounded())) · active \(Int(cachedActiveKcal.rounded()))")
                 .font(.caption).foregroundStyle(.secondary)
             // "max HR" here is the 220-age zone/calorie reference, NOT an observed peak.
             Text("BMR \(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day · est. max HR \(maxHR) bpm (220-age)")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Recompute the active-kcal estimate OFF the render/scene-update path (0x8BADF00D fix):
+        // once per real input change, after layout — never synchronously inside `body`.
+        .task(id: caloriesInputsKey) {
+            cachedActiveKcal = activeToday
+        }
     }
 }

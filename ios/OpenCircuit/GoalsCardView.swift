@@ -57,6 +57,24 @@ struct GoalsCardView: View {
         _latestSleep = Query(sleepDesc)
     }
 
+    // Active-kcal + exercise-minutes are HELD AS STATE and recomputed OFF the render path in
+    // `.task(id:)` below — NOT read in `body`. They were computed vars that `body` evaluated ~10× per
+    // pass (`progress` alone is read 4×, each rebuilding both), running the O(n) analytics over the
+    // unbounded `todayHR` SYNCHRONOUSLY inside the background scene-update layout when a workout's
+    // `stop()` batch-ingest invalidated the @Query — that blew the 10 s scene-update watchdog
+    // (0x8BADF00D). As @State the body renders instantly and the analysis runs once per data change.
+    // (Same fix as VitalsStatusCardView.)
+    @State private var cachedActiveKcal: Double = 0
+    @State private var cachedActivityMin: Double = 0
+
+    /// Identity for the recompute `.task` — changes only when an input to the two estimates changes,
+    /// so they re-run on new data (HR count grows, steps, profile, or last night) and never on an
+    /// unrelated re-render.
+    private var goalsInputsKey: String {
+        "\(todayHR.count)|\(currentSteps)|\(age)|\(weightKg)|\(heightCm)|\(sexRaw)|"
+        + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)"
+    }
+
     // MARK: Computed values
 
     private var stepsGoal: Int {
@@ -112,8 +130,8 @@ struct GoalsCardView: View {
     private var progress: DailyGoalProgress {
         DailyGoalProgress(
             steps:           GoalProgress(current: Double(currentSteps),     goal: Double(stepsGoal)),
-            activeKcal:      GoalProgress(current: currentActiveKcal,        goal: activeKcalGoal),
-            activityMinutes: GoalProgress(current: currentActivityMin,       goal: actMinGoal),
+            activeKcal:      GoalProgress(current: cachedActiveKcal,         goal: activeKcalGoal),
+            activityMinutes: GoalProgress(current: cachedActivityMin,        goal: actMinGoal),
             sleepMinutes:    GoalProgress(current: Double(creditedLastNightMin), goal: Double(sleepGoalMin))
         )
     }
@@ -134,12 +152,12 @@ struct GoalsCardView: View {
                          color: .green)
                 goalRing(progress: progress.activeKcal,
                          label: "Active kcal\u{B9}",
-                         current: "\(Int(currentActiveKcal))",
+                         current: "\(Int(cachedActiveKcal))",
                          goal: "\(Int(activeKcalGoal))",
                          color: .orange)
                 goalRing(progress: progress.activityMinutes,
                          label: "Exercise min\u{B9}",
-                         current: "\(Int(currentActivityMin))",
+                         current: "\(Int(cachedActivityMin))",
                          goal: "\(Int(actMinGoal))",
                          color: .blue)
                 goalRing(progress: progress.sleepMinutes,
@@ -154,6 +172,12 @@ struct GoalsCardView: View {
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Recompute the two HR-derived estimates OFF the render/scene-update path (0x8BADF00D fix):
+        // once per real input change, after layout — never synchronously inside `body`.
+        .task(id: goalsInputsKey) {
+            cachedActiveKcal = currentActiveKcal
+            cachedActivityMin = currentActivityMin
+        }
     }
 
     @ViewBuilder

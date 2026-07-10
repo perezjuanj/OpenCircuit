@@ -247,20 +247,6 @@ final class WorkoutSessionManager: NSObject {
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
 
-        // Capture any REAL HR the ring already surfaced (e.g. epochs drained during this session)
-        // so it can backfill the workout window below. The live poll often can't lock HR while
-        // moving (#45); this fills from on-device data when present. Empty stays empty — never
-        // interpolated. History-stream HR now covers BOTH still/sleep-vitals AND activity epochs
-        // (BulkRecord.heartRate excludes only `.idle`, per #45/#38), so this backfill is no longer
-        // a near-guaranteed no-op for an in-motion walk — it's just lower-resolution than a true
-        // continuous stream would be. A durable SPORT-mode stream (#90: SportHrModel{utc,hr,conf})
-        // would still improve resolution if it's ever captured, but is no longer the only source.
-        // (The earlier #99 byte[6]=HrSync theory was disproven — PROTOCOL.md §5.3: all-day HR is
-        // the 0x4c epoch, not a live stream.)
-        let backfillHR: [HRSample] = (session?.historySamples ?? [])
-            .filter { $0.kind == .heartRate }
-            .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-
         // End the ring's native sport mode (SportStop) and capture the ring-counted step total (#90).
         let sportSteps = session?.endSportSession() ?? 0
         session = nil
@@ -280,13 +266,10 @@ final class WorkoutSessionManager: NSObject {
             return
         }
 
-        // Backfill the workout window with any real in-window stored HR before finalizing, so
-        // avg/max HR + zones reflect on-device data the live poll missed. No-op (preserved) when
-        // the store has nothing for the window. Captured live samples win on a timestamp tie.
-        if let start = sessionStart {
-            agg.backfill(backfillHR, window: DateInterval(start: start, end: max(endDate, start)))
-        }
-
+        // The workout's HR is whatever it captured live — the native `0x4e` sport stream (continuous)
+        // or the `0x95` fallback poll. No stop-time history drain: native sport mode (#90, enter from
+        // synced-idle) now carries continuous HR directly, so the old `0x4c` backfill was empty when
+        // sport streamed AND a multi-second "saving…" stall when it fell back — removed.
         let hasRoute = !routeLocations.isEmpty && selectedSport.isOutdoor
         let summary = agg.finalize(
             sport: selectedSport,
