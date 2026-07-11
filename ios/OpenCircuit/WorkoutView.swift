@@ -134,10 +134,21 @@ struct WorkoutView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(session == nil || session?.ready != true)
+            // Gate Start on the ring being ready AND not busy with a sync/workout-hold (T1).
+            // Starting a workout issues SportStart (06 03), which our one-writer rule forbids
+            // while a history sync (`syncing`) or a workout contention hold (`workoutHolding`)
+            // owns the link — otherwise #174 absorbs the race with an 18 s wait + a motion-blind
+            // poll and the workout gets no native 0x4e HR. Blocking Start at the source means
+            // every workout that DOES start gets the clean native stream. RingSession is
+            // @Observable, so the button re-enables automatically the moment `syncing` flips false.
+            .disabled(session == nil || session?.ready != true
+                      || session?.syncing == true || session?.workoutHolding == true)
 
             if session == nil || session?.ready != true {
                 Text("Connect to the ring before starting a workout.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if session?.syncing == true || session?.workoutHolding == true {
+                Text("Ring is finishing its sync — you can start a workout in a moment.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
         }
