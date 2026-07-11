@@ -121,6 +121,37 @@ final class WorkoutSessionManager: NSObject {
     /// shows the blue location indicator. Shared key with `UserProfileSettingsView`.
     static let indoorKeepAliveEnabledKey = "workout.indoorKeepAlive"
 
+    // MARK: - Durable "workout in progress" flag (T6)
+
+    /// UserDefaults key for the durable "a workout is in progress" flag. `nonisolated` so the
+    /// nonisolated accessors below (and ContentView's launch/foreground paths) can read it without
+    /// hopping to the main actor.
+    nonisolated static let workoutInProgressKey = "workout.inProgress"
+
+    /// True iff a workout was started and has not yet cleanly ended. PERSISTED (UserDefaults) so a
+    /// crash/relaunch can tell a workout was underway when the process died. ContentView reads this
+    /// to SUPPRESS the once-a-morning whole-night backlog drain while a workout owns (or should own)
+    /// the BLE link — that drain takes the link (`syncTask != nil`) and would starve a just-
+    /// (re)started workout of native `0x4e` HR (T6). In-memory `RingSession.workoutHolding` can't
+    /// cover a crash-relaunch (a fresh session reads it false); this durable flag does. Nonisolated:
+    /// a plain global flag over thread-safe UserDefaults, read from ContentView's launch/foreground
+    /// paths. The crash-orphan case (flag left set with no live workout) is reconciled at launch by
+    /// ContentView (clear + re-arm the deferred drain) — see `clearWorkoutInProgressFlag`.
+    nonisolated static var isWorkoutInProgressPersisted: Bool {
+        UserDefaults.standard.bool(forKey: workoutInProgressKey)
+    }
+
+    /// Set/clear the durable flag. `true` on workout start; `false` on EVERY end path
+    /// (normal stop, error, cancel, reset) and on the crash-orphan cleanup at launch.
+    nonisolated static func setWorkoutInProgressPersisted(_ inProgress: Bool) {
+        UserDefaults.standard.set(inProgress, forKey: workoutInProgressKey)
+    }
+
+    /// Convenience for the end paths and the launch-time orphan cleanup.
+    nonisolated static func clearWorkoutInProgressFlag() {
+        setWorkoutInProgressPersisted(false)
+    }
+
     private weak var session: RingSession?
     /// Where to persist this workout's continuous HR samples so they count toward today's
     /// Activity-minutes goal and Trends/exports — the same store the ring's history sync writes
@@ -176,6 +207,13 @@ final class WorkoutSessionManager: NSObject {
         lastLocation = nil
 
         recordingState = .starting
+
+        // T6: mark a workout in progress DURABLY (survives a crash-relaunch). ContentView reads this
+        // to suppress the relaunch/foreground whole-night backlog drain while the workout owns the
+        // link, so the just-started session gets the clean native `0x4e` stream instead of being
+        // starved by a drain that holds `syncTask`. Cleared on every end path (stop/cancel/reset)
+        // and reconciled at launch if the process was killed mid-workout.
+        Self.setWorkoutInProgressPersisted(true)
 
         // Enter the ring's NATIVE sport mode for this workout (#90): SportStart → the ring streams
         // `0x4e` HR+steps frames (~10 s) which RingSession routes into `liveHR`/`liveHRAt` (picked up
@@ -244,10 +282,18 @@ final class WorkoutSessionManager: NSObject {
         }
         recordingState = .finishing
 
+        // T6: clear the durable flag FIRST — before `endSportSession()` below flips
+        // `session.workoutHolding` false (which fires ContentView's re-arm). Clearing here covers
+        // BOTH the normal completion below AND the `guard let agg` error-return, so no end path can
+        // leave the flag set and suppress the morning drain forever (#119 lane).
+        Self.setWorkoutInProgressPersisted(false)
+
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
 
         // End the ring's native sport mode (SportStop) and capture the ring-counted step total (#90).
+        // Flipping `session.workoutHolding` false here is what re-arms the T6-suppressed drain
+        // (ContentView observes it) so the deferred morning night still drains after the workout.
         let sportSteps = session?.endSportSession() ?? 0
         session = nil
 
@@ -321,6 +367,9 @@ final class WorkoutSessionManager: NSObject {
 
     /// Discard the session without writing to HealthKit.
     func cancel() {
+        // T6: clear the durable flag on the cancel end path too (before `endSportSession()` below
+        // releases `workoutHolding` and re-arms the deferred drain).
+        Self.setWorkoutInProgressPersisted(false)
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
         // Tear down the Live Activity too — a discarded session should leave nothing on the Lock
@@ -338,6 +387,9 @@ final class WorkoutSessionManager: NSObject {
     }
 
     func reset() {
+        // T6: belt-and-suspenders — `reset()` runs from the summary "Done" / error "Dismiss"
+        // buttons (after `stop()` already cleared it), but clear again so no path can leave it set.
+        Self.setWorkoutInProgressPersisted(false)
         recordingState = .idle
         elapsedSeconds = 0
         currentHR = nil

@@ -137,6 +137,21 @@ struct ContentView: View {
                 OnboardingView { onboardingCompleted = true }
             }
             .task {
+                // T6 — ORPHANED workout-in-progress flag (crash mid-workout): if the app was KILLED
+                // during a workout, `stop()`/`endSportSession()` never ran, so the DURABLE flag is
+                // still set on this fresh process with NO live workout to resume (full session resume
+                // is out of scope for this pass — follow-up). Left set, it would suppress the morning
+                // whole-night backlog drain FOREVER and age a night out of the ring's buffer (#119
+                // lane). So at launch: detect it (flag set + no live hold), CLEAR it, and re-arm the
+                // deferred drain. `session?.workoutHolding != true` is defensive — a genuine same-
+                // process workout sets the flag AFTER this `.task` runs and holds the ring, so it can
+                // never be cleared here; only a crash orphan reaches this branch.
+                if WorkoutSessionManager.isWorkoutInProgressPersisted, session?.workoutHolding != true {
+                    ringLog.notice("workout: orphaned in-progress flag at launch — clearing and re-arming the deferred drain (T6)")
+                    WorkoutSessionManager.clearWorkoutInProgressFlag()
+                    pendingAutoSync = true
+                    maybeAutoSyncOnReady()   // fires now if the link is already ready; else onChange(ready) will
+                }
                 // Reflect any prior Health authorization so the UI shows the mirrored state,
                 // and backfill anything the background refresh persisted while we were away.
                 // Runs in `.task` (after first frame), never `.onAppear` — a synchronous store
@@ -199,6 +214,19 @@ struct ContentView: View {
             }
             .onChange(of: session?.monitoring) { _, monitoring in
                 if monitoring == false { flushHealth() }
+            }
+            // T6 — RESCHEDULE, NOT DROP: a workout hold just released (endSportSession/endWorkoutHR
+            // flip `workoutHolding` false), so re-arm and run the whole-night backlog drain that T6
+            // suppressed during the workout. Without this the deferred morning night would never
+            // drain until the next foreground/reconnect and could age out of the ring's buffer
+            // (#119 lane). `maybeAutoSyncOnReady` re-checks all its own gates (ready/monitoring/
+            // syncing/throttle), so this is a no-op when nothing is due. WorkoutSessionManager
+            // clears the durable flag BEFORE `endSportSession()` flips this, so the guard passes.
+            .onChange(of: session?.workoutHolding) { _, holding in
+                if holding == false {
+                    pendingAutoSync = true
+                    maybeAutoSyncOnReady()
+                }
             }
             .sheet(isPresented: $showCalibration, onDismiss: {
                 Task { await calibration.refreshLatestEstimateIfNeeded(minInterval: 2) }
@@ -341,8 +369,15 @@ struct ContentView: View {
     private func maybeAutoSyncOnReady() {
         // `!session.workoutHolding`: don't fire a foreground-return history sync during an active
         // workout — it contends with the busy ring and can knock the `0x4e` sport stream off (#90).
+        // `!WorkoutSessionManager.isWorkoutInProgressPersisted` (T6): also suppress off the DURABLE
+        // app-side flag, which — unlike the in-memory `workoutHolding` — survives a crash-relaunch,
+        // so the once-a-morning whole-night backlog drain can't take the link (`syncTask != nil`)
+        // and starve a just-(re)started workout of native `0x4e` HR. Both `else { return }` misses
+        // leave `pendingAutoSync` SET, so this is a RESCHEDULE (re-fired on workout end via the
+        // `workoutHolding` onChange, or on the next `ready`), never a silent drop (#119 lane).
         guard pendingAutoSync, let session, session.ready,
-              !session.monitoring, !session.syncing, !session.workoutHolding else { return }
+              !session.monitoring, !session.syncing, !session.workoutHolding,
+              !WorkoutSessionManager.isWorkoutInProgressPersisted else { return }
         if let last = lastForegroundSync,
            Date().timeIntervalSince(last) < Self.autoSyncInterval {
             pendingAutoSync = false   // too soon — consume the request without syncing
