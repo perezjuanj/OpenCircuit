@@ -255,6 +255,18 @@ final class RingSession: NSObject {
     /// ambient swings, intermittent skin contact) to trend, so we only persist overnight.
     private var nightWindow: DateInterval?
     private var nightWindowRefreshedAt: Date?
+    /// True when `nightWindow` came from an EXPLICIT user schedule (iOS Sleep / manual) rather than
+    /// the learned/generous skin-temp window. The drain-suppression gate (`isInSleepWindow`) trusts
+    /// an explicit schedule as-is but tightens the generous temp window (see `isInSleepWindow`).
+    private var nightWindowIsExplicit = false
+    /// `nightWindow` (skin-temp) ends at wake + `SleepWindow.habitualInterval`'s 1.5 h `wakeMargin`.
+    /// The DRAIN gate trims that back off so overnight-quiet ends at the user's LEARNED wake, not
+    /// 1.5 h later — otherwise the morning history sync never auto-fires (device log 07-11: still
+    /// "inside sleep window" at 09:10 while the user was up and walking, so the night — sleep AND the
+    /// OSA 0x48 — was never drained). Fully adaptive, no wall-clock cap: the gate tracks the user's
+    /// real hours. If the learned wake itself reads late, that's an over-count in sleep STAGING (the
+    /// source) to fix there, not to mask here with a fixed clock. See `isInSleepWindow`.
+    private static let drainWakeMarginTrim: TimeInterval = 5400   // matches habitualInterval wakeMargin
 
     /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
     /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
@@ -1146,8 +1158,10 @@ final class RingSession: NSObject {
     func refreshNightWindowIfNeeded(force: Bool = false) async {
         let stale = nightWindowRefreshedAt.map { Date().timeIntervalSince($0) > 30 * 60 } ?? true
         guard stale || force else { return }
+        nightWindowIsExplicit = false
         if let w = await SleepSchedule.current(forNightEndingNear: Date()) {
             nightWindow = w                                   // explicit schedule (HealthKit / manual) wins
+            nightWindowIsExplicit = true                      // real bed→wake — the drain gate trusts it as-is
         } else if let learned = learnedNightWindow(nightEndingNear: Date()) {
             // No explicit schedule (the default state): ADAPT the window to the user's REAL recent
             // sleep hours, learned from persisted nights. The fixed 22:30→06:30 default below
@@ -1171,6 +1185,17 @@ final class RingSession: NSObject {
             nightWindow = DateInterval(start: dayStart, end: dayStart.addingTimeInterval(6 * 3600))
         }
         nightWindowRefreshedAt = Date()
+        if let w = nightWindow {
+            // Surface the resolved window + the effective DRAIN-gate end so a device-log pull can tell
+            // whether a late morning drain is the temp-margin (fixed here) or an over-counted learned
+            // wake (a staging problem). `hm` = local HH:mm.
+            func hm(_ d: Date) -> String {
+                let c = Calendar.current.dateComponents([.hour, .minute], from: d)
+                return String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0)
+            }
+            let gateEnd = nightWindowIsExplicit ? w.end : w.end.addingTimeInterval(-Self.drainWakeMarginTrim)
+            ringLog.notice("sleep-window: \(hm(w.start), privacy: .public)→\(hm(w.end), privacy: .public) explicit=\(self.nightWindowIsExplicit) → drain-gate ends \(hm(gateEnd), privacy: .public)")
+        }
     }
 
     /// Generous no-schedule / no-history fallback window for skin-temp capture: bed 21:30, wake
@@ -1204,14 +1229,27 @@ final class RingSession: NSObject {
     /// manual/default schedule so the gate still holds before the async window resolves (e.g. a cold
     /// background drain). MANUAL user syncs bypass this entirely (user intent wins).
     var isInSleepWindow: Bool {
-        if let w = nightWindow { return w.contains(Date()) }
+        let now = Date()
+        if let w = nightWindow {
+            // An EXPLICIT user schedule (iOS Sleep / manual) is the real bed→wake — trust it as-is.
+            if nightWindowIsExplicit { return w.contains(now) }
+            // Otherwise `nightWindow` is the GENEROUS skin-temp window: wake + ~1.5 h margin, up to a
+            // 10:00 fallback, adapted from LEARNED nights. That's right for temp capture but too WIDE
+            // for the drain gate — it kept overnight-quiet on for hours after real wake, so the morning
+            // history sync never auto-fired (device log 07-11: "inside sleep window" at 09:10 while
+            // walking → the night, sleep AND the OSA 0x48, was never drained). Trim the temp
+            // wake-margin back off so the gate ends at the LEARNED wake — adaptive, no wall clock.
+            let gateEnd = w.end.addingTimeInterval(-Self.drainWakeMarginTrim)
+            guard gateEnd > w.start else { return false }       // trimmed away → treat as awake
+            return DateInterval(start: w.start, end: gateEnd).contains(now)
+        }
         let d = UserDefaults.standard
         SleepScheduleDefaults.register(d)
         guard let w = SleepWindow.interval(
             bedMinutes: d.integer(forKey: SleepScheduleDefaults.bedMinutes),
             wakeMinutes: d.integer(forKey: SleepScheduleDefaults.wakeMinutes),
-            nightEndingNear: Date()) else { return false }
-        return w.contains(Date())
+            nightEndingNear: now) else { return false }
+        return w.contains(now)
     }
 
     /// Persist decoded samples to the local store (the vitals dashboard reads from it, so
