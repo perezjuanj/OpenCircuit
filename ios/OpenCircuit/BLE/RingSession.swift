@@ -268,6 +268,8 @@ final class RingSession: NSObject {
     /// source) to fix there, not to mask here with a fixed clock. See `isInSleepWindow`.
     private static let drainWakeMarginTrim: TimeInterval = 5400   // matches habitualInterval wakeMargin
 
+    private static let drainEmptyNoPagesCap = 12   // seconds: cut a zero-page, no-end-signal channel here instead of the 45 s backstop — safely above first-page latency
+
     /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
     /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
     private(set) var historySamples: [QuantitySample] = []
@@ -2415,6 +2417,7 @@ final class RingSession: NSObject {
             try? await Task.sleep(for: .milliseconds(300))
             if Task.isCancelled { return }
         }
+        var firstPageTick: Int? = nil
         for tick in 0 ..< 45 {
             try? await Task.sleep(for: .seconds(1))
             if Task.isCancelled {
@@ -2431,6 +2434,21 @@ final class RingSession: NSObject {
             syncQuietTicks += 1
             let sawPages = bulkRecords.count > recordsAtStart
             let ackedEmpty = activeDrainTrace?.sawEmptyHistorySignal == true && !sawPages
+            // Instrumentation (T3 tuning): log the first-page latency once so the empty-channel cap
+            // below stays safely above it.
+            if sawPages, firstPageTick == nil {
+                firstPageTick = tick
+                ringLog.notice("sync: ch=\(label, privacy: .public) first page at ~\(tick + 1)s")
+            }
+            // T3: a channel that has streamed ZERO pages and given NO end signal (no 0x50 `syncDone`,
+            // no 0x82-ff `ackedEmpty`) would otherwise burn the full 45 s. Once ANY page lands, `sawPages`
+            // is true and this never applies — so this only ever cuts a genuinely empty channel, above
+            // first-page latency. Lossless: nothing acked-but-unbanked (no pages were streamed).
+            if !sawPages, !ackedEmpty, !syncDone, tick + 1 >= Self.drainEmptyNoPagesCap {
+                ringLog.notice("sync: ch=\(label, privacy: .public) empty (no pages, no end signal) — cut at \(tick + 1)s (T3)")
+                finishActiveDrainTrace(.quietNoPages)
+                break
+            }
             if syncDone || (sawPages && syncQuietTicks >= 3) || (ackedEmpty && syncQuietTicks >= 3) {
                 let added = self.bulkRecords.count - recordsAtStart
                 ringLog.notice("sync: ch=\(label, privacy: .public) drained at \(tick)s (done=\(self.syncDone), quiet=\(self.syncQuietTicks), ackedEmpty=\(ackedEmpty), records=\(self.bulkRecords.count))")
