@@ -694,6 +694,8 @@ final class RingSession: NSObject {
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
         syncTask?.cancel(); syncTask = nil
         rssiPollTask?.cancel(); rssiPollTask = nil   // Find My Ring RSSI poll (#96)
+        sportStartTask?.cancel(); sportStartTask = nil   // native sport enter/stall watchdog (#90)
+        sportCePollTask?.cancel(); sportCePollTask = nil // proactive ce sport-stream poll (#90)
         endDrainAssertion()   // a cancelled drain must not leak its assertion (#119)
         monitoring = false
         livePreparing = false
@@ -1588,6 +1590,15 @@ final class RingSession: NSObject {
     /// The SportStart-with-retry watchdog task (re-sends SportStart until the ring starts streaming,
     /// then falls back to the live-HR poll if it never does).
     private var sportStartTask: Task<Void, Never>?
+    /// Proactive `ce` sport-stream poll (#90 stall fix). The ring emits the NEXT `0x4e` only after it
+    /// receives a `ce 00 00`; our reactive ack in the 0x4e handler covers the steady state, but a
+    /// LOST/gapped frame leaves the ring waiting for a `ce` we only send on receipt → deadlock (we wait
+    /// for `4e`, it waits for `ce`) → the 35 s stall watchdog fires and we fall to the dead `0x95` poll
+    /// (on-device: the stream ran clean ~9.5 min then a BLE hiccup silenced it). The official app (fresh
+    /// Android snoop, captures/fresh_workout/) polls `ce` PROACTIVELY on a ~3 s timer — even with NO
+    /// preceding `0x4e` — which is what lets its stream survive gaps and run for an hour. This timer
+    /// mirrors that; it SUPPLEMENTS (does not replace) the reactive ack.
+    private var sportCePollTask: Task<Void, Never>?
     /// Wall-clock when the current sport-enter reach-idle sequence began. `awaitIdleDescriptor` only
     /// trusts a descriptor mode reading stamped at/after this, so a STALE pre-live-HR "idle" can't be
     /// mistaken for the ring having returned to idle now (#174).
@@ -1658,6 +1669,7 @@ final class RingSession: NSObject {
         liveHRAt = nil
         sportGotFirstFrame = false
         sportUsingLivePollFallback = false
+        stopSportCePoll()   // defensive: a prior session's ce poll must not survive into this one (#90)
         lastSportFrameAt = nil
         sportStartRejected = false
         monitoringStartedAt = Date()   // gate: only in-session locks seed the workout (WorkoutHRGate)
@@ -1784,6 +1796,7 @@ final class RingSession: NSObject {
     private func fallBackToLivePoll() async {
         guard workoutHRActive, !sportUsingLivePollFallback else { return }   // ended, or already fell back
         sportSessionActive = false        // stop arming the 0x4e path
+        stopSportCePoll()                 // the 0x4e stream is dead — stop ce so it can't fight the 0x95 poll (#90)
         sportUsingLivePollFallback = true
         autoMeasuring = false             // don't let a concurrent auto-measure tear the cycle down
         write(Command.sportStop)          // 06 00 00 — sport → IDLE before the live-HR mode switch
@@ -1792,10 +1805,40 @@ final class RingSession: NSObject {
         startMonitoring(mode: .hr, userInitiated: false, quickLiveRead: true)
     }
 
+    /// Start the proactive `ce` poll once the native `0x4e` stream is live (#90 stall fix). Idempotent —
+    /// called from the 0x4e handler on every frame, but only ever spins up ONE task. Fires `ce 00 00`
+    /// every ~3 s to keep prompting the ring for its next frame, so a lost/gapped `0x4e` self-heals
+    /// instead of deadlocking into the 35 s stall watchdog + dead `0x95` fallback. Torn down by
+    /// `stopSportCePoll` on session end / poll fallback / disconnect so `ce` never fights the live poll.
+    private func startSportCePoll() {
+        guard sportCePollTask == nil else { return }
+        sportCePollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                guard let self, !Task.isCancelled else { return }
+                // Only while the native stream is the HR source — stop the instant we fall back to the
+                // `0x95` live poll (or the session ends) so `ce` and `95` don't fight for the link.
+                guard self.sportSessionActive, self.sportGotFirstFrame,
+                      !self.sportUsingLivePollFallback else { return }
+                // Skip a redundant poll if a `0x4e` (and its reactive ack) just landed < 2.5 s ago; in
+                // the 10 s-cadence GAPS — and after a dropped frame — this fires and re-prompts the ring.
+                if let last = self.lastSportFrameAt, Date().timeIntervalSince(last) < 2.5 { continue }
+                self.write(Command.sportStreamAck)   // ce 00 00 — proactively prompt the next 0x4e
+            }
+        }
+    }
+
+    /// Stop the proactive `ce` poll (session end / poll fallback / disconnect).
+    private func stopSportCePoll() {
+        sportCePollTask?.cancel()
+        sportCePollTask = nil
+    }
+
     /// End the native workout mode; returns the ring-counted step total. Sends `SportStop` (`06 00 00`).
     @discardableResult
     func endSportSession() -> Int {
         sportStartTask?.cancel(); sportStartTask = nil   // stop the retry/fallback watchdog
+        stopSportCePoll()                                // stop the proactive ce poll (#90)
         sportSessionActive = false
         workoutHRActive = false
         workoutHolding = false   // release the contention hold taken in beginSportSession
@@ -3195,6 +3238,7 @@ extension RingSession: CBPeripheralDelegate {
                 if self.sportSessionActive {
                     self.sportGotFirstFrame = true   // stream is live → stop the SportStart retry watchdog
                     self.lastSportFrameAt = Date()   // stream-health heartbeat (drives the stall watchdog)
+                    self.startSportCePoll()          // stream is live → proactively poll ce so gaps self-heal (#90)
                     // ACK EVERY 0x4e, before (and independent of) decode. Ground truth (fresh Android
                     // snoop): the official app sends `ce 00 00` for every 0x4e regardless of content —
                     // the ring only emits the NEXT frame once it sees the ack. Gating the ack on a
