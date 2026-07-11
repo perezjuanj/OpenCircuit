@@ -1580,7 +1580,8 @@ final class RingSession: NSObject {
     private var sportStartRejected = false
     /// Set by the `0x86` handler when the ring ACCEPTS a `0x06`-family command (`86 00 86`). Ground
     /// truth (yoga snoop 2026-07-09): the ring answers `06 03` with its accept/reject verdict in
-    /// ~0.4 s, THEN an accepted start streams its first `0x4e` ~8 s later. So the enter loop watches
+    /// ~0.4 s, THEN an accepted start streams its first `0x4e` ~12–13 s later (fresh snoop: ~12.6 s
+    /// after the `86 00` accept). So the enter loop watches
     /// this to tell "accepted, waiting for the stream" from "ignored (no `86` — the ring wasn't idle)"
     /// and stop burning the whole stream-watch window on a `06 03` that never landed (#174).
     private var sportStartAccepted = false
@@ -1608,9 +1609,11 @@ final class RingSession: NSObject {
     /// straight to the full drain-to-idle.
     private static let sportFastPathAfterLive: TimeInterval = 2
     /// After an ACCEPTED `06 03` (`86 00 86`), how long to wait for the ring's first `0x4e` stream
-    /// frame (ground truth ~8 s). Separate from the reach-idle budget — once accepted, the ring is
-    /// idle and streaming is just a matter of time.
-    private static let sportFirstFrameWait: TimeInterval = 14
+    /// frame (ground truth ~12–13 s — fresh snoop: first `0x4e` ~12.6 s after the `86 00` accept).
+    /// Separate from the reach-idle budget — once accepted, the ring is idle and streaming is just a
+    /// matter of time. 18 s clears the observed 12.6 s with margin and stays under the 35 s stall
+    /// watchdog; 14 s left only ~1.4 s and could bail to the poll before the stream even started.
+    private static let sportFirstFrameWait: TimeInterval = 18
 
     /// The ring's work-mode as reported by the most recent `0x10`/`0x87` descriptor byte[2]:
     /// `0x02`/`0x03` idle, `0x04` on charger, `0x06` sport active (others, e.g. a live-read mode,
@@ -1851,7 +1854,8 @@ final class RingSession: NSObject {
 
     /// Send `06 03 <type>` and classify the ring's response (#174). Ground truth (yoga snoop
     /// 2026-07-09): the ring answers `06 03` with `86 00 86` (accept) or `86 fd …` (reject) within
-    /// ~0.4 s, then an accepted start streams its first `0x4e` ~8 s later. So watch a short window for
+    /// ~0.4 s, then an accepted start streams its first `0x4e` ~12–13 s later (fresh snoop: ~12.6 s
+    /// after the `86 00` accept). So watch a short window for
     /// the `86` verdict — a start that draws NO `86` was dropped from a non-idle state (`.ignored`),
     /// and we return at once instead of burning the whole stream-watch on a command that never landed.
     private func sendSportStartAndClassify(typeByte: UInt8) async -> SportStartResult {
@@ -1859,8 +1863,11 @@ final class RingSession: NSObject {
         lastSportFrameAt = nil
         sportStartRejected = false           // arm accept/reject detection for THIS SportStart
         sportStartAccepted = false
-        write(Command.sportStart(typeByte))  // 06 03 <type> 04 00 — NO 06 00 before it
-        write(Command.statusQuery)           // d0 00 00 — the app's enter sequence
+        // 06 03 <type> 04 00 — sent ALONE (no d0, no 06 00). Ground truth (fresh_decoded.txt,
+        // Android snoop): the app writes `06 03` solo then WAITS for the `86` verdict; it NEVER
+        // sends `d0` at sport-start. The trailing `d0 00 00` we used to fire ~96 µs later aborted
+        // the start → `86 fd` even from confirmed idle (mode 0x03). Removing it is the 0-HR fix.
+        write(Command.sportStart(typeByte))
         // Phase A — the `86` accept/reject verdict (~0.4 s in ground truth; cap ~3 s).
         for _ in 0..<6 {
             try? await Task.sleep(for: .milliseconds(500))
@@ -1872,7 +1879,7 @@ final class RingSession: NSObject {
         // No `86` verdict within the window → the `06 03` was dropped from a non-idle state. (A
         // 0x4e this early already returned `.streaming` above, so only the accept flag can be set here.)
         guard sportStartAccepted else { return .ignored }
-        // Phase B — accepted: wait for the first unsolicited `0x4e` (~8 s in ground truth).
+        // Phase B — accepted: wait for the first unsolicited `0x4e` (~12.6 s in fresh snoop).
         let streamDeadline = Date().addingTimeInterval(RingSession.sportFirstFrameWait)
         while Date() < streamDeadline {
             try? await Task.sleep(for: .milliseconds(500))
