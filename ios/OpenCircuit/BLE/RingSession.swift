@@ -3195,8 +3195,14 @@ extension RingSession: CBPeripheralDelegate {
                 if self.sportSessionActive {
                     self.sportGotFirstFrame = true   // stream is live → stop the SportStart retry watchdog
                     self.lastSportFrameAt = Date()   // stream-health heartbeat (drives the stall watchdog)
+                    // ACK EVERY 0x4e, before (and independent of) decode. Ground truth (fresh Android
+                    // snoop): the official app sends `ce 00 00` for every 0x4e regardless of content —
+                    // the ring only emits the NEXT frame once it sees the ack. Gating the ack on a
+                    // successful decode meant one undecodable/warm-up frame skipped the ack → the ring
+                    // went silent → the 35 s stall watchdog fired → fallback to the dead 0x95 poll → 0
+                    // further HR. A bad frame must never stall the stream.
+                    self.write(Command.sportStreamAck)
                     if let sample = SportFrame.decode(bytes) {
-                        self.write(Command.sportStreamAck)
                         self.sportSteps += sample.steps
                         if let hr = sample.hr {
                             self.liveHR = hr
