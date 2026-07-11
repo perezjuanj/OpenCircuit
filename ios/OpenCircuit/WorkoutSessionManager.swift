@@ -355,11 +355,47 @@ final class WorkoutSessionManager: NSObject {
         // TRIMP kcal as the daily active-energy delta AND let the workout's own `activeEnergyBurned`
         // sample land too — a permanent, unretractable double-count. Ingesting only now guarantees
         // any flush that sees the workout HR also sees the banked credit and nets it out.
+        //
+        // The guard holds PER CHUNK. We split the ingest into small LOSSLESS sub-batches below —
+        // each `store.ingest(...)` is a single `context.save()`, so a one-shot ingest of the whole
+        // workout's HR invalidated EVERY `@Query[StoredSample]` (Calories/Goals/Vitals cards) at
+        // once and the dashboard `List` diffed all of it synchronously on the main thread — >10 s →
+        // the FRONTBOARD `0x8BADF00D` scene-update-watchdog SIGKILL a user hit when backgrounding
+        // right after a long workout summary. Chunking makes each save a SMALL @Query invalidation
+        // (a small List scene-update), and `await Task.yield()` hands the main actor back between
+        // saves so the diffs spread across runloop turns instead of one giant blocking update.
+        // Every chunk still runs AFTER the banked active-energy credit, so a `flushHealth()` that
+        // lands between chunks still nets out exactly as the single-shot ingest did.
         if let store {
-            let toIngest = agg.collectedSamples.map {
+            // Sort ascending by `start` BEFORE chunking so the forward-only SyncCursor
+            // (`selectNew` keeps `start > watermark`, strictly) advances monotonically and never
+            // discards a later chunk. The chunks are disjoint and together cover EVERY sample, and
+            // each boundary is extended to swallow any equal-`start` run at its tail (see below), so
+            // the total StoredSample rows are identical to the old single `store.ingest(toIngest)` —
+            // lossless, nothing dropped or deduped away.
+            let sorted = agg.collectedSamples.sorted { $0.start < $1.start }
+            let toIngest = sorted.map {
                 QuantitySample(kind: .heartRate, start: $0.start, end: $0.end, value: Double($0.bpm))
             }
-            _ = try? store.ingest(toIngest)
+            let chunkSize = 64
+            var i = 0
+            while i < toIngest.count {
+                var end = min(i + chunkSize, toIngest.count)
+                // Never split an equal-`start` run across a boundary: once the head sample advances
+                // the cursor watermark to that instant, `selectNew`'s strict `start > watermark`
+                // would drop the tail sample in the next chunk. Extend to swallow the whole run so
+                // chunking stays byte-for-byte lossless vs. the single-batch ingest.
+                while end < toIngest.count && toIngest[end].start == toIngest[end - 1].start {
+                    end += 1
+                }
+                _ = try? store.ingest(Array(toIngest[i..<end]))
+                i = end
+                // Hand the main actor back between saves: each small @Query invalidation gets its
+                // own runloop turn, so no single dashboard-List scene-update exceeds the watchdog
+                // budget. (Escalate to `try? await Task.sleep(for: .milliseconds(16))` if on-device
+                // background throttling makes a bare yield insufficient.)
+                await Task.yield()
+            }
         }
 
         recordingState = .finished(summary: summary)
