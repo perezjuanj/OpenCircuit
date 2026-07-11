@@ -359,11 +359,15 @@ final class WorkoutSessionManager: NSObject {
         // The guard holds PER CHUNK. We split the ingest into small LOSSLESS sub-batches below —
         // each `store.ingest(...)` is a single `context.save()`, so a one-shot ingest of the whole
         // workout's HR invalidated EVERY `@Query[StoredSample]` (Calories/Goals/Vitals cards) at
-        // once and the dashboard `List` diffed all of it synchronously on the main thread — >10 s →
-        // the FRONTBOARD `0x8BADF00D` scene-update-watchdog SIGKILL a user hit when backgrounding
-        // right after a long workout summary. Chunking makes each save a SMALL @Query invalidation
-        // (a small List scene-update), and `await Task.yield()` hands the main actor back between
-        // saves so the diffs spread across runloop turns instead of one giant blocking update.
+        // once and the dashboard `List` re-fetched + re-laid-out all of it synchronously on the
+        // main thread — >10 s → the FRONTBOARD `0x8BADF00D` scene-update-watchdog SIGKILL a user hit
+        // when backgrounding right after a long workout summary. Two-part fix: (1) chunking makes
+        // each save a SMALL @Query invalidation, and a short `Task.sleep` between saves gives the
+        // runloop a real turn so no single scene-update exceeds the watchdog budget; (2) the actual
+        // confirmed stall in the crash trace was the READER side — those three cards' per-card
+        // baseline/kcal analytics now run OFF the main actor (`.task` → `Task.detached`, see
+        // CaloriesCardView / GoalsCardView / VitalsStatusCardView), so a re-fetch during a
+        // background scene-update snapshot no longer drags the O(n) math onto the main thread.
         // Every chunk still runs AFTER the banked active-energy credit, so a `flushHealth()` that
         // lands between chunks still nets out exactly as the single-shot ingest did.
         if let store {
@@ -377,6 +381,20 @@ final class WorkoutSessionManager: NSObject {
             let toIngest = sorted.map {
                 QuantitySample(kind: .heartRate, start: $0.start, end: $0.end, value: Double($0.bpm))
             }
+            // PARTIAL-WRITE HARDENING (review MF3): the crash scenario this fixes IS "user
+            // backgrounds right after the summary", so this chunked loop very often runs as the app
+            // leaves the foreground. Without a background-task assertion iOS can suspend the app
+            // mid-loop and only a PREFIX of the workout HR would reach LocalStore — a bounded local
+            // active-kcal/exercise-min under-count (HealthKit already has EVERY sample from
+            // `writeWorkout` above; this only keeps the LOCAL estimate whole, and the cursor guard
+            // still prevents any double-count). The loop is ~1–2 s of wall time, far under the
+            // background budget, and self-ends via `defer` / the expiration handler.
+            var bgTask: UIBackgroundTaskIdentifier = .invalid
+            bgTask = UIApplication.shared.beginBackgroundTask(withName: "oc.workout-hr-ingest") {
+                if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask); bgTask = .invalid }
+            }
+            defer { if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) } }
+
             let chunkSize = 64
             var i = 0
             while i < toIngest.count {
@@ -390,11 +408,15 @@ final class WorkoutSessionManager: NSObject {
                 }
                 _ = try? store.ingest(Array(toIngest[i..<end]))
                 i = end
-                // Hand the main actor back between saves: each small @Query invalidation gets its
-                // own runloop turn, so no single dashboard-List scene-update exceeds the watchdog
-                // budget. (Escalate to `try? await Task.sleep(for: .milliseconds(16))` if on-device
-                // background throttling makes a bare yield insufficient.)
-                await Task.yield()
+                // Give the runloop a real turn between saves (review MF1). A bare `Task.yield()`
+                // reschedules on the SAME main-actor executor and can resume WITHOUT CFRunLoop
+                // reaching before-waiting and committing a CATransaction — so the chunk saves + the
+                // coalesced `@Query` re-fetches could still execute as ONE contiguous >10 s
+                // main-thread stretch and blow the scene-update watchdog anyway. A short sleep
+                // suspends off the executor so the runloop definitively lays out + commits (and the
+                // watchdog resets) between chunks. Cheap: workouts collect ~6 HR/min, so even a long
+                // session is a handful of chunks.
+                try? await Task.sleep(for: .milliseconds(20))
             }
         }
 

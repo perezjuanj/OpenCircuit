@@ -1607,10 +1607,22 @@ struct CaloriesCardView: View {
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        // Recompute the active-kcal estimate OFF the render/scene-update path (0x8BADF00D fix):
-        // once per real input change, after layout — never synchronously inside `body`.
+        // Recompute the active-kcal estimate OFF the main actor (0x8BADF00D fix). d338484 moved this
+        // to `.task` but a View's `.task` still runs on the MAIN actor — deferred, not off-loaded —
+        // so a workout `stop()` ingest that invalidated the @Query still dragged this O(n) map+math
+        // onto the main thread during the background scene-update snapshot, and the crash recurred.
+        // Snapshot the SwiftData rows to Sendable value types HERE (main actor), then run the pure
+        // Kit math on `Task.detached` and publish the result back.
         .task(id: caloriesInputsKey) {
-            cachedActiveKcal = activeToday
+            let samples = hrSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+            let steps = todayDaily.first?.steps ?? 0
+            let profile = profile
+            let maxHR = maxHR
+            cachedActiveKcal = await Task.detached {
+                let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
+                let stepKcal = Calories.activeKcalFromSteps(steps: steps, profile: profile)
+                return max(hrKcal, stepKcal)
+            }.value
         }
     }
 }

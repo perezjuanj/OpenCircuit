@@ -172,11 +172,30 @@ struct GoalsCardView: View {
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        // Recompute the two HR-derived estimates OFF the render/scene-update path (0x8BADF00D fix):
-        // once per real input change, after layout — never synchronously inside `body`.
+        // Recompute the two HR-derived estimates OFF the main actor (0x8BADF00D fix). d338484 moved
+        // this to `.task`, but a View's `.task` still runs on the MAIN actor — so a workout `stop()`
+        // ingest that invalidated the @Query still ran this O(n) map+analytics on the main thread
+        // during the background scene-update snapshot, and the crash recurred. Snapshot the
+        // SwiftData rows to Sendable value types HERE (main actor), then run the pure Kit math on
+        // `Task.detached` and publish back. (Also maps `todayHR` ONCE instead of twice.)
         .task(id: goalsInputsKey) {
-            cachedActiveKcal = currentActiveKcal
-            cachedActivityMin = currentActivityMin
+            let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+            let steps = currentSteps
+            let profile = profile
+            let maxHR = max(220 - age, 1)
+            let sleepWindow: DateInterval? = latestSleep.first.flatMap { s in
+                guard s.inBedStart > Date.distantPast else { return nil }
+                return DateInterval(start: s.inBedStart, end: s.inBedEnd)
+            }
+            let result = await Task.detached { () -> (kcal: Double, minutes: Double) in
+                let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
+                let stepKcal = Calories.activeKcalFromSteps(steps: steps, profile: profile)
+                let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: maxHR,
+                                                       sleepWindow: sleepWindow)
+                return (max(hrKcal, stepKcal), minutes)
+            }.value
+            cachedActiveKcal = result.kcal
+            cachedActivityMin = result.minutes
         }
     }
 
