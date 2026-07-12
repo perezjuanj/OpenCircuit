@@ -694,12 +694,23 @@ final class RingSession: NSObject {
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
         syncTask?.cancel(); syncTask = nil
         rssiPollTask?.cancel(); rssiPollTask = nil   // Find My Ring RSSI poll (#96)
+        // #reconnect (review HIGH): tear down SPORT too. Without this the sport-enter task — its `06 03`
+        // retry loop OR its stall-watchdog `while sportSessionActive` — survives teardown (it retains
+        // this now-dead session via its `guard let self`) and, ~35 s later, writes SportStop / `06 03` /
+        // live-HR onto the SAME CBPeripheral that a RECONNECTED session has since re-armed for native
+        // sport (the write gate is `peripheral.state == .connected && writeChar != nil`, both live again
+        // post-reconnect) → knocks the RESUMED `0x4e` stream off, defeating reconnect-resume. Pure
+        // cancel+detach: no SportStop write (the peripheral is .disconnected at teardown, so it'd no-op).
+        sportStartTask?.cancel(); sportStartTask = nil
         endDrainAssertion()   // a cancelled drain must not leak its assertion (#119)
         monitoring = false
         livePreparing = false
         syncing = false
         autoMeasuring = false
         userMeasuring = false
+        sportSessionActive = false
+        workoutHRActive = false
+        sportUsingLivePollFallback = false
         userMeasureDeadline = nil
         // Stop CoreBluetooth callbacks routing to a torn-down session. Only clear the delegate if
         // it's still us — a newer session for the same peripheral reassigns it in its own `init`,
@@ -1614,6 +1625,19 @@ final class RingSession: NSObject {
     /// matter of time. 18 s clears the observed 12.6 s with margin and stays under the 35 s stall
     /// watchdog; 14 s left only ~1.4 s and could bail to the poll before the stream even started.
     private static let sportFirstFrameWait: TimeInterval = 18
+    /// How many times to (re-)send `06 03` before giving up on native sport and falling back to the
+    /// `0x95` live-HR poll. GROUND TRUTH (official-app Android snoop, `fresh_decoded.txt` L389–401):
+    /// the app fires `06 03`, and when the ring does NOT accept it (no `86`, or a `86 fd` "not ready")
+    /// it simply RE-SENDS the identical `06 03` ~5 s later — NO history drain, no mode dance — until
+    /// the ring answers `86 00` and streams `0x4e`. The app got its accept on the SECOND send. Our old
+    /// path ran a full ~24 s history drain between the two attempts, which is slow AND counter-
+    /// productive (the drain is itself a sync, and a `06 03` fired right after a sync is rejected again
+    /// — device-confirmed `86 fd` on BOTH attempts, 2026-07-11 15:14). So we re-send patiently instead.
+    private static let sportStartMaxAttempts = 5
+    /// Gap between app-faithful `06 03` re-sends. Ground truth ~5 s (the ring accepted the app's 2nd
+    /// send 5.4 s after the 1st). Kept under `sportFirstFrameWait` so a late accept still catches its
+    /// stream within the same enter sequence.
+    private static let sportStartRetryGap: TimeInterval = 4
 
     /// The ring's work-mode as reported by the most recent `0x10`/`0x87` descriptor byte[2]:
     /// `0x02`/`0x03` idle, `0x04` on charger, `0x06` sport active (others, e.g. a live-read mode,
@@ -1626,11 +1650,13 @@ final class RingSession: NSObject {
     /// 2026-07-09: descriptor mode `0x03` → `06 03` → `86 00 86`). `0x04` is on-charger, `0x06` sport.
     private static func isIdleMode(_ mode: UInt8) -> Bool { mode == 0x02 || mode == 0x03 }
 
-    /// Outcome of one `06 03` SportStart attempt (#174).
+    /// Outcome of one `06 03` SportStart attempt (#174). `rejected`/`ignored` are both RETRY-ABLE — the
+    /// caller re-sends the identical `06 03` (the official app's recovery, `fresh_decoded.txt` L389–401);
+    /// only `silentAccept` (accepted but never streamed) is terminal-for-this-link → poll fallback.
     private enum SportStartResult: Equatable {
         case streaming     // a 0x4e frame arrived — native sport HR is live
-        case rejected      // `86 fd …` — the ring refused (not idle)
-        case ignored       // no `86` verdict at all — the command was dropped from a non-idle state
+        case rejected      // `86 fd …` — the ring answered "not ready"; a patient re-send usually clears it
+        case ignored       // no `86` verdict at all — the command was dropped (ring busy); re-send
         case silentAccept  // `86 00 86` but no 0x4e stream materialised within the wait
     }
 
@@ -1661,100 +1687,104 @@ final class RingSession: NSObject {
         lastSportFrameAt = nil
         sportStartRejected = false
         monitoringStartedAt = Date()   // gate: only in-session locks seed the workout (WorkoutHRGate)
-        // Enter sport the OFFICIAL APP's way (ground truth: 1-hour Gentle Yoga snoop, 2026-07-09,
-        // captures/workout_yoga_20260709.zip). The app enters `06 03` from clean POST-SYNC IDLE and sends
-        // `06 00` ONLY to STOP — never before a start. Our `86 fd` rejection came from sending `06 00`
-        // (to exit the dashboard's live-HR mode) right before `06 03`; and `06 03` sent directly from
-        // live-HR mode was silently IGNORED. FIX: reach idle the app's way — a history SYNC (live-HR and
-        // history sync are mutually exclusive, so the drain forces the ring out of live-HR → idle) — then
-        // `06 03` with NO `06 00` anywhere. If the ring still refuses, fall back to the live-HR poll so
-        // the workout still records (`workoutHRActive` stays true across the switch).
+        // Enter the ring's native sport mode the OFFICIAL APP's way. Two ground-truth captures inform
+        // this: (1) the yoga snoop (2026-07-09) established `06 03 <type>` alone (never `06 00` before a
+        // start) as the SportStart, and that a stray trailing `d0` aborted it → `86 fd`; (2) the fresh
+        // workout snoop (`fresh_decoded.txt` L389–401) revealed the RECOVERY behavior: the app fires
+        // `06 03`, and when the ring does NOT accept it (no `86`, or a `86 fd` "not ready"), it simply
+        // RE-SENDS the identical `06 03` ~5 s later — NO history drain — until `86 00` + the `0x4e`
+        // stream. It got its accept on the 2nd send. Our previous code ran a full ~24 s history drain
+        // between attempts to "reach idle"; that was slow AND counter-productive — the drain is a sync,
+        // and a `06 03` fired right after a sync is rejected again (device-confirmed `86 fd` on BOTH
+        // attempts, 2026-07-11 15:14, from confirmed-idle descriptor mode). So we now reach idle ONCE
+        // (best-effort) then patiently re-send `06 03` like the app. If it never lands, fall back to the
+        // `0x95` live-HR poll so the workout still records (`workoutHRActive` stays true across the switch).
         let wasMonitoring = monitoring   // were we in the dashboard's live-HR mode? (sizes the fast-path probe)
         if monitoring { stopLiveMonitoring(scheduleStatusRefresh: false) }
         sportStartTask?.cancel()
         sportStartTask = Task { [weak self] in
             guard let self else { return }
-            // Reach idle the app's way (ground truth: yoga snoop 2026-07-09) — the ring accepts `06 03`
-            // ONLY from idle (descriptor mode 0x02/0x03). We NEVER send `06 00` before `06 03` (that was
-            // the old `86 fd` root cause). BOUNDED so a backlogged/busy ring can't hang the start (#174):
-            //   attempt 1 — await any in-flight sync (it lands the ring in idle when it finishes, so don't
-            //               SKIP it) then let the descriptor confirm idle (already-idle / auto-reverted).
-            //   attempt 2 — force the transition with a bounded single-channel sync-to-idle (opening a
-            //               sync kicks the ring out of live-HR), then confirm idle.
-            // Whole thing capped by `sportReachIdleBudget`; on failure we fall back to the `0x95` poll so
-            // the workout still records HR (`workoutHRActive` stays true across the switch).
             self.reachIdleStartedAt = Date()
             let deadline = self.reachIdleStartedAt.addingTimeInterval(RingSession.sportReachIdleBudget)
+            // Reach idle ONCE (fast path): await any in-flight sync (it lands the ring in idle when it
+            // finishes, so don't SKIP it — #174 #3) then let the descriptor confirm idle. This exits the
+            // dashboard's live-HR mode. It is BEST-EFFORT: we send `06 03` even without a positive idle
+            // confirm, because the ground-truth app fires `06 03` without waiting for idle (and the retry
+            // loop below is what actually lands the start). The old code did a full ~24 s history drain
+            // here on a non-idle read — removed: the app never drains to start sport, and a `06 03` right
+            // after a drain-sync is rejected again (device-confirmed 86 fd twice, 2026-07-11).
+            await self.awaitInFlightSyncForIdle(deadline: deadline)   // #174 #3 — don't skip a running sync
+            guard self.sportSessionActive, !Task.isCancelled else { return }
+            let probe = wasMonitoring ? RingSession.sportFastPathAfterLive : RingSession.sportFastPathIdle
+            let idleConfirmed = await self.awaitIdleDescriptor(
+                deadline: min(deadline, Date().addingTimeInterval(probe)), reason: "fast-path")
+            if !idleConfirmed {
+                ringLog.notice("sport: fast path didn't confirm idle — sending 06 03 anyway (app-faithful)")
+            }
+            // PRIME MEASUREMENT before SportStart. TRUE ROOT CAUSE (same-ring A/B snoop, app_workout2
+            // 2026-07-12): the ring accepts `06 03` ONLY while it is ACTIVELY MEASURING, and the official
+            // app puts it there by opening + FULLY DRAINING the all-day history right before `06 03` — its
+            // `07`/`c7`/`cc` pull real `0x47` PPG + `0x4c` pages (ring streaming = measuring), reaching the
+            // `4c 00 00` end, THEN `06 03 → 86 00`. Our COLD reach-idle (`07` → `0x10` status, never
+            // `0x47`) leaves the ring non-measuring → `86 fd` (device-confirmed 5×, on BOTH type 0x06 and
+            // 0x07, 2026-07-12). So run the FULL lossless history drain here — it MUST go through the sync
+            // machinery (`syncing=true` banks each `0x4c`; a bare `cc` ack would ack-and-DISCARD an
+            // un-synced night, the #119 loss class) — to stream the ring's history and land it measuring.
+            // (I had removed this drain-before-`06 03` earlier this session on the WRONG inference "the app
+            // never syncs"; the fresh snoop shows it does. runGuardedHistoryDrain self-guards ready/
+            // syncTask==nil/not-sleep-window and no-ops overnight so it can't self-contend the night.)
+            if self.syncTask == nil, !self.sportGotFirstFrame {
+                ringLog.notice("sport: priming measurement via all-day history drain before SportStart")
+                // allowInSleepWindow: a workout means the user is awake → the overnight night-protection
+                // doesn't apply, and the official app itself primes+starts sport overnight (00:05 snoop).
+                // allDayOnly: even overnight, touch ONLY the all-day channel (0x03) — never the sleep
+                // pointer — so priming a workout can't fragment/truncate a sleep night (#119).
+                await self.runGuardedHistoryDrain(trigger: "sport-enter", allowInSleepWindow: true, allDayOnly: true)
+                guard self.sportSessionActive, !self.sportGotFirstFrame, !Task.isCancelled else { return }
+            }
+            // App-faithful SportStart retry (ground truth: `fresh_decoded.txt` L389–401). Re-send the
+            // identical `06 03` up to `sportStartMaxAttempts`, ~`sportStartRetryGap` s apart, with NO
+            // drain between tries — exactly how the official app recovers a `06 03` the ring doesn't
+            // accept. See `sportStartMaxAttempts` for the full rationale.
             var streaming = false
-            for attempt in 1...2 {
-                guard self.sportSessionActive, !self.sportGotFirstFrame, !Task.isCancelled else { return }
-                var idleConfirmed = false
-                if attempt == 1 {
-                    await self.awaitInFlightSyncForIdle(deadline: deadline)   // #174 #3 — don't skip a running sync
-                    guard self.sportSessionActive, !self.sportGotFirstFrame, !Task.isCancelled else { return }
-                    let probe = wasMonitoring ? RingSession.sportFastPathAfterLive : RingSession.sportFastPathIdle
-                    // Anchor the probe window to NOW (not task start): `awaitInFlightSyncForIdle` may have
-                    // just spent several seconds waiting out a sync, and that wait must not eat the probe —
-                    // otherwise the just-finished sync leaves the ring idle but we never confirm it and do a
-                    // redundant full drain (defeating the #3 await-the-sync mechanism).
-                    idleConfirmed = await self.awaitIdleDescriptor(
-                        deadline: min(deadline, Date().addingTimeInterval(probe)),
-                        reason: "fast-path")
-                } else {
-                    // Not idle after the fast path: force the ring out of live-HR with a FULL, LOSSLESS
-                    // drain to its natural end (the proven recovery). We do NOT cut it short — a partial
-                    // drain would ack-and-discard the streamed remainder and truncate an un-synced night
-                    // (#119). Skipped overnight; `runGuardedHistoryDrain` also no-ops if a sync is running
-                    // (attempt 1 already awaited it). After it the ring is idle, so confirm briefly (the
-                    // drain may have run past `deadline`; use a fresh short window) then always try `06 03`.
-                    if !self.isInSleepWindow {
-                        await self.runGuardedHistoryDrain(trigger: "sport-enter")
-                    }
-                    guard self.sportSessionActive, !self.sportGotFirstFrame, !Task.isCancelled else { return }
-                    idleConfirmed = await self.awaitIdleDescriptor(
-                        deadline: Date().addingTimeInterval(RingSession.sportFastPathIdle), reason: "post-drain")
-                    ringLog.notice("sport: SportStart retry after full drain-to-idle (idleConfirmed=\(idleConfirmed))")
-                }
-                guard self.sportSessionActive, !self.sportGotFirstFrame, !Task.isCancelled else { return }
-                // Attempt 1 only fires `06 03` with POSITIVE idle confirmation — a `06 03` from a non-idle
-                // ring is ignored/rejected and just wastes the watch window, so fall straight to the drain.
-                // Attempt 2 always tries: the drain likely reached idle even if the descriptor read lagged.
-                if attempt == 1, !idleConfirmed {
-                    ringLog.notice("sport: fast path didn't confirm idle — full drain-to-idle next")
-                    continue
-                }
-                // One-writer rule (#174): never inject `06 03` into a link a sync still owns. A foreign
-                // sync (morning reconnect / periodic overnight backlog) can outlast the reach-idle budget
-                // that `awaitInFlightSyncForIdle` is bounded by; `runGuardedHistoryDrain` then no-ops on
-                // its `syncTask == nil` guard, so without this check attempt 2 would write SportStart into
-                // the still-active drain. Break to the poll fallback, which takes the link over cleanly
-                // (`startLiveMonitoring` cancels the sync AFTER banking its captured pages — lossless).
+            for attempt in 1...RingSession.sportStartMaxAttempts {
+                guard self.sportSessionActive, !Task.isCancelled else { return }
+                if self.sportGotFirstFrame { break }   // a 0x4e already arrived → install the watchdog below
+                // One-writer rule (#174): never inject `06 03` into a link a sync still owns. If a foreign
+                // sync (morning reconnect / periodic overnight backlog) outlasted the bounded
+                // `awaitInFlightSyncForIdle` wait and still owns the link, hand off to the poll fallback:
+                // `startLiveMonitoring` cancels the sync AFTER banking its captured pages (lossless), so
+                // this neither truncates a night nor writes `06 03` into an active sync. (We do NOT try to
+                // drain it here — `runGuardedHistoryDrain` no-ops while `syncTask != nil` anyway.)
                 if self.syncTask != nil {
-                    ringLog.notice("sport: a sync still owns the link after reach-idle — falling back to poll")
+                    ringLog.notice("sport: a sync still owns the link — falling back to poll")
                     break
                 }
                 let result = await self.sendSportStartAndClassify(typeByte: typeByte)
-                switch result {
-                case .streaming:
-                    streaming = true
-                case .rejected:
-                    ringLog.notice("sport: SportStart rejected (86 fd) on attempt \(attempt)")
-                case .ignored:
-                    ringLog.notice("sport: SportStart got no 86 (ignored — ring not idle) on attempt \(attempt)")
-                case .silentAccept:
-                    // `86 00 86` but no 0x4e — the ring took the command from idle yet won't stream on
-                    // this link. Retrying won't change that; fall straight to the poll fallback.
+                if result == .streaming { streaming = true; break }
+                if result == .silentAccept {
+                    // `86 00 86` but no `0x4e` — the ring took the command yet won't stream on this link.
+                    // Retrying can't change that; fall straight to the poll fallback.
                     ringLog.notice("sport: SportStart accepted but no 0x4e stream — falling back to poll")
+                    break
                 }
-                // Stop retrying on success (streaming) or a genuine-accept-but-no-stream (retry can't
-                // help). A reject/ignore means we weren't idle — attempt 2's full drain-to-idle is the fix.
-                if result == .streaming || result == .silentAccept { break }
-                guard self.sportSessionActive, !self.sportGotFirstFrame, !Task.isCancelled else { return }
-                // A reject/ignore means we weren't idle — always fall through to attempt 2's full
-                // lossless drain-to-idle, even if attempt 1's waits consumed the reach-idle budget.
+                // `.rejected` (`86 fd` — not ready) or `.ignored` (no `86`): the app's fix is a patient,
+                // identical re-send. Don't burn the last attempt's gap sleeping before the fallback.
+                guard self.sportSessionActive, !Task.isCancelled else { return }
+                if attempt < RingSession.sportStartMaxAttempts {
+                    ringLog.notice("sport: SportStart \(String(describing: result)) on attempt \(attempt)/\(RingSession.sportStartMaxAttempts) — re-sending 06 03 in \(Int(RingSession.sportStartRetryGap))s (app-faithful, no drain)")
+                    try? await Task.sleep(for: .seconds(RingSession.sportStartRetryGap))
+                } else {
+                    ringLog.notice("sport: SportStart \(String(describing: result)) on final attempt \(attempt)/\(RingSession.sportStartMaxAttempts) — falling back to poll")
+                }
             }
-            guard self.sportSessionActive else { return }
-            if !streaming {
+            guard self.sportSessionActive, !Task.isCancelled else { return }
+            // Inclusive (review finding): a `0x4e` that arrived OUTSIDE a `sendSportStartAndClassify`
+            // call — during reach-idle, inside a retry gap, or on a rapid re-begin — sets
+            // `sportGotFirstFrame` without setting the local `streaming`. Count it so the stall-watchdog
+            // below still installs for a genuinely live stream instead of aborting HR-less.
+            let streamingConfirmed = streaming || self.sportGotFirstFrame
+            if !streamingConfirmed {
                 // The ring won't stream sport HR on this link (proven iOS behavior — 86 fd reject, no-86
                 // ignore, or accepted-but-silent, each logged above). Fall back to the `0x95` live-HR poll
                 // so the workout still records best-effort HR (#45) instead of nothing.
@@ -1902,18 +1932,25 @@ final class RingSession: NSObject {
     /// which case draining IS the right thing — it syncs the night). Guarded so it never runs overnight
     /// (self-contention truncates the night) or collides with an in-flight sync. Returns false (no-op)
     /// when skipped.
+    /// `allowInSleepWindow` (workout measurement-prime only): normally we NEVER drain overnight
+    /// (self-contention truncates the night). But a user-initiated WORKOUT means the user is AWAKE, so
+    /// the night-protection doesn't apply — and the ring must be measuring for `06 03` to be accepted
+    /// (same-ring A/B snoop, 2026-07-12). Paired with `allDayOnly: true` so even overnight the prime
+    /// touches ONLY the all-day channel (0x03), never the sleep pointer — so it can't fragment a night.
     @discardableResult
-    private func runGuardedHistoryDrain(trigger: String) async -> Bool {
-        guard ready, syncTask == nil, !calibrationCapturing, !isInSleepWindow else {
+    private func runGuardedHistoryDrain(trigger: String,
+                                        allowInSleepWindow: Bool = false,
+                                        allDayOnly: Bool = false) async -> Bool {
+        guard ready, syncTask == nil, !calibrationCapturing, allowInSleepWindow || !isInSleepWindow else {
             ringLog.notice("\(trigger, privacy: .public): drain SKIP (link busy or sleep-window)")
             return false
         }
         if monitoring { stopLiveMonitoring(scheduleStatusRefresh: false) }   // live polling would fight the drain
-        ringLog.notice("\(trigger, privacy: .public): draining history to reach clean idle")
+        ringLog.notice("\(trigger, privacy: .public): draining history\(allDayOnly ? " (all-day only)" : "") to reach clean idle")
         historySyncTrigger = trigger
         let task = Task { [weak self] in
             guard let self else { return }
-            await self.performHistoryDrain()
+            await self.performHistoryDrain(allDayOnly: allDayOnly)
         }
         syncTask = task            // block any concurrent sync for the drain's duration
         await task.value           // performHistoryDrain runs finalizeSync and clears syncing/syncTask
@@ -2263,7 +2300,7 @@ final class RingSession: NSObject {
     /// `0x03`), so the two streams union cleanly in the EpochArchive with no counter collisions —
     /// the daytime channel never overwrites a sleep epoch's motion/HRV. `finalizeSync` clears
     /// `syncing`/`syncTask` on exit.
-    private func performHistoryDrain() async {
+    private func performHistoryDrain(allDayOnly: Bool = false) async {
         // Backgrounded drain (#119): hold an assertion and remember what woke us — this drain
         // must deliver its own results (Health flush + morning notification) because the
         // foreground pipelines (ContentView's onChange(syncing) mirror) don't run suspended.
@@ -2287,8 +2324,13 @@ final class RingSession: NSObject {
         syncing = true
         syncStatus = nil
         drainCountsByLabel.removeAll()
-        // Channel 0x00 — the sleep/overnight history (+ idle epochs).
-        await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
+        // Channel 0x00 — the sleep/overnight history (+ idle epochs). SKIPPED when `allDayOnly` (the
+        // workout measurement-prime): draining the sleep channel overnight advances the sleep resume
+        // pointer and can truncate/fragment the night (#119), and the prime only needs the all-day
+        // channel to wake measurement — so the prime touches ONLY 0x03 and never the sleep pointer.
+        if !allDayOnly {
+            await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
+        }
         // Channel 0x03 — the awake/all-day log: activity HR + a periodic ~10-min daytime SpO₂ reading
         // (same 23-byte schema, so it flows through the same BulkSleep decode → Health as-is). The
         // official app drains this too; pulling only 0x00 was why daytime SpO₂ went stale (#99).
@@ -3227,11 +3269,15 @@ extension RingSession: CBPeripheralDelegate {
                 return
             case 0x86:
                 // Response to a `0x06`-family command (SportStart `06 03 …` / SportStop `06 00 …` /
-                // live-HR `06 01 …`). `86 00 86` = accepted; `86 <err> …` (err≠0, e.g. `86 fd 7b`) =
-                // REJECTED. The enter loop watches `sportStartRejected`/`sportStartAccepted` to classify
-                // the start (accept→wait for the 0x4e stream, reject→bail) fast (#174).
-                let accepted = bytes.count >= 2 && bytes[1] == 0x00
-                self.sportStartRejected = bytes.count >= 2 && bytes[1] != 0x00
+                // live-HR `06 01 …`). `86 00 86` = accepted. `86 fc …` = "already in sport" — benign:
+                // the ring IS in sport and will stream `0x4e`, so treat it as accepted (ground truth
+                // `fresh_decoded.txt` L397–401: the app's redundant `06 03` while already in sport drew
+                // `86 fc 7a`, then the `0x4e` stream flowed). `86 <other>` (err≠0, e.g. `86 fd 7b` =
+                // "not ready") = a real REJECT → the enter loop re-sends the identical `06 03` (app-
+                // faithful, no drain). The enter loop watches `sportStartRejected`/`sportStartAccepted`.
+                let err: UInt8 = bytes.count >= 2 ? bytes[1] : 0xFF
+                let accepted = (err == 0x00 || err == 0xFC)
+                self.sportStartRejected = !accepted
                 self.sportStartAccepted = accepted
                 ringLog.notice("← 0x86 sport-cmd resp: \(self.lastFrame ?? "", privacy: .public)")
                 return

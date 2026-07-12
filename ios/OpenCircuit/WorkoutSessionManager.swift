@@ -101,6 +101,9 @@ final class WorkoutSessionManager: NSObject {
 
     private var hrPollTask: Task<Void, Never>?
     private var timerTask: Task<Void, Never>?
+    /// Re-arms native sport on a NEW `RingSession` after a mid-workout BLE drop (#reconnect). Bounded so
+    /// a link that never comes back can't spin forever. Cancelled on every workout-end path.
+    private var reconnectResumeTask: Task<Void, Never>?
 
     /// CoreLocation manager for outdoor GPS route capture (or the indoor keep-alive session).
     private var locationManager: CLLocationManager?
@@ -189,6 +192,13 @@ final class WorkoutSessionManager: NSObject {
         guard case .idle = recordingState else { return }
         self.session = session
         self.store = store
+        // Reconnect-resume (#reconnect): if the ring drops mid-workout, RingScanner tears down this
+        // session and builds a fresh one with NO sport state — adopt it and re-arm native sport so HR
+        // resumes. This is the ONLY background-safe hook (fires from CoreBluetooth's didConnect even
+        // while the screen is locked). Cleared on every end path (stop/cancel/reset).
+        RingScanner.shared.onSessionReplaced = { [weak self] newSession in
+            self?.adoptReconnectedSession(newSession)
+        }
         let start = Date()
         sessionStart = start
         let profile = HealthKitWriter.storedUserProfile()
@@ -273,6 +283,33 @@ final class WorkoutSessionManager: NSObject {
         )
     }
 
+    /// Adopt a `RingSession` that replaced ours mid-workout (a BLE drop → RingScanner reconnected and
+    /// built a fresh session with NO sport state). Re-point at it and, once it's authed/`ready`, re-enter
+    /// native sport so the `0x4e` HR stream resumes. The aggregator + timer keep running across the gap,
+    /// so only HR pauses (honestly — #45) then continues; pre-drop ring-counted steps are lost (minor —
+    /// HR history is preserved in the aggregator). Bounded wait so a link that never returns can't spin.
+    func adoptReconnectedSession(_ newSession: RingSession) {
+        switch recordingState { case .starting, .active: break; default: return }
+        guard newSession !== session else { return }
+        session = newSession
+        reconnectResumeTask?.cancel()
+        reconnectResumeTask = Task { [weak self] in
+            // The fresh link starts un-authed; wait until it's `ready` before SportStart (a `06 03` into
+            // an un-authed link is dropped). Bounded so a ring that never comes back doesn't spin.
+            let deadline = Date().addingTimeInterval(30)
+            while !Task.isCancelled, Date() < deadline {
+                guard let self else { return }
+                switch self.recordingState { case .starting, .active: break; default: return }
+                guard self.session === newSession else { return }   // superseded by a newer swap / ended
+                if newSession.ready { break }
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            guard let self, self.session === newSession, newSession.ready else { return }
+            switch self.recordingState { case .starting, .active: break; default: return }
+            newSession.beginSportSession(typeByte: self.selectedSport.firmwareByte)
+        }
+    }
+
     /// Stop the session, write to HealthKit, transition to `.finished`.
     func stop() async {
         // Allow stopping from both .starting and .active
@@ -281,6 +318,11 @@ final class WorkoutSessionManager: NSObject {
         default: return
         }
         recordingState = .finishing
+
+        // Reconnect-resume teardown (#reconnect): stop adopting replacement sessions + cancel any
+        // pending re-arm, so a reconnect that lands after the user hit Stop can't restart sport.
+        RingScanner.shared.onSessionReplaced = nil
+        reconnectResumeTask?.cancel(); reconnectResumeTask = nil
 
         // T6: clear the durable flag FIRST — before `endSportSession()` below flips
         // `session.workoutHolding` false (which fires ContentView's re-arm). Clearing here covers
@@ -425,6 +467,8 @@ final class WorkoutSessionManager: NSObject {
 
     /// Discard the session without writing to HealthKit.
     func cancel() {
+        RingScanner.shared.onSessionReplaced = nil          // #reconnect: stop adopting replacement sessions
+        reconnectResumeTask?.cancel(); reconnectResumeTask = nil
         // T6: clear the durable flag on the cancel end path too (before `endSportSession()` below
         // releases `workoutHolding` and re-arms the deferred drain).
         Self.setWorkoutInProgressPersisted(false)
@@ -445,6 +489,8 @@ final class WorkoutSessionManager: NSObject {
     }
 
     func reset() {
+        RingScanner.shared.onSessionReplaced = nil          // #reconnect: belt-and-suspenders teardown
+        reconnectResumeTask?.cancel(); reconnectResumeTask = nil
         // T6: belt-and-suspenders — `reset()` runs from the summary "Done" / error "Dismiss"
         // buttons (after `stop()` already cleared it), but clear again so no path can leave it set.
         Self.setWorkoutInProgressPersisted(false)

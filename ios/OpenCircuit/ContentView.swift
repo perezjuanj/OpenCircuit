@@ -69,9 +69,16 @@ struct ContentView: View {
     @State private var batteryWasFull = false
     /// Last time the foreground auto-refresh ran a sync; debounces repeated foregrounds.
     @State private var lastForegroundSync: Date?
-    /// Minimum spacing between foreground auto-syncs — one bounded refresh per foreground,
-    /// never a loop, and conservative about battery/contention with the official app.
-    private static let autoSyncInterval: TimeInterval = 120
+    /// Minimum spacing between foreground/reconnect auto-syncs — one bounded refresh, never a loop,
+    /// conservative about battery/contention. Raised 120→300 s: a FLAKY ring reconnects/relaunches
+    /// repeatedly and each one re-fired the auto-sync, so a ~2-min spacing let almost every reconnect run
+    /// a full ~30 s (usually empty) sync that blocks the workout Start. The periodic/BLE-wake drain still
+    /// delivers the backlog on its own cadence; this only suppresses the redundant reconnect re-sync.
+    /// (Kept at 300 s, NOT 600 s — the throttle now also honours the PERSISTED `lastSuccessfulSync`,
+    /// which a *partial* background drain bumps (epochs>0 yet the night not fully drained); a longer
+    /// window would suppress the foreground continuation drain of the night's tail for that whole window.
+    /// 300 s bounds that delay, and the hourly wake-drain backstops the tail regardless — review MEDIUM.)
+    private static let autoSyncInterval: TimeInterval = 300
 
     private let health = HealthKitWriter()
 
@@ -378,9 +385,14 @@ struct ContentView: View {
         guard pendingAutoSync, let session, session.ready,
               !session.monitoring, !session.syncing, !session.workoutHolding,
               !WorkoutSessionManager.isWorkoutInProgressPersisted else { return }
-        if let last = lastForegroundSync,
-           Date().timeIntervalSince(last) < Self.autoSyncInterval {
-            pendingAutoSync = false   // too soon — consume the request without syncing
+        // Throttle off the most recent of the in-memory OR the PERSISTED last successful sync (#churn):
+        // `lastForegroundSync` alone RESET on every app relaunch, so a fresh launch (or a background
+        // relaunch on a ring reconnect) always re-synced — the "open the app → wait ~30 s before I can
+        // start a workout" churn. `observability.lastSuccessfulSync` survives relaunch, so a reconnect/
+        // relaunch within the interval of the last real sync is skipped.
+        let lastSync = [lastForegroundSync, observability.lastSuccessfulSync].compactMap { $0 }.max()
+        if let last = lastSync, Date().timeIntervalSince(last) < Self.autoSyncInterval {
+            pendingAutoSync = false   // synced recently (this session OR a prior one) — skip the re-sync
             return
         }
         pendingAutoSync = false
