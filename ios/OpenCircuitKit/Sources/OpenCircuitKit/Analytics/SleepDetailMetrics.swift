@@ -49,11 +49,13 @@ public enum SleepDetailMetrics {
         case active = 2   // substantial movement (likely awake/arousal)
     }
 
-    /// Motion threshold (summed non-baseline `[10:15]` counts) above which an epoch is `.active`
-    /// rather than `.light`. `1` per sub-sample is the still baseline and contributes 0; this
-    /// `.active` cut-off aligns with `SleepStaging`'s awake-motion default, so a movement spike
-    /// the chart calls "active" is the same energy that drives an Awake classification.
-    public static let activeThreshold = 15
+    /// Fraction of the night's OWN moving epochs that read `.active` rather than `.light`. The
+    /// still/moving split is absolute (zero intra-epoch motion = still); this only decides where,
+    /// WITHIN the movement you actually had, "light" becomes "active" — a distribution split (like
+    /// `SleepDetection.motionFloorPercentile`), NOT a physical motion baseline. Deriving it from the
+    /// night's own energies means a calm night is never painted `.active` by an absolute cut (the bug
+    /// this file used to have) while a genuinely restless night still surfaces its worst epochs.
+    public static let activePercentile = 0.80
 
     public struct MovementEpoch: Equatable, Sendable {
         public let time: Date
@@ -66,19 +68,45 @@ public enum SleepDetailMetrics {
 
     /// Per-epoch movement levels across the records, optionally scoped to a window. One entry
     /// per 0x4c record (≈ every 2.5 min). Idle/unworn epochs read as `.still`.
+    /// `activeThreshold`: optional absolute cut on the intra-epoch energy for `.active`. Pass `nil`
+    /// (the default) to derive the cut from the night's own movement distribution — production always
+    /// does, so there is no hardcoded motion baseline; an explicit value is for deterministic tests.
     public static func movement(records: [BulkRecord],
                                 in window: DateInterval? = nil,
-                                activeThreshold: Int = activeThreshold,
+                                activeThreshold: Int? = nil,
                                 epoch: Int = Command.syncEpoch) -> [MovementEpoch] {
-        records
+        let scoped = records
             .sorted { $0.counter < $1.counter }
-            .compactMap { r in
-                let t = r.date(epoch: epoch)
-                if let w = window, !w.contains(t) { return nil }
-                let mag = r.motion.reduce(0) { $0 + ($1 == 1 ? 0 : Int($1)) }
-                let level: MovementLevel = mag == 0 ? .still : (mag > activeThreshold ? .active : .light)
-                return MovementEpoch(time: t, level: level, magnitude: mag)
-            }
+            .filter { r in window.map { $0.contains(r.date(epoch: epoch)) } ?? true }
+        let mags = scoped.map(epochMotionEnergy)
+        let cut = activeThreshold ?? derivedActiveCut(mags)
+        return zip(scoped, mags).map { r, mag in
+            let level: MovementLevel = mag == 0 ? .still : (mag >= cut ? .active : .light)
+            return MovementEpoch(time: r.date(epoch: epoch), level: level, magnitude: mag)
+        }
+    }
+
+    /// Intra-epoch movement energy: how far the five 30-s sub-samples rise above the epoch's OWN
+    /// minimum. A constant run — the ring's still/placeholder filler at ANY device level (Gen-2 `01`,
+    /// Gen-3 `0f`=15, or a drifted idle; see `BulkRecord.motionIsPlaceholder`) — has zero deviation →
+    /// `0` (still). Real motion, whose counts always vary sample-to-sample, rises above its floor.
+    /// This replaces the old `$1 == 1` absolute baseline, which read a Gen-3 `0f`=15 placeholder as
+    /// maximal motion (5×15 = 75 > 15) and painted every core-sleep epoch `.active` — the "all-orange"
+    /// bug. No device-specific baseline constant: the floor is the epoch's own minimum.
+    static func epochMotionEnergy(_ r: BulkRecord) -> Int {
+        let m = r.motion
+        guard let base = m.min() else { return 0 }
+        return m.reduce(0) { $0 + Int($1) - Int(base) }
+    }
+
+    /// Light/active boundary derived from the night's OWN movement — the `activePercentile` of the
+    /// positive (moving) epoch energies. Returns `.max` when nothing moved, so an all-still night has
+    /// no `.active` epochs. Fully data-derived; no absolute motion constant.
+    static func derivedActiveCut(_ mags: [Int]) -> Int {
+        let positive = mags.filter { $0 > 0 }.sorted()
+        guard !positive.isEmpty else { return .max }
+        let idx = Int((Double(positive.count - 1) * activePercentile).rounded())
+        return positive[idx]
     }
 
     /// Compact movement summary for persistence/display: the per-epoch level series plus
@@ -98,7 +126,7 @@ public enum SleepDetailMetrics {
 
     public static func movementSummary(records: [BulkRecord],
                                        in window: DateInterval? = nil,
-                                       activeThreshold: Int = activeThreshold,
+                                       activeThreshold: Int? = nil,
                                        epoch: Int = Command.syncEpoch) -> MovementSummary {
         let epochs = movement(records: records, in: window, activeThreshold: activeThreshold, epoch: epoch)
         var still = 0, light = 0, active = 0

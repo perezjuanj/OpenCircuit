@@ -128,6 +128,23 @@ public struct BulkRecord: Equatable {
     /// `[10:15]` — 5 per-30 s motion/activity counts (🟢 role). `01` baseline = still.
     public var motion: [UInt8] { Array(raw[10..<15]) }
 
+    /// True when `[10:15]` is a CONSTANT run (all five 30-s sub-samples equal) on a worn epoch —
+    /// the ring's "no fine-motion recorded" placeholder. 🟢 verified on the 2026-07-12 capture: a
+    /// byte-identical `0f 0f 0f 0f 0f` (=15) filled 185 epochs across the whole core-sleep window
+    /// while HR/HRV/SpO2 varied normally — a constant field is a FILLER, not a measurement, and its
+    /// `[15:20]` tail was zero 71 % of the time with no correlation to sleep depth. The placeholder
+    /// level is device- and posture-dependent (Gen-2 idles at `01`, Gen-3 at `0f` and DRIFTS), so
+    /// this keys on the STRUCTURE (zero intra-epoch variation), never a specific value — real motion,
+    /// whose counts always vary sample-to-sample, is never a constant run. Layout-agnostic on purpose:
+    /// the same placeholder rides BOTH sleep-vitals AND `0x12`-activity epochs (92 + 93 of the 185),
+    /// so gating on layout would miss half of them and leave the movement bar half-wrong. The idle /
+    /// unworn template is excluded — it has its own `.idle` layout and dedicated handling.
+    public var motionIsPlaceholder: Bool {
+        guard layout != .idle else { return false }
+        let m = raw[10..<15]
+        return m.allSatisfy { $0 == m.first }
+    }
+
     /// Confidence / signal quality, `[6]` (🟢 named, PROTOCOL.md §5.3 — range ~0...12,
     /// not yet bounded precisely). Decoded but NOT currently consumed by any analytic —
     /// available for the supervised sleep-stage fitter (`desktop/ringconn_sleep_fit.py`)

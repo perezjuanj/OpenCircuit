@@ -4,14 +4,19 @@ import XCTest
 /// SYNTHETIC-ONLY tests for per-stage HR + the movement timeline (#70).
 final class SleepDetailMetricsTests: XCTestCase {
 
-    /// A sleep-vitals epoch with explicit HR + uniform motion byte.
-    private func rec(_ counter: UInt32, hr: UInt8, motion: UInt8 = 1) -> BulkRecord {
+    /// A sleep-vitals epoch with an explicit 5-sample motion array.
+    private func rec(_ counter: UInt32, hr: UInt8, motionBytes: [UInt8]) -> BulkRecord {
         var b = [UInt8](repeating: 0, count: 23)
         b[0] = UInt8(counter >> 24); b[1] = UInt8((counter >> 16) & 0xFF)
         b[2] = UInt8((counter >> 8) & 0xFF); b[3] = UInt8(counter & 0xFF)
         b[4] = hr; b[8] = 0x62
-        for k in 0..<5 { b[10 + k] = motion }
+        for k in 0..<5 { b[10 + k] = motionBytes[k] }
         return BulkRecord(b)!
+    }
+
+    /// A sleep-vitals epoch with a UNIFORM motion byte (a constant run = still at any level).
+    private func rec(_ counter: UInt32, hr: UInt8, motion: UInt8 = 1) -> BulkRecord {
+        rec(counter, hr: hr, motionBytes: [UInt8](repeating: motion, count: 5))
     }
 
     private let step: UInt32 = 150
@@ -43,26 +48,54 @@ final class SleepDetailMetricsTests: XCTestCase {
         XCTAssertNil(byStage[.inBed], "inBed excluded so stages don't double-count")
     }
 
+    /// Regression for the "all-orange" bug: a CONSTANT motion run is the ring's still/placeholder
+    /// filler at ANY level — Gen-2 `01`, Gen-3 `0f`(=15), a drifted idle — and must read `.still`,
+    /// never `.active`. The old `$1 == 1` baseline read `0f`×5 as 75 → `.active` on every sleep epoch.
+    func testConstantRunsAreStillAtAnyLevel() {
+        var c: UInt32 = 0
+        var recs: [BulkRecord] = []
+        for v: UInt8 in [1, 15, 20, 39] { recs.append(rec(c, hr: 55, motion: v)); c += step }
+        let m = SleepDetailMetrics.movement(records: recs)
+        XCTAssertEqual(m.map(\.level), [.still, .still, .still, .still])
+        XCTAssertTrue(m.allSatisfy { $0.magnitude == 0 }, "a constant run has zero intra-epoch energy")
+    }
+
+    /// Movement = how far the 5 sub-samples rise above the epoch's OWN minimum (intra-epoch
+    /// variation), not the raw sum. Explicit cut for determinism.
     func testMovementLevels() {
         var c: UInt32 = 0
-        let still = rec(c, hr: 55, motion: 1); c += step      // baseline → still
-        let light = rec(c, hr: 55, motion: 3); c += step      // 5×(3) = 15, not > 15 → light
-        let active = rec(c, hr: 55, motion: 20)               // 5×20 = 100 → active
+        let still  = rec(c, hr: 55, motionBytes: [1, 1, 1, 1, 1]);      c += step  // no variation → still
+        let light  = rec(c, hr: 55, motionBytes: [1, 1, 1, 4, 1]);      c += step  // energy 3
+        let active = rec(c, hr: 55, motionBytes: [10, 40, 15, 50, 20])             // energy 85
 
-        let m = SleepDetailMetrics.movement(records: [still, light, active])
+        let m = SleepDetailMetrics.movement(records: [still, light, active], activeThreshold: 20)
         XCTAssertEqual(m.map(\.level), [.still, .light, .active])
         XCTAssertEqual(m[0].magnitude, 0)
-        XCTAssertEqual(m[2].magnitude, 100)
+        XCTAssertEqual(m[1].magnitude, 3)
+        XCTAssertEqual(m[2].magnitude, 85)
+    }
+
+    /// With no explicit threshold the light/active split is the 80th percentile of the night's OWN
+    /// moving energies — the most energetic epochs read `.active`, calmer movement `.light`.
+    func testDerivedActiveCutUsesNightDistribution() {
+        var c: UInt32 = 0
+        var recs: [BulkRecord] = []
+        // energies 2, 4, 6, 8, 80 ; idx = round(4×0.8) = 3 → cut = 8 ; ≥8 → active
+        for a: [UInt8] in [[1,3,1,1,1], [1,5,1,1,1], [1,7,1,1,1], [1,9,1,1,1], [1,81,1,1,1]] {
+            recs.append(rec(c, hr: 55, motionBytes: a)); c += step
+        }
+        let m = SleepDetailMetrics.movement(records: recs)
+        XCTAssertEqual(m.map(\.level), [.light, .light, .light, .active, .active])
     }
 
     func testMovementSummaryCounts() {
         var c: UInt32 = 0
         var recs: [BulkRecord] = []
-        for _ in 0..<6 { recs.append(rec(c, hr: 55, motion: 1)); c += step }   // still
-        for _ in 0..<3 { recs.append(rec(c, hr: 55, motion: 3)); c += step }   // light
-        for _ in 0..<1 { recs.append(rec(c, hr: 55, motion: 30)); c += step }  // active
+        for _ in 0..<6 { recs.append(rec(c, hr: 55, motion: 1)); c += step }                 // still (energy 0)
+        for _ in 0..<3 { recs.append(rec(c, hr: 55, motionBytes: [1,1,1,4,1])); c += step }   // light (energy 3)
+        recs.append(rec(c, hr: 55, motionBytes: [5,50,5,5,5]))                                // active (energy 45)
 
-        let s = SleepDetailMetrics.movementSummary(records: recs)
+        let s = SleepDetailMetrics.movementSummary(records: recs, activeThreshold: 20)
         XCTAssertEqual(s.still, 6)
         XCTAssertEqual(s.light, 3)
         XCTAssertEqual(s.active, 1)

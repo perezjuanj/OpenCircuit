@@ -146,9 +146,14 @@ public enum SleepStaging {
         // territory, so every knob is exposed.
 
         /// Fraction of the evening→floor HR descent at which (smoothed) HR is taken to have
-        /// "settled" into sleep. Onset band = floor + fraction × (eveningLevel − floor). Lower =
-        /// stricter (band nearer the floor) → onset later / trims more. 0 disables the band move
-        /// (band == floor); raise toward 1 to trim only the most elevated wind-down.
+        /// "settled" into sleep. Onset band = floor + fraction × (eveningLevel − floor). 0 disables
+        /// the band move (band == floor); raise toward 1 to trim more of an elevated wind-down.
+        /// EMPIRICAL, non-monotonic across the whole onset pipeline (it interacts with the lead-in
+        /// gate + the night-relative bands): on the 2026-07-12 pull (Helio onset 01:02) 0.35→22:50,
+        /// 0.55→23:20, 0.65→22:55. Set to 0.55 tuned to that night's late wind-down (HR stays 66–73
+        /// until the real deep-sleep drop ~02:35, so HR cannot resolve 01:02 exactly — this only
+        /// trims the worst of the pre-sleep over-count). NOT a supervised re-fit; revert to 0.35 if a
+        /// ground-truth hypnogram fit (RUNBOOK_SLEEP_GROUNDTRUTH) supersedes it.
         public var onsetSettleFraction: Double
         /// Minimum evening→floor descent (bpm) for the onset trim to fire at all. Below this there
         /// is no real wind-down to trim (the sleeper was already calm at lights-out), so the night
@@ -212,7 +217,7 @@ public enum SleepStaging {
                     motionAwakeVitalsHalfWindow: Int = 3,
                     onsetSustainEpochs: Int = 6,
                     minHRWakeRunEpochs: Int = 5,
-                    onsetSettleFraction: Double = 0.35,
+                    onsetSettleFraction: Double = 0.55,
                     onsetMinDescentBPM: Double = 10,
                     onsetScanEpochs: Int = 12,
                     onsetSearchEpochs: Int = 48,
