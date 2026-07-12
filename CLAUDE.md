@@ -35,6 +35,7 @@ Health** — no cloud, no subscription.
 | `docs/REVERSE_ENGINEERING.md` | Capture + decode workflow |
 | `docs/RUNBOOK_OVERNIGHT_TEMP.md` | **Overnight capture for skin temp / sleep stages / HRV (#7,#9,#12)** |
 | `docs/RUNBOOK_SLEEP_GROUNDTRUTH.md` | **Capture RingConn's computed hypnogram (`sleepPhases`) via mitmproxy → fit our staging to it** |
+| `docs/RUNBOOK_OSA_APNEA.md` | **OSA sleep-apnea (#91) — capture cracked (start `05 22 01`, dense PPG `0x48`), decode→AHI parked; forward plan** |
 | `desktop/ringconn_sleep_fit.py` | Supervised-fit harness: align our epochs to RingConn `sleepPhases`, fit `SleepStaging.Tuning` (`--synthetic` to demo) |
 | `docs/HEALTHKIT_MAPPING.md` | Each metric → HealthKit type |
 | `docs/HANDOFF_MACOS_IOS.md` | **Pickup instructions for the iOS work on macOS** |

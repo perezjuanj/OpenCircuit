@@ -19,6 +19,21 @@ struct VitalsStatusCardView: View {
     private let healthBaselineReader = HealthKitVitalsBaselineReader()
     @State private var healthBaselineReport: HealthKitVitalsBaselineReader.Report?
 
+    /// The assembled report, held as STATE and recomputed off the render path in `.task(id:)` below.
+    /// It was a computed `var` read TWICE per `body` pass, so the full 32-day baseline analysis (incl.
+    /// the resting-HR derivation) ran ~2× on every SwiftUI invalidation — and, fatally, SYNCHRONOUSLY
+    /// inside the background scene-update layout when a workout's `stop()` batch-ingest invalidated the
+    /// @Query. That blew the 10 s scene-update watchdog (0x8BADF00D). As @State it renders instantly and
+    /// the analysis runs once per data change, OFF the main actor (snapshot → `Task.detached`, below).
+    @State private var report: VitalsBaseline.Report?
+
+    /// Identity for the recompute `.task`: changes only when an input that affects the report changes,
+    /// so the analysis re-runs on new data (not on every unrelated re-render).
+    private var reportInputsKey: String {
+        "\(hrSamples.count)|\(spo2Samples.count)|\(hrvSamples.count)|"
+        + "\(sleepNights.first?.night.timeIntervalSince1970 ?? 0)|\(healthBaselineReport == nil ? 0 : 1)"
+    }
+
     /// User's temperature-unit preference (#83), so the skin-temp delta matches the rest of the app.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
 
@@ -83,35 +98,71 @@ struct VitalsStatusCardView: View {
             guard healthBaselineReport == nil else { return }
             healthBaselineReport = try? await healthBaselineReader.loadReport(lookbackDays: Self.historyDays)
         }
+        // Recompute the report OFF THE MAIN ACTOR whenever an input changes (0x8BADF00D fix). d338484
+        // moved this to `.task`, but a View's `.task` still runs on the MAIN actor — so a workout
+        // `stop()` ingest that invalidated the @Query still ran the full 32-day baseline analysis (the
+        // heaviest card: resting-HR derivation + per-vital stats + skin-temp baseline) on the main
+        // thread during the background scene-update snapshot, and the watchdog crash recurred. Snapshot
+        // the SwiftData rows + the Health fallback to Sendable value types HERE (main actor), then run
+        // the pure OpenCircuitKit math on `Task.detached` and publish the result back.
+        .task(id: reportInputsKey) {
+            let hr = hrSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+            let spo2 = spo2Samples.map { (start: $0.start, value: $0.value) }
+            let hrv = hrvSamples.map { (start: $0.start, value: $0.value) }
+            let nights = sleepNights.map { (night: $0.night, skinTempC: $0.skinTempC) }
+            let fbRestingHR = healthBaselineReport?.restingHR.map { (day: $0.day, value: $0.value) }
+            let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
+            let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
+            let fbSkinTempOffsetC = healthBaselineReport?.skinTempOffsetC
+            report = await Task.detached {
+                Self.computeReport(hr: hr, spo2: spo2, hrv: hrv, nights: nights,
+                                   fallbackRestingHR: fbRestingHR, fallbackSpO2: fbSpO2,
+                                   fallbackHRV: fbHRV, fallbackSkinTempOffsetC: fbSkinTempOffsetC)
+            }.value
+        }
     }
 
     // MARK: Report
 
     /// The Vitals Status report for the latest day, or nil until at least one vital has enough
     /// baseline history. Pure logic lives in OpenCircuitKit.VitalsBaseline; this assembles its inputs.
-    private var report: VitalsBaseline.Report? {
+    ///
+    /// `nonisolated static` + Sendable-snapshot parameters (no `@Query`/`@State`/`self` access) so the
+    /// whole 32-day analysis runs on `Task.detached`, OFF the main actor — that's the reader-side half
+    /// of the 0x8BADF00D fix. The numbers are byte-identical to the previous main-actor version: the
+    /// callers below pass the exact same rows, just pre-snapshotted to value tuples on the main actor.
+    nonisolated static func computeReport(
+        hr: [HRSample],
+        spo2: [(start: Date, value: Double)],
+        hrv: [(start: Date, value: Double)],
+        nights: [(night: Date, skinTempC: Double)],
+        fallbackRestingHR: [(day: Date, value: Double)]?,
+        fallbackSpO2: [(day: Date, value: Double)]?,
+        fallbackHRV: [(day: Date, value: Double)]?,
+        fallbackSkinTempOffsetC: Double?
+    ) -> VitalsBaseline.Report? {
         let config = VitalsBaseline.Config()
         var inputs: [VitalsBaseline.VitalInput] = []
-        if let i = vitalInput(.restingHR, localDays: restingHRDaily(),
-                              fallback: healthBaselineReport?.restingHR,
+        if let i = vitalInput(.restingHR, localDays: restingHRDaily(hr),
+                              fallback: fallbackRestingHR,
                               config: config) { inputs.append(i) }
-        if let i = vitalInput(.overnightSpO2, localDays: dailyMeans(spo2Samples, scale: 100),
-                              fallback: healthBaselineReport?.overnightSpO2,
+        if let i = vitalInput(.overnightSpO2, localDays: dailyMeans(spo2, scale: 100),
+                              fallback: fallbackSpO2,
                               config: config) { inputs.append(i) }
-        if let i = vitalInput(.overnightHRV, localDays: dailyMeans(hrvSamples, scale: 1),
-                              fallback: healthBaselineReport?.overnightHRV,
+        if let i = vitalInput(.overnightHRV, localDays: dailyMeans(hrv, scale: 1),
+                              fallback: fallbackHRV,
                               config: config) { inputs.append(i) }
-        let offset = skinTempOffset() ?? healthBaselineReport?.skinTempOffsetC
+        let offset = skinTempOffset(nights) ?? fallbackSkinTempOffsetC
         guard !inputs.isEmpty || offset != nil else { return nil }
         return VitalsBaseline.report(inputs, skinTempOffsetC: offset, config: config)
     }
 
     /// Build a VitalInput from local history first, falling back to Apple Health history when the
     /// local store has not yet accumulated enough baseline days.
-    private func vitalInput(_ vital: VitalsBaseline.Vital,
-                            localDays: [(day: Date, value: Double)],
-                            fallback: [HealthKitVitalsBaselineReader.DailyValue]?,
-                            config: VitalsBaseline.Config) -> VitalsBaseline.VitalInput? {
+    nonisolated private static func vitalInput(_ vital: VitalsBaseline.Vital,
+                                               localDays: [(day: Date, value: Double)],
+                                               fallback: [(day: Date, value: Double)]?,
+                                               config: VitalsBaseline.Config) -> VitalsBaseline.VitalInput? {
         let localSeries = dailySeries(localDays)
         if let input = vitalInput(vital, series: localSeries, config: config) { return input }
         let fallbackSeries = fallback?.sorted { $0.day < $1.day }.map(\.value) ?? []
@@ -119,9 +170,9 @@ struct VitalsStatusCardView: View {
     }
 
     /// Build a VitalInput from a chronological (oldest→newest) series, requiring enough prior days.
-    private func vitalInput(_ vital: VitalsBaseline.Vital,
-                            series: [Double],
-                            config: VitalsBaseline.Config) -> VitalsBaseline.VitalInput? {
+    nonisolated private static func vitalInput(_ vital: VitalsBaseline.Vital,
+                                               series: [Double],
+                                               config: VitalsBaseline.Config) -> VitalsBaseline.VitalInput? {
         guard let today = series.last else { return nil }
         let prior = Array(series.dropLast())
         guard prior.count >= config.minBaselineDays else { return nil }
@@ -129,18 +180,18 @@ struct VitalsStatusCardView: View {
     }
 
     /// Chronological list of daily values (oldest→newest).
-    private func dailySeries(_ days: [(day: Date, value: Double)]) -> [Double] {
+    nonisolated private static func dailySeries(_ days: [(day: Date, value: Double)]) -> [Double] {
         days.sorted { $0.day < $1.day }.map(\.value)
     }
 
     /// Resting HR per day = the day's sleep/low-activity HR estimate (RestingHR analytics).
-    private func restingHRDaily() -> [(day: Date, value: Double)] {
-        let samples = hrSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        return RestingHR.dailyValues(hr: samples).map { (day: $0.day, value: $0.bpm) }
+    nonisolated private static func restingHRDaily(_ hr: [HRSample]) -> [(day: Date, value: Double)] {
+        RestingHR.dailyValues(hr: hr).map { (day: $0.day, value: $0.bpm) }
     }
 
     /// Per-calendar-day mean of a sample kind (SpO₂ fraction → percent via `scale`).
-    private func dailyMeans(_ samples: [StoredSample], scale: Double) -> [(day: Date, value: Double)] {
+    nonisolated private static func dailyMeans(_ samples: [(start: Date, value: Double)],
+                                               scale: Double) -> [(day: Date, value: Double)] {
         let byDay = Dictionary(grouping: samples) { Calendar.current.startOfDay(for: $0.start) }
         return byDay.map { (day, rows) in
             (day: day, value: rows.reduce(0.0) { $0 + $1.value * scale } / Double(rows.count))
@@ -148,8 +199,8 @@ struct VitalsStatusCardView: View {
     }
 
     /// Latest night's signed skin-temp offset from the rolling baseline (#69), or nil.
-    private func skinTempOffset() -> Double? {
-        let valid = sleepNights.filter { $0.skinTempC > 0 }
+    nonisolated private static func skinTempOffset(_ nights: [(night: Date, skinTempC: Double)]) -> Double? {
+        let valid = nights.filter { $0.skinTempC > 0 }
         guard let latest = valid.max(by: { $0.night < $1.night }) else { return nil }
         let cal = Calendar.current
         let tonightDay = cal.startOfDay(for: latest.night)

@@ -46,6 +46,15 @@ final class RingScanner: NSObject {
     private(set) var state: State = .idle
     private(set) var session: RingSession?
 
+    /// Invoked on the MAIN ACTOR immediately after a fresh `RingSession` replaces the previous one on a
+    /// (re)connect (`didConnect`). The workout manager registers here so a mid-workout BLE drop re-arms
+    /// native sport mode on the NEW link — the ONLY background-safe signal, since SwiftUI does not render
+    /// while the screen is locked mid-workout, so a view `.onChange(of: session)` would miss the swap
+    /// until the user foregrounds (minutes of lost HR). Single consumer (workout resume); registered in
+    /// `WorkoutSessionManager.start`, cleared on every workout-end path. `@ObservationIgnored`: a plain
+    /// callback slot, not observed view state.
+    @ObservationIgnored var onSessionReplaced: ((RingSession) -> Void)?
+
     /// LAZY (#142): created only when Bluetooth is actually needed (first connect / saved-ring
     /// restore), NOT at app launch. Allocating a `CBCentralManager` is what triggers the iOS
     /// Bluetooth permission prompt, so eager creation in `init()` fired the prompt before onboarding
@@ -834,8 +843,14 @@ extension RingScanner: CBCentralManagerDelegate {
             // Tear down any prior session before replacing it so its keepalive/auto-measure/sync
             // tasks can't keep driving the same peripheral behind the new session (#42).
             self.teardownSession()
-            self.session = RingSession(peripheral: peripheral, localStore: self.localStore)
+            let newSession = RingSession(peripheral: peripheral, localStore: self.localStore)
+            self.session = newSession
             self.armConnectStabilityReset()
+            // Reconnect-resume (#reconnect): a mid-workout BLE drop tore down the old session and its
+            // sport state; hand the fresh session to any registered consumer (the workout manager) so it
+            // can re-arm native sport on the new link. Runs on the main actor whether foregrounded or
+            // BACKGROUNDED (this is a CoreBluetooth delegate callback), unlike a SwiftUI view update.
+            self.onSessionReplaced?(newSession)
         }
     }
 

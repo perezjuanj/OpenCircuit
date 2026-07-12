@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-BUNDLE_ID="dtrh.projectcircuit.com"
+BUNDLE_ID="com.standardsoftwaresolutions.opencircuit"
 SAVE=false
 RECORD=false
 RECORD_DURATION="8h"

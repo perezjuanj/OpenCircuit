@@ -69,9 +69,16 @@ struct ContentView: View {
     @State private var batteryWasFull = false
     /// Last time the foreground auto-refresh ran a sync; debounces repeated foregrounds.
     @State private var lastForegroundSync: Date?
-    /// Minimum spacing between foreground auto-syncs — one bounded refresh per foreground,
-    /// never a loop, and conservative about battery/contention with the official app.
-    private static let autoSyncInterval: TimeInterval = 120
+    /// Minimum spacing between foreground/reconnect auto-syncs — one bounded refresh, never a loop,
+    /// conservative about battery/contention. Raised 120→300 s: a FLAKY ring reconnects/relaunches
+    /// repeatedly and each one re-fired the auto-sync, so a ~2-min spacing let almost every reconnect run
+    /// a full ~30 s (usually empty) sync that blocks the workout Start. The periodic/BLE-wake drain still
+    /// delivers the backlog on its own cadence; this only suppresses the redundant reconnect re-sync.
+    /// (Kept at 300 s, NOT 600 s — the throttle now also honours the PERSISTED `lastSuccessfulSync`,
+    /// which a *partial* background drain bumps (epochs>0 yet the night not fully drained); a longer
+    /// window would suppress the foreground continuation drain of the night's tail for that whole window.
+    /// 300 s bounds that delay, and the hourly wake-drain backstops the tail regardless — review MEDIUM.)
+    private static let autoSyncInterval: TimeInterval = 300
 
     private let health = HealthKitWriter()
 
@@ -137,6 +144,21 @@ struct ContentView: View {
                 OnboardingView { onboardingCompleted = true }
             }
             .task {
+                // T6 — ORPHANED workout-in-progress flag (crash mid-workout): if the app was KILLED
+                // during a workout, `stop()`/`endSportSession()` never ran, so the DURABLE flag is
+                // still set on this fresh process with NO live workout to resume (full session resume
+                // is out of scope for this pass — follow-up). Left set, it would suppress the morning
+                // whole-night backlog drain FOREVER and age a night out of the ring's buffer (#119
+                // lane). So at launch: detect it (flag set + no live hold), CLEAR it, and re-arm the
+                // deferred drain. `session?.workoutHolding != true` is defensive — a genuine same-
+                // process workout sets the flag AFTER this `.task` runs and holds the ring, so it can
+                // never be cleared here; only a crash orphan reaches this branch.
+                if WorkoutSessionManager.isWorkoutInProgressPersisted, session?.workoutHolding != true {
+                    ringLog.notice("workout: orphaned in-progress flag at launch — clearing and re-arming the deferred drain (T6)")
+                    WorkoutSessionManager.clearWorkoutInProgressFlag()
+                    pendingAutoSync = true
+                    maybeAutoSyncOnReady()   // fires now if the link is already ready; else onChange(ready) will
+                }
                 // Reflect any prior Health authorization so the UI shows the mirrored state,
                 // and backfill anything the background refresh persisted while we were away.
                 // Runs in `.task` (after first frame), never `.onAppear` — a synchronous store
@@ -199,6 +221,19 @@ struct ContentView: View {
             }
             .onChange(of: session?.monitoring) { _, monitoring in
                 if monitoring == false { flushHealth() }
+            }
+            // T6 — RESCHEDULE, NOT DROP: a workout hold just released (endSportSession/endWorkoutHR
+            // flip `workoutHolding` false), so re-arm and run the whole-night backlog drain that T6
+            // suppressed during the workout. Without this the deferred morning night would never
+            // drain until the next foreground/reconnect and could age out of the ring's buffer
+            // (#119 lane). `maybeAutoSyncOnReady` re-checks all its own gates (ready/monitoring/
+            // syncing/throttle), so this is a no-op when nothing is due. WorkoutSessionManager
+            // clears the durable flag BEFORE `endSportSession()` flips this, so the guard passes.
+            .onChange(of: session?.workoutHolding) { _, holding in
+                if holding == false {
+                    pendingAutoSync = true
+                    maybeAutoSyncOnReady()
+                }
             }
             .sheet(isPresented: $showCalibration, onDismiss: {
                 Task { await calibration.refreshLatestEstimateIfNeeded(minInterval: 2) }
@@ -339,11 +374,25 @@ struct ContentView: View {
     /// `syncHistory()` is itself bounded (watchdog), and the descriptor stream refreshes
     /// steps/temp meanwhile — so this is a single bounded refresh, not a poll loop.
     private func maybeAutoSyncOnReady() {
+        // `!session.workoutHolding`: don't fire a foreground-return history sync during an active
+        // workout — it contends with the busy ring and can knock the `0x4e` sport stream off (#90).
+        // `!WorkoutSessionManager.isWorkoutInProgressPersisted` (T6): also suppress off the DURABLE
+        // app-side flag, which — unlike the in-memory `workoutHolding` — survives a crash-relaunch,
+        // so the once-a-morning whole-night backlog drain can't take the link (`syncTask != nil`)
+        // and starve a just-(re)started workout of native `0x4e` HR. Both `else { return }` misses
+        // leave `pendingAutoSync` SET, so this is a RESCHEDULE (re-fired on workout end via the
+        // `workoutHolding` onChange, or on the next `ready`), never a silent drop (#119 lane).
         guard pendingAutoSync, let session, session.ready,
-              !session.monitoring, !session.syncing else { return }
-        if let last = lastForegroundSync,
-           Date().timeIntervalSince(last) < Self.autoSyncInterval {
-            pendingAutoSync = false   // too soon — consume the request without syncing
+              !session.monitoring, !session.syncing, !session.workoutHolding,
+              !WorkoutSessionManager.isWorkoutInProgressPersisted else { return }
+        // Throttle off the most recent of the in-memory OR the PERSISTED last successful sync (#churn):
+        // `lastForegroundSync` alone RESET on every app relaunch, so a fresh launch (or a background
+        // relaunch on a ring reconnect) always re-synced — the "open the app → wait ~30 s before I can
+        // start a workout" churn. `observability.lastSuccessfulSync` survives relaunch, so a reconnect/
+        // relaunch within the interval of the last real sync is skipped.
+        let lastSync = [lastForegroundSync, observability.lastSuccessfulSync].compactMap { $0 }.max()
+        if let last = lastSync, Date().timeIntervalSince(last) < Self.autoSyncInterval {
+            pendingAutoSync = false   // synced recently (this session OR a prior one) — skip the re-sync
             return
         }
         pendingAutoSync = false
@@ -1517,6 +1566,17 @@ struct CaloriesCardView: View {
         _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
     }
 
+    /// Active kcal HELD AS STATE, recomputed off the render path in `.task(id:)` — NOT read in `body`.
+    /// `activeToday` maps + runs `Calories.activeKcal` over the unbounded today's-HR set and was read
+    /// TWICE per `body` pass; run SYNCHRONOUSLY inside a background scene-update (a workout `stop()`
+    /// batch-ingest invalidates the @Query) that blew the 10 s watchdog (0x8BADF00D, same as
+    /// GoalsCardView / VitalsStatusCardView). As @State the body renders instantly.
+    @State private var cachedActiveKcal: Double = 0
+    /// Identity for the recompute `.task` — the HR count, today's steps, and the profile inputs.
+    private var caloriesInputsKey: String {
+        "\(hrSamples.count)|\(todayDaily.first?.steps ?? 0)|\(age)|\(weightKg)|\(heightCm)|\(sexRaw)"
+    }
+
     private var profile: UserProfile {
         UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
                     sex: BiologicalSex(rawValue: sexRaw) ?? .male)
@@ -1547,17 +1607,34 @@ struct CaloriesCardView: View {
                 Text("CALORIES").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             }
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("\(Int((restingToday + activeToday).rounded()))")
+                Text("\(Int((restingToday + cachedActiveKcal).rounded()))")
                     .font(.system(size: 40, weight: .bold, design: .rounded))
                     .monospacedDigit().contentTransition(.numericText())
                 Text("kcal today").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
             }
-            Text("resting \(Int(restingToday.rounded())) · active \(Int(activeToday.rounded()))")
+            Text("resting \(Int(restingToday.rounded())) · active \(Int(cachedActiveKcal.rounded()))")
                 .font(.caption).foregroundStyle(.secondary)
             // "max HR" here is the 220-age zone/calorie reference, NOT an observed peak.
             Text("BMR \(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day · est. max HR \(maxHR) bpm (220-age)")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Recompute the active-kcal estimate OFF the main actor (0x8BADF00D fix). d338484 moved this
+        // to `.task` but a View's `.task` still runs on the MAIN actor — deferred, not off-loaded —
+        // so a workout `stop()` ingest that invalidated the @Query still dragged this O(n) map+math
+        // onto the main thread during the background scene-update snapshot, and the crash recurred.
+        // Snapshot the SwiftData rows to Sendable value types HERE (main actor), then run the pure
+        // Kit math on `Task.detached` and publish the result back.
+        .task(id: caloriesInputsKey) {
+            let samples = hrSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+            let steps = todayDaily.first?.steps ?? 0
+            let profile = profile
+            let maxHR = maxHR
+            cachedActiveKcal = await Task.detached {
+                let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
+                let stepKcal = Calories.activeKcalFromSteps(steps: steps, profile: profile)
+                return max(hrKcal, stepKcal)
+            }.value
+        }
     }
 }

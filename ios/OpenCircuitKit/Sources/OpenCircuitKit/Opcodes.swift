@@ -17,6 +17,12 @@ public enum Opcode {
     public static let syncOpen: UInt8 = 0x02
     public static let liveHRMode: UInt8 = 0x06
     public static let statusQuery: UInt8 = 0xD0
+
+    /// OSA dense-PPG store-and-forward burst (#91, 🟢). The ring dumps the whole sleep-apnea
+    /// assessment's raw PPG as a flood of `0x48` frames during the morning sync (unprompted,
+    /// right after the `0xd0` fetch-ack), with NO per-frame ack. Decoded by `OSAWaveform`
+    /// (mirrors `OSAWaveform.opcode`). Only present if an assessment was armed the night before.
+    public static let osaPPG: UInt8 = 0x48
 }
 
 /// Exact command byte sequences, sent VERBATIM (🟢 verified live, PROTOCOL.md §3).
@@ -70,6 +76,13 @@ public enum Command {
     /// Ring airplane mode ON (drops the BLE link — the ring re-wakes only via the charging case;
     /// there is no "off" command). `08 04 00` → resp `88 00 88`.
     public static let airplaneModeOn: [UInt8] = [0x08, 0x04, 0x00]
+
+    /// Arm an overnight OSA (sleep-apnea) assessment (#91, 🟢 captured 2026-07-08). One write; the
+    /// ring then records the dense `0x48` PPG through the night (persistent — survives disconnects)
+    /// and dumps it store-and-forward on the morning sync. Same `05 2x` detection-control family as
+    /// the `05 23` toggles. `05 22 01` = arm, `05 22 02` = stop/disarm.
+    public static let osaAssessmentStart: [UInt8] = [0x05, 0x22, 0x01]
+    public static let osaAssessmentStop: [UInt8]  = [0x05, 0x22, 0x02]
 
     /// Steps to enter live-HR mode, in the order the official app sends them (verified
     /// in the FR02.018 capture: open+drain history, then `d0 00 00` → `06 01 00` → fetch,

@@ -572,8 +572,9 @@ within the day and `active_seconds` ≤ 150/epoch.
 layout** (only `[0]` respid differs; `0x87` body == `0x10` body) → shared descriptor,
 XOR-valid. **`[1]`=BATTERY %** 🟢 (ground-truthed 2026-06-15: `0x4c`=76 matched the app's
 76% exactly at capture time; the buffer showed a clean 92→86→85→84→78→77→76 discharge
-curve — it is NOT a per-session marker) · **`[2]`=CHARGE/STATE: `0x04`=ON CHARGER** 🟢
-(`0x02`/`0x03`=worn-streaming sub-frame toggle, `0x01`=startup/settle; see below) ·
+curve — it is NOT a per-session marker) · **`[2]`=CHARGE/STATE/WORK-MODE: `0x04`=ON CHARGER** 🟢
+(`0x02`/`0x03`=idle worn-streaming toggle, `0x01`=startup/settle, **`0x06`=NATIVE SPORT MODE ACTIVE**
+🟢 #174 — see below) ·
 **`[4:6]`=STEP COUNT (16-bit BE)** 🟢 ·
 **`[6:8]`/`[8:10]`=SKIN TEMPERATURE, two channels, 0.1 °C BE** 🟢 (each prefixed `01`=
 valid; see below) · **`[14:16]`=BATTERY VOLTAGE mV (16-bit BE)** 🟢 (#89, see below) ·
@@ -609,6 +610,15 @@ fell **31.4→26.6 °C**; against that ground truth:
   (the whole charge is in-band), so charging is readable live — no need for the battery-%-rising
   proxy when a frame is in hand. Decoded by `OpenCircuitKit.DeviceStatus.isOnCharger` /
   `.batteryVoltageMillivolts`.
+- **`[2]==0x06` = NATIVE SPORT MODE ACTIVE** 🟢 (#174, `captures/workout_yoga_20260709` — 1-hour
+  Gentle Yoga btsnoop). `[2]` is a **work-mode** byte: the instant the ring accepted `SportStart`
+  (`06 03 07 04 00` → `86 00 86`) the very next descriptor flipped `0x03`→`0x06`, held `0x06` for the
+  whole workout (streaming `0x4e` HR+steps ~every 10 s), and returned to `0x02`/`0x03` at `SportStop`
+  (`06 00 00`). **Enter rule:** the ring accepts `06 03` **only from idle** (`[2]`=`0x02`/`0x03`); the
+  app enters sport from post-sync idle and never sends `06 00` before a start. `07 00 00` (fetch)
+  returns a fresh descriptor carrying this byte even mid-session, so it is pollable — the sport-enter
+  "reach idle" fast path watches `[2]` for `0x02`/`0x03` before `06 03`. Surfaced as
+  `RingSession.lastDescriptorMode`.
 
 **`[6:8]` / `[8:10]` = skin temperature in 0.1 °C** 🟢 (ground-truthed 2026-06-15,
 `captures/morning_temp_20260615`). Two near-equal 16-bit BE values (e.g. `01 64 01 65` =

@@ -101,6 +101,9 @@ final class WorkoutSessionManager: NSObject {
 
     private var hrPollTask: Task<Void, Never>?
     private var timerTask: Task<Void, Never>?
+    /// Re-arms native sport on a NEW `RingSession` after a mid-workout BLE drop (#reconnect). Bounded so
+    /// a link that never comes back can't spin forever. Cancelled on every workout-end path.
+    private var reconnectResumeTask: Task<Void, Never>?
 
     /// CoreLocation manager for outdoor GPS route capture (or the indoor keep-alive session).
     private var locationManager: CLLocationManager?
@@ -120,6 +123,37 @@ final class WorkoutSessionManager: NSObject {
     /// keep-alive for a request/response BLE device with no GPS. Off by default: costs battery and
     /// shows the blue location indicator. Shared key with `UserProfileSettingsView`.
     static let indoorKeepAliveEnabledKey = "workout.indoorKeepAlive"
+
+    // MARK: - Durable "workout in progress" flag (T6)
+
+    /// UserDefaults key for the durable "a workout is in progress" flag. `nonisolated` so the
+    /// nonisolated accessors below (and ContentView's launch/foreground paths) can read it without
+    /// hopping to the main actor.
+    nonisolated static let workoutInProgressKey = "workout.inProgress"
+
+    /// True iff a workout was started and has not yet cleanly ended. PERSISTED (UserDefaults) so a
+    /// crash/relaunch can tell a workout was underway when the process died. ContentView reads this
+    /// to SUPPRESS the once-a-morning whole-night backlog drain while a workout owns (or should own)
+    /// the BLE link — that drain takes the link (`syncTask != nil`) and would starve a just-
+    /// (re)started workout of native `0x4e` HR (T6). In-memory `RingSession.workoutHolding` can't
+    /// cover a crash-relaunch (a fresh session reads it false); this durable flag does. Nonisolated:
+    /// a plain global flag over thread-safe UserDefaults, read from ContentView's launch/foreground
+    /// paths. The crash-orphan case (flag left set with no live workout) is reconciled at launch by
+    /// ContentView (clear + re-arm the deferred drain) — see `clearWorkoutInProgressFlag`.
+    nonisolated static var isWorkoutInProgressPersisted: Bool {
+        UserDefaults.standard.bool(forKey: workoutInProgressKey)
+    }
+
+    /// Set/clear the durable flag. `true` on workout start; `false` on EVERY end path
+    /// (normal stop, error, cancel, reset) and on the crash-orphan cleanup at launch.
+    nonisolated static func setWorkoutInProgressPersisted(_ inProgress: Bool) {
+        UserDefaults.standard.set(inProgress, forKey: workoutInProgressKey)
+    }
+
+    /// Convenience for the end paths and the launch-time orphan cleanup.
+    nonisolated static func clearWorkoutInProgressFlag() {
+        setWorkoutInProgressPersisted(false)
+    }
 
     private weak var session: RingSession?
     /// Where to persist this workout's continuous HR samples so they count toward today's
@@ -158,6 +192,13 @@ final class WorkoutSessionManager: NSObject {
         guard case .idle = recordingState else { return }
         self.session = session
         self.store = store
+        // Reconnect-resume (#reconnect): if the ring drops mid-workout, RingScanner tears down this
+        // session and builds a fresh one with NO sport state — adopt it and re-arm native sport so HR
+        // resumes. This is the ONLY background-safe hook (fires from CoreBluetooth's didConnect even
+        // while the screen is locked). Cleared on every end path (stop/cancel/reset).
+        RingScanner.shared.onSessionReplaced = { [weak self] newSession in
+            self?.adoptReconnectedSession(newSession)
+        }
         let start = Date()
         sessionStart = start
         let profile = HealthKitWriter.storedUserProfile()
@@ -176,6 +217,13 @@ final class WorkoutSessionManager: NSObject {
         lastLocation = nil
 
         recordingState = .starting
+
+        // T6: mark a workout in progress DURABLY (survives a crash-relaunch). ContentView reads this
+        // to suppress the relaunch/foreground whole-night backlog drain while the workout owns the
+        // link, so the just-started session gets the clean native `0x4e` stream instead of being
+        // starved by a drain that holds `syncTask`. Cleared on every end path (stop/cancel/reset)
+        // and reconciled at launch if the process was killed mid-workout.
+        Self.setWorkoutInProgressPersisted(true)
 
         // Enter the ring's NATIVE sport mode for this workout (#90): SportStart → the ring streams
         // `0x4e` HR+steps frames (~10 s) which RingSession routes into `liveHR`/`liveHRAt` (picked up
@@ -235,6 +283,33 @@ final class WorkoutSessionManager: NSObject {
         )
     }
 
+    /// Adopt a `RingSession` that replaced ours mid-workout (a BLE drop → RingScanner reconnected and
+    /// built a fresh session with NO sport state). Re-point at it and, once it's authed/`ready`, re-enter
+    /// native sport so the `0x4e` HR stream resumes. The aggregator + timer keep running across the gap,
+    /// so only HR pauses (honestly — #45) then continues; pre-drop ring-counted steps are lost (minor —
+    /// HR history is preserved in the aggregator). Bounded wait so a link that never returns can't spin.
+    func adoptReconnectedSession(_ newSession: RingSession) {
+        switch recordingState { case .starting, .active: break; default: return }
+        guard newSession !== session else { return }
+        session = newSession
+        reconnectResumeTask?.cancel()
+        reconnectResumeTask = Task { [weak self] in
+            // The fresh link starts un-authed; wait until it's `ready` before SportStart (a `06 03` into
+            // an un-authed link is dropped). Bounded so a ring that never comes back doesn't spin.
+            let deadline = Date().addingTimeInterval(30)
+            while !Task.isCancelled, Date() < deadline {
+                guard let self else { return }
+                switch self.recordingState { case .starting, .active: break; default: return }
+                guard self.session === newSession else { return }   // superseded by a newer swap / ended
+                if newSession.ready { break }
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            guard let self, self.session === newSession, newSession.ready else { return }
+            switch self.recordingState { case .starting, .active: break; default: return }
+            newSession.beginSportSession(typeByte: self.selectedSport.firmwareByte)
+        }
+    }
+
     /// Stop the session, write to HealthKit, transition to `.finished`.
     func stop() async {
         // Allow stopping from both .starting and .active
@@ -244,24 +319,23 @@ final class WorkoutSessionManager: NSObject {
         }
         recordingState = .finishing
 
+        // Reconnect-resume teardown (#reconnect): stop adopting replacement sessions + cancel any
+        // pending re-arm, so a reconnect that lands after the user hit Stop can't restart sport.
+        RingScanner.shared.onSessionReplaced = nil
+        reconnectResumeTask?.cancel(); reconnectResumeTask = nil
+
+        // T6: clear the durable flag FIRST — before `endSportSession()` below flips
+        // `session.workoutHolding` false (which fires ContentView's re-arm). Clearing here covers
+        // BOTH the normal completion below AND the `guard let agg` error-return, so no end path can
+        // leave the flag set and suppress the morning drain forever (#119 lane).
+        Self.setWorkoutInProgressPersisted(false)
+
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
 
-        // Capture any REAL HR the ring already surfaced (e.g. epochs drained during this session)
-        // so it can backfill the workout window below. The live poll often can't lock HR while
-        // moving (#45); this fills from on-device data when present. Empty stays empty — never
-        // interpolated. History-stream HR now covers BOTH still/sleep-vitals AND activity epochs
-        // (BulkRecord.heartRate excludes only `.idle`, per #45/#38), so this backfill is no longer
-        // a near-guaranteed no-op for an in-motion walk — it's just lower-resolution than a true
-        // continuous stream would be. A durable SPORT-mode stream (#90: SportHrModel{utc,hr,conf})
-        // would still improve resolution if it's ever captured, but is no longer the only source.
-        // (The earlier #99 byte[6]=HrSync theory was disproven — PROTOCOL.md §5.3: all-day HR is
-        // the 0x4c epoch, not a live stream.)
-        let backfillHR: [HRSample] = (session?.historySamples ?? [])
-            .filter { $0.kind == .heartRate }
-            .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-
         // End the ring's native sport mode (SportStop) and capture the ring-counted step total (#90).
+        // Flipping `session.workoutHolding` false here is what re-arms the T6-suppressed drain
+        // (ContentView observes it) so the deferred morning night still drains after the workout.
         let sportSteps = session?.endSportSession() ?? 0
         session = nil
 
@@ -280,13 +354,10 @@ final class WorkoutSessionManager: NSObject {
             return
         }
 
-        // Backfill the workout window with any real in-window stored HR before finalizing, so
-        // avg/max HR + zones reflect on-device data the live poll missed. No-op (preserved) when
-        // the store has nothing for the window. Captured live samples win on a timestamp tie.
-        if let start = sessionStart {
-            agg.backfill(backfillHR, window: DateInterval(start: start, end: max(endDate, start)))
-        }
-
+        // The workout's HR is whatever it captured live — the native `0x4e` sport stream (continuous)
+        // or the `0x95` fallback poll. No stop-time history drain: native sport mode (#90, enter from
+        // synced-idle) now carries continuous HR directly, so the old `0x4c` backfill was empty when
+        // sport streamed AND a multi-second "saving…" stall when it fell back — removed.
         let hasRoute = !routeLocations.isEmpty && selectedSport.isOutdoor
         let summary = agg.finalize(
             sport: selectedSport,
@@ -326,11 +397,69 @@ final class WorkoutSessionManager: NSObject {
         // TRIMP kcal as the daily active-energy delta AND let the workout's own `activeEnergyBurned`
         // sample land too — a permanent, unretractable double-count. Ingesting only now guarantees
         // any flush that sees the workout HR also sees the banked credit and nets it out.
+        //
+        // The guard holds PER CHUNK. We split the ingest into small LOSSLESS sub-batches below —
+        // each `store.ingest(...)` is a single `context.save()`, so a one-shot ingest of the whole
+        // workout's HR invalidated EVERY `@Query[StoredSample]` (Calories/Goals/Vitals cards) at
+        // once and the dashboard `List` re-fetched + re-laid-out all of it synchronously on the
+        // main thread — >10 s → the FRONTBOARD `0x8BADF00D` scene-update-watchdog SIGKILL a user hit
+        // when backgrounding right after a long workout summary. Two-part fix: (1) chunking makes
+        // each save a SMALL @Query invalidation, and a short `Task.sleep` between saves gives the
+        // runloop a real turn so no single scene-update exceeds the watchdog budget; (2) the actual
+        // confirmed stall in the crash trace was the READER side — those three cards' per-card
+        // baseline/kcal analytics now run OFF the main actor (`.task` → `Task.detached`, see
+        // CaloriesCardView / GoalsCardView / VitalsStatusCardView), so a re-fetch during a
+        // background scene-update snapshot no longer drags the O(n) math onto the main thread.
+        // Every chunk still runs AFTER the banked active-energy credit, so a `flushHealth()` that
+        // lands between chunks still nets out exactly as the single-shot ingest did.
         if let store {
-            let toIngest = agg.collectedSamples.map {
+            // Sort ascending by `start` BEFORE chunking so the forward-only SyncCursor
+            // (`selectNew` keeps `start > watermark`, strictly) advances monotonically and never
+            // discards a later chunk. The chunks are disjoint and together cover EVERY sample, and
+            // each boundary is extended to swallow any equal-`start` run at its tail (see below), so
+            // the total StoredSample rows are identical to the old single `store.ingest(toIngest)` —
+            // lossless, nothing dropped or deduped away.
+            let sorted = agg.collectedSamples.sorted { $0.start < $1.start }
+            let toIngest = sorted.map {
                 QuantitySample(kind: .heartRate, start: $0.start, end: $0.end, value: Double($0.bpm))
             }
-            _ = try? store.ingest(toIngest)
+            // PARTIAL-WRITE HARDENING (review MF3): the crash scenario this fixes IS "user
+            // backgrounds right after the summary", so this chunked loop very often runs as the app
+            // leaves the foreground. Without a background-task assertion iOS can suspend the app
+            // mid-loop and only a PREFIX of the workout HR would reach LocalStore — a bounded local
+            // active-kcal/exercise-min under-count (HealthKit already has EVERY sample from
+            // `writeWorkout` above; this only keeps the LOCAL estimate whole, and the cursor guard
+            // still prevents any double-count). The loop is ~1–2 s of wall time, far under the
+            // background budget, and self-ends via `defer` / the expiration handler.
+            var bgTask: UIBackgroundTaskIdentifier = .invalid
+            bgTask = UIApplication.shared.beginBackgroundTask(withName: "oc.workout-hr-ingest") {
+                if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask); bgTask = .invalid }
+            }
+            defer { if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) } }
+
+            let chunkSize = 64
+            var i = 0
+            while i < toIngest.count {
+                var end = min(i + chunkSize, toIngest.count)
+                // Never split an equal-`start` run across a boundary: once the head sample advances
+                // the cursor watermark to that instant, `selectNew`'s strict `start > watermark`
+                // would drop the tail sample in the next chunk. Extend to swallow the whole run so
+                // chunking stays byte-for-byte lossless vs. the single-batch ingest.
+                while end < toIngest.count && toIngest[end].start == toIngest[end - 1].start {
+                    end += 1
+                }
+                _ = try? store.ingest(Array(toIngest[i..<end]))
+                i = end
+                // Give the runloop a real turn between saves (review MF1). A bare `Task.yield()`
+                // reschedules on the SAME main-actor executor and can resume WITHOUT CFRunLoop
+                // reaching before-waiting and committing a CATransaction — so the chunk saves + the
+                // coalesced `@Query` re-fetches could still execute as ONE contiguous >10 s
+                // main-thread stretch and blow the scene-update watchdog anyway. A short sleep
+                // suspends off the executor so the runloop definitively lays out + commits (and the
+                // watchdog resets) between chunks. Cheap: workouts collect ~6 HR/min, so even a long
+                // session is a handful of chunks.
+                try? await Task.sleep(for: .milliseconds(20))
+            }
         }
 
         recordingState = .finished(summary: summary)
@@ -338,6 +467,11 @@ final class WorkoutSessionManager: NSObject {
 
     /// Discard the session without writing to HealthKit.
     func cancel() {
+        RingScanner.shared.onSessionReplaced = nil          // #reconnect: stop adopting replacement sessions
+        reconnectResumeTask?.cancel(); reconnectResumeTask = nil
+        // T6: clear the durable flag on the cancel end path too (before `endSportSession()` below
+        // releases `workoutHolding` and re-arms the deferred drain).
+        Self.setWorkoutInProgressPersisted(false)
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
         // Tear down the Live Activity too — a discarded session should leave nothing on the Lock
@@ -355,6 +489,11 @@ final class WorkoutSessionManager: NSObject {
     }
 
     func reset() {
+        RingScanner.shared.onSessionReplaced = nil          // #reconnect: belt-and-suspenders teardown
+        reconnectResumeTask?.cancel(); reconnectResumeTask = nil
+        // T6: belt-and-suspenders — `reset()` runs from the summary "Done" / error "Dismiss"
+        // buttons (after `stop()` already cleared it), but clear again so no path can leave it set.
+        Self.setWorkoutInProgressPersisted(false)
         recordingState = .idle
         elapsedSeconds = 0
         currentHR = nil
@@ -379,7 +518,10 @@ final class WorkoutSessionManager: NSObject {
     /// interpolated. The displayed `currentHR` is kept (UI marks it stale via `currentHRIsStale`)
     /// so it doesn't flicker; what we never do is COUNT or PERSIST a held value as a new reading.
     private func collectHRSnapshot() {
-        guard let session, session.sportSessionActive else { return }
+        // `workoutHRActive` (not `sportSessionActive`): the workout records HR from EITHER the native
+        // `0x4e` sport stream OR the live-HR-poll fallback RingSession switches to when the ring never
+        // streams `0x4e`. Gating on `sportSessionActive` would drop every reading after that fallback.
+        guard let session, session.workoutHRActive else { return }
         guard WorkoutHRGate.shouldRecord(liveHRAt: session.liveHRAt,
                                          sessionStart: sessionStart,
                                          lastRecordedAt: lastRecordedHRAt,
