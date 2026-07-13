@@ -611,7 +611,7 @@ final class RingScanner: NSObject {
     /// service-filtered scan), drain + decode the ring's history, and snapshot it for the
     /// caller to mirror into Apple Health. Always tears the link down (re-arming the standing
     /// reconnect) on the way out so nothing is held open in the background.
-    func captureForBackground(timeout: TimeInterval) async -> BackgroundCapture {
+    func captureForBackground(timeout: TimeInterval, allowLivePoll: Bool = true) async -> BackgroundCapture {
         // No active saved ring → nothing to reconnect to or capture. Bail BEFORE ensureCentral() so a
         // fresh install that never connected a ring (BGTasks are scheduled unconditionally at launch)
         // doesn't allocate a CBCentralManager in the background — which would defeat #142's deferred BT
@@ -642,6 +642,15 @@ final class RingScanner: NSObject {
                     // automatic syncs never refreshed daytime SpO₂.
                     session.syncHistory()
                     didDrain = true
+                } else if session.syncing == false && !allowLivePoll {
+                    // Short window (app-refresh): the drain has committed + persisted the all-day
+                    // HR/steps, so skip the opportunistic live-HR poll. That poll needs ~60 s to lock
+                    // and never does in a ~30 s window — it just idles the budget until iOS cuts the
+                    // task ("ended early"), which can skip the caller's Health flush. Break the moment
+                    // the drain finishes so `syncVitals` reaches `flushToHealth` cleanly and the run
+                    // completes with the drained vitals mirrored. The longer BGProcessing path
+                    // (allowLivePoll: true) keeps the poll — it has the budget to actually lock. (#daytime-bg-drain)
+                    break
                 } else if session.syncing == false && !startedLiveRead && !session.isInSleepWindow {
                     // Backlog committed — now a quick optical HR read (syncAll → empty → fast lock),
                     // NOT user-initiated so any prior live HR stays until a fresh one locks. The

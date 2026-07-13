@@ -133,7 +133,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                 // live-HR poll isn't starved by the history drain (#45 A); the processing path
                 // gets the longer budget so the poll can actually lock. The expirationHandler
                 // below still cancels cleanly if iOS grants a shorter window.
-                let synced = try await service.syncVitals(timeout: timeout)
+                // Skip the opportunistic live-HR poll on the SHORT app-refresh window so the run
+                // completes and flushes to Health cleanly instead of being cut mid-poll ("iOS ended
+                // the task early"); the longer processing window keeps the poll — it can lock. (#daytime-bg-drain)
+                let synced = try await service.syncVitals(timeout: timeout, allowLivePoll: kind == .processing)
                 guard !Task.isCancelled else { return }
                 observability.recordSyncOutcome(kind: kind, success: synced,
                                                 detail: synced ? "captured/flushed data" : "no data this run")
