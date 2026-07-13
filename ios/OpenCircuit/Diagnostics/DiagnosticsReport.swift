@@ -80,6 +80,24 @@ enum DiagnosticsReport {
         }
         s.append("")
 
+        // 4b) Background scheduling diagnostics (#bg-observability) — the decisive triage for
+        // "no background sync ever". Reads: whether register() was accepted (bgregister), whether
+        // submit() succeeded or the named reason it failed (bgschedule), what iOS actually has queued
+        // (bgpending), and whether iOS ever invoked the handler (bgtask "handler INVOKED"). If this
+        // shows submits ok + pending requests but never a "handler INVOKED" line, iOS isn't granting;
+        // a "SUBMIT FAILED — …" line names the cause (refresh disabled / id missing from Info.plist).
+        s.append("# Background scheduling")
+        s.append("  Last (re)scheduled: \(t(observability.bgLastScheduled))")
+        let bgSources: Set<String> = ["bgregister", "bgschedule", "bgpending", "bgtask"]
+        let bgLog = observability.metricRecords()
+            .filter { bgSources.contains($0.source) }
+            .sorted { $0.date > $1.date }
+        if bgLog.isEmpty { s.append("  (no scheduling events recorded)") }
+        for r in bgLog.prefix(24) {
+            s.append("  \(t(r.date))  \(r.source)  \(r.detail)")
+        }
+        s.append("")
+
         // 5) Raw-frame capture — only present if the tester enabled it (protocol RE).
         if session.diagnosticsFrameCount > 0 {
             s.append("# Raw-frame capture")

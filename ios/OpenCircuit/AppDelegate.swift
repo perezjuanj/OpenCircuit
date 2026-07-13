@@ -14,7 +14,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // local notifications, so the user would see nothing and the backoff would still record a
         // fire — making them miss the alert entirely.
         UNUserNotificationCenter.current().delegate = self
-        scheduler.register { task in
+        let refreshRegistered = scheduler.register { task in
             guard let refreshTask = task as? BGAppRefreshTask else {
                 task.setTaskCompleted(success: false)
                 return
@@ -24,7 +24,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         }
         // BGProcessingTask: the longer-window sibling that finally gives the optical-HR poll room
         // to clear its ~60 s warm-up in the background (#45). Same sync path, larger time budget.
-        scheduler.registerProcessing { task in
+        let processingRegistered = scheduler.registerProcessing { task in
             guard let processingTask = task as? BGProcessingTask else {
                 task.setTaskCompleted(success: false)
                 return
@@ -32,6 +32,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             Self.handle(processingTask, kind: .processing,
                         timeout: RingBackgroundSyncService.processingTimeout)
         }
+        // Record whether iOS ACCEPTED our task-handler registrations (#bg-observability). A `false`
+        // means the identifier isn't in `BGTaskSchedulerPermittedIdentifiers` (Info.plist) or we
+        // registered too late — either way no background task of that kind can EVER run, and this is
+        // the line in the Diagnostics export that would say so.
+        ObservabilityStore().recordMetricEvent(
+            source: "bgregister", detail: "refresh=\(refreshRegistered) processing=\(processingRegistered)")
 
         // Re-instantiate the CBCentralManager (with its restore identifier) during launch so
         // iOS can deliver state restoration — including when it relaunches us in the
@@ -47,6 +53,20 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // ring implies a restorable central, so a state-restoration relaunch is covered by this gate.
         if RingScanner.hasSavedRingToRestore {
             MainActor.assumeIsolated {
+                // Wire the process-wide store into the shared scanner BEFORE arming reconnect, so a
+                // CoreBluetooth state-restoration relaunch (iOS waking us because the ring came back
+                // in range — a wake source INDEPENDENT of any BGTask grant) has a store to persist
+                // into. Without this, `willRestoreState`/`didConnect` build the RingSession with a nil
+                // store, and the autonomous 0x11-heartbeat drain that follows ingests nothing, writes
+                // no sleep summary, and flushes nothing to Health until the next FOREGROUND launch —
+                // silently defeating openless sync on the primary all-day path (G1). Non-destructive
+                // builder ONLY (never `makeContainer()`), so #131's no-background-wipe invariant holds;
+                // if neither container resolves (pre-first-unlock Data Protection) the store stays nil
+                // and behavior is exactly as before. `setLocalStore` is a reference assign that also
+                // propagates to an existing session (no second drain), so one-writer is preserved.
+                if let container = OpenCircuitApp.sharedContainer ?? (try? OpenCircuitApp.makeContainerOrThrow()) {
+                    RingScanner.shared.setLocalStore(LocalStore(container.mainContext))
+                }
                 RingScanner.shared.reconnectKnownPeripheral()
             }
         }
@@ -60,6 +80,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         scheduler.schedule()
         scheduler.scheduleProcessing()
         ObservabilityStore().recordScheduled()
+        // Snapshot what iOS actually queued right after submitting (#bg-observability): if this shows
+        // zero pending, the submit is silently failing; if it shows our two ids but no handler ever
+        // runs, iOS just isn't granting. Async (getPendingTaskRequests) — lands in the metric log.
+        scheduler.probePendingRequests()
         return true
     }
 
@@ -79,6 +103,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     private static func handle(_ task: BGTask, kind: TaskRecord.Kind, timeout: TimeInterval) {
         let scheduler = BackgroundRefreshScheduler()
         let observability = ObservabilityStore()
+        // Breadcrumb the INSTANT iOS invokes us, before any async work — so "iOS never woke us" (no
+        // such line) is distinguishable from "woke us but the drain didn't finish" (this line with no
+        // matching sync outcome below). This is the single record that answers "does ANY background
+        // task ever actually run?" — the whole question behind "every sync has been foreground".
+        // (#bg-observability)
+        observability.recordMetricEvent(source: "bgtask", detail: "\(kind.rawValue): handler INVOKED by iOS")
         scheduler.schedule()
         scheduler.scheduleProcessing()
         observability.recordScheduled()

@@ -93,25 +93,75 @@ struct BackgroundRefreshScheduler {
                                            fallbackInterval: fallbackInterval)
     }
 
-    func schedule() {
+    @discardableResult
+    func schedule() -> Bool {
+        submit(makeRequest(), cancelIdentifier: Self.identifier, label: "refresh")
+    }
+
+    @discardableResult
+    func scheduleProcessing() -> Bool {
+        submit(makeProcessingRequest(), cancelIdentifier: Self.processingIdentifier, label: "processing")
+    }
+
+    /// Cancel any duplicate then submit, recording the REAL outcome into the Diagnostics metric log
+    /// (#bg-observability). The old `#if DEBUG print` swallowed submit failures, so on a
+    /// device/TestFlight build a request iOS rejected on EVERY call (Background App Refresh
+    /// unavailable, or the identifier missing from `BGTaskSchedulerPermittedIdentifiers`) was
+    /// indistinguishable from a healthy schedule — `recordScheduled` fired regardless. That is
+    /// exactly how "no background sync ever runs" hides. We now persist success/failure (+ the
+    /// named reason) so the export can trace it.
+    @discardableResult
+    private func submit(_ request: BGTaskRequest, cancelIdentifier: String, label: String) -> Bool {
+        scheduler.cancel(taskRequestWithIdentifier: cancelIdentifier)
         do {
-            scheduler.cancel(taskRequestWithIdentifier: Self.identifier)
-            try scheduler.submit(makeRequest())
+            try scheduler.submit(request)
+            ObservabilityStore().recordMetricEvent(
+                source: "bgschedule", detail: "\(label): submitted ok (earliest \(Self.stamp(request)))")
+            return true
         } catch {
+            ObservabilityStore().recordMetricEvent(
+                source: "bgschedule", detail: "\(label): SUBMIT FAILED — \(Self.describe(error))")
             #if DEBUG
-            print("Unable to schedule background refresh: \(error)")
+            print("Unable to schedule background \(label): \(error)")
             #endif
+            return false
         }
     }
 
-    func scheduleProcessing() {
-        do {
-            scheduler.cancel(taskRequestWithIdentifier: Self.processingIdentifier)
-            try scheduler.submit(makeProcessingRequest())
-        } catch {
-            #if DEBUG
-            print("Unable to schedule background processing: \(error)")
-            #endif
+    /// Snapshot what iOS actually has QUEUED for us, into the Diagnostics metric log. The decisive
+    /// triage signal: if this shows zero pending right after `schedule()`, the submit is silently
+    /// failing; if it shows our two identifiers yet the handler never runs, iOS simply isn't
+    /// granting (throttle/conditions), not a wiring bug. Uses the real scheduler singleton (a
+    /// device-only diagnostic), so it reflects true system state, not an injected test mock.
+    func probePendingRequests() {
+        BGTaskScheduler.shared.getPendingTaskRequests { requests in
+            let summary = requests.isEmpty
+                ? "NONE queued (submit is failing, or iOS dropped them)"
+                : requests.map { req in
+                    "\(req.identifier)@\(req.earliestBeginDate.map(Self.iso) ?? "asap")"
+                }.joined(separator: ", ")
+            ObservabilityStore().recordMetricEvent(source: "bgpending", detail: summary)
         }
+    }
+
+    /// Human-readable reason for a `BGTaskScheduler` submit failure so the log names the actual
+    /// cause. The top suspects for "no background run ever" are `unavailable` (refresh off) and
+    /// `notPermitted` (identifier not declared in Info.plist).
+    static func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        guard ns.domain == "BGTaskSchedulerErrorDomain" else {
+            return "\(ns.domain) code \(ns.code): \(ns.localizedDescription)"
+        }
+        switch ns.code {
+        case 1:  return "unavailable — Background App Refresh is off/restricted for this app or device"
+        case 2:  return "tooManyPendingTaskRequests"
+        case 3:  return "notPermitted — identifier missing from BGTaskSchedulerPermittedIdentifiers, or submitted after launch"
+        default: return "BGTaskScheduler code \(ns.code): \(ns.localizedDescription)"
+        }
+    }
+
+    private static func iso(_ date: Date) -> String { ISO8601DateFormatter().string(from: date) }
+    private static func stamp(_ request: BGTaskRequest) -> String {
+        request.earliestBeginDate.map(iso) ?? "asap"
     }
 }
