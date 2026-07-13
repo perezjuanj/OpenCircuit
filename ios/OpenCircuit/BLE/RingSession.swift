@@ -2347,6 +2347,11 @@ final class RingSession: NSObject {
         write([0x96, 0x01, 0x00, 0x00, 0x00])
     }
 
+    /// How long after the sleep window's end a BACKGROUND drain is still treated as the morning
+    /// overnight catch-up (sleep-channel-FIRST, #119). Beyond this, background drains are ordinary
+    /// daytime refreshes (all-day-first, so a short window lands HR/steps before it's cut). (#daytime-bg-drain)
+    private static let morningCatchUpWindow: TimeInterval = 3 * 3600
+
     /// Drain BOTH history channels into `bulkRecords` — `0x00` (sleep/overnight) then `0x03`
     /// (awake/all-day) — and COMMIT the union via `finalizeSync`. Sets `syncing` for the whole
     /// duration so the frame handler captures pages into `bulkRecords`. The firmware assigns each
@@ -2396,7 +2401,20 @@ final class RingSession: NSObject {
         // overlap), each channel self-advances its OWN resume pointer, and the union commit in
         // `finalizeSync` is order-independent. `allDayOnly` (the workout prime) still skips sleep
         // entirely — never touching the sleep pointer overnight (#119).
-        let sleepFirst = !inBackground
+        //
+        // EXCEPTION — the morning overnight CATCH-UP stays sleep-FIRST even in the background (#119):
+        // shortly after the sleep window ends, the night accumulated untouched under overnight-quiet,
+        // so the big sleep backlog must land BEFORE you open the app. Detect it by proximity to the
+        // window's end (fresh here — the 0x11/descriptor wake path refreshes the window before this);
+        // ordinary daytime background refreshes (far from wake) keep all-day-first. Worst case if
+        // mis-timed is a delayed — never dropped — "Last night" summary that self-heals on the next
+        // wake / foreground open (adversarial review 2026-07-13, wf verify-drain-reorder-dataloss).
+        let morningCatchUp: Bool = {
+            guard inBackground, let end = nightWindow?.end else { return false }
+            let sinceWake = Date().timeIntervalSince(end)
+            return sinceWake >= 0 && sinceWake <= Self.morningCatchUpWindow
+        }()
+        let sleepFirst = !inBackground || morningCatchUp
         if sleepFirst, !allDayOnly {
             await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
         }
