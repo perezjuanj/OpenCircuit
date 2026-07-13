@@ -37,10 +37,11 @@ struct RingBackgroundSyncService {
     /// double-writes. Returns the BGTask success flag — true when we captured ANY data, not
     /// only a live HR, so iOS keeps scheduling us even on nights the optical HR never locks.
     @discardableResult
-    func syncVitals(timeout: TimeInterval = RingBackgroundSyncService.defaultTimeout) async throws -> Bool {
+    func syncVitals(timeout: TimeInterval = RingBackgroundSyncService.defaultTimeout,
+                    allowLivePoll: Bool = true) async throws -> Bool {
         let scanner = RingScanner.shared
         scanner.setLocalStore(store)   // RingSession auto-persists the drained history + temp
-        let capture = await scanner.captureForBackground(timeout: timeout)
+        let capture = await scanner.captureForBackground(timeout: timeout, allowLivePoll: allowLivePoll)
         // Resolve the night window for this connect so temp frames are gated correctly even
         // on a fresh background session that never ran the reactive refresh. This CANNOT be
         // hoisted above `captureForBackground`: the `RingSession` is created during that call's
