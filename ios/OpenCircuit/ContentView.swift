@@ -168,6 +168,12 @@ struct ContentView: View {
                 refreshHealthShareState()   // partial-grant (#132) + persisted write failures (#135)
                 refreshObservability()
                 if healthAuthorized {
+                    // #129: an already-authorized user who UPGRADED to a build that ADDED a writable
+                    // type (e.g. skin temp's switch to `.bodyTemperature`) is never re-prompted — every
+                    // `requestAuthorization` call site is gated on `!healthAuthorized` — so the new type
+                    // stays `.notDetermined`: its writes silently fail AND it never appears in Health's
+                    // Data Access screen to toggle on manually. Reconcile it here before the flush.
+                    await reconcileNewlyAuthorizableShareTypes()
                     flushHealth()
                 } else {
                     // Declined-before detection: the one-time sheet may be used up, in which
@@ -420,6 +426,26 @@ struct ContentView: View {
         }
         observability.recordSyncOutcome(kind: .foreground, success: gotData, detail: detail)
         refreshObservability()
+    }
+
+    /// #129: re-prompt an ALREADY-authorized user for a newly-added writable HealthKit type.
+    ///
+    /// Every `requestAuthorization` call site is gated on `!healthAuthorized`, so a user who upgrades
+    /// to a build that adds a writable type — e.g. skin temp's switch from `.basalBodyTemperature` to
+    /// `.bodyTemperature` — is never asked for it. The new type stays `.notDetermined`, which means its
+    /// writes silently fail AND it never appears in Health's Data Access screen (so it can't even be
+    /// toggled on manually). When `statusForAuthorizationRequest` still reports the set as requestable
+    /// (a `.notDetermined` type remains), re-run `requestAuthorization` so iOS prompts for JUST the new
+    /// type and registers it. Self-limiting: once the user answers, the type is determined and
+    /// `authorizationPromptAvailable()` flips false, so this never re-fires (a decline lands the type in
+    /// the `.sharingDenied` "not reaching Health" banner instead). Uses the existing `allTypes` set,
+    /// which deliberately excludes the non-shareable correlation types (#121/#128) — no new auth-crash risk.
+    @MainActor
+    private func reconcileNewlyAuthorizableShareTypes() async {
+        guard await health.authorizationPromptAvailable() == true else { return }
+        try? await health.requestAuthorization()
+        healthAuthorized = health.isShareAuthorized
+        refreshHealthShareState()
     }
 
     /// Foreground alert evaluation with a LIVE battery reading (the background path can't see
