@@ -2378,18 +2378,33 @@ final class RingSession: NSObject {
         syncing = true
         syncStatus = nil
         drainCountsByLabel.removeAll()
-        // Channel 0x00 — the sleep/overnight history (+ idle epochs). SKIPPED when `allDayOnly` (the
-        // workout measurement-prime): draining the sleep channel overnight advances the sleep resume
-        // pointer and can truncate/fragment the night (#119), and the prime only needs the all-day
-        // channel to wake measurement — so the prime touches ONLY 0x03 and never the sleep pointer.
-        if !allDayOnly {
+        // Channel order (#daytime-bg-drain). Two channels: 0x00 = sleep/overnight history (+ idle
+        // epochs); 0x03 = awake/all-day log (activity HR + ~10-min daytime SpO₂, same 23-byte schema
+        // → same BulkSleep decode → Health; the official app drains it too — pulling only 0x00 was
+        // why daytime SpO₂ went stale, #99). Each drains to its own 0x50 end-of-history, or an iOS
+        // task-cut that `flushDrainedToArchive` banks → resumes next wake (NEVER a mid-stream
+        // truncation). WHICH goes first matters in the BACKGROUND, where the BGAppRefresh window is
+        // ~30 s and iOS often cuts it ("ended early"):
+        //   • BACKGROUND → ALL-DAY (0x03) FIRST — it carries the daytime HR / steps / RR / SpO₂ the
+        //     background wake exists to refresh, so going first guarantees today's vitals land before
+        //     the short window closes. The sleep channel can NO-ACK on a daytime cursor and burn the
+        //     whole window on a timeout before all-day ever opens (device-observed 2026-07-13: sleep
+        //     no-ack added=0, then all-day added=173) — so sleep-first was starving the wanted data.
+        //   • FOREGROUND → SLEEP (0x00) FIRST, unchanged — the window is long and the morning
+        //     overnight catch-up (the big sleep backlog) should complete first.
+        // Safe to reorder: firmware assigns each epoch to exactly ONE channel (🟢 0 % counter
+        // overlap), each channel self-advances its OWN resume pointer, and the union commit in
+        // `finalizeSync` is order-independent. `allDayOnly` (the workout prime) still skips sleep
+        // entirely — never touching the sleep pointer overnight (#119).
+        let sleepFirst = !inBackground
+        if sleepFirst, !allDayOnly {
             await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
         }
-        // Channel 0x03 — the awake/all-day log: activity HR + a periodic ~10-min daytime SpO₂ reading
-        // (same 23-byte schema, so it flows through the same BulkSleep decode → Health as-is). The
-        // official app drains this too; pulling only 0x00 was why daytime SpO₂ went stale (#99).
         if !Task.isCancelled {
             await drainChannel(channel: Command.syncChannelAllDay, label: "all-day")
+        }
+        if !sleepFirst, !allDayOnly, !Task.isCancelled {
+            await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
         }
         lastDrainSummary = "sleep \(drainCountsByLabel["sleep"] ?? 0) · all-day \(drainCountsByLabel["all-day"] ?? 0) epochs"
         finalizeSync()
