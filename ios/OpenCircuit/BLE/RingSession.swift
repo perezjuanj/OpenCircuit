@@ -2347,6 +2347,11 @@ final class RingSession: NSObject {
         write([0x96, 0x01, 0x00, 0x00, 0x00])
     }
 
+    /// How long after the sleep window's end a BACKGROUND drain is still treated as the morning
+    /// overnight catch-up (sleep-channel-FIRST, #119). Beyond this, background drains are ordinary
+    /// daytime refreshes (all-day-first, so a short window lands HR/steps before it's cut). (#daytime-bg-drain)
+    private static let morningCatchUpWindow: TimeInterval = 3 * 3600
+
     /// Drain BOTH history channels into `bulkRecords` — `0x00` (sleep/overnight) then `0x03`
     /// (awake/all-day) — and COMMIT the union via `finalizeSync`. Sets `syncing` for the whole
     /// duration so the frame handler captures pages into `bulkRecords`. The firmware assigns each
@@ -2378,18 +2383,46 @@ final class RingSession: NSObject {
         syncing = true
         syncStatus = nil
         drainCountsByLabel.removeAll()
-        // Channel 0x00 — the sleep/overnight history (+ idle epochs). SKIPPED when `allDayOnly` (the
-        // workout measurement-prime): draining the sleep channel overnight advances the sleep resume
-        // pointer and can truncate/fragment the night (#119), and the prime only needs the all-day
-        // channel to wake measurement — so the prime touches ONLY 0x03 and never the sleep pointer.
-        if !allDayOnly {
+        // Channel order (#daytime-bg-drain). Two channels: 0x00 = sleep/overnight history (+ idle
+        // epochs); 0x03 = awake/all-day log (activity HR + ~10-min daytime SpO₂, same 23-byte schema
+        // → same BulkSleep decode → Health; the official app drains it too — pulling only 0x00 was
+        // why daytime SpO₂ went stale, #99). Each drains to its own 0x50 end-of-history, or an iOS
+        // task-cut that `flushDrainedToArchive` banks → resumes next wake (NEVER a mid-stream
+        // truncation). WHICH goes first matters in the BACKGROUND, where the BGAppRefresh window is
+        // ~30 s and iOS often cuts it ("ended early"):
+        //   • BACKGROUND → ALL-DAY (0x03) FIRST — it carries the daytime HR / steps / RR / SpO₂ the
+        //     background wake exists to refresh, so going first guarantees today's vitals land before
+        //     the short window closes. The sleep channel can NO-ACK on a daytime cursor and burn the
+        //     whole window on a timeout before all-day ever opens (device-observed 2026-07-13: sleep
+        //     no-ack added=0, then all-day added=173) — so sleep-first was starving the wanted data.
+        //   • FOREGROUND → SLEEP (0x00) FIRST, unchanged — the window is long and the morning
+        //     overnight catch-up (the big sleep backlog) should complete first.
+        // Safe to reorder: firmware assigns each epoch to exactly ONE channel (🟢 0 % counter
+        // overlap), each channel self-advances its OWN resume pointer, and the union commit in
+        // `finalizeSync` is order-independent. `allDayOnly` (the workout prime) still skips sleep
+        // entirely — never touching the sleep pointer overnight (#119).
+        //
+        // EXCEPTION — the morning overnight CATCH-UP stays sleep-FIRST even in the background (#119):
+        // shortly after the sleep window ends, the night accumulated untouched under overnight-quiet,
+        // so the big sleep backlog must land BEFORE you open the app. Detect it by proximity to the
+        // window's end (fresh here — the 0x11/descriptor wake path refreshes the window before this);
+        // ordinary daytime background refreshes (far from wake) keep all-day-first. Worst case if
+        // mis-timed is a delayed — never dropped — "Last night" summary that self-heals on the next
+        // wake / foreground open (adversarial review 2026-07-13, wf verify-drain-reorder-dataloss).
+        let morningCatchUp: Bool = {
+            guard inBackground, let end = nightWindow?.end else { return false }
+            let sinceWake = Date().timeIntervalSince(end)
+            return sinceWake >= 0 && sinceWake <= Self.morningCatchUpWindow
+        }()
+        let sleepFirst = !inBackground || morningCatchUp
+        if sleepFirst, !allDayOnly {
             await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
         }
-        // Channel 0x03 — the awake/all-day log: activity HR + a periodic ~10-min daytime SpO₂ reading
-        // (same 23-byte schema, so it flows through the same BulkSleep decode → Health as-is). The
-        // official app drains this too; pulling only 0x00 was why daytime SpO₂ went stale (#99).
         if !Task.isCancelled {
             await drainChannel(channel: Command.syncChannelAllDay, label: "all-day")
+        }
+        if !sleepFirst, !allDayOnly, !Task.isCancelled {
+            await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
         }
         lastDrainSummary = "sleep \(drainCountsByLabel["sleep"] ?? 0) · all-day \(drainCountsByLabel["all-day"] ?? 0) epochs"
         finalizeSync()
@@ -3239,6 +3272,19 @@ extension RingSession: CBPeripheralDelegate {
                 // workout capture shows whether the ring entered sport mode after our SportStart (#90).
                 let mode = bytes.count > 2 ? String(format: "0x%02x", bytes[2]) : "-"
                 ringLog.notice("status frame: mode=\(mode, privacy: .public) stepsRaw=\(stepCounter ?? -1) total=\(self.steps ?? -1) batt=\(self.batteryPercent ?? -1)% charging=\(self.charging) case=\(self.caseBattery?.percent ?? -1)% temp=\(tempText, privacy: .public)")
+            }
+            // Descriptor (0x10/0x87) frames are this ring's steady ~2.5-min background beat: on
+            // FR02.018/Gen2 the stream carries descriptors, NOT the 0x11 heartbeat the all-day
+            // background drain keys off (see the 0x11 case below). Keying the drain trigger on 0x11
+            // alone therefore leaves the daytime background drain with NO trigger on this ring — the
+            // app is woken (a descriptor arrives) but never evaluates whether a drain is due, so HR/
+            // steps/RR only refresh on foreground. Treat any descriptor arriving while suspended as a
+            // background wake slot too. `maybeDrainOnBackgroundWake` is background-only, and
+            // `evaluatePeriodicDrain` re-checks the ~1 h cadence + overnight-quiet gate + syncTask, so
+            // this is a safe no-op unless a drain is genuinely due (no extra radio, no double-drain,
+            // overnight-quiet preserved). (#daytime-bg-drain)
+            if let op = bytes.first, op == 0x10 || op == 0x87 {
+                self.maybeDrainOnBackgroundWake(trigger: "descriptor-wake")
             }
             // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).
             switch bytes.first {

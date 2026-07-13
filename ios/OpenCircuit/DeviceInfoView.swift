@@ -185,6 +185,20 @@ struct DeviceInfoView: View {
                 Label("Export diagnostics", systemImage: "square.and.arrow.up")
             }
             .disabled(session == nil)
+            // Re-arm the BGTask chain and snapshot what iOS has queued, on demand (#bg-observability).
+            // Tap this, wait a few seconds (the pending-requests probe is async), then Export
+            // diagnostics — the "# Background scheduling" section then shows submit outcomes + the
+            // pending requests, which is how we diagnose "no background sync ever runs".
+            Button {
+                let scheduler = BackgroundRefreshScheduler()
+                scheduler.schedule()
+                scheduler.scheduleProcessing()
+                ObservabilityStore().recordScheduled()
+                scheduler.probePendingRequests()
+                ObservabilityStore().recordMetricEvent(source: "bgtask", detail: "manual reschedule+probe from Diagnostics")
+            } label: {
+                Label("Reschedule & probe background tasks", systemImage: "arrow.clockwise")
+            }
             Toggle("Capture raw history frames", isOn: $captureEnabled)
             LabeledContent("Frames captured", value: "\(session?.diagnosticsFrameCount ?? 0)")
             if (session?.diagnosticsFrameCount ?? 0) > 0 {
