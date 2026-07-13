@@ -3240,6 +3240,19 @@ extension RingSession: CBPeripheralDelegate {
                 let mode = bytes.count > 2 ? String(format: "0x%02x", bytes[2]) : "-"
                 ringLog.notice("status frame: mode=\(mode, privacy: .public) stepsRaw=\(stepCounter ?? -1) total=\(self.steps ?? -1) batt=\(self.batteryPercent ?? -1)% charging=\(self.charging) case=\(self.caseBattery?.percent ?? -1)% temp=\(tempText, privacy: .public)")
             }
+            // Descriptor (0x10/0x87) frames are this ring's steady ~2.5-min background beat: on
+            // FR02.018/Gen2 the stream carries descriptors, NOT the 0x11 heartbeat the all-day
+            // background drain keys off (see the 0x11 case below). Keying the drain trigger on 0x11
+            // alone therefore leaves the daytime background drain with NO trigger on this ring — the
+            // app is woken (a descriptor arrives) but never evaluates whether a drain is due, so HR/
+            // steps/RR only refresh on foreground. Treat any descriptor arriving while suspended as a
+            // background wake slot too. `maybeDrainOnBackgroundWake` is background-only, and
+            // `evaluatePeriodicDrain` re-checks the ~1 h cadence + overnight-quiet gate + syncTask, so
+            // this is a safe no-op unless a drain is genuinely due (no extra radio, no double-drain,
+            // overnight-quiet preserved). (#daytime-bg-drain)
+            if let op = bytes.first, op == 0x10 || op == 0x87 {
+                self.maybeDrainOnBackgroundWake(trigger: "descriptor-wake")
+            }
             // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).
             switch bytes.first {
             case 0x47:
