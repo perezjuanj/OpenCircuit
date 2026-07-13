@@ -70,7 +70,7 @@ final class HealthKitShareTypesTests: XCTestCase {
     func testShareStatePartialListsDeniedTypes() {
         let types = HealthKitWriter().allTypes
         let spo2 = HKQuantityType(.oxygenSaturation)
-        let temp = HKQuantityType(.basalBodyTemperature)
+        let temp = HKQuantityType(.bodyTemperature)
         let state = HealthKitWriter.resolveShareState(authorizableTypes: types) { type in
             (type.isEqual(spo2) || type.isEqual(temp)) ? .sharingDenied : .sharingAuthorized
         }
@@ -99,7 +99,7 @@ final class HealthKitShareTypesTests: XCTestCase {
     func testFriendlyNamesMapAndDedupe() {
         let names = HealthKitWriter.friendlyNames(for: [
             HKQuantityType(.oxygenSaturation),
-            HKQuantityType(.basalBodyTemperature),
+            HKQuantityType(.bodyTemperature),
             HKQuantityType(.bloodPressureSystolic),
             HKQuantityType(.bloodPressureDiastolic),   // collapses with systolic → one "Blood Pressure"
             HKCategoryType(.sleepAnalysis),

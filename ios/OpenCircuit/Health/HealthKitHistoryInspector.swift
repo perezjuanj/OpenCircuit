@@ -64,7 +64,7 @@ struct HealthKitHistoryInspector {
         }
 
         let tempNights = try await countCoveredNights(
-            type: HKQuantityType(.basalBodyTemperature),
+            type: HKQuantityType(.bodyTemperature),
             from: start,
             to: end,
             nights: nights,
@@ -187,7 +187,7 @@ struct HealthKitHistoryInspector {
             return .secondUnit(with: .milli)
         case HKQuantityTypeIdentifier.oxygenSaturation.rawValue:
             return .percent()
-        case HKQuantityTypeIdentifier.basalBodyTemperature.rawValue:
+        case HKQuantityTypeIdentifier.bodyTemperature.rawValue:
             return .degreeCelsius()
         default:
             return .count()
@@ -283,7 +283,7 @@ struct HealthKitVitalsBaselineReader {
             scale: 1
         )
         let nightlyTemp = try await nightlyMeans(
-            type: HKQuantityType(.basalBodyTemperature),
+            type: HKQuantityType(.bodyTemperature),
             from: start,
             to: end,
             nights: nights,
@@ -385,7 +385,7 @@ struct HealthKitVitalsBaselineReader {
             return .secondUnit(with: .milli)
         case HKQuantityTypeIdentifier.oxygenSaturation.rawValue:
             return .percent()
-        case HKQuantityTypeIdentifier.basalBodyTemperature.rawValue:
+        case HKQuantityTypeIdentifier.bodyTemperature.rawValue:
             return .degreeCelsius()
         default:
             return .count()

@@ -30,15 +30,17 @@ final class HealthKitWriter {
         case .restingHeartRate: id = .restingHeartRate
         case .hrvSDNN: id = .heartRateVariabilitySDNN
         case .spo2: id = .oxygenSaturation
-        // Skin temp is captured ONLY during the nightly sleep window (RingSession), so a
-        // rest-oriented type is the right home — NOT clinical `.bodyTemperature`, whose chart a
-        // skin reading (~5 °C below oral/core) would pollute (#29). The ideal sleeping-wrist type
-        // (`.appleSleepingWristTemperature`) is Apple-COMPUTED and read-only for third parties:
-        // it can't be save()d, and putting it in the `toShare` set of `requestAuthorization`
-        // raises NSInvalidArgumentException, which would crash auth or — swallowed by the
-        // call-site `try?` — silently disable EVERY metric's writeback. So we use the writable,
-        // rest-scoped `.basalBodyTemperature` instead. Units stay °C (see `unit(for:)`).
-        case .temperature: id = .basalBodyTemperature
+        // Skin temp is captured ONLY during the nightly sleep window (RingSession). The ideal
+        // sleeping-wrist type (`.appleSleepingWristTemperature`) is Apple-COMPUTED and read-only
+        // for third parties: it can't be save()d, and putting it in the `toShare` set of
+        // `requestAuthorization` raises NSInvalidArgumentException, which would crash auth or —
+        // swallowed by the call-site `try?` — silently disable EVERY metric's writeback. We
+        // previously used `.basalBodyTemperature`, but Apple Health hard-wires that type to
+        // Cycle Tracking's basal body temperature (BBT) chart, which is a specific fertility
+        // signal — polluting it with nightly skin readings misreports BBT. Writing to the
+        // general `.bodyTemperature` keeps the data in Health without entangling it with the
+        // menstrual-cycle chart. Units stay °C (see `unit(for:)`).
+        case .temperature: id = .bodyTemperature
         case .respiratoryRate: id = .respiratoryRate
         case .steps: id = .stepCount
         case .activeEnergy: id = .activeEnergyBurned
@@ -88,7 +90,7 @@ final class HealthKitWriter {
         set.insert(HKQuantityType(.distanceCycling))
         // Women's health (#78): user-logged period flow written to Health.
         // NOTE: temperature is NOT added here — it already ships via the canonical
-        // `.basalBodyTemperature` path (MetricKind.temperature). No triple-write.
+        // `.bodyTemperature` path (MetricKind.temperature). No triple-write.
         set.insert(HKCategoryType(.menstrualFlow))
         // Blood pressure (#121): authorization is granted on the two CONSTITUENT quantity
         // types only. The `bloodPressureType` HKCorrelationType must NEVER be added here:
@@ -518,7 +520,7 @@ final class HealthKitWriter {
             read.insert(type)
         }
         // Every type in `allTypes` is deliberately third-party-WRITABLE (that's why `.temperature`
-        // maps to `.basalBodyTemperature`, not the read-only `.appleSleepingWristTemperature`) —
+        // maps to `.bodyTemperature`, not the read-only `.appleSleepingWristTemperature`) —
         // an unshareable type here would poison the whole request. Defensive isolation: if the
         // request still throws (a future/edge type the OS refuses to share), retry WITHOUT
         // temperature so one bad type degrades to "temp not shared" instead of disabling share
