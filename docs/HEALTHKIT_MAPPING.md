@@ -10,7 +10,7 @@ device's own timestamps (so historical sync backfills correctly).
 | Resting heart rate | `.restingHeartRate` | Quantity | count/min | daily, derived on-device (sleep mean → low-activity floor); see notes |
 | HRV (RMSSD) | `.heartRateVariabilitySDNN` | Quantity | ms | ring reports **RMSSD**; written into the SDNN field and **tagged via metadata** (no fake conversion) — see notes |
 | Blood oxygen (SpO₂) | `.oxygenSaturation` | Quantity | % (0–1.0) | HealthKit wants a fraction |
-| Skin / sleeping-wrist temperature | `.basalBodyTemperature` | Quantity | °C | sleep-scoped writable type; the ideal `.appleSleepingWristTemperature` is Apple-computed/read-only for third parties — see notes |
+| Skin / sleeping-wrist temperature | `.bodyTemperature` | Quantity | °C | general writable temperature type; the ideal `.appleSleepingWristTemperature` is Apple-computed/read-only for third parties, and `.basalBodyTemperature` is hard-wired to Cycle Tracking's BBT chart — see notes |
 | Respiratory rate | `.respiratoryRate` | Quantity | count/min | |
 | Steps | `.stepCount` | Quantity | count | cumulative; avoid double-counting with phone |
 | Active energy | `.activeEnergyBurned` | Quantity | kcal | |
@@ -33,12 +33,10 @@ device's own timestamps (so historical sync backfills correctly).
 - **No HealthKit on desktop/macOS.** This mapping is only realized in the iOS app;
   the desktop workbench just dumps to SQLite/CSV for validation.
 
-### Temperature → `.basalBodyTemperature` (#29)
+### Temperature → `.bodyTemperature` (#29)
 
 OpenCircuit only captures skin temperature during the nightly sleep window
-(`RingSession` gates temp frames to the detected/scheduled night), so it belongs in a
-rest-oriented type — NOT clinical `.bodyTemperature`, whose oral/core chart a skin reading
-(~5 °C below core) would corrupt.
+(`RingSession` gates temp frames to the detected/scheduled night).
 
 The *ideal* home is `.appleSleepingWristTemperature` (what Apple's own sleep apps and
 Bevel's wrist-temp baseline read), but that type is **Apple-computed and read-only for
@@ -46,11 +44,19 @@ third-party apps**: a `save()` of it would fail, and — worse — listing it in
 `toShare` set of `requestAuthorization` raises an Obj-C `NSInvalidArgumentException`
 ("Authorization to share the following types is disallowed"), which crashes the auth
 flow or, once swallowed by the call site's `try?`, silently disables writeback for *every*
-metric. So we write the writable, rest-scoped **`.basalBodyTemperature`** instead
+metric.
+
+The next candidate, `.basalBodyTemperature`, is a writable third-party type — but Apple
+Health hard-wires it to **Cycle Tracking's basal body temperature (BBT) chart**, a
+specific fertility signal read at wake before rising. Writing nightly wrist skin
+readings there would corrupt users' BBT/ovulation reporting.
+
+So we write the writable, general **`.bodyTemperature`** type instead
 (`HealthKitWriter.quantityType(for: .temperature)`), and `requestAuthorization` is
 hardened to drop the temperature type rather than poison the whole share request if it is
-ever refused. Trade-off: third-party apps simply cannot populate the sleeping-wrist chart,
-so a wrist-temp baseline reader won't see ring temperature there. Values stay in °C.
+ever refused. Trade-offs: values do not land in the sleeping-wrist chart (that type is
+third-party read-only), and `.bodyTemperature`'s chart is normally oral/core — a wrist
+skin reading (~5 °C below core) will look low there. Values stay in °C.
 
 ### HRV: RMSSD stored in the SDNN field, labeled via metadata (#37)
 
