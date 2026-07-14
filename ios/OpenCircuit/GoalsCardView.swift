@@ -133,10 +133,22 @@ struct GoalsCardView: View {
     /// Asleep minutes credited to today's ring — the stored night's `asleepMin` only when it ended
     /// today, else 0 (empty ring). Don't gate on `asleepMin > 0`: a stale night has positive
     /// minutes too, so recency (not magnitude) is what decides.
-    /// Today's nap sleep (#nap-parity), folded into the daily sleep total per RingConn.
-    private var napAsleepMin: Int { todayNaps.reduce(0) { $0 + $1.asleepMin } }
-    /// Credited daily sleep = last night (if it ended today) + today's naps. Naps are detected
-    /// outside the main night, so this never double-counts.
+    /// The credited night's in-bed window, when a night ended today. Naps overlapping it are excluded
+    /// from the fold-in so they can never double-count against the night (a MANUAL nap has no
+    /// auto-detection night guard, so this exclusion is required, not just belt-and-suspenders).
+    private var creditedNightInterval: DateInterval? {
+        guard sleepCredited, let s = latestSleep.first, s.inBedEnd > s.inBedStart else { return nil }
+        return DateInterval(start: s.inBedStart, end: s.inBedEnd)
+    }
+    /// Today's nap sleep (#nap-parity), folded into the daily sleep total per RingConn — excluding any
+    /// nap overlapping the credited night.
+    private var napAsleepMin: Int {
+        todayNaps.reduce(0) { sum, nap in
+            if let n = creditedNightInterval, nap.effectiveStart < n.end && nap.effectiveEnd > n.start { return sum }
+            return sum + nap.asleepMin
+        }
+    }
+    /// Credited daily sleep = last night (if it ended today) + today's non-overlapping naps.
     private var creditedLastNightMin: Int {
         (sleepCredited ? (latestSleep.first?.asleepMin ?? 0) : 0) + napAsleepMin
     }

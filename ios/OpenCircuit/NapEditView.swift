@@ -37,7 +37,7 @@ struct NapEditView: View {
     private var isAdd: Bool { originalStart == nil }
     private var window: NapEdit.Window { .init(start: start, end: end) }
     private var invalid: NapEdit.Invalid? {
-        NapEdit.validate(window, night: night, otherNaps: otherNaps)
+        NapEdit.validate(window, night: night, otherNaps: otherNaps, now: Date())
     }
 
     var body: some View {
@@ -84,6 +84,8 @@ struct NapEditView: View {
         case .endNotAfterStart:   return "End time must be after the start."
         case .tooShort(let m):    return "A nap is at least \(m) minutes."
         case .tooLong(let h):     return "That’s over \(h) hours — log it as a night, not a nap."
+        case .notDaytime:         return "A nap has to be during the day."
+        case .inFuture:           return "That time hasn’t happened yet."
         case .overlapsNight:      return "This overlaps your main sleep."
         case .overlapsNap:        return "This overlaps another nap."
         }

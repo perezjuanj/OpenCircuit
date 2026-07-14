@@ -25,25 +25,33 @@ public enum NapEdit {
         case endNotAfterStart
         case tooShort(minMinutes: Int)
         case tooLong(maxHours: Int)
+        case notDaytime
+        case inFuture
         case overlapsNight
         case overlapsNap
     }
 
     /// Validate a proposed nap window (edit or add). `night` is the main in-bed window to stay clear
-    /// of (nil when unknown); `otherNaps` are the OTHER naps' windows (exclude the one being edited).
-    /// Returns nil when the window is a valid, non-overlapping daytime nap.
+    /// of (nil when unknown); `otherNaps` are the OTHER naps' windows (exclude the one being edited);
+    /// `now` (when supplied) rejects a future-dated window. Returns nil when the window is a valid,
+    /// non-overlapping DAYTIME nap. The daytime gate mirrors NapDetection's own overnight-block
+    /// rejection, so the manual path can't log a nap in the middle of the night.
     public static func validate(_ w: Window, night: DateInterval? = nil,
-                                otherNaps: [DateInterval] = []) -> Invalid? {
+                                otherNaps: [DateInterval] = [], now: Date? = nil) -> Invalid? {
         if w.end <= w.start { return .endNotAfterStart }
         if w.duration < minDuration { return .tooShort(minMinutes: Int(minDuration / 60)) }
         if w.duration > maxDuration { return .tooLong(maxHours: Int(maxDuration / 3600)) }
+        if let now, w.end > now { return .inFuture }
+        // Overlaps are the more actionable error near the night boundary, so check them BEFORE the
+        // daytime gate (a nap that overlaps the night reports "overlaps your sleep", not "not daytime").
         if let n = night, w.start < n.end && w.end > n.start { return .overlapsNight }
         for o in otherNaps where w.start < o.end && w.end > o.start { return .overlapsNap }
+        if SleepWindow.isOvernightBlock(start: w.start, end: w.end) { return .notDaytime }
         return nil
     }
 
     public static func isValid(_ w: Window, night: DateInterval? = nil,
-                               otherNaps: [DateInterval] = []) -> Bool {
-        validate(w, night: night, otherNaps: otherNaps) == nil
+                               otherNaps: [DateInterval] = [], now: Date? = nil) -> Bool {
+        validate(w, night: night, otherNaps: otherNaps, now: now) == nil
     }
 }

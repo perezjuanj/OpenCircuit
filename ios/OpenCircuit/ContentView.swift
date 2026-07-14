@@ -944,7 +944,8 @@ struct ContentView: View {
                           await session?.applySleepEdit(night: night, window: window) ?? nil
                       },
                       onNap: { originalStart, window in
-                          await session?.applyNapEdit(originalStart: originalStart, window: window) ?? false
+                          // Through the scanner, not session — nap add/edit works offline (no ring needed).
+                          await scanner.applyNapEdit(originalStart: originalStart, window: window)
                       })
     }
 

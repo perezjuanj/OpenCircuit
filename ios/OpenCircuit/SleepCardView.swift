@@ -723,7 +723,7 @@ struct SleepCardView: View {
     @ViewBuilder
     private func napsRow() -> some View {
         if let onNap {
-            let totalMin = todayNaps.reduce(0) { $0 + $1.durationMin }
+            let totalMin = todayNaps.reduce(0) { $0 + $1.asleepMin }
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Image(systemName: "sun.max.fill").font(.caption2).foregroundStyle(.yellow)
@@ -740,11 +740,15 @@ struct SleepCardView: View {
                 }
                 ForEach(todayNaps, id: \.start) { nap in
                     Button {
-                        napTarget = NapTarget(originalStart: nap.start, initialStart: nap.start, initialEnd: nap.end)
+                        // originalStart is the STABLE dedup key; the initial window is the effective one.
+                        napTarget = NapTarget(originalStart: nap.start,
+                                              initialStart: nap.effectiveStart, initialEnd: nap.effectiveEnd)
                     } label: {
                         HStack(spacing: 6) {
                             Text(napTimeLabel(nap)).font(.caption2)
-                            if nap.isManuallyEdited || nap.isManuallyAdded {
+                            if nap.isManuallyAdded {
+                                Text("added").font(.caption2).foregroundStyle(.secondary)
+                            } else if nap.isManuallyEdited {
                                 Text("edited").font(.caption2).foregroundStyle(.secondary)
                             }
                             Spacer()
@@ -766,7 +770,7 @@ struct SleepCardView: View {
                     onSave: { originalStart, window in await onNap(originalStart, window) })
             }
         } else if !todayNaps.isEmpty {
-            let totalMin = todayNaps.reduce(0) { $0 + $1.durationMin }
+            let totalMin = todayNaps.reduce(0) { $0 + $1.asleepMin }
             HStack(spacing: 6) {
                 Image(systemName: "sun.max.fill").font(.caption2).foregroundStyle(.yellow)
                 Text("Naps today").font(.caption2).foregroundStyle(.secondary)
@@ -790,7 +794,7 @@ struct SleepCardView: View {
     }
 
     private func napTimeLabel(_ nap: StoredNap) -> String {
-        "\(nap.start.formatted(date: .omitted, time: .shortened))–\(nap.end.formatted(date: .omitted, time: .shortened)) · \(nap.durationMin)m"
+        "\(nap.effectiveStart.formatted(date: .omitted, time: .shortened))–\(nap.effectiveEnd.formatted(date: .omitted, time: .shortened)) · \(nap.durationMin)m"
     }
 
     // MARK: Subjective rating (#70)

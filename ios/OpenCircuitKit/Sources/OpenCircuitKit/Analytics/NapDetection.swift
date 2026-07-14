@@ -95,8 +95,10 @@ public enum NapDetection {
     /// it. Per-nap Deep/Light/REM STAGING (RingConn parity — their `SleepNapModel` carries a
     /// `sleepPhases` hypnogram) when the classifier can produce it; a COARSE asleep/awake split when
     /// the short / low-signal window gives it nothing to stage (or its gates strip the sleep). The
-    /// fallback is never worse than the previous behaviour, and NapDetection's own gates remain the
-    /// authority on whether this block is a nap at all — staging only adds detail, never removes the nap.
+    /// fallback keeps a nap the classifier can't stage; NapDetection's own gates remain the authority
+    /// on whether this block is a nap at all. Staging refines the stage breakdown and MAY shift the
+    /// asleep-vs-awake split (so credited minutes can differ from the coarse path), but never removes
+    /// the nap or its boundaries.
     private static func napSegments(from records: [BulkRecord],
                                     period: ActivityPeriod,
                                     epoch: Int) -> [SleepSegment] {
