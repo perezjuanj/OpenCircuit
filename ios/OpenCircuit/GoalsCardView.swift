@@ -35,10 +35,17 @@ struct GoalsCardView: View {
     @Query private var todayHR: [StoredSample]
     /// Most recent sleep summary for last-night's sleep duration + sleep window exclusion.
     @Query private var latestSleep: [StoredSleepSummary]
+    /// Today's naps (#nap-parity) — folded into the daily sleep total, matching RingConn's
+    /// sleepNapAvgTimeLength. Detected OUTSIDE the main night, so no double-count.
+    @Query private var todayNaps: [StoredNap]
 
     init() {
         let dayStart = Calendar.current.startOfDay(for: Date())
         let hrKind = MetricKind.heartRate.rawValue
+
+        _todayNaps = Query(FetchDescriptor<StoredNap>(
+            predicate: #Predicate { $0.start >= dayStart },
+            sortBy: [SortDescriptor(\.start, order: .forward)]))
 
         _todayDaily = Query(
             filter: #Predicate<StoredDaily> { $0.day == dayStart },
@@ -126,7 +133,27 @@ struct GoalsCardView: View {
     /// Asleep minutes credited to today's ring — the stored night's `asleepMin` only when it ended
     /// today, else 0 (empty ring). Don't gate on `asleepMin > 0`: a stale night has positive
     /// minutes too, so recency (not magnitude) is what decides.
-    private var creditedLastNightMin: Int { sleepCredited ? (latestSleep.first?.asleepMin ?? 0) : 0 }
+    /// The credited night's in-bed window, when a night ended today. Naps overlapping it are excluded
+    /// from the fold-in so they can never double-count against the night (a MANUAL nap has no
+    /// auto-detection night guard, so this exclusion is required, not just belt-and-suspenders).
+    private var creditedNightInterval: DateInterval? {
+        guard sleepCredited, let s = latestSleep.first, s.inBedEnd > s.inBedStart else { return nil }
+        return DateInterval(start: s.inBedStart, end: s.inBedEnd)
+    }
+    /// Today's nap sleep (#nap-parity), folded into the daily sleep total per RingConn — excluding any
+    /// nap overlapping the credited night.
+    private var napAsleepMin: Int {
+        todayNaps.reduce(0) { sum, nap in
+            if let n = creditedNightInterval, nap.effectiveStart < n.end && nap.effectiveEnd > n.start { return sum }
+            return sum + nap.asleepMin
+        }
+    }
+    /// Credited daily sleep = last night (if it ended today) + today's non-overlapping naps.
+    private var creditedLastNightMin: Int {
+        (sleepCredited ? (latestSleep.first?.asleepMin ?? 0) : 0) + napAsleepMin
+    }
+    /// True when there's any sleep to credit today (a night ended today, or a nap was logged).
+    private var hasSleepCredit: Bool { sleepCredited || napAsleepMin > 0 }
 
     private var sleepGoalMin: Int {
         GoalDefaults.isWeekend() ? weekendSleepMin : workdaySleepMin
@@ -185,7 +212,7 @@ struct GoalsCardView: View {
                          label: "Sleep",
                          // "—" (not "0m") when no night ended today, so an empty ring reads as
                          // "no data yet", never "0 minutes slept" (#147).
-                         current: sleepCredited ? formatDuration(creditedLastNightMin) : "—",
+                         current: hasSleepCredit ? formatDuration(creditedLastNightMin) : "—",
                          goal: formatDuration(sleepGoalMin),
                          color: .purple)
             }

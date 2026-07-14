@@ -516,6 +516,27 @@ final class RingScanner: NSObject {
         session?.setLocalStore(localStore)
     }
 
+    /// Apply a manual nap action (#nap-parity, RingConn add/edit nap). Routed through the SCANNER, not
+    /// the connection-scoped `session` (which is nil while disconnected), so nap add/edit works OFFLINE
+    /// — it needs only the persisted store + Apple Health, never the live ring. `originalStart == nil`
+    /// ADDS; otherwise it EDITS that nap. Non-destructive: an ADD appends to Apple Health; an EDIT is
+    /// app-side (a nap already mirrored is never re-written or deleted). Returns whether it persisted.
+    @discardableResult
+    func applyNapEdit(originalStart: Date?, window: NapEdit.Window) async -> Bool {
+        guard let store = localStore else { return false }
+        let ok: Bool
+        if let originalStart {
+            ok = (try? store.editNap(originalStart: originalStart, newStart: window.start, newEnd: window.end)) ?? false
+        } else {
+            ok = (try? store.addManualNap(start: window.start, end: window.end)) ?? false
+        }
+        guard ok else { return false }
+        if HealthKitWriter.isAvailable {
+            _ = await HealthKitWriter().flushToHealth(store: store)
+        }
+        return true
+    }
+
     /// Tear down the live link and STOP auto-reconnecting. Clearing `wantConnection`
     /// before cancelling is essential: otherwise `didDisconnectPeripheral` still wants a
     /// connection and immediately reconnects, looping forever (#14 fix).

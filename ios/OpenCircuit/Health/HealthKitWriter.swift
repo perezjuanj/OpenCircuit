@@ -443,9 +443,11 @@ final class HealthKitWriter {
         guard let pending = try? store.pendingNaps(), !pending.isEmpty else { return 0 }
         var written = 0
         for nap in pending {
-            let segs = [
-                SleepSegment(start: nap.start, end: nap.end, stage: .inBed),
-                SleepSegment(start: nap.start, end: nap.end, stage: .asleepCore),
+            // Write the nap's staged hypnogram (Deep/Light/REM — RingConn sleepPhases parity) when it
+            // has one, else a coarse inBed+asleepCore pair. Append-only, gated by the nap's own flag.
+            let segs = nap.stagedSegments ?? [
+                SleepSegment(start: nap.effectiveStart, end: nap.effectiveEnd, stage: .inBed),
+                SleepSegment(start: nap.effectiveStart, end: nap.effectiveEnd, stage: .asleepCore),
             ]
             do {
                 try await write(sleep: segs)

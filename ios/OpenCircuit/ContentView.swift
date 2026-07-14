@@ -942,6 +942,10 @@ struct ContentView: View {
         SleepCardView(liveSegments: session?.stagedSegments ?? [], lastSyncAt: lastSyncAt,
                       onEditSleep: { night, window in
                           await session?.applySleepEdit(night: night, window: window) ?? nil
+                      },
+                      onNap: { originalStart, window in
+                          // Through the scanner, not session — nap add/edit works offline (no ring needed).
+                          await scanner.applyNapEdit(originalStart: originalStart, window: window)
                       })
     }
 

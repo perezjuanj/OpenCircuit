@@ -1570,9 +1570,19 @@ final class RingSession: NSObject {
         let naps = NapDetection.naps(from: bulkRecords, mainSleep: main,
                                      temperatures: wearTemperatureSamples())
         for nap in naps {
+            // Don't re-add a detected nap that overlaps a MANUAL nap (user-added/edited): the manual
+            // one is authoritative and may sit at a different start key, so saveNap's same-start
+            // preservation alone wouldn't catch it.
+            let dayStart = Calendar.current.startOfDay(for: nap.start)
+            let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+            let manualOverlap = ((try? store.naps(from: dayStart, to: dayEnd)) ?? [])
+                .contains { ($0.isManuallyEdited || $0.isManuallyAdded)
+                    && nap.start < $0.effectiveEnd && nap.end > $0.effectiveStart }
+            if manualOverlap { continue }
             try? store.saveNap(start: nap.start, end: nap.end,
                                asleepMin: Int((nap.asleep / 60).rounded()),
-                               isLongNap: nap.isLongNap)
+                               isLongNap: nap.isLongNap,
+                               segments: nap.segments)
         }
     }
 

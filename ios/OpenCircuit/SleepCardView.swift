@@ -42,6 +42,10 @@ struct SleepCardView: View {
     /// by ContentView (→ RingSession.applySleepEdit). nil hides the Edit affordance entirely.
     var onEditSleep: ((Date, SleepEdit.Window) async -> Int?)? = nil
     @State private var editTarget: EditTarget?
+    /// Runs a manual nap add/edit (#nap-parity) → success. nil originalStart = add, else edit.
+    /// Injected by ContentView (→ RingSession.applyNapEdit). nil hides the nap edit/add affordance.
+    var onNap: ((Date?, NapEdit.Window) async -> Bool)? = nil
+    @State private var napTarget: NapTarget?
     /// Completion time of the most recent successful sync/drain (from `ObservabilityStore`), used to
     /// tell "last night hasn't drained yet" from "you didn't sleep" (#148). A drain that lands AFTER
     /// this morning's wake yet stages no night ending today is a genuine miss; before that, the
@@ -61,10 +65,12 @@ struct SleepCardView: View {
     private static let historyNights = 35
 
     init(liveSegments: [SleepSegment] = [], lastSyncAt: Date? = nil,
-         onEditSleep: ((Date, SleepEdit.Window) async -> Int?)? = nil) {
+         onEditSleep: ((Date, SleepEdit.Window) async -> Int?)? = nil,
+         onNap: ((Date?, NapEdit.Window) async -> Bool)? = nil) {
         self.liveSegments = liveSegments
         self.lastSyncAt = lastSyncAt
         self.onEditSleep = onEditSleep
+        self.onNap = onNap
         var d = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
         d.fetchLimit = Self.historyNights
         _storedSleep = Query(d)
@@ -119,6 +125,14 @@ struct SleepCardView: View {
         let inBedEnd: Date
         let recordedOnset: Date
         let recordedWake: Date
+    }
+
+    /// Value snapshot for the nap add/edit sheet, independent of the live SwiftData row.
+    private struct NapTarget: Identifiable {
+        let id = UUID()
+        let originalStart: Date?    // nil = add a new nap
+        let initialStart: Date
+        let initialEnd: Date
     }
 
     /// Latest persisted night — the source of the detail metrics (#69/#70/#71). Aligns with the
@@ -708,17 +722,79 @@ struct SleepCardView: View {
 
     @ViewBuilder
     private func napsRow() -> some View {
-        if !todayNaps.isEmpty {
-            let totalMin = todayNaps.reduce(0) { $0 + $1.durationMin }
+        if let onNap {
+            let totalMin = todayNaps.reduce(0) { $0 + $1.asleepMin }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: "sun.max.fill").font(.caption2).foregroundStyle(.yellow)
+                    Text("Naps today").font(.caption2).foregroundStyle(.secondary)
+                    if !todayNaps.isEmpty {
+                        Text("\(todayNaps.count)").font(.caption.weight(.semibold)).monospacedDigit()
+                        Text("· \(totalMin)m · est.").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button { napTarget = addNapTarget() } label: {
+                        Label("Add", systemImage: "plus.circle").font(.caption2.weight(.semibold))
+                    }
+                    .buttonStyle(.plain).foregroundStyle(.tint)
+                }
+                ForEach(todayNaps, id: \.start) { nap in
+                    Button {
+                        // originalStart is the STABLE dedup key; the initial window is the effective one.
+                        napTarget = NapTarget(originalStart: nap.start,
+                                              initialStart: nap.effectiveStart, initialEnd: nap.effectiveEnd)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(napTimeLabel(nap)).font(.caption2)
+                            if nap.isManuallyAdded {
+                                Text("added").font(.caption2).foregroundStyle(.secondary)
+                            } else if nap.isManuallyEdited {
+                                Text("edited").font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "pencil").font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Edit nap, \(napTimeLabel(nap))")
+                }
+            }
+            .padding(.top, 2)
+            .sheet(item: $napTarget) { t in
+                NapEditView(
+                    originalStart: t.originalStart,
+                    initialStart: t.initialStart, initialEnd: t.initialEnd,
+                    night: nightInterval,
+                    otherNaps: todayNaps.filter { $0.start != t.originalStart }
+                        .map { DateInterval(start: $0.start, end: max($0.end, $0.start.addingTimeInterval(1))) },
+                    onSave: { originalStart, window in await onNap(originalStart, window) })
+            }
+        } else if !todayNaps.isEmpty {
+            let totalMin = todayNaps.reduce(0) { $0 + $1.asleepMin }
             HStack(spacing: 6) {
                 Image(systemName: "sun.max.fill").font(.caption2).foregroundStyle(.yellow)
                 Text("Naps today").font(.caption2).foregroundStyle(.secondary)
                 Text("\(todayNaps.count)").font(.caption.weight(.semibold)).monospacedDigit()
-                Text("· \(totalMin)m total").font(.caption2).foregroundStyle(.secondary)
-                Text("· est.").font(.caption2).foregroundStyle(.tertiary)
+                Text("· \(totalMin)m total · est.").font(.caption2).foregroundStyle(.secondary)
             }
             .padding(.top, 2)
         }
+    }
+
+    /// Default window for a new nap — a 30-min block ending an hour ago (the user adjusts it).
+    private func addNapTarget() -> NapTarget {
+        let end = Date().addingTimeInterval(-3600)
+        return NapTarget(originalStart: nil, initialStart: end.addingTimeInterval(-1800), initialEnd: end)
+    }
+
+    /// The main night's in-bed window (for nap-overlap validation), nil when unknown.
+    private var nightInterval: DateInterval? {
+        guard let s = latest, s.inBedEnd > s.inBedStart else { return nil }
+        return DateInterval(start: s.inBedStart, end: s.inBedEnd)
+    }
+
+    private func napTimeLabel(_ nap: StoredNap) -> String {
+        "\(nap.effectiveStart.formatted(date: .omitted, time: .shortened))–\(nap.effectiveEnd.formatted(date: .omitted, time: .shortened)) · \(nap.durationMin)m"
     }
 
     // MARK: Subjective rating (#70)

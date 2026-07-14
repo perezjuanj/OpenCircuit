@@ -91,15 +91,39 @@ public enum NapDetection {
         return Double(worn.filter { $0.layout == .sleepVitals }.count) / Double(worn.count)
     }
 
-    /// Coarse HealthKit segments for a nap: an `inBed` span plus the asleep/awake sub-blocks
-    /// detected inside it (same shape as `BulkSleep.sleepSegments`, scoped to the nap window).
+    /// HealthKit segments for a nap: a full-window `inBed` envelope plus the sleep sub-blocks inside
+    /// it. Per-nap Deep/Light/REM STAGING (RingConn parity — their `SleepNapModel` carries a
+    /// `sleepPhases` hypnogram) when the classifier can produce it; a COARSE asleep/awake split when
+    /// the short / low-signal window gives it nothing to stage (or its gates strip the sleep). The
+    /// fallback keeps a nap the classifier can't stage; NapDetection's own gates remain the authority
+    /// on whether this block is a nap at all. Staging refines the stage breakdown and MAY shift the
+    /// asleep-vs-awake split (so credited minutes can differ from the coarse path), but never removes
+    /// the nap or its boundaries.
     private static func napSegments(from records: [BulkRecord],
                                     period: ActivityPeriod,
                                     epoch: Int) -> [SleepSegment] {
+        let window = DateInterval(start: period.start, end: period.end)
         let inWindow = records.filter {
             let t = $0.date(epoch: epoch)
             return t >= period.start && t <= period.end
         }
+
+        // Try the SAME classifier the night uses. If it yields real Deep/Light/REM, keep a
+        // full-window inBed envelope + the staged sub-segments (clipped to the nap).
+        let staged = BulkSleep.stagedSegments(from: inWindow, within: window, epoch: epoch)
+        let hasStagedSleep = staged.contains {
+            $0.stage == .asleepCore || $0.stage == .asleepDeep || $0.stage == .asleepREM
+        }
+        if hasStagedSleep {
+            var out: [SleepSegment] = [SleepSegment(start: period.start, end: period.end, stage: .inBed)]
+            for seg in staged where seg.stage != .inBed {
+                let s = max(seg.start, period.start), e = min(seg.end, period.end)
+                if e > s { out.append(SleepSegment(start: s, end: e, stage: seg.stage)) }
+            }
+            return out.sorted { $0.start < $1.start }
+        }
+
+        // Coarse fallback: inBed envelope + the motion-detected asleep/awake sub-blocks.
         let timeline = BulkSleep.motionTimeline(from: inWindow, epoch: epoch)
         let periods = ActivityPeriod.detectFromMotion(timeline)
         var segs = [SleepSegment(start: period.start, end: period.end, stage: .inBed)]
