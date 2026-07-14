@@ -1479,6 +1479,27 @@ final class RingSession: NSObject {
         return summary.minutes.asleep
     }
 
+    /// Apply a manual nap action (#nap-parity, RingConn add/edit nap). `originalStart == nil` ADDS a
+    /// user-logged nap; otherwise it EDITS the nap with that start. Persists via LocalStore
+    /// (non-destructive: adds are `isManuallyAdded`, edits `isManuallyEdited`, both preserved across
+    /// auto re-detection), then flushes Health so an ADD APPENDS to Apple Health (a nap already
+    /// mirrored is never re-written or deleted). Returns whether it persisted.
+    @discardableResult
+    func applyNapEdit(originalStart: Date?, window: NapEdit.Window) async -> Bool {
+        guard let store = localStore else { return false }
+        let ok: Bool
+        if let originalStart {
+            ok = (try? store.editNap(originalStart: originalStart, newStart: window.start, newEnd: window.end)) ?? false
+        } else {
+            ok = (try? store.addManualNap(start: window.start, end: window.end)) ?? false
+        }
+        guard ok else { return false }
+        if HealthKitWriter.isAvailable {
+            _ = await HealthKitWriter().flushToHealth(store: store)
+        }
+        return true
+    }
+
     /// Persist the latest night's sleep summary + today's step count so the dashboard
     /// shows them OFFLINE after disconnect. Both UPSERT by day (no duplicates) and bypass
     /// the cumulative-counter `ingest` path entirely — the SyncCursor is untouched.
@@ -1570,9 +1591,18 @@ final class RingSession: NSObject {
         let naps = NapDetection.naps(from: bulkRecords, mainSleep: main,
                                      temperatures: wearTemperatureSamples())
         for nap in naps {
+            // Don't re-add a detected nap that overlaps a MANUAL nap (user-added/edited): the manual
+            // one is authoritative and may sit at a different start key, so saveNap's same-start
+            // preservation alone wouldn't catch it.
+            let dayStart = Calendar.current.startOfDay(for: nap.start)
+            let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+            let manualOverlap = ((try? store.naps(from: dayStart, to: dayEnd)) ?? [])
+                .contains { ($0.isManuallyEdited || $0.isManuallyAdded) && nap.start < $0.end && nap.end > $0.start }
+            if manualOverlap { continue }
             try? store.saveNap(start: nap.start, end: nap.end,
                                asleepMin: Int((nap.asleep / 60).rounded()),
-                               isLongNap: nap.isLongNap)
+                               isLongNap: nap.isLongNap,
+                               segments: nap.segments)
         }
     }
 

@@ -289,6 +289,14 @@ final class StoredNap {
     var isLongNap: Bool = false
     var healthWritten: Bool = false
     var updatedAt: Date = Date.distantPast
+    // Manual nap edit/add overlay (RingConn `SleepNapModel.isEdited` parity). DEFAULTED for SwiftData
+    // lightweight migration (cf. #21). A manual nap (edited window or user-added) is PRESERVED across
+    // auto re-detection — see `saveNap`. `isManuallyAdded` marks a nap the ring never detected.
+    var isManuallyEdited: Bool = false
+    var isManuallyAdded: Bool = false
+    /// Encoded staged `[SleepSegment]` hypnogram for the Apple Health write (Deep/Light/REM — RingConn
+    /// `sleepPhases` parity). nil = coarse, and `flushNaps` then writes a plain inBed+asleepCore pair.
+    var napSegmentsData: Data? = nil
 
     init(start: Date, end: Date, asleepMin: Int = 0, isLongNap: Bool = false,
          healthWritten: Bool = false, updatedAt: Date = Date()) {
@@ -301,6 +309,12 @@ final class StoredNap {
     }
 
     var durationMin: Int { max(Int(end.timeIntervalSince(start) / 60), 0) }
+
+    /// The staged per-nap hypnogram (decoded from `napSegmentsData`), or nil when the nap is coarse.
+    var stagedSegments: [SleepSegment]? {
+        get { napSegmentsData.flatMap { try? JSONDecoder().decode([SleepSegment].self, from: $0) } }
+        set { napSegmentsData = newValue.flatMap { try? JSONEncoder().encode($0) } }
+    }
 }
 
 /// A DAYTIME skin-temp reading, kept entirely separate from the nightly `StoredSleepSummary
@@ -1049,17 +1063,73 @@ struct LocalStore {
     /// Upsert one auto-detected nap, keyed by start. A re-detected nap with the same start
     /// updates in place; a genuinely new nap inserts. Preserves `healthWritten` on update so a
     /// nap already mirrored to Health isn't re-written.
-    func saveNap(start: Date, end: Date, asleepMin: Int, isLongNap: Bool) throws {
+    func saveNap(start: Date, end: Date, asleepMin: Int, isLongNap: Bool,
+                 segments: [SleepSegment] = []) throws {
         let descriptor = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == start })
         if let existing = try? context.fetch(descriptor).first {
+            // A manually edited/added nap is authoritative — auto re-detection must not overwrite it.
+            if existing.isManuallyEdited || existing.isManuallyAdded { return }
             existing.end = end
             existing.asleepMin = asleepMin
             existing.isLongNap = isLongNap
+            existing.stagedSegments = segments.isEmpty ? nil : segments
             existing.updatedAt = Date()
         } else {
-            context.insert(StoredNap(start: start, end: end, asleepMin: asleepMin, isLongNap: isLongNap))
+            let row = StoredNap(start: start, end: end, asleepMin: asleepMin, isLongNap: isLongNap)
+            row.stagedSegments = segments.isEmpty ? nil : segments
+            context.insert(row)
         }
         try context.save()
+    }
+
+    /// Add a user-logged nap the ring never detected (#nap-parity, RingConn add-nap). Coarse segments
+    /// (the user asserts the window). `isManuallyAdded` so re-detection can't remove it, and
+    /// `healthWritten=false` so the next flush APPENDS it to Apple Health (never deletes). Returns
+    /// false if a nap already exists at that exact start.
+    @discardableResult
+    func addManualNap(start: Date, end: Date) throws -> Bool {
+        guard end > start else { return false }
+        let dup = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == start })
+        if (try? context.fetch(dup).first) != nil { return false }
+        let row = StoredNap(start: start, end: end,
+                            asleepMin: Int((end.timeIntervalSince(start) / 60).rounded()),
+                            isLongNap: end.timeIntervalSince(start) >= NapDetection.longNapDuration)
+        row.isManuallyAdded = true
+        row.stagedSegments = [
+            SleepSegment(start: start, end: end, stage: .inBed),
+            SleepSegment(start: start, end: end, stage: .asleepCore),
+        ]
+        context.insert(row)
+        try context.save()
+        return true
+    }
+
+    /// Edit an existing nap's window (#nap-parity, RingConn `isEdited`). Marks it `isManuallyEdited`
+    /// so re-detection can't clobber it. Keeps `healthWritten` as-is: an already-mirrored nap is NOT
+    /// re-written (app-side edit — nothing is deleted from Apple Health); a not-yet-written nap flushes
+    /// with the new times. Returns false if the nap isn't found, or if `newStart` collides with another
+    /// nap's unique start key.
+    @discardableResult
+    func editNap(originalStart: Date, newStart: Date, newEnd: Date) throws -> Bool {
+        guard newEnd > newStart else { return false }
+        let descriptor = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == originalStart })
+        guard let row = try? context.fetch(descriptor).first else { return false }
+        if newStart != originalStart {
+            let clash = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == newStart })
+            if (try? context.fetch(clash).first) != nil { return false }
+        }
+        row.start = newStart
+        row.end = newEnd
+        row.asleepMin = Int((newEnd.timeIntervalSince(newStart) / 60).rounded())
+        row.isLongNap = newEnd.timeIntervalSince(newStart) >= NapDetection.longNapDuration
+        row.isManuallyEdited = true
+        row.stagedSegments = [
+            SleepSegment(start: newStart, end: newEnd, stage: .inBed),
+            SleepSegment(start: newStart, end: newEnd, stage: .asleepCore),
+        ]
+        row.updatedAt = Date()
+        try context.save()
+        return true
     }
 
     /// Naps that started on `day` (start-of-day bucket), latest first.
