@@ -305,6 +305,7 @@ struct ContentView: View {
     @ViewBuilder
     private func sectionView(_ section: DashboardSection) -> some View {
         switch section {
+        case .readiness:    card { WellnessBalanceCardView() }
         case .vitals:       vitalsCard
         case .vitalsStatus: vitalsStatusCard
         case .sleep:        sleepCard
@@ -1552,7 +1553,7 @@ struct ContentView: View {
 /// `dashboard.sectionOrder`, so keep these stable across releases; `allCases` order is the default
 /// (first-run) layout.
 private enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
-    case vitals, vitalsStatus, sleep, calories, goals, workout, cycle, trends, sync
+    case readiness, vitals, vitalsStatus, sleep, calories, goals, workout, cycle, trends, sync
     var id: String { rawValue }
 }
 

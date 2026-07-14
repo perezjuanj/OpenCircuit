@@ -66,6 +66,11 @@ struct GoalsCardView: View {
     // (Same fix as VitalsStatusCardView.)
     @State private var cachedActiveKcal: Double = 0
     @State private var cachedActivityMin: Double = 0
+    /// Daily Activity Score (#95) — the weighted goal-attainment of the three activity rings
+    /// below (steps, active kcal, exercise minutes). Held as @State and computed in the SAME
+    /// off-main `.task` as the two estimates it consumes, so the score never runs analytics on
+    /// the render / scene-update path. nil until the first compute lands.
+    @State private var cachedActivityScore: ActivityScore.Result?
 
     /// Identity for the recompute `.task` — changes only when an input to the two estimates changes,
     /// so they re-run on new data (HR count grows, steps, profile, or last night) and never on an
@@ -144,6 +149,22 @@ struct GoalsCardView: View {
                 Image(systemName: "target").foregroundStyle(.green)
                 Text("DAILY GOALS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             }
+            if let s = cachedActivityScore {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("\(s.score)")
+                        .font(.system(size: 34, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .foregroundStyle(activityTierColor(s.tier))
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("Activity Score\u{B9}").font(.caption.weight(.semibold))
+                        Text(activityTierLabel(s.tier)).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Activity Score, estimate, \(s.score) out of 100, \(activityTierLabel(s.tier))")
+            }
             HStack(spacing: 16) {
                 goalRing(progress: progress.steps,
                          label: "Steps",
@@ -168,7 +189,7 @@ struct GoalsCardView: View {
                          goal: formatDuration(sleepGoalMin),
                          color: .purple)
             }
-            Text("\u{B9} Active calories & exercise minutes are estimates (active kcal from heart rate where available, else steps × distance; exercise minutes from an elevated-HR threshold — independent of steps). Full accuracy follows the ring activity-payload decode.")
+            Text("\u{B9} Activity Score is an on-device estimate — the weighted attainment of your step, active-calorie & exercise-minute goals, not the RingConn app's number. Active calories & exercise minutes are themselves estimates (active kcal from heart rate where available, else steps × distance; exercise minutes from an elevated-HR threshold — independent of steps). Full accuracy follows the ring activity-payload decode.")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -196,6 +217,28 @@ struct GoalsCardView: View {
             }.value
             cachedActiveKcal = result.kcal
             cachedActivityMin = result.minutes
+            // Score is pure + O(1) — fine on the main actor once the O(n) estimates it reads
+            // have been published. Reuses the same goals the rings use so the two never disagree.
+            cachedActivityScore = ActivityScore.score(.init(
+                steps: steps, stepGoal: stepsGoal,
+                activeMinutes: result.minutes, activeMinutesGoal: actMinGoal,
+                activeKcal: result.kcal, activeKcalGoal: activeKcalGoal))
+        }
+    }
+
+    private func activityTierLabel(_ t: ActivityScore.Tier) -> String {
+        switch t {
+        case .excellent:        return "Excellent"
+        case .good:             return "Good"
+        case .needsImprovement: return "Keep moving"
+        }
+    }
+
+    private func activityTierColor(_ t: ActivityScore.Tier) -> Color {
+        switch t {
+        case .excellent:        return .green
+        case .good:             return .teal   // dashboard mid/secondary accent (matches SleepCardView)
+        case .needsImprovement: return .orange
         }
     }
 
