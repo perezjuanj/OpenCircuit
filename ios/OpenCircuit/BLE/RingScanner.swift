@@ -625,6 +625,14 @@ final class RingScanner: NSObject {
         var heartRate: Int?
         var sleepSegments: [SleepSegment] = []
         var steps: Int?
+        /// Wall time (ms) from wake to the session becoming `ready` (link up + characteristics
+        /// discovered) — i.e. the connect cost. `nil` when the ring never connected this run, which
+        /// is itself the signal for a CONNECT-overrun early kill (vs a drain-overrun). (#119)
+        var connectToReadyMS: Int?
+        /// Wall time (ms) the two-channel history drain took once ready. `nil` when the drain never
+        /// finished inside the window — the signal for a DRAIN-overrun early kill. Splitting connect
+        /// vs drain is how the next activity-log export attributes the ~28 s budget overrun. (#119)
+        var drainMS: Int?
         var gotData: Bool { heartRate != nil || !sleepSegments.isEmpty || (steps ?? 0) > 0 }
     }
 
@@ -643,9 +651,11 @@ final class RingScanner: NSObject {
         // of silent background reconnection. (#142 reviewer MAJOR)
         guard Self.activePeripheralID != nil else { return BackgroundCapture() }
         ensureCentral()   // background sync legitimately needs the central (#142)
-        let deadline = Date().addingTimeInterval(timeout)
+        let runStart = Date()
+        let deadline = runStart.addingTimeInterval(timeout)
         var didDrain = false
         var startedLiveRead = false
+        var drainStartAt: Date?   // when syncHistory() was kicked — for the drain-duration breadcrumb (#119)
         if !reconnectKnownPeripheral() {
             start(services: Self.backgroundScanServices)
         }
@@ -655,6 +665,15 @@ final class RingScanner: NSObject {
 
         while !Task.isCancelled && Date() < deadline {
             if let session, session.ready {
+                // Connect cost: first tick the link is up + characteristics discovered (#119).
+                if capture.connectToReadyMS == nil {
+                    capture.connectToReadyMS = Int(Date().timeIntervalSince(runStart) * 1000)
+                }
+                // Drain cost: recorded on the first post-drain tick where `syncing` has fallen back to
+                // false — the SAME transition the short-window break below keys off, so the two agree.
+                if didDrain, let start = drainStartAt, capture.drainMS == nil, session.syncing == false {
+                    capture.drainMS = Int(Date().timeIntervalSince(start) * 1000)
+                }
                 if !didDrain {
                     // Thorough history drain — BOTH channels (0x00 sleep + 0x03 all-day daytime
                     // SpO₂/HR), the SAME `syncHistory()` path the foreground Sync / pull-to-refresh
@@ -663,6 +682,7 @@ final class RingScanner: NSObject {
                     // automatic syncs never refreshed daytime SpO₂.
                     session.syncHistory()
                     didDrain = true
+                    drainStartAt = Date()
                 } else if session.syncing == false && !allowLivePoll {
                     // Short window (app-refresh): the drain has committed + persisted the all-day
                     // HR/steps, so skip the opportunistic live-HR poll. That poll needs ~60 s to lock
