@@ -41,6 +41,27 @@ struct RingBackgroundSyncService {
                     allowLivePoll: Bool = true) async throws -> Bool {
         let scanner = RingScanner.shared
         scanner.setLocalStore(store)   // RingSession auto-persists the drained history + temp
+
+        // F1 flush-first (#119 early-termination): on the SHORT app-refresh window, mirror any
+        // ALREADY-BANKED backlog to Apple Health BEFORE the drain, so a run iOS later cuts mid-capture
+        // still advances Health with the prior night/day instead of deferring everything to the next
+        // foreground open (the 7d activity log showed 11/15 app-refresh runs "ended early" with a
+        // fully-banked-but-unmirrored night). flushToHealth is READ-ONLY w.r.t. the ring — it issues
+        // ZERO BLE, so it cannot advance the resume pointer, cannot violate one-writer (never touches
+        // `syncTask`), and cannot drain in the overnight-quiet window — and every metric is watermark-
+        // gated (SyncCursor), so this pre-flush and the post-capture flush below never double-write.
+        // Gated to `!allowLivePoll` (the app-refresh window) so the longer BGProcessing path keeps its
+        // capture-first behavior. `preMirrored` records that the mirror actually landed THIS wake,
+        // which the task's success flag can't reflect on a cut run (the expirationHandler sets it).
+        var preMirrored = false
+        if !allowLivePoll && HealthKitWriter.isAvailable {
+            let persisted = scanner.loadLastCommittedSleepSegments()
+            let priorSegments = !persisted.staged.isEmpty ? persisted.staged : persisted.coarse
+            preMirrored = await health.flushToHealth(store: store,
+                                                     sleepSegments: priorSegments).wroteAnything
+            if preMirrored { ObservabilityStore().recordHealthWrite() }
+        }
+
         let capture = await scanner.captureForBackground(timeout: timeout, allowLivePoll: allowLivePoll)
         // Resolve the night window for this connect so temp frames are gated correctly even
         // on a fresh background session that never ran the reactive refresh. This CANNOT be
@@ -53,6 +74,7 @@ struct RingBackgroundSyncService {
         await scanner.session?.refreshNightWindowIfNeeded()
 
         var mirrored = false
+        let flushStart = Date()
         if HealthKitWriter.isAvailable {
             mirrored = await health.flushToHealth(store: store,
                                                   sleepSegments: capture.sleepSegments).wroteAnything
@@ -60,8 +82,44 @@ struct RingBackgroundSyncService {
             // background path too, not just the manual button (#44).
             if mirrored { ObservabilityStore().recordHealthWrite() }
         }
-        // Success = we captured fresh data OR mirrored previously-pending data to Health, so a
-        // run that only flushed a backlog still counts (iOS uses this to keep scheduling us).
-        return capture.gotData || mirrored
+
+        // Phase-timing breadcrumb (#119 early-termination): splits the wake into connect vs drain vs
+        // flush so the next activity-log export can attribute an early kill to a CONNECT-overrun (F3
+        // irrelevant) vs a DRAIN-overrun (F3 relevant) — an open question the 7d log couldn't answer
+        // (no daytime connection evidence). `preMirrored`/`mirrored` record whether Health actually
+        // advanced this wake, independent of the "ended early" completion flag. Lands in the metric
+        // log the Diagnostics export reads. (verifier)
+        ObservabilityStore().recordMetricEvent(
+            source: "bgphase",
+            detail: Self.bgPhaseBreadcrumb(
+                appRefresh: !allowLivePoll,
+                connectToReadyMS: capture.connectToReadyMS,
+                drainMS: capture.drainMS,
+                flushMS: Int(Date().timeIntervalSince(flushStart) * 1000),
+                ready: capture.connectToReadyMS != nil,
+                gotData: capture.gotData,
+                preMirrored: preMirrored,
+                mirrored: mirrored))
+
+        // Success = we captured fresh data, mirrored freshly-drained data, OR flushed a pending
+        // backlog (flush-first) to Health — any of the three keeps iOS scheduling us. (#44/#119)
+        return capture.gotData || mirrored || preMirrored
+    }
+
+    /// Format the `bgphase` diagnostic detail line — the primary metric for validating the #119
+    /// early-termination fix, since a cut run's task success flag is set to `false` by the
+    /// expirationHandler regardless of whether the flush-first mirror landed. A `nil` connect/drain
+    /// duration renders `n/a` (the drain/connect never finished this wake): `connect=n/a ready=false`
+    /// is a CONNECT-overrun, `connect=Nms drain=n/a` is a DRAIN-overrun. Pure/static so the format
+    /// stays locked for the log parser and is unit-testable without a scanner or HealthKit. (#119)
+    nonisolated static func bgPhaseBreadcrumb(appRefresh: Bool, connectToReadyMS: Int?, drainMS: Int?,
+                                              flushMS: Int, ready: Bool, gotData: Bool,
+                                              preMirrored: Bool, mirrored: Bool) -> String {
+        "kind=\(appRefresh ? "appRefresh" : "processing")"
+            + " connect=\(connectToReadyMS.map { "\($0)ms" } ?? "n/a")"
+            + " drain=\(drainMS.map { "\($0)ms" } ?? "n/a")"
+            + " flush=\(flushMS)ms"
+            + " ready=\(ready) gotData=\(gotData)"
+            + " preMirrored=\(preMirrored) mirrored=\(mirrored)"
     }
 }
