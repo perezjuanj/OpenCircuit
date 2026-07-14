@@ -20,6 +20,7 @@ final class SleepSegmentPersistenceTests: XCTestCase {
     // Isolated UserDefaults suite per test run — never touches real app state.
     private let suiteName = "test.SleepSegmentPersistenceTests"
     private var testDefaults: UserDefaults!
+    private var containers: [ModelContainer] = []
 
     override func setUp() {
         super.setUp()
@@ -29,6 +30,7 @@ final class SleepSegmentPersistenceTests: XCTestCase {
     override func tearDown() {
         testDefaults.removePersistentDomain(forName: suiteName)
         testDefaults = nil
+        containers.removeAll()
         super.tearDown()
     }
 
@@ -63,8 +65,10 @@ final class SleepSegmentPersistenceTests: XCTestCase {
         let container = try ModelContainer(
             for: StoredSample.self, StoredCursor.self,
             StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
+            StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true)
         )
+        containers.append(container)
         return LocalStore(container.mainContext)
     }
 
@@ -160,6 +164,22 @@ final class SleepSegmentPersistenceTests: XCTestCase {
         let pending = try store.pendingHealthSleep([firstHalf, secondHalf])
         XCTAssertEqual(pending.count, 1)
         XCTAssertEqual(pending.first?.stage, .asleepREM)
+        XCTAssertEqual(pending.first?.start, midNight)
+    }
+
+    func testCursorGate_clipsCrossingSegmentInsteadOfDuplicatingPrefix() throws {
+        let store = try makeStore()
+        let firstEnd = nightStart.addingTimeInterval(3600)
+        try store.markSleepWritten([
+            SleepSegment(start: nightStart, end: firstEnd, stage: .asleepCore)
+        ])
+
+        let pending = try store.pendingHealthSleep([
+            SleepSegment(start: nightStart, end: firstEnd.addingTimeInterval(3600), stage: .asleepCore)
+        ])
+        XCTAssertEqual(pending, [
+            SleepSegment(start: firstEnd, end: firstEnd.addingTimeInterval(3600), stage: .asleepCore)
+        ])
     }
 
     // MARK: Full stranded-sleep simulation

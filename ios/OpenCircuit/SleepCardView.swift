@@ -38,6 +38,10 @@ struct SleepCardView: View {
     /// Freshly staged segments from the just-finished sync (empty when none / after disconnect).
     /// Preferred over the store so a completed sync updates the card immediately.
     var liveSegments: [SleepSegment]
+    /// Runs a manual sleep-time edit (#176) for a night → new asleep minutes (nil = failed). Injected
+    /// by ContentView (→ RingSession.applySleepEdit). nil hides the Edit affordance entirely.
+    var onEditSleep: ((Date, SleepEdit.Window) async -> Int?)? = nil
+    @State private var editTarget: EditTarget?
     /// Completion time of the most recent successful sync/drain (from `ObservabilityStore`), used to
     /// tell "last night hasn't drained yet" from "you didn't sleep" (#148). A drain that lands AFTER
     /// this morning's wake yet stages no night ending today is a genuine miss; before that, the
@@ -56,9 +60,11 @@ struct SleepCardView: View {
     /// Trailing nights queried for the baseline + temp chart (#69). 35 ≥ the 30-night baseline.
     private static let historyNights = 35
 
-    init(liveSegments: [SleepSegment] = [], lastSyncAt: Date? = nil) {
+    init(liveSegments: [SleepSegment] = [], lastSyncAt: Date? = nil,
+         onEditSleep: ((Date, SleepEdit.Window) async -> Int?)? = nil) {
         self.liveSegments = liveSegments
         self.lastSyncAt = lastSyncAt
+        self.onEditSleep = onEditSleep
         var d = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
         d.fetchLimit = Self.historyNights
         _storedSleep = Query(d)
@@ -86,6 +92,7 @@ struct SleepCardView: View {
 
     /// One night resolved for display, from either the live staging or the persisted rollup.
     private struct Night {
+        let nightKey: Date
         let summary: SleepStaging.Summary
         let inBedStart: Date?
         let inBedEnd: Date?
@@ -100,6 +107,18 @@ struct SleepCardView: View {
         /// times, where `when` is only the start-of-day key) the label shows the date instead of a
         /// relative term, so a pre-midnight night isn't mislabeled "yesterday".
         let wakeKnown: Bool
+        let isManuallyEdited: Bool
+    }
+
+    /// Value snapshot for sheet presentation. Keeping it independent of the live SwiftData model
+    /// prevents a query refresh during presentation from silently changing the night being edited.
+    private struct EditTarget: Identifiable {
+        let id = UUID()
+        let night: Date
+        let inBedStart: Date
+        let inBedEnd: Date
+        let recordedOnset: Date
+        let recordedWake: Date
     }
 
     /// Latest persisted night — the source of the detail metrics (#69/#70/#71). Aligns with the
@@ -122,22 +141,35 @@ struct SleepCardView: View {
             let start = liveSegments.map(\.start).min()
             let end = liveSegments.map(\.end).max()
             let sleep = SleepStaging.sleepWindow(liveSegments)
-            return Night(summary: s, inBedStart: start, inBedEnd: end,
+            return Night(nightKey: Calendar.current.startOfDay(for: start ?? end ?? Date()),
+                         summary: s, inBedStart: start, inBedEnd: end,
                          onset: sleep?.onset, wake: sleep?.wake,
-                         when: end ?? start ?? Date(), wakeKnown: end != nil)
+                         when: end ?? start ?? Date(), wakeKnown: end != nil,
+                         isManuallyEdited: false)
         }()
         let stored: Night? = {
             guard let s = storedSleep.first, s.asleepMin > 0 else { return nil }
-            let start = s.inBedStart > .distantPast ? s.inBedStart : nil
-            let end = (s.inBedEnd > s.inBedStart) ? s.inBedEnd : nil
-            let onset = s.sleepOnset > .distantPast ? s.sleepOnset : nil
-            let wake = s.sleepWake > s.sleepOnset ? s.sleepWake : nil
-            return Night(summary: s.asSummary, inBedStart: start, inBedEnd: end,
+            let currentStart = s.sleepEditCurrentInBedStart
+            let currentEnd = s.sleepEditCurrentInBedEnd
+            let start = currentStart > .distantPast ? currentStart : nil
+            let end = currentEnd > currentStart ? currentEnd : nil
+            // The edit window is credited as sleep at either exposed edge, so its visible sleep
+            // clock follows the overlay. The original onset/wake remain untouched as immutable
+            // anchors for future ±3 h re-edits.
+            let onset = s.isManuallyEdited ? start
+                : (s.sleepOnset > .distantPast ? s.sleepOnset : nil)
+            let wake = s.isManuallyEdited ? end
+                : (s.sleepWake > s.sleepOnset ? s.sleepWake : nil)
+            return Night(nightKey: s.night, summary: s.asSummary, inBedStart: start, inBedEnd: end,
                          onset: onset, wake: wake,
-                         when: end ?? start ?? s.night, wakeKnown: end != nil)
+                         when: end ?? start ?? s.night, wakeKnown: end != nil,
+                         isManuallyEdited: s.isManuallyEdited)
         }()
         switch (live, stored) {
         case let (l?, r?):
+            // A manual overlay is authoritative for its own night, including a trim. Comparing only
+            // asleep minutes made the larger live/raw staging win and visually undo every trim.
+            if l.nightKey == r.nightKey, r.isManuallyEdited { return r }
             // A genuinely newer live night (wake a day+ past the stored one) always wins; otherwise
             // it's the same night → show the fuller (more asleep) so a thin re-stage can't shrink it.
             if l.when.timeIntervalSince(r.when) > 18 * 3600 { return l }
@@ -146,6 +178,15 @@ struct SleepCardView: View {
         case let (nil, r?): return r
         default: return nil
         }
+    }
+
+    /// Only offer Edit for the persisted row that is actually on screen. During the short interval
+    /// where a newer live night has staged but has not yet upserted, editing `storedSleep.first`
+    /// would target the older night while the button appeared attached to the newer one.
+    private var editableSleepSummary: StoredSleepSummary? {
+        guard let latest, let night, latest.night == night.nightKey,
+              latest.inBedEnd > latest.inBedStart else { return nil }
+        return latest
     }
 
     /// Recency of the night on screen, resolved by the shared kit predicate so this card and the
@@ -211,6 +252,20 @@ struct SleepCardView: View {
                 Image(systemName: "moon.zzz.fill").foregroundStyle(.indigo)
                 Text("SLEEP").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 Spacer()
+                if let editableSleepSummary, onEditSleep != nil {
+                    Button("Edit") { editTarget = makeEditTarget(editableSleepSummary) }
+                        .font(.caption.weight(.semibold))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.tint)
+                        .accessibilityLabel("Edit sleep times")
+                    if editableSleepSummary.isManuallyEdited {
+                        Text("edited")
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                            .accessibilityLabel("Manually edited")
+                    }
+                }
                 if let night {
                     Text(Self.nightLabel(night.when, wakeKnown: night.wakeKnown))
                         .font(.caption).foregroundStyle(.secondary)
@@ -227,6 +282,24 @@ struct SleepCardView: View {
         .padding()
         .background(RoundedRectangle(cornerRadius: 16)
             .fill(Color(.secondarySystemGroupedBackground)))
+        .sheet(item: $editTarget) { target in
+            EditSleepView(
+                night: target.night,
+                inBedStart: target.inBedStart, inBedEnd: target.inBedEnd,
+                recordedOnset: target.recordedOnset, recordedWake: target.recordedWake,
+                onSave: { window in await onEditSleep?(target.night, window) ?? nil })
+        }
+    }
+
+    private func makeEditTarget(_ row: StoredSleepSummary) -> EditTarget {
+        let onset = row.sleepEditRecordedOnset > Date.distantPast
+            ? row.sleepEditRecordedOnset : row.sleepEditRecordedInBedStart
+        let wake = row.sleepEditRecordedWake > onset
+            ? row.sleepEditRecordedWake : row.sleepEditRecordedInBedEnd
+        return EditTarget(night: row.night,
+                          inBedStart: row.sleepEditCurrentInBedStart,
+                          inBedEnd: row.sleepEditCurrentInBedEnd,
+                          recordedOnset: onset, recordedWake: wake)
     }
 
     @ViewBuilder

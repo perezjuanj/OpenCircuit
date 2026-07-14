@@ -338,6 +338,10 @@ struct RollupBackup: Codable {
         var asleepMin, deepMin, lightMin, remMin, awakeMin: Int
         var efficiency: Double
         var inBedStart, inBedEnd, updatedAt: Date
+        // Optional keeps decoding compatible with a backup written by an older app build.
+        var sleepOnset, sleepWake: Date?
+        var editedInBedStart, editedInBedEnd: Date?
+        var isManuallyEdited: Bool?
     }
     struct Daily: Codable {
         var day: Date
@@ -400,7 +404,10 @@ struct RollupBackup: Codable {
                 Sleep(night: $0.night, asleepMin: $0.asleepMin, deepMin: $0.deepMin,
                       lightMin: $0.lightMin, remMin: $0.remMin, awakeMin: $0.awakeMin,
                       efficiency: $0.efficiency, inBedStart: $0.inBedStart,
-                      inBedEnd: $0.inBedEnd, updatedAt: $0.updatedAt)
+                      inBedEnd: $0.inBedEnd, updatedAt: $0.updatedAt,
+                      sleepOnset: $0.sleepOnset, sleepWake: $0.sleepWake,
+                      editedInBedStart: $0.editedInBedStart, editedInBedEnd: $0.editedInBedEnd,
+                      isManuallyEdited: $0.isManuallyEdited)
             },
             daily: dailyRows.map {
                 Daily(day: $0.day, steps: $0.steps, updatedAt: $0.updatedAt,
@@ -427,10 +434,16 @@ struct RollupBackup: Codable {
     func restore(into container: ModelContainer) {
         let ctx = ModelContext(container)
         for s in sleep {
-            ctx.insert(StoredSleepSummary(
+            let row = StoredSleepSummary(
                 night: s.night, asleepMin: s.asleepMin, deepMin: s.deepMin, lightMin: s.lightMin,
                 remMin: s.remMin, awakeMin: s.awakeMin, efficiency: s.efficiency,
-                inBedStart: s.inBedStart, inBedEnd: s.inBedEnd, updatedAt: s.updatedAt))
+                inBedStart: s.inBedStart, inBedEnd: s.inBedEnd,
+                sleepOnset: s.sleepOnset ?? .distantPast,
+                sleepWake: s.sleepWake ?? .distantPast, updatedAt: s.updatedAt)
+            row.editedInBedStart = s.editedInBedStart ?? .distantPast
+            row.editedInBedEnd = s.editedInBedEnd ?? .distantPast
+            row.isManuallyEdited = s.isManuallyEdited ?? false
+            ctx.insert(row)
         }
         for d in daily {
             ctx.insert(StoredDaily(day: d.day, steps: d.steps, updatedAt: d.updatedAt,

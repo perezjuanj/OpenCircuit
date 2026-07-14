@@ -290,13 +290,35 @@ final class HealthKitWriter {
         if SleepHealthGate.isSettled(latestSegmentEnd: sleepSegments.map(\.end).max(), now: Date()),
            let pendingSleep = try? store.pendingHealthSleep(sleepSegments), !pendingSleep.isEmpty {
             do {
-                try await write(sleep: pendingSleep); try store.markSleepWritten(pendingSleep)
+                try await write(sleep: pendingSleep)
+                try store.markSleepWritten(pendingSleep)
+                try store.markSleepEditHealthCovered(by: pendingSleep)
                 result.sleepSegments = pendingSleep.count
                 writtenKinds.insert(.sleep)
             } catch {
                 // A denied .sleepAnalysis type throws here forever — surface it (#135) instead of
                 // silently retrying, so the card can say "Sleep hasn't synced". Cursor stays put.
                 pendingFlushFailures.insert(.sleep)
+            }
+        }
+        // Persisted manual extensions backfill after the ordinary night write. This is essential for
+        // bedtime slices (which sit before the forward cursor) and also retries a wake extension if
+        // the edit happened while Health was denied/offline. Watermarks advance only after `save`
+        // succeeds; no HealthKit object is queried, replaced, or deleted.
+        if let edits = try? store.pendingSleepEditHealthWrites() {
+            for edit in edits {
+                guard SleepHealthGate.isSettled(
+                    latestSegmentEnd: edit.segments.map(\.end).max(), now: Date()
+                ) else { continue }
+                do {
+                    try await write(sleep: edit.segments)
+                    try store.markSleepEditHealthWritten(night: edit.night, segments: edit.segments)
+                    result.sleepSegments += edit.segments.count
+                    writtenKinds.insert(.sleep)
+                } catch {
+                    pendingFlushFailures.insert(.sleep)
+                    break
+                }
             }
         }
         // Naps (#76): each carries its own `healthWritten` flag (NOT the night's `.sleep` cursor),

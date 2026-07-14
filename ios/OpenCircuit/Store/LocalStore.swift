@@ -137,6 +137,18 @@ final class StoredSleepSummary {
     var osaODI: Double = 0
     var osaValidWindows: Int = 0
 
+    // MARK: Manual sleep-time edit overlay (#176) — RingConn parity (EditSleepStagePage /
+    // SleepEditableTimeRange). DEFAULTED for SwiftData lightweight migration (cf. #21). `distantPast`
+    // = not edited. When set, this night's display window + durations were recomputed for the user's
+    // edited [editedInBedStart, editedInBedEnd] (within ±3 h of the recorded onset/wake), and a
+    // re-sync must NOT overwrite them — the raw epoch archive still holds the original staging, so the
+    // edit is a non-destructive overlay. Set via `LocalStore.applySleepEdit`.
+    var editedInBedStart: Date = Date.distantPast
+    var editedInBedEnd: Date = Date.distantPast
+    /// Persisted (rather than inferred from the dates) so an unchanged Save can never accidentally
+    /// turn a recorded night into a manual edit, and so lightweight migration has an explicit flag.
+    var isManuallyEdited: Bool = false
+
     init(
         night: Date,
         asleepMin: Int = 0,
@@ -194,6 +206,26 @@ final class StoredSleepSummary {
         let asleep = light + deep + rem
         let inBed = efficiency > 0 ? asleep / efficiency : asleep + awake
         return SleepStaging.Summary(inBed: inBed, awake: awake, light: light, deep: deep, rem: rem)
+    }
+
+    var sleepEditRecordedInBedStart: Date {
+        inBedStart
+    }
+    var sleepEditRecordedInBedEnd: Date {
+        inBedEnd
+    }
+    var sleepEditRecordedOnset: Date {
+        sleepOnset
+    }
+    var sleepEditRecordedWake: Date {
+        sleepWake
+    }
+
+    var sleepEditCurrentInBedStart: Date {
+        isManuallyEdited ? editedInBedStart : inBedStart
+    }
+    var sleepEditCurrentInBedEnd: Date {
+        isManuallyEdited ? editedInBedEnd : inBedEnd
     }
 }
 
@@ -673,7 +705,17 @@ struct LocalStore {
         // extend past it — otherwise the morning sync re-writes the earlier fragment, duplicating /
         // overlapping sleep samples (HealthKit doesn't dedup). With the cursor before the night (the
         // common case) every segment passes, so a whole night still lands. (Adversarial review.)
-        if let last = cursor.last(.sleep) { return segments.filter { $0.end > last } }
+        if let last = cursor.last(.sleep) {
+            // Clip a segment that crosses the watermark instead of re-writing its already-saved
+            // prefix. This matters for a re-edited wake extension: 08:00→10:00 presented after a
+            // prior 08:00→09:00 extension must append only 09:00→10:00, not duplicate an hour.
+            return segments.compactMap { segment in
+                let start = max(segment.start, last)
+                return segment.end > start
+                    ? SleepSegment(start: start, end: segment.end, stage: segment.stage)
+                    : nil
+            }
+        }
         return segments
     }
 
@@ -738,6 +780,10 @@ struct LocalStore {
         let descriptor = FetchDescriptor<StoredSleepSummary>(
             predicate: #Predicate { $0.night == dayStart })
         if let existing = try? context.fetch(descriptor).first {
+            // A manually edited night (#176) is authoritative: a later re-sync must not overwrite the
+            // user's window/durations. Preserve it. The raw epoch archive still holds the original
+            // staging, so the edit stays reversible by re-editing.
+            if existing.isManuallyEdited { return }
             // Non-destructive upsert. A night can be drained in MORE THAN ONE piece (e.g. a
             // background drain mid-night, then the foreground morning sync) — the ring hands off
             // un-delivered history incrementally, so each drain stages only its own slice. Blindly
@@ -846,6 +892,13 @@ struct LocalStore {
         return try context.fetch(descriptor)
     }
 
+    func sleepSummary(night: Date) throws -> StoredSleepSummary? {
+        let dayStart = Calendar.current.startOfDay(for: night)
+        let descriptor = FetchDescriptor<StoredSleepSummary>(
+            predicate: #Predicate { $0.night == dayStart })
+        return try context.fetch(descriptor).first
+    }
+
     /// Persist the user's subjective sleep rating (1–9, #70) onto an existing night. No-op if
     /// the night isn't in the store yet (a rating only makes sense once a night exists).
     func setFeelScore(_ score: Int, night: Date) throws {
@@ -856,6 +909,139 @@ struct LocalStore {
         row.feelScore = max(0, min(score, 9))
         row.updatedAt = Date()
         try context.save()
+    }
+
+    /// Apply a manual sleep-time edit (#176) to an existing night: persist the edited in-bed window
+    /// overlay and the recomputed durations/stages/efficiency/score. Non-destructive — the raw epoch
+    /// archive is untouched, and `isManuallyEdited` makes a later re-sync preserve this row (see
+    /// `saveSleepSummary`). `feelScore` is left as the user set it. Returns false if the night isn't
+    /// in the store. The caller (RingSession) re-stages from the archive and appends the extension to
+    /// Apple Health separately (append-only; nothing is deleted).
+    @discardableResult
+    func applySleepEdit(night: Date, editedWindow: SleepEdit.Window,
+                        summary: SleepStaging.Summary, sleepOnset: Date, sleepWake: Date) throws -> Bool {
+        let dayStart = Calendar.current.startOfDay(for: night)
+        let descriptor = FetchDescriptor<StoredSleepSummary>(predicate: #Predicate { $0.night == dayStart })
+        guard let row = try? context.fetch(descriptor).first else { return false }
+        // Defense in depth behind the sheet/session dirty checks: submitting the recorded values
+        // unchanged must not manufacture a manual edit or rewrite its score/timestamp.
+        if SleepEdit.isSamePickerMinute(editedWindow.inBedStart, row.sleepEditCurrentInBedStart),
+           SleepEdit.isSamePickerMinute(editedWindow.inBedEnd, row.sleepEditCurrentInBedEnd) {
+            return true
+        }
+        let m = summary.minutes
+        row.editedInBedStart = editedWindow.inBedStart
+        row.editedInBedEnd = editedWindow.inBedEnd
+        row.isManuallyEdited = true
+        row.asleepMin = m.asleep
+        row.deepMin = m.deep
+        row.lightMin = m.light
+        row.remMin = m.rem
+        row.awakeMin = m.awake
+        row.efficiency = summary.efficiency
+        // Recompute the duration-driven Sleep Score from the edited night (HR/temp factors dropped →
+        // renormalised, per SleepScore's contract — never fabricated).
+        row.sleepScore = SleepScore.composite(.init(
+            totalAsleep: summary.totalAsleep, timeAwake: summary.awake, efficiency: summary.efficiency,
+            deep: summary.deep, light: summary.light, rem: summary.rem)).score
+        row.updatedAt = Date()
+        try context.save()
+        return true
+    }
+
+    struct PendingSleepEditHealthWrite {
+        let night: Date
+        let segments: [SleepSegment]
+    }
+
+    private static func sleepEditLeadingCursorKey(_ night: Date) -> String {
+        "hk:sleep-edit-leading:\(Calendar.current.startOfDay(for: night).timeIntervalSince1970)"
+    }
+
+    private func sleepEditLeadingWatermark(_ night: Date) throws -> Date? {
+        let key = Self.sleepEditLeadingCursorKey(night)
+        let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
+        return try context.fetch(descriptor).first?.last
+    }
+
+    /// Extensions waiting for an append-only Health write. Wake-side progress uses the ordinary
+    /// forward sleep cursor; bedtime-side progress uses the per-row leading watermark. Rows are
+    /// offered only after their original night is known to be in Health; otherwise the ordinary
+    /// first full-night write carries the extension once.
+    func pendingSleepEditHealthWrites() throws -> [PendingSleepEditHealthWrite] {
+        guard let sleepCursor = try loadCursor().last(.sleep) else { return [] }
+        let rows = try context.fetch(FetchDescriptor<StoredSleepSummary>())
+        return rows.compactMap { row in
+            guard row.isManuallyEdited else { return nil }
+            let recordedStart = row.sleepEditRecordedInBedStart
+            let recordedEnd = row.sleepEditRecordedInBedEnd
+            guard recordedEnd > recordedStart, sleepCursor >= recordedEnd else { return nil }
+            let writtenStart = (try? sleepEditLeadingWatermark(row.night)) ?? recordedStart
+            let writtenEnd = max(recordedEnd, min(sleepCursor, row.editedInBedEnd))
+            var segments: [SleepSegment] = []
+            let leadEnd = min(writtenStart, row.editedInBedEnd)
+            if row.editedInBedStart < leadEnd {
+                segments += [
+                    SleepSegment(start: row.editedInBedStart, end: leadEnd, stage: .inBed),
+                    SleepSegment(start: row.editedInBedStart, end: leadEnd, stage: .asleepCore),
+                ]
+            }
+            if row.editedInBedEnd > writtenEnd {
+                segments += [
+                    SleepSegment(start: writtenEnd, end: row.editedInBedEnd, stage: .inBed),
+                    SleepSegment(start: writtenEnd, end: row.editedInBedEnd, stage: .asleepCore),
+                ]
+            }
+            return segments.isEmpty ? nil : PendingSleepEditHealthWrite(night: row.night,
+                                                                         segments: segments)
+        }
+    }
+
+    /// Advance both per-row manual-extension edges after one atomic HealthKit save.
+    func markSleepEditHealthWritten(night: Date, segments: [SleepSegment]) throws {
+        guard let row = try sleepSummary(night: night),
+              let first = segments.map(\.start).min(), let last = segments.map(\.end).max() else { return }
+        let recordedStart = row.sleepEditRecordedInBedStart
+        var changed = false
+        if first < recordedStart {
+            let key = Self.sleepEditLeadingCursorKey(row.night)
+            let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
+            if let cursor = try context.fetch(descriptor).first {
+                if first < cursor.last { cursor.last = first; changed = true }
+            } else {
+                context.insert(StoredCursor(kindRaw: key, last: first))
+                changed = true
+            }
+        }
+        // A retry can carry the wake-side extension after the ordinary sleep write failed. Advance
+        // the shared forward cursor too, but never regress it for an older edited night; otherwise a
+        // later re-edit can offer the same successful tail through `pendingHealthSleep` again.
+        let cursor = try loadCursor()
+        if cursor.isNew(.sleep, last) {
+            upsertCursor(kind: MetricKind.sleep.rawValue, last: last)
+            changed = true
+        }
+        if changed { try context.save() }
+    }
+
+    /// A normal first full-night write can already include the manual leading extension. Mark any
+    /// such row covered so the separate bedtime append path never sends the same interval again.
+    func markSleepEditHealthCovered(by segments: [SleepSegment]) throws {
+        guard let first = segments.map(\.start).min(), let last = segments.map(\.end).max() else { return }
+        let rows = try context.fetch(FetchDescriptor<StoredSleepSummary>())
+        var changed = false
+        for row in rows where row.isManuallyEdited {
+            let recordedStart = row.sleepEditRecordedInBedStart
+            let recordedEnd = row.sleepEditRecordedInBedEnd
+            if row.editedInBedStart < recordedStart,
+               first <= row.editedInBedStart, last >= recordedEnd,
+               (try? sleepEditLeadingWatermark(row.night)) == nil {
+                context.insert(StoredCursor(kindRaw: Self.sleepEditLeadingCursorKey(row.night),
+                                            last: row.editedInBedStart))
+                changed = true
+            }
+        }
+        if changed { try context.save() }
     }
 
     // MARK: Naps (#76) — separate from the night so they never double-count

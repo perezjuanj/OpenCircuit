@@ -939,7 +939,10 @@ struct ContentView: View {
     /// so the most recent night stays on screen all day — across reconnects and syncs — and
     /// reflects a just-finished sync instantly via the live staged segments. (See SleepCardView.)
     private var sleepCard: some View {
-        SleepCardView(liveSegments: session?.stagedSegments ?? [], lastSyncAt: lastSyncAt)
+        SleepCardView(liveSegments: session?.stagedSegments ?? [], lastSyncAt: lastSyncAt,
+                      onEditSleep: { night, window in
+                          await session?.applySleepEdit(night: night, window: window) ?? nil
+                      })
     }
 
     /// Workout session card — taps through to WorkoutView (#75).

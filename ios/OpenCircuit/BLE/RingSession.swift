@@ -1408,6 +1408,77 @@ final class RingSession: NSObject {
         return SleepStaging.PersonalBaseline.fromRecentDeepHR(Array(recentDeepHR))
     }
 
+    /// Apply a manual sleep-time edit (#176, RingConn parity) to a past night. Re-stages that night
+    /// from the raw epoch archive, recomputes for the user's edited in-bed window (`SleepEdit.recompute`
+    /// credits the extension as asleep, preserves interior awake, clips on trim — all NON-DESTRUCTIVE),
+    /// persists the overlay via `LocalStore.applySleepEdit`, then APPENDS the added sleep to Apple
+    /// Health (the append-only write-watermark means an extension adds samples and nothing is ever
+    /// deleted; a trim updates the in-app view only). Returns the recomputed asleep minutes, or nil if
+    /// it couldn't run (no store / no night row).
+    ///
+    /// Editing is offered only for the persisted night currently shown by the Sleep card. Archive
+    /// records are scoped to that night's immutable ±3 h edit bounds before staging.
+    @discardableResult
+    func applySleepEdit(night: Date, window: SleepEdit.Window) async -> Int? {
+        guard let store = localStore else { return nil }
+        guard let row = try? store.sleepSummary(night: night) else { return nil }
+
+        // Always validate against immutable RECORDED anchors, never the last edited values. This is
+        // both a server-side guard (the UI cannot smuggle an out-of-range Window) and what prevents
+        // re-editing from walking the ±3 h limits farther outward on every Save.
+        let recordedOnset = row.sleepEditRecordedOnset > .distantPast
+            ? row.sleepEditRecordedOnset : row.sleepEditRecordedInBedStart
+        let recordedWake = row.sleepEditRecordedWake > recordedOnset
+            ? row.sleepEditRecordedWake : row.sleepEditRecordedInBedEnd
+        guard SleepEdit.validate(window, recordedOnset: recordedOnset, recordedWake: recordedWake,
+                                 minDuration: 30 * 60) == nil else { return nil }
+
+        // An unchanged Save is a no-op. In particular, it must not turn an unedited recorded row
+        // into a manual one merely because the same dates were submitted programmatically.
+        if SleepEdit.isSamePickerMinute(window.inBedStart, row.sleepEditCurrentInBedStart),
+           SleepEdit.isSamePickerMinute(window.inBedEnd, row.sleepEditCurrentInBedEnd) {
+            return row.asleepMin
+        }
+
+        // Scope the archive to THIS stored night before asking the staging model to pick a block.
+        // The 30 h archive can contain two nights; calling `latestNightRecords` on the whole union
+        // silently edits the newer one while persisting the result under the requested row's key.
+        let editBounds = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
+        let archiveMargin: TimeInterval = 30 * 60
+        let scopedArchive = epochArchiveStore.load().filter { record in
+            let date = record.date()
+            return date >= editBounds.earliest.addingTimeInterval(-archiveMargin)
+                && date <= editBounds.latest.addingTimeInterval(archiveMargin)
+        }
+        let nightRecords = BulkSleep.latestNightRecords(from: scopedArchive,
+                                                        temperatures: wearTemperatureSamples())
+        let base = overnightStagedSegments(from: nightRecords)
+        let segments = SleepEdit.recompute(baseSegments: base, window: window)
+        guard !segments.isEmpty else { return nil }
+        let summary = SleepStaging.summary(segments)
+        let sleep = SleepStaging.sleepWindow(segments)
+        let onset = sleep?.onset ?? window.inBedStart
+        let wake = sleep?.wake ?? window.inBedEnd
+        guard (try? store.applySleepEdit(night: night, editedWindow: window, summary: summary,
+                                         sleepOnset: onset, sleepWake: wake)) == true else { return nil }
+
+        if HealthKitWriter.isAvailable {
+            // Health gets the ORIGINAL staging plus any extension, never the app-only trim. Keeping
+            // the full base envelope here also means a first Health write after an edit cannot lose
+            // recorded sleep that the user trimmed only for the OpenCircuit display.
+            let healthWindow: SleepEdit.Window
+            if let baseStart = base.map(\.start).min(), let baseEnd = base.map(\.end).max() {
+                healthWindow = .init(inBedStart: min(baseStart, window.inBedStart),
+                                     inBedEnd: max(baseEnd, window.inBedEnd))
+            } else {
+                healthWindow = window
+            }
+            let healthSegments = SleepEdit.recompute(baseSegments: base, window: healthWindow)
+            _ = await HealthKitWriter().flushToHealth(store: store, sleepSegments: healthSegments)
+        }
+        return summary.minutes.asleep
+    }
+
     /// Persist the latest night's sleep summary + today's step count so the dashboard
     /// shows them OFFLINE after disconnect. Both UPSERT by day (no duplicates) and bypass
     /// the cumulative-counter `ingest` path entirely — the SyncCursor is untouched.
