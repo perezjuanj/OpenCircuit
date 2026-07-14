@@ -16,10 +16,12 @@ let ringLog = Logger(subsystem: "com.standardsoftwaresolutions.opencircuit", cat
 // OpenCircuitKit's confirmed codec. Spec-supported behavior implemented:
 //   • live-HR poll (0x95 → 0x15, LiveHR.decode 🟡)
 //   • history sync: drain 0x4c activity/sleep pages → BulkSleep → HR/HRV/SpO2
-//     samples (PROTOCOL.md §5.3, 🟢 fields). 0x47 PPG pages are acked but not yet
-//     decoded (their payload is 🔴 — issue #8).
+//     samples (PROTOCOL.md §5.3, 🟢 fields). 0x47 PPG pages are acked and decoded
+//     diagnostically-only: 0x47 is a sparse ~15-min perfusion trend, not a
+//     pulse-resolution waveform (PROTOCOL.md §5.2), so it never feeds HealthKit.
 //   • Layer-A epoch page routing (0x47/0x4c/0x50) also feeds EpochSyncSession in
-//     parallel, gated behind `epochDecodingEnabled` (#24).
+//     parallel, gated behind `epochDecodingEnabled` (intentionally false — 0x47 is
+//     diagnostic-only, so no epoch stream is routed into samples; see PPGTrend.swift).
 
 @Observable
 @MainActor
@@ -74,8 +76,8 @@ final class RingSession: NSObject {
     private(set) var lastFrame: String?
     private(set) var decodedEpochRecords = 0
     private(set) var storedMetricSamples = 0
-    /// Diagnostic-only decode of the most recent `0x47` PPG/optical-trend page (issue #8 —
-    /// PROTOCOL.md §5.2). Bit-width (10-bit BE) and cadence (900s) are settled offline, but
+    /// Diagnostic-only decode of the most recent `0x47` PPG/optical-trend page
+    /// (PROTOCOL.md §5.2). Bit-width (10-bit BE) and cadence (900s) are settled offline, but
     /// channel identity and absolute units are NOT — so this is surfaced for inspection (e.g.
     /// the Debug card) only, never written to HealthKit or fed into any analytic.
     private(set) var lastPPGTrendSummary: String?
@@ -559,6 +561,8 @@ final class RingSession: NSObject {
     private var lastDiscoveryKick: Date?
     private var localStore: LocalStore?
     private var syncSession = EpochSyncSession()
+    /// Intentionally false: 0x47 is a diagnostic-only perfusion trend (not pulse-resolution),
+    /// so the Layer-A epoch stream is never routed into stored samples (see PPGTrend.swift, PROTOCOL.md §5.2).
     private let epochDecodingEnabled = false
     /// Rolling archive of recent raw epochs (incl. the motion channel staging needs) + the last-drain
     /// timestamp, persisted across sessions. Lets `finalizeSync` re-stage the night from the UNION of
@@ -3293,8 +3297,8 @@ extension RingSession: CBPeripheralDelegate {
                 if self.syncing { self.syncQuietTicks = 0 }
                 ringLog.debug("← 0x47 PPG page (\(bytes.count)B), ack")
                 self.write(Command.pageAck47)
-                self.handlePPGPage(data)   // Layer-A epoch decode, gated (#24)
-                self.logPPGTrend(bytes)    // diagnostic-only optical-trend decode (issue #8)
+                self.handlePPGPage(data)   // Layer-A epoch decode, gated off (epochDecodingEnabled=false)
+                self.logPPGTrend(bytes)    // diagnostic-only optical-trend decode (PROTOCOL.md §5.2)
                 return
             case 0x4C:
                 self.drainSawPage = true
@@ -3488,8 +3492,8 @@ extension RingSession: CBPeripheralDelegate {
         decodedEpochRecords += syncSession.appendPPGPage(data).count
     }
 
-    /// Diagnostic-only decode of a `0x47` page's optical-trend samples (issue #8 —
-    /// PROTOCOL.md §5.2). Surfaces a summary for inspection (`lastPPGTrendSummary`, e.g. the
+    /// Diagnostic-only decode of a `0x47` page's optical-trend samples
+    /// (PROTOCOL.md §5.2). Surfaces a summary for inspection (`lastPPGTrendSummary`, e.g. the
     /// Debug card); never feeds HealthKit or any analytic — channel identity and absolute
     /// units are still unconfirmed (see `PPGTrend.swift`'s header).
     private func logPPGTrend(_ bytes: [UInt8]) {
@@ -3501,7 +3505,7 @@ extension RingSession: CBPeripheralDelegate {
         let summary = "\(records.count) records, \(allSamples.count) samples, "
             + "range \(lo)–\(hi), mean \(String(format: "%.0f", mean))"
         self.lastPPGTrendSummary = summary
-        ringLog.debug("0x47 optical-trend (diagnostic, issue #8): \(summary, privacy: .public)")
+        ringLog.debug("0x47 optical-trend (diagnostic): \(summary, privacy: .public)")
     }
 
     private func handleEndOfHistory(_ data: Data) {
