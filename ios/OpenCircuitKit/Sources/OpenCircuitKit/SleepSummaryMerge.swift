@@ -38,11 +38,19 @@ public enum SleepSummaryMerge {
     ///   window padded with awake/gaps could carry LESS sleep yet replace a fuller night, shrinking the
     ///   displayed total. Span is used only as a fallback when neither asleep value is known (legacy
     ///   rows / a no-HR block). A stored row with no usable data (both non-positive) is always replaced
-    ///   so the first real capture of a night always lands.
+    ///   so the first real capture of a night always lands. On an EQUAL-asleep tie the WIDER in-bed
+    ///   span wins — so a later slice that drained the same sleep core WITHOUT the pre-onset
+    ///   awake-in-bed lead-in can't clobber a bedtime-widened row back to `inBedStart == onset` /
+    ///   100 % efficiency (the bedtime-widen durability guarantee).
     public static func shouldReplace(storedInBed: TimeInterval, newInBed: TimeInterval,
                                      storedAsleep: TimeInterval = 0, newAsleep: TimeInterval = 0) -> Bool {
         guard storedInBed > 0 || storedAsleep > 0 else { return true }
-        if storedAsleep > 0 || newAsleep > 0 { return newAsleep >= storedAsleep }
+        if storedAsleep > 0 || newAsleep > 0 {
+            // More recovered sleep always wins; on a tie, keep the fuller (wider in-bed) night so an
+            // awake-only difference — exactly the bedtime widen — is never lost to arrival order.
+            if newAsleep != storedAsleep { return newAsleep > storedAsleep }
+            return newInBed >= storedInBed
+        }
         return newInBed >= storedInBed
     }
 }

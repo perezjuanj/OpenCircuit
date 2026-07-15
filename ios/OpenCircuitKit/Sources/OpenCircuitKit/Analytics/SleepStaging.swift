@@ -198,6 +198,23 @@ public enum SleepStaging {
         /// the single-night classifier is byte-identical (the property is inert without a baseline).
         public var deepBaselineMarginBPM: Double
 
+        // --- Bedtime widen (the "in bed == asleep / 100% efficiency" fix) ------------
+        // The motion-still block defines "in bed" by STILLNESS, so a MOVING-but-awake pre-sleep
+        // stretch (reading/scrolling in bed) never enters the block and inBedStart collapses onto
+        // onset → efficiency reads a phantom 100%. On a fast-onset night the ring DID record that
+        // lead-in (device-confirmed: motion + an elevated HR descending toward the floor, before a
+        // data gap the block detector split on), it was just discarded. This reaches back over that
+        // MEASURED lead-in and re-opens the in-bed envelope, leaving onset/wake — the #176 edit
+        // anchors — untouched. It never fabricates a latency: with no measured awake-in-bed lead-in
+        // (HR already flat at the floor, or no worn pre-onset epochs) it is a no-op and the night
+        // stays 100% honestly.
+
+        /// Max epochs (150 s each) to reach back before the detected in-bed start when re-opening the
+        /// envelope over a measured awake-in-bed lead-in. `0` DISABLES the widen entirely, so every
+        /// night — including the 100 %-efficiency ones — stages byte-identically to the pre-widen
+        /// model (the regression escape hatch, mirroring `motionAwakeVitalsHalfWindow = 0`). ~24 ≈ 1 h.
+        public var preOnsetBedtimeReachEpochs: Int
+
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
                     remHRPercentile: Double = 0.86,
@@ -222,7 +239,8 @@ public enum SleepStaging {
                     onsetScanEpochs: Int = 12,
                     onsetSearchEpochs: Int = 48,
                     minConsolidatedSleepEpochs: Int = 16,
-                    deepBaselineMarginBPM: Double = 18) {
+                    deepBaselineMarginBPM: Double = 18,
+                    preOnsetBedtimeReachEpochs: Int = 24) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -248,6 +266,7 @@ public enum SleepStaging {
             self.onsetSearchEpochs = onsetSearchEpochs
             self.minConsolidatedSleepEpochs = minConsolidatedSleepEpochs
             self.deepBaselineMarginBPM = deepBaselineMarginBPM
+            self.preOnsetBedtimeReachEpochs = preOnsetBedtimeReachEpochs
         }
 
         public static let `default` = Tuning()
@@ -327,12 +346,96 @@ public enum SleepStaging {
                                 tuning: Tuning = .default,
                                 baseline: PersonalBaseline? = nil) -> [SleepSegment] {
         let frags = BulkSleep.contiguousFragments(records)
-        guard frags.count > 1 else {
-            return classifyContiguous(from: records, epoch: epoch, tuning: tuning, baseline: baseline)
+        let staged: [SleepSegment] = frags.count > 1
+            ? frags.flatMap { classifyContiguous(from: $0, epoch: epoch, tuning: tuning, baseline: baseline) }
+                   .sorted { $0.start < $1.start }
+            : classifyContiguous(from: records, epoch: epoch, tuning: tuning, baseline: baseline)
+        // Re-open the in-bed envelope over a MEASURED pre-onset awake-in-bed lead-in the still-block
+        // missed (the "inBed == asleep / 100 % efficiency" fix). Runs over the FULL record set so it
+        // sees a lead-in that a data gap split into a discarded fragment. No-op when the knob is 0.
+        return applyBedtimeWiden(staged, records: records, epoch: epoch, tuning: tuning)
+    }
+
+    /// Extend the in-bed envelope back over a MEASURED awake-in-bed lead-in that the motion still-block
+    /// missed — a moving/reading-in-bed stretch before onset — so a fast-onset night stops reporting a
+    /// phantom 100 % efficiency. Guarantees (each verified by a test):
+    ///   • ONSET/WAKE UNTOUCHED — only the first `.inBed` segment's start moves and a leading `.awake`
+    ///     is prepended; the asleep segments (and thus `sleepOnset`/`sleepWake`, the #176 edit anchors)
+    ///     are byte-identical. So this widens `inBed`/`awake`/lowers efficiency, never re-times sleep.
+    ///   • FAST-ONSET ONLY — fires only when the in-bed envelope already opens exactly at onset (no
+    ///     pre-onset `.awake`). A 07-11-style night (a detected still-but-awake lead-in) is untouched.
+    ///   • MEASURED, NOT FABRICATED — `preOnsetBedStart` widens only on real worn epochs carrying an
+    ///     elevated (awake) HR; with no such lead-in it returns nil and the night stays as staged.
+    ///   • BYTE-IDENTICAL WHEN OFF — `preOnsetBedtimeReachEpochs == 0` short-circuits to `segments`.
+    private static func applyBedtimeWiden(_ segments: [SleepSegment], records: [BulkRecord],
+                                          epoch: Int, tuning: Tuning) -> [SleepSegment] {
+        guard tuning.preOnsetBedtimeReachEpochs > 0, !segments.isEmpty else { return segments }
+        let asleep: Set<SleepStage> = [.asleepCore, .asleepDeep, .asleepREM]
+        guard let onset = segments.filter({ asleep.contains($0.stage) }).map(\.start).min(),
+              let inBedIdx = segments.firstIndex(where: {
+                  $0.stage == .inBed && $0.start <= onset && onset < $0.end
+              })
+        else { return segments }
+        // Fast-onset only: the envelope opens exactly at onset and nothing awake precedes it.
+        guard segments[inBedIdx].start == onset,
+              !segments.contains(where: { $0.stage == .awake && $0.start < onset })
+        else { return segments }
+        guard let bedStart = preOnsetBedStart(records: records, onset: onset, epoch: epoch, tuning: tuning),
+              bedStart < onset else { return segments }
+        var out = segments
+        out[inBedIdx] = SleepSegment(start: bedStart, end: segments[inBedIdx].end, stage: .inBed)
+        out.append(SleepSegment(start: bedStart, end: onset, stage: .awake))
+        return out.sorted { $0.start < $1.start }
+    }
+
+    /// The earliest time we can HONESTLY call "in bed" before `onset`. Walks worn epochs backward from
+    /// onset, bridging small data gaps (or a larger gap only while HR stays at sleep level on both
+    /// sides — asleep across it, so bridging doesn't invent bed time during an up-and-about spell), and
+    /// widens ONLY if the run contains at least one genuinely-awake epoch (HR ≥ sleeping floor + wake
+    /// margin). Returns nil — no widen — when no measured awake-in-bed lead-in exists (the honest
+    /// fast-onset outcome), bounding the reach to `preOnsetBedtimeReachEpochs`.
+    private static func preOnsetBedStart(records: [BulkRecord], onset: Date, epoch: Int,
+                                         tuning: Tuning) -> Date? {
+        let interval = TimeInterval(BulkRecord.epochSeconds)   // 0x96 = 150 s, canonical
+        let reach = onset.addingTimeInterval(-Double(tuning.preOnsetBedtimeReachEpochs) * interval)
+        // Sleeping floor from the first ~2 h after onset (the same low-percentile basis classify uses).
+        let sleepHR = records
+            .filter { let t = $0.date(epoch: epoch); return t >= onset && t < onset.addingTimeInterval(2 * 3600) }
+            .compactMap(\.heartRate).map(Double.init)
+        guard sleepHR.count >= 4 else { return nil }
+        let floor = percentile(sleepHR.sorted(), tuning.sleepFloorPercentile)
+        let wakeThreshold = floor + tuning.wakeHRMarginBPM
+        // HR at onset seeds the first gap's asleep-bridge test (defaults to the floor if not found —
+        // floor ≤ threshold, so a genuinely-asleep first gap still bridges).
+        let onsetHR = records.first { abs($0.date(epoch: epoch).timeIntervalSince(onset)) < 1 }?
+            .heartRate.map(Double.init) ?? floor
+        // Worn epochs strictly before onset within reach, nearest-first (descending time).
+        let pre = records
+            .filter { r in
+                let t = r.date(epoch: epoch)
+                return t < onset && t >= reach && r.heartRate != nil
+            }
+            .sorted { $0.counter > $1.counter }
+        guard !pre.isEmpty else { return nil }
+        var bedStart: Date?
+        var sawAwake = false
+        var prevTime = onset
+        var prevHR = onsetHR
+        for r in pre {
+            let t = r.date(epoch: epoch)
+            let hr = Double(r.heartRate!)
+            let gap = prevTime.timeIntervalSince(t)
+            // Tolerate a single dropped epoch (real 0x4c streams drop one now and then) so an awake
+            // lead-in with a lone gap isn't cut short; larger gaps still need the asleep-bridge.
+            let contiguous = gap <= interval * 2.5
+            let asleepBridge = hr <= wakeThreshold && prevHR <= wakeThreshold
+            guard contiguous || asleepBridge else { break }
+            bedStart = t
+            if hr >= wakeThreshold { sawAwake = true }
+            prevTime = t
+            prevHR = hr
         }
-        return frags
-            .flatMap { classifyContiguous(from: $0, epoch: epoch, tuning: tuning, baseline: baseline) }
-            .sorted { $0.start < $1.start }
+        return sawAwake ? bedStart : nil
     }
 
     /// Stage ONE contiguous record run (no internal data gaps) into `inBed` + stage segments.
