@@ -1494,6 +1494,10 @@ final class RingSession: NSObject {
             // Real sleep-window clock times (segments carry the dates; Summary doesn't) — so a
             // night-temp window aligns to actual onset/wake, not midnight. `night` (start-of-day)
             // remains the upsert key.
+            // `start` is the in-bed window start — which the bedtime widen (SleepStaging) may have
+            // moved earlier over a measured awake-in-bed lead-in. So the extras below (temp/stress
+            // window, movement timeline, per-stage HR) intentionally span that recovered pre-onset
+            // awake-in-bed stretch; it is credited to awake, not sleep (onset/wake are unchanged).
             let start = stagedSegments.map(\.start).min() ?? Date()
             let end = stagedSegments.map(\.end).max() ?? start
             // Actual sleep onset/wake (first…last asleep epoch) — narrower than the in-bed window by

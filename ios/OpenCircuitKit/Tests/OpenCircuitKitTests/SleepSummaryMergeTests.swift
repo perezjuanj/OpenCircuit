@@ -57,11 +57,26 @@ final class SleepSummaryMergeTests: XCTestCase {
             storedInBed: 5 * h, newInBed: 5 * h, storedAsleep: 3 * h, newAsleep: 7 * h))
     }
 
-    /// Asleep dominates the span fallback: equal asleep ⇒ replace (idempotent re-stage) regardless of
-    /// a narrower span.
-    func testEqualAsleepReplacesDespiteNarrowerSpan() {
+    /// On an EQUAL-asleep tie the WIDER in-bed span wins. An idempotent re-stage (equal span) still
+    /// replaces; a NARROWER-span slice does NOT — that's the lead-in-less drain that must not clobber a
+    /// bedtime-widened row.
+    func testEqualAsleepKeepsWiderInBed() {
+        // Same night re-staged identically → replace (idempotent).
         XCTAssertTrue(SleepSummaryMerge.shouldReplace(
+            storedInBed: 5 * h, newInBed: 5 * h, storedAsleep: 5 * h, newAsleep: 5 * h))
+        // Equal asleep but NARROWER new span → keep the fuller stored night.
+        XCTAssertFalse(SleepSummaryMerge.shouldReplace(
             storedInBed: 8 * h, newInBed: 5 * h, storedAsleep: 5 * h, newAsleep: 5 * h))
+    }
+
+    /// Bedtime-widen durability: a morning drain widens in-bed back over the awake-in-bed lead-in
+    /// (inBed 8.5 h, asleep 7.5 h, eff 0.88); a LATER same-night slice lands the same sleep core WITHOUT
+    /// the lead-in (inBed 7.5 h == asleep, eff 1.0). Time-asleep ties, so the old asleep-only rule would
+    /// clobber the widened row back to 100 %. The tie-break must KEEP the widened (wider in-bed) row.
+    func testLeadInLessSliceDoesNotClobberWidenedRow() {
+        XCTAssertFalse(SleepSummaryMerge.shouldReplace(
+            storedInBed: 8.5 * h, newInBed: 7.5 * h, storedAsleep: 7.5 * h, newAsleep: 7.5 * h),
+            "a lead-in-less later slice must not collapse a bedtime-widened night to 100 % efficiency")
     }
 
     /// With no asleep info on EITHER side (legacy rows), it falls back to the in-bed span comparison.
