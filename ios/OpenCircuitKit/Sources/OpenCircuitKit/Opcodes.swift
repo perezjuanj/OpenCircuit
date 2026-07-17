@@ -45,6 +45,8 @@ public enum Command {
     public static let poll: [UInt8] = [0x95, 0x00, 0x00]
     public static let pageAck47: [UInt8] = [0xC7, 0x00, 0x00]
     public static let pageAck4C: [UInt8] = [0xCC, 0x00, 0x00]
+    /// Continue a `0x4d` historical sport page (0x4d = 0xcd ^ 0x80).
+    public static let pageAck4D: [UInt8] = [0xCD, 0x00, 0x00]
     /// Reply to the ring's unsolicited `0x11` heartbeat (ring→host `11 00 <ctr> <tok> <xor>`).
     /// The official app answers every heartbeat with a constant `91 00 00` (0x11+0x80, same
     /// +0x80 response convention as 0x47→0xC7) — it does NOT echo the counter/token. 🟢 confirmed
@@ -84,6 +86,14 @@ public enum Command {
     public static let osaAssessmentStart: [UInt8] = [0x05, 0x22, 0x01]
     public static let osaAssessmentStop: [UInt8]  = [0x05, 0x22, 0x02]
 
+    /// Enable/disable ring-side automatic workout recognition (#179, 🟢 captured 2026-07-08).
+    /// The official app sent `05 23 01 00` then `05 23 00 00`; both received the generic
+    /// `85 00 85` acknowledgement. This is the `sendAutoSportCommand` path visible in the 4.2.1
+    /// Flutter AOT snapshot, adjacent to the `BleAutoSportsRspMixin` response handler.
+    public static func automaticSportRecognition(enabled: Bool) -> [UInt8] {
+        [0x05, 0x23, enabled ? 0x01 : 0x00, 0x00]
+    }
+
     /// Steps to enter live-HR mode, in the order the official app sends them (verified
     /// in the FR02.018 capture: open+drain history, then `d0 00 00` → `06 01 00` → fetch,
     /// then poll `95 00 00` for `15 00 <hr>` frames). The `d0 00 00` is REQUIRED — without
@@ -96,13 +106,15 @@ public enum Command {
     /// PROTOCOL.md §5.6 — derived from 3 capture (time,cursor) pairs to <0.34 s).
     public static let syncEpoch = 1_577_793_600
 
-    /// History-channel selector — `byte[6]` of the `0x02` sync-open. The ring keeps TWO history
-    /// channels, each with its own resume cursor; the official app drains BOTH every sync (🟢 mined
-    /// from every capture — the app only ever sends these two values):
+    /// History-channel selector — `byte[6]` of the `0x02` sync-open. The ring keeps at least three
+    /// history channels, each with its own resume cursor. The normal vitals sync drains 0x00/0x03;
+    /// workout flows also drain 0x02:
     ///   • `0x00` — sleep/overnight log (+ idle epochs). What we historically pulled.
     ///   • `0x03` — awake/all-day log: activity HR + a periodic (~10 min) daytime SpO₂ reading.
     /// Pulling only `0x00` left daytime SpO₂ stale (the #99 gap). Same 23-byte record schema on both.
     public static let syncChannelSleep: UInt8 = 0x00
+    /// Store-and-forward 10-second sport history, used by manual and automatic workouts (#179).
+    public static let syncChannelSport: UInt8 = 0x02
     public static let syncChannelAllDay: UInt8 = 0x03
 
     /// Build `02 00 <cursor BE4> <channel> 01 00` with `cursor = unixSeconds − syncEpoch` (big-endian).

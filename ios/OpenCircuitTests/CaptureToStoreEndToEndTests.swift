@@ -128,4 +128,18 @@ final class CaptureToStoreEndToEndTests: XCTestCase {
         let stored = try store.latestSleepSummary()
         XCTAssertEqual(stored?.asleepMin, 420, "a thinner re-stage must not clobber the fuller night")
     }
+
+    func testSameCoverageReclassificationCanReduceAsleep() throws {
+        let store = try makeStore()
+        let night = Date(timeIntervalSince1970: 1_750_000_000)
+        let end = night.addingTimeInterval(8 * 3600)
+
+        try store.saveSleepSummary(summary(inBedMin: 480, asleepMin: 470),
+                                   night: night, inBedStart: night, inBedEnd: end)
+        // Same archived start/end, but refined onset logic recognizes 90 minutes of quiet wake.
+        try store.saveSleepSummary(summary(inBedMin: 480, asleepMin: 380),
+                                   night: night, inBedStart: night, inBedEnd: end)
+
+        XCTAssertEqual(try store.latestSleepSummary()?.asleepMin, 380)
+    }
 }

@@ -183,6 +183,33 @@ final class WorkoutSessionManager: NSObject {
         }
     }
 
+    /// Confirm a ring-detected historical bout and write it to Apple Health. Unlike a live session,
+    /// this uses only the ring's real 10-second records: no route and no interpolated HR. Returns
+    /// false when HealthKit rejects the write so the candidate remains available for retry.
+    func importDetectedWorkout(
+        _ candidate: AutomaticWorkoutDetector.Candidate,
+        as sport: WorkoutSportType
+    ) async -> Bool {
+        guard case .idle = recordingState else { return false }
+        recordingState = .finishing
+
+        let profile = HealthKitWriter.storedUserProfile()
+        let prepared = AutomaticWorkoutConfirmation.prepare(
+            candidate: candidate,
+            sport: sport,
+            profile: profile
+        )
+        let saved = await writeWorkout(
+            summary: prepared.summary,
+            hrSamples: prepared.heartRateSamples,
+            routeLocations: []
+        )
+        recordingState = saved
+            ? .finished(summary: prepared.summary)
+            : .error("Apple Health did not accept the detected workout. It was not removed, so you can try again.")
+        return saved
+    }
+
     // MARK: - Start / Stop
 
     /// Begin a workout session. Drives the ring's existing live-HR poll (0x95→0x15) via
@@ -377,9 +404,9 @@ final class WorkoutSessionManager: NSObject {
             hrIsStale: true))
 
         // Write to HealthKit (best-effort; gracefully silent on failure).
-        await writeWorkout(summary: summary,
-                           hrSamples: agg.collectedSamples,
-                           routeLocations: hasRoute ? routeLocations : [])
+        _ = await writeWorkout(summary: summary,
+                               hrSamples: agg.collectedSamples,
+                               routeLocations: hasRoute ? routeLocations : [])
 
         // Persist this workout's continuous HR into LocalStore — same store the ring's history
         // sync writes to. These samples carry REAL start/end spans (unlike the zero-duration point
@@ -632,8 +659,8 @@ final class WorkoutSessionManager: NSObject {
         summary: WorkoutSummary,
         hrSamples: [HRSample],
         routeLocations: [CLLocation]
-    ) async {
-        guard HKHealthStore.isHealthDataAvailable() else { return }
+    ) async -> Bool {
+        guard HKHealthStore.isHealthDataAvailable() else { return false }
         let activityType = Self.hkActivityType(for: summary.sport)
 
         let configuration = HKWorkoutConfiguration()
@@ -651,7 +678,7 @@ final class WorkoutSessionManager: NSObject {
         do {
             try await builder.beginCollection(at: summary.startDate)
         } catch {
-            return   // HealthKit auth not granted or unavailable
+            return false   // HealthKit auth not granted or unavailable
         }
 
         // Add HR samples during the workout window
@@ -727,13 +754,13 @@ final class WorkoutSessionManager: NSObject {
         // End collection and finish workout
         do {
             try await builder.endCollection(at: summary.endDate)
-        } catch { return }
+        } catch { return false }
 
         let workout: HKWorkout
         do {
-            guard let finished = try await builder.finishWorkout() else { return }
+            guard let finished = try await builder.finishWorkout() else { return false }
             workout = finished
-        } catch { return }
+        } catch { return false }
 
         // Workout is now COMMITTED to Health — only NOW record its foot-based GPS distance so the
         // daily steps×stride distance + active-energy estimates net out exactly what was written
@@ -753,6 +780,7 @@ final class WorkoutSessionManager: NSObject {
         if !routeLocations.isEmpty, summary.hasRoute {
             await writeRoute(locations: routeLocations, to: workout)
         }
+        return true
     }
 
     private func writeRoute(locations: [CLLocation], to workout: HKWorkout) async {

@@ -304,6 +304,35 @@ final class RingSession: NSObject {
     /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
     /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
     private(set) var historySamples: [QuantitySample] = []
+    /// Potential workouts reconstructed from channel-0x02 `0x4d` store-and-forward records (#179).
+    /// Surfacing/confirmation and durable persistence are deliberately separate from the decoder.
+    private(set) var automaticWorkoutCandidates: [AutomaticWorkoutDetector.Candidate] = []
+    private var historicalSportSamples: [HistoricalSportFrame.Sample] = []
+    /// User-controlled ring-side automatic recognition state. Persisted per ring because the command
+    /// changes firmware state and survives a BLE reconnect; we cannot query it yet from a status frame.
+    private(set) var automaticWorkoutDetectionEnabled = false
+    private var automaticWorkoutDetectionKey: String {
+        "workout.automaticDetection.enabled.v1.\(peripheral.identifier.uuidString)"
+    }
+    private var automaticWorkoutSamplesKey: String {
+        "workout.automaticDetection.samples.v1.\(peripheral.identifier.uuidString)"
+    }
+    /// Start cursors of candidates the user already saved or dismissed. The first cursor remains
+    /// stable if later pages extend a bout; using the end cursor could resurrect that same workout.
+    private var resolvedAutomaticWorkoutCursors: Set<UInt32> = []
+    private var resolvedAutomaticWorkoutCursorsKey: String {
+        "workout.automaticDetection.resolved.v1.\(peripheral.identifier.uuidString)"
+    }
+    /// Candidate starts whose one-time notification attempt was delivered or declined. Separate
+    /// from resolution: an unreviewed workout stays in the inbox, but reconnects must not nag.
+    private var notifiedAutomaticWorkoutCursors: Set<UInt32> = []
+    private var pendingAutomaticWorkoutNotificationCursors: Set<UInt32> = []
+    private var notifiedAutomaticWorkoutCursorsKey: String {
+        "workout.automaticDetection.notified.v1.\(peripheral.identifier.uuidString)"
+    }
+    /// Pages received by the channel currently being drained. Unlike `bulkRecords.count`, this also
+    /// advances for `0x47` optical pages and channel-0x02 `0x4d` sport pages.
+    private var activeDrainPageCount = 0
     /// COARSE sleep segments from the motion channel (inBed/asleepCore/awake, no HR onset
     /// trim). The fallback for HealthKit/store when no HR-staged block exists. Its non-emptiness
     /// also doubles as the wear gate (#41) — empty on a charging/off-wrist night.
@@ -672,6 +701,19 @@ final class RingSession: NSObject {
         if let data = UserDefaults.standard.data(forKey: historyCaptureKey),
            let saved = try? JSONDecoder().decode(HistoryFrameCapture.self, from: data) {
             self.historyCapture = saved
+        }
+        automaticWorkoutDetectionEnabled = UserDefaults.standard.bool(forKey: automaticWorkoutDetectionKey)
+        if let data = UserDefaults.standard.data(forKey: resolvedAutomaticWorkoutCursorsKey),
+           let saved = try? JSONDecoder().decode(Set<UInt32>.self, from: data) {
+            resolvedAutomaticWorkoutCursors = saved
+        }
+        if let data = UserDefaults.standard.data(forKey: notifiedAutomaticWorkoutCursorsKey),
+           let saved = try? JSONDecoder().decode(Set<UInt32>.self, from: data) {
+            notifiedAutomaticWorkoutCursors = saved
+        }
+        if let data = UserDefaults.standard.data(forKey: automaticWorkoutSamplesKey),
+           let saved = try? JSONDecoder().decode([HistoricalSportFrame.Sample].self, from: data) {
+            mergeHistoricalSportSamples(saved)
         }
         peripheral.delegate = self
         // Seed the model name from the peripheral's advertised name; may be overridden later
@@ -2184,6 +2226,116 @@ final class RingSession: NSObject {
         return true
     }
 
+    /// Change the ring's persistent automatic-workout detector (#179). `05 23 01 00` / `00 00` is
+    /// captured ground truth from the official app. The local flag gates the extra foreground sport
+    /// history drain and is written only when the command can actually be sent.
+    @discardableResult
+    func setAutomaticWorkoutDetection(enabled: Bool) -> Bool {
+        guard ready, syncTask == nil, !monitoring, !workoutHolding else { return false }
+        write(Command.automaticSportRecognition(enabled: enabled))
+        automaticWorkoutDetectionEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: automaticWorkoutDetectionKey)
+        ringLog.notice("automatic workout detection: \(enabled ? "ENABLED (05 23 01 00)" : "disabled (05 23 00 00)", privacy: .public)")
+        return true
+    }
+
+    /// Merge retransmitted sport pages, retain the official app's two-day review window, rebuild
+    /// retroactive candidates, and persist across reconnects. Prefer the duplicate that has valid HR.
+    private func mergeHistoricalSportSamples(_ incoming: [HistoricalSportFrame.Sample]) {
+        let rebuilt = AutomaticWorkoutInbox.rebuild(
+            existing: historicalSportSamples,
+            incoming: incoming,
+            resolvedStartCursors: resolvedAutomaticWorkoutCursors
+        )
+        historicalSportSamples = rebuilt.samples
+        automaticWorkoutCandidates = rebuilt.candidates
+        if let data = try? JSONEncoder().encode(historicalSportSamples) {
+            UserDefaults.standard.set(data, forKey: automaticWorkoutSamplesKey)
+        }
+
+        let unannounced = automaticWorkoutCandidates.filter {
+            guard let startCursor = $0.samples.first?.cursor else { return false }
+            return !notifiedAutomaticWorkoutCursors.contains(startCursor)
+                && !pendingAutomaticWorkoutNotificationCursors.contains(startCursor)
+        }
+        if !unannounced.isEmpty {
+            // Claim in memory before creating the task: several pages can rebuild the same candidate
+            // faster than authorization returns. Persist after successful enqueue or an explicit
+            // authorization decision; only a transient enqueue error remains retryable.
+            pendingAutomaticWorkoutNotificationCursors.formUnion(
+                unannounced.compactMap { $0.samples.first?.cursor }
+            )
+            Task { [weak self] in
+                guard let self else { return }
+                for candidate in unannounced {
+                    guard let cursor = candidate.samples.first?.cursor else { continue }
+                    let handled = await self.postAutomaticWorkoutNotification(candidate)
+                    self.pendingAutomaticWorkoutNotificationCursors.remove(cursor)
+                    if handled {
+                        self.notifiedAutomaticWorkoutCursors.insert(cursor)
+                        if let data = try? JSONEncoder().encode(self.notifiedAutomaticWorkoutCursors) {
+                            UserDefaults.standard.set(data, forKey: self.notifiedAutomaticWorkoutCursorsKey)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Announce a newly reconstructed bout once. Authorization is requested lazily only when the
+    /// opted-in detector actually finds something; provisional grants still receive it quietly.
+    private func postAutomaticWorkoutNotification(
+        _ candidate: AutomaticWorkoutDetector.Candidate
+    ) async -> Bool {
+        let center = UNUserNotificationCenter.current()
+        switch await center.notificationSettings().authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+            break
+        case .notDetermined:
+            let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+            // A declined prompt is a final user decision, not a reason to retry once per incoming
+            // page. Treat it as handled; the workout remains visible in the dashboard inbox.
+            guard granted else { return true }
+        default:
+            return true
+        }
+
+        let minutes = max(Int(candidate.duration / 60), 1)
+        let time = candidate.start.formatted(date: .omitted, time: .shortened)
+        let kind: String
+        switch candidate.suggestedKind {
+        case .walking: kind = "walk"
+        case .running: kind = "run"
+        case nil: kind = "workout"
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "Possible \(kind) detected"
+        content.body = "Your ring detected about \(minutes) minutes starting at \(time). Open Workouts to review it."
+        content.sound = .default
+        let cursor = candidate.samples.first?.cursor ?? 0
+        let identifier = "workout.detected.\(peripheral.identifier.uuidString).\(cursor)"
+        do {
+            try await center.add(UNNotificationRequest(identifier: identifier,
+                                                       content: content,
+                                                       trigger: nil))
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Permanently remove a reviewed candidate from the two-day inbox. Saving and dismissing share
+    /// this path: both mean the user has made a decision, and neither should reappear after a page
+    /// retransmission or reconnect.
+    func resolveAutomaticWorkoutCandidate(_ candidate: AutomaticWorkoutDetector.Candidate) {
+        guard let startCursor = candidate.samples.first?.cursor else { return }
+        resolvedAutomaticWorkoutCursors.insert(startCursor)
+        automaticWorkoutCandidates.removeAll { $0.samples.first?.cursor == startCursor }
+        if let data = try? JSONEncoder().encode(resolvedAutomaticWorkoutCursors) {
+            UserDefaults.standard.set(data, forKey: resolvedAutomaticWorkoutCursorsKey)
+        }
+    }
+
     /// Per-mode user-measure budget (seconds): HR needs longer stillness to converge than SpO₂.
     private func userMeasureBudget(for mode: LiveMode) -> TimeInterval {
         mode == .spo2 ? 45 : 90
@@ -2513,7 +2665,17 @@ final class RingSession: NSObject {
         if !sleepFirst, !allDayOnly, !Task.isCancelled {
             await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
         }
-        lastDrainSummary = "sleep \(drainCountsByLabel["sleep"] ?? 0) · all-day \(drainCountsByLabel["all-day"] ?? 0) epochs"
+        // Automatic recognition is ring-side, but its store-and-forward 10-second samples live on
+        // channel 0x02. Drain it only in the foreground and only after the user enables the feature:
+        // it is not worth spending a bounded background wake on workout review data, and the
+        // official two-day retention window means the next foreground open is sufficient.
+        if !inBackground, !allDayOnly, automaticWorkoutDetectionEnabled, !Task.isCancelled {
+            await drainChannel(channel: Command.syncChannelSport, label: "sport")
+        }
+        let sportSummary = automaticWorkoutDetectionEnabled
+            ? " · sport \(drainCountsByLabel["sport"] ?? 0) samples"
+            : ""
+        lastDrainSummary = "sleep \(drainCountsByLabel["sleep"] ?? 0) · all-day \(drainCountsByLabel["all-day"] ?? 0) epochs\(sportSummary)"
         finalizeSync()
         if inBackground { await deliverBackgroundResults(trigger: wakeTrigger) }
         endDrainAssertion()
@@ -2624,7 +2786,9 @@ final class RingSession: NSObject {
     private func drainChannel(channel: UInt8, label: String) async {
         syncDone = false
         syncQuietTicks = 0
+        activeDrainPageCount = 0
         let recordsAtStart = bulkRecords.count
+        let sportSamplesAtStart = historicalSportSamples.count
         let open = Command.syncUpToNow(channel: channel)
         var trace = HistoryChannelTrace(label: label, channel: channel)
         trace.recordsAtStart = recordsAtStart
@@ -2657,7 +2821,7 @@ final class RingSession: NSObject {
             // we know no pages are coming. Apply the same 3-tick quiet exit without waiting for pages
             // to start — saves up to 42 s per empty channel (observed: all-day channel 2026-06-28).
             syncQuietTicks += 1
-            let sawPages = bulkRecords.count > recordsAtStart
+            let sawPages = activeDrainPageCount > 0
             let ackedEmpty = activeDrainTrace?.sawEmptyHistorySignal == true && !sawPages
             // Instrumentation (T3 tuning): log the first-page latency once so the empty-channel cap
             // below stays safely above it.
@@ -2675,7 +2839,9 @@ final class RingSession: NSObject {
                 break
             }
             if syncDone || (sawPages && syncQuietTicks >= 3) || (ackedEmpty && syncQuietTicks >= 3) {
-                let added = self.bulkRecords.count - recordsAtStart
+                let added = channel == Command.syncChannelSport
+                    ? self.historicalSportSamples.count - sportSamplesAtStart
+                    : self.bulkRecords.count - recordsAtStart
                 ringLog.notice("sync: ch=\(label, privacy: .public) drained at \(tick)s (done=\(self.syncDone), quiet=\(self.syncQuietTicks), ackedEmpty=\(ackedEmpty), records=\(self.bulkRecords.count))")
                 print("[OC] sync DRAIN ch=\(label) added=\(added) ackedEmpty=\(ackedEmpty)")
                 finishActiveDrainTrace(syncDone ? .endMarker : .quietAfterPages)
@@ -2683,10 +2849,12 @@ final class RingSession: NSObject {
             }
         }
         if activeDrainTrace != nil {
-            let sawPages = bulkRecords.count > recordsAtStart
+            let sawPages = activeDrainPageCount > 0
             finishActiveDrainTrace(sawPages ? .hardTimeout : .quietNoPages)
         }
-        drainCountsByLabel[label] = bulkRecords.count - recordsAtStart
+        drainCountsByLabel[label] = channel == Command.syncChannelSport
+            ? historicalSportSamples.count - sportSamplesAtStart
+            : bulkRecords.count - recordsAtStart
     }
 
     /// Probe one speculative sync-open channel into the forensic raw log. Uses the same
@@ -3379,7 +3547,10 @@ extension RingSession: CBPeripheralDelegate {
             switch bytes.first {
             case 0x47:
                 self.drainSawPage = true
-                if self.syncing { self.syncQuietTicks = 0 }
+                if self.syncing {
+                    self.syncQuietTicks = 0
+                    self.activeDrainPageCount += 1
+                }
                 ringLog.debug("← 0x47 PPG page (\(bytes.count)B), ack")
                 self.write(Command.pageAck47)
                 self.handlePPGPage(data)   // Layer-A epoch decode, gated off (epochDecodingEnabled=false)
@@ -3390,11 +3561,32 @@ extension RingSession: CBPeripheralDelegate {
                 if self.syncing || self.livePreparing {   // keep records during a sync OR a live-enter drain
                     self.bulkRecords += BulkSleep.records(fromPage: bytes)
                     self.syncQuietTicks = 0
+                    if self.syncing { self.activeDrainPageCount += 1 }
                 }
                 ringLog.debug("← 0x4c sleep page (\(bytes.count)B) → records=\(self.bulkRecords.count), ack")
                 self.write(Command.pageAck4C)
                 self.handleActivityPage(data)   // Layer-A epoch decode, gated (#24)
                 return   // always ack to keep draining
+            case 0x4D:
+                // Channel 0x02 store-and-forward sport history (#179). ACK every valid or invalid
+                // page so one malformed record cannot stall the remaining workout history, matching
+                // the official app's `4d` → `cd 00 00` exchange. The pure decoder validates XOR.
+                self.write(Command.pageAck4D)
+                self.drainSawPage = true
+                if self.syncing {
+                    // A malformed page still proves that this drain made progress. Count it here,
+                    // before decode, so the quiet-window state machine cannot misclassify a real
+                    // sport response as an empty/refused channel and retry it unnecessarily.
+                    self.syncQuietTicks = 0
+                    self.activeDrainPageCount += 1
+                }
+                if let samples = HistoricalSportFrame.decode(bytes) {
+                    self.mergeHistoricalSportSamples(samples)
+                    ringLog.notice("← 0x4d sport history: +\(samples.count) samples, candidates=\(self.automaticWorkoutCandidates.count)")
+                } else {
+                    ringLog.warning("← 0x4d sport history: invalid page (acked, not decoded)")
+                }
+                return
             case 0x82:
                 // Sync-open ACK. At NOTICE so an ACCEPTED open (0x82 arrives) is distinguishable
                 // from a refused one (silence — cursor out of range); debug writes don't persist.

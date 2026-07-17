@@ -8,6 +8,12 @@ import XCTest
 // the RingConn app's night totals do (light ≫ rem > deep, modest awake).
 final class SleepStagingTests: XCTestCase {
 
+    /// Locks the user-ground-truthed quiet-wake onset calibration. The behavioural wind-down tests
+    /// below guard its safety properties; this assertion prevents an unnoticed default rollback.
+    func testQuietWakeOnsetCalibration() {
+        XCTAssertEqual(SleepStaging.Tuning.default.onsetSettleFraction, 0.60)
+    }
+
     // MARK: - Record builders
 
     /// A sleep-vitals epoch (sub 0x62) with explicit HR/HRV and a uniform motion byte.

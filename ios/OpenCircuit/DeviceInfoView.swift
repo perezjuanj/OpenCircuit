@@ -111,6 +111,23 @@ struct DeviceInfoView: View {
                      + "an experimental estimate, not a medical diagnosis.")
             }
 
+            Section {
+                Toggle(isOn: Binding(
+                    get: { session?.automaticWorkoutDetectionEnabled ?? false },
+                    set: { session?.setAutomaticWorkoutDetection(enabled: $0) }
+                )) {
+                    Label("Automatic Workout Detection", systemImage: "figure.run.circle")
+                }
+                .disabled(session?.ready != true || session?.syncing == true || session?.monitoring == true)
+            } header: {
+                Text("Workouts")
+            } footer: {
+                Text("The ring recognizes continuous workouts lasting at least 10 minutes and stores "
+                     + "their heart-rate and motion samples. Open OpenCircuit within two days to sync "
+                     + "and review detected periods; OpenCircuit notifies you when one arrives. This "
+                     + "uses more battery, matching the RingConn feature.")
+            }
+
             // Switching rings is uncommon (most people have one ring), so it lives here rather than
             // on the main screen. Opens a picker that scans for OTHER nearby rings — it keeps the
             // current link until you actually pick another, so cancelling is non-destructive. Data

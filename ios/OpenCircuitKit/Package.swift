@@ -15,7 +15,11 @@ let package = Package(
     targets: [
         .target(name: "OpenCircuitKit"),
         // `swift test` (needs Xcode for XCTest) runs this suite.
-        .testTarget(name: "OpenCircuitKitTests", dependencies: ["OpenCircuitKit"]),
+        .testTarget(
+            name: "OpenCircuitKitTests",
+            dependencies: ["OpenCircuitKit"],
+            resources: [.process("Fixtures")]
+        ),
         // CLT-friendly verifier: `swift run RingKitVerify` works without Xcode,
         // asserting the same real-capture fixtures. Stopgap until Xcode is present.
         .executableTarget(name: "RingKitVerify", dependencies: ["OpenCircuitKit"]),

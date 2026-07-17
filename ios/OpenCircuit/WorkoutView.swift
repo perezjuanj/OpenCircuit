@@ -20,6 +20,7 @@ import OpenCircuitKit
 struct WorkoutView: View {
     let session: RingSession?
     @State private var manager = WorkoutSessionManager()
+    @State private var detectedCandidate: AutomaticWorkoutDetector.Candidate?
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
 
@@ -47,7 +48,11 @@ struct WorkoutView: View {
             Group {
                 switch manager.recordingState {
                 case .idle:
-                    idleView
+                    if let detectedCandidate {
+                        detectedWorkoutReview(detectedCandidate)
+                    } else {
+                        idleView
+                    }
                 case .starting, .active:
                     activeView
                 case .finishing:
@@ -92,7 +97,39 @@ struct WorkoutView: View {
     // MARK: - Idle
 
     private var idleView: some View {
-        VStack(spacing: 24) {
+        ScrollView {
+          VStack(spacing: 24) {
+            if let candidates = session?.automaticWorkoutCandidates, !candidates.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("DETECTED BY RING")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    ForEach(candidates) { candidate in
+                        Button { beginReview(candidate) } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: candidate.suggestedKind == .running
+                                      ? "figure.run" : candidate.suggestedKind == .walking
+                                      ? "figure.walk" : "figure.mixed.cardio")
+                                    .font(.title2).foregroundStyle(.blue).frame(width: 32)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(candidateTitle(candidate)).font(.subheadline.weight(.semibold))
+                                    Text(candidateSubtitle(candidate))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                            }
+                            .padding(12)
+                            .background(RoundedRectangle(cornerRadius: 12)
+                                .fill(Color(.secondarySystemGroupedBackground)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Text("Review within two days. The ring supplies the time, heart rate, and steps; confirm the activity type before saving.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+
             Text("SELECT SPORT")
                 .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -104,8 +141,6 @@ struct WorkoutView: View {
                     }
                 }
             }
-
-            Spacer()
 
             // Best-effort HR note (#45)
             HStack(alignment: .top, spacing: 8) {
@@ -151,8 +186,99 @@ struct WorkoutView: View {
                 Text("Ring is finishing its sync — you can start a workout in a moment.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
+          }
+          .padding()
         }
-        .padding()
+    }
+
+    // MARK: - Automatically detected workout review
+
+    private func detectedWorkoutReview(_ candidate: AutomaticWorkoutDetector.Candidate) -> some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                VStack(spacing: 6) {
+                    Image(systemName: "waveform.path.ecg.rectangle")
+                        .font(.system(size: 38)).foregroundStyle(.blue)
+                    Text("Detected Workout").font(.title2.weight(.bold))
+                    Text(candidateSubtitle(candidate))
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                    statCell("Duration", formattedDuration(candidate.duration))
+                    statCell("Steps", candidate.steps > 0 ? "\(candidate.steps)" : "--")
+                    statCell("Avg HR", candidate.averageHeartRate.map { "\(Int($0.rounded())) bpm" } ?? "--")
+                    statCell("Max HR", candidate.maximumHeartRate.map { "\($0) bpm" } ?? "--")
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("CONFIRM ACTIVITY")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 110))], spacing: 12) {
+                        ForEach(WorkoutSportType.allCases, id: \.rawValue) { sport in
+                            SportButton(sport: sport, selected: manager.selectedSport == sport) {
+                                manager.selectedSport = sport
+                            }
+                        }
+                    }
+                }
+
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "info.circle").foregroundStyle(.secondary)
+                    Text("Activity type is a suggestion from cadence, not a decoded firmware label. No GPS route is available for a workout recognized after it ended.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Button {
+                    Task {
+                        if await manager.importDetectedWorkout(candidate, as: manager.selectedSport) {
+                            session?.resolveAutomaticWorkoutCandidate(candidate)
+                            detectedCandidate = nil
+                        }
+                    }
+                } label: {
+                    Label("Add to Apple Health", systemImage: "heart.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                HStack {
+                    Button("Back") { detectedCandidate = nil }
+                    Spacer()
+                    Button("Not a Workout", role: .destructive) {
+                        session?.resolveAutomaticWorkoutCandidate(candidate)
+                        detectedCandidate = nil
+                    }
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding()
+        }
+    }
+
+    private func beginReview(_ candidate: AutomaticWorkoutDetector.Candidate) {
+        switch candidate.suggestedKind {
+        case .walking: manager.selectedSport = .walkingOutdoor
+        case .running: manager.selectedSport = .runningOutdoor
+        case nil: manager.selectedSport = .other
+        }
+        detectedCandidate = candidate
+    }
+
+    private func candidateTitle(_ candidate: AutomaticWorkoutDetector.Candidate) -> String {
+        switch candidate.suggestedKind {
+        case .walking: return "Possible Walk"
+        case .running: return "Possible Run"
+        case nil: return "Possible Workout"
+        }
+    }
+
+    private func candidateSubtitle(_ candidate: AutomaticWorkoutDetector.Candidate) -> String {
+        let df = DateFormatter()
+        df.dateStyle = Calendar.current.isDateInToday(candidate.start) ? .none : .medium
+        df.timeStyle = .short
+        return "\(df.string(from: candidate.start)) · \(formattedDuration(candidate.duration))"
     }
 
     // MARK: - Active

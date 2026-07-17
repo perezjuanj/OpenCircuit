@@ -819,12 +819,21 @@ struct LocalStore {
             let storedSpan = existing.inBedEnd > existing.inBedStart
                 ? existing.inBedEnd.timeIntervalSince(existing.inBedStart) : 0
             let newSpan = inBedEnd > inBedStart ? inBedEnd.timeIntervalSince(inBedStart) : 0
+            // A classifier refinement can legitimately turn formerly-asleep quiet wake into
+            // awake-in-bed while using the exact same archived coverage. Treat matching boundaries
+            // (within one ring epoch) as a reclassification, not as a thinner fragment; otherwise the
+            // old, larger asleep total would be merge-protected forever after an onset fix ships.
+            let epochTolerance = TimeInterval(BulkRecord.epochSeconds)
+            let sameCoverage = storedSpan > 0 && newSpan > 0
+                && abs(existing.inBedStart.timeIntervalSince(inBedStart)) <= epochTolerance
+                && abs(existing.inBedEnd.timeIntervalSince(inBedEnd)) <= epochTolerance
             // Completeness is judged on time ASLEEP (span is a fallback): a later, shorter slice — or a
             // wide window padded with awake — can't shrink a fuller night. See SleepSummaryMerge.
             guard SleepSummaryMerge.shouldReplace(
                 storedInBed: storedSpan, newInBed: newSpan,
                 storedAsleep: TimeInterval(existing.asleepMin) * 60,
-                newAsleep: TimeInterval(m.asleep) * 60) else {
+                newAsleep: TimeInterval(m.asleep) * 60,
+                sameCoverage: sameCoverage) else {
                 return   // keep the fuller existing night (its window, stages, extras + feelScore)
             }
             existing.asleepMin = m.asleep
