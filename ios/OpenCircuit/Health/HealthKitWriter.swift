@@ -491,19 +491,39 @@ final class HealthKitWriter {
     /// `HKMetadataKeyMenstrualCycleStart: true` is set on the FIRST day only (period start =
     /// cycle start). Never fabricates a duration the user didn't log (P1 fix).
     private func writeMenstrualFlow(entry: StoredPeriodEntry) async throws -> [String] {
+        let samples = Self.menstrualFlowSamples(
+            start: entry.start,
+            end: entry.end,
+            flowLevelRaw: entry.flowLevelRaw
+        )
+        guard !samples.isEmpty else { return [] }
+        try await store.save(samples)
+        return samples.map { $0.uuid.uuidString }
+    }
+
+    /// Build one HealthKit menstrual-flow sample per logged day. HealthKit requires
+    /// `HKMetadataKeyMenstrualCycleStart` on EVERY menstrual-flow sample: `true` on the first
+    /// day and `false` thereafter. Omitting the key raises an uncatchable Obj-C exception while
+    /// constructing the second sample, which caused the build 17–22 TestFlight launch/background
+    /// crash loop for anyone with a multi-day period pending. Internal for the app-target crash
+    /// regression test.
+    static func menstrualFlowSamples(start: Date,
+                                     end: Date?,
+                                     flowLevelRaw: Int,
+                                     today now: Date = Date(),
+                                     calendar cal: Calendar = .current) -> [HKCategorySample] {
         let type = HKCategoryType(.menstrualFlow)
         let flowValue: HKCategoryValueMenstrualFlow
-        switch entry.flowLevelRaw {
+        switch flowLevelRaw {
         case 1: flowValue = .light
         case 3: flowValue = .heavy
         default: flowValue = .medium
         }
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
-        let firstDay = cal.startOfDay(for: entry.start)
+        let today = cal.startOfDay(for: now)
+        let firstDay = cal.startOfDay(for: start)
         // Finalized period: through the logged end day. Open period: only up to today.
         // Either way, never write a day in the future.
-        let endCandidate = entry.end.map { cal.startOfDay(for: $0) } ?? today
+        let endCandidate = end.map { cal.startOfDay(for: $0) } ?? today
         let lastDay = min(endCandidate, today)
         guard lastDay >= firstDay else { return [] }
 
@@ -512,16 +532,14 @@ final class HealthKitWriter {
         var isFirstDay = true
         while day <= lastDay {
             let dayEnd = cal.date(byAdding: .day, value: 1, to: day) ?? day.addingTimeInterval(86_400)
-            // Mark only the first day of the period as the first day of the cycle.
-            let metadata: [String: Any]? = isFirstDay ? [HKMetadataKeyMenstrualCycleStart: true] : nil
+            // The key is REQUIRED on every sample; only its Boolean value changes after day one.
+            let metadata: [String: Any] = [HKMetadataKeyMenstrualCycleStart: isFirstDay]
             samples.append(HKCategorySample(type: type, value: flowValue.rawValue,
                                             start: day, end: dayEnd, metadata: metadata))
             isFirstDay = false
             day = dayEnd
         }
-        guard !samples.isEmpty else { return [] }
-        try await store.save(samples)
-        return samples.map { $0.uuid.uuidString }
+        return samples
     }
 
     /// Delete previously-written `menstrualFlow` samples by UUID (best-effort). Used when a
