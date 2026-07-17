@@ -32,6 +32,9 @@ public enum SleepSummaryMerge {
     ///   - newInBed: the freshly-staged in-bed span (seconds).
     ///   - storedAsleep: the stored row's time-actually-asleep (seconds); `0` when unknown (legacy).
     ///   - newAsleep: the freshly-staged time-actually-asleep (seconds); `0` when unknown.
+    ///   - sameCoverage: `true` when both summaries came from the same start/end coverage. This is
+    ///     an intentional reclassification, so refined wake/onset logic may legitimately reduce the
+    ///     asleep total without being mistaken for a thinner capture fragment.
     /// - Returns: `true` to overwrite. Completeness is judged PRIMARILY by time ASLEEP — a capture
     ///   that recovers more sleep (a stitched multi-fragment night) supersedes a thinner one, and a
     ///   shorter fragment never shrinks a fuller night. In-bed SPAN alone was the wrong proxy: a wide
@@ -43,8 +46,10 @@ public enum SleepSummaryMerge {
     ///   awake-in-bed lead-in can't clobber a bedtime-widened row back to `inBedStart == onset` /
     ///   100 % efficiency (the bedtime-widen durability guarantee).
     public static func shouldReplace(storedInBed: TimeInterval, newInBed: TimeInterval,
-                                     storedAsleep: TimeInterval = 0, newAsleep: TimeInterval = 0) -> Bool {
+                                     storedAsleep: TimeInterval = 0, newAsleep: TimeInterval = 0,
+                                     sameCoverage: Bool = false) -> Bool {
         guard storedInBed > 0 || storedAsleep > 0 else { return true }
+        if sameCoverage { return true }
         if storedAsleep > 0 || newAsleep > 0 {
             // More recovered sleep always wins; on a tie, keep the fuller (wider in-bed) night so an
             // awake-only difference — exactly the bedtime widen — is never lost to arrival order.

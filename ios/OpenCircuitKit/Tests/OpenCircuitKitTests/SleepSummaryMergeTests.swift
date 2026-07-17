@@ -50,6 +50,15 @@ final class SleepSummaryMergeTests: XCTestCase {
             storedInBed: 6 * h, newInBed: 8 * h, storedAsleep: 6 * h, newAsleep: 3 * h))
     }
 
+    /// A classifier update may reduce time asleep while retaining the exact same raw-epoch coverage
+    /// (quiet wake is reclassified as awake-in-bed). That corrected result must replace the stale one.
+    func testSameCoverageAllowsLowerAsleepReclassification() {
+        XCTAssertTrue(SleepSummaryMerge.shouldReplace(
+            storedInBed: 9.25 * h, newInBed: 9.25 * h,
+            storedAsleep: 9.2 * h, newAsleep: 7.6 * h,
+            sameCoverage: true))
+    }
+
     /// A capture that recovers MORE sleep (a stitched night) supersedes a thinner stored one, even at
     /// the same or smaller in-bed span.
     func testMoreAsleepReplaces() {

@@ -332,7 +332,7 @@ struct SleepCardView: View {
                         .lineLimit(1).minimumScaleFactor(0.6)
                     Text("asleep").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
                 }
-                Text("\(m.inBed / 60)h \(m.inBed % 60)m in bed")
+                Text(inBedText(night))
                     .font(.caption).foregroundStyle(.secondary).monospacedDigit()
             }
             Spacer()
@@ -953,6 +953,20 @@ struct SleepCardView: View {
 
     private static func clock(_ d: Date) -> String {
         d.formatted(date: .omitted, time: .shortened)
+    }
+
+    /// Time-in-bed duration plus its clock range when the night is contiguous. A stitched night can
+    /// contain archive gaps, so its wall-clock span may be much wider than the summed in-bed duration;
+    /// omit the range in that case rather than presenting two values that cannot reconcile.
+    private func inBedText(_ night: Night) -> String {
+        let minutes = night.summary.minutes.inBed
+        var text = "\(minutes / 60)h \(minutes % 60)m in bed"
+        if let start = night.inBedStart, let end = night.inBedEnd, end > start,
+           night.summary.inBed > 0,
+           end.timeIntervalSince(start) <= night.summary.inBed * 1.15 {
+            text += " · \(Self.clock(start))–\(Self.clock(end))"
+        }
+        return text
     }
 
     /// Footer parts: efficiency + the estimate caveat. The time-in-bed DURATION sits under the
