@@ -949,8 +949,8 @@ struct ContentView: View {
                       })
     }
 
-    /// Workout session card — taps through to WorkoutView (#75).
-    /// Displays a start-workout prompt; tapping opens the sport-picker sheet.
+    /// Workout session card — taps through to WorkoutView (#75/#179). Detected bouts take priority
+    /// so the two-day review window is visible without hiding manual workout recording.
     private var workoutCard: some View {
         Button {
             showWorkout = true
@@ -964,8 +964,13 @@ struct ContentView: View {
                     Image(systemName: "chevron.right")
                         .font(.caption).foregroundStyle(.tertiary)
                 }
-                Text("Record a workout with HR zones + GPS route (outdoor)")
-                    .font(.subheadline).foregroundStyle(.secondary)
+                if let count = session?.automaticWorkoutCandidates.count, count > 0 {
+                    Label("\(count) workout\(count == 1 ? "" : "s") ready to review", systemImage: "sparkles")
+                        .font(.subheadline.weight(.semibold)).foregroundStyle(.blue)
+                } else {
+                    Text("Record a workout with HR zones + GPS route (outdoor)")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
             }
         }
         .buttonStyle(.plain)

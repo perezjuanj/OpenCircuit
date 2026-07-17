@@ -55,12 +55,12 @@ public struct HistoryFrameCapture: Codable, Equatable, Sendable {
 
     /// Opcodes worth capturing for protocol triage: history pages (`0x47` PPG / `0x4c` sleep),
     /// the end-of-history cursor (`0x50`), the sync-open ACK (`0x82`), the status descriptor
-    /// (`0x10`/`0x87`), and the native sport-mode HR+steps stream (`0x4e`) so a WORKOUT's actual HR
-    /// path is visible in a capture (it was invisible before — the reason a bad-workout-HR report
-    /// couldn't be diagnosed). `0x4e` is only emitted during an active sport session, so it never
-    /// floods the buffer in normal use. Still EXCLUDES the high-rate live poll (`0x15`) and heartbeats
-    /// (`0x11`) so the buffer stays focused on the sleep/history + workout paths.
-    public static let capturedOpcodes: Set<UInt8> = [0x47, 0x4c, 0x50, 0x82, 0x10, 0x87, 0x4e]
+    /// (`0x10`/`0x87`), automatic sport-history pages (`0x4d`), and the native manual sport-mode
+    /// HR+steps stream (`0x4e`) so BOTH workout paths are visible in an exported capture. `0x4d`
+    /// remains bounded by the two-day foreground drain and this ring buffer's cap; `0x4e` is only
+    /// emitted during an active sport session. Still EXCLUDES the high-rate live poll (`0x15`) and
+    /// heartbeats (`0x11`) so the buffer stays focused on sleep/history + workout paths.
+    public static let capturedOpcodes: Set<UInt8> = [0x47, 0x4c, 0x4d, 0x50, 0x82, 0x10, 0x87, 0x4e]
 
     /// True when this opcode should be recorded (see `capturedOpcodes`).
     public static func shouldCapture(_ bytes: [UInt8]) -> Bool {

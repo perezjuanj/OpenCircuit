@@ -1,10 +1,9 @@
 // Predicted decoder for the still-uncaptured 历史活动响应 ("history ACTIVITY response")
 // record — PROTOCOL.md §5.3.1, issue #93. This is a DIFFERENT record from the `0x4c`
-// MEASUREMENT record `BulkRecord` decodes; it has never been observed on the wire — every
-// capture so far used sync-open `byte[6]`=0x00/0x03, which only ever returns MEASUREMENT
-// records. `RingSession.probeActivityChannels` exists to capture `byte[6]=0x02`, the
-// predicted activity-channel selector; this decoder is what validates that capture once it
-// lands.
+// MEASUREMENT record `BulkRecord` decodes; it has never been observed on the wire. Channel
+// `0x02` is now ruled out: the 2026-07-11 workout capture proves it returns `0x4d` 10-second
+// SPORT records (#179), decoded by `HistoricalSportFrame`. The remaining unknown selectors
+// can still be swept with `RingSession.probeActivityChannels`.
 //
 // Layout below is PREDICTED via the `wire_index = APK_loc - 3` convention already validated
 // against the MEASUREMENT record (PROTOCOL.md §5.3: 5 independent fields landed byte-for-byte
