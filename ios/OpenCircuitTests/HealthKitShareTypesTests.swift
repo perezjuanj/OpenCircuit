@@ -38,6 +38,31 @@ final class HealthKitShareTypesTests: XCTestCase {
         }
     }
 
+    /// HealthKit requires HKMetadataKeyMenstrualCycleStart on EVERY menstrual-flow sample.
+    /// Omitting it after day one throws an uncatchable NSInvalidArgumentException during sample
+    /// construction, which caused the build 17–22 TestFlight crash loop on every foreground or
+    /// background Health flush for testers who logged a multi-day period.
+    func testMultiDayMenstrualFlowMarksEverySampleWithCycleStartMetadata() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let start = Date(timeIntervalSince1970: 1_752_192_000) // 2025-07-11 00:00:00 UTC
+        let end = calendar.date(byAdding: .day, value: 2, to: start)!
+
+        let samples = HealthKitWriter.menstrualFlowSamples(
+            start: start,
+            end: end,
+            flowLevelRaw: 2,
+            today: end,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(samples.count, 3)
+        XCTAssertEqual(
+            samples.map { $0.metadata?[HKMetadataKeyMenstrualCycleStart] as? Bool },
+            [true, false, false]
+        )
+    }
+
     func testEnergyWritesCountAsFlushOutput() {
         var basal = HealthKitWriter.FlushResult()
         basal.passiveHours = 1
