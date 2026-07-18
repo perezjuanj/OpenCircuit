@@ -962,27 +962,30 @@ final class HealthKitWriter {
         var written = defaults.double(forKey: Self.activeWrittenKey)
         if cal.startOfDay(for: storedDay) != today { written = 0 }  // new day → reset accumulator
 
-        // HR-derived TRIMP active energy. Sparse by nature — usually ~0 without dense daytime HR,
-        // which is exactly why a day with walking used to show 0 active calories. Kept as one
-        // input; never widened/fabricated.
+        // Use the same elevated-HR duration + Keytel energy estimate as the dashboard rings. This
+        // keeps Health mirroring from reviving the old contradiction where moderate HR earned
+        // exercise minutes but zero HR calories. Sleep is excluded before either value is derived.
         let hr = (try? local.samples(kind: .heartRate, from: today, to: now)) ?? []
         let hrSamples = hr.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        let maxHR = max(220 - profile.age, 1)
-        let hrKcal = hrSamples.isEmpty ? 0 : Calories.activeKcal(hrSamples: hrSamples, maxHR: maxHR)
-
-        // Step/distance-derived estimate — works even with no HR. The workout's foot-distance is
-        // netted out of the daily estimate below (via the committed workout kcal), so no per-channel
-        // distance netting is needed here.
         let steps = (try? local.todaySteps(day: today)) ?? 0
-        let stepKcal = Calories.activeKcalFromSteps(steps: steps, profile: profile)
+        let sleepWindow: DateInterval? = (try? local.latestSleepSummary()).flatMap { s in
+            guard s.inBedStart > Date.distantPast, s.inBedEnd > s.inBedStart else { return nil }
+            return DateInterval(start: s.inBedStart, end: s.inBedEnd)
+        }
+        let estimate = Calories.dailyEstimate(
+            hrSamples: hrSamples,
+            steps: steps,
+            profile: profile,
+            sleepWindow: sleepWindow
+        )
 
         // #121 started persisting workout HR into LocalStore for Goals/Trends, and workouts also
         // write their own activeEnergyBurned sample. Subtract the committed workout active kcal from
         // whichever daily channel (HR or step) is chosen, so both HR-locked and indoor/step-only
         // workouts are netted exactly once (see `netDailyActiveKcalEstimate`).
         let total = Self.netDailyActiveKcalEstimate(
-            hrKcal: hrKcal,
-            stepKcal: stepKcal,
+            hrKcal: estimate.activeKcal,
+            stepKcal: 0,
             workoutActiveKcal: Self.workoutActiveKcalCredited(day: today)
         )
         let delta = total - written

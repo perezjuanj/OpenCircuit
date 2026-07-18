@@ -100,25 +100,6 @@ struct GoalsCardView: View {
                     sex: BiologicalSex(rawValue: sexRaw) ?? .male)
     }
 
-    /// Active kcal today — the larger of the HR-TRIMP estimate (sparse; ~0 without dense HR) and a
-    /// step/distance estimate, so a day with walking still shows nonzero active calories. Estimate.
-    private var currentActiveKcal: Double {
-        let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: max(220 - age, 1))
-        let stepKcal = Calories.activeKcalFromSteps(steps: currentSteps, profile: profile)
-        return max(hrKcal, stepKcal)
-    }
-
-    private var currentActivityMin: Double {
-        let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        let maxHR = max(220 - age, 1)
-        let sleepWindow: DateInterval? = latestSleep.first.flatMap { s in
-            guard s.inBedStart > Date.distantPast else { return nil }
-            return DateInterval(start: s.inBedStart, end: s.inBedEnd)
-        }
-        return ExerciseMinutes.estimate(hrSamples: samples, maxHR: maxHR, sleepWindow: sleepWindow)
-    }
-
     /// True when the newest stored night actually ended TODAY, so its minutes may be credited to
     /// today's Sleep ring. A days-old night (no overnight sync landed) is NOT credited — the ring
     /// stays empty rather than silently reading a stale night as last night (#147). Uses the SAME
@@ -177,7 +158,7 @@ struct GoalsCardView: View {
                 Text("DAILY GOALS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             }
             if let s = cachedActivityScore {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                HStack(alignment: .center, spacing: 8) {
                     Text("\(s.score)")
                         .font(.system(size: 34, weight: .semibold, design: .rounded))
                         .monospacedDigit()
@@ -199,12 +180,12 @@ struct GoalsCardView: View {
                          goal: "\(stepsGoal.formatted())",
                          color: .green)
                 goalRing(progress: progress.activeKcal,
-                         label: "Active kcal\u{B9}",
+                         label: "Active kcal est.",
                          current: "\(Int(cachedActiveKcal))",
                          goal: "\(Int(activeKcalGoal))",
                          color: .orange)
                 goalRing(progress: progress.activityMinutes,
-                         label: "Exercise min\u{B9}",
+                         label: "Elevated HR\u{B9}",
                          current: "\(Int(cachedActivityMin))",
                          goal: "\(Int(actMinGoal))",
                          color: .blue)
@@ -216,7 +197,7 @@ struct GoalsCardView: View {
                          goal: formatDuration(sleepGoalMin),
                          color: .purple)
             }
-            Text("\u{B9} Activity Score is an on-device estimate — the weighted attainment of your step, active-calorie & exercise-minute goals, not the RingConn app's number. Active calories & exercise minutes are themselves estimates (active kcal from heart rate where available, else steps × distance; exercise minutes from an elevated-HR threshold — independent of steps). Full accuracy follows the ring activity-payload decode.")
+            Text("\u{B9} Activity Score is an on-device estimate — the weighted attainment of your step, active-calorie & elevated-HR goals, not the RingConn app's number. Active calories and elevated-HR minutes now use the same qualifying heart-rate periods; steps remain the calorie fallback. Elevated HR is not detected workout duration. Full accuracy follows the ring activity-payload decode.")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -230,26 +211,26 @@ struct GoalsCardView: View {
             let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
             let steps = currentSteps
             let profile = profile
-            let maxHR = max(220 - age, 1)
             let sleepWindow: DateInterval? = latestSleep.first.flatMap { s in
-                guard s.inBedStart > Date.distantPast else { return nil }
+                guard s.inBedStart > Date.distantPast, s.inBedEnd > s.inBedStart else { return nil }
                 return DateInterval(start: s.inBedStart, end: s.inBedEnd)
             }
-            let result = await Task.detached { () -> (kcal: Double, minutes: Double) in
-                let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
-                let stepKcal = Calories.activeKcalFromSteps(steps: steps, profile: profile)
-                let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: maxHR,
-                                                       sleepWindow: sleepWindow)
-                return (max(hrKcal, stepKcal), minutes)
+            let result = await Task.detached { () -> Calories.DailyEstimate in
+                Calories.dailyEstimate(
+                    hrSamples: samples,
+                    steps: steps,
+                    profile: profile,
+                    sleepWindow: sleepWindow
+                )
             }.value
-            cachedActiveKcal = result.kcal
-            cachedActivityMin = result.minutes
+            cachedActiveKcal = result.activeKcal
+            cachedActivityMin = result.elevatedMinutes
             // Score is pure + O(1) — fine on the main actor once the O(n) estimates it reads
             // have been published. Reuses the same goals the rings use so the two never disagree.
             cachedActivityScore = ActivityScore.score(.init(
                 steps: steps, stepGoal: stepsGoal,
-                activeMinutes: result.minutes, activeMinutesGoal: actMinGoal,
-                activeKcal: result.kcal, activeKcalGoal: activeKcalGoal))
+                activeMinutes: result.elevatedMinutes, activeMinutesGoal: actMinGoal,
+                activeKcal: result.activeKcal, activeKcalGoal: activeKcalGoal))
         }
     }
 

@@ -439,7 +439,6 @@ struct TrendsView: View {
         // Profile for the same step/HR-derived activity ESTIMATES HealthKitWriter writes
         // (active energy, distance, exercise minutes) — so the trend matches Apple Health.
         let profile = HealthKitWriter.storedUserProfile()
-        let maxHR = max(220 - profile.age, 1)
 
         // Build one point per day across the UNION of sleep-summary nights, daily-step days,
         // and any day with a vitals sample — so a chart renders even on a day with no overnight
@@ -469,6 +468,15 @@ struct TrendsView: View {
             let daySteps = stepsByDay[day]
             let dayHRSamples = hrSamples.filter { dayWindow.contains($0.start) }
                 .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+            let activityEstimate: Calories.DailyEstimate? =
+                (daySteps != nil || !dayHRSamples.isEmpty)
+                ? Calories.dailyEstimate(
+                    hrSamples: dayHRSamples,
+                    steps: daySteps ?? 0,
+                    profile: profile,
+                    sleepWindow: window
+                )
+                : nil
 
             return TrendsEngine.DailyPoint(
                 date:          day,
@@ -488,11 +496,9 @@ struct TrendsView: View {
                 dayHRVAvg:     avg(hrvSamples, in: dayWindow),
                 daySpO2Avg:    avg(spo2Samples, in: dayWindow),
                 dayRRAvg:      avg(rrSamples, in: dayWindow),
-                activeEnergyKcal: daySteps.map { Calories.activeKcalFromSteps(steps: $0, profile: profile) },
+                activeEnergyKcal: activityEstimate?.activeKcal,
                 distanceM:        daySteps.map { DistanceEstimate.meters(steps: $0) },
-                exerciseMin:      dayHRSamples.isEmpty ? nil : ExerciseMinutes.estimate(
-                    hrSamples: dayHRSamples, maxHR: maxHR, sleepWindow: window
-                )
+                exerciseMin:      activityEstimate?.elevatedMinutes
             )
         }
 

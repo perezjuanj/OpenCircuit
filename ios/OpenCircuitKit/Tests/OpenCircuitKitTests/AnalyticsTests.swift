@@ -170,6 +170,45 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(Calories.activeKcalFromSteps(steps: 0, profile: profile), 0.0, accuracy: 0.001)
     }
 
+    func testDailyEstimateUsesSameModerateHRRunForMinutesAndCalories() {
+        let profile = UserProfile(age: 33, weightKg: 72.5, heightCm: 170, sex: .male)
+        let start = Date(timeIntervalSince1970: 0)
+        // 100 bpm is above the elevated-HR threshold for age 33 (93 bpm), but below the old
+        // 50%-of-HR-reserve calorie floor (~124 bpm). The old dashboard therefore showed
+        // exercise time with zero HR calories. Four consecutive 2.5-min epochs represent 10 min.
+        let samples = [0.0, 150.0, 300.0, 450.0].map { offset in
+            HRSample(bpm: 100,
+                     start: start.addingTimeInterval(offset),
+                     end: start.addingTimeInterval(offset))
+        }
+
+        let result = Calories.dailyEstimate(
+            hrSamples: samples,
+            steps: 0,
+            profile: profile
+        )
+        let expectedKcal = Calories.workoutActiveKcal(
+            avgHR: 100,
+            durationSeconds: 10 * 60,
+            profile: profile
+        )
+
+        XCTAssertEqual(result.elevatedMinutes, 10, accuracy: 0.001)
+        XCTAssertEqual(result.activeKcal, expectedKcal, accuracy: 0.001)
+        XCTAssertGreaterThan(result.activeKcal, 0)
+    }
+
+    func testDailyEstimateFallsBackToStepsWithoutQualifyingHR() {
+        let profile = UserProfile(age: 33, weightKg: 72.5, heightCm: 170, sex: .male)
+        let low = HRSample(bpm: 70, start: Date(timeIntervalSince1970: 0))
+        let result = Calories.dailyEstimate(hrSamples: [low], steps: 5_000, profile: profile)
+
+        XCTAssertEqual(result.elevatedMinutes, 0)
+        XCTAssertEqual(result.activeKcal,
+                       Calories.activeKcalFromSteps(steps: 5_000, profile: profile),
+                       accuracy: 0.001)
+    }
+
     // MARK: Trimmed-mean baseline robustness (#172 review, fix #4)
 
     func testRestingBaselineTrimmedMeanResistsOutlier() throws {

@@ -1,6 +1,6 @@
 // Daily Activity Score (#95) — an on-device ESTIMATE of how active the day was,
 // scored 0–100 with tiers, from the same three daily activity goals the app already
-// tracks in GoalsCardView: STEPS, ACTIVE MINUTES (elevated-HR), and ACTIVE CALORIES.
+// tracks in GoalsCardView: STEPS, ELEVATED-HR MINUTES, and ACTIVE CALORIES.
 //
 // WHY a goal-attainment proxy and NOT the RingConn app's headline number: the app's
 // Activity Score is a proprietary combination of 4 CALIBRATED intensity buckets
@@ -34,7 +34,7 @@ public enum ActivityScore {
 
     /// Inputs: each is a daily current value paired with its goal. All are values the app
     /// already computes for the Goals ring (steps from the descriptor counter, active
-    /// minutes from `ExerciseMinutes.estimate`, active kcal from `Calories`). A factor
+    /// minutes and active kcal from the shared `Calories.dailyEstimate`). A factor
     /// whose goal is ≤ 0 (unset / disabled) is dropped and the rest are renormalised.
     public struct Input: Equatable, Sendable {
         public var steps: Int
