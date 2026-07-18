@@ -247,6 +247,11 @@ final class RingSession: NSObject {
     /// Fires once after the notify subscription is confirmed: if no DATA frame has arrived within
     /// `firstFrameTimeout`, flips `notStreaming` (ring not activated/bonded). #54.
     private var streamWatchdogTask: Task<Void, Never>?
+    /// Re-applies the user's persisted automatic-workout preference once per authenticated
+    /// connection. The ring-side setting is not queryable, so a remembered local `true` must not
+    /// be treated as proof that firmware is still armed after a reboot/reconnect.
+    private var automaticWorkoutReassertTask: Task<Void, Never>?
+    private var automaticWorkoutDetectionAppliedThisConnection = false
     /// Seconds after a confirmed subscription to wait for the ring's first DATA frame. The keepalive
     /// starts writing status/fetch immediately on `ready`, so an activated ring answers well within
     /// this; only an un-activated ring stays silent past it.
@@ -767,6 +772,7 @@ final class RingSession: NSObject {
         autoMeasureTask?.cancel(); autoMeasureTask = nil
         postSyncStatusTask?.cancel(); postSyncStatusTask = nil
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
+        automaticWorkoutReassertTask?.cancel(); automaticWorkoutReassertTask = nil
         syncTask?.cancel(); syncTask = nil
         rssiPollTask?.cancel(); rssiPollTask = nil   // Find My Ring RSSI poll (#96)
         // #reconnect (review HIGH): tear down SPORT too. Without this the sport-enter task — its `06 03`
@@ -2226,17 +2232,53 @@ final class RingSession: NSObject {
         return true
     }
 
-    /// Change the ring's persistent automatic-workout detector (#179). `05 23 01 00` / `00 00` is
+    /// Change the ring's automatic-workout detector (#179). `05 23 01 00` / `00 00` is
     /// captured ground truth from the official app. The local flag gates the extra foreground sport
-    /// history drain and is written only when the command can actually be sent.
+    /// history drain and records the user's desired state; enabled state is re-asserted once per
+    /// authenticated connection because firmware state cannot currently be queried.
     @discardableResult
     func setAutomaticWorkoutDetection(enabled: Bool) -> Bool {
         guard ready, syncTask == nil, !monitoring, !workoutHolding else { return false }
         write(Command.automaticSportRecognition(enabled: enabled))
         automaticWorkoutDetectionEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: automaticWorkoutDetectionKey)
+        automaticWorkoutDetectionAppliedThisConnection = true
+        automaticWorkoutReassertTask?.cancel()
+        automaticWorkoutReassertTask = nil
         ringLog.notice("automatic workout detection: \(enabled ? "ENABLED (05 23 01 00)" : "disabled (05 23 00 00)", privacy: .public)")
         return true
+    }
+
+    /// A persisted toggle is desired state, not an observation of firmware state. Wait until the
+    /// link has delivered authenticated data and the single-writer BLE path is idle, then arm the
+    /// detector again. This runs once per RingSession (therefore once per reconnect) and never
+    /// interrupts history, live measurement, calibration, or a manual workout.
+    private func reassertAutomaticWorkoutDetectionIfNeeded() {
+        guard automaticWorkoutDetectionEnabled,
+              !automaticWorkoutDetectionAppliedThisConnection,
+              automaticWorkoutReassertTask == nil else { return }
+        automaticWorkoutReassertTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.automaticWorkoutReassertTask = nil }
+            while !Task.isCancelled {
+                if self.ready,
+                   self.notifySubscribed,
+                   self.gotDataFrame,
+                   self.syncTask == nil,
+                   !self.syncing,
+                   !self.monitoring,
+                   !self.livePreparing,
+                   !self.workoutHolding,
+                   !self.calibrationCapturing {
+                    self.write(Command.automaticSportRecognition(enabled: true))
+                    self.automaticWorkoutDetectionAppliedThisConnection = true
+                    ringLog.notice("automatic workout detection: RE-ASSERTED after reconnect (05 23 01 00)")
+                    print("[OC] automatic workout detection RE-ASSERTED after reconnect")
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
     }
 
     /// Merge retransmitted sport pages, retain the official app's two-day review window, rebuild
@@ -3269,6 +3311,7 @@ extension RingSession: CBPeripheralDelegate {
             if self.ready {
                 self.startKeepalive()      // continuous descriptor polling (temp/steps/battery)
                 self.startAutoMeasure()    // periodic HR/SpO₂ reads so those refresh on their own
+                self.reassertAutomaticWorkoutDetectionIfNeeded()
             }
         }
     }
@@ -3757,7 +3800,10 @@ extension RingSession: CBPeripheralDelegate {
             }
             self.notifySubscribed = characteristic.isNotifying
             ringLog.notice("notify subscribed=\(characteristic.isNotifying)")
-            if characteristic.isNotifying { self.startStreamWatchdog() }
+            if characteristic.isNotifying {
+                self.startStreamWatchdog()
+                self.reassertAutomaticWorkoutDetectionIfNeeded()
+            }
         }
     }
 

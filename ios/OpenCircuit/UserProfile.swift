@@ -350,7 +350,7 @@ struct UserProfileSettingsView: View {
                     LabeledContent("Active calories", value: "\(Int(activeKcalGoal)) kcal")
                 }
                 Stepper(value: $actMinGoal, in: 5...180, step: 5) {
-                    LabeledContent("Exercise minutes", value: "\(Int(actMinGoal)) min")
+                    LabeledContent("Elevated-HR minutes", value: "\(Int(actMinGoal)) min")
                 }
                 Stepper(value: $workdaySleepMin, in: 240...600, step: 15) {
                     LabeledContent("Weekday sleep", value: formatGoalSleep(workdaySleepMin))
@@ -358,7 +358,7 @@ struct UserProfileSettingsView: View {
                 Stepper(value: $weekendSleepMin, in: 240...600, step: 15) {
                     LabeledContent("Weekend sleep", value: formatGoalSleep(weekendSleepMin))
                 }
-                Text("Progress rings on the dashboard show today's goal vs. actual. Exercise minutes = elevated-HR minutes (basic threshold estimate), independent of steps/calories.")
+                Text("Progress rings on the dashboard show today's goal vs. actual. Elevated-HR minutes are a basic threshold estimate, not detected workout duration; active calories use those same qualifying periods with steps as the fallback.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

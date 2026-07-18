@@ -214,6 +214,11 @@ public enum SleepStaging {
         /// night — including the 100 %-efficiency ones — stages byte-identically to the pre-widen
         /// model (the regression escape hatch, mirroring `motionAwakeVitalsHalfWindow = 0`). ~24 ≈ 1 h.
         public var preOnsetBedtimeReachEpochs: Int
+        /// Largest short sensor/history gap (in 150-second epoch intervals) that the bedtime widen
+        /// may cross. A few missing epochs are common while the ring changes measurement state; a
+        /// much longer awake-bordered hole remains ambiguous and must not be called time in bed.
+        /// ~5 ≈ 12.5 min, covering the device-observed 2026-07-18 11-minute dropout.
+        public var preOnsetBedtimeMaxGapEpochs: Int
 
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
@@ -240,7 +245,8 @@ public enum SleepStaging {
                     onsetSearchEpochs: Int = 48,
                     minConsolidatedSleepEpochs: Int = 16,
                     deepBaselineMarginBPM: Double = 18,
-                    preOnsetBedtimeReachEpochs: Int = 24) {
+                    preOnsetBedtimeReachEpochs: Int = 24,
+                    preOnsetBedtimeMaxGapEpochs: Int = 5) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -267,6 +273,7 @@ public enum SleepStaging {
             self.minConsolidatedSleepEpochs = minConsolidatedSleepEpochs
             self.deepBaselineMarginBPM = deepBaselineMarginBPM
             self.preOnsetBedtimeReachEpochs = preOnsetBedtimeReachEpochs
+            self.preOnsetBedtimeMaxGapEpochs = preOnsetBedtimeMaxGapEpochs
         }
 
         public static let `default` = Tuning()
@@ -425,9 +432,11 @@ public enum SleepStaging {
             let t = r.date(epoch: epoch)
             let hr = Double(r.heartRate!)
             let gap = prevTime.timeIntervalSince(t)
-            // Tolerate a single dropped epoch (real 0x4c streams drop one now and then) so an awake
-            // lead-in with a lone gap isn't cut short; larger gaps still need the asleep-bridge.
-            let contiguous = gap <= interval * 2.5
+            // Tolerate a SHORT dropout (real 0x4c streams can miss several epochs while changing
+            // measurement state) so measured awake lead-in is not discarded. Longer gaps still
+            // require sleep-level HR on both sides and therefore retain the anti-fabrication guard.
+            let maxShortGap = interval * Double(max(1, tuning.preOnsetBedtimeMaxGapEpochs))
+            let contiguous = gap <= maxShortGap
             let asleepBridge = hr <= wakeThreshold && prevHR <= wakeThreshold
             guard contiguous || asleepBridge else { break }
             bedStart = t

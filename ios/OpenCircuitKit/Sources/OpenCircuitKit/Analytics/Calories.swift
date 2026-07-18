@@ -155,6 +155,65 @@ public enum Calories {
         return trimp * trimpKcalFactor
     }
 
+    /// One internally-consistent daily activity estimate for the dashboard rings, readiness,
+    /// trends, and Health mirroring. The previous implementation used two incompatible HR rules:
+    /// exercise minutes started at 50% of max HR while active calories started at 50% of HEART-RATE
+    /// RESERVE. A moderate session could therefore earn hours of exercise time but zero HR calories,
+    /// leaving the calorie ring on its steps-only fallback.
+    ///
+    /// This estimate deliberately reuses `ExerciseMinutes` as the qualifying-duration source and
+    /// applies the same Keytel HR model used by a recorded workout to that duration. Until the
+    /// calibrated activity-seconds payload is decoded, `elevatedMinutes` is explicitly labeled as
+    /// an elevated-HR estimate in the UI rather than presented as detected workout duration.
+    public struct DailyEstimate: Equatable, Sendable {
+        public let activeKcal: Double
+        public let elevatedMinutes: Double
+
+        public init(activeKcal: Double, elevatedMinutes: Double) {
+            self.activeKcal = activeKcal
+            self.elevatedMinutes = elevatedMinutes
+        }
+    }
+
+    public static func dailyEstimate(
+        hrSamples: [HRSample],
+        steps: Int,
+        profile: UserProfile,
+        sleepWindow: DateInterval? = nil
+    ) -> DailyEstimate {
+        let maxHR = max(220 - profile.age, 1)
+        let elevatedMinutes = ExerciseMinutes.estimate(
+            hrSamples: hrSamples,
+            maxHR: maxHR,
+            sleepWindow: sleepWindow
+        )
+
+        let threshold = ExerciseMinutes.threshold(maxHR: maxHR)
+        let qualifyingBPM = hrSamples.compactMap { sample -> Int? in
+            guard sample.bpm >= threshold,
+                  sleepWindow.map({ !$0.contains(sample.start) }) ?? true else { return nil }
+            return sample.bpm
+        }
+        let hrKcal: Double
+        if elevatedMinutes > 0, !qualifyingBPM.isEmpty {
+            let average = Int((Double(qualifyingBPM.reduce(0, +))
+                               / Double(qualifyingBPM.count)).rounded())
+            hrKcal = workoutActiveKcal(
+                avgHR: average,
+                durationSeconds: elevatedMinutes * 60,
+                profile: profile
+            )
+        } else {
+            hrKcal = 0
+        }
+
+        let stepKcal = activeKcalFromSteps(steps: steps, profile: profile)
+        return DailyEstimate(
+            activeKcal: max(hrKcal, stepKcal),
+            elevatedMinutes: elevatedMinutes
+        )
+    }
+
     /// Active-energy estimate for a WORKOUT via the Keytel et al. (2005) HR→energy regression — the
     /// standard heart-rate calorie model. Uses the AVERAGE HR over the workout's true duration:
     /// Keytel is linear in HR, so avg-HR-over-duration equals the per-sample integral for equal

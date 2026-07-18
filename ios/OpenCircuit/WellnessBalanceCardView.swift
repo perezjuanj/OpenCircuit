@@ -104,7 +104,6 @@ struct WellnessBalanceCardView: View {
             let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
             let steps = currentSteps
             let profile = profile
-            let maxHR = max(220 - age, 1)
             let sleepWindow: DateInterval? = latestSleep.first.flatMap { s in
                 // Guard BOTH ends: DateInterval(start:end:) traps when end < start, and a legacy /
                 // partial row can carry a real inBedStart with inBedEnd == .distantPast.
@@ -116,13 +115,16 @@ struct WellnessBalanceCardView: View {
             let kcalGoal = activeKcalGoal
 
             let activity = await Task.detached { () -> ActivityScore.Result in
-                let hrKcal = Calories.activeKcal(hrSamples: samples, maxHR: maxHR)
-                let stepKcal = Calories.activeKcalFromSteps(steps: steps, profile: profile)
-                let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: maxHR, sleepWindow: sleepWindow)
+                let estimate = Calories.dailyEstimate(
+                    hrSamples: samples,
+                    steps: steps,
+                    profile: profile,
+                    sleepWindow: sleepWindow
+                )
                 return ActivityScore.score(.init(
                     steps: steps, stepGoal: stepGoal,
-                    activeMinutes: minutes, activeMinutesGoal: minGoal,
-                    activeKcal: max(hrKcal, stepKcal), activeKcalGoal: kcalGoal))
+                    activeMinutes: estimate.elevatedMinutes, activeMinutesGoal: minGoal,
+                    activeKcal: estimate.activeKcal, activeKcalGoal: kcalGoal))
             }.value
 
             // Sleep + overnight recovery only count when last night actually ended today.
