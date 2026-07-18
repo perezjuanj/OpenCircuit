@@ -177,4 +177,22 @@ final class BedtimeWidenTests: XCTestCase {
         let on = SleepStaging.classify(from: recs, tuning: tuning(reach: 48))
         XCTAssertEqual(inBedStart(on), onset(on), "an awake-bordered gap is not bridged (no widen)")
     }
+
+    func testShortAwakeBorderedDropoutStillWidens() {
+        // Device regression 2026-07-18: a measured elevated-HR lead-in ended about 11 minutes
+        // before the flat sleep block. Treat that as a routine sensor/history dropout, not enough
+        // ambiguity to throw away the whole measured bedtime lead-in. The 30-minute guard above
+        // remains a no-op, bounding how much unknown time the envelope can absorb.
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 100_000
+        for _ in 0..<12 { recs.append(mrec(c, hr: 78)); c += step }
+        c += step * 3                                                // 10 min separation
+        for _ in 0..<120 { recs.append(srec(c, hr: 52)); c += step }
+
+        let on = SleepStaging.classify(from: recs, tuning: tuning(reach: 48))
+        guard let bed = inBedStart(on), let sleep = onset(on) else { return XCTFail("no segments") }
+        XCTAssertLessThan(bed, sleep, "a short dropout must not erase measured awake-in-bed lead-in")
+        XCTAssertGreaterThan(SleepStaging.summary(on).awake, 0)
+        XCTAssertLessThan(SleepStaging.summary(on).efficiency, 1.0)
+    }
 }
