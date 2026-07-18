@@ -23,6 +23,20 @@ The RingConn app sends your data to RingConn's cloud (AWS, UK). OpenCircuit keep
 it on your devices: the ring talks BLE straight to a client you control, which
 writes into Apple Health. No subscription, no third-party server.
 
+## See it in action
+
+<p align="center">
+  <img src="docs/images/dashboard-vitals.jpg" alt="OpenCircuit dashboard showing ring connection, readiness, and vitals" width="31%" />
+  <img src="docs/images/sleep-insights.jpg" alt="OpenCircuit sleep insights with sleep stages, overnight vitals, and stress" width="31%" />
+  <img src="docs/images/activity-goals.jpg" alt="OpenCircuit daily activity goals, calories, and workout entry point" width="31%" />
+</p>
+<p align="center">
+  <img src="docs/images/workout-picker.jpg" alt="OpenCircuit workout picker with supported activity types" width="31%" />
+  <img src="docs/images/live-workout.jpg" alt="OpenCircuit live outdoor running workout with heart-rate zones" width="31%" />
+</p>
+
+<p align="center"><em>Dashboard, sleep and activity insights, and live workout tracking — all from data decoded locally from your RingConn.</em></p>
+
 ## What you get
 
 Every metric below is decoded **on-device** from the ring's own Bluetooth stream and
