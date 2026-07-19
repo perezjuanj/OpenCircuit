@@ -471,7 +471,10 @@ public enum SleepStaging {
         // WHOLE night awake → `sleepSpan` found nothing → no staged segments. De-flooring against the
         // local rolling floor stays a no-op for Gen 2 (flat `1` → 0) while tracking Gen-3 drift.
         let times = inBlock.map { $0.date(epoch: epoch) }
-        let rawMotion = inBlock.map { Float($0.motion.reduce(0) { $0 + Int($1) }) }
+        // Some real nights carry a constant filler in `[10:15]` for every epoch while the record's
+        // intensity half still contains movement. Select that fallback only for the structurally
+        // degenerate run; normal primary-motion nights remain byte-identical.
+        let rawMotion = BulkSleep.motionMagnitudes(from: inBlock)
         let floor = ActivityPeriod.rollingLowPercentile(rawMotion, times: times,
                         windowSeconds: ActivityPeriod.motionFloorWindowSecondsStaging,
                         percentile: ActivityPeriod.motionFloorPercentile)
