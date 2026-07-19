@@ -163,6 +163,14 @@ public struct BulkRecord: Equatable {
     /// to nothing — like `confidence`, it's a candidate cue for the supervised sleep-stage
     /// fitter to test empirically, not a license to hand-tune `SleepStaging` with it.
     public var activityCounts: [UInt8] { Array(raw[10..<20]) }
+
+    /// `[15:20]` — the intensity half of `activityCounts`. This is NOT a second step counter or a
+    /// separately timed five-sample motion channel, but it remains zero while still and carries
+    /// measured activity when some firmware sessions replace `[10:15]` with a constant filler.
+    /// Consumers may use it only through `BulkSleep.usesMotionIntensityFallback`, which requires the
+    /// primary channel to be structurally absent across a run; normal primary-motion nights never mix
+    /// the two signals.
+    public var motionIntensityTail: [UInt8] { Array(raw[15..<20]) }
 }
 
 /// Reassembles `0x4c` pages into records and maps sleep-vitals epochs to samples.
@@ -217,16 +225,64 @@ public enum BulkSleep {
     /// should scope `records` to a worn period (charging data reads as still too).
     public static func motionTimeline(from records: [BulkRecord],
                                       epoch: Int = Command.syncEpoch) -> [MotionSample] {
+        let useIntensityFallback = usesMotionIntensityFallback(records)
+        let fallbackMagnitudes = useIntensityFallback
+            ? motionIntensityFallbackMagnitudes(records)
+            : []
         var out: [MotionSample] = []
         out.reserveCapacity(records.count * 5)
-        for r in records {
+        for (recordIndex, r) in records.enumerated() {
             let base = r.date(epoch: epoch)
+            // The intensity tail is an epoch-level fallback, not five independently-timed samples.
+            // Repeat its derived light/active magnitude over the epoch's five 30-second slots so the
+            // detector retains its canonical cadence without inventing sub-epoch timing.
             for k in 0 ..< 5 {
                 out.append(MotionSample(time: base.addingTimeInterval(Double(k) * 30),
-                                        movement: Float(r.raw[10 + k])))
+                                        movement: useIntensityFallback
+                                            ? fallbackMagnitudes[recordIndex]
+                                            : Float(r.raw[10 + k])))
             }
         }
         return out
+    }
+
+    /// True only for the captured failure shape where the normal five-byte motion field is a
+    /// constant filler on EVERY worn epoch while the intensity half still reports repeated activity.
+    /// Requiring a run (not one record) plus at least two non-zero tail epochs keeps ordinary still
+    /// nights and isolated/noisy records byte-identical to the primary-motion path.
+    static func usesMotionIntensityFallback(_ records: [BulkRecord]) -> Bool {
+        let worn = records.filter { $0.layout != .idle }
+        guard worn.count >= 4,
+              !worn.contains(where: { !$0.motionIsPlaceholder }) else { return false }
+        return worn.lazy.filter { $0.motionIntensityTail.contains(where: { $0 > 0 }) }.prefix(2).count == 2
+    }
+
+    /// One magnitude per epoch using the same run-level signal selection as `motionTimeline`.
+    /// The staging model subtracts its rolling local floor afterward, exactly as on primary motion.
+    static func motionMagnitudes(from records: [BulkRecord]) -> [Float] {
+        let useIntensityFallback = usesMotionIntensityFallback(records)
+        if useIntensityFallback { return motionIntensityFallbackMagnitudes(records) }
+        return records.map { record in
+            Float(record.motion.reduce(0) { $0 + Int($1) })
+        }
+    }
+
+    /// Convert the secondary intensity distribution into the scale shared by coarse detection and
+    /// staging. Any non-zero tail remains visible as LIGHT movement in `SleepDetailMetrics`, but only
+    /// the night's upper intensity quintile becomes motion-awake here. This keeps ordinary sleeping
+    /// position shifts from becoming wake while retaining substantial, sustained movement as an
+    /// awakening cue. Values deliberately straddle the existing thresholds: `1` is still/light for
+    /// detection and staging, `16` is active (`motionStillThreshold == 2`, `awakeMotion == 15`).
+    private static func motionIntensityFallbackMagnitudes(_ records: [BulkRecord]) -> [Float] {
+        let sums = records.map { $0.motionIntensityTail.reduce(0) { $0 + Int($1) } }
+        let positive = sums.filter { $0 > 0 }.sorted()
+        guard !positive.isEmpty else { return [Float](repeating: 0, count: records.count) }
+        let activeIndex = Int((Double(positive.count - 1) * 0.80).rounded())
+        let activeCut = positive[activeIndex]
+        return sums.map { magnitude in
+            guard magnitude > 0 else { return 0 }
+            return magnitude >= activeCut ? 16 : 1
+        }
     }
 
     /// Per-epoch heart-rate timeline (the 0x4c head, byte[4] 🟢) for `detectFromMotion`'s HR gate,

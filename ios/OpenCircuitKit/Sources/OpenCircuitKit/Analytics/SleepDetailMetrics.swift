@@ -78,7 +78,12 @@ public enum SleepDetailMetrics {
         let scoped = records
             .sorted { $0.counter < $1.counter }
             .filter { r in window.map { $0.contains(r.date(epoch: epoch)) } ?? true }
-        let mags = scoped.map(epochMotionEnergy)
+        let useIntensityFallback = BulkSleep.usesMotionIntensityFallback(scoped)
+        let mags = scoped.map { record in
+            useIntensityFallback
+                ? record.motionIntensityTail.reduce(0) { $0 + Int($1) }
+                : epochMotionEnergy(record)
+        }
         let cut = activeThreshold ?? derivedActiveCut(mags)
         return zip(scoped, mags).map { r, mag in
             let level: MovementLevel = mag == 0 ? .still : (mag >= cut ? .active : .light)
