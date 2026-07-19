@@ -339,6 +339,28 @@ struct UserProfileSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("Sleep Focus sync") {
+                NavigationLink {
+                    SleepFocusSyncSetupView()
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Sync when Sleep Focus ends")
+                            Text("One-time setup in iOS Settings")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "moon.zzz.fill")
+                            .foregroundStyle(.indigo)
+                    }
+                }
+                Text("Add OpenCircuit to your Sleep Focus once, and turning that Focus off will "
+                     + "trigger a ring history sync alongside the existing automatic syncs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Daily goals") {
                 Stepper(value: $workdaySteps, in: 1_000...30_000, step: 500) {
                     LabeledContent("Weekday steps", value: workdaySteps.formatted())
