@@ -131,6 +131,47 @@ public enum SleepStaging {
         /// driven awake epochs are exempt (a real movement is awake however brief).
         public var minHRWakeRunEpochs: Int
 
+        // --- Second-bout HR-wake rescue (the "sleep never continues after a 3 a.m. wake" fix) ----
+        // The wake gate above condemns an epoch on a SINGLE night-wide floor (`sleepFloorPercentile`
+        // + `wakeHRMarginBPM`). A night with a real mid-sleep awakening is BIMODAL: the consolidated
+        // first half is deep-rich, owns the low tail, and so SETS the floor; sleep AFTER the awakening
+        // returns legitimately lighter (less N3, more N2/REM, a little post-ambulation elevation) and
+        // can sit a few bpm above that floor — an objectively LOW heart rate that still clears
+        // floor+18, so EVERY epoch of the second bout flags awake and the whole back half of the night
+        // (hours) is lost as "awake with low HR". `erodeShortHRWake` can't undo it (it reaches only
+        // runs < `minHRWakeRunEpochs`); the motion softening can't (it needs `smHR < wakeThreshold`,
+        // the very thing that failed); the coarse `sleepVitalsRescue` can't (it grows the block's END
+        // into a trailing `.active` period, but here the COARSE layer got the night right so there is
+        // nothing to grow into — the error is staging-only). So add the missing ADD-only counterpart:
+        // relabel a long, motion-free, sleep-vitals-backed, only-mildly-elevated HR-awake run back to
+        // asleep when a consolidated sleep bout already lies BEHIND it. Grounded on the 2026-07-19
+        // tester report (build 26): slept ~23:00–03:00, a ~10-min bathroom trip, then read "awake with
+        // low heart rate" until 07:00 — ~4 h of real sleep dropped. 🟢 the mechanism + the cliff at
+        // exactly floor+`wakeHRMarginBPM` are reproduced by a synthetic-night test (see
+        // SleepContinuationTests); 🟡 that THIS tester's second-bout HR sat in the rescue band pending
+        // his replayed archive.
+
+        /// bpm above the sleeping floor at/above which an epoch is taken to be GENUINELY awake and is
+        /// never rescued: every epoch of a rescued sub-run must sit strictly below `floor + this`, so the
+        /// effective rescue band is [floor+`wakeHRMarginBPM`, floor+this) ≈ [+18, +25). NOTE the number
+        /// 25 is borrowed from `ActivityPeriod.awakeHRMarginBPM` as a plausible "definitely awake above
+        /// this" line, but the layers are NOT symmetric: the coarse gate uses +25 only to REMOVE sleep
+        /// (SleepDetection.swift:104, "only REMOVES sleep, never adds it"), whereas this pass ADDS sleep
+        /// below it — so in [+18, +25) the coarse layer is merely "not sure it's awake" while this pass
+        /// asserts "asleep". That is the deliberate bias documented on `rescueSecondBoutHRWake` (light
+        /// second-bout sleep vs still quiet wake are not separable here); this knob is the dial for it.
+        /// `0` DISABLES the rescue entirely — byte-identical to the pre-rescue staging (the regression
+        /// escape hatch, mirroring `motionAwakeVitalsHalfWindow = 0` / `preOnsetBedtimeReachEpochs = 0`).
+        /// The single most validation-sensitive knob of this rescue; retune against a captured
+        /// mid-night-wake night with known bed/wake truth before widening it.
+        public var hrWakeRescueCeilingBPM: Double
+        /// Minimum fraction of a candidate awake run's epochs that must carry SLEEP-VITALS (a raw,
+        /// non-forward-filled HRV read — the ring's OWN evidence it got a clean motionless optical
+        /// pass, the same signal the coarse `sleepVitalsRescue` trusts). Sized to the ~1-sleep-vitals-
+        /// per-2-epochs interleave the ring emits (see the `motionAwakeVitalsHalfWindow` note above), so
+        /// ≥ 0.5 means the ring was measuring sleep across the run rather than an odd stray epoch.
+        public var hrWakeRescueVitalsFraction: Double
+
         // --- Descent-relative ONSET trim (the "mild wind-down" fix) -----------------
         // The fixed `wakeHRMarginBPM` gate (floor + 18) catches a CLEARLY elevated pre-sleep
         // block (lying in bed at 78 bpm) but MISSES the common case: HR drifting down from a
@@ -239,6 +280,8 @@ public enum SleepStaging {
                     motionAwakeVitalsHalfWindow: Int = 3,
                     onsetSustainEpochs: Int = 6,
                     minHRWakeRunEpochs: Int = 5,
+                    hrWakeRescueCeilingBPM: Double = 25,
+                    hrWakeRescueVitalsFraction: Double = 0.5,
                     onsetSettleFraction: Double = 0.60,
                     onsetMinDescentBPM: Double = 10,
                     onsetScanEpochs: Int = 12,
@@ -266,6 +309,8 @@ public enum SleepStaging {
             self.motionAwakeVitalsHalfWindow = motionAwakeVitalsHalfWindow
             self.onsetSustainEpochs = onsetSustainEpochs
             self.minHRWakeRunEpochs = minHRWakeRunEpochs
+            self.hrWakeRescueCeilingBPM = hrWakeRescueCeilingBPM
+            self.hrWakeRescueVitalsFraction = hrWakeRescueVitalsFraction
             self.onsetSettleFraction = onsetSettleFraction
             self.onsetMinDescentBPM = onsetMinDescentBPM
             self.onsetScanEpochs = onsetScanEpochs
@@ -542,6 +587,14 @@ public enum SleepStaging {
         // Erode HR-only awake runs shorter than the floor so a transient REM-ish HR bump
         // doesn't read as an awakening (motion-driven awakes are kept, however brief).
         erodeShortHRWake(&awake, motionAwake: motionAwake, minRun: tuning.minHRWakeRunEpochs)
+        // Rescue a LONG HR-only awake run that is really a SECOND SLEEP BOUT after a mid-night wake —
+        // the ADD-only counterpart to the erode above, and the only pass that may relabel a night's
+        // INTERIOR awake→asleep. Runs on the settled mask AFTER erosion, and BEFORE the two leading-edge
+        // onset passes below (which only ever ADD leading awake) so those still get the last word at the
+        // head — though the rescue's "consolidated sleep already behind it" guard means it can never
+        // reach the head anyway. No-op when `hrWakeRescueCeilingBPM == 0` (byte-identical to pre-rescue).
+        rescueSecondBoutHRWake(&awake, smHR: smHR, motionAwake: motionAwake,
+                               vitals: rows.map(\.vitals), floor: sleepFloor, tuning: tuning)
 
         // --- Descent-relative onset: trim the quiet pre-sleep wind-down -------------
         // Mark the LEADING in-bed stretch as awake while HR is still settling DOWN toward the
@@ -747,6 +800,81 @@ public enum SleepStaging {
             let run = j - i + 1
             let hasMotion = (i ... j).contains { motionAwake[$0] }
             if run < minRun && !hasMotion { for k in i ... j { awake[k] = false } }
+            i = j + 1
+        }
+    }
+
+    /// Relabel a LONG, motion-free, HR-only awake stretch back to asleep when it is a SECOND SLEEP
+    /// BOUT after a mid-night wake, not a genuine awakening. The complement of `erodeShortHRWake`
+    /// (which reaches only runs shorter than `minHRWakeRunEpochs`), and the ONLY pass that may remove
+    /// awake from a night's INTERIOR — so it is fenced by five conjunctive guards, each blocking a
+    /// distinct false positive, and it only ever ADDS sleep:
+    ///   (a) KILL-SWITCH — `hrWakeRescueCeilingBPM <= 0` disables it entirely (byte-identical to the
+    ///       pre-rescue staging).
+    ///   (b) MOTION-FREE — the candidate is a maximal MOTION-FREE sub-run of awake epochs, so any
+    ///       `motionAwake` epoch splits it and can never be rescued. This is what keeps the getting-up
+    ///       itself awake: on the tester's night the 10-min bathroom trip (motion) and the sleep that
+    ///       follows it (HR-only awake) are ONE contiguous awake run; we rescue only the still tail
+    ///       AFTER the last movement, leaving the trip correctly scored as wake. A restless genuine
+    ///       awakening — which keeps moving — is never rescued at all.
+    ///   (c) LONG ONLY — only sub-runs `>= minHRWakeRunEpochs`, so erosion (shorter) and this rescue
+    ///       (longer) are strictly complementary with no overlap.
+    ///   (d) REAL SLEEP ALREADY BEHIND IT — a consolidated asleep run of `>= minConsolidatedSleepEpochs`
+    ///       must exist somewhere before the sub-run (the same guard `markLeadInWakeOnset` uses to tell
+    ///       a mid-night awakening from a pre-sleep struggle; the scan looks past the intervening
+    ///       getting-up motion to the first bout). This structurally guarantees the leading edge is
+    ///       never touched, so onset detection and the two onset passes below keep byte-identical
+    ///       inputs — and it is exactly what spares a genuine lie-awake-first night (2026-06-26), whose
+    ///       awake block has NO consolidated sleep before it.
+    ///   (e) RING MEASURING SLEEP, HR ONLY MILDLY ELEVATED — EVERY epoch of the sub-run has
+    ///       `smHR < floor + hrWakeRescueCeilingBPM` (an above-ceiling arousal splits the sub-run and
+    ///       stays awake, so a spike is never averaged away), AND the fraction of sub-run epochs carrying
+    ///       raw sleep-vitals is `>= hrWakeRescueVitalsFraction` (the ring's own clean-optical-read
+    ///       signal, as trusted by the coarse `sleepVitalsRescue`). Because a motion-free awake epoch
+    ///       already has `smHR >= floor + wakeHRMarginBPM`, the rescued band is exactly [+wakeHRMargin,
+    ///       +rescueCeiling) — a still, measured, only-mildly-elevated second bout.
+    /// The backward scan for guard (d) sees any sub-run this pass ALREADY rescued as asleep, so a night
+    /// with two successive mid-night wakes has its second bout support the third — correct by construction.
+    ///
+    /// HONEST LIMIT (signal ceiling): in the [+wakeHRMargin, +rescueCeiling) band the ring's HR + motion
+    /// + vitals cannot fully separate LIGHT second-bout sleep from motionless QUIET WAKEFULNESS — a still
+    /// awake wrist emits the same HRV, and its HR can sit in the same few-bpm band. This pass therefore
+    /// biases toward COUNTING such a stretch as sleep (fixing the reported lost-continuation night) at
+    /// the cost of occasionally over-counting a genuinely-still low-HR awakening. The narrow band, the
+    /// per-epoch ceiling, and the motion/consolidated-sleep guards bound that exposure; `hrWakeRescueCeilingBPM`
+    /// is the single knob that trades the two error directions (and `0` opts out entirely).
+    private static func rescueSecondBoutHRWake(_ awake: inout [Bool], smHR: [Double],
+                                               motionAwake: [Bool], vitals: [Bool],
+                                               floor: Double, tuning: Tuning) {
+        guard tuning.hrWakeRescueCeilingBPM > 0 else { return }   // (a)
+        let ceiling = floor + tuning.hrWakeRescueCeilingBPM
+        let n = awake.count
+        var i = 0
+        while i < n {
+            // Seed a candidate sub-run only at an awake epoch that is motion-free AND below the ceiling,
+            // and extend it only across epochs that stay both. So BOTH a movement epoch (b) and an
+            // above-ceiling arousal epoch (e) terminate the sub-run and are left awake — a brief HR
+            // arousal inside an otherwise-still bout splits it and is preserved as wake, rather than
+            // being averaged away by a run median. Every epoch we ultimately rescue is therefore
+            // individually motion-free and < ceiling.
+            guard awake[i], !motionAwake[i], smHR[i] < ceiling else { i += 1; continue }
+            var j = i
+            while j + 1 < n && awake[j + 1] && !motionAwake[j + 1] && smHR[j + 1] < ceiling { j += 1 }
+            let run = j - i + 1
+            // (d) longest consolidated asleep run anywhere strictly before this sub-run.
+            var longestPrior = 0, prior = 0
+            for k in 0 ..< i {
+                if awake[k] { prior = 0 } else { prior += 1; longestPrior = max(longestPrior, prior) }
+            }
+            let hasSleepBehind = longestPrior >= tuning.minConsolidatedSleepEpochs   // (d)
+            // (e) the ring was measuring sleep vitals across the sub-run (stillness + a clean optical read).
+            let vitalsCount = (i ... j).filter { vitals[$0] }.count
+            let vitalsFraction = Double(vitalsCount) / Double(run)
+            if run >= tuning.minHRWakeRunEpochs,                                      // (c)
+               hasSleepBehind,                                                        // (d)
+               vitalsFraction >= tuning.hrWakeRescueVitalsFraction {                  // (e)
+                for k in i ... j { awake[k] = false }
+            }
             i = j + 1
         }
     }
