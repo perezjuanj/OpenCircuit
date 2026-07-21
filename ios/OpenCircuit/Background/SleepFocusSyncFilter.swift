@@ -12,6 +12,15 @@ struct SleepFocusSyncFilter: SetFocusFilterIntent {
     static let description = IntentDescription(
         "Sync your ring when the Sleep Focus this filter belongs to turns off."
     )
+    // iOS 26 replaced `openAppWhenRun` with explicit execution modes. This intent must launch the
+    // containing app into a BACKGROUND process: its work depends on the app-owned CoreBluetooth
+    // restoration manager, SwiftData container, and HealthKit writer. Leaving the mode implicit made
+    // iOS 27 advertise the filter in Settings but never invoke `perform()` while OpenCircuit was
+    // suspended (device log: neither the enabled nor disabled breadcrumb ever appeared).
+    @available(iOS 26.0, *)
+    static var supportedModes: IntentModes { .background }
+
+    // Compatibility for iOS 17...25. On iOS 26+ `supportedModes` above is authoritative.
     static let openAppWhenRun = false
 
     /// The default MUST remain false. iOS supplies parameter defaults when a Focus turns off; the
@@ -86,7 +95,8 @@ private enum SleepFocusSyncRunner {
             // remaining window waiting for an optical HR lock.
             let synced = try await service.syncVitals(
                 timeout: RingBackgroundSyncService.defaultTimeout,
-                allowLivePoll: false
+                allowLivePoll: false,
+                sleepFinalized: true
             )
             guard !Task.isCancelled else { return }
 

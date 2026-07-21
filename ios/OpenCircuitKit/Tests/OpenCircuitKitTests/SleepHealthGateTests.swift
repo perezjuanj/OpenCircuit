@@ -30,4 +30,21 @@ final class SleepHealthGateTests: XCTestCase {
         let end = now.addingTimeInterval(-SleepHealthGate.settleMargin + 1)
         XCTAssertFalse(SleepHealthGate.isSettled(latestSegmentEnd: end, now: now))
     }
+
+    func testOrdinaryWriteStillRequiresSettlement() {
+        let end = now.addingTimeInterval(-3 * 60)
+        XCTAssertFalse(SleepHealthGate.isReadyToWrite(
+            latestSegmentEnd: end, now: now, finalized: false))
+    }
+
+    func testFocusEndFinalizationWritesImmediately() {
+        let end = now.addingTimeInterval(-3 * 60)
+        XCTAssertTrue(SleepHealthGate.isReadyToWrite(
+            latestSegmentEnd: end, now: now, finalized: true))
+    }
+
+    func testFinalizationStillRequiresRealSegments() {
+        XCTAssertFalse(SleepHealthGate.isReadyToWrite(
+            latestSegmentEnd: nil, now: now, finalized: true))
+    }
 }
