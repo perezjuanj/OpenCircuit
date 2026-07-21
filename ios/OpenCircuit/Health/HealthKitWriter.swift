@@ -260,8 +260,12 @@ final class HealthKitWriter {
     /// writes. No-op (and advances no watermark) when share access isn't granted, so the
     /// data backfills on the first flush after the user authorizes. Best-effort: a failure
     /// on one metric doesn't block the others or advance its watermark.
+    /// `sleepFinalized` is reserved for an authoritative wake signal (currently Sleep Focus ending):
+    /// unlike an ordinary drain, that signal proves the user ended their sleep session, so the night
+    /// can be written immediately instead of waiting for the conservative 20-minute quiet margin.
     @discardableResult
-    func flushToHealth(store: LocalStore, sleepSegments: [SleepSegment] = []) async -> FlushResult {
+    func flushToHealth(store: LocalStore, sleepSegments: [SleepSegment] = [],
+                       sleepFinalized: Bool = false) async -> FlushResult {
         var result = FlushResult()
         guard isShareAuthorized, !Self.isFlushing else { return result }
         Self.isFlushing = true
@@ -287,7 +291,8 @@ final class HealthKitWriter {
         // as epochs arrive, and `pendingHealthSleep` keys off the latest segment end — writing an
         // in-progress night each drain would lay down OVERLAPPING sleep samples. Once the block has
         // stopped advancing (sleeper is up), it writes once and the `.sleep` cursor blocks re-writes.
-        if SleepHealthGate.isSettled(latestSegmentEnd: sleepSegments.map(\.end).max(), now: Date()),
+        if SleepHealthGate.isReadyToWrite(latestSegmentEnd: sleepSegments.map(\.end).max(),
+                                          now: Date(), finalized: sleepFinalized),
            let pendingSleep = try? store.pendingHealthSleep(sleepSegments), !pendingSleep.isEmpty {
             do {
                 try await write(sleep: pendingSleep)

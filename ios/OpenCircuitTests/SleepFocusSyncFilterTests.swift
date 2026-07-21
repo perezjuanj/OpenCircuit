@@ -9,4 +9,10 @@ final class SleepFocusSyncFilterTests: XCTestCase {
     func testDefaultParametersAtFocusEndTriggerSync() {
         XCTAssertTrue(SleepFocusSyncFilter.shouldSync(focusIsActive: false))
     }
+
+    func testModernIOSRunsFilterInBackground() {
+        if #available(iOS 26.0, *) {
+            XCTAssertEqual(SleepFocusSyncFilter.supportedModes, .background)
+        }
+    }
 }

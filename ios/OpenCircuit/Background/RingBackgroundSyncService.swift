@@ -38,7 +38,8 @@ struct RingBackgroundSyncService {
     /// only a live HR, so iOS keeps scheduling us even on nights the optical HR never locks.
     @discardableResult
     func syncVitals(timeout: TimeInterval = RingBackgroundSyncService.defaultTimeout,
-                    allowLivePoll: Bool = true) async throws -> Bool {
+                    allowLivePoll: Bool = true,
+                    sleepFinalized: Bool = false) async throws -> Bool {
         let scanner = RingScanner.shared
         scanner.setLocalStore(store)   // RingSession auto-persists the drained history + temp
 
@@ -58,7 +59,8 @@ struct RingBackgroundSyncService {
             let persisted = scanner.loadLastCommittedSleepSegments()
             let priorSegments = !persisted.staged.isEmpty ? persisted.staged : persisted.coarse
             preMirrored = await health.flushToHealth(store: store,
-                                                     sleepSegments: priorSegments).wroteAnything
+                                                     sleepSegments: priorSegments,
+                                                     sleepFinalized: sleepFinalized).wroteAnything
             if preMirrored { ObservabilityStore().recordHealthWrite() }
         }
 
@@ -77,7 +79,8 @@ struct RingBackgroundSyncService {
         let flushStart = Date()
         if HealthKitWriter.isAvailable {
             mirrored = await health.flushToHealth(store: store,
-                                                  sleepSegments: capture.sleepSegments).wroteAnything
+                                                  sleepSegments: capture.sleepSegments,
+                                                  sleepFinalized: sleepFinalized).wroteAnything
             // Record the Health write so ContentView's "Last Health write" reflects the
             // background path too, not just the manual button (#44).
             if mirrored { ObservabilityStore().recordHealthWrite() }

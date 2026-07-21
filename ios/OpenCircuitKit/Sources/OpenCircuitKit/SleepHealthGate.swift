@@ -26,4 +26,16 @@ public enum SleepHealthGate {
         guard let end = latestSegmentEnd else { return false }
         return end <= now.addingTimeInterval(-margin)
     }
+
+    /// Whether a night is safe to mirror now. Ordinary drains still require the quiet margin above;
+    /// an authoritative finalization signal (Sleep Focus ended) may write immediately. A finalization
+    /// signal never fabricates sleep: real segments are still required, and the Health watermark keeps
+    /// later flushes append-only if the ring subsequently contributes a small tail.
+    public static func isReadyToWrite(latestSegmentEnd: Date?,
+                                      now: Date,
+                                      finalized: Bool,
+                                      margin: TimeInterval = settleMargin) -> Bool {
+        guard latestSegmentEnd != nil else { return false }
+        return finalized || isSettled(latestSegmentEnd: latestSegmentEnd, now: now, margin: margin)
+    }
 }
