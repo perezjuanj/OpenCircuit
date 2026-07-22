@@ -39,7 +39,8 @@ struct RingBackgroundSyncService {
     @discardableResult
     func syncVitals(timeout: TimeInterval = RingBackgroundSyncService.defaultTimeout,
                     allowLivePoll: Bool = true,
-                    sleepFinalized: Bool = false) async throws -> Bool {
+                    sleepFinalized: Bool = false,
+                    forceHistoryDrain: Bool = false) async throws -> Bool {
         let scanner = RingScanner.shared
         scanner.setLocalStore(store)   // RingSession auto-persists the drained history + temp
 
@@ -64,7 +65,8 @@ struct RingBackgroundSyncService {
             if preMirrored { ObservabilityStore().recordHealthWrite() }
         }
 
-        let capture = await scanner.captureForBackground(timeout: timeout, allowLivePoll: allowLivePoll)
+        let capture = await scanner.captureForBackground(timeout: timeout, allowLivePoll: allowLivePoll,
+                                                         forceHistoryDrain: forceHistoryDrain)
         // Resolve the night window for this connect so temp frames are gated correctly even
         // on a fresh background session that never ran the reactive refresh. This CANNOT be
         // hoisted above `captureForBackground`: the `RingSession` is created during that call's

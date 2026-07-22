@@ -93,10 +93,19 @@ private enum SleepFocusSyncRunner {
             // Sleep Focus ending is a short system wake, so use the same bounded, no-live-poll mode
             // as BGAppRefresh. The history drain and Health flush complete without spending the
             // remaining window waiting for an optical HR lock.
+            //
+            // `forceHistoryDrain: true` — Focus ending is the authoritative "sleep is over" wake, the
+            // exact moment the overnight-quiet policy defers the whole-night drain TO. So this drains
+            // ring→app in ONE pass even when the learned sleep window still overlaps 09:00 (a non-manual
+            // drain would be SKIPPED by that gate, which is why a just-ended night failed to reach Health
+            // until the user opened the app). `sleepFinalized: true` then writes the drained night to
+            // Apple Health immediately, bypassing the 20-min settle margin — so Focus-off delivers the
+            // full ring→app→Health chain.
             let synced = try await service.syncVitals(
                 timeout: RingBackgroundSyncService.defaultTimeout,
                 allowLivePoll: false,
-                sleepFinalized: true
+                sleepFinalized: true,
+                forceHistoryDrain: true
             )
             guard !Task.isCancelled else { return }
 

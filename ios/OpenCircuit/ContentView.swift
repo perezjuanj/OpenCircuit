@@ -1076,6 +1076,26 @@ struct ContentView: View {
                       || session?.monitoring == true        // stop live before syncing
                       || session?.notStreaming == true)     // a not-streaming ring would sync nothing (#54)
 
+            // On-demand push of everything already captured into Apple Health. "Sync from ring"
+            // above pulls fresh data off the ring; this forces what's ALREADY in the store into
+            // Health right now — no ring required (store → Health) and bypassing the 20-min sleep
+            // settle margin. Closes the gap where a just-ended night (e.g. after Sleep Focus turns
+            // off, before the ring has handed over the last epochs) sits unwritten until the margin
+            // elapses or the app is next opened. Safe: `flushHealth` dedups via the per-kind Health
+            // watermark, so a redundant tap writes nothing new.
+            Button {
+                flushHealth(finalized: true)
+            } label: {
+                Label("Sync to Apple Health", systemImage: "heart.text.square.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!healthAuthorized)
+            if !healthAuthorized {
+                Text("Authorize Apple Health below to enable syncing.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
 #if DEBUG
             // #152: "One-time historic pull" and "Forensic sweep" are reverse-engineering capture
             // tools — they dump the raw BLE exchange / probe unresolved channel selectors for Mac-side
@@ -1477,7 +1497,16 @@ struct ContentView: View {
     /// Push everything pending to Apple Health (scalars + sleep + step delta), each gated by
     /// its own watermark so it never double-writes. Safe to call liberally — it's a no-op
     /// until the user authorizes and whenever nothing is pending.
-    private func flushHealth() {
+    /// Mirror everything staged in the store into Apple Health.
+    ///
+    /// `finalized` forwards to the sleep write gate: the automatic post-drain flush leaves it
+    /// `false` so an in-progress night stays behind the 20-min quiet margin (writing it each drain
+    /// would lay down overlapping sleep samples). A user-initiated "Sync to Apple Health" tap passes
+    /// `true` — the same authoritative "this night is done" signal the Sleep Focus-end path uses — so
+    /// a just-ended night reaches Health immediately instead of waiting on the settle margin. It never
+    /// fabricates sleep: real segments are still required and the sleep watermark keeps later flushes
+    /// append-only.
+    private func flushHealth(finalized: Bool = false) {
         guard healthAuthorized else { return }
         let store = LocalStore(modelContext)
         // `healthSleepSegments` encodes the staged-vs-coarse policy once (prefer the HR-aware,
@@ -1498,7 +1527,8 @@ struct ContentView: View {
             }
         }
         Task {
-            let r = await health.flushToHealth(store: store, sleepSegments: segments)
+            let r = await health.flushToHealth(store: store, sleepSegments: segments,
+                                               sleepFinalized: finalized)
             // Reflect any per-metric write failure (or its clearing) this flush just persisted, so
             // the sync card's amber warning is accurate without waiting for a foreground return (#135).
             refreshHealthShareState()

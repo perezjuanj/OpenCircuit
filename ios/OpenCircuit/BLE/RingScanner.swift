@@ -640,7 +640,8 @@ final class RingScanner: NSObject {
     /// service-filtered scan), drain + decode the ring's history, and snapshot it for the
     /// caller to mirror into Apple Health. Always tears the link down (re-arming the standing
     /// reconnect) on the way out so nothing is held open in the background.
-    func captureForBackground(timeout: TimeInterval, allowLivePoll: Bool = true) async -> BackgroundCapture {
+    func captureForBackground(timeout: TimeInterval, allowLivePoll: Bool = true,
+                              forceHistoryDrain: Bool = false) async -> BackgroundCapture {
         // No active saved ring → nothing to reconnect to or capture. Bail BEFORE ensureCentral() so a
         // fresh install that never connected a ring (BGTasks are scheduled unconditionally at launch)
         // doesn't allocate a CBCentralManager in the background — which would defeat #142's deferred BT
@@ -680,7 +681,13 @@ final class RingScanner: NSObject {
                     // use, so the background captures daytime data too, not just overnight (#99).
                     // Previously this opened the live-enter drain (channel 0x00 only) which is why
                     // automatic syncs never refreshed daytime SpO₂.
-                    session.syncHistory()
+                    // `forceHistoryDrain` bypasses the overnight-quiet gate: only the Sleep Focus-END
+                    // path sets it, because Focus ending is the authoritative "sleep is over" wake
+                    // signal the overnight-quiet policy defers the whole-night drain TO — so it pulls
+                    // the complete night even when the learned sleep window still overlaps the moment.
+                    // Every other background caller leaves it false and stays gated (a 03:00 app-refresh
+                    // must never drain mid-sleep and shred the night).
+                    session.syncHistory(manual: forceHistoryDrain)
                     didDrain = true
                     drainStartAt = Date()
                 } else if session.syncing == false && !allowLivePoll {
