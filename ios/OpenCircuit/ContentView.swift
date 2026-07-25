@@ -48,10 +48,28 @@ struct ContentView: View {
     /// First-run onboarding gate (#103): false until the user finishes/skips the welcome flow, then
     /// it never auto-shows again. Re-openable from the profile screen's About section.
     @AppStorage(OnboardingView.completedKey) private var onboardingCompleted = false
-    /// Typed navigation-stack path. Reorderable cards push by appending a `Route` instead of
-    /// wrapping in a `NavigationLink`, so the enclosing `List` doesn't draw its own row chevron on
-    /// top of each card's custom one.
+    /// Typed navigation-stack path for the Today tab. Reorderable cards push by appending a `Route`
+    /// instead of wrapping in a `NavigationLink`, so the enclosing `List` doesn't draw its own row
+    /// chevron on top of each card's custom one.
     @State private var path: [Route] = []
+
+    /// The five-tab bottom navigation selection (#ui-overhaul).
+    enum Tab: Hashable { case today, sleep, activity, trends, profile }
+    @State private var selectedTab: Tab = .today
+
+    /// Shared two-week trends cache, loaded once and reused by the Today hero, the Sleep tab
+    /// (sleep graphs), the Activity tab (activity graphs), and the Trends tab (all-day vitals) —
+    /// so the same metric can never disagree between tabs. Reloaded on launch, foreground return,
+    /// and after a sync finishes. See `loadTrends()`.
+    @State private var trends = TrendsData()
+    /// Rolling buffer of recent live readings feeding the liveline live chart during an on-demand
+    /// measurement (HR or SpO₂). Accumulated from `session.liveHR`/`liveSpO2` onChange, reset when
+    /// monitoring stops. Display units: bpm for HR, whole-percent for SpO₂.
+    @State private var liveBuffer = LiveBuffer()
+
+    // Display units (#83) — SI is stored; only the display layer converts. Shared keys with settings.
+    @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
+    @AppStorage("units.distance") private var distUnitRaw = DistanceUnit.localeDefault.rawValue
 
     /// Freshness timestamps mirrored from the UserDefaults-backed observability store (#44).
     /// Held in @State because UserDefaults writes (from the background task / a flush) don't
@@ -88,50 +106,43 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationStack(path: $path) {
-            // A List (not a ScrollView) so the middle cards can be long-press-dragged to reorder
-            // via `.onMove`. The connection card (ring name + battery) is pinned at the top and the
-            // device-info + debug cards are pinned at the bottom — only the sections in between are
-            // user-orderable (QoL). Row chrome is stripped so each card keeps its own styling, and
-            // the list background defers to the grouped background like the old ScrollView did.
-            List {
-                Group {
-                    connectionCard
-                    // First-run Health authorization banner (#143): routes a new user to authorize
-                    // Health right under the connection card, instead of burying the only authorize
-                    // button beneath the RE tooling at the bottom of the last card. Disappears the
-                    // moment auth succeeds (`healthAuthorized` is refreshed in `.task`/on foreground).
-                    if !healthAuthorized, HealthKitWriter.isAvailable {
-                        healthAuthBanner
-                    }
-                    ForEach(visibleSections) { section in
-                        sectionView(section)
-                    }
-                    .onMove(perform: moveSection)
-                    deviceInfoCard
-                    debugCard
-                }
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+        // Five-tab bottom navigation. Each tab wraps its own NavigationStack; the app-level lifecycle
+        // (launch tasks, foreground refresh, Health flush, alerts, battery, onboarding) is attached to
+        // the TabView below so it runs regardless of which tab is active — exactly once, not per tab.
+        TabView(selection: $selectedTab) {
+            todayTab
+                .tabItem { Label("Today", systemImage: "house.fill") }
+                .tag(Tab.today)
+            sleepTab
+                .tabItem { Label("Sleep", systemImage: "bed.double.fill") }
+                .tag(Tab.sleep)
+            activityTab
+                .tabItem { Label("Activity", systemImage: "figure.run") }
+                .tag(Tab.activity)
+            trendsTab
+                .tabItem { Label("Trends", systemImage: "chart.xyaxis.line") }
+                .tag(Tab.trends)
+            profileTab
+                .tabItem { Label("Profile", systemImage: "person.crop.circle") }
+                .tag(Tab.profile)
+        }
+        .tint(Theme.accent)
+            // Shared trends cache: load once, then refresh on foreground return and after each sync.
+            .task { await loadTrends() }
+            .onChange(of: scenePhase) { _, phase in if phase == .active { Task { await loadTrends() } } }
+            .onChange(of: session?.syncing) { _, syncing in if syncing == false { Task { await loadTrends() } } }
+            // Feed / reset the liveline live-vitals buffer as on-demand readings arrive.
+            .onChange(of: session?.liveHR) { _, hr in
+                if session?.monitoring == true, session?.liveMode == .hr, let hr { appendLive(Double(hr)) }
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .background(Color(.systemGroupedBackground))
-            // Pull-to-refresh: swipe down to force a history sync, mirroring the "Sync from ring"
-            // button. The control stays up until the bounded sync settles (QoL). See `forceSync`.
-            .refreshable { await forceSync() }
-            .navigationTitle("OpenCircuit")
-            .navigationDestination(for: Route.self) { route in destination(for: route) }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink {
-                        UserProfileSettingsView()
-                    } label: {
-                        Image(systemName: "person.crop.circle")
-                    }
-                }
+            .onChange(of: session?.liveSpO2) { _, s in
+                // liveSpO2 is already a whole percent (0x15 byte[14]), so no ×100 scaling.
+                if session?.monitoring == true, session?.liveMode == .spo2, let s { appendLive(Double(s)) }
             }
+            .onChange(of: session?.monitoring) { _, m in if m != true { liveBuffer.reset() } }
+            // Also clear on a live-mode switch (HR↔SpO₂ mid-measure keeps `monitoring` true), so the
+            // new metric's chart doesn't plot leftover points from the previous mode.
+            .onChange(of: session?.liveMode) { _, _ in liveBuffer.reset() }
             .onAppear {
                 // Wire persistence into the scanner/session so the (currently gated)
                 // epoch-sync decoder can persist Layer-A records once enabled. #24
@@ -246,6 +257,12 @@ struct ContentView: View {
             }) {
                 CalibrationSessionView(manager: calibration, session: session)
             }
+            // Probe/raw-capture share sheet — hoisted to the TabView so it presents regardless of which
+            // tab triggered it (the DEBUG "Share raw history capture" button lives in the Today sync
+            // card, while the activity-probe share lives in the Profile debug card).
+            .sheet(isPresented: $showProbeShareSheet) {
+                if let url = probeExportURL { ShareActivityView(url: url) }
+            }
             // Battery: TTE + charging-complete notification (#86).
             .onChange(of: session?.batteryPercent) { _, pct in
                 guard let pct else { return }
@@ -258,7 +275,202 @@ struct ContentView: View {
                 }
                 if pct < 100 { batteryWasFull = false }
             }
+    }
+
+    // MARK: - Tabs (five-tab bottom navigation)
+
+    /// TODAY — the glanceable "now": connection, the live-measure hero, then the reorderable
+    /// readiness / vitals / calories / goals / cycle / sync cards. Middle sections stay
+    /// long-press-draggable (the reorder QoL), so this tab keeps a `List`.
+    private var todayTab: some View {
+        NavigationStack(path: $path) {
+            List {
+                Group {
+                    connectionCard
+                    // First-run Health authorization banner (#143) — right under the connection card.
+                    if !healthAuthorized, HealthKitWriter.isAvailable {
+                        healthAuthBanner
+                    }
+                    liveMeasureCard
+                    ForEach(visibleSections) { section in
+                        sectionView(section)
+                    }
+                    .onMove(perform: moveSection)
+                }
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(Theme.pageBackground)
+            // Pull-to-refresh mirrors the "Sync from ring" button (same guards). See `forceSync`.
+            .refreshable { await forceSync() }
+            .navigationTitle("Today")
+            .navigationDestination(for: Route.self) { route in destination(for: route) }
         }
+    }
+
+    /// The liveline live-vitals hero — shown ONLY during an on-demand HR/SpO₂ measurement, when the
+    /// animated momentum line is genuinely live. Hidden otherwise (the vitals card carries the
+    /// resting numbers). This is the "live" half of the hybrid charting decision.
+    @ViewBuilder
+    private var liveMeasureCard: some View {
+        if let session, session.monitoring == true {
+            let isHR = session.liveMode == .hr
+            OCCard {
+                OCSectionHeader(isHR ? "Live Heart Rate" : "Live SpO₂",
+                                systemImage: isHR ? "heart.fill" : "lungs.fill",
+                                tint: isHR ? Theme.hr : Theme.spo2)
+                LiveVitalsChart(buffer: liveBuffer,
+                                color: isHR ? Theme.hr : Theme.spo2,
+                                window: 90,
+                                unit: isHR ? "bpm" : "%",
+                                emptyText: "Hold still — getting a reading…")
+                    .frame(height: 150)
+            }
+        }
+    }
+
+    /// SLEEP — last night's sleep card, a sleep-duration hero, the sleep-graph history, and a
+    /// Sleep Focus setup shortcut.
+    private var sleepTab: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: Theme.sectionSpacing) {
+                    let sleepHours = heroPoints { $0.sleepMinutes.map { Double($0) / 60.0 } }
+                    if sleepHours.count >= 2, let last = sleepHours.last {
+                        heroCard(title: "Sleep", systemImage: "bed.double.fill", tint: Theme.sleep,
+                                 points: sleepHours, value: String(format: "%.1f", last.1), unit: "h asleep",
+                                 metricUnit: "h", metricDecimals: 1)
+                    }
+                    sleepCard
+                    if !trends.points.isEmpty {
+                        OCSectionHeader("Sleep Trends", systemImage: "chart.xyaxis.line", tint: Theme.sleep)
+                        SleepTrendsSection(points: trends.points, tempUnitRaw: tempUnitRaw)
+                    }
+                    NavigationLink { SleepFocusSyncSetupView() } label: {
+                        card {
+                            HStack(spacing: 8) {
+                                Image(systemName: "moon.zzz.fill").foregroundStyle(Theme.sleep)
+                                Text("SLEEP FOCUS SYNC").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                            }
+                            Text("Set up automatic bedtime detection via the iOS Sleep Focus")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding()
+            }
+            .background(Theme.pageBackground)
+            .navigationTitle("Sleep")
+        }
+    }
+
+    /// ACTIVITY — a steps hero, workout entry, goals, calories, and the activity-graph history.
+    private var activityTab: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: Theme.sectionSpacing) {
+                    let stepPts = heroPoints { $0.steps.map(Double.init) }
+                    if stepPts.count >= 2, let last = stepPts.last {
+                        heroCard(title: "Activity", systemImage: "figure.walk", tint: Theme.steps,
+                                 points: stepPts, value: Int(last.1).formatted(), unit: "steps",
+                                 metricUnit: "", metricDecimals: 0)
+                    }
+                    workoutCard
+                    card { GoalsCardView() }
+                    caloriesCard
+                    if !trends.points.isEmpty {
+                        OCSectionHeader("Activity Trends", systemImage: "chart.bar.fill", tint: Theme.steps)
+                        ActivityTrendsSection(points: trends.points, distUnitRaw: distUnitRaw)
+                    }
+                }
+                .padding()
+            }
+            .background(Theme.pageBackground)
+            .navigationTitle("Activity")
+        }
+    }
+
+    /// TRENDS — all-day body-vital history + recent readings + per-day drill-down (TrendsView).
+    private var trendsTab: some View {
+        NavigationStack {
+            TrendsView()
+        }
+    }
+
+    /// PROFILE — settings, device info, background activity, and the debug / RE surfaces.
+    private var profileTab: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: Theme.sectionSpacing) {
+                    NavigationLink { UserProfileSettingsView() } label: {
+                        card {
+                            HStack(spacing: 8) {
+                                Image(systemName: "gearshape.fill").foregroundStyle(Theme.accent)
+                                Text("SETTINGS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                            }
+                            Text("Profile, Apple Health, goals, alerts, reminders, units, export")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    deviceInfoCard
+                    NavigationLink { ActivityLogView(session: session) } label: {
+                        card {
+                            HStack(spacing: 8) {
+                                Image(systemName: "clock.arrow.circlepath").foregroundStyle(.teal)
+                                Text("BACKGROUND ACTIVITY").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                            }
+                            Text("Sync history, background-task runs, and the Health-write log")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    debugCard
+                }
+                .padding()
+            }
+            .background(Theme.pageBackground)
+            .navigationTitle("Profile")
+        }
+    }
+
+    // MARK: - Tab helpers
+
+    /// Reload the shared two-week trends cache — fetch on main, heavy per-day compute off-main.
+    @MainActor
+    private func loadTrends() async {
+        trends = await TrendsData.loadAsync(store: LocalStore(modelContext), tempUnitRaw: tempUnitRaw)
+    }
+
+    /// Append one live reading (already in display units) to the liveline buffer, stamped now.
+    private func appendLive(_ value: Double) {
+        liveBuffer.append(value: value, at: Date().timeIntervalSince1970)
+    }
+
+    /// Project the shared trends points into (date, value) pairs for a hero sparkline, dropping days
+    /// with no value for that metric.
+    private func heroPoints(_ pick: (TrendsEngine.DailyPoint) -> Double?) -> [(Date, Double)] {
+        trends.points.compactMap { p in pick(p).map { (p.date, $0) } }
+    }
+
+    /// A tab hero: accent header + a big value that reads out the scrubbed day + a summary sparkline.
+    /// `metricUnit`/`metricDecimals` format that scrub read-out (e.g. "h" + 1 decimal for sleep).
+    @ViewBuilder
+    private func heroCard(title: String, systemImage: String, tint: Color,
+                          points: [(Date, Double)], value: String, unit: String,
+                          metricUnit: String = "", metricDecimals: Int = 0) -> some View {
+        HeroCard(title: title, systemImage: systemImage, tint: tint, points: points,
+                 value: value, unit: unit, metricUnit: metricUnit, metricDecimals: metricDecimals)
     }
 
     // MARK: Dashboard section ordering (long-press to reorder)
@@ -301,30 +513,27 @@ struct ContentView: View {
         sectionOrderRaw = merged.map(\.rawValue).joined(separator: ",")
     }
 
-    /// Map a section id to its card view (the body's reorderable middle).
+    /// Map a Today-tab section id to its card view (the reorderable middle). Sleep, workout, and
+    /// trends moved to their own tabs, so they're no longer Today sections.
     @ViewBuilder
     private func sectionView(_ section: DashboardSection) -> some View {
         switch section {
         case .readiness:    card { WellnessBalanceCardView() }
         case .vitals:       vitalsCard
         case .vitalsStatus: vitalsStatusCard
-        case .sleep:        sleepCard
         case .calories:     caloriesCard
         case .goals:        card { GoalsCardView() }
-        case .workout:      workoutCard
         case .cycle:        cycleCalendarCard
-        case .trends:       trendsNavigationCard
         case .sync:         syncCard
         }
     }
 
-    /// Destination view for a programmatic navigation `Route`.
+    /// Destination view for a programmatic navigation `Route` (Today-tab pushes). Device info and
+    /// the (former) trends push are now a NavigationLink / a tab respectively.
     @ViewBuilder
     private func destination(for route: Route) -> some View {
         switch route {
-        case .trends:      TrendsView()
         case .cycle:       CycleCalendarView()
-        case .deviceInfo:  DeviceInfoView(session: session)
         case .activityLog: ActivityLogView(session: session)
         }
     }
@@ -1002,25 +1211,6 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
-    /// Daily trends nav card — taps through to the full TrendsView (#74).
-    private var trendsNavigationCard: some View {
-        Button {
-            path.append(.trends)
-        } label: {
-            card {
-                HStack(spacing: 8) {
-                    Image(systemName: "chart.line.uptrend.xyaxis").foregroundStyle(.purple)
-                    Text("TRENDS")
-                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption).foregroundStyle(.tertiary)
-                }
-            }
-        }
-        .buttonStyle(.plain)
-    }
-
     /// Calories on the home page. Headline is today's estimated burn; secondary lines break out
     /// resting BMR + active energy so the app stays honest about derived calories.
     private var caloriesCard: some View {
@@ -1383,10 +1573,11 @@ struct ContentView: View {
     // MARK: Device Info (#79)
 
     /// Taps through to the read-only device information screen (FW version / generation /
-    /// manufacturer / MAC address). Sits between the sync card and the debug card.
+    /// manufacturer / MAC address). Lives on the Profile tab; pushes onto that tab's own stack via a
+    /// value-less NavigationLink (not the Today `path`).
     private var deviceInfoCard: some View {
-        Button {
-            path.append(.deviceInfo)
+        NavigationLink {
+            DeviceInfoView(session: session)
         } label: {
             card {
                 HStack(spacing: 8) {
@@ -1432,9 +1623,7 @@ struct ContentView: View {
                 Text("Debug — last sync & frame").font(.subheadline.weight(.medium))
             }
         }
-        .sheet(isPresented: $showProbeShareSheet) {
-            if let url = probeExportURL { ShareActivityView(url: url) }
-        }
+        // (The $showProbeShareSheet sheet is hoisted to the TabView so it presents from any tab.)
     }
 
     /// RE tool (issue #93): sweep untried sync-open `byte[6]` channels looking for the
@@ -1485,13 +1674,11 @@ struct ContentView: View {
 
     // MARK: Helpers
 
-    @ViewBuilder
-    private func card<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 12) { content() }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding()
-            .background(RoundedRectangle(cornerRadius: 16)
-                .fill(Color(.secondarySystemGroupedBackground)))
+    /// Legacy card wrapper — now routes through the shared `OCCard` design-system surface so every
+    /// card across the tabs shares one look (rounded 20pt, soft light-mode lift). `@escaping` because
+    /// `OCCard` stores the content closure.
+    private func card<Content: View>(@ViewBuilder _ content: @escaping () -> Content) -> some View {
+        OCCard { content() }
     }
 
     /// Push everything pending to Apple Health (scalars + sleep + step delta), each gated by
@@ -1590,20 +1777,20 @@ struct ContentView: View {
     }
 }
 
-/// The reorderable dashboard sections — everything between the pinned connection card at the top and
-/// the pinned device-info/debug cards at the bottom. `rawValue` is the persistence key written to
+/// The reorderable Today-tab sections. `rawValue` is the persistence key written to
 /// `dashboard.sectionOrder`, so keep these stable across releases; `allCases` order is the default
-/// (first-run) layout.
+/// (first-run) layout. (Sleep / workout / trends moved to their own tabs and are no longer sections;
+/// the order decoder ignores those now-unknown saved ids, so existing saved orders still load.)
 private enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
-    case readiness, vitals, vitalsStatus, sleep, calories, goals, workout, cycle, trends, sync
+    case readiness, vitals, vitalsStatus, calories, goals, cycle, sync
     var id: String { rawValue }
 }
 
-/// Programmatic navigation targets pushed onto the `NavigationStack` path. Using a typed route (vs a
-/// `NavigationLink` per card) keeps the `List` from drawing its own disclosure chevron on top of the
-/// cards' custom ones.
+/// Programmatic navigation targets pushed onto the Today tab's `NavigationStack` path. Using a typed
+/// route (vs a `NavigationLink` per card) keeps the `List` from drawing its own disclosure chevron on
+/// top of the cards' custom ones.
 private enum Route: Hashable {
-    case trends, cycle, deviceInfo, activityLog
+    case cycle, activityLog
 }
 
 /// Home-page calories card. Headline = today's estimated burn; secondary lines break it

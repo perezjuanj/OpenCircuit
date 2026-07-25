@@ -19,6 +19,12 @@ settings:
 packages:
   OpenCircuitKit:
     path: OpenCircuitKit
+  # liveline-swift (MIT) — native-SwiftUI real-time/animated charts, drawn with Canvas (no WebView,
+  # no Swift-Charts dependency). Used for the live HR/SpO₂ streaming line (measure + workout) and the
+  # per-tab hero sparklines in the tabbed UI. Historical daily-trend grids stay on Apple Swift Charts.
+  Liveline:
+    url: https://github.com/ParthJadhav/liveline-swift.git
+    from: "0.3.1"
 
 targets:
   OpenCircuit:
@@ -32,6 +38,9 @@ targets:
     dependencies:
       - package: OpenCircuitKit
         product: OpenCircuitKit
+      # liveline-swift charts (live vitals line + hero sparklines). See the `packages:` note above.
+      - package: Liveline
+        product: Liveline
       # Embed the Live Activity / Dynamic Island widget extension into the app's PlugIns.
       - target: WorkoutWidget
         embed: true
