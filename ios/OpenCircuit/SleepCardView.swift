@@ -294,7 +294,7 @@ struct SleepCardView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding()
-        .background(RoundedRectangle(cornerRadius: 16)
+        .background(RoundedRectangle(cornerRadius: Theme.cardCornerRadius)
             .fill(Color(.secondarySystemGroupedBackground)))
         .sheet(item: $editTarget) { target in
             EditSleepView(

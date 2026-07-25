@@ -79,6 +79,12 @@ struct DayDetailView: View {
         .padding(.top, 40)
     }
 
+    /// The day's [start, start+1d) window — the fixed x-domain every intraday chart is scaled to.
+    private var dayDomain: ClosedRange<Date> {
+        let end = Calendar.current.date(byAdding: .day, value: 1, to: day) ?? day
+        return day...end
+    }
+
     @ViewBuilder
     private func timeSeriesCard(
         title: String, unit: String, color: Color,
@@ -88,57 +94,8 @@ struct DayDetailView: View {
             .filter { $0.value > minVal }
             .map { (time: $0.start, value: $0.value * scale) }
             .sorted { $0.time < $1.time }
-
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
-                if let avg = points.isEmpty ? nil : points.map(\.value).reduce(0, +) / Double(points.count) {
-                    Text("avg \(String(format: "%.1f", avg))\(unit.isEmpty ? "" : " \(unit)")")
-                        .font(.caption.weight(.semibold)).foregroundStyle(color)
-                }
-            }
-            if points.isEmpty {
-                Text("No readings this day")
-                    .font(.caption).foregroundStyle(.tertiary)
-                    .frame(height: 90, alignment: .center)
-                    .frame(maxWidth: .infinity)
-            } else {
-                Chart {
-                    if let window = nightWindow {
-                        RectangleMark(
-                            xStart: .value("Sleep start", window.start),
-                            xEnd: .value("Sleep end", window.end)
-                        )
-                        .foregroundStyle(Color.indigo.opacity(0.08))
-                    }
-                    ForEach(points, id: \.time) { p in
-                        LineMark(x: .value("Time", p.time), y: .value(title, p.value))
-                            .foregroundStyle(color)
-                        PointMark(x: .value("Time", p.time), y: .value(title, p.value))
-                            .foregroundStyle(color)
-                            .symbolSize(18)
-                    }
-                }
-                .frame(height: 90)
-                .chartXScale(domain: day...(Calendar.current.date(byAdding: .day, value: 1, to: day) ?? day))
-                .chartXAxis {
-                    AxisMarks(values: .stride(by: .hour, count: 6)) { _ in
-                        AxisGridLine()
-                        AxisValueLabel(format: .dateTime.hour())
-                    }
-                }
-                .chartYAxis {
-                    AxisMarks(position: .leading) { _ in
-                        AxisGridLine()
-                        AxisValueLabel()
-                    }
-                }
-            }
-        }
-        .padding()
-        .background(RoundedRectangle(cornerRadius: 16)
-            .fill(Color(.secondarySystemGroupedBackground)))
+        IntradayChartCard(title: title, unit: unit, color: color, points: points,
+                          domain: dayDomain, nightWindow: nightWindow)
     }
 
     /// Bucket timestamped step deltas to the hour each reading LANDED in (`end`), summed — each
@@ -156,59 +113,12 @@ struct DayDetailView: View {
     }
 
     /// Steps as an hourly BAR chart (#steps-history) — a count metric reads naturally as bars
-    /// (matching Apple Health's own Steps presentation), unlike the continuous line+point series
-    /// the other vitals use above.
+    /// (matching Apple Health's own Steps presentation), unlike the continuous line series the other
+    /// vitals use above.
     @ViewBuilder
     private func stepsChartCard() -> some View {
-        let points = hourlyStepBuckets()
-
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("STEPS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
-                if let stepsTotal {
-                    Text("\(stepsTotal) total")
-                        .font(.caption.weight(.semibold)).foregroundStyle(.green)
-                }
-            }
-            if points.isEmpty {
-                Text("No readings this day")
-                    .font(.caption).foregroundStyle(.tertiary)
-                    .frame(height: 90, alignment: .center)
-                    .frame(maxWidth: .infinity)
-            } else {
-                Chart {
-                    if let window = nightWindow {
-                        RectangleMark(
-                            xStart: .value("Sleep start", window.start),
-                            xEnd: .value("Sleep end", window.end)
-                        )
-                        .foregroundStyle(Color.indigo.opacity(0.08))
-                    }
-                    ForEach(points, id: \.hour) { hour, steps in
-                        BarMark(x: .value("Hour", hour, unit: .hour), y: .value("Steps", steps))
-                            .foregroundStyle(.green)
-                    }
-                }
-                .frame(height: 90)
-                .chartXScale(domain: day...(Calendar.current.date(byAdding: .day, value: 1, to: day) ?? day))
-                .chartXAxis {
-                    AxisMarks(values: .stride(by: .hour, count: 6)) { _ in
-                        AxisGridLine()
-                        AxisValueLabel(format: .dateTime.hour())
-                    }
-                }
-                .chartYAxis {
-                    AxisMarks(position: .leading) { _ in
-                        AxisGridLine()
-                        AxisValueLabel()
-                    }
-                }
-            }
-        }
-        .padding()
-        .background(RoundedRectangle(cornerRadius: 16)
-            .fill(Color(.secondarySystemGroupedBackground)))
+        IntradayStepsCard(buckets: hourlyStepBuckets(), total: stepsTotal,
+                          domain: dayDomain, nightWindow: nightWindow)
     }
 
     @MainActor
@@ -237,5 +147,219 @@ struct DayDetailView: View {
         }
 
         loading = false
+    }
+}
+
+// MARK: - Intraday cards
+
+/// One intraday vital as a smooth, gradient-filled time series over a single day. Replaces the old
+/// dense line+point cloud (a point per ~minute sample was unreadable): the line alone shows the
+/// shape, and touch-to-scrub reads the exact value/time at any moment. The night in-bed window is
+/// shaded but CLAMPED to the day's domain so it can't run off the right edge, and the plot is
+/// clipped so nothing bleeds past the axes.
+private struct IntradayChartCard: View {
+    let title: String
+    let unit: String
+    let color: Color
+    /// (time, value) sorted oldest→newest, already unit-converted.
+    let points: [(time: Date, value: Double)]
+    let domain: ClosedRange<Date>
+    let nightWindow: DateInterval?
+
+    @State private var selected: Date?
+
+    private var average: Double? {
+        points.isEmpty ? nil : points.map(\.value).reduce(0, +) / Double(points.count)
+    }
+
+    /// Clamp the y-axis to the data (+15% padding) so a tight vital isn't flattened by a 0 baseline.
+    private var yDomain: ClosedRange<Double> {
+        guard let lo = points.map(\.value).min(), let hi = points.map(\.value).max() else {
+            return 0...1
+        }
+        if lo == hi { return (lo - 1)...(hi + 1) }
+        let pad = (hi - lo) * 0.15
+        return (lo - pad)...(hi + pad)
+    }
+
+    private var areaFloor: Double { yDomain.lowerBound }
+
+    /// Night band, clamped to this day's window so a sleep window that crosses midnight can't draw
+    /// past the right axis (the reported "blue shade runs off the right").
+    private var clampedNight: (start: Date, end: Date)? {
+        guard let w = nightWindow else { return nil }
+        let s = max(w.start, domain.lowerBound)
+        let e = min(w.end, domain.upperBound)
+        return e > s ? (s, e) : nil
+    }
+
+    private var selectedPoint: (time: Date, value: Double)? {
+        guard let selected else { return nil }
+        return points.min {
+            abs($0.time.timeIntervalSince(selected)) < abs($1.time.timeIntervalSince(selected))
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                if let sel = selectedPoint {
+                    HStack(spacing: 4) {
+                        Text(sel.time, format: .dateTime.hour().minute())
+                            .font(.caption2).foregroundStyle(.tertiary)
+                        Text("\(String(format: "%.1f", sel.value))\(unit.isEmpty ? "" : " \(unit)")")
+                            .font(.caption.weight(.semibold)).foregroundStyle(color)
+                    }
+                } else if let average {
+                    Text("avg \(String(format: "%.1f", average))\(unit.isEmpty ? "" : " \(unit)")")
+                        .font(.caption.weight(.semibold)).foregroundStyle(color)
+                }
+            }
+            if points.isEmpty {
+                Text("No readings this day")
+                    .font(.caption).foregroundStyle(.tertiary)
+                    .frame(height: 110, alignment: .center)
+                    .frame(maxWidth: .infinity)
+            } else {
+                chart.frame(height: 110)
+            }
+        }
+        .ocCardSurface()
+    }
+
+    @ViewBuilder
+    private var chart: some View {
+        Chart {
+            if let night = clampedNight {
+                RectangleMark(xStart: .value("Sleep start", night.start),
+                              xEnd: .value("Sleep end", night.end))
+                    .foregroundStyle(Color.indigo.opacity(0.10))
+            }
+            ForEach(points, id: \.time) { p in
+                AreaMark(x: .value("Time", p.time),
+                         yStart: .value(title, areaFloor),
+                         yEnd: .value(title, p.value))
+                    .interpolationMethod(.catmullRom)
+                    .foregroundStyle(.linearGradient(
+                        colors: [color.opacity(0.25), color.opacity(0.02)],
+                        startPoint: .top, endPoint: .bottom))
+                LineMark(x: .value("Time", p.time), y: .value(title, p.value))
+                    .interpolationMethod(.catmullRom)
+                    .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .foregroundStyle(color)
+            }
+            if let sel = selectedPoint {
+                RuleMark(x: .value("Time", sel.time))
+                    .lineStyle(StrokeStyle(lineWidth: 1))
+                    .foregroundStyle(color.opacity(0.35))
+                PointMark(x: .value("Time", sel.time), y: .value(title, sel.value))
+                    .symbolSize(90).foregroundStyle(color)
+            }
+        }
+        .chartXScale(domain: domain)
+        .chartYScale(domain: yDomain)
+        .chartXSelection(value: $selected)
+        .chartPlotStyle { $0.clipped() }
+        .chartXAxis {
+            AxisMarks(values: .stride(by: .hour, count: 6)) { _ in
+                AxisGridLine()
+                AxisValueLabel(format: .dateTime.hour())
+            }
+        }
+        .chartYAxis {
+            AxisMarks(position: .leading) { _ in
+                AxisGridLine()
+                AxisValueLabel()
+            }
+        }
+    }
+}
+
+/// Hourly steps as a clipped bar chart with touch-to-read. Bars match Apple Health's Steps look; the
+/// night band is clamped to the day so it can't overflow the right axis.
+private struct IntradayStepsCard: View {
+    let buckets: [(hour: Date, steps: Int)]
+    let total: Int?
+    let domain: ClosedRange<Date>
+    let nightWindow: DateInterval?
+
+    @State private var selected: Date?
+
+    private var clampedNight: (start: Date, end: Date)? {
+        guard let w = nightWindow else { return nil }
+        let s = max(w.start, domain.lowerBound)
+        let e = min(w.end, domain.upperBound)
+        return e > s ? (s, e) : nil
+    }
+
+    private var selectedBucket: (hour: Date, steps: Int)? {
+        guard let selected else { return nil }
+        return buckets.min {
+            abs($0.hour.timeIntervalSince(selected)) < abs($1.hour.timeIntervalSince(selected))
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("STEPS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                if let sel = selectedBucket {
+                    HStack(spacing: 4) {
+                        Text(sel.hour, format: .dateTime.hour())
+                            .font(.caption2).foregroundStyle(.tertiary)
+                        Text("\(sel.steps) steps").font(.caption.weight(.semibold)).foregroundStyle(.green)
+                    }
+                } else if let total {
+                    Text("\(total) total").font(.caption.weight(.semibold)).foregroundStyle(.green)
+                }
+            }
+            if buckets.isEmpty {
+                Text("No readings this day")
+                    .font(.caption).foregroundStyle(.tertiary)
+                    .frame(height: 110, alignment: .center)
+                    .frame(maxWidth: .infinity)
+            } else {
+                chart.frame(height: 110)
+            }
+        }
+        .ocCardSurface()
+    }
+
+    @ViewBuilder
+    private var chart: some View {
+        Chart {
+            if let night = clampedNight {
+                RectangleMark(xStart: .value("Sleep start", night.start),
+                              xEnd: .value("Sleep end", night.end))
+                    .foregroundStyle(Color.indigo.opacity(0.10))
+            }
+            ForEach(buckets, id: \.hour) { hour, steps in
+                BarMark(x: .value("Hour", hour, unit: .hour), y: .value("Steps", steps))
+                    .foregroundStyle(.green)
+            }
+            if let sel = selectedBucket {
+                RuleMark(x: .value("Hour", sel.hour, unit: .hour))
+                    .lineStyle(StrokeStyle(lineWidth: 1))
+                    .foregroundStyle(Color.green.opacity(0.4))
+            }
+        }
+        .chartXScale(domain: domain)
+        .chartXSelection(value: $selected)
+        .chartPlotStyle { $0.clipped() }
+        .chartXAxis {
+            AxisMarks(values: .stride(by: .hour, count: 6)) { _ in
+                AxisGridLine()
+                AxisValueLabel(format: .dateTime.hour())
+            }
+        }
+        .chartYAxis {
+            AxisMarks(position: .leading) { _ in
+                AxisGridLine()
+                AxisValueLabel()
+            }
+        }
     }
 }
