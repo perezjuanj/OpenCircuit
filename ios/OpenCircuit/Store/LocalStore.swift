@@ -290,7 +290,7 @@ enum SleepEditHealthSampleOverlay {
 /// A sleep-edit Health reconcile that couldn't run because the periodic flush held the Health-write
 /// gate. Persisted so the NEXT flush drains it — otherwise a trim made while a flush was in flight
 /// would silently never reach Apple Health (the flush's own sleep path is append-only and can't trim).
-struct PendingSleepReconcile: Codable {
+struct PendingSleepReconcile: Codable, Equatable {
     var night: Date
     var inBedStart: Date
     var sleepOnset: Date
@@ -875,16 +875,21 @@ struct LocalStore {
     }
 
     /// The deferred sleep-edit reconciles awaiting a Health-gate-free flush to apply their trim/edit.
-    func pendingSleepReconciles() -> [(night: Date, times: SleepEdit.Times, segments: [SleepSegment])] {
-        PendingSleepReconcileStore.all().map {
-            ($0.night,
-             SleepEdit.Times(inBedStart: $0.inBedStart, sleepOnset: $0.sleepOnset, sleepWake: $0.sleepWake),
-             $0.segments)
-        }
+    func pendingSleepReconciles() -> [PendingSleepReconcile] {
+        PendingSleepReconcileStore.all()
     }
 
     func clearPendingSleepReconcile(night: Date) {
         PendingSleepReconcileStore.clear(night: night)
+    }
+
+    /// Clear a deferred reconcile ONLY if the stored marker still equals the one just processed — so a
+    /// NEWER same-night edit that was enqueued while this one was mid-flight is never wiped (avoids the
+    /// lost-update where a stale drain clears a fresh trim).
+    func clearPendingSleepReconcileIfUnchanged(_ item: PendingSleepReconcile) {
+        let current = PendingSleepReconcileStore.all()
+            .first { Calendar.current.isDate($0.night, inSameDayAs: item.night) }
+        if current == item { PendingSleepReconcileStore.clear(night: item.night) }
     }
 
     /// Windows of naps ALREADY mirrored to Apple Health that overlap `[start, end]`. The sleep-edit

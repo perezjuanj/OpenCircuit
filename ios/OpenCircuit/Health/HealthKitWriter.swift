@@ -332,10 +332,15 @@ final class HealthKitWriter {
         // Drain any sleep-edit reconciles that were deferred because a flush held the gate when the
         // user saved (so a trim made mid-flush still reaches Health). We hold `isFlushing` here, so
         // run the locked core directly — it deletes the trimmed sleep the append-only paths can't.
+        // Clear ONLY if the stored marker is still the one we processed, so a newer same-night edit
+        // enqueued during our awaits is preserved (not lost) and drained next flush.
         for pending in store.pendingSleepReconciles() {
-            await reconcileEditedNightSleepLocked(local: store, night: pending.night,
-                                                  times: pending.times,
-                                                  editedSegments: pending.segments)
+            let times = SleepEdit.Times(inBedStart: pending.inBedStart, sleepOnset: pending.sleepOnset,
+                                        sleepWake: pending.sleepWake)
+            let done = await reconcileEditedNightSleepLocked(local: store, night: pending.night,
+                                                             times: times,
+                                                             editedSegments: pending.segments)
+            if done { store.clearPendingSleepReconcileIfUnchanged(pending) }
         }
         // Naps (#76): each carries its own `healthWritten` flag (NOT the night's `.sleep` cursor),
         // so a daytime nap and the overnight night write independently and never collide.
@@ -1130,33 +1135,40 @@ final class HealthKitWriter {
         }
         Self.isFlushing = true
         defer { Self.isFlushing = false }
-        await reconcileEditedNightSleepLocked(local: local, night: night, times: times,
-                                              editedSegments: editedSegments)
+        let done = await reconcileEditedNightSleepLocked(local: local, night: night, times: times,
+                                                         editedSegments: editedSegments)
+        // A fresh user edit supersedes any stale pending marker on success; if it couldn't apply
+        // (e.g. a transient write failure), defer it so the next flush retries.
+        if done { local.clearPendingSleepReconcile(night: night) }
+        else { local.setPendingSleepReconcile(night: night, times: times, segments: editedSegments) }
     }
 
     /// The reconcile body, assuming the Health-write gate is ALREADY held (the public wrapper takes it;
-    /// the flush calls this directly while draining a deferred reconcile). Idempotent per night.
+    /// the flush calls this directly while draining a deferred reconcile). Returns `true` when the
+    /// reconcile is DONE or moot (the pending marker should be cleared) and `false` when it should be
+    /// RETRIED later (kept/queued).
+    @discardableResult
     private func reconcileEditedNightSleepLocked(local: LocalStore, night: Date,
                                                  times: SleepEdit.Times,
-                                                 editedSegments: [SleepSegment]) async {
-        guard isShareAuthorized, !editedSegments.isEmpty else { return }
-        guard let row = try? local.sleepSummary(night: night) else {
-            local.clearPendingSleepReconcile(night: night); return   // night gone → nothing to reconcile
-        }
+                                                 editedSegments: [SleepSegment]) async -> Bool {
+        guard !editedSegments.isEmpty else { return true }   // nothing to write → clear the marker
+        guard isShareAuthorized else { return false }        // retry once Health sharing is granted
+        guard let row = try? local.sleepSummary(night: night) else { return true }  // night gone → clear
         // Only reconcile a settled (finalized) night — the edit UI is only offered for a past night,
         // so this is normally always true; it just guards against clobbering an in-progress night.
         guard SleepHealthGate.isSettled(latestSegmentEnd: editedSegments.map(\.end).max(),
-                                        now: Date()) else { return }
+                                        now: Date()) else { return false }
 
         let recordedStart = row.sleepEditRecordedInBedStart > .distantPast
             ? row.sleepEditRecordedInBedStart : times.inBedStart
         let recordedEnd = row.sleepEditRecordedInBedEnd > recordedStart
             ? row.sleepEditRecordedInBedEnd : times.sleepWake
 
-        // 1. WRITE the edited picture FIRST. If this throws, nothing was deleted → no data loss.
+        // 1. WRITE the edited picture FIRST. If this throws, nothing was deleted → no data loss;
+        //    return false so the edit is retried on the next flush.
         let newUUIDs: [String]
         do { newUUIDs = try await writeReturningSleepUUIDs(editedSegments) }
-        catch { return }
+        catch { return false }
 
         // 2. DELETE the prior night's samples — exact tracked UUIDs + a recorded-span transition
         //    cleanup — always EXCLUDING the fresh write AND every Health-written nap window (so a nap
@@ -1175,7 +1187,7 @@ final class HealthKitWriter {
         try? local.forceSleepCursorAtLeast(max(recordedEnd, editedEnd))
         try? local.markSleepEditHealthWritten(night: night, segments: editedSegments)
         try? local.markSleepEditHealthCovered(by: editedSegments)
-        local.clearPendingSleepReconcile(night: night)   // this edit is now applied to Health
+        return true   // applied to Health; caller clears the pending marker (conditionally, on drain)
     }
 
     /// Delete the app's own prior sleep for an edited night: the exact tracked UUIDs from the last
