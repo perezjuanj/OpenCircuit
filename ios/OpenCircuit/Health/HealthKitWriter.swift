@@ -286,23 +286,25 @@ final class HealthKitWriter {
             }
             pendingFlushFailures.formUnion(outcome.failed)
         }
-        // Sleep: same write-then-mark order (a failed save must not lose the night). Only mirror a
-        // SETTLED night (SleepHealthGate): with periodic overnight draining the staged night grows
-        // as epochs arrive, and `pendingHealthSleep` keys off the latest segment end — writing an
-        // in-progress night each drain would lay down OVERLAPPING sleep samples. Once the block has
-        // stopped advancing (sleeper is up), it writes once and the `.sleep` cursor blocks re-writes.
+        // Sleep: mirror the SETTLED night to Health (SleepHealthGate) — with periodic overnight
+        // draining the staged night grows as epochs arrive, so an in-progress night is held back
+        // behind the quiet margin. A night also routinely RE-STAGES hours after wake (denser data /
+        // the once-a-morning full re-stage), and the old forward-only `.sleep` cursor made the write
+        // append-only, freezing Health at the first, thinner write while the card grew to the fuller
+        // staging. `mirrorSettledNight` fixes that: it delete-and-replaces the night whenever the
+        // current staging differs from what was last mirrored (a no-op when nothing changed), so
+        // Apple Health tracks the card up AND down.
         if SleepHealthGate.isReadyToWrite(latestSegmentEnd: sleepSegments.map(\.end).max(),
-                                          now: Date(), finalized: sleepFinalized),
-           let pendingSleep = try? store.pendingHealthSleep(sleepSegments), !pendingSleep.isEmpty {
-            do {
-                try await write(sleep: pendingSleep)
-                try store.markSleepWritten(pendingSleep)
-                try store.markSleepEditHealthCovered(by: pendingSleep)
-                result.sleepSegments = pendingSleep.count
+                                          now: Date(), finalized: sleepFinalized) {
+            switch await mirrorSettledNight(local: store, segments: sleepSegments) {
+            case .wrote(let count):
+                result.sleepSegments = count
                 writtenKinds.insert(.sleep)
-            } catch {
-                // A denied .sleepAnalysis type throws here forever — surface it (#135) instead of
-                // silently retrying, so the card can say "Sleep hasn't synced". Cursor stays put.
+            case .unchanged:
+                break
+            case .failed:
+                // A denied .sleepAnalysis type (or a transient write error) — surface it (#135)
+                // instead of silently retrying, so the card can say "Sleep hasn't synced".
                 pendingFlushFailures.insert(.sleep)
             }
         }
@@ -1238,6 +1240,149 @@ final class HealthKitWriter {
         let pred = subs.count == 1 ? subs[0] : NSCompoundPredicate(andPredicateWithSubpredicates: subs)
         _ = try? await store.deleteObjects(of: type, predicate: pred)
         return surviving
+    }
+
+    enum MirrorOutcome { case wrote(Int); case unchanged; case failed }
+
+    /// Mirror a SETTLED, non-edited night into Apple Health so it tracks the CARD — the merge-protected
+    /// `StoredSleepSummary`, not the raw drain. The ordinary flush used to append behind the forward
+    /// `.sleep` cursor, so once a night's end was under the cursor a later, fuller re-stage could never
+    /// reach Health (the card grew; Health stayed frozen at the first write). This compares a content
+    /// signature of the staged segments to what was last mirrored and, when it changed, delete-and-
+    /// replaces the night.
+    ///
+    /// The night is resolved by IN-BED OVERLAP against the stored summary (`sleepSummaryOverlapping`),
+    /// not `startOfDay(firstSegment)`, so a bedtime that straddles midnight can't key the mirror to a
+    /// different day than the card — which would else miss an edited row (invariant 5) or under-scope
+    /// the cleanup. Two guards keep Health from ever going THINNER than the card: an edited night is
+    /// left to the edit reconcile, and a drain fragment whose asleep total is below the summary's
+    /// (the card stayed fuller via `SleepSummaryMerge`) is NOT written — otherwise a later re-drain of
+    /// a partial night would shrink Health below the protected card.
+    ///
+    /// Data-safety mirrors the edit reconcile: WRITE-FIRST (a throw can't empty the night — the prior
+    /// samples remain), then re-check the edited flag (an edit racing our write must win), then delete
+    /// the prior copy over the UNION of the last-mirrored, current, and the summary's RECORDED in-bed
+    /// spans — EXCLUDING the fresh write and every Health-written nap window (so naps, other nights, and
+    /// other apps are never touched). Anchoring to the durable summary span (not just this drain's
+    /// segments) means a wider prior write, or one made before this overlay existed, is still cleaned.
+    /// The signature is recorded even if the delete throws (write-first already put the correct night in
+    /// Health) to avoid per-flush rewrite churn; the leftover duplicate — de-overlapped by Health in the
+    /// "time asleep" total — is cleared by the next re-stage's union delete. Assumes the Health-write
+    /// gate (`Self.isFlushing`) is HELD by the caller.
+    func mirrorSettledNight(local: LocalStore, segments: [SleepSegment]) async -> MirrorOutcome {
+        guard let start = segments.map(\.start).min(),
+              let end = segments.map(\.end).max(), end > start else { return .unchanged }
+        // Resolve the night by in-bed overlap so the key matches the card's summary across midnight;
+        // fall back to start-of-day when no summary row exists yet (first-ever mirror of a new night).
+        let row = try? local.sleepSummaryOverlapping(start: start, end: end)
+        let night = row?.night ?? Calendar.current.startOfDay(for: start)
+        // A manually-edited night is OWNED by the edit reconcile, which writes the EDITED picture.
+        // The raw staging here must never overwrite it, so leave edited nights entirely alone.
+        if row?.isManuallyEdited == true { return .unchanged }
+        // Don't let a thinner drain fragment shrink Health below the merge-protected card: if the card
+        // (summary) is fuller than this staging, `SleepSummaryMerge` kept the older, fuller night — so
+        // this staging is a partial re-drain, not a correction. Skip it (a hair of epoch tolerance
+        // keeps a benign reclassification from tripping the guard).
+        if let row {
+            let currentAsleep = SleepStaging.totalAsleep(segments)
+            let cardAsleep = TimeInterval(row.asleepMin) * 60
+            if currentAsleep + TimeInterval(BulkRecord.epochSeconds) < cardAsleep { return .unchanged }
+        }
+        // Sleep sharing EXPLICITLY denied → we can never write; surface as a failure (the card's
+        // "hasn't synced" note). `.notDetermined` falls through and the write throws until granted.
+        if store.authorizationStatus(for: HKCategoryType(.sleepAnalysis)) == .sharingDenied {
+            return .failed
+        }
+
+        let signature = Self.sleepSignature(segments)
+        let last = local.mirroredNight(night: night)
+        // Health already reflects this exact staging — nothing to do (the common steady-state).
+        if last?.signature == signature { return .unchanged }
+
+        // 1. WRITE the current staging FIRST. A throw here leaves the prior night intact → no loss.
+        let fresh: [String]
+        do { fresh = try await writeReturningSleepUUIDs(segments) }
+        catch { return .failed }
+
+        // 1b. An edit could have landed DURING the write's await (both run on the main actor). If the
+        //     night is now edited, don't delete or record — leave the raw samples we just wrote for the
+        //     edit reconcile's recorded-span cleanup to replace, so the user's edit wins.
+        if (try? local.sleepSummary(night: night))?.isManuallyEdited == true { return .unchanged }
+
+        // 2. DELETE the prior copy across the UNION of the last-mirrored, current, and RECORDED in-bed
+        //    spans (so a re-stage that SHRANK the night, or a wider pre-overlay write, is still
+        //    cleared), nap-safe and excluding the fresh write.
+        let cleanStart = min(start, last?.spanStart ?? start, row?.inBedStart ?? start)
+        let cleanEnd = max(end, last?.spanEnd ?? end, row?.inBedEnd ?? end)
+        let napWindows = local.healthWrittenNapWindows(overlapping: cleanStart, to: cleanEnd)
+        // Record the signature regardless of the delete's outcome: the correct night is already in
+        // Health (write-first), so recording avoids re-writing it every flush. A delete failure leaves
+        // a duplicate that Health de-overlaps in the asleep total and that the next re-stage's union
+        // delete removes; retrying the whole write would only pile up more duplicates.
+        do {
+            try await deleteNightSleep(from: cleanStart, to: cleanEnd,
+                                       napWindows: napWindows, keeping: fresh)
+        } catch {
+            // best-effort; see note above
+        }
+        local.setMirroredNight(night: night, signature: signature, spanStart: cleanStart, spanEnd: cleanEnd)
+        try? local.forceSleepCursorAtLeast(end)
+        try? local.markSleepEditHealthCovered(by: segments)
+        return .wrote(segments.count)
+    }
+
+    /// Delete this app's sleep samples in `[start, end]`, EXCLUDING the freshly-written samples and
+    /// every Health-written nap window. Same nap-safe, own-samples-only predicate as the edit path's
+    /// transition cleanup, but it THROWS so the caller can tell whether the prior copy was removed.
+    private func deleteNightSleep(from start: Date, to end: Date,
+                                  napWindows: [DateInterval], keeping newUUIDs: [String]) async throws {
+        guard end > start else { return }
+        let type = HKCategoryType(.sleepAnalysis)
+        var subs: [NSPredicate] = [
+            HKQuery.predicateForSamples(withStart: start, end: end, options: []),
+        ]
+        let keep = Set(newUUIDs.compactMap { UUID(uuidString: $0) })
+        if !keep.isEmpty {
+            subs.append(NSCompoundPredicate(
+                notPredicateWithSubpredicate: HKQuery.predicateForObjects(with: keep)))
+        }
+        for window in napWindows {
+            subs.append(NSCompoundPredicate(notPredicateWithSubpredicate:
+                HKQuery.predicateForSamples(withStart: window.start, end: window.end, options: [])))
+        }
+        let pred = subs.count == 1 ? subs[0] : NSCompoundPredicate(andPredicateWithSubpredicates: subs)
+        _ = try await store.deleteObjects(of: type, predicate: pred)
+    }
+
+    /// A stable (launch-invariant) content signature of a night's staged segments: the sorted set of
+    /// (start, end, HealthKit stage value). Changes whenever the staging changes in any Health-visible
+    /// way — including an interior reclassification that keeps the asleep TOTAL constant — so the
+    /// mirror re-writes exactly when it must and no-ops otherwise. FNV-1a (not Swift's per-launch
+    /// `Hasher`, which is seeded and would force a needless rewrite every launch).
+    static func sleepSignature(_ segments: [SleepSegment]) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        func mix(_ value: Int) {
+            var bits = UInt64(bitPattern: Int64(value))
+            for _ in 0..<8 {
+                hash = (hash ^ (bits & 0xff)) &* 0x100000001b3
+                bits >>= 8
+            }
+        }
+        // TOTAL order (start, then end, then stage): segments routinely share a start — the in-bed
+        // span and the leading latency-awake both begin at bedtime — so sorting by start alone is
+        // ambiguous and would make the signature depend on input order (spurious rewrites). Ordering
+        // by all three fields makes it a pure function of the segment SET.
+        let ordered = segments.sorted { a, b in
+            if a.start != b.start { return a.start < b.start }
+            if a.end != b.end { return a.end < b.end }
+            return sleepValue(a.stage).rawValue < sleepValue(b.stage).rawValue
+        }
+        for seg in ordered {
+            mix(Int(seg.start.timeIntervalSince1970.rounded()))
+            mix(Int(seg.end.timeIntervalSince1970.rounded()))
+            mix(sleepValue(seg.stage).rawValue)
+        }
+        return String(hash, radix: 16)
     }
 
     static func sleepValue(_ stage: SleepStage) -> HKCategoryValueSleepAnalysis {

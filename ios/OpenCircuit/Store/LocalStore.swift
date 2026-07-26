@@ -287,6 +287,36 @@ enum SleepEditHealthSampleOverlay {
     }
 }
 
+/// What this app last MIRRORED to Apple Health for an unedited night: a content signature of the
+/// staged segments plus the time span they covered. Nights routinely re-stage hours after wake, and
+/// the forward-only `.sleep` cursor makes the ordinary write append-only — so without this the card
+/// grows to the fuller staging while Health stays frozen at the first write. Comparing the current
+/// signature to the stored one lets the flush delete-and-replace the night ONLY when the staging
+/// actually changed (no churn otherwise). The span drives the union-cleanup so a re-stage that
+/// SHRINKS the night still removes the old tail from Health. UserDefaults (keyed by night) —
+/// no SwiftData migration, matching the overlays above.
+struct MirroredNightRecord: Codable {
+    var signature: String
+    var spanStart: Date
+    var spanEnd: Date
+}
+
+enum MirroredNightOverlay {
+    private static func key(_ night: Date) -> String {
+        let day = Calendar.current.startOfDay(for: night).timeIntervalSince1970
+        return "sleep.mirror.night.\(day)"
+    }
+
+    static func load(night: Date) -> MirroredNightRecord? {
+        guard let data = UserDefaults.standard.data(forKey: key(night)) else { return nil }
+        return try? JSONDecoder().decode(MirroredNightRecord.self, from: data)
+    }
+
+    static func save(_ record: MirroredNightRecord, night: Date) {
+        UserDefaults.standard.set(try? JSONEncoder().encode(record), forKey: key(night))
+    }
+}
+
 /// A sleep-edit Health reconcile that couldn't run because the periodic flush held the Health-write
 /// gate. Persisted so the NEXT flush drains it — otherwise a trim made while a flush was in flight
 /// would silently never reach Apple Health (the flush's own sleep path is append-only and can't trim).
@@ -866,6 +896,19 @@ struct LocalStore {
         SleepEditHealthSampleOverlay.append(uuids, night: night)
     }
 
+    /// What this app last mirrored to Apple Health for `night` (signature + span), or nil if never.
+    /// Drives the flush's "night re-staged → correct Health" delete/replace (see `mirrorSettledNight`).
+    func mirroredNight(night: Date) -> MirroredNightRecord? {
+        MirroredNightOverlay.load(night: night)
+    }
+
+    /// Record the staging signature + span just mirrored to Apple Health for `night`, so a later flush
+    /// re-mirrors ONLY when the staging changed.
+    func setMirroredNight(night: Date, signature: String, spanStart: Date, spanEnd: Date) {
+        MirroredNightOverlay.save(.init(signature: signature, spanStart: spanStart, spanEnd: spanEnd),
+                                  night: night)
+    }
+
     /// Persist a sleep-edit reconcile deferred because a flush held the Health gate (drained by the
     /// next flush). Keyed by night — a newer deferral for the same night supersedes the older.
     func setPendingSleepReconcile(night: Date, times: SleepEdit.Times, segments: [SleepSegment]) {
@@ -1086,6 +1129,26 @@ struct LocalStore {
         let descriptor = FetchDescriptor<StoredSleepSummary>(
             predicate: #Predicate { $0.night == dayStart })
         return try context.fetch(descriptor).first
+    }
+
+    /// The stored summary whose IN-BED window best overlaps `[start, end]`. Used by the Health mirror
+    /// to resolve the night by its actual span rather than `startOfDay(firstSegmentStart)` — a bedtime
+    /// that straddles midnight (or a lead-in trim that moves the earliest start across it) can otherwise
+    /// key the mirror to a different calendar day than the summary the card shows, letting the mirror
+    /// miss a manually-edited row or under-scope its cleanup. Prefers the row with the largest overlap.
+    func sleepSummaryOverlapping(start: Date, end: Date) throws -> StoredSleepSummary? {
+        guard end > start else { return nil }
+        let rows = try context.fetch(FetchDescriptor<StoredSleepSummary>())
+        var best: (row: StoredSleepSummary, overlap: TimeInterval)?
+        for row in rows {
+            guard row.inBedEnd > row.inBedStart else { continue }
+            let lo = max(start, row.inBedStart)
+            let hi = min(end, row.inBedEnd)
+            let overlap = hi.timeIntervalSince(lo)
+            guard overlap > 0 else { continue }
+            if best == nil || overlap > best!.overlap { best = (row, overlap) }
+        }
+        return best?.row
     }
 
     /// Persist the user's subjective sleep rating (1–9, #70) onto an existing night. No-op if
