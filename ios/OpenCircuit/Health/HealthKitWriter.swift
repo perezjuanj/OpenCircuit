@@ -1119,7 +1119,10 @@ final class HealthKitWriter {
     /// other nights, and other apps' data are never deleted.
     func reconcileEditedNightSleep(local: LocalStore, night: Date,
                                    times: SleepEdit.Times, editedSegments: [SleepSegment]) async {
-        guard isShareAuthorized, !editedSegments.isEmpty else { return }
+        // NOTE: don't gate here on `isShareAuthorized` (that probes heart-rate) — an edit made while
+        // Sleep sharing is merely not-yet-granted should DEFER and retry on grant, not be dropped. The
+        // locked core drops the marker only when Sleep sharing is explicitly denied.
+        guard !editedSegments.isEmpty else { return }
 
         // Serialize with the periodic flush, which also mutates HealthKit sleep — wait briefly for an
         // in-flight flush, then take the same gate so our write+delete can't interleave with it. If a
@@ -1152,7 +1155,9 @@ final class HealthKitWriter {
                                                  times: SleepEdit.Times,
                                                  editedSegments: [SleepSegment]) async -> Bool {
         guard !editedSegments.isEmpty else { return true }   // nothing to write → clear the marker
-        guard isShareAuthorized else { return false }        // retry once Health sharing is granted
+        // Sleep sharing EXPLICITLY denied → we can never write this, so drop the marker (no forever
+        // churn). `.notDetermined` falls through and retries — the write throws until Sleep is granted.
+        if store.authorizationStatus(for: HKCategoryType(.sleepAnalysis)) == .sharingDenied { return true }
         guard let row = try? local.sleepSummary(night: night) else { return true }  // night gone → clear
         // Only reconcile a settled (finalized) night — the edit UI is only offered for a past night,
         // so this is normally always true; it just guards against clobbering an in-progress night.
