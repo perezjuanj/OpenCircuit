@@ -316,7 +316,10 @@ final class HealthKitWriter {
                     latestSegmentEnd: edit.segments.map(\.end).max(), now: Date()
                 ) else { continue }
                 do {
-                    try await write(sleep: edit.segments)
+                    // Track the backfill sample UUIDs so a later TRIM of the same night can delete
+                    // them (otherwise an extension written here would survive the trim).
+                    let uuids = try await writeReturningSleepUUIDs(edit.segments)
+                    store.appendSleepEditHealthUUIDs(uuids, night: edit.night)
                     try store.markSleepEditHealthWritten(night: edit.night, segments: edit.segments)
                     result.sleepSegments += edit.segments.count
                     writtenKinds.insert(.sleep)
@@ -1110,6 +1113,17 @@ final class HealthKitWriter {
         guard SleepHealthGate.isSettled(latestSegmentEnd: editedSegments.map(\.end).max(),
                                         now: Date()) else { return }
 
+        // Serialize with the periodic flush, which also mutates HealthKit sleep — wait briefly for an
+        // in-flight flush, then take the same gate so our write+delete can't interleave with it (and
+        // a flush can't start mid-reconcile and lay down untracked duplicate extension samples).
+        var waited = 0
+        while Self.isFlushing, waited < 40 {
+            try? await Task.sleep(nanoseconds: 50_000_000); waited += 1
+        }
+        guard !Self.isFlushing else { return }   // flush still busy after ~2 s — skip; user can re-save
+        Self.isFlushing = true
+        defer { Self.isFlushing = false }
+
         let recordedStart = row.sleepEditRecordedInBedStart > .distantPast
             ? row.sleepEditRecordedInBedStart : times.inBedStart
         let recordedEnd = row.sleepEditRecordedInBedEnd > recordedStart
@@ -1120,16 +1134,19 @@ final class HealthKitWriter {
         do { newUUIDs = try await writeReturningSleepUUIDs(editedSegments) }
         catch { return }
 
-        // 2. DELETE the prior night's samples (exact tracked UUIDs + recorded-span transition
-        //    cleanup), always EXCLUDING what we just wrote. Best-effort: a delete failure only leaves
-        //    a transient duplicate, which the next edit removes.
-        await deletePriorEditedNightSleep(priorUUIDs: local.sleepEditHealthUUIDs(night: night),
-                                          recordedStart: recordedStart, recordedEnd: recordedEnd,
-                                          keeping: newUUIDs)
+        // 2. DELETE the prior night's samples — exact tracked UUIDs + a recorded-span transition
+        //    cleanup — always EXCLUDING the fresh write AND every Health-written nap window (so a nap
+        //    the night later grew over is never deleted). Returns prior UUIDs we could NOT confirm
+        //    deleted, so we keep tracking them for a retry instead of forgetting them.
+        let napWindows = local.healthWrittenNapWindows(overlapping: recordedStart, to: recordedEnd)
+        let survivingPrior = await deletePriorEditedNightSleep(
+            priorUUIDs: local.sleepEditHealthUUIDs(night: night),
+            recordedStart: recordedStart, recordedEnd: recordedEnd,
+            napWindows: napWindows, keeping: newUUIDs)
 
-        // 3. Track the new set, and pin the watermarks so the periodic flush neither re-adds the
-        //    deleted (trimmed) recorded tail nor re-appends the leading extension.
-        local.setSleepEditHealthUUIDs(newUUIDs, night: night)
+        // 3. Track (fresh write + any prior we couldn't delete), and pin the watermarks so the periodic
+        //    flush neither re-adds the trimmed recorded tail nor re-appends the leading extension.
+        local.setSleepEditHealthUUIDs(newUUIDs + survivingPrior, night: night)
         let editedEnd = editedSegments.map(\.end).max() ?? recordedEnd
         try? local.forceSleepCursorAtLeast(max(recordedEnd, editedEnd))
         try? local.markSleepEditHealthWritten(night: night, segments: editedSegments)
@@ -1137,32 +1154,48 @@ final class HealthKitWriter {
     }
 
     /// Delete the app's own prior sleep for an edited night: the exact tracked UUIDs from the last
-    /// write, plus any app-authored sleep still in the RECORDED in-bed span (first-edit cleanup of the
-    /// ordinary-flush night). Both EXCLUDE the freshly-written samples; the recorded span never
-    /// contains a nap (a nap can't overlap the night's in-bed window — enforced on add).
+    /// write (a), plus a transition cleanup of app-authored sleep still in the RECORDED in-bed span
+    /// (b, for the untracked ordinary-flush night). Both EXCLUDE the freshly-written samples, and (b)
+    /// additionally excludes every Health-written NAP window — the recorded span can contain a nap the
+    /// night later widened over, which must never be deleted. Returns the (a) UUIDs that could not be
+    /// confirmed deleted, so the caller keeps tracking them.
     private func deletePriorEditedNightSleep(priorUUIDs: [String], recordedStart: Date,
-                                             recordedEnd: Date, keeping newUUIDs: [String]) async {
+                                             recordedEnd: Date, napWindows: [DateInterval],
+                                             keeping newUUIDs: [String]) async -> [String] {
         let type = HKCategoryType(.sleepAnalysis)
         let keep = Set(newUUIDs.compactMap { UUID(uuidString: $0) })
 
-        // (a) Precise: the exact samples we wrote last time (never a nap or another night).
+        // (a) Precise: the exact samples we wrote last time (never a nap or another night). Retain any
+        //     we couldn't confirm deleted so they aren't forgotten (would otherwise become a permanent
+        //     duplicate once the overlay is overwritten).
+        var surviving: [String] = []
         let prior = Set(priorUUIDs.compactMap { UUID(uuidString: $0) }).subtracting(keep)
         if !prior.isEmpty {
-            _ = try? await store.deleteObjects(of: type,
-                                               predicate: HKQuery.predicateForObjects(with: prior))
+            do {
+                _ = try await store.deleteObjects(of: type,
+                                                  predicate: HKQuery.predicateForObjects(with: prior))
+            } catch {
+                surviving = prior.map { $0.uuidString }
+            }
         }
 
-        // (b) Transition cleanup: app sleep still sitting in the RECORDED in-bed span (the untracked
-        //     ordinary-flush night), excluding the fresh write. Bounded to the recorded span → no nap.
-        guard recordedEnd > recordedStart else { return }
-        let inRecorded = HKQuery.predicateForSamples(withStart: recordedStart, end: recordedEnd,
-                                                     options: [])
-        let pred: NSPredicate = keep.isEmpty ? inRecorded
-            : NSCompoundPredicate(andPredicateWithSubpredicates: [
-                inRecorded,
-                NSCompoundPredicate(notPredicateWithSubpredicate: HKQuery.predicateForObjects(with: keep)),
-            ])
+        // (b) Transition cleanup: app sleep still in the RECORDED in-bed span, EXCLUDING the fresh
+        //     write and every Health-written nap window. Idempotent — a failure just retries next time.
+        guard recordedEnd > recordedStart else { return surviving }
+        var subs: [NSPredicate] = [
+            HKQuery.predicateForSamples(withStart: recordedStart, end: recordedEnd, options: []),
+        ]
+        if !keep.isEmpty {
+            subs.append(NSCompoundPredicate(
+                notPredicateWithSubpredicate: HKQuery.predicateForObjects(with: keep)))
+        }
+        for window in napWindows {
+            subs.append(NSCompoundPredicate(notPredicateWithSubpredicate:
+                HKQuery.predicateForSamples(withStart: window.start, end: window.end, options: [])))
+        }
+        let pred = subs.count == 1 ? subs[0] : NSCompoundPredicate(andPredicateWithSubpredicates: subs)
         _ = try? await store.deleteObjects(of: type, predicate: pred)
+        return surviving
     }
 
     static func sleepValue(_ stage: SleepStage) -> HKCategoryValueSleepAnalysis {

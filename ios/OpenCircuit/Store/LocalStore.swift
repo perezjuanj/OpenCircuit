@@ -276,6 +276,15 @@ enum SleepEditHealthSampleOverlay {
     static func save(_ uuids: [String], night: Date) {
         UserDefaults.standard.set(uuids, forKey: key(night))
     }
+
+    /// Add UUIDs to the night's tracked set (order-preserving de-dup). Used by the flush's
+    /// leading-extension backfill so those samples are also deletable by a later edit.
+    static func append(_ uuids: [String], night: Date) {
+        guard !uuids.isEmpty else { return }
+        var seen = Set<String>()
+        let merged = (load(night: night) + uuids).filter { seen.insert($0).inserted }
+        save(merged, night: night)
+    }
 }
 
 /// Per-day rollups for values that are NOT epoch samples and must NOT flow through the
@@ -819,6 +828,23 @@ struct LocalStore {
     /// exactly those and nothing else.
     func setSleepEditHealthUUIDs(_ uuids: [String], night: Date) {
         SleepEditHealthSampleOverlay.save(uuids, night: night)
+    }
+
+    /// Append to the night's tracked Apple Health sleep-sample UUIDs (leading-extension backfill).
+    func appendSleepEditHealthUUIDs(_ uuids: [String], night: Date) {
+        SleepEditHealthSampleOverlay.append(uuids, night: night)
+    }
+
+    /// Windows of naps ALREADY mirrored to Apple Health that overlap `[start, end]`. The sleep-edit
+    /// recorded-span cleanup excludes these so a nap the night later widened over (a short first drain
+    /// grew by a fuller re-drain) is never deleted from Apple Health.
+    func healthWrittenNapWindows(overlapping start: Date, to end: Date) -> [DateInterval] {
+        let naps = (try? context.fetch(FetchDescriptor<StoredNap>())) ?? []
+        return naps.compactMap { nap in
+            guard nap.healthWritten, nap.effectiveEnd > nap.effectiveStart,
+                  nap.effectiveStart < end, nap.effectiveEnd > start else { return nil }
+            return DateInterval(start: nap.effectiveStart, end: nap.effectiveEnd)
+        }
     }
 
     /// Advance the Health watermark past the newest written sample per kind.
