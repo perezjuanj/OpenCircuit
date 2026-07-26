@@ -1149,8 +1149,8 @@ struct ContentView: View {
     /// reflects a just-finished sync instantly via the live staged segments. (See SleepCardView.)
     private var sleepCard: some View {
         SleepCardView(liveSegments: session?.stagedSegments ?? [], lastSyncAt: lastSyncAt,
-                      onEditSleep: { night, window in
-                          await session?.applySleepEdit(night: night, window: window) ?? nil
+                      onEditSleep: { night, times in
+                          await session?.applySleepEdit(night: night, times: times) ?? nil
                       },
                       onNap: { originalStart, window in
                           // Through the scanner, not session — nap add/edit works offline (no ring needed).

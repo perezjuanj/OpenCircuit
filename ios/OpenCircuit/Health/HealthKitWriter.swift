@@ -1077,6 +1077,54 @@ final class HealthKitWriter {
         try await store.save(samples)
     }
 
+    /// Reconcile Apple Health so a manually-edited night matches the EDITED window. This is the piece
+    /// that makes a **trim** REMOVE sleep from Health — the ordinary flush is append-only, so shrinking
+    /// the night otherwise left the old, wider sleep in Health. It DELETES the sleep this app
+    /// previously wrote across the night's envelope, then WRITES the complete edited picture.
+    ///
+    /// Safety: HealthKit scopes `deleteObjects` to samples THIS app authored, so a user's manual sleep
+    /// or another app's data is never touched. The delete is bounded to the night's own envelope (the
+    /// union of the recorded and edited spans, ± one epoch), and daytime naps sit outside the night's
+    /// in-bed window (enforced when a nap is added), so naps are not deleted. Delete-THEN-write means
+    /// an old sample straddling the new boundary can't survive a trim and a kept interior sample can't
+    /// be duplicated by the rewrite.
+    func reconcileEditedNightSleep(local: LocalStore, night: Date,
+                                   times: SleepEdit.Times, editedSegments: [SleepSegment]) async {
+        guard isShareAuthorized, !editedSegments.isEmpty else { return }
+        guard let row = try? local.sleepSummary(night: night) else { return }
+        // Only reconcile a settled (finalized) night — the edit UI is only offered for a past night,
+        // so this is normally always true; it just guards against clobbering an in-progress night.
+        guard SleepHealthGate.isSettled(latestSegmentEnd: editedSegments.map(\.end).max(),
+                                        now: Date()) else { return }
+
+        let recordedStart = row.sleepEditRecordedInBedStart > .distantPast
+            ? row.sleepEditRecordedInBedStart : times.inBedStart
+        let recordedEnd = row.sleepEditRecordedInBedEnd > recordedStart
+            ? row.sleepEditRecordedInBedEnd : times.sleepWake
+        let envelopeStart = min(recordedStart, times.inBedStart)
+        let envelopeEnd = max(recordedEnd, times.sleepWake)
+        guard envelopeEnd > envelopeStart else { return }
+        let margin = TimeInterval(BulkRecord.epochSeconds)   // catch boundary-aligned samples
+        let predicate = HKQuery.predicateForSamples(
+            withStart: envelopeStart.addingTimeInterval(-margin),
+            end: envelopeEnd.addingTimeInterval(margin),
+            options: [])
+
+        // Delete first, then write. On any HealthKit error, leave watermarks untouched so a later
+        // flush retries rather than silently losing the night.
+        do {
+            _ = try await store.deleteObjects(of: HKCategoryType(.sleepAnalysis), predicate: predicate)
+            try await write(sleep: editedSegments)
+        } catch {
+            return
+        }
+        // Keep the sleep watermarks consistent with what's now in Health so the periodic flush neither
+        // re-adds the deleted trim nor re-appends the leading extension.
+        try? local.markSleepWritten(editedSegments)
+        try? local.markSleepEditHealthWritten(night: night, segments: editedSegments)
+        try? local.markSleepEditHealthCovered(by: editedSegments)
+    }
+
     static func sleepValue(_ stage: SleepStage) -> HKCategoryValueSleepAnalysis {
         switch stage {
         case .inBed: return .inBed

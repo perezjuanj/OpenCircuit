@@ -102,6 +102,25 @@ final class SleepEditStoreTests: XCTestCase {
         XCTAssertFalse(row.isManuallyEdited)
     }
 
+    func testThreeTimeEditPersistsBedtimeSeparatelyFromSleepWindow() throws {
+        let store = try makeStore()
+        try seed(store)
+        let times = SleepEdit.Times(inBedStart: at(-0.5), sleepOnset: at(0.5), sleepWake: at(8))
+        let segments = SleepEdit.recompute(baseSegments: [
+            .init(start: at(0), end: at(8), stage: .inBed),
+            .init(start: at(0.5), end: at(8), stage: .asleepCore),
+        ], times: times)
+
+        XCTAssertTrue(try store.applySleepEdit(night: at(0), times: times,
+                                                summary: SleepStaging.summary(segments)))
+        let row = try XCTUnwrap(store.sleepSummary(night: at(0)))
+        XCTAssertEqual(row.sleepEditCurrentInBedStart, at(-0.5))
+        XCTAssertEqual(row.sleepEditCurrentOnset, at(0.5))
+        XCTAssertEqual(row.sleepEditCurrentWake, at(8))
+        XCTAssertEqual(row.awakeMin, 60)
+        XCTAssertEqual(row.asleepMin, 450)
+    }
+
     func testVisuallyUnchangedRecordedWindowDoesNotBecomeManualEdit() throws {
         let store = try makeStore()
         try seed(store)
