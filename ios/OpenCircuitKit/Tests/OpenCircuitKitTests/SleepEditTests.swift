@@ -78,6 +78,15 @@ final class SleepEditTests: XCTestCase {
         XCTAssertEqual(SleepEdit.Window(inBedStart: at(5), inBedEnd: at(4)).duration, 0)
     }
 
+    func testThreeTimesRequireBedtimeThenOnsetThenWake() {
+        XCTAssertEqual(SleepEdit.validate(
+            .init(inBedStart: at(1), sleepOnset: at(0.5), sleepWake: at(8)),
+            recordedOnset: at(1), recordedWake: at(8)), .onsetBeforeBedtime)
+        XCTAssertEqual(SleepEdit.validate(
+            .init(inBedStart: at(0), sleepOnset: at(8), sleepWake: at(8)),
+            recordedOnset: at(1), recordedWake: at(8)), .wakeNotAfterOnset)
+    }
+
     // MARK: recompute
 
     private func seg(_ a: Double, _ b: Double, _ stage: SleepStage) -> SleepSegment {
@@ -102,6 +111,22 @@ final class SleepEditTests: XCTestCase {
         let out = SleepEdit.recompute(baseSegments: base, window: .init(inBedStart: at(-0.5), inBedEnd: at(8)))
         XCTAssertEqual(out.first, seg(-0.5, 1, .asleepCore))
         XCTAssertEqual(out.count, 2)
+    }
+
+    func testThreeTimeRecomputeCountsPreSleepAsAwakeInBed() {
+        let base = [seg(1, 9, .inBed), seg(1, 9, .asleepCore)]
+        let times = SleepEdit.Times(inBedStart: at(0), sleepOnset: at(1), sleepWake: at(9))
+        let out = SleepEdit.recompute(baseSegments: base, times: times)
+        let summary = SleepStaging.summary(out)
+
+        XCTAssertEqual(out.first, seg(0, 9, .inBed))
+        XCTAssertTrue(out.contains(seg(0, 1, .awake)))
+        XCTAssertEqual(summary.minutes.inBed, 9 * 60)
+        XCTAssertEqual(summary.minutes.asleep, 8 * 60)
+        XCTAssertEqual(summary.minutes.awake, 60)
+        XCTAssertEqual(summary.efficiency, 8.0 / 9.0, accuracy: 0.0001)
+        XCTAssertEqual(SleepStaging.sleepWindow(out)?.onset, at(1))
+        XCTAssertEqual(SleepStaging.sleepWindow(out)?.wake, at(9))
     }
 
     func testRecomputeExtendsInBedLayerWithStagedNight() {

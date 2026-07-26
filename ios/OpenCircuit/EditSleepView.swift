@@ -1,7 +1,7 @@
 // Manual sleep-time edit sheet (#176) — RingConn parity (EditSleepStagePage / SleepEditableTimeRange).
 //
-// Two time pickers over the night's in-bed window, hard-bounded to ±3 h of the recorded onset/wake
-// (SleepEdit.bounds), with a live in-bed duration preview and the app's own limit copy. On Save it
+// Three independent time pickers for bedtime, sleep onset, and wake, hard-bounded to ±3 h of the
+// recorded onset/wake (SleepEdit.bounds), with live in-bed and asleep-window previews. On Save it
 // runs the NON-DESTRUCTIVE edit via the injected closure (→ RingSession.applySleepEdit): extending a
 // truncated night APPENDS the added sleep to Apple Health; trimming updates the in-app view only.
 // Nothing in Apple Health is ever deleted.
@@ -14,20 +14,21 @@ struct EditSleepView: View {
     let recordedOnset: Date
     let recordedWake: Date
     /// Runs the edit, returning the new asleep minutes (nil = failed). Injected by SleepCardView.
-    let onSave: (SleepEdit.Window) async -> Int?
+    let onSave: (SleepEdit.Times) async -> Int?
 
     @Environment(\.dismiss) private var dismiss
 
     @State private var bedtime: Date
+    @State private var onset: Date
     @State private var wake: Date
     @State private var saving = false
     @State private var saveFailed = false
-    private let initialWindow: SleepEdit.Window
+    private let initialTimes: SleepEdit.Times
     private static let minimumDuration: TimeInterval = 30 * 60
 
-    init(night: Date, inBedStart: Date, inBedEnd: Date,
+    init(night: Date, inBedStart: Date, sleepOnset: Date, sleepWake: Date,
          recordedOnset: Date, recordedWake: Date,
-         onSave: @escaping (SleepEdit.Window) async -> Int?) {
+         onSave: @escaping (SleepEdit.Times) async -> Int?) {
         self.night = night
         self.recordedOnset = recordedOnset
         self.recordedWake = recordedWake
@@ -35,45 +36,56 @@ struct EditSleepView: View {
         // Clamp the initial values into the editable bounds so the DatePickers never start out of range.
         let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
         var start = SleepEdit.clamp(inBedStart, to: b)
-        var end = SleepEdit.clamp(inBedEnd, to: b)
-        if end.timeIntervalSince(start) < Self.minimumDuration {
-            end = min(b.latest, start.addingTimeInterval(Self.minimumDuration))
-            start = max(b.earliest, end.addingTimeInterval(-Self.minimumDuration))
+        var asleep = SleepEdit.clamp(sleepOnset, to: b)
+        var end = SleepEdit.clamp(sleepWake, to: b)
+        asleep = max(start, asleep)
+        if end.timeIntervalSince(asleep) < Self.minimumDuration {
+            end = min(b.latest, asleep.addingTimeInterval(Self.minimumDuration))
+            asleep = max(start, end.addingTimeInterval(-Self.minimumDuration))
         }
-        let initial = SleepEdit.Window(inBedStart: start, inBedEnd: end)
-        initialWindow = initial
+        start = min(start, asleep)
+        let initial = SleepEdit.Times(inBedStart: start, sleepOnset: asleep, sleepWake: end)
+        initialTimes = initial
         _bedtime = State(initialValue: initial.inBedStart)
-        _wake = State(initialValue: initial.inBedEnd)
+        _onset = State(initialValue: initial.sleepOnset)
+        _wake = State(initialValue: initial.sleepWake)
     }
 
     private var bounds: SleepEdit.Bounds {
         SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
     }
-    private var window: SleepEdit.Window { .init(inBedStart: bedtime, inBedEnd: wake) }
+    private var times: SleepEdit.Times {
+        .init(inBedStart: bedtime, sleepOnset: onset, sleepWake: wake)
+    }
     private var invalid: SleepEdit.Invalid? {
-        SleepEdit.validate(window, recordedOnset: recordedOnset, recordedWake: recordedWake,
+        SleepEdit.validate(times, recordedOnset: recordedOnset, recordedWake: recordedWake,
                            minDuration: Self.minimumDuration)
     }
     private var hasChanges: Bool {
-        !SleepEdit.isSamePickerMinute(window.inBedStart, initialWindow.inBedStart)
-            || !SleepEdit.isSamePickerMinute(window.inBedEnd, initialWindow.inBedEnd)
+        !SleepEdit.isSamePickerMinute(times.inBedStart, initialTimes.inBedStart)
+            || !SleepEdit.isSamePickerMinute(times.sleepOnset, initialTimes.sleepOnset)
+            || !SleepEdit.isSamePickerMinute(times.sleepWake, initialTimes.sleepWake)
     }
     private var bedtimeRange: ClosedRange<Date> {
-        bounds.earliest...min(bounds.latest,
-                              wake.addingTimeInterval(-Self.minimumDuration))
+        bounds.earliest...onset
+    }
+    private var onsetRange: ClosedRange<Date> {
+        bedtime...min(bounds.latest, wake.addingTimeInterval(-Self.minimumDuration))
     }
     private var wakeRange: ClosedRange<Date> {
         max(bounds.earliest,
-            bedtime.addingTimeInterval(Self.minimumDuration))...bounds.latest
+            onset.addingTimeInterval(Self.minimumDuration))...bounds.latest
     }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    DatePicker("Bedtime", selection: $bedtime, in: bedtimeRange,
+                    DatePicker("In bed", selection: $bedtime, in: bedtimeRange,
                                displayedComponents: [.date, .hourAndMinute])
-                    DatePicker("Wake up", selection: $wake, in: wakeRange,
+                    DatePicker("Fell asleep", selection: $onset, in: onsetRange,
+                               displayedComponents: [.date, .hourAndMinute])
+                    DatePicker("Woke up", selection: $wake, in: wakeRange,
                                displayedComponents: [.date, .hourAndMinute])
                 } header: {
                     Text("Editable Time Range")
@@ -82,6 +94,7 @@ struct EditSleepView: View {
                 }
                 Section {
                     LabeledContent("Time in bed", value: durationText)
+                    LabeledContent("Sleep window", value: asleepDurationText)
                     if let invalid {
                         Text(message(for: invalid)).font(.caption).foregroundStyle(.orange)
                     }
@@ -90,7 +103,7 @@ struct EditSleepView: View {
                             .font(.caption).foregroundStyle(.orange)
                     }
                 } footer: {
-                    Text("Extending a night adds the sleep to Apple Health; trimming updates this app only. Your ring's original recording is never changed.")
+                    Text("Time before “Fell asleep” counts as awake in bed. Changing the sleep window updates the estimate without changing your ring's original recording.")
                 }
             }
             .navigationTitle("Edit Sleep")
@@ -112,9 +125,16 @@ struct EditSleepView: View {
         return "\(mins / 60)h \(mins % 60)m"
     }
 
+    private var asleepDurationText: String {
+        let mins = Int(max(0, wake.timeIntervalSince(onset)) / 60)
+        return "\(mins / 60)h \(mins % 60)m"
+    }
+
     private func message(for e: SleepEdit.Invalid) -> String {
         switch e {
         case .endNotAfterStart:    return "Wake time must be after bedtime."
+        case .onsetBeforeBedtime:  return "Fell asleep can’t be before In bed."
+        case .wakeNotAfterOnset:   return "Woke up must be after Fell asleep."
         case .startBeforeEarliest: return "Bedtime can’t be more than 3 hours before your recorded sleep."
         case .endAfterLatest:      return "Wake time can’t be more than 3 hours after your recorded wake."
         case .tooShort:            return "That window is too short for a night."
@@ -124,7 +144,7 @@ struct EditSleepView: View {
     private func save() async {
         saving = true
         saveFailed = false
-        let saved = await onSave(window) != nil
+        let saved = await onSave(times) != nil
         saving = false
         if saved { dismiss() } else { saveFailed = true }
     }

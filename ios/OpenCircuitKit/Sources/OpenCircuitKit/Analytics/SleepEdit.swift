@@ -56,12 +56,59 @@ public enum SleepEdit {
         public var duration: TimeInterval { max(0, inBedEnd.timeIntervalSince(inBedStart)) }
     }
 
+    /// The three clock times exposed by the sleep editor. Bedtime and sleep onset are deliberately
+    /// separate: `[inBedStart, sleepOnset]` is awake-in-bed, while `[sleepOnset, sleepWake]` is the
+    /// editable sleep window. The wake time is also the end of the in-bed envelope because the UI
+    /// intentionally asks for the three user-observable anchors rather than a fourth "left bed" time.
+    public struct Times: Equatable, Sendable {
+        public var inBedStart: Date
+        public var sleepOnset: Date
+        public var sleepWake: Date
+
+        public init(inBedStart: Date, sleepOnset: Date, sleepWake: Date) {
+            self.inBedStart = inBedStart
+            self.sleepOnset = sleepOnset
+            self.sleepWake = sleepWake
+        }
+
+        public var inBedEnd: Date { sleepWake }
+        public var inBedDuration: TimeInterval {
+            max(0, sleepWake.timeIntervalSince(inBedStart))
+        }
+        public var asleepWindowDuration: TimeInterval {
+            max(0, sleepWake.timeIntervalSince(sleepOnset))
+        }
+    }
+
     /// Why a proposed edit is rejected. nil (from `validate`) means the edit is allowed.
     public enum Invalid: Error, Equatable, Sendable {
         case endNotAfterStart
+        case onsetBeforeBedtime
+        case wakeNotAfterOnset
         case startBeforeEarliest    // pushed bedtime > 3 h before recorded onset
         case endAfterLatest         // pushed wake > 3 h after recorded wake
         case tooShort(minMinutes: Int)
+    }
+
+    /// Validate the three independent editor anchors. The minimum applies to the asserted sleep
+    /// window, not to the longer in-bed envelope.
+    public static func validate(_ times: Times, recordedOnset: Date, recordedWake: Date,
+                                minDuration: TimeInterval = 0) -> Invalid? {
+        let b = bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
+        if times.sleepOnset < times.inBedStart { return .onsetBeforeBedtime }
+        if times.sleepWake <= times.sleepOnset { return .wakeNotAfterOnset }
+        if times.inBedStart < b.earliest { return .startBeforeEarliest }
+        if times.sleepWake > b.latest { return .endAfterLatest }
+        if times.asleepWindowDuration < minDuration {
+            return .tooShort(minMinutes: Int(minDuration / 60))
+        }
+        return nil
+    }
+
+    public static func isValid(_ times: Times, recordedOnset: Date, recordedWake: Date,
+                               minDuration: TimeInterval = 0) -> Bool {
+        validate(times, recordedOnset: recordedOnset, recordedWake: recordedWake,
+                 minDuration: minDuration) == nil
     }
 
     /// Validate a proposed window against the recorded onset/wake bounds. Returns nil when valid.
@@ -131,5 +178,56 @@ public enum SleepEdit {
             out.append(SleepSegment(start: trailingStart, end: end, stage: fillStage))
         }
         return out
+    }
+
+    /// Recompute using independent bedtime, sleep-onset, and wake anchors.
+    ///
+    /// The result always has one in-bed envelope. The bedtime-to-onset interval is explicitly
+    /// `.awake`; recorded stages inside the original sleep window are preserved; only a user-added
+    /// extension of the *sleep* window is synthetic core sleep. Thus moving bedtime earlier no
+    /// longer inflates time asleep or produces 100% efficiency.
+    public static func recompute(baseSegments: [SleepSegment], times: Times,
+                                 fillStage: SleepStage = .asleepCore) -> [SleepSegment] {
+        guard times.sleepWake > times.sleepOnset,
+              times.sleepOnset >= times.inBedStart else { return [] }
+
+        let stageBase = baseSegments
+            .filter { $0.stage != .inBed }
+            .sorted { $0.start < $1.start }
+        let recordedSleep = SleepStaging.sleepWindow(stageBase)
+
+        var stages: [SleepSegment] = []
+        if let recordedSleep {
+            let preservedStart = max(times.sleepOnset, recordedSleep.onset)
+            let preservedEnd = min(times.sleepWake, recordedSleep.wake)
+
+            if times.sleepOnset < min(times.sleepWake, recordedSleep.onset) {
+                stages.append(SleepSegment(start: times.sleepOnset,
+                                           end: min(times.sleepWake, recordedSleep.onset),
+                                           stage: fillStage))
+            }
+            if preservedEnd > preservedStart {
+                stages.append(contentsOf: stageBase.compactMap { segment in
+                    let start = max(segment.start, preservedStart)
+                    let end = min(segment.end, preservedEnd)
+                    return end > start
+                        ? SleepSegment(start: start, end: end, stage: segment.stage) : nil
+                })
+            }
+            if max(times.sleepOnset, recordedSleep.wake) < times.sleepWake {
+                stages.append(SleepSegment(start: max(times.sleepOnset, recordedSleep.wake),
+                                           end: times.sleepWake, stage: fillStage))
+            }
+        } else {
+            stages.append(SleepSegment(start: times.sleepOnset, end: times.sleepWake,
+                                       stage: fillStage))
+        }
+
+        var result = [SleepSegment(start: times.inBedStart, end: times.inBedEnd, stage: .inBed)]
+        if times.inBedStart < times.sleepOnset {
+            result.append(SleepSegment(start: times.inBedStart, end: times.sleepOnset, stage: .awake))
+        }
+        result.append(contentsOf: stages)
+        return result
     }
 }

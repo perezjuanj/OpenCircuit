@@ -40,7 +40,7 @@ struct SleepCardView: View {
     var liveSegments: [SleepSegment]
     /// Runs a manual sleep-time edit (#176) for a night → new asleep minutes (nil = failed). Injected
     /// by ContentView (→ RingSession.applySleepEdit). nil hides the Edit affordance entirely.
-    var onEditSleep: ((Date, SleepEdit.Window) async -> Int?)? = nil
+    var onEditSleep: ((Date, SleepEdit.Times) async -> Int?)? = nil
     @State private var editTarget: EditTarget?
     /// Runs a manual nap add/edit (#nap-parity) → success. nil originalStart = add, else edit.
     /// Injected by ContentView (→ RingSession.applyNapEdit). nil hides the nap edit/add affordance.
@@ -65,7 +65,7 @@ struct SleepCardView: View {
     private static let historyNights = 35
 
     init(liveSegments: [SleepSegment] = [], lastSyncAt: Date? = nil,
-         onEditSleep: ((Date, SleepEdit.Window) async -> Int?)? = nil,
+         onEditSleep: ((Date, SleepEdit.Times) async -> Int?)? = nil,
          onNap: ((Date?, NapEdit.Window) async -> Bool)? = nil) {
         self.liveSegments = liveSegments
         self.lastSyncAt = lastSyncAt
@@ -122,7 +122,8 @@ struct SleepCardView: View {
         let id = UUID()
         let night: Date
         let inBedStart: Date
-        let inBedEnd: Date
+        let sleepOnset: Date
+        let sleepWake: Date
         let recordedOnset: Date
         let recordedWake: Date
     }
@@ -167,13 +168,10 @@ struct SleepCardView: View {
             let currentEnd = s.sleepEditCurrentInBedEnd
             let start = currentStart > .distantPast ? currentStart : nil
             let end = currentEnd > currentStart ? currentEnd : nil
-            // The edit window is credited as sleep at either exposed edge, so its visible sleep
-            // clock follows the overlay. The original onset/wake remain untouched as immutable
-            // anchors for future ±3 h re-edits.
-            let onset = s.isManuallyEdited ? start
-                : (s.sleepOnset > .distantPast ? s.sleepOnset : nil)
-            let wake = s.isManuallyEdited ? end
-                : (s.sleepWake > s.sleepOnset ? s.sleepWake : nil)
+            let currentOnset = s.sleepEditCurrentOnset
+            let currentWake = s.sleepEditCurrentWake
+            let onset = currentOnset > .distantPast ? currentOnset : nil
+            let wake = currentWake > currentOnset ? currentWake : nil
             return Night(nightKey: s.night, summary: s.asSummary, inBedStart: start, inBedEnd: end,
                          onset: onset, wake: wake,
                          when: end ?? start ?? s.night, wakeKnown: end != nil,
@@ -299,7 +297,8 @@ struct SleepCardView: View {
         .sheet(item: $editTarget) { target in
             EditSleepView(
                 night: target.night,
-                inBedStart: target.inBedStart, inBedEnd: target.inBedEnd,
+                inBedStart: target.inBedStart,
+                sleepOnset: target.sleepOnset, sleepWake: target.sleepWake,
                 recordedOnset: target.recordedOnset, recordedWake: target.recordedWake,
                 onSave: { window in await onEditSleep?(target.night, window) ?? nil })
         }
@@ -312,7 +311,8 @@ struct SleepCardView: View {
             ? row.sleepEditRecordedWake : row.sleepEditRecordedInBedEnd
         return EditTarget(night: row.night,
                           inBedStart: row.sleepEditCurrentInBedStart,
-                          inBedEnd: row.sleepEditCurrentInBedEnd,
+                          sleepOnset: row.sleepEditCurrentOnset,
+                          sleepWake: row.sleepEditCurrentWake,
                           recordedOnset: onset, recordedWake: wake)
     }
 

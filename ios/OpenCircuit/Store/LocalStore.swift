@@ -227,6 +227,95 @@ final class StoredSleepSummary {
     var sleepEditCurrentInBedEnd: Date {
         isManuallyEdited ? editedInBedEnd : inBedEnd
     }
+    var sleepEditCurrentOnset: Date {
+        guard isManuallyEdited else { return sleepOnset }
+        if let onset = SleepEditOnsetOverlay.load(night: night) { return onset }
+        // A night edited under the pre-3-anchor editor (or one whose overlay desynced) has no stored
+        // onset: fall back to the RECORDED onset clamped into the edited window — never bedtime, which
+        // would read as onset==bedtime / 100% efficiency.
+        let recorded = sleepOnset > .distantPast ? sleepOnset : editedInBedStart
+        return min(max(recorded, editedInBedStart), editedInBedEnd)
+    }
+    var sleepEditCurrentWake: Date {
+        isManuallyEdited ? editedInBedEnd : sleepWake
+    }
+}
+
+/// One extra edited clock value is needed beyond the existing two-edge SwiftData overlay. Keeping
+/// it in UserDefaults avoids changing the production SwiftData schema (and therefore avoids a
+/// destructive migration on phones with an existing sleep database). Wake remains editedInBedEnd.
+private enum SleepEditOnsetOverlay {
+    private static func key(_ night: Date) -> String {
+        let day = Calendar.current.startOfDay(for: night).timeIntervalSince1970
+        return "sleep.edit.onset.\(day)"
+    }
+
+    static func load(night: Date) -> Date? {
+        UserDefaults.standard.object(forKey: key(night)) as? Date
+    }
+
+    static func save(_ onset: Date, night: Date) {
+        UserDefaults.standard.set(onset, forKey: key(night))
+    }
+}
+
+/// The UUIDs of the Apple Health sleep samples this app last wrote for an edited night, so a later
+/// edit deletes EXACTLY those (never a nap, never another night) before rewriting — mirroring the
+/// menstrual-flow UUID-tracked delete/replace. UserDefaults (keyed by night) avoids a SwiftData
+/// migration, matching the onset overlay above.
+enum SleepEditHealthSampleOverlay {
+    private static func key(_ night: Date) -> String {
+        let day = Calendar.current.startOfDay(for: night).timeIntervalSince1970
+        return "sleep.edit.hkuuids.\(day)"
+    }
+
+    static func load(night: Date) -> [String] {
+        UserDefaults.standard.stringArray(forKey: key(night)) ?? []
+    }
+
+    static func save(_ uuids: [String], night: Date) {
+        UserDefaults.standard.set(uuids, forKey: key(night))
+    }
+
+    /// Add UUIDs to the night's tracked set (order-preserving de-dup). Used by the flush's
+    /// leading-extension backfill so those samples are also deletable by a later edit.
+    static func append(_ uuids: [String], night: Date) {
+        guard !uuids.isEmpty else { return }
+        var seen = Set<String>()
+        let merged = (load(night: night) + uuids).filter { seen.insert($0).inserted }
+        save(merged, night: night)
+    }
+}
+
+/// A sleep-edit Health reconcile that couldn't run because the periodic flush held the Health-write
+/// gate. Persisted so the NEXT flush drains it — otherwise a trim made while a flush was in flight
+/// would silently never reach Apple Health (the flush's own sleep path is append-only and can't trim).
+struct PendingSleepReconcile: Codable, Equatable {
+    var night: Date
+    var inBedStart: Date
+    var sleepOnset: Date
+    var sleepWake: Date
+    var segments: [SleepSegment]
+}
+
+enum PendingSleepReconcileStore {
+    private static let key = "sleep.edit.pending-reconcile.v1"
+
+    static func all() -> [PendingSleepReconcile] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([PendingSleepReconcile].self, from: data)) ?? []
+    }
+
+    static func upsert(_ item: PendingSleepReconcile) {
+        var items = all().filter { Calendar.current.isDate($0.night, inSameDayAs: item.night) == false }
+        items.append(item)
+        UserDefaults.standard.set(try? JSONEncoder().encode(items), forKey: key)
+    }
+
+    static func clear(night: Date) {
+        let items = all().filter { Calendar.current.isDate($0.night, inSameDayAs: night) == false }
+        UserDefaults.standard.set(try? JSONEncoder().encode(items), forKey: key)
+    }
 }
 
 /// Per-day rollups for values that are NOT epoch samples and must NOT flow through the
@@ -745,13 +834,81 @@ struct LocalStore {
     /// Advance the `.sleep` cursor past the night just written to Apple Health.
     func markSleepWritten(_ segments: [SleepSegment]) throws {
         guard let latest = segments.map(\.end).max() else { return }
+        try forceSleepCursorAtLeast(latest)
+    }
+
+    /// Ensure the forward `.sleep` watermark is at least `date`. Used after a TRIM reconcile so the
+    /// deleted recorded tail `(editedWake, recordedWake]` can never be re-presented as "new" by
+    /// `pendingHealthSleep` on a later full-base flush (which would re-add the trimmed sleep).
+    func forceSleepCursorAtLeast(_ date: Date) throws {
         var cursor = try loadCursor()
-        guard cursor.isNew(.sleep, latest) else { return }
-        cursor.advance(.sleep, to: latest)
+        guard cursor.isNew(.sleep, date) else { return }
+        cursor.advance(.sleep, to: date)
         if let last = cursor.last(.sleep) {
             upsertCursor(kind: MetricKind.sleep.rawValue, last: last)
         }
         try context.save()
+    }
+
+    /// The Apple Health sleep-sample UUIDs this app last wrote for `night` (edit delete/replace).
+    func sleepEditHealthUUIDs(night: Date) -> [String] {
+        SleepEditHealthSampleOverlay.load(night: night)
+    }
+
+    /// Remember the Apple Health sleep-sample UUIDs written for `night`, so the next edit deletes
+    /// exactly those and nothing else.
+    func setSleepEditHealthUUIDs(_ uuids: [String], night: Date) {
+        SleepEditHealthSampleOverlay.save(uuids, night: night)
+    }
+
+    /// Append to the night's tracked Apple Health sleep-sample UUIDs (leading-extension backfill).
+    func appendSleepEditHealthUUIDs(_ uuids: [String], night: Date) {
+        SleepEditHealthSampleOverlay.append(uuids, night: night)
+    }
+
+    /// Persist a sleep-edit reconcile deferred because a flush held the Health gate (drained by the
+    /// next flush). Keyed by night — a newer deferral for the same night supersedes the older.
+    func setPendingSleepReconcile(night: Date, times: SleepEdit.Times, segments: [SleepSegment]) {
+        PendingSleepReconcileStore.upsert(.init(night: night, inBedStart: times.inBedStart,
+                                                sleepOnset: times.sleepOnset, sleepWake: times.sleepWake,
+                                                segments: segments))
+    }
+
+    /// The deferred sleep-edit reconciles awaiting a Health-gate-free flush to apply their trim/edit.
+    func pendingSleepReconciles() -> [PendingSleepReconcile] {
+        PendingSleepReconcileStore.all()
+    }
+
+    func clearPendingSleepReconcile(night: Date) {
+        PendingSleepReconcileStore.clear(night: night)
+    }
+
+    /// Clear a deferred reconcile ONLY if the stored marker still equals the one just processed — so a
+    /// NEWER same-night edit that was enqueued while this one was mid-flight is never wiped (avoids the
+    /// lost-update where a stale drain clears a fresh trim).
+    func clearPendingSleepReconcileIfUnchanged(_ item: PendingSleepReconcile) {
+        let current = PendingSleepReconcileStore.all()
+            .first { Calendar.current.isDate($0.night, inSameDayAs: item.night) }
+        if current == item { PendingSleepReconcileStore.clear(night: item.night) }
+    }
+
+    /// Windows of naps ALREADY mirrored to Apple Health that overlap `[start, end]`. The sleep-edit
+    /// recorded-span cleanup excludes these so a nap the night later widened over (a short first drain
+    /// grew by a fuller re-drain) is never deleted from Apple Health.
+    ///
+    /// Uses the UNION of the ORIGINAL and EDITED nap windows: `editNap` keeps `healthWritten == true`
+    /// and does NOT re-mirror, so the actual Health sample may sit at the original `start…end` even
+    /// after the displayed window moved to `editedStart…editedEnd`. Excluding both covers wherever the
+    /// sample actually is.
+    func healthWrittenNapWindows(overlapping start: Date, to end: Date) -> [DateInterval] {
+        let naps = (try? context.fetch(FetchDescriptor<StoredNap>())) ?? []
+        return naps.compactMap { nap in
+            guard nap.healthWritten else { return nil }
+            let lo = min(nap.start, nap.effectiveStart)
+            let hi = max(nap.end, nap.effectiveEnd)
+            guard hi > lo, lo < end, hi > start else { return nil }
+            return DateInterval(start: lo, end: hi)
+        }
     }
 
     /// Advance the Health watermark past the newest written sample per kind.
@@ -950,20 +1107,22 @@ struct LocalStore {
     /// in the store. The caller (RingSession) re-stages from the archive and appends the extension to
     /// Apple Health separately (append-only; nothing is deleted).
     @discardableResult
-    func applySleepEdit(night: Date, editedWindow: SleepEdit.Window,
-                        summary: SleepStaging.Summary, sleepOnset: Date, sleepWake: Date) throws -> Bool {
+    func applySleepEdit(night: Date, times: SleepEdit.Times,
+                        summary: SleepStaging.Summary) throws -> Bool {
         let dayStart = Calendar.current.startOfDay(for: night)
         let descriptor = FetchDescriptor<StoredSleepSummary>(predicate: #Predicate { $0.night == dayStart })
         guard let row = try? context.fetch(descriptor).first else { return false }
         // Defense in depth behind the sheet/session dirty checks: submitting the recorded values
         // unchanged must not manufacture a manual edit or rewrite its score/timestamp.
-        if SleepEdit.isSamePickerMinute(editedWindow.inBedStart, row.sleepEditCurrentInBedStart),
-           SleepEdit.isSamePickerMinute(editedWindow.inBedEnd, row.sleepEditCurrentInBedEnd) {
+        if SleepEdit.isSamePickerMinute(times.inBedStart, row.sleepEditCurrentInBedStart),
+           SleepEdit.isSamePickerMinute(times.sleepOnset, row.sleepEditCurrentOnset),
+           SleepEdit.isSamePickerMinute(times.sleepWake, row.sleepEditCurrentWake) {
             return true
         }
         let m = summary.minutes
-        row.editedInBedStart = editedWindow.inBedStart
-        row.editedInBedEnd = editedWindow.inBedEnd
+        row.editedInBedStart = times.inBedStart
+        row.editedInBedEnd = times.inBedEnd
+        SleepEditOnsetOverlay.save(times.sleepOnset, night: row.night)
         row.isManuallyEdited = true
         row.asleepMin = m.asleep
         row.deepMin = m.deep
@@ -981,6 +1140,18 @@ struct LocalStore {
         return true
     }
 
+    /// Compatibility entry point for callers/tests built around the original two-edge editor.
+    /// Its explicit onset/wake arguments now become the persisted sleep window instead of being
+    /// silently ignored.
+    @discardableResult
+    func applySleepEdit(night: Date, editedWindow: SleepEdit.Window,
+                        summary: SleepStaging.Summary, sleepOnset: Date, sleepWake: Date) throws -> Bool {
+        try applySleepEdit(night: night,
+                           times: .init(inBedStart: editedWindow.inBedStart,
+                                        sleepOnset: sleepOnset, sleepWake: sleepWake),
+                           summary: summary)
+    }
+
     struct PendingSleepEditHealthWrite {
         let night: Date
         let segments: [SleepSegment]
@@ -990,8 +1161,18 @@ struct LocalStore {
         "hk:sleep-edit-leading:\(Calendar.current.startOfDay(for: night).timeIntervalSince1970)"
     }
 
+    private static func sleepEditLeadingAsleepCursorKey(_ night: Date) -> String {
+        "hk:sleep-edit-leading-asleep:\(Calendar.current.startOfDay(for: night).timeIntervalSince1970)"
+    }
+
     private func sleepEditLeadingWatermark(_ night: Date) throws -> Date? {
         let key = Self.sleepEditLeadingCursorKey(night)
+        let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
+        return try context.fetch(descriptor).first?.last
+    }
+
+    private func sleepEditLeadingAsleepWatermark(_ night: Date) throws -> Date? {
+        let key = Self.sleepEditLeadingAsleepCursorKey(night)
         let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
         return try context.fetch(descriptor).first?.last
     }
@@ -1007,16 +1188,21 @@ struct LocalStore {
             guard row.isManuallyEdited else { return nil }
             let recordedStart = row.sleepEditRecordedInBedStart
             let recordedEnd = row.sleepEditRecordedInBedEnd
+            let recordedOnset = row.sleepEditRecordedOnset > .distantPast
+                ? row.sleepEditRecordedOnset : recordedStart
             guard recordedEnd > recordedStart, sleepCursor >= recordedEnd else { return nil }
             let writtenStart = (try? sleepEditLeadingWatermark(row.night)) ?? recordedStart
+            let writtenOnset = (try? sleepEditLeadingAsleepWatermark(row.night)) ?? recordedOnset
             let writtenEnd = max(recordedEnd, min(sleepCursor, row.editedInBedEnd))
             var segments: [SleepSegment] = []
-            let leadEnd = min(writtenStart, row.editedInBedEnd)
-            if row.editedInBedStart < leadEnd {
-                segments += [
-                    SleepSegment(start: row.editedInBedStart, end: leadEnd, stage: .inBed),
-                    SleepSegment(start: row.editedInBedStart, end: leadEnd, stage: .asleepCore),
-                ]
+            if row.editedInBedStart < writtenStart {
+                segments.append(SleepSegment(start: row.editedInBedStart, end: writtenStart,
+                                             stage: .inBed))
+            }
+            let editedOnset = row.sleepEditCurrentOnset
+            if editedOnset < writtenOnset {
+                segments.append(SleepSegment(start: editedOnset, end: writtenOnset,
+                                             stage: .asleepCore))
             }
             if row.editedInBedEnd > writtenEnd {
                 segments += [
@@ -1034,14 +1220,28 @@ struct LocalStore {
         guard let row = try sleepSummary(night: night),
               let first = segments.map(\.start).min(), let last = segments.map(\.end).max() else { return }
         let recordedStart = row.sleepEditRecordedInBedStart
+        let recordedOnset = row.sleepEditRecordedOnset > .distantPast
+            ? row.sleepEditRecordedOnset : recordedStart
         var changed = false
-        if first < recordedStart {
+        if let inBedFirst = segments.filter({ $0.stage == .inBed }).map(\.start).min(),
+           inBedFirst < recordedStart {
             let key = Self.sleepEditLeadingCursorKey(row.night)
             let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
             if let cursor = try context.fetch(descriptor).first {
-                if first < cursor.last { cursor.last = first; changed = true }
+                if inBedFirst < cursor.last { cursor.last = inBedFirst; changed = true }
             } else {
-                context.insert(StoredCursor(kindRaw: key, last: first))
+                context.insert(StoredCursor(kindRaw: key, last: inBedFirst))
+                changed = true
+            }
+        }
+        if let asleepFirst = segments.filter({ $0.stage != .inBed && $0.stage != .awake })
+            .map(\.start).min(), asleepFirst < recordedOnset {
+            let key = Self.sleepEditLeadingAsleepCursorKey(row.night)
+            let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
+            if let cursor = try context.fetch(descriptor).first {
+                if asleepFirst < cursor.last { cursor.last = asleepFirst; changed = true }
+            } else {
+                context.insert(StoredCursor(kindRaw: key, last: asleepFirst))
                 changed = true
             }
         }
@@ -1065,11 +1265,19 @@ struct LocalStore {
         for row in rows where row.isManuallyEdited {
             let recordedStart = row.sleepEditRecordedInBedStart
             let recordedEnd = row.sleepEditRecordedInBedEnd
-            if row.editedInBedStart < recordedStart,
-               first <= row.editedInBedStart, last >= recordedEnd,
-               (try? sleepEditLeadingWatermark(row.night)) == nil {
+            let recordedOnset = row.sleepEditRecordedOnset > .distantPast
+                ? row.sleepEditRecordedOnset : recordedStart
+            if row.editedInBedStart < recordedStart, first <= row.editedInBedStart,
+               last >= recordedEnd, (try? sleepEditLeadingWatermark(row.night)) == nil {
                 context.insert(StoredCursor(kindRaw: Self.sleepEditLeadingCursorKey(row.night),
                                             last: row.editedInBedStart))
+                changed = true
+            }
+            let editedOnset = row.sleepEditCurrentOnset
+            if editedOnset < recordedOnset, first <= editedOnset, last >= recordedEnd,
+               (try? sleepEditLeadingAsleepWatermark(row.night)) == nil {
+                context.insert(StoredCursor(kindRaw: Self.sleepEditLeadingAsleepCursorKey(row.night),
+                                            last: editedOnset))
                 changed = true
             }
         }
