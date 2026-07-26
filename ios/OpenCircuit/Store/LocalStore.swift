@@ -229,7 +229,12 @@ final class StoredSleepSummary {
     }
     var sleepEditCurrentOnset: Date {
         guard isManuallyEdited else { return sleepOnset }
-        return SleepEditOnsetOverlay.load(night: night) ?? editedInBedStart
+        if let onset = SleepEditOnsetOverlay.load(night: night) { return onset }
+        // A night edited under the pre-3-anchor editor (or one whose overlay desynced) has no stored
+        // onset: fall back to the RECORDED onset clamped into the edited window — never bedtime, which
+        // would read as onset==bedtime / 100% efficiency.
+        let recorded = sleepOnset > .distantPast ? sleepOnset : editedInBedStart
+        return min(max(recorded, editedInBedStart), editedInBedEnd)
     }
     var sleepEditCurrentWake: Date {
         isManuallyEdited ? editedInBedEnd : sleepWake
@@ -251,6 +256,25 @@ private enum SleepEditOnsetOverlay {
 
     static func save(_ onset: Date, night: Date) {
         UserDefaults.standard.set(onset, forKey: key(night))
+    }
+}
+
+/// The UUIDs of the Apple Health sleep samples this app last wrote for an edited night, so a later
+/// edit deletes EXACTLY those (never a nap, never another night) before rewriting — mirroring the
+/// menstrual-flow UUID-tracked delete/replace. UserDefaults (keyed by night) avoids a SwiftData
+/// migration, matching the onset overlay above.
+enum SleepEditHealthSampleOverlay {
+    private static func key(_ night: Date) -> String {
+        let day = Calendar.current.startOfDay(for: night).timeIntervalSince1970
+        return "sleep.edit.hkuuids.\(day)"
+    }
+
+    static func load(night: Date) -> [String] {
+        UserDefaults.standard.stringArray(forKey: key(night)) ?? []
+    }
+
+    static func save(_ uuids: [String], night: Date) {
+        UserDefaults.standard.set(uuids, forKey: key(night))
     }
 }
 
@@ -770,13 +794,31 @@ struct LocalStore {
     /// Advance the `.sleep` cursor past the night just written to Apple Health.
     func markSleepWritten(_ segments: [SleepSegment]) throws {
         guard let latest = segments.map(\.end).max() else { return }
+        try forceSleepCursorAtLeast(latest)
+    }
+
+    /// Ensure the forward `.sleep` watermark is at least `date`. Used after a TRIM reconcile so the
+    /// deleted recorded tail `(editedWake, recordedWake]` can never be re-presented as "new" by
+    /// `pendingHealthSleep` on a later full-base flush (which would re-add the trimmed sleep).
+    func forceSleepCursorAtLeast(_ date: Date) throws {
         var cursor = try loadCursor()
-        guard cursor.isNew(.sleep, latest) else { return }
-        cursor.advance(.sleep, to: latest)
+        guard cursor.isNew(.sleep, date) else { return }
+        cursor.advance(.sleep, to: date)
         if let last = cursor.last(.sleep) {
             upsertCursor(kind: MetricKind.sleep.rawValue, last: last)
         }
         try context.save()
+    }
+
+    /// The Apple Health sleep-sample UUIDs this app last wrote for `night` (edit delete/replace).
+    func sleepEditHealthUUIDs(night: Date) -> [String] {
+        SleepEditHealthSampleOverlay.load(night: night)
+    }
+
+    /// Remember the Apple Health sleep-sample UUIDs written for `night`, so the next edit deletes
+    /// exactly those and nothing else.
+    func setSleepEditHealthUUIDs(_ uuids: [String], night: Date) {
+        SleepEditHealthSampleOverlay.save(uuids, night: night)
     }
 
     /// Advance the Health watermark past the newest written sample per kind.
