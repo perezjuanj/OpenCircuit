@@ -287,6 +287,37 @@ enum SleepEditHealthSampleOverlay {
     }
 }
 
+/// A sleep-edit Health reconcile that couldn't run because the periodic flush held the Health-write
+/// gate. Persisted so the NEXT flush drains it — otherwise a trim made while a flush was in flight
+/// would silently never reach Apple Health (the flush's own sleep path is append-only and can't trim).
+struct PendingSleepReconcile: Codable {
+    var night: Date
+    var inBedStart: Date
+    var sleepOnset: Date
+    var sleepWake: Date
+    var segments: [SleepSegment]
+}
+
+enum PendingSleepReconcileStore {
+    private static let key = "sleep.edit.pending-reconcile.v1"
+
+    static func all() -> [PendingSleepReconcile] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([PendingSleepReconcile].self, from: data)) ?? []
+    }
+
+    static func upsert(_ item: PendingSleepReconcile) {
+        var items = all().filter { Calendar.current.isDate($0.night, inSameDayAs: item.night) == false }
+        items.append(item)
+        UserDefaults.standard.set(try? JSONEncoder().encode(items), forKey: key)
+    }
+
+    static func clear(night: Date) {
+        let items = all().filter { Calendar.current.isDate($0.night, inSameDayAs: night) == false }
+        UserDefaults.standard.set(try? JSONEncoder().encode(items), forKey: key)
+    }
+}
+
 /// Per-day rollups for values that are NOT epoch samples and must NOT flow through the
 /// cumulative-counter `ingest` path (which computes HealthKit deltas). Currently the
 /// ring's onboard step count for the day. Keyed by `day` (start-of-day) and UPSERTED, so
@@ -835,15 +866,43 @@ struct LocalStore {
         SleepEditHealthSampleOverlay.append(uuids, night: night)
     }
 
+    /// Persist a sleep-edit reconcile deferred because a flush held the Health gate (drained by the
+    /// next flush). Keyed by night — a newer deferral for the same night supersedes the older.
+    func setPendingSleepReconcile(night: Date, times: SleepEdit.Times, segments: [SleepSegment]) {
+        PendingSleepReconcileStore.upsert(.init(night: night, inBedStart: times.inBedStart,
+                                                sleepOnset: times.sleepOnset, sleepWake: times.sleepWake,
+                                                segments: segments))
+    }
+
+    /// The deferred sleep-edit reconciles awaiting a Health-gate-free flush to apply their trim/edit.
+    func pendingSleepReconciles() -> [(night: Date, times: SleepEdit.Times, segments: [SleepSegment])] {
+        PendingSleepReconcileStore.all().map {
+            ($0.night,
+             SleepEdit.Times(inBedStart: $0.inBedStart, sleepOnset: $0.sleepOnset, sleepWake: $0.sleepWake),
+             $0.segments)
+        }
+    }
+
+    func clearPendingSleepReconcile(night: Date) {
+        PendingSleepReconcileStore.clear(night: night)
+    }
+
     /// Windows of naps ALREADY mirrored to Apple Health that overlap `[start, end]`. The sleep-edit
     /// recorded-span cleanup excludes these so a nap the night later widened over (a short first drain
     /// grew by a fuller re-drain) is never deleted from Apple Health.
+    ///
+    /// Uses the UNION of the ORIGINAL and EDITED nap windows: `editNap` keeps `healthWritten == true`
+    /// and does NOT re-mirror, so the actual Health sample may sit at the original `start…end` even
+    /// after the displayed window moved to `editedStart…editedEnd`. Excluding both covers wherever the
+    /// sample actually is.
     func healthWrittenNapWindows(overlapping start: Date, to end: Date) -> [DateInterval] {
         let naps = (try? context.fetch(FetchDescriptor<StoredNap>())) ?? []
         return naps.compactMap { nap in
-            guard nap.healthWritten, nap.effectiveEnd > nap.effectiveStart,
-                  nap.effectiveStart < end, nap.effectiveEnd > start else { return nil }
-            return DateInterval(start: nap.effectiveStart, end: nap.effectiveEnd)
+            guard nap.healthWritten else { return nil }
+            let lo = min(nap.start, nap.effectiveStart)
+            let hi = max(nap.end, nap.effectiveEnd)
+            guard hi > lo, lo < end, hi > start else { return nil }
+            return DateInterval(start: lo, end: hi)
         }
     }
 
