@@ -702,25 +702,37 @@ final class HealthKitWriter {
     /// NOT a value the ring measured — so Health readers can label or filter it (#82-style).
     static let activeEnergyEstimateMetadataKey = "OpenCircuitActiveEnergyEstimated"
 
-    func writeActiveCalories(kcal: Double, date: Date) async throws {
-        guard kcal > 0 else { return }
-        let type = HKQuantityType(.activeEnergyBurned)
-        let quantity = HKQuantity(unit: .kilocalorie(), doubleValue: kcal)
-        let sample = HKQuantitySample(
-            type: type,
-            quantity: quantity,
-            start: date,
-            end: date.addingTimeInterval(3600),
+    /// Build one active-energy sample over an EXPLICIT window. Extracted as a pure static (the same
+    /// seam `menstrualFlowSamples` uses) so the timestamps can be asserted in the app test target —
+    /// `HealthKitWriter` builds a live `HKHealthStore`, so anything that saves cannot be tested.
+    /// Returns nil for non-positive kcal or an inverted/empty window; HealthKit REJECTS `end < start`
+    /// and a throw there would strand the flush watermarks (see `ActiveEnergyWindow`).
+    static func activeEnergySample(kcal: Double, start: Date, end: Date) -> HKQuantitySample? {
+        guard kcal > 0, end > start else { return nil }
+        return HKQuantitySample(
+            type: HKQuantityType(.activeEnergyBurned),
+            quantity: HKQuantity(unit: .kilocalorie(), doubleValue: kcal),
+            start: start,
+            end: end,
             metadata: [Self.activeEnergyEstimateMetadataKey: true,
                        HKMetadataKeyWasUserEntered: false]
         )
-        try await store.save(sample)
     }
 
-    func writeActiveCalories(hrSamples: [HRSample], profile: UserProfile, date: Date) async throws {
-        let maxHR = max(220 - profile.age, 1)
-        let kcal = Calories.activeKcal(hrSamples: hrSamples, maxHR: maxHR)
-        try await writeActiveCalories(kcal: kcal, date: date)
+    /// Write one active-energy delta over the window it accrued in.
+    ///
+    /// WAS `writeActiveCalories(kcal:date:)`, which hardcoded `start: date, end: date + 3600` and was
+    /// only ever called with `date = startOfDay` — so the WHOLE day's active energy piled into Apple
+    /// Health's 00:00–01:00 bar ("it says I burned 300 calories at 12am, while I was laying in bed").
+    /// The daily total was always correct (HealthKit SUMs this type); only the placement was wrong.
+    /// The window now comes from `ActiveEnergyWindow.resolve`. Returns whether a sample was written.
+    @discardableResult
+    func writeActiveCalories(kcal: Double, window: DateInterval) async throws -> Bool {
+        guard let sample = Self.activeEnergySample(kcal: kcal,
+                                                   start: window.start,
+                                                   end: window.end) else { return false }
+        try await store.save(sample)
+        return true
     }
 
     /// One derived resting-HR sample for a day (anchored at start-of-day; HealthKit buckets it
@@ -742,6 +754,11 @@ final class HealthKitWriter {
     private static let basalWatermarkKey = "hk.basalEnergy.nextHour" // first hour not yet written
     private static let activeDayKey = "hk.activeEnergy.day"          // start-of-day of the accumulator
     private static let activeWrittenKey = "hk.activeEnergy.writtenKcal"
+    /// End of the last active-energy window SUCCESSFULLY written — the start of the next one, so
+    /// consecutive deltas tile the day without overlapping (HealthKit SUMs them). Advanced only
+    /// alongside `activeWrittenKey` on a confirmed save; see `ActiveEnergyWindow.resolve` for why
+    /// every read of it is clamped to start-of-day.
+    private static let activeAnchorKey = "hk.activeEnergy.anchorEnd"
     // Exercise minutes (#82) watermark — like active energy, delta-based per day.
     private static let exerciseDayKey     = "hk.exerciseTime.day"         // start-of-day
     private static let exerciseWrittenKey = "hk.exerciseTime.writtenMin"  // total minutes already counted
@@ -973,6 +990,25 @@ final class HealthKitWriter {
         return (today, Calories.restingBaselineBpm(prior: prior))
     }
 
+    /// Earliest moment today's active-energy estimate could have started accruing: the first sample
+    /// that actually fed it. `Calories.dailyEstimate` derives active kcal from qualifying HR samples
+    /// (outside the sleep window) and, when the step channel wins, from the day's step total — so
+    /// nothing it produces can predate the earliest of those observations.
+    ///
+    /// Returns nil when there is no data at all, in which case the caller falls back to start-of-day.
+    /// Pure and static so it is unit-testable without HealthKit.
+    static func earliestActiveEnergyContribution(hrSamples: [HRSample],
+                                                 stepSamples: [StoredStepSample],
+                                                 sleepWindow: DateInterval?) -> Date? {
+        // HR inside the sleep window is excluded from the estimate, so it must not lower the floor.
+        let hrStarts = hrSamples
+            .filter { sample in sleepWindow.map { !$0.contains(sample.start) } ?? true }
+            .map(\.start)
+        // A step snapshot's `start` is its observation window's start (see `StoredStepSample`).
+        let stepStarts = stepSamples.map(\.start)
+        return (hrStarts + stepStarts).min()
+    }
+
     /// Write today's active-energy DELTA (today's HR-derived TRIMP kcal minus what's already
     /// been written today), returning the kcal written. HealthKit SUMS activeEnergyBurned, so
     /// writing the delta lands the running daily total without re-adding it each flush.
@@ -1015,12 +1051,56 @@ final class HealthKitWriter {
         guard delta >= 1.0 else {  // ignore sub-kcal churn; still persist the (reset) day marker
             defaults.set(today.timeIntervalSince1970, forKey: Self.activeDayKey)
             defaults.set(written, forKey: Self.activeWrittenKey)
+            // Deliberately does NOT advance the anchor: this window's energy is still owed, so it
+            // must roll into the next delta's window rather than being silently skipped over.
+            return 0
+        }
+
+        // WHEN this delta accrued, not just how much. Previously every delta was stamped
+        // [startOfDay, +1h] and Health showed the day's whole active burn at midnight (#tester
+        // 2026-07-27).
+        //
+        // The first-flush floor is the earliest moment this energy could possibly have accrued. It
+        // is deliberately NOT just the sleep window's end: `latestSleepSummary` returns the newest
+        // night by date REGARDLESS OF AGE, so on any day whose night never staged — fresh install,
+        // ring on the charger overnight, or a sleep drain that starved, which is precisely the
+        // tester population that reports this — that value predates today, gets clamped away, and
+        // the window collapses back to [00:00, now]. The reported bug would have survived the fix
+        // for exactly the users who hit it. So the floor also takes the earliest sample that
+        // actually FED the estimate: no active energy can predate the first data point it was
+        // derived from, and that bound needs no staged night to exist.
+        let earliestContribution = Self.earliestActiveEnergyContribution(
+            hrSamples: hrSamples,
+            stepSamples: (try? local.stepSamples(from: today, to: now)) ?? [],
+            sleepWindow: sleepWindow
+        )
+        let notBefore = [sleepWindow?.end, earliestContribution].compactMap { $0 }.max()
+
+        // A stored anchor can never legitimately exceed `now`; a clock step-forward (bad RTC before
+        // NTP, restored backup, manual date change) would otherwise wedge active energy off until
+        // wall-clock caught up — a skipped write never advances the anchor, so there is no self-heal
+        // path. Clamp on read, and drop it entirely on a day rollover alongside `written`.
+        let storedAnchor = defaults.double(forKey: Self.activeAnchorKey)
+        var anchor: Date? = storedAnchor > 0 ? Date(timeIntervalSince1970: storedAnchor) : nil
+        if cal.startOfDay(for: storedDay) != today { anchor = nil }
+        if let a = anchor, a > now { anchor = nil }
+
+        guard let window = ActiveEnergyWindow.resolve(anchor: anchor,
+                                                      notBefore: notBefore,
+                                                      now: now,
+                                                      dayStart: today,
+                                                      kcal: delta) else {
+            // No legal window (clock step-back, or two flushes inside the same second). Skip the
+            // write and leave BOTH marks untouched so the kcal is still owed and rides the next
+            // delta — advancing them here would silently drop it.
             return 0
         }
         do {
-            try await writeActiveCalories(kcal: delta, date: today)
+            let wrote = try await writeActiveCalories(kcal: delta, window: window)
+            guard wrote else { return 0 }
             defaults.set(today.timeIntervalSince1970, forKey: Self.activeDayKey)
             defaults.set(total, forKey: Self.activeWrittenKey)
+            defaults.set(window.end.timeIntervalSince1970, forKey: Self.activeAnchorKey)
             return delta
         } catch { pendingFlushFailures.insert(.activeEnergy); return 0 }
     }

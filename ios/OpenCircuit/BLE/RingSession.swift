@@ -2682,27 +2682,24 @@ final class RingSession: NSObject {
         // ordinary daytime background refreshes (far from wake) keep all-day-first. Worst case if
         // mis-timed is a delayed — never dropped — "Last night" summary that self-heals on the next
         // wake / foreground open (adversarial review 2026-07-13, wf verify-drain-reorder-dataloss).
-        let morningCatchUp: Bool = {
-            guard inBackground, let end = nightWindow?.end else { return false }
-            let sinceWake = Date().timeIntervalSince(end)
-            return sinceWake >= 0 && sinceWake <= Self.morningCatchUpWindow
-        }()
-        let sleepFirst = !inBackground || morningCatchUp
-        if sleepFirst, !allDayOnly {
-            await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
-        }
-        if !Task.isCancelled {
-            await drainChannel(channel: Command.syncChannelAllDay, label: "all-day")
-        }
-        if !sleepFirst, !allDayOnly, !Task.isCancelled {
-            await drainChannel(channel: Command.syncChannelSleep, label: "sleep")
-        }
-        // Automatic recognition is ring-side, but its store-and-forward 10-second samples live on
-        // channel 0x02. Drain it only in the foreground and only after the user enables the feature:
-        // it is not worth spending a bounded background wake on workout review data, and the
-        // official two-day retention window means the next foreground open is sufficient.
-        if !inBackground, !allDayOnly, automaticWorkoutDetectionEnabled, !Task.isCancelled {
-            await drainChannel(channel: Command.syncChannelSport, label: "sport")
+        // The order described above now lives in the pure, unit-tested `HistoryDrainPlan` rather
+        // than in inline booleans here — same behaviour, but the #119 invariant (the `allDayOnly`
+        // workout prime must NEVER schedule the sleep channel) is locked by tests instead of prose.
+        //
+        // Automatic workout recognition is ring-side, but its store-and-forward 10-second samples
+        // live on channel 0x02 — `HistoryDrainPlan` appends it foreground-only and last: it is not
+        // worth spending a bounded background wake on workout review data, and the official two-day
+        // retention window means the next foreground open is sufficient.
+        let plan = HistoryDrainPlan.steps(
+            inBackground: inBackground,
+            allDayOnly: allDayOnly,
+            sportEnabled: automaticWorkoutDetectionEnabled,
+            now: Date(),
+            nightWindowEnd: nightWindow?.end,
+            morningCatchUpWindow: Self.morningCatchUpWindow)
+        for step in plan {
+            if Task.isCancelled { break }
+            await drainChannel(channel: step.channel, label: step.label)
         }
         let sportSummary = automaticWorkoutDetectionEnabled
             ? " · sport \(drainCountsByLabel["sport"] ?? 0) samples"
@@ -2833,10 +2830,35 @@ final class RingSession: NSObject {
         // Open at cursor ≈ NOW: the ring streams its un-delivered backlog on this channel up to now
         // and advances its own resume pointer (§3). `syncAll`'s far-future cursor returns empty.
         // status0 re-primes the SM3 challenge per channel (the second open may be re-challenged).
+        // ⚠️ That last clause ("may be re-challenged") is an UNSOURCED hypothesis with no confidence
+        // tag — keep the `status0` (harmless, and the official app does re-auth per connection) but
+        // do NOT reason from it. In particular it is NOT a workaround for a per-connection open
+        // limit: whether such a limit exists is an open 🟡 question (see `HistoryDrainPlan`), and
+        // sending `01 00 00` before every open plainly does not prevent the failure this tester saw.
+        // Track whether the open actually got onto the wire. `write` returns false when the link is
+        // down/half-open and it dropped the bytes; before this, drainChannel ignored that and then
+        // sat in the tick loop below for 12–45 s waiting for a reply to a command the ring never
+        // received — burning a bounded background window and reporting `noAck`, which reads as "the
+        // ring refused" (see `HistoryChannelOutcome.linkDown`).
+        var openDelivered = true
         for cmd in [Command.status0, open, Command.fetch] {   // 81 00 challenge → reactive SM3 auth (#54)
-            write(cmd)
+            if !write(cmd) { openDelivered = false }
             try? await Task.sleep(for: .milliseconds(300))
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                // Was returning WITHOUT finishing the trace, leaving `activeDrainTrace` dangling and
+                // this channel with no breadcrumb at all — the tick loop's cancel branch below always
+                // finished it. Matched up so a cancelled channel is visible in diagnostics either way.
+                finishActiveDrainTrace(.cancelled)
+                return
+            }
+        }
+        if !openDelivered {
+            activeDrainTrace?.openWriteFailed = true
+            ringLog.notice("sync: ch=\(label, privacy: .public) ABORT — link unusable, open never sent")
+            print("[OC] sync ABORT ch=\(label) link-down")
+            finishActiveDrainTrace(.linkUnusable)
+            drainCountsByLabel[label] = 0
+            return
         }
         var firstPageTick: Int? = nil
         for tick in 0 ..< 45 {
@@ -2844,6 +2866,25 @@ final class RingSession: NSObject {
             if Task.isCancelled {
                 finishActiveDrainTrace(.cancelled)
                 return
+            }
+            // Link died mid-drain with NOTHING received → stop waiting; no page can arrive on a
+            // dead link no matter how long we sit here, so the remaining 12–45 s is pure waste.
+            //
+            // ⚠️ GATED ON `activeDrainPageCount == 0` ON PURPOSE — do not "simplify" this to bail
+            // whenever the link drops. Once pages HAVE arrived, the shipped path is: pages stop,
+            // `syncQuietTicks` reaches 3, the loop exits `.quietAfterPages`, and
+            // `HistoryChannelTrace.outcome` returns `.complete` (page4CCount > 0 && quietAfterPages)
+            // — which is what lets the night COMMIT. Exiting `.linkUnusable` instead would fall
+            // through to `.partial`, whose `allowsSleepCommit` is false, and a sleep drain that had
+            // already delivered its pages would be silently discarded. That is the night-losing
+            // regression this project has shipped before; the pages are banked either way, but the
+            // classification decides whether they are staged. Zero pages can never be `.complete`,
+            // so bailing there changes no verdict — it only stops the wait.
+            if !canWriteCommands, activeDrainPageCount == 0 {
+                ringLog.notice("sync: ch=\(label, privacy: .public) link lost at \(tick)s with no pages — abandoning channel")
+                activeDrainTrace?.openWriteFailed = true
+                finishActiveDrainTrace(.linkUnusable)
+                break
             }
             // Count seconds since the last page (the frame handler zeroes `syncQuietTicks` on every
             // 0x47/0x4c). The quiet-exit only applies once pages have actually started this channel,
@@ -3216,10 +3257,17 @@ final class RingSession: NSObject {
     }
 
 
-    private func write(_ bytes: [UInt8]) {
+    /// Send one command. Returns whether it actually reached CoreBluetooth — `false` means the link
+    /// was unusable and the bytes were DROPPED. Callers that need the ring to answer (the history
+    /// drain's sync-open) must check this: silently dropping the open and then waiting out the full
+    /// timeout for a reply that can never come is exactly how the all-day channel was being
+    /// mis-reported as `noAck` for a whole day (see `HistoryDrainPlan`). Discardable because the
+    /// fire-and-forget callers (keepalive, page acks) genuinely don't care.
+    @discardableResult
+    private func write(_ bytes: [UInt8]) -> Bool {
         guard let writeChar else {
             ringLog.warning("write DROPPED (no writeChar yet): \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
-            return
+            return false
         }
         guard canWriteCommands else {
             let state: String
@@ -3234,7 +3282,7 @@ final class RingSession: NSObject {
             let detail = "skipped state=\(state) ready=\(ready) notify=\(notifySubscribed) bytes=\(hex)"
             observability.recordMetricEvent(source: "ble-write", detail: detail)
             ringLog.warning("write SKIPPED (unusable link): \(detail, privacy: .public)")
-            return
+            return false
         }
         if captureRawFrames {
             rawCaptureLog.append("Write 0x0802 " + bytes.map { String(format: "%02x", $0) }.joined(separator: " "))
@@ -3242,6 +3290,7 @@ final class RingSession: NSObject {
         // Write char advertises `write` (with response).
         ringLog.debug("→ write \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
         peripheral.writeValue(Data(bytes), for: writeChar, type: .withResponse)
+        return true
     }
 
     /// Recover a half-open link. On a restored / already-connected reconnect, the persisted
