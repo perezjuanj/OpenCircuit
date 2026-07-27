@@ -9,6 +9,13 @@ public enum HistoryChannelOutcome: String, Codable, Sendable {
     case partial
     case ppgOnly
     case noAck
+    /// The channel's sync-open never reached the wire — the BLE link was down or half-open, so
+    /// `RingSession.write` dropped the commands. Split out of `.noAck` (2026-07-27) because the two
+    /// were being conflated in tester diagnostics and they mean opposite things: `.noAck` says the
+    /// RING was asked and stayed silent (a protocol/cursor signal worth investigating), while this
+    /// says WE never asked (a connectivity problem, and the ring is exonerated). A tester export
+    /// showing 27 all-day `noAck`s looked like a ring-side channel limit; it was a flaky link.
+    case linkDown
 
     /// Safe to re-stage/persist sleep from this channel.
     public var allowsSleepCommit: Bool { self == .complete }
@@ -20,6 +27,10 @@ public enum HistoryChannelExitReason: String, Codable, Sendable {
     case quietNoPages
     case hardTimeout
     case cancelled
+    /// Abandoned because the link went unusable — either the opens could not be written at all, or
+    /// it dropped mid-drain. Distinct from `.hardTimeout`/`.quietNoPages`, which mean we waited out
+    /// a live link and heard nothing.
+    case linkUnusable
 }
 
 public struct HistoryChannelTrace: Equatable, Codable, Sendable {
@@ -34,6 +45,17 @@ public struct HistoryChannelTrace: Equatable, Codable, Sendable {
     /// was already drained. byte[1]=0x00 in prior real-cursor ACKs that DID stream pages).
     /// When true with no pages, the drain can exit early instead of waiting the full 45s cap.
     public var sawEmptyHistorySignal = false
+    /// The channel's sync-open commands never reached the wire — `RingSession.write` dropped them
+    /// because the link was down or half-open. Drives `.linkDown`.
+    ///
+    /// OPTIONAL ON PURPOSE, do not "tidy" it to a defaulted `Bool`. `ObservabilityStore` persists
+    /// these traces as JSON and decodes them with `try? JSONDecoder().decode([HistorySyncEvidence]…)`,
+    /// falling back to `[]` on any error. Swift's SYNTHESIZED decoder does not fall back to a
+    /// property's default when its key is absent — it throws `keyNotFound` — so adding a
+    /// non-optional field here would make every previously-stored evidence bundle fail to decode
+    /// and silently wipe the user's whole diagnostics history on upgrade. An Optional decodes via
+    /// `decodeIfPresent` and simply reads back `nil` for traces written before this field existed.
+    public var openWriteFailed: Bool?
     public var page4CCount = 0
     public var page47Count = 0
     public var endMarkerCount = 0
@@ -62,6 +84,9 @@ public struct HistoryChannelTrace: Equatable, Codable, Sendable {
         if page4CCount > 0 { return .partial }
         if page47Count > 0 { return .ppgOnly }
         if sawSyncAck { return .empty }
+        // Ordered AFTER every "we heard something" branch: if pages or an ACK arrived, the link
+        // plainly worked and a stale write-failure flag must not override real evidence.
+        if openWriteFailed == true { return .linkDown }
         return .noAck
     }
 }

@@ -209,4 +209,64 @@ final class HealthKitShareTypesTests: XCTestCase {
             accuracy: 0.001
         )
     }
+
+    // MARK: Active-energy sample windows (tester 2026-07-27: "300 calories at 12am")
+
+    /// Every active-energy delta used to be stamped `[startOfDay, startOfDay + 1h]`, so Apple
+    /// Health apportioned the whole day's active burn into the midnight bar. The sample must now
+    /// carry the window the energy actually accrued in, verbatim — no re-anchoring, no fixed width.
+    func testActiveEnergySampleCarriesItsWindowVerbatim() throws {
+        let start = Date(timeIntervalSince1970: 1_785_027_000)
+        let end = start.addingTimeInterval(37 * 60)
+        let sample = try XCTUnwrap(HealthKitWriter.activeEnergySample(kcal: 42.5, start: start, end: end))
+        XCTAssertEqual(sample.startDate, start)
+        XCTAssertEqual(sample.endDate, end)
+        XCTAssertNotEqual(sample.endDate, start.addingTimeInterval(3600),
+                          "the hardcoded 1-hour window must not come back")
+        XCTAssertEqual(sample.quantity.doubleValue(for: .kilocalorie()), 42.5, accuracy: 0.001)
+        XCTAssertEqual(sample.quantityType, HKQuantityType(.activeEnergyBurned))
+    }
+
+    /// The sample stays labelled a derived ESTIMATE — it is a Keytel/steps model, not a ring reading.
+    func testActiveEnergySampleKeepsItsEstimateMetadata() {
+        let start = Date(timeIntervalSince1970: 1_785_027_000)
+        let sample = HealthKitWriter.activeEnergySample(kcal: 10, start: start,
+                                                        end: start.addingTimeInterval(600))
+        XCTAssertEqual(sample?.metadata?[HealthKitWriter.activeEnergyEstimateMetadataKey] as? Bool, true)
+        XCTAssertEqual(sample?.metadata?[HKMetadataKeyWasUserEntered] as? Bool, false)
+    }
+
+    /// HKHealthStore.save REJECTS `end < start`, and a throw inside `flushActiveCalories` leaves the
+    /// kcal watermark AND the window anchor unadvanced — active energy would then fail on every
+    /// later flush until wall-clock passed the anchor. Refuse to build the sample instead.
+    func testActiveEnergySampleRefusesInvalidInputs() {
+        let start = Date(timeIntervalSince1970: 1_785_027_000)
+        XCTAssertNil(HealthKitWriter.activeEnergySample(kcal: 0, start: start,
+                                                        end: start.addingTimeInterval(600)),
+                     "zero kcal must not produce a sample")
+        XCTAssertNil(HealthKitWriter.activeEnergySample(kcal: -5, start: start,
+                                                        end: start.addingTimeInterval(600)),
+                     "negative kcal must not produce a sample")
+        XCTAssertNil(HealthKitWriter.activeEnergySample(kcal: 10, start: start, end: start),
+                     "zero-width window must not produce a sample")
+        XCTAssertNil(HealthKitWriter.activeEnergySample(kcal: 10, start: start,
+                                                        end: start.addingTimeInterval(-60)),
+                     "inverted window must not produce a sample")
+    }
+
+    /// End-to-end on the seam the flush actually uses: the Kit resolves the window, the app target
+    /// stamps it. Pins the reported symptom — nothing lands in the midnight hour on a normal day.
+    func testResolvedWindowForAWakeCatchUpFlushNeverTouchesMidnight() throws {
+        let dayStart = Date(timeIntervalSince1970: 1_785_000_000)
+        let wake = dayStart.addingTimeInterval(7.5 * 3600)
+        let now = dayStart.addingTimeInterval(9 * 3600)
+        let window = try XCTUnwrap(ActiveEnergyWindow.resolve(anchor: nil, notBefore: wake,
+                                                              now: now, dayStart: dayStart))
+        let sample = try XCTUnwrap(HealthKitWriter.activeEnergySample(kcal: 300,
+                                                                      start: window.start,
+                                                                      end: window.end))
+        XCTAssertEqual(sample.startDate, wake)
+        XCTAssertGreaterThan(sample.startDate, dayStart.addingTimeInterval(3600),
+                             "no active energy may be attributed to the 00:00–01:00 bar")
+    }
 }
