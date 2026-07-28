@@ -45,7 +45,7 @@ struct TrendsData {
         let inBedStart, inBedEnd: Date
     }
     struct TempRow: Sendable { let time: Date; let celsius: Double }
-    struct StepRow: Sendable { let end: Date; let delta: Int }
+    struct StepRow: Sendable { let start: Date; let end: Date; let delta: Int }
 
     struct Inputs: Sendable {
         var summaryByNight: [Date: SleepRow]
@@ -92,7 +92,7 @@ struct TrendsData {
         let temps = ((try? store.daytimeTemperatures(from: lookbackStart, to: now)) ?? [])
             .map { TempRow(time: $0.time, celsius: $0.celsius) }
         let stepDeltas = ((try? store.stepSamples(from: lookbackStart, to: now)) ?? [])
-            .map { StepRow(end: $0.end, delta: $0.delta) }
+            .map { StepRow(start: $0.start, end: $0.end, delta: $0.delta) }
         return Inputs(summaryByNight: summaryByNight, stepsByDay: stepsByDay,
                       hr: hr, hrv: hrv, spo2: spo2, rr: rr, temps: temps, stepDeltas: stepDeltas,
                       profile: HealthKitWriter.storedUserProfile(), tempUnitRaw: tempUnitRaw)
@@ -125,10 +125,21 @@ struct TrendsData {
             let daySteps = i.stepsByDay[day]
             let dayHRSamples = i.hr.filter { dayWindow.contains($0.start) }
                 .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+            // Per-snapshot step windows for THIS day, so active energy is attributed to when it was
+            // earned (see `Calories.dailyEstimate`). A day with no step rows degrades to the
+            // pre-attribution number automatically. NOTE: Trends recomputes history from stored
+            // samples, so days that predate attribution now read higher here than the
+            // activeEnergyBurned samples already sitting in Apple Health for those days —
+            // `flushActiveCalories` only ever writes TODAY and never backfills. Trends is
+            // internally consistent; Health keeps what it was given at the time.
+            let dayStepWindows = i.stepDeltas
+                .filter { $0.end >= day && $0.start < dayWindow.end }
+                .map { StepWindow(start: $0.start, end: $0.end, delta: $0.delta) }
             let activityEstimate: Calories.DailyEstimate? =
                 (daySteps != nil || !dayHRSamples.isEmpty)
                 ? Calories.dailyEstimate(hrSamples: dayHRSamples, steps: daySteps ?? 0,
-                                         profile: i.profile, sleepWindow: window)
+                                         profile: i.profile, sleepWindow: window,
+                                         stepWindows: dayStepWindows, dayStart: day)
                 : nil
 
             return TrendsEngine.DailyPoint(

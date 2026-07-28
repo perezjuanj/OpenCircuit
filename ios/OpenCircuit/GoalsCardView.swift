@@ -38,10 +38,20 @@ struct GoalsCardView: View {
     /// Today's naps (#nap-parity) — folded into the daily sleep total, matching RingConn's
     /// sleepNapAvgTimeLength. Detected OUTSIDE the main night, so no double-count.
     @Query private var todayNaps: [StoredNap]
+    /// Per-snapshot step deltas, so active energy can be attributed to WHEN it was earned. Fetched
+    /// from yesterday so a snapshot straddling midnight still contributes its in-day share. Must
+    /// stay in lockstep with `HealthKitWriter.flushActiveCalories` — this card and Apple Health
+    /// have to show the same number.
+    @Query private var recentStepSamples: [StoredStepSample]
 
     init() {
         let dayStart = Calendar.current.startOfDay(for: Date())
+        let stepsFrom = dayStart.addingTimeInterval(-86_400)
         let hrKind = MetricKind.heartRate.rawValue
+
+        _recentStepSamples = Query(FetchDescriptor<StoredStepSample>(
+            predicate: #Predicate { $0.start >= stepsFrom },
+            sortBy: [SortDescriptor(\.start, order: .forward)]))
 
         _todayNaps = Query(FetchDescriptor<StoredNap>(
             predicate: #Predicate { $0.start >= dayStart },
@@ -83,8 +93,8 @@ struct GoalsCardView: View {
     /// so they re-run on new data (HR count grows, steps, profile, or last night) and never on an
     /// unrelated re-render.
     private var goalsInputsKey: String {
-        "\(todayHR.count)|\(currentSteps)|\(age)|\(weightKg)|\(heightCm)|\(sexRaw)|"
-        + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)"
+        "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(weightKg)|"
+        + "\(heightCm)|\(sexRaw)|\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)"
     }
 
     // MARK: Computed values
@@ -215,12 +225,18 @@ struct GoalsCardView: View {
                 guard s.inBedStart > Date.distantPast, s.inBedEnd > s.inBedStart else { return nil }
                 return DateInterval(start: s.inBedStart, end: s.inBedEnd)
             }
+            let stepWindows = recentStepSamples.map {
+                StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
+            }
+            let dayStart = Calendar.current.startOfDay(for: Date())
             let result = await Task.detached { () -> Calories.DailyEstimate in
                 Calories.dailyEstimate(
                     hrSamples: samples,
                     steps: steps,
                     profile: profile,
-                    sleepWindow: sleepWindow
+                    sleepWindow: sleepWindow,
+                    stepWindows: stepWindows,
+                    dayStart: dayStart
                 )
             }.value
             cachedActiveKcal = result.activeKcal

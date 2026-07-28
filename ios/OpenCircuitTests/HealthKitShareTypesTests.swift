@@ -270,3 +270,114 @@ final class HealthKitShareTypesTests: XCTestCase {
                              "no active energy may be attributed to the 00:00–01:00 bar")
     }
 }
+
+/// `HealthKitWriter.beginActiveEnergyDay` — the day-rollover reset.
+///
+/// Five independent review lenses found the same blocker here before release: stamping only the
+/// day marker on a flush that writes nothing left YESTERDAY's `writtenKcal` in place, so the next
+/// flush seeded every one of today's buckets as already paid and Apple Health stayed silent for
+/// the rest of the day. That is the very symptom the attribution change exists to fix.
+@MainActor
+final class ActiveEnergyDayRolloverTests: XCTestCase {
+
+    private var defaults: UserDefaults!
+    private let suite = "ActiveEnergyDayRolloverTests"
+
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.removePersistentDomain(forName: suite)
+        defaults = UserDefaults(suiteName: suite)
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removePersistentDomain(forName: suite)
+        defaults = nil
+        super.tearDown()
+    }
+
+    private var cal: Calendar {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "America/New_York")!
+        return c
+    }
+
+    private func day(_ offsetDays: Int) -> Date {
+        cal.startOfDay(for: Date(timeIntervalSince1970: 1_753_660_800)
+            .addingTimeInterval(Double(offsetDays) * 86_400))
+    }
+
+    /// THE regression. Yesterday ended at 450 kcal; today's first flush writes nothing (a sub-gate
+    /// morning). The reset must already be persisted, so the SECOND flush still sees a clean day.
+    func testRolloverResetSurvivesAFlushThatWritesNothing() {
+        defaults.set(day(0).timeIntervalSince1970, forKey: HealthKitWriter.activeDayKey)
+        defaults.set(450.0, forKey: HealthKitWriter.activeWrittenKey)
+        defaults.set([10.0, 20.0], forKey: HealthKitWriter.activeBucketKcalKey)
+        defaults.set(day(0).timeIntervalSince1970, forKey: HealthKitWriter.activeBucketSeedDayKey)
+        defaults.set(450.0, forKey: HealthKitWriter.activeSavedKey)
+        defaults.set("America/New_York", forKey: HealthKitWriter.activeDayTZKey)
+
+        let first = HealthKitWriter.beginActiveEnergyDay(defaults, today: day(1), calendar: cal,
+                                                         timeZoneID: "America/New_York")
+        XCTAssertTrue(first.isNewDay)
+        XCTAssertEqual(first.written, 0)
+
+        // No write happens. The next flush must NOT see yesterday's 450.
+        let second = HealthKitWriter.beginActiveEnergyDay(defaults, today: day(1), calendar: cal,
+                                                          timeZoneID: "America/New_York")
+        XCTAssertFalse(second.isNewDay)
+        XCTAssertEqual(second.written, 0, "yesterday's total must not survive into today")
+        XCTAssertNil(defaults.array(forKey: HealthKitWriter.activeBucketKcalKey))
+        XCTAssertNil(defaults.object(forKey: HealthKitWriter.activeBucketSeedDayKey))
+        XCTAssertEqual(defaults.double(forKey: HealthKitWriter.activeSavedKey), 0)
+    }
+
+    func testSameDayFlushPreservesEverything() {
+        defaults.set(day(1).timeIntervalSince1970, forKey: HealthKitWriter.activeDayKey)
+        defaults.set(120.0, forKey: HealthKitWriter.activeWrittenKey)
+        defaults.set([10.0, 20.0], forKey: HealthKitWriter.activeBucketKcalKey)
+        defaults.set("America/New_York", forKey: HealthKitWriter.activeDayTZKey)
+
+        let state = HealthKitWriter.beginActiveEnergyDay(defaults, today: day(1), calendar: cal,
+                                                         timeZoneID: "America/New_York")
+        XCTAssertFalse(state.isNewDay)
+        XCTAssertEqual(state.written, 120)
+        XCTAssertEqual(defaults.array(forKey: HealthKitWriter.activeBucketKcalKey) as? [Double],
+                       [10.0, 20.0])
+    }
+
+    /// Flying west makes `startOfDay` map the stored marker onto the previous calendar day, so the
+    /// rollover test fires MID-DAY over a day Health already holds writes for. Resetting there
+    /// would re-pay the whole morning, and `activeEnergyBurned` SUMS — it could never be undone.
+    func testTravellingWestIsNotTreatedAsANewDay() {
+        var london = Calendar(identifier: .gregorian)
+        london.timeZone = TimeZone(identifier: "Europe/London")!
+        let londonMidnight = london.startOfDay(for: Date(timeIntervalSince1970: 1_753_660_800))
+
+        defaults.set(londonMidnight.timeIntervalSince1970, forKey: HealthKitWriter.activeDayKey)
+        defaults.set(601.0, forKey: HealthKitWriter.activeWrittenKey)
+        defaults.set(601.0, forKey: HealthKitWriter.activeSavedKey)
+        defaults.set("Europe/London", forKey: HealthKitWriter.activeDayTZKey)
+        defaults.set(londonMidnight.timeIntervalSince1970,
+                     forKey: HealthKitWriter.activeBucketSeedDayKey)
+
+        var newYork = Calendar(identifier: .gregorian)
+        newYork.timeZone = TimeZone(identifier: "America/New_York")!
+        let nyToday = newYork.startOfDay(for: londonMidnight.addingTimeInterval(14 * 3600))
+
+        let state = HealthKitWriter.beginActiveEnergyDay(defaults, today: nyToday,
+                                                         calendar: newYork,
+                                                         timeZoneID: "America/New_York")
+        XCTAssertFalse(state.isNewDay, "a time-zone change is travel, not a rollover")
+        XCTAssertEqual(state.written, 601)
+        XCTAssertEqual(defaults.double(forKey: HealthKitWriter.activeSavedKey), 601)
+        XCTAssertNil(defaults.object(forKey: HealthKitWriter.activeBucketSeedDayKey),
+                     "marks must be re-seeded onto the new day grid")
+    }
+
+    func testFirstEverRunResetsCleanly() {
+        let state = HealthKitWriter.beginActiveEnergyDay(defaults, today: day(1), calendar: cal,
+                                                         timeZoneID: "America/New_York")
+        XCTAssertTrue(state.isNewDay)
+        XCTAssertEqual(state.written, 0)
+    }
+}

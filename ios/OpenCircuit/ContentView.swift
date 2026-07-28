@@ -1811,10 +1811,18 @@ struct CaloriesCardView: View {
     @Query private var todayDaily: [StoredDaily]
     /// Latest sleep window, excluded from elevated-HR activity just like the Goals card.
     @Query private var latestSleep: [StoredSleepSummary]
+    /// Per-snapshot step deltas — see the same query in `GoalsCardView`. Required for the
+    /// time-attributed active-energy estimate, and kept identical here so this card, the Goals
+    /// rings and Apple Health can never disagree.
+    @Query private var recentStepSamples: [StoredStepSample]
 
     init() {
         let hr = MetricKind.heartRate.rawValue
         let dayStart = Calendar.current.startOfDay(for: Date())
+        let stepsFrom = dayStart.addingTimeInterval(-86_400)
+        _recentStepSamples = Query(
+            filter: #Predicate<StoredStepSample> { $0.start >= stepsFrom },
+            sort: \.start)
         // Match GoalsCardView's HR query exactly: same start-of-day lower bound AND the `value > 0`
         // guard, so a stray 0-bpm sample can't skew the active-calorie estimate and the two cards
         // read the same today's-HR set.
@@ -1836,7 +1844,8 @@ struct CaloriesCardView: View {
     @State private var cachedActiveKcal: Double = 0
     /// Identity for the recompute `.task` — the HR count, today's steps, and the profile inputs.
     private var caloriesInputsKey: String {
-        "\(hrSamples.count)|\(todayDaily.first?.steps ?? 0)|\(age)|\(weightKg)|\(heightCm)|\(sexRaw)|"
+        "\(hrSamples.count)|\(todayDaily.first?.steps ?? 0)|\(recentStepSamples.count)|"
+        + "\(age)|\(weightKg)|\(heightCm)|\(sexRaw)|"
         + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)"
     }
 
@@ -1886,12 +1895,18 @@ struct CaloriesCardView: View {
                 guard s.inBedStart > Date.distantPast, s.inBedEnd > s.inBedStart else { return nil }
                 return DateInterval(start: s.inBedStart, end: s.inBedEnd)
             }
+            let stepWindows = recentStepSamples.map {
+                StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
+            }
+            let dayStart = Calendar.current.startOfDay(for: Date())
             cachedActiveKcal = await Task.detached {
                 Calories.dailyEstimate(
                     hrSamples: samples,
                     steps: steps,
                     profile: profile,
-                    sleepWindow: sleepWindow
+                    sleepWindow: sleepWindow,
+                    stepWindows: stepWindows,
+                    dayStart: dayStart
                 ).activeKcal
             }.value
         }

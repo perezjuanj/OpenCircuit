@@ -168,14 +168,98 @@ public enum Calories {
     public struct DailyEstimate: Equatable, Sendable {
         public let activeKcal: Double
         public let elevatedMinutes: Double
+        /// Chronological, non-overlapping time attribution of `activeKcal`. Invariant:
+        /// `buckets.map(\.activeKcal).reduce(0,+) == activeKcal` whenever attribution ran.
+        /// EMPTY when the inputs could not support it — see `dailyEstimate`'s degrade rule.
+        public let buckets: [EnergyBucket]
 
-        public init(activeKcal: Double, elevatedMinutes: Double) {
+        public init(activeKcal: Double, elevatedMinutes: Double, buckets: [EnergyBucket] = []) {
             self.activeKcal = activeKcal
             self.elevatedMinutes = elevatedMinutes
+            self.buckets = buckets
         }
     }
 
+    /// Width of one attribution bucket. This is PLACEMENT metadata only: the day total is
+    /// bucket-width-invariant because overlap between the HR and step channels is netted on the
+    /// real overlap, not on a grid cell. Changing this changes which Apple Health hour bar a
+    /// sample lands in, never how many kcal the day holds. 15 min divides an hour exactly, so a
+    /// bucket never straddles two bars.
+    public static let energyBucketSeconds: TimeInterval = 15 * 60
+
+    /// Defensive upper bound on how far past `dayStart` attribution will place energy. Wider than
+    /// any real calendar day (25 h at a DST fall-back) so it never truncates legitimate data;
+    /// steps beyond it are recovered by the residual reconciliation in `attributedDailyEstimate`.
+    static let maxAttributionSeconds: TimeInterval = 26 * 3600
+
+    /// One slice of the day with the active energy attributed to it, split by source.
+    public struct EnergyBucket: Equatable, Sendable {
+        public let start: Date
+        public let end: Date
+        /// Keytel energy of the elevated-HR time inside this bucket.
+        public let hrKcal: Double
+        /// Walking energy credited here — already netted against `hrKcal` where the two overlap,
+        /// so a walk that raised heart rate is paid once, by whichever channel valued it higher.
+        public let stepKcal: Double
+        public let elevatedMinutes: Double
+
+        public init(start: Date, end: Date, hrKcal: Double, stepKcal: Double,
+                    elevatedMinutes: Double) {
+            self.start = start
+            self.end = end
+            self.hrKcal = hrKcal
+            self.stepKcal = stepKcal
+            self.elevatedMinutes = elevatedMinutes
+        }
+
+        public var activeKcal: Double { hrKcal + stepKcal }
+    }
+
+    /// One internally-consistent daily activity estimate (see the type docs above).
+    ///
+    /// Pass `stepWindows` + `dayStart` to get TIME-ATTRIBUTED energy; omit them and the result is
+    /// byte-identical to the pre-attribution behaviour. The degrade is deliberate and load-bearing:
+    /// a call site that has not been updated, or a day whose step rows predate per-snapshot step
+    /// history, produces exactly the old number with no buckets rather than a silently different
+    /// one. (Trends DOES pass both for every day in its lookback, so historical days there are
+    /// re-priced and read higher than the samples already sitting in Apple Health for those days —
+    /// deliberate, and documented at that call site. Only days with no step rows stay put.)
+    ///
+    /// WHY attribution exists: the legacy estimate is `max(hrKcal, stepKcal)` over two WHOLE-DAY
+    /// snapshots. Once the last bout above the elevated-HR threshold ends, `elevatedMinutes` stops
+    /// growing, so `hrKcal` is exactly constant — and the step channel is worth only
+    /// `0.000124 x weightKg` kcal/step, so it needs ~27-40k steps to overtake a 300 kcal `hrKcal`
+    /// and the `max()` never switches. A tester's whole afternoon (a 25-minute, 2,100-step walk
+    /// home at ~90 bpm) was therefore worth 0.000 kcal, `HealthKitWriter.flushActiveCalories`
+    /// computed a zero delta on every flush for 5.5 hours, and Apple Health showed a hard stop at
+    /// 2pm (2026-07-28). Attribution pays each channel where it actually earned, so a sedentary-HR
+    /// afternoon of walking still accrues.
     public static func dailyEstimate(
+        hrSamples: [HRSample],
+        steps: Int,
+        profile: UserProfile,
+        sleepWindow: DateInterval? = nil,
+        stepWindows: [StepWindow] = [],
+        dayStart: Date? = nil,
+        bucketSeconds: TimeInterval = energyBucketSeconds
+    ) -> DailyEstimate {
+        if let dayStart, bucketSeconds > 0, steps == 0 || !stepWindows.isEmpty,
+           let attributed = attributedDailyEstimate(hrSamples: hrSamples,
+                                                    steps: steps,
+                                                    profile: profile,
+                                                    sleepWindow: sleepWindow,
+                                                    stepWindows: stepWindows,
+                                                    dayStart: dayStart,
+                                                    bucketSeconds: bucketSeconds) {
+            return attributed
+        }
+        return legacyDailyEstimate(hrSamples: hrSamples, steps: steps,
+                                   profile: profile, sleepWindow: sleepWindow)
+    }
+
+    /// The pre-attribution estimate, kept verbatim as the degrade path (and as the thing the
+    /// attribution tests assert they still reproduce for steps-only / HR-only days).
+    public static func legacyDailyEstimate(
         hrSamples: [HRSample],
         steps: Int,
         profile: UserProfile,
@@ -212,6 +296,164 @@ public enum Calories {
             activeKcal: max(hrKcal, stepKcal),
             elevatedMinutes: elevatedMinutes
         )
+    }
+
+    /// Time-attributed estimate. Returns nil when the inputs cannot be attributed at all, so the
+    /// caller falls back to `legacyDailyEstimate` rather than reporting a partial day.
+    ///
+    /// Composition, per bucket:
+    ///   hrKcal   = Keytel priced on EACH elevated piece's own bpm (never a whole-day average, so
+    ///              a later bout cannot re-price an earlier one and an isolated spot read cannot
+    ///              dilute either).
+    ///   stepKcal = walking energy where the wearer was NOT in elevated HR, plus, where they
+    ///              overlap, `max(0, stepKcal - hrKcal)` — the excess the HR channel did not
+    ///              already price. That is what keeps a walk from being paid twice while still
+    ///              crediting a walk the 50%-of-max-HR gate ignores.
+    ///
+    /// Everything here is linear in duration (Keytel at fixed bpm, and metres→kcal), so splitting
+    /// a span across bucket edges is exactly additive: the grid cannot change the day total.
+    static func attributedDailyEstimate(
+        hrSamples: [HRSample],
+        steps: Int,
+        profile: UserProfile,
+        sleepWindow: DateInterval?,
+        stepWindows: [StepWindow],
+        dayStart: Date,
+        bucketSeconds: TimeInterval
+    ) -> DailyEstimate? {
+        let maxHR = max(220 - profile.age, 1)
+        let pieces = ExerciseMinutes.elevatedPieces(hrSamples: hrSamples,
+                                                    maxHR: maxHR,
+                                                    sleepWindow: sleepWindow)
+        let elevatedMinutes = pieces.reduce(0.0) { $0 + $1.seconds } / 60.0
+        let dayEnd = dayStart.addingTimeInterval(maxAttributionSeconds)
+
+        func ordinal(_ t: Date) -> Int {
+            Int((t.timeIntervalSince(dayStart) / bucketSeconds).rounded(.down))
+        }
+        func bucketStart(_ o: Int) -> Date {
+            dayStart.addingTimeInterval(Double(o) * bucketSeconds)
+        }
+
+        /// Spread `total` across the buckets `[from, to)` covers, in proportion to the time spent
+        /// in each. A zero-length span lands wholly in the bucket containing it.
+        func spread(from: Date, to: Date, total: Double, into dict: inout [Int: Double]) {
+            guard total != 0 else { return }
+            let lo = Swift.max(from, dayStart)
+            let hi = Swift.min(to, dayEnd)
+            guard hi > lo else {
+                if from >= dayStart, from < dayEnd { dict[ordinal(from), default: 0] += total }
+                return
+            }
+            let span = hi.timeIntervalSince(lo)
+            var cursor = lo
+            var o = ordinal(lo)
+            while cursor < hi {
+                let edge = Swift.min(bucketStart(o + 1), hi)
+                dict[o, default: 0] += total * (edge.timeIntervalSince(cursor) / span)
+                cursor = edge
+                o += 1
+            }
+        }
+
+        var hrByOrdinal: [Int: Double] = [:]
+        var minutesByOrdinal: [Int: Double] = [:]
+        var stepByOrdinal: [Int: Double] = [:]
+
+        for piece in pieces {
+            let kcal = workoutActiveKcal(avgHR: piece.bpm,
+                                         durationSeconds: piece.seconds,
+                                         profile: profile)
+            spread(from: piece.start, to: piece.end, total: kcal, into: &hrByOrdinal)
+            spread(from: piece.start, to: piece.end, total: piece.seconds / 60.0,
+                   into: &minutesByOrdinal)
+        }
+
+        // Steps, netted against the elevated time they overlap. Prorated on METRES, never on the
+        // Int step count — splitting an Int at a boundary truncates and quietly loses steps.
+        var creditedSteps = 0
+        for window in stepWindows where window.delta > 0 {
+            let lo = Swift.max(window.start, dayStart)
+            let hi = Swift.min(window.end, dayEnd)
+            guard window.start < dayEnd, window.end >= dayStart else { continue }
+            let metres = Double(window.delta) * DistanceEstimate.metersPerStep
+
+            guard hi > lo else {  // point snapshot: nothing to net against, credit it whole
+                creditedSteps += window.delta
+                spread(from: lo, to: lo,
+                       total: activeKcalFromDistance(meters: metres, profile: profile),
+                       into: &stepByOrdinal)
+                continue
+            }
+
+            // Prorate against the window's FULL span, not the clipped one: a snapshot that opened
+            // before midnight earned only the share of its steps that fell inside the day, and
+            // measuring the fraction against the clipped span would credit all of them to today.
+            let fullSpan = window.end.timeIntervalSince(window.start)
+            let duration = fullSpan > 0 ? fullSpan : hi.timeIntervalSince(lo)
+            creditedSteps += Int((Double(window.delta)
+                                  * (hi.timeIntervalSince(lo) / duration)).rounded())
+            var cursor = lo
+            var idx = 0
+            while cursor < hi {
+                while idx < pieces.count, pieces[idx].end <= cursor { idx += 1 }
+                let piece = idx < pieces.count ? pieces[idx] : nil
+                let segmentEnd: Date
+                let overlapped: ExerciseMinutes.ElevatedPiece?
+                if let piece, piece.start <= cursor {
+                    segmentEnd = Swift.min(piece.end, hi)
+                    overlapped = piece
+                } else if let piece, piece.start < hi {
+                    segmentEnd = piece.start
+                    overlapped = nil
+                } else {
+                    segmentEnd = hi
+                    overlapped = nil
+                }
+                guard segmentEnd > cursor else { break }
+
+                let seconds = segmentEnd.timeIntervalSince(cursor)
+                let segmentKcal = activeKcalFromDistance(meters: metres * (seconds / duration),
+                                                         profile: profile)
+                let credit: Double
+                if let overlapped {
+                    let alreadyPriced = workoutActiveKcal(avgHR: overlapped.bpm,
+                                                          durationSeconds: seconds,
+                                                          profile: profile)
+                    credit = Swift.max(0, segmentKcal - alreadyPriced)
+                } else {
+                    credit = segmentKcal
+                }
+                spread(from: cursor, to: segmentEnd, total: credit, into: &stepByOrdinal)
+                cursor = segmentEnd
+            }
+        }
+
+        // Steps the daily counter knows about but no snapshot placed in time (a snapshot whose
+        // window opened before midnight, or a row written before per-snapshot step history). Credit
+        // them at the earliest bucket that already holds activity rather than at midnight — putting
+        // them at 00:00 is the very mis-placement this attribution exists to end.
+        let residual = steps - creditedSteps
+        if residual > 0 {
+            let kcal = activeKcalFromDistance(
+                meters: Double(residual) * DistanceEstimate.metersPerStep, profile: profile)
+            guard let earliest = [stepByOrdinal.keys.min(), hrByOrdinal.keys.min()]
+                .compactMap({ $0 }).min() else { return nil }
+            stepByOrdinal[earliest, default: 0] += kcal
+        }
+
+        let ordinals = Set(hrByOrdinal.keys).union(stepByOrdinal.keys).sorted()
+        guard !ordinals.isEmpty else { return nil }
+        let buckets = ordinals.map { o in
+            EnergyBucket(start: bucketStart(o),
+                         end: bucketStart(o + 1),
+                         hrKcal: hrByOrdinal[o] ?? 0,
+                         stepKcal: stepByOrdinal[o] ?? 0,
+                         elevatedMinutes: minutesByOrdinal[o] ?? 0)
+        }
+        return DailyEstimate(activeKcal: buckets.reduce(0) { $0 + $1.activeKcal },
+                             elevatedMinutes: elevatedMinutes,
+                             buckets: buckets)
     }
 
     /// Active-energy estimate for a WORKOUT via the Keytel et al. (2005) HR→energy regression — the
