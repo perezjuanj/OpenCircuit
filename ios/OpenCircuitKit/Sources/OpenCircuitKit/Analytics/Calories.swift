@@ -221,7 +221,9 @@ public enum Calories {
     /// byte-identical to the pre-attribution behaviour. The degrade is deliberate and load-bearing:
     /// a call site that has not been updated, or a day whose step rows predate per-snapshot step
     /// history, produces exactly the old number with no buckets rather than a silently different
-    /// one. Historical Trends days therefore do not move.
+    /// one. (Trends DOES pass both for every day in its lookback, so historical days there are
+    /// re-priced and read higher than the samples already sitting in Apple Health for those days —
+    /// deliberate, and documented at that call site. Only days with no step rows stay put.)
     ///
     /// WHY attribution exists: the legacy estimate is `max(hrKcal, stepKcal)` over two WHOLE-DAY
     /// snapshots. Once the last bout above the elevated-HR threshold ends, `elevatedMinutes` stops

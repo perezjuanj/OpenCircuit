@@ -205,3 +205,98 @@ final class ActiveEnergyLedgerTests: XCTestCase {
         XCTAssertEqual(plan.watermarks.count, 99)  // ordinal 98 (24.5 h / 15 min) + 1
     }
 }
+
+/// Regressions from the pre-release adversarial review of the attribution change.
+final class ActiveEnergyLedgerReviewRegressionTests: XCTestCase {
+
+    private let day = Date(timeIntervalSince1970: 1_753_660_800)
+    private let width: TimeInterval = 15 * 60
+
+    private func at(_ hours: Double) -> Date { day.addingTimeInterval(hours * 3600) }
+
+    private func bucket(hour: Double, kcal: Double) -> Calories.EnergyBucket {
+        Calories.EnergyBucket(start: at(hour), end: at(hour).addingTimeInterval(width),
+                              hrKcal: kcal, stepKcal: 0, elevatedMinutes: 0)
+    }
+
+    /// REVIEW BLOCKER. A bucket's attributed energy can FALL between flushes — a later drain
+    /// inserts an earlier HR point that re-prices a piece across a bucket edge. With per-bucket
+    /// high-water marks alone, the fall stranded its inflated mark while the bucket that GAINED
+    /// paid in full, so Apple Health drifted permanently high. It must net out.
+    func testEnergyMovingBetweenBucketsPaysTheNetNotTheGross() {
+        let before = [bucket(hour: 12, kcal: 3.847), bucket(hour: 12.25, kcal: 53.864)]
+        let first = ActiveEnergyLedger.plan(buckets: before, watermarks: [],
+                                            dayStart: day, now: at(13))
+        XCTAssertEqual(first.totalKcal, 57.711, accuracy: 0.01)
+
+        // The re-priced day: 12:00 gains 8.984, 12:15 loses 2.563. Net rise is 6.421.
+        let after = [bucket(hour: 12, kcal: 12.831), bucket(hour: 12.25, kcal: 51.301)]
+        let second = ActiveEnergyLedger.plan(buckets: after, watermarks: first.watermarks,
+                                             dayStart: day, now: at(14),
+                                             savedKcal: first.totalKcal)
+        XCTAssertEqual(second.totalKcal, 6.421, accuracy: 0.01)
+
+        // What Health holds must equal what the day is now worth — not the sum of gross rises.
+        let held = first.totalKcal + second.totalKcal
+        XCTAssertEqual(held, after.reduce(0) { $0 + $1.activeKcal }, accuracy: 0.01)
+    }
+
+    /// The netted overpayment has to SURVIVE a flush that writes nothing, or it is forgotten and
+    /// the same kcal is paid again on the next rise.
+    func testAFallWithNoOffsettingRiseIsHandedBackAsCarry() {
+        let before = [bucket(hour: 9, kcal: 40)]
+        let first = ActiveEnergyLedger.plan(buckets: before, watermarks: [], dayStart: day, now: at(10))
+
+        let shrunk = [bucket(hour: 9, kcal: 25)]
+        let second = ActiveEnergyLedger.plan(buckets: shrunk, watermarks: first.watermarks,
+                                             dayStart: day, now: at(11), savedKcal: first.totalKcal)
+        XCTAssertTrue(second.writes.isEmpty)
+        XCTAssertEqual(second.carryRemaining, 15, accuracy: 1e-9)
+        XCTAssertEqual(second.watermarks.first(where: { $0 > 0 }), 25)
+
+        // A later 15 kcal rise is fully absorbed by that debt — Health stays at 40, the day's peak.
+        let regrown = shrunk + [bucket(hour: 16, kcal: 15)]
+        let third = ActiveEnergyLedger.plan(buckets: regrown, watermarks: second.watermarks,
+                                            dayStart: day, now: at(17),
+                                            carry: second.carryRemaining,
+                                            savedKcal: first.totalKcal)
+        XCTAssertTrue(third.writes.isEmpty)
+    }
+
+    /// REVIEW MAJOR. The #131 store recovery rebuilds the day from fewer rows while the marks
+    /// survive in UserDefaults, and the residual step reconciliation re-places the day's energy in
+    /// a DIFFERENT bucket. Without a day-total backstop that pays the same kcal twice — and
+    /// HealthKit SUMS, so it can never be taken back.
+    func testDayTotalBackstopBlocksRepaymentAfterEnergyIsRelocated() {
+        let morning = (0 ..< 4).map { bucket(hour: 8 + Double($0) * 0.25, kcal: 30) }
+        let first = ActiveEnergyLedger.plan(buckets: morning, watermarks: [],
+                                            dayStart: day, now: at(13))
+        XCTAssertEqual(first.totalKcal, 120, accuracy: 1e-9)
+
+        // Store wiped: the same ~120 kcal day is rebuilt as ONE bucket at a different ordinal.
+        let rebuilt = [bucket(hour: 13.75, kcal: 118)]
+        let second = ActiveEnergyLedger.plan(buckets: rebuilt, watermarks: first.watermarks,
+                                             dayStart: day, now: at(14),
+                                             savedKcal: first.totalKcal)
+        XCTAssertTrue(second.writes.isEmpty,
+                      "Health already holds 120 for a day now worth 118 — nothing may be re-paid")
+    }
+
+    func testBackstopClampsAPartialWriteRatherThanDroppingIt() {
+        let buckets = [bucket(hour: 9, kcal: 100)]
+        let plan = ActiveEnergyLedger.plan(buckets: buckets, watermarks: [],
+                                           dayStart: day, now: at(10), savedKcal: 70)
+        XCTAssertEqual(plan.totalKcal, 30, accuracy: 1e-9)
+    }
+
+    /// An empty bucket set means "no data yet", not "the day lost everything" — otherwise the
+    /// first flush of a morning would net the whole previous state into carry.
+    func testEmptyBucketsAreNotReadAsATotalLoss() {
+        let seeded = ActiveEnergyLedger.plan(buckets: [bucket(hour: 9, kcal: 40)],
+                                             watermarks: [], dayStart: day, now: at(10))
+        let empty = ActiveEnergyLedger.plan(buckets: [], watermarks: seeded.watermarks,
+                                            dayStart: day, now: at(11), savedKcal: 40)
+        XCTAssertEqual(empty.watermarks, seeded.watermarks)
+        XCTAssertEqual(empty.carryRemaining, 0)
+    }
+}

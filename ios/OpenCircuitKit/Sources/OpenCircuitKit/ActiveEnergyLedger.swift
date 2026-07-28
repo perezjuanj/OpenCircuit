@@ -86,30 +86,62 @@ public enum ActiveEnergyLedger {
                             now: Date,
                             carry: Double = 0,
                             uncreditedWorkoutKcal: Double = 0,
+                            savedKcal: Double = 0,
                             bucketSeconds: TimeInterval = Calories.energyBucketSeconds,
                             minWriteKcal: Double = minWriteKcal) -> Plan {
         let unchanged = Plan(writes: [], watermarks: watermarks,
                              carryRemaining: carry, workoutConsumed: 0)
-        guard bucketSeconds > 0 else { return unchanged }
+        // An empty bucket set means "no data yet", NOT "the day lost its energy" — returning here
+        // keeps the fall-netting below from reading a still-empty morning as a giant overpayment.
+        guard bucketSeconds > 0, !buckets.isEmpty else { return unchanged }
 
-        var marks = watermarks
-        // Pending increments, oldest first, with the window each would be written over.
-        var pending: [(ordinal: Int, start: Date, end: Date, kcal: Double)] = []
-
+        var byOrdinal: [Int: Double] = [:]
+        var windows: [Int: (start: Date, end: Date)] = [:]
         for bucket in buckets.sorted(by: { $0.start < $1.start }) {
             let o = ordinal(bucket.start, dayStart: dayStart, bucketSeconds: bucketSeconds)
             guard o >= 0 else { continue }
-            if marks.count <= o { marks.append(contentsOf: Array(repeating: 0, count: o + 1 - marks.count)) }
-            let increment = bucket.activeKcal - marks[o]
-            guard increment > 0 else { continue }
-            // A bucket still in progress is written up to `now`, never into the future.
-            let end = Swift.min(bucket.end, now)
-            guard end > bucket.start else { continue }  // wholly in the future — stays owed
-            pending.append((o, bucket.start, end, increment))
+            byOrdinal[o, default: 0] += bucket.activeKcal
+            windows[o] = (bucket.start, Swift.min(bucket.end, now))
         }
-        guard !pending.isEmpty else { return unchanged }
+        guard let highest = byOrdinal.keys.max() else { return unchanged }
+
+        var marks = watermarks
+        if marks.count <= highest {
+            marks.append(contentsOf: Array(repeating: 0, count: highest + 1 - marks.count))
+        }
 
         var carryLeft = Swift.max(0, carry)
+
+        // A bucket's attributed energy can FALL between flushes — a later drain inserts an earlier
+        // HR point that re-prices a piece, the sleep window widens over morning HR, a store recovery
+        // drops rows. Per-bucket high-water marks alone would keep the inflated mark and pay a rise
+        // elsewhere in full, so Health would drift permanently high (activeEnergyBurned SUMS, and it
+        // cannot be reconciled back down). Lower the mark and carry the shortfall as debt, so the
+        // day nets out exactly the way the single day-scalar this replaced always did.
+        for o in marks.indices where marks[o] > 0 {
+            let current = byOrdinal[o] ?? 0
+            guard current < marks[o] else { continue }
+            carryLeft += marks[o] - current
+            marks[o] = current
+        }
+
+        // Pending increments, oldest first, with the window each would be written over.
+        var pending: [(ordinal: Int, start: Date, end: Date, kcal: Double)] = []
+        for o in byOrdinal.keys.sorted() {
+            let increment = (byOrdinal[o] ?? 0) - marks[o]
+            guard increment > 0, let window = windows[o] else { continue }
+            // A bucket still in progress is written up to `now`, never into the future.
+            guard window.end > window.start else { continue }  // wholly ahead of now — stays owed
+            pending.append((o, window.start, window.end, increment))
+        }
+        guard !pending.isEmpty else {
+            // Nothing to write, but a fall may still have been netted — hand back the debt so the
+            // caller can persist it, otherwise the overpayment is forgotten and re-paid later.
+            return carryLeft > Swift.max(0, carry)
+                ? Plan(writes: [], watermarks: marks, carryRemaining: carryLeft, workoutConsumed: 0)
+                : unchanged
+        }
+
         var workoutLeft = Swift.max(0, uncreditedWorkoutKcal)
         var writes: [Write] = []
 
@@ -127,6 +159,23 @@ public enum ActiveEnergyLedger {
                 writes.append(Write(start: item.start, end: item.end, kcal: remaining))
             }
         }
+
+        // Day-total backstop. The marks say WHERE energy sits; this says how much the day is worth
+        // in total. Any path that relocates energy between buckets without the marks following —
+        // a store recovery that rebuilds the day from fewer rows, a mid-day fall back to the
+        // single-delta path, the residual step reconciliation moving to a different bucket — could
+        // otherwise re-pay kcal Health already holds. Clamping to what the day is still worth makes
+        // that structurally impossible, and it only ever REDUCES a write.
+        let dayTotal = byOrdinal.values.reduce(0, +)
+        var headroom = Swift.max(0, dayTotal - Swift.max(0, savedKcal))
+        var clamped: [Write] = []
+        for write in writes {
+            guard headroom > 0 else { break }
+            let kcal = Swift.min(write.kcal, headroom)
+            headroom -= kcal
+            clamped.append(Write(start: write.start, end: write.end, kcal: kcal))
+        }
+        writes = clamped
 
         let writable = writes.reduce(0) { $0 + $1.kcal }
         guard writable >= minWriteKcal else { return unchanged }

@@ -768,8 +768,8 @@ final class HealthKitWriter {
     // only advanced after a confirmed write, so a failed/unauthorized flush backfills next time.
     private static let rhrWatermarkKey = "hk.restingHR.lastDay"      // start-of-day last written
     private static let basalWatermarkKey = "hk.basalEnergy.nextHour" // first hour not yet written
-    private static let activeDayKey = "hk.activeEnergy.day"          // start-of-day of the accumulator
-    private static let activeWrittenKey = "hk.activeEnergy.writtenKcal"
+    static let activeDayKey = "hk.activeEnergy.day"          // start-of-day of the accumulator
+    static let activeWrittenKey = "hk.activeEnergy.writtenKcal"
     /// End of the last active-energy window SUCCESSFULLY written — the start of the next one, so
     /// consecutive deltas tile the day without overlapping (HealthKit SUMs them). Advanced only
     /// alongside `activeWrittenKey` on a confirmed save; see `ActiveEnergyWindow.resolve` for why
@@ -778,11 +778,19 @@ final class HealthKitWriter {
     // Per-bucket accounting (see `ActiveEnergyLedger`). Indexed by ordinal from local midnight, so
     // a late drain that inserts an EARLIER bucket pays only its own increment. All four are
     // day-scoped and cleared together on rollover.
-    private static let activeBucketKcalKey = "hk.activeEnergy.bucketKcal"
-    private static let activeCarryKey = "hk.activeEnergy.carryKcal"
-    private static let activeBucketSeedDayKey = "hk.activeEnergy.bucketSeedDay"
+    static let activeBucketKcalKey = "hk.activeEnergy.bucketKcal"
+    static let activeCarryKey = "hk.activeEnergy.carryKcal"
+    static let activeBucketSeedDayKey = "hk.activeEnergy.bucketSeedDay"
     private static let activeWorkoutCreditedKey = "hk.activeEnergy.workoutCreditedKcal"
     private static let activeWorkoutCreditedDayKey = "hk.activeEnergy.workoutCreditedDay"
+    /// Total active kcal this app has actually SAVED to HealthKit today. Distinct from the bucket
+    /// marks, which say only where energy sits: this is the day-total backstop that makes any
+    /// bucket relocation incapable of re-paying kcal Health already holds.
+    static let activeSavedKey = "hk.activeEnergy.savedKcal"
+    /// Time zone the stored day marker was computed in. `startOfDay` evaluates BOTH sides in the
+    /// CURRENT zone, so flying west turns mid-day into "a new day", which would reset every mark
+    /// and re-pay the morning. Travel must re-seed against the new grid, never reset.
+    static let activeDayTZKey = "hk.activeEnergy.dayTZ"
     // Exercise minutes (#82) watermark — like active energy, delta-based per day.
     private static let exerciseDayKey     = "hk.exerciseTime.day"         // start-of-day
     private static let exerciseWrittenKey = "hk.exerciseTime.writtenMin"  // total minutes already counted
@@ -1041,10 +1049,9 @@ final class HealthKitWriter {
         let now = Date()
         let today = cal.startOfDay(for: now)
         let defaults = UserDefaults.standard
-        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: Self.activeDayKey))
-        let isNewDay = cal.startOfDay(for: storedDay) != today
-        var written = defaults.double(forKey: Self.activeWrittenKey)
-        if isNewDay { written = 0 }  // new day → reset accumulator
+        let day = Self.beginActiveEnergyDay(defaults, today: today, calendar: cal)
+        let isNewDay = day.isNewDay
+        var written = day.written
 
         // Use the same elevated-HR duration + Keytel energy estimate as the dashboard rings. This
         // keeps Health mirroring from reviving the old contradiction where moderate HR earned
@@ -1123,10 +1130,11 @@ final class HealthKitWriter {
         // A stored anchor can never legitimately exceed `now`; a clock step-forward (bad RTC before
         // NTP, restored backup, manual date change) would otherwise wedge active energy off until
         // wall-clock caught up — a skipped write never advances the anchor, so there is no self-heal
-        // path. Clamp on read, and drop it entirely on a day rollover alongside `written`.
+        // path. Clamp on read; `beginActiveEnergyDay` already cleared it on a rollover, and the
+        // `isNewDay` guard keeps that intent explicit rather than relying on that side effect.
         let storedAnchor = defaults.double(forKey: Self.activeAnchorKey)
         var anchor: Date? = storedAnchor > 0 ? Date(timeIntervalSince1970: storedAnchor) : nil
-        if cal.startOfDay(for: storedDay) != today { anchor = nil }
+        if isNewDay { anchor = nil }
         if let a = anchor, a > now { anchor = nil }
 
         guard let window = ActiveEnergyWindow.resolve(anchor: anchor,
@@ -1145,8 +1153,58 @@ final class HealthKitWriter {
             defaults.set(today.timeIntervalSince1970, forKey: Self.activeDayKey)
             defaults.set(total, forKey: Self.activeWrittenKey)
             defaults.set(window.end.timeIntervalSince1970, forKey: Self.activeAnchorKey)
+            // Count it toward the day-total backstop too: a day can start here (no step history
+            // yet) and switch to the bucket path later, whose marks know nothing about this write.
+            defaults.set(defaults.double(forKey: Self.activeSavedKey) + delta,
+                         forKey: Self.activeSavedKey)
             return delta
         } catch { pendingFlushFailures.insert(.activeEnergy); return 0 }
+    }
+
+    struct ActiveEnergyDayState: Equatable {
+        let isNewDay: Bool
+        /// Active kcal already accounted for today (0 immediately after a rollover).
+        let written: Double
+    }
+
+    /// Open today's active-energy accounting, persisting a rollover reset IMMEDIATELY.
+    ///
+    /// This exists as its own step because the reset must survive a flush that decides to write
+    /// nothing. Stamping only the day marker on such a flush leaves YESTERDAY's `writtenKcal` in
+    /// place; the next flush then reads `isNewDay == false`, seeds every one of today's buckets as
+    /// already paid, and writes nothing for the rest of the day — the exact "active energy stops
+    /// and never resumes" symptom this change exists to fix, reintroduced through the rollover
+    /// path. It is armed by any first flush of a day worth under the 1 kcal aggregate gate, which
+    /// is most mornings.
+    ///
+    /// Travel is deliberately NOT a rollover. `startOfDay` evaluates both sides in the CURRENT zone,
+    /// so flying west maps the stored marker onto the previous calendar day and the test fires
+    /// mid-day, over a day Health already holds writes for. Keep the marks and force a re-seed onto
+    /// the new day grid instead, so the written energy is absorbed rather than paid twice.
+    static func beginActiveEnergyDay(_ defaults: UserDefaults,
+                                     today: Date,
+                                     calendar cal: Calendar = .current,
+                                     timeZoneID: String = TimeZone.current.identifier)
+        -> ActiveEnergyDayState {
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: activeDayKey))
+        let storedTZ = defaults.string(forKey: activeDayTZKey)
+        let travelled = storedTZ != nil && storedTZ != timeZoneID
+        let isNewDay = cal.startOfDay(for: storedDay) != today && !travelled
+        defaults.set(timeZoneID, forKey: activeDayTZKey)
+
+        if isNewDay {
+            defaults.set(today.timeIntervalSince1970, forKey: activeDayKey)
+            defaults.set(0.0, forKey: activeWrittenKey)
+            defaults.set(0.0, forKey: activeCarryKey)
+            defaults.set(0.0, forKey: activeSavedKey)
+            defaults.removeObject(forKey: activeBucketKcalKey)
+            defaults.removeObject(forKey: activeBucketSeedDayKey)
+            defaults.removeObject(forKey: activeAnchorKey)
+            return ActiveEnergyDayState(isNewDay: true, written: 0)
+        }
+        if travelled { defaults.removeObject(forKey: activeBucketSeedDayKey) }
+        return ActiveEnergyDayState(isNewDay: false,
+                                    written: defaults.double(forKey: activeWrittenKey))
     }
 
     /// Write the per-bucket active-energy increments this flush owes (see `ActiveEnergyLedger`).
@@ -1189,16 +1247,24 @@ final class HealthKitWriter {
             ? defaults.double(forKey: Self.activeWorkoutCreditedKey) : 0
         let uncreditedWorkout = max(0, Self.workoutActiveKcalCredited(day: today) - alreadyCredited)
 
+        let savedToday = defaults.double(forKey: Self.activeSavedKey)
         let plan = ActiveEnergyLedger.plan(buckets: buckets,
                                            watermarks: marks,
                                            dayStart: today,
                                            now: now,
                                            carry: carry,
-                                           uncreditedWorkoutKcal: uncreditedWorkout)
+                                           uncreditedWorkoutKcal: uncreditedWorkout,
+                                           savedKcal: savedToday)
         guard !plan.writes.isEmpty else {
-            // Nothing owed (or below the aggregate gate). Persist ONLY the day marker so rollover
-            // still works; every other mark stays put and the kcal rides the next flush.
-            defaults.set(today.timeIntervalSince1970, forKey: Self.activeDayKey)
+            // Nothing owed (or below the aggregate gate). The day marker and the rollover reset are
+            // already persisted by the caller, so there is nothing to stamp here — but a fall in an
+            // already-paid bucket may have been netted into carry, and that debt MUST be persisted
+            // or the overpayment is forgotten and paid again on the next rise.
+            if plan.carryRemaining != carry || plan.watermarks != marks {
+                defaults.set(plan.watermarks, forKey: Self.activeBucketKcalKey)
+                defaults.set(plan.carryRemaining, forKey: Self.activeCarryKey)
+                defaults.set(today.timeIntervalSince1970, forKey: Self.activeBucketSeedDayKey)
+            }
             return 0
         }
         do {
@@ -1211,6 +1277,7 @@ final class HealthKitWriter {
             defaults.set(alreadyCredited + plan.workoutConsumed,
                          forKey: Self.activeWorkoutCreditedKey)
             defaults.set(today.timeIntervalSince1970, forKey: Self.activeWorkoutCreditedDayKey)
+            defaults.set(savedToday + plan.totalKcal, forKey: Self.activeSavedKey)
             // Keep the legacy scalar + anchor coherent, so a day that later loses its step history
             // (or a rollback to a build without attribution) resumes from sane state. Σ marks
             // includes increments netted against debt rather than written, so it can exceed what
