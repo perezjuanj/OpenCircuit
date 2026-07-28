@@ -31,10 +31,17 @@ struct WellnessBalanceCardView: View {
     @Query private var todayDaily: [StoredDaily]
     @Query private var todayHR: [StoredSample]
     @Query private var latestSleep: [StoredSleepSummary]
+    /// Per-snapshot step deltas — see the same query in `GoalsCardView`. Readiness scores active
+    /// kcal, so it must price the day exactly as the Goals rings and Apple Health do.
+    @Query private var recentStepSamples: [StoredStepSample]
 
     init() {
         let dayStart = Calendar.current.startOfDay(for: Date())
+        let stepsFrom = dayStart.addingTimeInterval(-86_400)
         let hrKind = MetricKind.heartRate.rawValue
+        _recentStepSamples = Query(FetchDescriptor<StoredStepSample>(
+            predicate: #Predicate { $0.start >= stepsFrom },
+            sortBy: [SortDescriptor(\.start, order: .forward)]))
         _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
         _todayHR = Query(FetchDescriptor<StoredSample>(
             predicate: #Predicate { $0.kindRaw == hrKind && $0.start >= dayStart && $0.value > 0 },
@@ -65,7 +72,7 @@ struct WellnessBalanceCardView: View {
 
     /// Recompute identity — changes only when an input to readiness changes.
     private var inputsKey: String {
-        "\(todayHR.count)|\(currentSteps)|\(age)|\(weightKg)|\(heightCm)|\(sexRaw)|"
+        "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(weightKg)|\(heightCm)|\(sexRaw)|"
         + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(latestSleep.first?.sleepScore ?? 0)|"
         + "\(latestSleep.first?.stressScore ?? 0)|\(sleepCredited ? 1 : 0)|"
         + "\(stepsGoal)|\(Int(actMinGoal))|\(Int(activeKcalGoal))"
@@ -114,12 +121,19 @@ struct WellnessBalanceCardView: View {
             let minGoal = actMinGoal
             let kcalGoal = activeKcalGoal
 
+            let stepWindows = recentStepSamples.map {
+                StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
+            }
+            let dayStart = Calendar.current.startOfDay(for: Date())
+
             let activity = await Task.detached { () -> ActivityScore.Result in
                 let estimate = Calories.dailyEstimate(
                     hrSamples: samples,
                     steps: steps,
                     profile: profile,
-                    sleepWindow: sleepWindow
+                    sleepWindow: sleepWindow,
+                    stepWindows: stepWindows,
+                    dayStart: dayStart
                 )
                 return ActivityScore.score(.init(
                     steps: steps, stepGoal: stepGoal,
