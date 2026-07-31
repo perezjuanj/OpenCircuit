@@ -88,6 +88,16 @@ struct OpenCircuitApp: App {
     /// lightweight migration, not a custom stage. Both land in ONE version deliberately, so the
     /// Phase-2 risk rows never need a second migration — each migration is a launch-crash surface
     /// whose recovery path wipes un-resyncable raw history (#40).
+    ///
+    /// V4 IS STILL UNRELEASED, so its shape is edited IN PLACE rather than superseded — Phase 2
+    /// added `StoredHeadacheRisk.nightKey` here without bumping the identifier. That is deliberate
+    /// and it is the only correct option: SwiftData derives a version's checksum from its model
+    /// SHAPES, so a V5 listing the same models is rejected outright with "duplicate version
+    /// checksums" (measured — it does not merely warn). The cost is that a device carrying an
+    /// INTERMEDIATE build of this branch has a V4 store whose checksum no longer matches and will
+    /// hit the container-open failure path; delete and reinstall such a dev build. No shipped build
+    /// has ever written V4, so no user store is exposed. Once this merges, V4 is frozen and the
+    /// next shape change must be a real V5.
     enum SchemaV4: VersionedSchema {
         static var versionIdentifier = Schema.Version(4, 0, 0)
         static var models: [any PersistentModel.Type] {
@@ -420,6 +430,8 @@ struct RollupBackup: Codable {
     /// silently vanish from every later precision/AUC number instead of being restored.
     struct RiskDay: Codable {
         var day: Date
+        /// Optional so a backup written before the timezone-stable key existed still decodes.
+        var nightKey: Date?
         var index: Double
         var bandRaw: Int
         var ringFeatureCount: Int
@@ -497,7 +509,7 @@ struct RollupBackup: Codable {
                          hkSampleUUIDs: $0.hkSampleUUIDs, updatedAt: $0.updatedAt)
             },
             riskDays: riskRows.map {
-                RiskDay(day: $0.day, index: $0.index, bandRaw: $0.bandRaw,
+                RiskDay(day: $0.day, nightKey: $0.nightKey, index: $0.index, bandRaw: $0.bandRaw,
                         ringFeatureCount: $0.ringFeatureCount,
                         coverageFraction: $0.coverageFraction,
                         contributionsJSON: $0.contributionsJSON, absentJSON: $0.absentJSON,
@@ -553,7 +565,8 @@ struct RollupBackup: Codable {
         }
         for r in riskDays ?? [] {
             ctx.insert(StoredHeadacheRisk(
-                day: r.day, index: r.index, bandRaw: r.bandRaw,
+                day: r.day, nightKey: r.nightKey ?? .distantPast,
+                index: r.index, bandRaw: r.bandRaw,
                 ringFeatureCount: r.ringFeatureCount, coverageFraction: r.coverageFraction,
                 contributionsJSON: r.contributionsJSON, absentJSON: r.absentJSON,
                 computedAt: r.computedAt, sleepUpdatedAt: r.sleepUpdatedAt,

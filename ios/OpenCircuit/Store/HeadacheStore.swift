@@ -124,8 +124,18 @@ extension StoredHeadacheEntry {
 /// rather than rescored, because rescoring would break the freeze.
 @Model
 final class StoredHeadacheRisk {
-    /// Local start-of-day for the night that ENDED this morning — the natural key.
+    /// Local start-of-day for the night that ENDED this morning — the display key.
     @Attribute(.unique) var day: Date = Date.distantPast
+    /// The `StoredSleepSummary.night` key of the night this row scores, or `.distantPast` when the
+    /// row was frozen without a sleep summary.
+    ///
+    /// This exists because `day` is NOT stable: it is recomputed as a local start-of-day on every
+    /// pass, so a device timezone change re-keys it. Flying west turns 2026-07-29T22:00Z into
+    /// 2026-07-30T04:00Z, the exact-equality existence check matches nothing, and the SAME NIGHT is
+    /// frozen a second time under a second key — two rows, two different indices, one night. That
+    /// breaks the freeze invariant every later statistic depends on. `night` is read from a
+    /// PERSISTED row rather than recomputed from the current calendar, so it does not move.
+    var nightKey: Date = Date.distantPast
     /// The relative index (0–100) for this day. Meaningful only against this user's own history.
     var index: Double = 0
     /// Band: 0 = typical, 1 = elevated, 2 = flagged.
@@ -150,6 +160,7 @@ final class StoredHeadacheRisk {
     var updatedAt: Date = Date()
 
     init(day: Date = Date.distantPast,
+         nightKey: Date = Date.distantPast,
          index: Double = 0,
          bandRaw: Int = 0,
          ringFeatureCount: Int = 0,
@@ -163,6 +174,7 @@ final class StoredHeadacheRisk {
          postUnlock: Bool = false,
          updatedAt: Date = Date()) {
         self.day = day
+        self.nightKey = nightKey
         self.index = index
         self.bandRaw = bandRaw
         self.ringFeatureCount = ringFeatureCount
@@ -332,9 +344,33 @@ extension LocalStore {
         let descriptor = FetchDescriptor<StoredHeadacheRisk>(
             predicate: #Predicate { $0.day == day })
         if let existing = try? context.fetch(descriptor).first, existing.day == day { return false }
+
+        // Second existence check, on the TIMEZONE-STABLE key. `day` is recomputed as a local
+        // start-of-day on every pass, so crossing a timezone re-keys it and the check above matches
+        // nothing — the same night would be frozen again under a second key, leaving two rows with
+        // two different indices for one night. `nightKey` comes from a persisted
+        // `StoredSleepSummary.night`, so it survives the move.
+        let nightKey = row.nightKey
+        if nightKey != .distantPast {
+            let byNight = FetchDescriptor<StoredHeadacheRisk>(
+                predicate: #Predicate { $0.nightKey == nightKey })
+            if let existing = try? context.fetch(byNight).first,
+               existing.nightKey == nightKey { return false }
+        }
+
         context.insert(row)
         try context.save()
         return true
+    }
+
+    /// The frozen row for a night, looked up by the timezone-stable key. Used in preference to the
+    /// `day` lookup so a device that has changed timezone still finds the row it already wrote —
+    /// otherwise an eastward move silently drops the re-stage flag for that night.
+    func riskRow(nightKey: Date) throws -> StoredHeadacheRisk? {
+        guard nightKey != .distantPast else { return nil }
+        let descriptor = FetchDescriptor<StoredHeadacheRisk>(
+            predicate: #Predicate { $0.nightKey == nightKey })
+        return try? context.fetch(descriptor).first
     }
 
     /// Frozen risk rows in `[from, to)`, oldest first.

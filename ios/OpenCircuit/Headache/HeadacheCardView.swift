@@ -1,12 +1,22 @@
 import SwiftUI
 import SwiftData
+import OpenCircuitKit
 
-// The dashboard's headache-log card + the shared Apple Health import control.
+// The dashboard's headache-log card: the two-tap log, the shared Apple Health import control, and
+// (Phase 2, #183) last night's overnight signals.
 //
-// Phase 1 is a LOG, not a detector: this card exists to make logging a headache a two-tap job, and
-// to get the labels the user already keeps in Apple Health into the same series. It shows a count
-// and nothing else — there is no score, band or forecast to show, and a placeholder for one would
-// imply a capability that doesn't exist.
+// The LOG half is the point of the feature. The user's entries are the only ground-truth labels
+// anything here could ever be validated against, and a headache that isn't logged can't be filled
+// in later.
+//
+// The SIGNALS half is an ESTIMATE, and the framing is chosen against its real accuracy rather than
+// its ambition. It sits under a neutral "Overnight signals" heading, it never shows the index, and
+// the word "headache" appears only on the Log button. That is not squeamishness: the published
+// ceiling for physiology-only headache forecasting is AUC ≈ 0.65, which at our operating point is
+// roughly 26 % precision — about three in four unusual nights are followed by nothing at all. A
+// headache-framed band on the dashboard would be a permanent ~10 %-of-days anxiety generator for a
+// user for whom nothing has been validated and who may never get headaches
+// (docs/HEADACHE_SIGNALS.md §6.1). Phase 2 also sends no notification, by design.
 //
 // Visibility is the CALLER's job (`HeadacheDefaults.enabled`), mirroring how the dashboard hides
 // the cycle card behind `womensHealthEnabled`.
@@ -33,9 +43,42 @@ struct HeadacheCardView: View {
     /// whole table through the render path on every SwiftData invalidation.
     @Query private var monthEntries: [StoredHeadacheEntry]
 
+    /// The last few FROZEN daily scores. Never rendered FROM here, and the index is never rendered
+    /// at all — this exists so the signals `.task(id:)` re-runs when a sync freezes this morning's
+    /// row, instead of the card holding last night's answer until some unrelated invalidation
+    /// happens to arrive. The row's band is read inside that task, through the engine.
+    @Query private var recentRisk: [StoredHeadacheRisk]
+
     @State private var showLogSheet = false
 
+    /// Last night's verdict, computed OFF the render path (see the `.task(id:)` below). `nil` once
+    /// `signalsLoaded` is true means the engine had nothing to say — which is rendered as "not
+    /// assessed", never as a reassuring "nothing unusual".
+    @State private var verdict: HeadacheSignals.Verdict?
+    @State private var signalsLoaded = false
+
+    /// Today's FROZEN band — the one OF RECORD — and the coverage recorded with it.
+    ///
+    /// The card shows THIS band whenever there is one, and only falls back to `verdict` before a
+    /// day is frozen. `todaysVerdict` re-assesses as of the freeze instant so the two normally
+    /// agree, but a night that re-stages after the freeze (1–22 h after wake in this app) moves the
+    /// live reproduction and NOT the row: the frozen row is what the history rows, the Diagnostics
+    /// export and any later accuracy check use, so a dashboard rendering the fresher number can
+    /// announce "last night was unusual for you" on a morning whose record says otherwise.
+    ///
+    /// `nil` band means nothing is frozen for today yet OR the stored `bandRaw` isn't one this
+    /// build knows — both fall back to the live reproduction rather than guessing.
+    @State private var recordedBand: HeadacheSignals.Band?
+    @State private var recordedFeatureCount: Int?
+
+    /// So a skin-temperature reason reads in the unit the rest of the app uses (#83).
+    @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
+
     private static let monthFetchLimit = 100
+    /// Three days of frozen rows: enough to see this morning's appear, small enough that the
+    /// dashboard never carries a growing fetch on its render path.
+    private static let riskWindowDays = 3
+    private static let riskFetchLimit = 4
 
     init(onOpenDetail: (() -> Void)? = nil) {
         self.onOpenDetail = onOpenDetail
@@ -47,6 +90,14 @@ struct HeadacheCardView: View {
             sortBy: [SortDescriptor(\.onset, order: .reverse)])
         desc.fetchLimit = Self.monthFetchLimit
         _monthEntries = Query(desc)
+
+        let riskSince = cal.startOfDay(for: Date())
+            .addingTimeInterval(-Double(Self.riskWindowDays) * 86_400)
+        var riskDesc = FetchDescriptor<StoredHeadacheRisk>(
+            predicate: #Predicate { $0.day >= riskSince },
+            sortBy: [SortDescriptor(\.day, order: .reverse)])
+        riskDesc.fetchLimit = Self.riskFetchLimit
+        _recentRisk = Query(riskDesc)
     }
 
     var body: some View {
@@ -61,6 +112,8 @@ struct HeadacheCardView: View {
             } else {
                 header
             }
+
+            signalsSection
 
             Button {
                 showLogSheet = true
@@ -82,6 +135,145 @@ struct HeadacheCardView: View {
                     originalOnset: draft.originalOnset)
             }
         }
+        // Last night's verdict, OFF the render path. `HeadacheEngine` owns the other half of the
+        // 0x8BADF00D discipline (VitalsStatusCardView.swift:101-122): it snapshots the SwiftData
+        // rows on the main actor and runs the Kit math on `Task.detached`. Doing any of it inline
+        // in `body` has already cost this app one shipped watchdog crash.
+        .task(id: signalsKey) {
+            let store = LocalStore(modelContext)
+            let engine = HeadacheEngine()
+            verdict = await engine.todaysVerdict(store: store)
+            // The row of record, fetched AFTER the assessment and flattened to values immediately:
+            // a `@Model` reference must not be carried across a suspension point (the row can be
+            // re-staged or deleted under us), and only these two values reach the render path.
+            // Reassigned unconditionally so the band clears again after midnight.
+            let recorded = engine.frozenToday(store: store)
+            recordedBand = recorded.flatMap { HeadacheSignals.Band(rawValue: $0.bandRaw) }
+            recordedFeatureCount = recorded?.ringFeatureCount
+            signalsLoaded = true
+        }
+    }
+
+    // MARK: - Overnight signals (#183, Phase 2)
+
+    /// Identity for the verdict recompute: today's date (so the card doesn't hold last night's
+    /// answer across midnight), the frozen rows (this morning's row appearing must show up), and
+    /// the log (logging today changes the suppression state).
+    private var signalsKey: String {
+        let day = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        return "\(day)|\(recentRisk.count)|\(recentRisk.first?.updatedAt.timeIntervalSince1970 ?? 0)|\(monthEntries.count)"
+    }
+
+    /// Whether the engine reported the feature switched off. The dashboard already gates the whole
+    /// card on `HeadacheDefaults.enabled`; this is the belt-and-braces case where the engine and
+    /// the caller disagree, and it renders nothing rather than an empty heading.
+    private var isNotEnabled: Bool {
+        guard let verdict else { return false }
+        if case .notEnabled = verdict { return true }
+        return false
+    }
+
+    /// The band this card is willing to show: the FROZEN row's when today is frozen, the live
+    /// reproduction's until it is, and nothing at all when neither can speak.
+    private var shownBand: HeadacheSignals.Band? {
+        if let recordedBand { return recordedBand }
+        if let verdict, case .scored(let assessment) = verdict {
+            return HeadacheSignalCopy.displayBand(assessment)
+        }
+        return nil
+    }
+
+    /// The live reproduction's assessment, when there is one. It supplies the DETAIL under the band
+    /// — the driver lines and the fever note — which the frozen row cannot: it stores contributions
+    /// as JSON, and the Kit's `Assessment` has no public initialiser to rebuild one from.
+    private var liveAssessment: HeadacheSignals.Assessment? {
+        if let verdict, case .scored(let assessment) = verdict { return assessment }
+        return nil
+    }
+
+    /// Last night's verdict under a NEUTRAL heading. Every branch states what we actually know:
+    /// there is deliberately no branch that renders a comfortable silence.
+    @ViewBuilder
+    private var signalsSection: some View {
+        if signalsLoaded && !isNotEnabled {
+            VStack(alignment: .leading, spacing: 6) {
+                Divider()
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("Overnight signals")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer(minLength: 8)
+                    if let shownBand {
+                        HeadacheBandChip(band: shownBand)
+                    }
+                }
+                if let verdict {
+                    signalsBody(verdict)
+                } else {
+                    Text("Not assessed yet.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private func signalsBody(_ verdict: HeadacheSignals.Verdict) -> some View {
+        // The headline follows the band actually on screen. Deriving it from the live verdict while
+        // the chip came from the frozen row is how the card ends up saying one thing beside another.
+        let head = recordedBand.map(HeadacheSignalCopy.headline(recordedBand:))
+            ?? HeadacheSignalCopy.headline(verdict)
+        Text(head.title)
+            .font(.subheadline)
+        if let detail = head.detail {
+            Text(detail)
+                .font(.caption).foregroundStyle(.secondary)
+        }
+
+        // The two biggest REASONS, with what they actually read. A band with nothing under it is an
+        // assertion; naming the inputs is what makes it checkable. Only the live reproduction can
+        // supply them, so on a re-staged morning the recorded band stands with no drivers under it
+        // rather than borrowing reasons that produced a different number.
+        if let live = liveAssessment, shownBand != .typical {
+            ForEach(Array(HeadacheSignalCopy.drivers(live.contributions).prefix(2)),
+                    id: \.feature) { driver in
+                driverLine(driver)
+            }
+        }
+
+        // Coverage on EVERY scored night, not just the thin ones. A confident "nothing unusual"
+        // derived from two working sensors is the dangerous failure mode here — a lie of omission —
+        // so how much was actually measured is never left off. Recorded coverage first, for the same
+        // reason as the band.
+        if let measured = recordedFeatureCount ?? liveAssessment?.ringFeatureCount {
+            Text("Measured \(measured) of \(HeadacheSignalCopy.ringFeatureTotal) signals.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+
+        if liveAssessment?.suppressedBy == .fever {
+            // Raised HR + raised temperature IS a scored night's signature, so it is named
+            // rather than left to be misread. `.headacheAlreadyLogged` is deliberately NOT
+            // surfaced: it only withholds a Phase-3 notification, and saying it here would put
+            // the word "headache" into signals copy for no gain.
+            Text("Your resting heart rate and skin temperature both look raised, which on its own can produce these signals.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+
+        // Attached to the BAND, not to the live verdict: whenever a band is on screen, so is the
+        // sentence saying what it is and is not.
+        if shownBand != nil {
+            Text("How unusual last night was for you — in either direction, not how bad it was. Not a prediction.")
+                .font(.caption2).foregroundStyle(.tertiary)
+        }
+    }
+
+    /// One reason, with its real reading attached in the user's own units.
+    private func driverLine(_ contribution: HeadacheSignals.Contribution) -> some View {
+        let unit = TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius
+        let name = HeadacheSignalCopy.name(contribution.feature)
+        let phrase = HeadacheSignalCopy.deviation(contribution, tempUnit: unit)
+        return Text(phrase.map { "\(name) — \($0)" } ?? name)
+            .font(.caption).foregroundStyle(.secondary)
     }
 
     /// Title + this month's count. The chevron is drawn in both modes because the card pushes the

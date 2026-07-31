@@ -143,8 +143,23 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                 await Self.evaluateAlerts()
                 // Body-vital alerts (#73/#85) from the freshly-synced store — battery/session are
                 // gone in the background, so this reads persisted samples only (session: nil).
-                await HealthNotificationCenter().evaluate(store: LocalStore(container.mainContext),
-                                                          session: nil)
+                //
+                // #183: the overnight-signals row for today is frozen IMMEDIATELY BEFORE that alert
+                // pass, so a background drain alone can produce the morning verdict — no foreground
+                // open required — and the alert pass reads the fresh row. The engine's expensive
+                // input (the resting-HR daily series) is fetched only when the user has opted in and
+                // is then shared with the fever cross-check inside `evaluate`, so a background wake
+                // never pays for that scan twice; opted out, this costs one UserDefaults read and
+                // the pass is exactly as it was before #183.
+                let alertStore = LocalStore(container.mainContext)
+                let alerts = HealthNotificationCenter()
+                let restingHRDaily = UserDefaults.standard.bool(forKey: HeadacheDefaults.enabled)
+                    ? alerts.restingHRDailySeries(store: alertStore) : nil
+                if let restingHRDaily {
+                    await HeadacheEngine().refreshToday(store: alertStore, restingHR: restingHRDaily)
+                }
+                await alerts.evaluate(store: alertStore, session: nil,
+                                      restingHRDaily: restingHRDaily)
                 scheduler.schedule()
                 scheduler.scheduleProcessing()
                 task.setTaskCompleted(success: synced)
