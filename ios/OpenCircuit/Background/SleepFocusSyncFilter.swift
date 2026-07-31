@@ -115,7 +115,19 @@ private enum SleepFocusSyncRunner {
                 detail: synced ? "captured/flushed data" : "no data this run"
             )
             await evaluateAlerts()
-            await HealthNotificationCenter().evaluate(store: store, session: nil)
+            // #183: Focus-off is the authoritative "the night is over" wake and the earliest moment
+            // the night is settled, so freeze today's overnight-signals row here, immediately before
+            // the alert pass reads it. Idempotent — a later BGTask or wake-drain that reaches the
+            // same day is a no-op. The resting-HR daily series is fetched only for an opted-in user
+            // and is then shared with the fever cross-check inside `evaluate` rather than scanned
+            // twice; opted out, this short system wake costs exactly what it did before #183.
+            let alerts = HealthNotificationCenter()
+            let restingHRDaily = UserDefaults.standard.bool(forKey: HeadacheDefaults.enabled)
+                ? alerts.restingHRDailySeries(store: store) : nil
+            if let restingHRDaily {
+                await HeadacheEngine().refreshToday(store: store, restingHR: restingHRDaily)
+            }
+            await alerts.evaluate(store: store, session: nil, restingHRDaily: restingHRDaily)
 
             scheduler.schedule()
             scheduler.scheduleProcessing()

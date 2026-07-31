@@ -82,11 +82,39 @@ struct OpenCircuitApp: App {
         }
     }
 
+    /// Adds `StoredHeadacheEntry` (the user-entered headache log) and `StoredHeadacheRisk` (the
+    /// frozen daily signals rows Phase 2 populates) — see `Store/HeadacheStore.swift`. Both are
+    /// brand-new tables and every column carries a default, so no existing model changes shape:
+    /// lightweight migration, not a custom stage. Both land in ONE version deliberately, so the
+    /// Phase-2 risk rows never need a second migration — each migration is a launch-crash surface
+    /// whose recovery path wipes un-resyncable raw history (#40).
+    ///
+    /// V4 IS STILL UNRELEASED, so its shape is edited IN PLACE rather than superseded — Phase 2
+    /// added `StoredHeadacheRisk.nightKey` here without bumping the identifier. That is deliberate
+    /// and it is the only correct option: SwiftData derives a version's checksum from its model
+    /// SHAPES, so a V5 listing the same models is rejected outright with "duplicate version
+    /// checksums" (measured — it does not merely warn). The cost is that a device carrying an
+    /// INTERMEDIATE build of this branch has a V4 store whose checksum no longer matches and will
+    /// hit the container-open failure path; delete and reinstall such a dev build. No shipped build
+    /// has ever written V4, so no user store is exposed. Once this merges, V4 is frozen and the
+    /// next shape change must be a real V5.
+    enum SchemaV4: VersionedSchema {
+        static var versionIdentifier = Schema.Version(4, 0, 0)
+        static var models: [any PersistentModel.Type] {
+            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
+             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
+             StoredHeadacheEntry.self, StoredHeadacheRisk.self]
+        }
+    }
+
     enum MigrationPlan: SchemaMigrationPlan {
-        static var schemas: [any VersionedSchema.Type] { [SchemaV1.self, SchemaV2.self, SchemaV3.self] }
+        static var schemas: [any VersionedSchema.Type] {
+            [SchemaV1.self, SchemaV2.self, SchemaV3.self, SchemaV4.self]
+        }
         static var stages: [MigrationStage] {
             [.lightweight(fromVersion: SchemaV1.self, toVersion: SchemaV2.self),
-             .lightweight(fromVersion: SchemaV2.self, toVersion: SchemaV3.self)]
+             .lightweight(fromVersion: SchemaV2.self, toVersion: SchemaV3.self),
+             .lightweight(fromVersion: SchemaV3.self, toVersion: SchemaV4.self)]
         }
     }
 
@@ -122,9 +150,12 @@ struct OpenCircuitApp: App {
     /// The schema + default configuration shared by BOTH container builders, so the foreground
     /// (recovering) and background (non-destructive) paths can never drift apart. (#131)
     private static func makeSchemaAndConfig() -> (Schema, ModelConfiguration) {
+        // Must list exactly `SchemaV4.models` — the container is built from THIS array, so a model
+        // present only in the versioned schema enum would migrate in and then be unreachable.
         let schema = Schema([StoredSample.self, StoredCursor.self,
                              StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
-                             StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self])
+                             StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
+                             StoredHeadacheEntry.self, StoredHeadacheRisk.self])
         return (schema, ModelConfiguration(schema: schema))
     }
 
@@ -373,10 +404,55 @@ struct RollupBackup: Codable {
         var healthWritten: Bool
         var updatedAt: Date
     }
+    /// User-ENTERED headache logs (headache-signals Phase 1). Same irreplaceability argument as
+    /// `Period` above, and it bites harder: this is the ground-truth LABEL series the detector can
+    /// only ever be validated against, HealthKit is never read back as a recovery source (import is
+    /// a user-initiated one-off, not a restore path), and the developer doesn't get headaches — so
+    /// a tester's labels lost to a wipe are lost for good. `healthWritten` + `hkSampleUUIDs` round-
+    /// trip so a restored entry is neither re-written to Health nor orphaned there (an orphaned
+    /// UUID is a sample the user can never delete through our UI again).
+    struct Headache: Codable {
+        var onset: Date
+        var end: Date?
+        var severityRaw: Int
+        var symptoms: [String]
+        var customSymptoms: [String]
+        var factors: [String]
+        var notes: String
+        var sourceRaw: String
+        var importedHKUUID: String?
+        var healthWritten: Bool
+        var hkSampleUUIDs: [String]
+        var updatedAt: Date
+    }
+    /// Frozen daily signals rows (Phase 2+). Backed up because the freeze is the point: a row is
+    /// written once and NEVER recomputed, so a wiped row cannot be regenerated — the day would
+    /// silently vanish from every later precision/AUC number instead of being restored.
+    struct RiskDay: Codable {
+        var day: Date
+        /// Optional so a backup written before the timezone-stable key existed still decodes.
+        var nightKey: Date?
+        var index: Double
+        var bandRaw: Int
+        var ringFeatureCount: Int
+        var coverageFraction: Double
+        var contributionsJSON: String
+        var absentJSON: String
+        var computedAt: Date
+        var sleepUpdatedAt: Date?
+        var sleepRestaged: Bool
+        var alerted: Bool
+        var postUnlock: Bool
+        var updatedAt: Date
+    }
     var sleep: [Sleep]
     var daily: [Daily]
     var periods: [Period]
     var naps: [Nap]
+    // Optional (like `Sleep.sleepOnset` above) so a backup file written by a shipped pre-headache
+    // build — which has no such keys — still decodes instead of failing the whole restore.
+    var headaches: [Headache]? = nil
+    var riskDays: [RiskDay]? = nil
 
     private static var backupURL: URL? {
         guard let dir = try? FileManager.default.url(
@@ -391,7 +467,8 @@ struct RollupBackup: Codable {
     /// fails). The file persists so a crash mid-wipe can't lose the rollups.
     static func exportBeforeWipe(config: ModelConfiguration) -> RollupBackup? {
         let schema = Schema([StoredSleepSummary.self, StoredDaily.self,
-                             StoredPeriodEntry.self, StoredNap.self])
+                             StoredPeriodEntry.self, StoredNap.self,
+                             StoredHeadacheEntry.self, StoredHeadacheRisk.self])
         let limited = ModelConfiguration(schema: schema, url: config.url)
         guard let container = try? ModelContainer(for: schema, configurations: limited) else { return nil }
         let ctx = ModelContext(container)
@@ -399,6 +476,8 @@ struct RollupBackup: Codable {
         let dailyRows = (try? ctx.fetch(FetchDescriptor<StoredDaily>())) ?? []
         let periodRows = (try? ctx.fetch(FetchDescriptor<StoredPeriodEntry>())) ?? []
         let napRows = (try? ctx.fetch(FetchDescriptor<StoredNap>())) ?? []
+        let headacheRows = (try? ctx.fetch(FetchDescriptor<StoredHeadacheEntry>())) ?? []
+        let riskRows = (try? ctx.fetch(FetchDescriptor<StoredHeadacheRisk>())) ?? []
         let backup = RollupBackup(
             sleep: sleepRows.map {
                 Sleep(night: $0.night, asleepMin: $0.asleepMin, deepMin: $0.deepMin,
@@ -421,6 +500,22 @@ struct RollupBackup: Codable {
             naps: napRows.map {
                 Nap(start: $0.start, end: $0.end, asleepMin: $0.asleepMin,
                     isLongNap: $0.isLongNap, healthWritten: $0.healthWritten, updatedAt: $0.updatedAt)
+            },
+            headaches: headacheRows.map {
+                Headache(onset: $0.onset, end: $0.end, severityRaw: $0.severityRaw,
+                         symptoms: $0.symptoms, customSymptoms: $0.customSymptoms,
+                         factors: $0.factors, notes: $0.notes, sourceRaw: $0.sourceRaw,
+                         importedHKUUID: $0.importedHKUUID, healthWritten: $0.healthWritten,
+                         hkSampleUUIDs: $0.hkSampleUUIDs, updatedAt: $0.updatedAt)
+            },
+            riskDays: riskRows.map {
+                RiskDay(day: $0.day, nightKey: $0.nightKey, index: $0.index, bandRaw: $0.bandRaw,
+                        ringFeatureCount: $0.ringFeatureCount,
+                        coverageFraction: $0.coverageFraction,
+                        contributionsJSON: $0.contributionsJSON, absentJSON: $0.absentJSON,
+                        computedAt: $0.computedAt, sleepUpdatedAt: $0.sleepUpdatedAt,
+                        sleepRestaged: $0.sleepRestaged, alerted: $0.alerted,
+                        postUnlock: $0.postUnlock, updatedAt: $0.updatedAt)
             })
         if let url = backupURL, let data = try? JSONEncoder().encode(backup) {
             try? data.write(to: url, options: .atomic)
@@ -459,6 +554,24 @@ struct RollupBackup: Codable {
             ctx.insert(StoredNap(start: n.start, end: n.end, asleepMin: n.asleepMin,
                                  isLongNap: n.isLongNap, healthWritten: n.healthWritten,
                                  updatedAt: n.updatedAt))
+        }
+        for h in headaches ?? [] {
+            ctx.insert(StoredHeadacheEntry(
+                onset: h.onset, end: h.end, severityRaw: h.severityRaw,
+                symptoms: h.symptoms, customSymptoms: h.customSymptoms, factors: h.factors,
+                notes: h.notes, sourceRaw: h.sourceRaw, importedHKUUID: h.importedHKUUID,
+                healthWritten: h.healthWritten, hkSampleUUIDs: h.hkSampleUUIDs,
+                updatedAt: h.updatedAt))
+        }
+        for r in riskDays ?? [] {
+            ctx.insert(StoredHeadacheRisk(
+                day: r.day, nightKey: r.nightKey ?? .distantPast,
+                index: r.index, bandRaw: r.bandRaw,
+                ringFeatureCount: r.ringFeatureCount, coverageFraction: r.coverageFraction,
+                contributionsJSON: r.contributionsJSON, absentJSON: r.absentJSON,
+                computedAt: r.computedAt, sleepUpdatedAt: r.sleepUpdatedAt,
+                sleepRestaged: r.sleepRestaged, alerted: r.alerted, postUnlock: r.postUnlock,
+                updatedAt: r.updatedAt))
         }
         if (try? ctx.save()) != nil, let url = Self.backupURL {
             try? FileManager.default.removeItem(at: url)

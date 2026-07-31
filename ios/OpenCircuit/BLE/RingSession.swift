@@ -2761,7 +2761,25 @@ final class RingSession: NSObject {
             // quiet-hours gate + per-notification `lastFired` backoff dedupe any overlap with the
             // BGTask path, and the whole await is covered by the surrounding drain assertion.
             if let localStore {
-                await HealthNotificationCenter().evaluate(store: localStore, session: self)
+                // #183: freeze today's overnight-signals row FIRST, so the alert pass right below
+                // reads a row computed from THIS drain rather than one lagging a sync. The engine is
+                // idempotent (a day freezes once) and this is the primary all-day delivery path, so
+                // it runs here and nowhere else in the BLE layer.
+                //
+                // The engine's one expensive input is the resting-HR daily series, so it is fetched
+                // ONLY when the user has opted in and then shared with the fever path below
+                // (`restingHRDailySeries`) instead of being scanned twice. Opted out → no series, no
+                // engine run, and `evaluate` falls back to its original lazy fetch: the cost of this
+                // wake-drain is then exactly what it was before #183. Nothing is substituted for a
+                // missing series — the engine is simply not called.
+                let alerts = HealthNotificationCenter()
+                let restingHRDaily = UserDefaults.standard.bool(forKey: HeadacheDefaults.enabled)
+                    ? alerts.restingHRDailySeries(store: localStore) : nil
+                if let restingHRDaily {
+                    await HeadacheEngine().refreshToday(store: localStore, restingHR: restingHRDaily)
+                }
+                await alerts.evaluate(store: localStore, session: self,
+                                      restingHRDaily: restingHRDaily)
             }
         }
         await postMorningSummaryIfNeeded()

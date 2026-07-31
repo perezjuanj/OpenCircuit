@@ -1,4 +1,5 @@
 import BackgroundTasks
+import OpenCircuitKit
 import SwiftData
 import UIKit
 import UserNotifications
@@ -14,6 +15,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // local notifications, so the user would see nothing and the backoff would still record a
         // fire — making them miss the alert entirely.
         UNUserNotificationCenter.current().delegate = self
+        Self.registerNotificationCategories()
         let refreshRegistered = scheduler.register { task in
             guard let refreshTask = task as? BGAppRefreshTask else {
                 task.setTaskCompleted(success: false)
@@ -87,6 +89,40 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         return true
     }
 
+    /// Register the app's `UNNotificationCategory` set. Currently exactly one: the #183 morning
+    /// overnight-signals verdict.
+    ///
+    /// ══ THE CATEGORY HAS NO ACTIONS, AND THAT IS DELIBERATE. DO NOT ADD ANY. ══
+    ///
+    /// The obvious "improvement" here is a pair of quick-reply buttons — "I have a headache" /
+    /// "No headache" — or a one-tap log action. It would be a serious, irreversible mistake.
+    ///
+    /// Those buttons would appear ONLY on flagged mornings, because that is the only morning this
+    /// notification fires. Label capture would then be CONDITIONED ON OUR OWN PREDICTION: we would
+    /// collect ground truth disproportionately from the days we flagged, and every precision,
+    /// recall and AUC number computed afterwards would be inflated by construction — including the
+    /// ones the auto-retire quality monitor uses to decide whether this alert is helping the user
+    /// at all. The bias is invisible in the data (a flagged-day label looks exactly like any other)
+    /// and it is permanent: labels collected under a biased sampling scheme cannot be repaired
+    /// afterwards, and this feature has exactly one source of ground truth.
+    ///
+    /// Logging therefore stays ONLY on paths that are NOT conditioned on the flag, all of which
+    /// already exist and are always available: the Siri/App Intents (`HeadacheLogIntent`), the
+    /// Control Centre control (`HeadacheLogControl`), the card's "Log a headache" button, and the
+    /// daily morning-after prompt — which deliberately ignores the score for exactly this reason.
+    ///
+    /// `setNotificationCategories` REPLACES the whole set, and this is the only call site in the
+    /// app (verified: no other `setNotificationCategories` / `UNNotificationCategory` exists), so a
+    /// future second category must be added to this array rather than registered by a second call.
+    private static func registerNotificationCategories() {
+        UNUserNotificationCenter.current().setNotificationCategories([
+            UNNotificationCategory(identifier: HeadacheSignsNotifications.categoryIdentifier,
+                                   actions: [],              // ← intentionally empty; see above.
+                                   intentIdentifiers: [],
+                                   options: []),
+        ])
+    }
+
     /// NOT delivered under the SwiftUI scene lifecycle — kept only as belt-and-braces against a
     /// future lifecycle change. The live submission points are `didFinishLaunching` above and
     /// OpenCircuitApp's `scenePhase == .background` handler. (#119)
@@ -143,8 +179,23 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                 await Self.evaluateAlerts()
                 // Body-vital alerts (#73/#85) from the freshly-synced store — battery/session are
                 // gone in the background, so this reads persisted samples only (session: nil).
-                await HealthNotificationCenter().evaluate(store: LocalStore(container.mainContext),
-                                                          session: nil)
+                //
+                // #183: the overnight-signals row for today is frozen IMMEDIATELY BEFORE that alert
+                // pass, so a background drain alone can produce the morning verdict — no foreground
+                // open required — and the alert pass reads the fresh row. The engine's expensive
+                // input (the resting-HR daily series) is fetched only when the user has opted in and
+                // is then shared with the fever cross-check inside `evaluate`, so a background wake
+                // never pays for that scan twice; opted out, this costs one UserDefaults read and
+                // the pass is exactly as it was before #183.
+                let alertStore = LocalStore(container.mainContext)
+                let alerts = HealthNotificationCenter()
+                let restingHRDaily = UserDefaults.standard.bool(forKey: HeadacheDefaults.enabled)
+                    ? alerts.restingHRDailySeries(store: alertStore) : nil
+                if let restingHRDaily {
+                    await HeadacheEngine().refreshToday(store: alertStore, restingHR: restingHRDaily)
+                }
+                await alerts.evaluate(store: alertStore, session: nil,
+                                      restingHRDaily: restingHRDaily)
                 scheduler.schedule()
                 scheduler.scheduleProcessing()
                 task.setTaskCompleted(success: synced)

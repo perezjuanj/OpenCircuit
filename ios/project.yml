@@ -14,7 +14,7 @@ options:
 settings:
   base:
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "33"
+    CURRENT_PROJECT_VERSION: "34"
 
 packages:
   OpenCircuitKit:
@@ -70,6 +70,17 @@ targets:
         # Live Activities (workout modal): required for the app to start an ActivityKit Live Activity
         # showing live workout time / calories / heart rate on the Lock Screen + Dynamic Island.
         NSSupportsLiveActivities: true
+        # Custom URL scheme — the app's ONE deep link, handled in ContentView's `.onOpenURL`.
+        # Required by the Control Centre / Lock Screen "Log a Headache" control: that control lives
+        # in the WorkoutWidget extension, which has no App Group and therefore cannot reach the
+        # app's SwiftData store, so it opens `opencircuit://headache/log?when=now` instead of
+        # writing a label it could only lose. See Shared/HeadacheQuickLink.swift. MUST live here —
+        # XcodeGen regenerates Info.plist and would strip a hand-edited key.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.standardsoftwaresolutions.opencircuit
+            CFBundleTypeRole: Editor
+            CFBundleURLSchemes:
+              - opencircuit
         # BLE (Phase 3) — required to connect to the ring.
         NSBluetoothAlwaysUsageDescription: "OpenCircuit connects to your RingConn Gen 2 ring over Bluetooth Low Energy."
         # Location (Phase 3, #75) — used ONLY during an active workout: to map the GPS route

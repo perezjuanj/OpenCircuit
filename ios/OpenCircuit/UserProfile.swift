@@ -88,6 +88,37 @@ struct UserProfileSettingsView: View {
     // never see the cycle calendar card on the dashboard. Shared key with ContentView.
     @AppStorage("userProfile.womensHealthEnabled") private var womensHealthEnabled = false
 
+    // Headache log toggle. Off by default — the dashboard card stays hidden until the user asks
+    // for it. Shared key with ContentView, referenced through `HeadacheDefaults.enabled` rather
+    // than a second copy of the literal (the `userProfile.womensHealthEnabled` string above is
+    // typed out in both files, which is exactly the drift hazard we're not repeating).
+    @AppStorage(HeadacheDefaults.enabled) private var headacheEnabled = false
+    /// Distinct from the app-wide `showOnboarding` above — this is the headache-specific explainer.
+    @State private var showHeadacheOnboarding = false
+    /// Whether the morning signal is live. User-writable to OFF at any time; only the 21-night
+    /// unlock (or an explicit resume) sets it true.
+    @AppStorage(HeadacheDefaults.unlocked) private var headacheAlertsOn = false
+    /// `yyyymmdd` of the day the morning signal first unlocked. 0 = never — before that there is
+    /// nothing to switch, so the row is a status line rather than a dead toggle.
+    @AppStorage(HeadacheDefaults.promotedOnDayKey) private var headachePromotedDay = 0
+
+    /// The morning signal only becomes a real control once it has actually unlocked.
+    private var headacheAlertsAvailable: Bool { headachePromotedDay != 0 || headacheAlertsOn }
+
+    /// Present the explainer when the user has never seen it, OR has seen a version whose promises
+    /// this build no longer keeps. Version 1 said "it won't notify you" — that is now false, and a
+    /// latched Bool would have left the retraction undelivered forever.
+    private func presentHeadacheOnboardingIfNeeded() {
+        let d = UserDefaults.standard
+        var seen = d.integer(forKey: HeadacheDefaults.onboardingVersion)
+        // Migration: an install predating the version key that already saw the v1 explainer.
+        if seen == 0, d.bool(forKey: HeadacheDefaults.onboardingShown) { seen = 1 }
+        guard seen < HeadacheDefaults.currentOnboardingVersion else { return }
+        d.set(HeadacheDefaults.currentOnboardingVersion, forKey: HeadacheDefaults.onboardingVersion)
+        d.set(true, forKey: HeadacheDefaults.onboardingShown)
+        showHeadacheOnboarding = true
+    }
+
     // Unit preferences (#83). Default to locale-appropriate units out of the box.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
     @AppStorage("units.distance")    private var distUnitRaw = DistanceUnit.localeDefault.rawValue
@@ -412,12 +443,15 @@ struct UserProfileSettingsView: View {
                 }
                 Toggle("Skin-temp & fever alerts", isOn: $tempFeverEnabled)
                     .onChange(of: tempFeverEnabled) { _, on in escalateNotifAuth(enabled: on) }
-                Text("Note: OpenCircuit is not a medical device. These reminders are based on ring "
-                     + "sensor data only and are not a diagnosis. If you feel unwell, consult a "
-                     + "qualified medical professional.")
+                Text(Self.medicalDisclaimer)
                     .font(.caption2).foregroundStyle(.secondary)
             }
-            .task { await refreshNotifAuthState() }
+            .task {
+            await refreshNotifAuthState()
+            // Users who enabled this under a previous explainer never hit the toggle's onChange, so
+            // the correction has to reach them on open too.
+            if headacheEnabled { presentHeadacheOnboardingIfNeeded() }
+        }
             .onChange(of: scenePhase) { _, phase in
                 // Coming back from iOS Settings: reflect a freshly-flipped notification switch
                 // (enabled or disabled) in the banner without an app relaunch (#136).
@@ -431,6 +465,48 @@ struct UserProfileSettingsView: View {
                      + "turn it on if you want it. Predictions are estimates only and "
                      + "are not a contraception tool or medical advice.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section("Headache signals") {
+                // No `escalateNotifAuth` on this toggle, unlike the four alert toggles above: this
+                // feature schedules NO notification, so asking for notification authorization here
+                // would burn the one-time system prompt (#133) on something that can never post.
+                Toggle("Show headache log", isOn: $headacheEnabled)
+                    // The explainer fires on the ENABLE edge only. The ask this feature makes is
+                    // entirely front-loaded (log everything, for months, for something that may
+                    // never pay off), and release notes never reach someone who flips a setting
+                    // weeks after installing.
+                    .onChange(of: headacheEnabled) { _, isOn in
+                        guard isOn else { return }
+                        presentHeadacheOnboardingIfNeeded()
+                    }
+                Text("Adds a headache log to the dashboard, and an \"overnight signals\" view "
+                     + "showing whether last night looked unusual for you. You record when a "
+                     + "headache started, when it eased off and how bad it was, and OpenCircuit "
+                     + "mirrors each entry into Apple Health; headaches already in Apple Health can "
+                     + "be imported. It never predicts headaches.")
+                    .font(.caption).foregroundStyle(.secondary)
+
+                // A REAL control, not a status line. It used to be a hardcoded "Off" label with
+                // copy saying there was no switch — written when the alert was gated behind proof
+                // and could not fire. It can now fire, so a user receiving it needs somewhere to
+                // stop it. Without this their only options were disabling the whole feature (which
+                // also hides their headache log) or revoking notification permission app-wide
+                // (which would silence the fever and reminder alerts too).
+                if headacheAlertsAvailable {
+                    Toggle("Morning signal", isOn: $headacheAlertsOn)
+                    Text("At most once in a morning, when the night stood out from your normal. It "
+                         + "tells you what was measured — never that a headache is coming.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    LabeledContent("Morning signal", value: "Not yet")
+                    Text("Needs about three weeks of scored nights before it can tell a stand-out "
+                         + "night from an ordinary one. It'll switch itself on then, and you can "
+                         + "turn it off here.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text(Self.headacheDisclaimer)
+                    .font(.caption2).foregroundStyle(.secondary)
             }
 
             Section("Quiet hours") {
@@ -528,6 +604,9 @@ struct UserProfileSettingsView: View {
 
         }
         .navigationTitle("User Profile")
+        .sheet(isPresented: $showHeadacheOnboarding) {
+            HeadacheOnboardingView()
+        }
         .sheet(isPresented: $showOnboarding) {
             OnboardingView { showOnboarding = false }
         }
@@ -614,6 +693,24 @@ struct UserProfileSettingsView: View {
         names.formUnion(healthWriteFailures.map(\.displayName))
         return names.sorted()
     }
+
+    /// The medical disclaimer paragraph, verbatim, shared by every section that touches a body
+    /// signal (Health alerts, and the headache log). Hoisted to ONE constant rather than re-typed
+    /// per section so the two can't drift into telling the user different things.
+    private static let medicalDisclaimer =
+        "Note: OpenCircuit is not a medical device. These reminders are based on ring "
+        + "sensor data only and are not a diagnosis. If you feel unwell, consult a "
+        + "qualified medical professional."
+
+    /// Headache-specific wording. The shared `medicalDisclaimer` above says the reminders "are
+    /// based on ring sensor data only" — neither clause is true of a Phase-1 headache log, which is
+    /// typed by the user, derives nothing from the ring, and fires no reminder at all. Over-
+    /// disclaiming is the safe direction, but a disclaimer that misdescribes the feature is its own
+    /// kind of untrue, and this one has to carry the load-bearing sentence: we do not predict.
+    private static let headacheDisclaimer =
+        "Note: OpenCircuit is not a medical device. A headache log is your own record, not a "
+        + "diagnosis, and OpenCircuit does not predict or detect headaches. If you feel unwell, "
+        + "consult a qualified medical professional."
 
     private func formatGoalSleep(_ minutes: Int) -> String {
         let h = minutes / 60, m = minutes % 60

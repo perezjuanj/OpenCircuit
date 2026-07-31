@@ -17,6 +17,18 @@ device's own timestamps (so historical sync backfills correctly).
 | Sleep stages | `HKCategoryType(.sleepAnalysis)` | Category | — | values: `inBed`, `asleepCore`, `asleepDeep`, `asleepREM`, `awake` |
 | Workout / strain | `HKWorkout` | Workout | — | openwhoop "strain" has no native type; store as workout + metadata |
 
+## User-entered logs
+
+Not everything we write comes from the ring. These types carry what the **user typed**,
+and the ring contributes nothing to them. Same house pattern in both cases: a SwiftData
+row keyed by its start, with the written sample UUIDs recorded on the row so an edit
+deletes-then-rewrites (HealthKit is append-only) and a delete removes the sample from Health.
+
+| User-logged entry | HealthKit type | Kind | Unit | Notes |
+|---|---|---|---|---|
+| Period / flow (#78) | `HKCategoryType(.menstrualFlow)` | Category | — | one single-day sample per logged day; `HKMetadataKeyMenstrualCycleStart` on the first day only |
+| Headache | `HKCategoryType(.headache)` | Category | — | value = `HKCategoryValueSeverity`; written **only** from an explicit user entry — see notes |
+
 ## Implementation notes
 
 - **Sources & dedup.** Use a stable `HKSource`/bundle id so re-syncs update rather
@@ -94,3 +106,56 @@ above are not stored samples, so each carries its own high-water mark in `UserDe
 (resting-HR day, basal next-hour, active-energy day + written-kcal). Marks advance only after
 a confirmed save and are shared across the foreground + background writer instances, so
 repeated foreground/background syncs never double-write.
+
+### Headache log → `HKCategoryType(.headache)`
+
+The headache log is a **label series the user writes**, not a measurement. It exists so a
+later phase's detector has ground truth to be validated against, and the mirror to Apple
+Health keeps that series portable and re-importable.
+
+**Write direction — user entries only.** A `.headache` sample is written for exactly one
+reason: the user opened the log sheet and said they had a headache. Nothing in this app ever
+*infers* a headache from ring data and writes it to Health. `StoredHeadacheEntry.source`
+records provenance (`user` / `healthImport` / `periodLogImport`), and
+`LocalStore.pendingHeadacheEntries()` excludes `healthImport` rows, so a sample read out of
+Health is never written back into it.
+
+**Severity is the identity function.** `StoredHeadacheEntry.severityRaw` deliberately stores
+`HKCategoryValueSeverity`'s own raw values, so the mapping is `severityRaw` → itself and
+there is no translation table that can silently drift when either side gains a case:
+
+| stored `severityRaw` | `HKCategoryValueSeverity` | shown in-app |
+|---|---|---|
+| 0 | `.unspecified` | Unspecified |
+| 1 | `.notPresent` | None |
+| 2 | `.mild` | Mild |
+| 3 | `.moderate` | Moderate |
+| 4 | `.severe` | Severe |
+
+**An open headache writes a zero-length sample.** When the user has logged an onset but no
+resolution (`end == nil`), the sample's start and end are both the onset — we never invent
+a duration for a headache that hasn't ended. The entry stays un-finalized so a later flush
+can delete that placeholder and re-write the real span once the user logs the end (the same
+delete/re-write path an edit uses).
+
+**Read direction — labels, never a displayed measurement.** Headaches already in Apple
+Health can be imported (on the user's explicit tap) so the label series isn't empty for
+people who have been logging elsewhere. Imported rows are marked `healthImport`, are
+de-duplicated by `importedHKUUID`, are shown as what they are — the user's own Health
+entries — and are never presented as something OpenCircuit measured or derived. The only
+downstream consumer is a future detector, which consumes them as **labels**. HealthKit does
+not report READ grants, so an empty read means *unknown*, never "this user has no
+headaches" — an import that returns nothing must not be treated as evidence of absence.
+
+**The detector writes nothing to Apple Health.** The overnight signals index
+(`StoredHeadacheRisk`) is local-only: no score, no band and no notification state is ever
+saved to Health, and there is no HealthKit type for any of it. The only thing this feature
+ever puts into Apple Health is what the user typed.
+
+**Authorization.** `HKCategoryType(.headache)` joins `HealthKitWriter.allTypes` — the
+single source of truth for the share set — so it is covered by the same partial-grant
+handling as every other type. Like every non-workout type there it is *also* requested for
+READ, which is what makes the import possible. It is a third-party-writable symptom type,
+so unlike
+`.appleSleepingWristTemperature` or `.appleExerciseTime` it can safely be listed in
+`toShare`.
