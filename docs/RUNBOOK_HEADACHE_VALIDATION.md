@@ -170,14 +170,16 @@ when it does not arrive, and a tester who quietly stops logging is worse than on
 >
 > **What you'll see:** an "Overnight signals" section saying whether last night looked unusual *for
 > you* — how far your sleep, heart rate, HRV and skin temperature drifted from your own normal. It
-> takes about a week before it says anything at all.
+> takes about a week before it says anything at all. After about three weeks it can also tell you, at
+> most once in a morning, when a night stood out. You can switch those mornings off any time in
+> Settings → Headache signals.
 >
-> **What it will NOT do, and we want to be straight about this:** it does not predict headaches and
-> it will not notify you. It says whether a night was unusual in either direction — a genuinely great
-> night looks "unusual" too, and so does a hangover, a late night out, or a hard training day. The
-> published accuracy ceiling for this kind of thing is low enough that we won't turn any alert on
-> until your own logged data shows it works *for you specifically*, which takes months and may never
-> happen. If that sounds underwhelming, that's the honest version.
+> **What it will NOT do, and we want to be straight about this:** it never tells you a headache is
+> coming. It only ever reports what it measured. "Unusual" cuts both ways — a genuinely great night
+> looks unusual too, and so does a hangover, a late night out, or a hard training day. Whether any of
+> it relates to *your* headaches is exactly what your logging is there to find out, and for some
+> people the answer will be no. If it turns out not to track anything for you, the app will stop
+> sending you the morning signal on its own and tell you why.
 >
 > **Even if you never get headaches, you're still helping** — the days with no headache are exactly
 > what tells us whether the signals mean anything. Please leave it on.
