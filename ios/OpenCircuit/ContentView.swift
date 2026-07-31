@@ -39,6 +39,10 @@ struct ContentView: View {
     @State private var showProbeShareSheet = false
     /// Women's health feature gate (#78). Matches the key in UserProfileSettingsView.
     @AppStorage("userProfile.womensHealthEnabled") private var womensHealthEnabled = false
+    /// Headache-log feature gate. Same key as the Profile toggle, but read through
+    /// `HeadacheDefaults.enabled` rather than a second copy of the raw string — the drift hazard the
+    /// duplicated `userProfile.womensHealthEnabled` literal above already demonstrates.
+    @AppStorage(HeadacheDefaults.enabled) private var headacheEnabled = false
 
     /// Persisted user ordering of the reorderable dashboard sections (long-press-drag QoL). Stored
     /// as a comma-joined list of `DashboardSection.rawValue`; unknown/duplicate entries are ignored
@@ -155,6 +159,14 @@ struct ContentView: View {
                 OnboardingView { onboardingCompleted = true }
             }
             .task {
+                // Register the headache-feature defaults once per launch, so a raw
+                // `UserDefaults.bool(forKey:)`/`integer(forKey:)` read outside an `@AppStorage`
+                // wrapper (the Diagnostics export, and Phase 2's gate bookkeeping) sees the
+                // documented default rather than a spurious `false`/`0`. `HealthAlertDefaults` and
+                // `ReminderDefaults` self-register from inside their own accessors
+                // (`HealthAlertDefaults.thresholds`, `evaluateReminders`); the headache keys have no
+                // such accessor yet, so the launch path owns it.
+                HeadacheDefaults.register()
                 // T6 — ORPHANED workout-in-progress flag (crash mid-workout): if the app was KILLED
                 // during a workout, `stop()`/`endSportSession()` never ran, so the DURABLE flag is
                 // still set on this fresh process with NO live workout to resume (full session resume
@@ -494,9 +506,11 @@ struct ContentView: View {
     }
 
     /// The sections actually rendered right now — `sectionOrder` minus any feature-gated card that's
-    /// switched off (currently just the women's-health cycle calendar).
+    /// switched off (the women's-health cycle calendar and the headache log, both opt-in).
     private var visibleSections: [DashboardSection] {
-        sectionOrder.filter { $0 != .cycle || womensHealthEnabled }
+        sectionOrder.filter {
+            ($0 != .cycle || womensHealthEnabled) && ($0 != .headache || headacheEnabled)
+        }
     }
 
     /// Apply a long-press-drag reorder. The move arrives in `visibleSections` index space; we apply
@@ -524,6 +538,7 @@ struct ContentView: View {
         case .calories:     caloriesCard
         case .goals:        card { GoalsCardView() }
         case .cycle:        cycleCalendarCard
+        case .headache:     headacheCard
         case .sync:         syncCard
         }
     }
@@ -534,6 +549,7 @@ struct ContentView: View {
     private func destination(for route: Route) -> some View {
         switch route {
         case .cycle:       CycleCalendarView()
+        case .headache:    HeadacheSignalsView()
         case .activityLog: ActivityLogView(session: session)
         }
     }
@@ -1211,6 +1227,20 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
+    /// Headache log nav card — taps through to HeadacheSignalsView. Only rendered when
+    /// `headacheEnabled` (settings toggle). Phase 1 is a LOG: the user records headaches they
+    /// actually had and they mirror into Apple Health. Nothing on this route detects, scores or
+    /// predicts a headache, so the card carries no claim of its own — `HeadacheCardView` draws its
+    /// own surface (as `VitalsStatusCardView` does) rather than being wrapped in `card { }` here.
+    private var headacheCard: some View {
+        // Deliberately NOT wrapped in an outer `Button` the way `cycleCalendarCard` is: this card
+        // carries its own controls ("Log a headache", the Apple Health import prompt), and a Button
+        // nested inside another Button's label does not receive its own taps — the outer hit area
+        // swallows them, which would break the feature's primary action. The card takes the push as
+        // a closure instead and drives it from its own header button.
+        HeadacheCardView(onOpenDetail: { path.append(.headache) })
+    }
+
     /// Calories on the home page. Headline is today's estimated burn; secondary lines break out
     /// resting BMR + active energy so the app stays honest about derived calories.
     private var caloriesCard: some View {
@@ -1782,7 +1812,7 @@ struct ContentView: View {
 /// (first-run) layout. (Sleep / workout / trends moved to their own tabs and are no longer sections;
 /// the order decoder ignores those now-unknown saved ids, so existing saved orders still load.)
 private enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
-    case readiness, vitals, vitalsStatus, calories, goals, cycle, sync
+    case readiness, vitals, vitalsStatus, calories, goals, cycle, headache, sync
     var id: String { rawValue }
 }
 
@@ -1790,7 +1820,7 @@ private enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
 /// route (vs a `NavigationLink` per card) keeps the `List` from drawing its own disclosure chevron on
 /// top of the cards' custom ones.
 private enum Route: Hashable {
-    case cycle, activityLog
+    case cycle, headache, activityLog
 }
 
 /// Home-page calories card. Headline = today's estimated burn; secondary lines break it

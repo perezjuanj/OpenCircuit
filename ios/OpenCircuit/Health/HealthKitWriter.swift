@@ -92,6 +92,13 @@ final class HealthKitWriter {
         // NOTE: temperature is NOT added here — it already ships via the canonical
         // `.bodyTemperature` path (MetricKind.temperature). No triple-write.
         set.insert(HKCategoryType(.menstrualFlow))
+        // Headache log (headache signals, Phase 1): the user's OWN logged headaches, mirrored as
+        // `HKCategoryValueSeverity`. Safe to authorize because `.headache` is an ordinary
+        // third-party-WRITABLE CATEGORY type — the same class as `.menstrualFlow` directly above —
+        // and NOT the Apple-computed / HKCorrelationType class whose presence in the auth set raised
+        // the uncatchable NSInvalidArgumentException of #121 (fixed in #128) and the #110 crash.
+        // That type distinction, not any try/catch, is the entire reason the crash cannot recur here.
+        set.insert(HKCategoryType(.headache))
         // Blood pressure (#121): authorization is granted on the two CONSTITUENT quantity
         // types only. The `bloodPressureType` HKCorrelationType must NEVER be added here:
         // correlation types are not authorizable, and their presence in the `toShare` set of
@@ -164,6 +171,9 @@ final class HealthKitWriter {
         if type.isEqual(systolicType) || type.isEqual(diastolicType) { return "Blood Pressure" }
         if type.isEqual(HKQuantityType(.distanceCycling)) { return "Cycling Distance" }
         if type is HKWorkoutType || type is HKSeriesType { return "Workouts" }
+        // Without this the #132 partial-grant banner would show the raw
+        // "HKCategoryTypeIdentifierHeadache" from the fallthrough below.
+        if type.isEqual(HKCategoryType(.headache)) { return "Headache" }
         return type.identifier
     }
 
@@ -211,6 +221,7 @@ final class HealthKitWriter {
         var distanceM = 0.0         // estimated distance written (#81)
         var exerciseMinutes = 0.0   // estimated exercise minutes written (#82)
         var menstrualFlowEntries = 0  // user-logged period entries written (#78)
+        var headacheEntries = 0       // user-logged headache entries written (headache signals P1)
         /// Metrics whose HealthKit `save` actually THREW this pass (#135) — distinct from "nothing
         /// pending". Persisted per-metric so the UI can surface an honest "X hasn't synced" warning
         /// instead of the blanket "Auto-syncing" line. Empty on a clean/idle flush.
@@ -219,6 +230,7 @@ final class HealthKitWriter {
             samples > 0 || sleepSegments > 0 || steps > 0
                 || restingDays > 0 || passiveHours > 0 || activeKcal > 0 || naps > 0
                 || distanceM > 0 || exerciseMinutes > 0 || menstrualFlowEntries > 0
+                || headacheEntries > 0
         }
     }
 
@@ -352,6 +364,11 @@ final class HealthKitWriter {
         // Women's health (#78): write pending user-logged period flow entries to Health.
         // Gated by each entry's own `healthWritten` flag — independent of all other writes.
         result.menstrualFlowEntries = await flushMenstrualFlow(localStore: store)
+
+        // Headache log (headache signals, Phase 1): the user's own logged headaches. Same shape as
+        // the period log — gated by each entry's own `healthWritten` flag, so it neither blocks nor
+        // is blocked by any other write. Nothing here is inferred; every row is user-entered.
+        result.headacheEntries = await flushHeadacheLog(localStore: store)
 
         // Profile is used for calories + exercise-minute thresholds — resolved once here so the
         // derived writes use the same snapshot. Body inputs come from the shared profile defaults;
@@ -573,6 +590,221 @@ final class HealthKitWriter {
         guard !uuids.isEmpty, Self.isAvailable else { return }
         let predicate = HKQuery.predicateForObjects(with: uuids)
         _ = try? await store.deleteObjects(of: HKCategoryType(.menstrualFlow), predicate: predicate)
+    }
+
+    // MARK: Headache log (headache signals, Phase 1)
+    //
+    // A user-entered LABEL series, not a measurement: nothing in this app detects a headache, so
+    // every sample below is `HKMetadataKeyWasUserEntered: true` and every field comes verbatim from
+    // what the user typed. Shaped after the period log (#78), with one deliberate divergence noted
+    // on `flushHeadacheLog`.
+
+    /// Write pending user-logged headache entries to Apple Health, returning the count written.
+    ///
+    /// One sample per entry, gated by that entry's own `healthWritten` flag. Entries IMPORTED from
+    /// Health are already excluded by `pendingHeadacheEntries`, so a read-back can never loop round
+    /// into a write-back.
+    ///
+    /// An OPEN headache (`end == nil`) is FINALIZED like any other. It is tempting to leave it
+    /// pending "so it extends later, like an open period" — but that analogy is false and the bug it
+    /// causes is real: `menstrualFlowSamples` derives its last day from `today`, so an open period
+    /// genuinely yields MORE samples as days elapse, whereas `headacheSamples` is a pure function of
+    /// (onset, end, severity) — with `end == nil` it rebuilds a byte-identical zero-length sample
+    /// forever. Leaving it unfinalized re-wrote that identical sample on every flush (foreground
+    /// activation, sync completion, every BLE wake-drain and BGTask) for the life of the entry, and
+    /// every one of those rewrites reopened the orphan window below. `saveHeadacheEntry` already
+    /// resets `healthWritten` on any clinical change, so the mirror re-opens exactly when the
+    /// content can actually differ — which is the only time a rewrite carries new information.
+    ///
+    /// Ordering DIVERGES from `flushMenstrualFlow` on purpose: this writes FIRST and deletes the
+    /// prior sample(s) afterwards, the same no-data-loss order `mirrorSettledNight` uses. The period
+    /// path's delete-first leaves a window in which a crash makes the user's Health store EMPTIER
+    /// than it was before the flush. Write-first's own hazard is narrower but NOT self-healing, so
+    /// it is closed explicitly: the new UUIDs are recorded ALONGSIDE the stale ones before anything
+    /// is deleted, so a kill mid-flush can only ever leave a TRACKED duplicate the next flush
+    /// removes — never a sample this app wrote that it can no longer name, which the user could
+    /// then never delete through our UI.
+    func flushHeadacheLog(localStore: LocalStore) async -> Int {
+        // EXPLICIT denial is TERMINAL — the save can never succeed, so return before touching the
+        // store instead of throwing on every entry on every flush. `.notDetermined` deliberately
+        // falls THROUGH: the save throws until the user grants, the entries stay pending, and the
+        // whole log backfills on the first flush after Headache sharing is turned on.
+        if store.authorizationStatus(for: HKCategoryType(.headache)) == .sharingDenied { return 0 }
+        guard let pending = try? localStore.pendingHeadacheEntries(), !pending.isEmpty else { return 0 }
+        var written = 0
+        for entry in pending {
+            let now = Date()
+            let samples = Self.headacheSamples(onset: entry.onset, end: entry.end,
+                                               severityRaw: entry.severityRaw, now: now)
+            guard !samples.isEmpty else { continue }   // unloggable row (placeholder onset)
+            let stale = entry.hkSampleUUIDs   // read BEFORE `recordHeadacheEntryHK` overwrites it
+            let fresh = samples.map { $0.uuid.uuidString }
+            let settled = Self.headacheEntryIsSettled(end: entry.end, now: now)
+            do {
+                try await store.save(samples)
+                // Track new AND stale together before deleting anything, so a kill between the save
+                // and the delete leaves every sample we have written still nameable by this row.
+                try localStore.recordHeadacheEntryHK(onset: entry.onset,
+                                                     hkSampleUUIDs: stale + fresh,
+                                                     finalized: false)
+                // Only now that the replacement is actually IN Health may the previous copy go.
+                if !stale.isEmpty { await deleteHeadacheSamples(uuidStrings: stale) }
+                try localStore.recordHeadacheEntryHK(onset: entry.onset,
+                                                     hkSampleUUIDs: fresh,
+                                                     finalized: settled)
+                written += 1
+            } catch { break }   // stop; the unwritten entry stays pending and retries next flush
+        }
+        return written
+    }
+
+    /// Whether the sample written for this entry is SETTLED — i.e. rebuilding it later from the
+    /// same entry cannot produce anything different, so the entry may be finalized and stop being
+    /// re-written on every flush.
+    ///
+    /// Pure + static so the rule is unit-testable without a live `HKHealthStore`: it is the guard
+    /// against a regression that is completely invisible at runtime (an identical sample rewritten
+    /// dozens of times a day forever, each rewrite reopening the orphan window, and
+    /// `FlushResult.wroteAnything` pinned true so every background wake logs a phantom Health write).
+    ///
+    /// `end == nil` is settled: `headacheSamples` emits a zero-length sample at `onset` that is
+    /// byte-identical on every rebuild. A PAST `end` is settled for the same reason. Only a FUTURE
+    /// `end` is unsettled, because `headacheSamples` clamps it to `now` — so the correct sample
+    /// genuinely does change as time passes, and that is the one case worth staying pending for.
+    static func headacheEntryIsSettled(end: Date?, now: Date = Date()) -> Bool {
+        guard let end else { return true }
+        return end <= now
+    }
+
+    /// Build the Apple Health sample(s) for one logged headache — exactly ONE, spanning
+    /// `[onset, end]`. Pure + static (the same seam `menstrualFlowSamples` uses) so the clamping
+    /// rules below are unit-testable without a live `HKHealthStore`.
+    static func headacheSamples(onset: Date, end: Date?, severityRaw: Int,
+                                now: Date = Date()) -> [HKCategorySample] {
+        // `StoredHeadacheEntry.onset` defaults to `.distantPast` for SwiftData lightweight
+        // migration, so a row that never received a real onset must produce NOTHING rather than a
+        // sample dated in year 1. Returning [] (not trapping) keeps one bad row from sinking the flush.
+        guard onset > .distantPast else { return [] }
+
+        // A headache with no logged resolution is a ZERO-LENGTH sample — we never invent a duration
+        // the user didn't state. HealthKit REJECTS `endDate < startDate`, and a rejected save would
+        // strand the entry permanently pending, so a future end is clamped to `now` and that clamp
+        // is itself floored at `onset` (an onset the user set in the future must still be writable).
+        var sampleEnd = onset
+        if let end, end > onset { sampleEnd = max(onset, min(end, now)) }
+
+        // `severityRaw` carries `HKCategoryValueSeverity`'s raw values 1:1, so this is the identity
+        // mapping — but it must be VALIDATED against the known set, not merely constructed.
+        // `HKCategoryValueSeverity` imports as a NON-FROZEN Obj-C enum, so `init(rawValue:)`
+        // succeeds for ANY Int (measured against the iOS 26.5 SDK: -1, 5, 99 and Int.max all
+        // construct successfully). An `init?` + `??` fallback is therefore DEAD CODE that would
+        // write a corrupt or future-build number into Apple Health as a severity.
+        //
+        // Anything outside the known set lands on `.unspecified` — NEVER on `.moderate` or any
+        // other substantive level. Quietly promoting an unknown number into a clinical one would
+        // assert a severity the user never stated.
+        let knownSeverities: Set<Int> = [
+            HKCategoryValueSeverity.unspecified.rawValue,
+            HKCategoryValueSeverity.notPresent.rawValue,
+            HKCategoryValueSeverity.mild.rawValue,
+            HKCategoryValueSeverity.moderate.rawValue,
+            HKCategoryValueSeverity.severe.rawValue,
+        ]
+        let value = knownSeverities.contains(severityRaw)
+            ? severityRaw
+            : HKCategoryValueSeverity.unspecified.rawValue
+
+        // User-entered by definition: nothing in this app auto-detects a headache.
+        return [HKCategorySample(type: HKCategoryType(.headache), value: value,
+                                 start: onset, end: sampleEnd,
+                                 metadata: [HKMetadataKeyWasUserEntered: true])]
+    }
+
+    /// Delete previously-written `.headache` samples by UUID (best-effort). Used by the write-then-
+    /// delete replacement above and when the user deletes a logged headache in-app, so Apple Health
+    /// never keeps a stale or orphaned entry. UUID- AND type-scoped, so no other data is reachable.
+    func deleteHeadacheSamples(uuidStrings: [String]) async {
+        let uuids = Set(uuidStrings.compactMap { UUID(uuidString: $0) })
+        guard !uuids.isEmpty, Self.isAvailable else { return }
+        let predicate = HKQuery.predicateForObjects(with: uuids)
+        _ = try? await store.deleteObjects(of: HKCategoryType(.headache), predicate: predicate)
+    }
+
+    /// One headache read back OUT of Apple Health, for the import path. A plain value type rather
+    /// than an `HKCategorySample` so the importer stays HealthKit-agnostic and testable.
+    struct ImportedHeadache: Sendable {
+        let uuid: String
+        let onset: Date
+        let end: Date?
+        let severityRaw: Int
+    }
+
+    /// The outcome of an Apple Health headache read, split by SOURCE.
+    ///
+    /// `ownSourceCount` exists for the sake of honest copy, not for the data. A read that came back
+    /// with nothing but OpenCircuit's own samples is a completely different thing to tell the user
+    /// than a read that came back with nothing at all — the latter is indistinguishable from a
+    /// DENIED read (HealthKit reports no error for one, only an empty result), the former proves
+    /// the read worked. Collapsing the two made the app tell a user whose Health store was full of
+    /// their own logged headaches that none were found, and blame permissions for it.
+    struct HeadacheReadResult: Sendable {
+        let external: [ImportedHeadache]
+        let ownSourceCount: Int
+
+        /// True only when the query returned NO samples whatsoever — the single case where "nothing
+        /// found" is accurate and where Health permissions are a plausible explanation.
+        var returnedNothingAtAll: Bool { external.isEmpty && ownSourceCount == 0 }
+    }
+
+    /// Headaches logged in Apple Health at or after `since`, EXCLUDING this app's own writes.
+    ///
+    /// HONEST EMPTY — read this before writing any UI copy against the result: HealthKit does not
+    /// report READ authorization (by design, so an app can't learn what a user declined to share).
+    /// A denied read simply returns no samples, INDISTINGUISHABLE from "the user has none logged".
+    /// `[]` here therefore means "nothing readable", and the caller must say "found none to import",
+    /// never anything about whether the user gets headaches.
+    ///
+    /// Read authorization needs no separate change: `requestAuthorization()` already builds its
+    /// `read` set from `allTypes` (minus workout types), so `.headache` joining `allTypes` puts it in
+    /// BOTH halves of the request, and Info.plist already carries NSHealthShareUsageDescription for
+    /// the existing reads. Users who already authorized are re-prompted because a newly-added
+    /// shareable type flips `authorizationPromptAvailable()` back to `true` (see its note).
+    func readHeadacheSamples(since: Date) async -> HeadacheReadResult {
+        guard Self.isAvailable else { return HeadacheReadResult(external: [], ownSourceCount: 0) }
+        // Our own samples must never be re-imported: each would return as a second, "healthImport"
+        // copy of an entry the user already logged, and every later import round would breed
+        // another. There is no existing own-source helper in this codebase, so identity is
+        // `Bundle.main.bundleIdentifier` matched against each sample's source. A nil bundle id
+        // (never true for a real app bundle) means we can't tell ours apart — refuse, don't loop.
+        guard let ownBundleID = Bundle.main.bundleIdentifier else {
+            return HeadacheReadResult(external: [], ownSourceCount: 0)
+        }
+        let predicate = HKQuery.predicateForSamples(withStart: since, end: nil, options: [])
+        let samples: [HKCategorySample] = await withCheckedContinuation { cont in
+            let query = HKSampleQuery(
+                sampleType: HKCategoryType(.headache), predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: [NSSortDescriptor(keyPath: \HKSample.startDate, ascending: true)]
+            ) { _, result, _ in
+                // The error is dropped deliberately: a denied read reports no error, only an empty
+                // result, so an error branch could not tell the two apart anyway (see above).
+                cont.resume(returning: (result as? [HKCategorySample]) ?? [])
+            }
+            store.execute(query)
+        }
+        let ownSource = samples.filter { $0.sourceRevision.source.bundleIdentifier == ownBundleID }
+        let external = samples.compactMap { sample -> ImportedHeadache? in
+            guard sample.sourceRevision.source.bundleIdentifier != ownBundleID else { return nil }
+            return ImportedHeadache(
+                uuid: sample.uuid.uuidString,
+                onset: sample.startDate,
+                // Zero-length = an onset with no logged resolution. Report nil, not an end equal to
+                // the start, which downstream would read as a real 0-minute headache.
+                end: sample.endDate > sample.startDate ? sample.endDate : nil,
+                severityRaw: sample.value
+            )
+        }
+        return HeadacheReadResult(external: external, ownSourceCount: ownSource.count)
     }
 
     func requestAuthorization() async throws {

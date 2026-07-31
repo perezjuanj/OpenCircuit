@@ -88,6 +88,12 @@ struct UserProfileSettingsView: View {
     // never see the cycle calendar card on the dashboard. Shared key with ContentView.
     @AppStorage("userProfile.womensHealthEnabled") private var womensHealthEnabled = false
 
+    // Headache log toggle. Off by default — the dashboard card stays hidden until the user asks
+    // for it. Shared key with ContentView, referenced through `HeadacheDefaults.enabled` rather
+    // than a second copy of the literal (the `userProfile.womensHealthEnabled` string above is
+    // typed out in both files, which is exactly the drift hazard we're not repeating).
+    @AppStorage(HeadacheDefaults.enabled) private var headacheEnabled = false
+
     // Unit preferences (#83). Default to locale-appropriate units out of the box.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
     @AppStorage("units.distance")    private var distUnitRaw = DistanceUnit.localeDefault.rawValue
@@ -412,9 +418,7 @@ struct UserProfileSettingsView: View {
                 }
                 Toggle("Skin-temp & fever alerts", isOn: $tempFeverEnabled)
                     .onChange(of: tempFeverEnabled) { _, on in escalateNotifAuth(enabled: on) }
-                Text("Note: OpenCircuit is not a medical device. These reminders are based on ring "
-                     + "sensor data only and are not a diagnosis. If you feel unwell, consult a "
-                     + "qualified medical professional.")
+                Text(Self.medicalDisclaimer)
                     .font(.caption2).foregroundStyle(.secondary)
             }
             .task { await refreshNotifAuthState() }
@@ -431,6 +435,27 @@ struct UserProfileSettingsView: View {
                      + "turn it on if you want it. Predictions are estimates only and "
                      + "are not a contraception tool or medical advice.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section("Headache signals") {
+                // No `escalateNotifAuth` on this toggle, unlike the four alert toggles above: this
+                // feature schedules NO notification, so asking for notification authorization here
+                // would burn the one-time system prompt (#133) on something that can never post.
+                Toggle("Show headache log", isOn: $headacheEnabled)
+                Text("Adds a headache log to the dashboard. You record when a headache started, "
+                     + "when it eased off and how bad it was, and OpenCircuit mirrors each entry "
+                     + "into Apple Health. Headaches already in Apple Health can be imported. "
+                     + "That is all it does today.")
+                    .font(.caption).foregroundStyle(.secondary)
+                // Read-only on purpose: there is nothing to switch on, so this is a status line and
+                // not a control the user can act on.
+                LabeledContent("Morning alerts", value: "Off")
+                Text("OpenCircuit has no headache detector — this is a log, nothing more. A morning "
+                     + "alert would first have to earn its way on against your own logged "
+                     + "headaches, so there is no switch for it here.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text(Self.headacheDisclaimer)
+                    .font(.caption2).foregroundStyle(.secondary)
             }
 
             Section("Quiet hours") {
@@ -614,6 +639,24 @@ struct UserProfileSettingsView: View {
         names.formUnion(healthWriteFailures.map(\.displayName))
         return names.sorted()
     }
+
+    /// The medical disclaimer paragraph, verbatim, shared by every section that touches a body
+    /// signal (Health alerts, and the headache log). Hoisted to ONE constant rather than re-typed
+    /// per section so the two can't drift into telling the user different things.
+    private static let medicalDisclaimer =
+        "Note: OpenCircuit is not a medical device. These reminders are based on ring "
+        + "sensor data only and are not a diagnosis. If you feel unwell, consult a "
+        + "qualified medical professional."
+
+    /// Headache-specific wording. The shared `medicalDisclaimer` above says the reminders "are
+    /// based on ring sensor data only" — neither clause is true of a Phase-1 headache log, which is
+    /// typed by the user, derives nothing from the ring, and fires no reminder at all. Over-
+    /// disclaiming is the safe direction, but a disclaimer that misdescribes the feature is its own
+    /// kind of untrue, and this one has to carry the load-bearing sentence: we do not predict.
+    private static let headacheDisclaimer =
+        "Note: OpenCircuit is not a medical device. A headache log is your own record, not a "
+        + "diagnosis, and OpenCircuit does not predict or detect headaches. If you feel unwell, "
+        + "consult a qualified medical professional."
 
     private func formatGoalSleep(_ minutes: Int) -> String {
         let h = minutes / 60, m = minutes % 60

@@ -63,6 +63,23 @@ final class HealthKitShareTypesTests: XCTestCase {
         )
     }
 
+    // MARK: Headache log (headache-signals Phase 1)
+
+    /// The user-logged headache mirrors to Apple Health as `HKCategoryTypeIdentifierHeadache`, so
+    /// the type has to be in the auth set: a type absent from `toShare` is never granted, and every
+    /// `save` of it then fails "not authorized" — silently, for the whole label series. It is a
+    /// plain category type, so it also stays clear of the correlation-type trap guarded above.
+    func testAuthTypeSetIncludesHeadache() {
+        let types = HealthKitWriter().allTypes
+        XCTAssertTrue(types.contains(HKCategoryType(.headache)))
+    }
+
+    /// The partial-grant / write-failure warnings name the denied types, so a headache the user
+    /// turned off must read "Headache" — not the raw `HKCategoryTypeIdentifierHeadache` fallback.
+    func testFriendlyNameForHeadache() {
+        XCTAssertEqual(HealthKitWriter.friendlyName(for: HKCategoryType(.headache)), "Headache")
+    }
+
     func testEnergyWritesCountAsFlushOutput() {
         var basal = HealthKitWriter.FlushResult()
         basal.passiveHours = 1
