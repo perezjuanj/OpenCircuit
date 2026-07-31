@@ -251,21 +251,50 @@ struct HealthNotificationCenter {
             hitByNotif[hit.notification] = hit
         }
 
+        // Read the per-night / per-day ledger ONCE. The #85 temp family and the #183 morning verdict
+        // share the single `alerts.health.lastNight` map — it is keyed by `rawValue`, so the two
+        // families cannot collide — and both branches below need it. Hoisted from the inline read
+        // it replaces; same value, same pass, nothing writes to it in between.
+        let dayLedger = store.lastNotifiedNight()
+
         // --- #85: skin-temp anomaly flags + suspected fever ------------------------------------
         // These flags describe ONE overnight summary, so they de-dupe per night (not by the 2h
         // backoff): once a night is notified, later syncs of the same night are dropped here so the
         // user doesn't get the same "skin temperature dropped" alert after every sync. A new night's
         // summary re-arms them.
         var tempNightKey: Int?
+        // nil = the temp/fever branch did not run this pass, so the fever verdict has not been
+        // computed yet (see the #183 branch, which needs it for its own suppression).
+        var feverSuspected: Bool?
         if HealthAlertDefaults.tempFeverEnabledValue() {
-            let (tempCandidates, night) = tempFeverCandidates(store: localStore,
-                                                             restingHRDaily: restingHRDaily)
-            if let night {
+            let temp = tempFeverCandidates(store: localStore, restingHRDaily: restingHRDaily)
+            feverSuspected = temp.fever
+            if let night = temp.night {
                 let key = TempFeverNotifications.dayKey(for: night)
                 tempNightKey = key
                 candidates += TempFeverNotifications.freshForNight(
-                    tempCandidates, night: key, lastNotifiedNight: store.lastNotifiedNight())
+                    temp.candidates, night: key, lastNotifiedNight: dayLedger)
             }
+        }
+
+        // --- #183: the morning overnight-signals verdict ----------------------------------------
+        // A MEASUREMENT of a night that is already over — "last night was unusual for you", plus
+        // what drifted. Never a forecast; the copy rule and its arithmetic live on
+        // `HeadacheSignsNotifications` in the Kit.
+        //
+        // De-dupes per CALENDAR DAY on the shared night ledger, NOT on the rolling 2 h backoff:
+        // a once-a-morning verdict under a 2 h backoff re-fires all day after every sync, which is
+        // the exact bug the #85 temp flags hit (documented at `TempFeverNotifications.freshForNight`).
+        var headacheDayKey: Int?
+        var headacheRowDay: Date?
+        var headacheSignals: [HeadacheSignals.Feature] = []
+        if let ready = headacheCandidate(store: localStore, now: now, lastNotifiedDay: dayLedger,
+                                         feverSuspected: feverSuspected,
+                                         restingHRDaily: restingHRDaily) {
+            candidates.append(.headacheSigns)
+            headacheDayKey = ready.dayKey
+            headacheRowDay = ready.rowDay
+            headacheSignals = ready.signals
         }
 
         // --- Route survivors through the ONE shared gate (quiet hours + backoff) ---------------
@@ -284,7 +313,24 @@ struct HealthNotificationCenter {
         store.markFired(fire, at: now)
         guard await ensureAuthorized() else { return }
         if let tempNightKey { store.markNight(fire.filter(Self.isTempFever), night: tempNightKey) }
-        for n in fire { await post(n, hit: hitByNotif[n]) }
+        // Same deferral, same reason (#183): the day ledger only re-arms on a strictly NEWER day, so
+        // claiming today before a successful post would swallow this morning's verdict for the whole
+        // day if authorization was denied. The 2 h backoff above is the self-healing retry — it
+        // expires inside the delivery window, so a denied-then-granted user still hears it today.
+        if let headacheDayKey, fire.contains(.headacheSigns) {
+            store.markNight([.headacheSigns], night: headacheDayKey)
+            // Record on the frozen row that this day actually alerted. This is the auto-retire
+            // quality monitor's denominator: it can only ask "did flagging help this user?" if it
+            // knows which flagged days were shown to them.
+            //
+            // Keyed on the ROW'S OWN `day`, carried out of `headacheCandidate` as a plain value
+            // BEFORE the `await` above — not a recomputed `startOfDay(for: now)`, and not a field
+            // read off the `@Model` after a suspension. A device that changed timezone since the
+            // freeze recomputes `startOfDay` differently, and `markRiskAlerted` matches on `day`
+            // exactly, so a recomputed key would silently mark nothing.
+            if let headacheRowDay { try? localStore.markRiskAlerted(day: headacheRowDay) }
+        }
+        for n in fire { await post(n, hit: hitByNotif[n], signals: headacheSignals) }
     }
 
     /// Whether `n` is one of the #85 skin-temp/fever notifications that de-dupe per night (see
@@ -297,10 +343,20 @@ struct HealthNotificationCenter {
     /// Compute the latest night's skin-temp anomaly flags (#69) + suspected fever (#72), then map
     /// them to notifications (#85). Reuses the SAME canonical SkinTempBaseline offset the Sleep card
     /// shows — temperature is not recomputed for fever.
+    ///
+    /// Also returns the raw `fever` verdict, so the #183 morning-verdict branch can reuse THIS
+    /// computation for its own fever suppression instead of assembling a second skin-temp report
+    /// off a second 40-night fetch. One owner for "is this a fever morning", so the fever alert and
+    /// the suppression it drives can never disagree.
     private func tempFeverCandidates(store: LocalStore,
                                      restingHRDaily: [RestingHR.DailyValue]?)
-        -> (candidates: [HealthNotification], night: Date?) {
-        guard let latest = try? store.latestSleepSummary(), latest.skinTempC > 0 else { return ([], nil) }
+        -> (candidates: [HealthNotification], night: Date?, fever: Bool) {
+        guard let latest = try? store.latestSleepSummary(), latest.skinTempC > 0 else {
+            // No usable overnight temperature ⇒ no temp offset ⇒ `VitalsBaseline.suspectedFever`
+            // would return false anyway (it requires one). Reporting `false` here is that same
+            // answer, not a substituted value.
+            return ([], nil, false)
+        }
         let nights = ((try? store.recentSleepSummaries(limit: 40)) ?? []).filter { $0.skinTempC > 0 }
         let cal = Calendar.current
         let tonightDay = cal.startOfDay(for: latest.night)
@@ -315,7 +371,7 @@ struct HealthNotificationCenter {
         let fever = suspectedFever(store: store, tempOffsetC: report.offsetC,
                                    restingHRDaily: restingHRDaily)
         let notifs = TempFeverNotifications.notifications(flags: report.flags, feverSuspected: fever)
-        return (notifs, tonightDay)
+        return (notifs, tonightDay, fever)
     }
 
     /// The ~30-day resting-HR daily series, ascending by day. Lifted verbatim out of
@@ -353,6 +409,111 @@ struct HealthNotificationCenter {
         let prior = daily.dropLast().map(\.bpm)
         return VitalsBaseline.suspectedFever(restingHRToday: today, restingHRPrior: Array(prior),
                                              skinTempOffsetC: tempOffsetC)
+    }
+
+    // MARK: - #183 morning overnight-signals verdict
+
+    /// UserDefaults key the AUTO-RETIRE QUALITY MONITOR writes when this user's own logged headaches
+    /// show that flagging is not helping them. READ-ONLY here — the monitor owns every write.
+    ///
+    /// The per-user statistics the plan of record specified as a PERMISSION GATE ("no alert until
+    /// your own labels show the detector beats chance") are still computed; their polarity is simply
+    /// inverted. Gating on proof meant ~10 months of silence for a typical episodic user (§1.1) for
+    /// a notification that only ever claims to have MEASURED something, so the alert now unlocks at
+    /// the natural floor (21 frozen days, below which there is no band at all) and the statistics
+    /// switch it back off for the users it demonstrably does not help.
+    ///
+    /// Declared here rather than in `HeadacheDefaults` only because that file is not owned by this
+    /// change; the string is the canonical one and should be hoisted into `HeadacheDefaults` when
+    /// the monitor lands, WITHOUT changing its value (a rename orphans every retired user's flag).
+    static let headacheRetiredKey = "headache.alerts.retired"
+
+    /// Whether this morning's FROZEN overnight-signals verdict should raise the notification, and
+    /// which signals to name in it. `nil` = do not fire.
+    ///
+    /// Gates are ordered CHEAPEST FIRST because this runs on every evaluate pass — several times an
+    /// hour, on background wakes. The early returns only ORDER the work: every one of them mirrors a
+    /// condition that `HeadacheSignsNotifications.candidates` re-checks, and that Kit call is the
+    /// single shipped decision (it is what the CLI tests exercise).
+    ///
+    /// SUPPRESSION IS RE-DERIVED AS OF NOW, not read off the frozen row (which has no such column,
+    /// deliberately). The frozen row records what was true when the score was taken, hours earlier;
+    /// suppression answers a different question — "should we interrupt this person right now" — and
+    /// a headache logged after the freeze must silence the alert. The SCORE is untouched either way.
+    private func headacheCandidate(store: LocalStore, now: Date,
+                                   lastNotifiedDay: [HealthNotification: Int],
+                                   feverSuspected: Bool?,
+                                   restingHRDaily: [RestingHR.DailyValue]?)
+        -> (dayKey: Int, rowDay: Date, signals: [HeadacheSignals.Feature])? {
+        // A background launch never renders any view, so it cannot rely on the UI having registered
+        // defaults — an unregistered read returns a spurious `false` that happens to match today's
+        // documented default and would silently stop matching if it ever changed.
+        HeadacheDefaults.register()
+        let defaults = UserDefaults.standard
+        let enabled = defaults.bool(forKey: HeadacheDefaults.enabled)
+        let retired = defaults.bool(forKey: Self.headacheRetiredKey)
+        guard enabled, !retired else { return nil }
+
+        let dayKey = HeadacheSignsNotifications.dayKey(for: now)
+        guard HeadacheSignsNotifications.withinDeliveryWindow(now),
+              !HeadacheSignsNotifications.freshForDay([.headacheSigns], day: dayKey,
+                                                      lastNotifiedDay: lastNotifiedDay).isEmpty
+        else { return nil }
+
+        // The BAND OF RECORD — the frozen row, never a live recompute, so the alert cannot disagree
+        // with the card the user opens two seconds later.
+        guard let frozen = HeadacheEngine().frozenToday(store: store, now: now) else { return nil }
+        let band = HeadacheSignals.Band(rawValue: frozen.bandRaw)
+        guard band == .flagged else { return nil }
+
+        let cal = Calendar.current
+        let day = cal.startOfDay(for: now)
+        let tuning = HeadacheSignals.Tuning()
+        // Counted over the SAME trailing window the band was taken against (`HeadacheEngine.snapshot`
+        // builds `priorIndices` from exactly this range). A lifetime count would unlock a user whose
+        // 21 rows are spread over two years and whose percentile budget is therefore built on almost
+        // nothing. `riskDays` is `[from, to)`, so today's own row is excluded — the same convention
+        // the banding window uses.
+        let bandStart = cal.date(byAdding: .day, value: -tuning.bandWindowDays, to: day) ?? day
+        let frozenDayCount = ((try? store.riskDays(from: bandStart, to: day)) ?? []).count
+
+        // A severity-1 (`notPresent`) entry records the ABSENCE of a headache, so it must not
+        // suppress anything — the same distinction the Apple Health import refuses to blur.
+        let end = cal.date(byAdding: .day, value: 1, to: day) ?? day.addingTimeInterval(86_400)
+        let loggedToday = ((try? store.headacheEntries(from: day, to: end)) ?? [])
+            .contains { $0.onset <= now && $0.severityRaw != 1 }
+        // Reuse the fever verdict the temp branch already computed this pass; only pay for it here
+        // when that branch did not run (the user turned the temp/fever alerts off).
+        let fever = feverSuspected
+            ?? tempFeverCandidates(store: store, restingHRDaily: restingHRDaily).fever
+        let suppression: HeadacheSignals.Suppression? = fever ? .fever
+            : (loggedToday ? .headacheAlreadyLogged : nil)
+
+        guard !HeadacheSignsNotifications.candidates(
+                enabled: enabled, band: band, suppressedBy: suppression,
+                frozenDayCount: frozenDayCount, retired: retired, now: now,
+                lastNotifiedDay: lastNotifiedDay, tuning: tuning, calendar: cal).isEmpty
+        else { return nil }
+
+        // Flatten everything the fire path needs OUT of the `@Model` here, before any suspension.
+        return (dayKey, frozen.day,
+                HeadacheSignsNotifications.topSignals(Self.weightedContributions(frozen)))
+    }
+
+    /// Each feature's WEIGHTED share of the frozen index (effective weight × ramp position), read
+    /// back out of the row's `contributionsJSON`.
+    ///
+    /// Absent features are dropped rather than mapped to 0: `HeadacheContributionRecord.c` is `nil`
+    /// for "we did not measure this", and a 0 means "measured, and ordinary". Collapsing the two is
+    /// the fabrication this whole feature is written to avoid, and here it would additionally put a
+    /// feature we never measured into the sentence naming what drifted.
+    private static func weightedContributions(_ row: StoredHeadacheRisk)
+        -> [HeadacheSignals.Feature: Double] {
+        HeadacheRiskCoding.decodeContributions(row.contributionsJSON)
+            .compactMapValues { record in
+                guard let contribution = record.c, contribution > 0 else { return nil }
+                return record.w * contribution
+            }
     }
 
     // MARK: - Reminders (#84)
@@ -539,15 +700,27 @@ struct HealthNotificationCenter {
             return false
         case .skinTempRise, .skinTempDrop, .skinTempFluctuationRise, .skinTempFluctuationDrop, .fever:
             return TempFeverNotifications.notificationSet.contains(n)
+        case .headacheSigns:
+            // YES — it is built entirely from ring sensor readings, and it is the one alert a user is
+            // most likely to over-read as a prediction. The disclaimer's "not a diagnosis" line is
+            // the second half of the copy rule the body's own "it is not a forecast" starts.
+            return true
         }
     }
 
-    private func post(_ n: HealthNotification, hit: HealthAlertHit?) async {
+    private func post(_ n: HealthNotification, hit: HealthAlertHit?,
+                      signals: [HeadacheSignals.Feature] = []) async {
         let content = UNMutableNotificationContent()
-        let copy = Self.copy(for: n, hit: hit)
+        let copy = Self.copy(for: n, hit: hit, signals: signals)
         content.title = copy.title
         content.body = Self.appendsDisclaimer(n) ? copy.body + "\n\n" + Self.disclaimer : copy.body
         content.sound = .default
+        // Carry the category ONLY for #183, so the notification lands in the category AppDelegate
+        // registered — which deliberately declares NO ACTIONS (see the label-bias note there).
+        // Everything else keeps the empty default category, unchanged.
+        if n == .headacheSigns {
+            content.categoryIdentifier = HeadacheSignsNotifications.categoryIdentifier
+        }
         // One pending request per condition (stable id) — re-posting just refreshes it.
         let request = UNNotificationRequest(identifier: "alerts.health.\(n.rawValue)",
                                             content: content, trigger: nil)
@@ -568,7 +741,10 @@ struct HealthNotificationCenter {
         return f.string(from: date)
     }
 
-    static func copy(for n: HealthNotification, hit: HealthAlertHit?) -> (title: String, body: String) {
+    /// `signals` is used only by `.headacheSigns` — the ring-derived features that drifted furthest,
+    /// already ranked. Defaulted so every other call site (and `HealthAlertCopyTests`) is unchanged.
+    static func copy(for n: HealthNotification, hit: HealthAlertHit?,
+                     signals: [HeadacheSignals.Feature] = []) -> (title: String, body: String) {
         let at = timeString(hit?.time)
         switch n {
         case .highHR:
@@ -621,6 +797,13 @@ struct HealthNotificationCenter {
         case .chargingComplete:
             return ("Ring fully charged",
                     "Your RingConn ring has reached 100% — disconnect the charger (estimated).")
+        // #183 — the morning overnight-signals verdict. The copy lives in the Kit (pure, CLI-tested)
+        // because its wording is the load-bearing part of the design, not a presentation detail:
+        // it reports WHAT WE MEASURED and never what we predict, and the word "headache" must not
+        // appear in the title or body at all. `HeadacheSignsNotifications` carries the full
+        // reasoning and `HealthAlertsHeadacheTests` pins it.
+        case .headacheSigns:
+            return HeadacheSignsNotifications.copy(topSignals: signals)
         }
     }
 }

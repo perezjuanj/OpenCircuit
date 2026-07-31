@@ -95,6 +95,29 @@ struct UserProfileSettingsView: View {
     @AppStorage(HeadacheDefaults.enabled) private var headacheEnabled = false
     /// Distinct from the app-wide `showOnboarding` above — this is the headache-specific explainer.
     @State private var showHeadacheOnboarding = false
+    /// Whether the morning signal is live. User-writable to OFF at any time; only the 21-night
+    /// unlock (or an explicit resume) sets it true.
+    @AppStorage(HeadacheDefaults.unlocked) private var headacheAlertsOn = false
+    /// `yyyymmdd` of the day the morning signal first unlocked. 0 = never — before that there is
+    /// nothing to switch, so the row is a status line rather than a dead toggle.
+    @AppStorage(HeadacheDefaults.promotedOnDayKey) private var headachePromotedDay = 0
+
+    /// The morning signal only becomes a real control once it has actually unlocked.
+    private var headacheAlertsAvailable: Bool { headachePromotedDay != 0 || headacheAlertsOn }
+
+    /// Present the explainer when the user has never seen it, OR has seen a version whose promises
+    /// this build no longer keeps. Version 1 said "it won't notify you" — that is now false, and a
+    /// latched Bool would have left the retraction undelivered forever.
+    private func presentHeadacheOnboardingIfNeeded() {
+        let d = UserDefaults.standard
+        var seen = d.integer(forKey: HeadacheDefaults.onboardingVersion)
+        // Migration: an install predating the version key that already saw the v1 explainer.
+        if seen == 0, d.bool(forKey: HeadacheDefaults.onboardingShown) { seen = 1 }
+        guard seen < HeadacheDefaults.currentOnboardingVersion else { return }
+        d.set(HeadacheDefaults.currentOnboardingVersion, forKey: HeadacheDefaults.onboardingVersion)
+        d.set(true, forKey: HeadacheDefaults.onboardingShown)
+        showHeadacheOnboarding = true
+    }
 
     // Unit preferences (#83). Default to locale-appropriate units out of the box.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
@@ -423,7 +446,12 @@ struct UserProfileSettingsView: View {
                 Text(Self.medicalDisclaimer)
                     .font(.caption2).foregroundStyle(.secondary)
             }
-            .task { await refreshNotifAuthState() }
+            .task {
+            await refreshNotifAuthState()
+            // Users who enabled this under a previous explainer never hit the toggle's onChange, so
+            // the correction has to reach them on open too.
+            if headacheEnabled { presentHeadacheOnboardingIfNeeded() }
+        }
             .onChange(of: scenePhase) { _, phase in
                 // Coming back from iOS Settings: reflect a freshly-flipped notification switch
                 // (enabled or disabled) in the banner without an app relaunch (#136).
@@ -449,25 +477,34 @@ struct UserProfileSettingsView: View {
                     // never pay off), and release notes never reach someone who flips a setting
                     // weeks after installing.
                     .onChange(of: headacheEnabled) { _, isOn in
-                        guard isOn,
-                              !UserDefaults.standard.bool(forKey: HeadacheDefaults.onboardingShown)
-                        else { return }
-                        UserDefaults.standard.set(true, forKey: HeadacheDefaults.onboardingShown)
-                        showHeadacheOnboarding = true
+                        guard isOn else { return }
+                        presentHeadacheOnboardingIfNeeded()
                     }
                 Text("Adds a headache log to the dashboard, and an \"overnight signals\" view "
                      + "showing whether last night looked unusual for you. You record when a "
                      + "headache started, when it eased off and how bad it was, and OpenCircuit "
                      + "mirrors each entry into Apple Health; headaches already in Apple Health can "
-                     + "be imported. It does not predict headaches and it sends no alerts.")
+                     + "be imported. It never predicts headaches.")
                     .font(.caption).foregroundStyle(.secondary)
-                // Read-only on purpose: there is nothing to switch on, so this is a status line and
-                // not a control the user can act on.
-                LabeledContent("Morning alerts", value: "Off")
-                Text("OpenCircuit has no headache detector — this is a log, nothing more. A morning "
-                     + "alert would first have to earn its way on against your own logged "
-                     + "headaches, so there is no switch for it here.")
-                    .font(.caption).foregroundStyle(.secondary)
+
+                // A REAL control, not a status line. It used to be a hardcoded "Off" label with
+                // copy saying there was no switch — written when the alert was gated behind proof
+                // and could not fire. It can now fire, so a user receiving it needs somewhere to
+                // stop it. Without this their only options were disabling the whole feature (which
+                // also hides their headache log) or revoking notification permission app-wide
+                // (which would silence the fever and reminder alerts too).
+                if headacheAlertsAvailable {
+                    Toggle("Morning signal", isOn: $headacheAlertsOn)
+                    Text("At most once in a morning, when the night stood out from your normal. It "
+                         + "tells you what was measured — never that a headache is coming.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    LabeledContent("Morning signal", value: "Not yet")
+                    Text("Needs about three weeks of scored nights before it can tell a stand-out "
+                         + "night from an ordinary one. It'll switch itself on then, and you can "
+                         + "turn it off here.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Text(Self.headacheDisclaimer)
                     .font(.caption2).foregroundStyle(.secondary)
             }

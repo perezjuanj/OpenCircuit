@@ -51,15 +51,18 @@ struct HeadacheOnboardingView: View {
                           title: "What you'll see",
                           body: "After about a week, whether last night looked unusual for you — how "
                               + "far your sleep, heart rate, HRV and skin temperature drifted from "
-                              + "your own normal.")
+                              + "your own normal. After about three weeks it can also tell you, at "
+                              + "most once in a morning, when a night stood out. You can switch "
+                              + "those mornings off in Settings whenever you like.")
 
                     point(icon: "exclamationmark.triangle",
                           title: "What it won't do",
-                          body: "It doesn't predict headaches and it won't notify you. \"Unusual\" "
-                              + "cuts both ways — a genuinely great night looks unusual too, and so "
-                              + "does a hangover, a late night, or a hard workout. We won't turn on "
-                              + "any alert until your own logged data shows it works for you, which "
-                              + "takes months and may never happen.")
+                          body: "It never tells you a headache is coming — it only ever reports what "
+                              + "it measured. \"Unusual\" cuts both ways: a genuinely great night "
+                              + "looks unusual too, and so does a hangover, a late night, or a hard "
+                              + "workout. Whether any of it relates to your headaches is exactly "
+                              + "what your logging is there to find out, and for some people the "
+                              + "answer will be no.")
 
                     point(icon: "person.2",
                           title: "Don't get headaches? Still useful",

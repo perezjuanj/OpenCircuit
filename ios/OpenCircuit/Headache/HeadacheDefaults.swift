@@ -14,9 +14,18 @@ enum HeadacheDefaults {
     /// dashboard section are all invisible until the user turns it on.
     static let enabled = "headache.enabled"
 
-    /// Whether the morning notification has EARNED its way on for this user, by passing the
-    /// evaluation gate against their own logged headaches. Never user-settable to ON: the only
-    /// route to `true` is the evaluated unlock. The user may always turn it back OFF.
+    /// Whether the morning notification is LIVE for this user.
+    ///
+    /// The name is historical and the semantics inverted: it once meant "earned its way on by
+    /// passing an evaluation gate against the user's own logged headaches". It no longer does. The
+    /// notification unlocks after `HeadacheSignals.Tuning.minDaysForBanding` scored nights, because
+    /// the alert reports a MEASUREMENT ("last night was unusual for you") rather than predicting a
+    /// headache — a measurement is true whatever the detector's predictive skill turns out to be.
+    /// The per-user statistics still run, but as an auto-retire MONITOR that can switch this back
+    /// off for someone it demonstrably is not helping.
+    ///
+    /// Consequently the user MAY set this to false themselves (Settings), and the monitor may set it
+    /// to false. Nothing but the 21-night unlock and an explicit user resume sets it to true.
     static let unlocked = "headache.alerts.unlocked"
 
     /// `yyyymmdd` of the day the unlock was granted, so post-unlock days can be excluded from the
@@ -49,13 +58,26 @@ enum HeadacheDefaults {
     /// Whether the 90-day "still logging?" nudge has been shown.
     static let ninetyDayNudgeShown = "headache.nudge.ninetyDayShown"
 
-    /// Whether the one-time explainer has been shown (on first enable).
-    ///
-    /// Shown ONCE, at the moment the user opts in, because the ask this feature makes is unusual and
-    /// entirely front-loaded: log every headache for months, for something that may never tell you
-    /// anything. A user who never learns that is a user whose labels quietly go incomplete, and
-    /// incomplete labels cannot be repaired later.
+    /// Legacy: whether the one-time explainer has been shown at all. Superseded by
+    /// `onboardingVersion`, and read only to migrate an existing install to version 1.
     static let onboardingShown = "headache.onboarding.shown"
+
+    /// Which VERSION of the explainer this user has seen. `0` = none.
+    ///
+    /// A version rather than a Bool, because the explainer can make promises that later become
+    /// false — and it already did. Version 1 told users, at the moment they opted in, "it won't
+    /// notify you" and "we won't turn on any alert until your own logged data shows it works for
+    /// you". The design then changed: the notification now unlocks after 21 scored nights and the
+    /// per-user statistics became an auto-retire monitor instead of a permission gate. A latched
+    /// Bool would have left that promise standing forever, with nothing in the app ever retracting
+    /// it — the user would simply start getting alerts they had been told in writing they would not
+    /// get. Bumping the version re-presents the explainer so the correction actually reaches them.
+    ///
+    /// Bump this whenever the explainer's PROMISES change, not when its wording is merely polished.
+    static let onboardingVersion = "headache.onboarding.version"
+
+    /// The explainer version this build ships. 2 = the measurement-framed notification.
+    static let currentOnboardingVersion = 2
 
     /// `yyyymmdd` of the day the morning-after prompt ASKED ABOUT, once the user has dismissed it
     /// for that day. `0` = never dismissed.

@@ -25,8 +25,9 @@ import OpenCircuitKit
 // A missing input is ABSENT with a reason, never a substituted zero — the Kit's `AbsentReason` is
 // carried all the way into the frozen row's `absentJSON` so a thin day stays debuggable remotely.
 //
-// NOTE ON PHASING: this file computes and stores. It does not notify, unlock, or say the word
-// "headache" anywhere a user can see it — that is Phase 3.
+// PHASE 3 adds a SECOND job to this file, at the bottom: the quality monitor. It does not change
+// anything above — the freeze path is untouched — and it never writes to a frozen row. See the
+// "Quality monitor" section header for what it decides and why the polarity is the way it is.
 
 // MARK: - Sendable snapshot (main actor → detached task)
 
@@ -340,7 +341,21 @@ struct HeadacheEngine {
     ///
     /// `restingHR` lets a caller that already derived the daily resting-HR series hand it over rather
     /// than pay for it twice; pass `[]` and it is derived from the same stored readings.
+    ///
+    /// Two passes, in order: freeze last night, then let the quality monitor take its (rare) look.
+    /// The monitor rides this call rather than being wired into the five evaluate sites separately —
+    /// it needs exactly the same wake paths, and adding a sixth call to five files it does not own
+    /// would be five more places to forget. It is cadence-gated to two `UserDefaults` reads on
+    /// almost every pass (`refreshMonitor`).
     func refreshToday(store: LocalStore, restingHR: [RestingHR.DailyValue], now: Date = Date()) async {
+        await freezeToday(store: store, restingHR: restingHR, now: now)
+        await refreshMonitor(store: store, now: now)
+    }
+
+    /// The freeze pass — behaviour unchanged from Phase 2, split out only so `refreshToday` can run
+    /// the monitor after it regardless of which of the freeze path's early returns was taken.
+    private func freezeToday(store: LocalStore, restingHR: [RestingHR.DailyValue],
+                             now: Date = Date()) async {
         // A background launch never renders ContentView, so it cannot rely on the UI having
         // registered defaults — an unregistered read would return a spurious `false` that happens to
         // match the documented default today, and would silently stop matching if it ever changed.
@@ -648,5 +663,502 @@ enum HeadacheRiskCoding {
     private static func decode<T: Decodable>(_ raw: String) -> T? {
         guard let data = raw.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(T.self, from: data)
+    }
+}
+
+// MARK: - Quality monitor (#183, Phase 3)
+//
+// WHAT CHANGED FROM THE PLAN, AND WHY. docs/HEADACHE_SIGNALS.md §5.3 gated the notification behind
+// PROOF: no alert until this user's own logged headaches showed the detector beating chance, which
+// §1.1 computes as roughly a YEAR of complete logging for a typical episodic sufferer. That gate is
+// gone. Two things replaced it:
+//
+//  1. The bar it was measured against. RingConn's own shipped "Headache Signs Alert" asks for a
+//     5-day continuous-wear baseline plus a 7-day average and publishes NO accuracy number at all;
+//     their copy hedges throughout ("SIGNS", "identify early SIGNALS", "POTENTIAL headache
+//     symptoms"). A year-long proof gate is not the industry bar, it is an order of magnitude past
+//     it.
+//  2. What the ~26 % precision ceiling (§1) is actually an argument against. It is an argument
+//     against CLAIMING TO PREDICT. It is not an argument against notifying, because a notification
+//     that says "last night was unusual for you, and here is what drifted" is a MEASUREMENT — true
+//     100 % of the time. Precision only starts to matter the moment we assert a headache is coming,
+//     which the copy never does (`HeadacheSignalCopy`, and the notification body itself).
+//
+// So the notification goes live at `HeadacheSignals.Tuning.minDaysForBanding` frozen days. That is
+// not a new threshold: it is the point at which `HeadacheSignals.band(index:priorIndices:...)` will
+// return anything other than `.typical` at all. Below it there is no band, so there is nothing to
+// notify about; at it, there is. Nothing was invented to pick that number.
+//
+// The statistics from §5.2 are still computed, on the same frozen rows, with the same exclusions.
+// Their POLARITY is inverted: they no longer grant permission to fire, they withdraw it. Fire,
+// measure, and switch the notification off for the users it demonstrably does not help. A detector
+// that silently degrades is worse than one that never fired (§5.5), and that argument does not
+// depend on which direction the gate points.
+//
+// THE FREEZE IS UNTOUCHED. Everything below READS `StoredHeadacheRisk` and writes nothing to it.
+// The moment a monitor pass can rewrite a score, every number it produces is a retro-fit against a
+// baseline that has already seen the label.
+
+// MARK: Sendable snapshot (main actor → detached task)
+
+/// One frozen row, flattened off SwiftData. Carries only what the evaluation reads — deliberately
+/// NOT the contributions JSON, which is large, per-day, and irrelevant to a hit/miss count.
+struct HeadacheFrozenRow: Sendable, Equatable {
+    let day: Date
+    let index: Double
+    let bandRaw: Int
+    let computedAt: Date
+    let sleepRestaged: Bool
+    let postUnlock: Bool
+    let alerted: Bool
+}
+
+/// Everything the monitor needs, already off SwiftData.
+struct HeadacheMonitorSnapshot: Sendable {
+    let now: Date
+    /// Frozen rows inside the evaluation window, oldest → newest.
+    let rows: [HeadacheFrozenRow]
+    /// ONSETS of real logged headaches (severity 1 `notPresent` already dropped), oldest → newest.
+    ///
+    /// Onsets only. The stored `end` is deliberately not carried, because the Kit's rule is
+    /// onset-based on both sides — a hit is an onset in `(computedAt, +24 h]`, an exclusion is an
+    /// onset in `[computedAt − 24 h, computedAt]` — and it owns that policy for a stated reason
+    /// (HeadacheEvaluation.swift:197-202). Consulting `end` here would be the app layer quietly
+    /// running a different definition than the Kit it reports through. See `scoredDays` for the one
+    /// case that choice leaves behind.
+    let onsets: [Date]
+    /// How many of `onsets` fall inside the evaluation window — the "you logged N" figure the panel
+    /// shows before any exclusion. `onsets` itself reaches slightly further back so a headache that
+    /// was already running at the window's first score is still visible to the in-progress test.
+    let onsetsInWindow: Int
+    let lookCount: Int
+    let lastDecisionAt: Date?
+    let windowDays: Int
+}
+
+/// What the detail screen renders. A value type, built off the main actor, holding no `@Model`.
+struct HeadacheMonitorReport: Sendable {
+    let status: HeadacheEvaluation.Status
+    /// `nil` only in `.building`, where nothing has been measured yet. Never a zeroed placeholder:
+    /// "measured nothing" and "measured zero" are different findings.
+    let metrics: HeadacheEvaluation.Metrics?
+    /// Frozen days at which the notification exists at all, for the `.building` line. The count SO
+    /// FAR comes from `Status.building(daysRemaining:)`, so the two can never disagree.
+    let daysNeeded: Int
+    /// Headaches logged in the window, BEFORE exclusions. Shown next to the usable count, because a
+    /// user who logged 20 and is told 12 are usable is owed the difference.
+    let loggedHeadaches: Int
+    /// Logged headaches that no frozen row could be paired with at all — the ring wasn't worn that
+    /// night, or nothing synced. The Kit cannot count these: a day with no row never reaches it.
+    let labelsWithNoScore: Int
+    /// Frozen rows dropped because their stored band isn't one this build knows. Normally 0; only a
+    /// downgrade produces one. Surfaced rather than swallowed so a denominator can always be
+    /// reconciled.
+    let rowsWithUnknownBand: Int
+    let lookCount: Int
+    let lastDecisionAt: Date?
+    let windowDays: Int
+}
+
+// MARK: Pure join (runs OFF the main actor)
+
+/// Joins frozen scores to logged headaches and asks the Kit what the pairing is worth.
+///
+/// File-scope for the same reason `HeadacheAssessmentBuilder` is: a type nested in the `@MainActor`
+/// engine inherits that actor, and this exists precisely to run off it.
+enum HeadacheMonitorBuilder {
+
+    /// Turn frozen rows + logged onsets into the Kit's scored days.
+    ///
+    /// THE JOIN IS ONE DECISION PER ROW: which single onset, if any, is the one relevant to this
+    /// score. `ScoredDay` carries one `headacheOnset`, and the Kit reads its POSITION relative to
+    /// `computedAt` to decide what the row is worth (HeadacheEvaluation.swift:304-335):
+    ///   · in `(computedAt, computedAt + outcomeWindowHours]` → the row PREDICTED it;
+    ///   · in `[computedAt − inProgressLookbackHours, computedAt]` → the headache was ALREADY UNDER
+    ///     WAY when we scored, so the row is unclassifiable and is dropped from BOTH terms.
+    /// So the in-progress side is chosen FIRST when both exist. That ordering is the whole point of
+    /// the exclusion: a morning that began mid-attack must not be able to score itself a hit off the
+    /// second headache of the same day. Feeding the later onset instead would inflate precision by
+    /// exactly the days most likely to look impressive.
+    ///
+    /// LABEL BIAS — READ BEFORE ADDING A SHORTCUT. Everything here is only as good as the label
+    /// series, and that series must be collected INDEPENDENTLY of what we scored. The logging paths
+    /// are deliberately the ones that are not conditioned on our own output: the Siri intents, the
+    /// Control Centre control, and the card's morning-after prompt, which triggers on an EMPTY day
+    /// and explicitly ignores the score (`HeadacheCardView.showsYesterdayPrompt`). Do not add a
+    /// "did you have a headache?" action to the notification, and do not gate a prompt on the band.
+    /// Either one would collect labels disproportionately from days we flagged, and every precision
+    /// number below would then be inflated by construction — invisibly, permanently, and with no way
+    /// to repair the record afterwards.
+    ///
+    /// KNOWN RESIDUAL, and it belongs to the Kit rather than here: a long attack the user logged with
+    /// an explicit end — onset more than `inProgressLookbackHours` before the score, end after it —
+    /// was genuinely under way and is nonetheless counted as an ordinary negative day, because the
+    /// Kit's rule is onset-based on purpose (one mis-typed date must not be able to delete a month of
+    /// evidence). Reading `end` here to override that would put a second, divergent definition of
+    /// "in progress" in the app layer. It biases the base rate very slightly DOWNWARD, which is the
+    /// safe direction for a retirement test.
+    static func scoredDays(_ s: HeadacheMonitorSnapshot,
+                           tuning: HeadacheEvaluation.Tuning = .init())
+        -> (days: [HeadacheEvaluation.ScoredDay], unknownBand: Int, labelsWithNoScore: Int) {
+        let outcome = tuning.outcomeWindowHours * 3600
+        let lookback = tuning.inProgressLookbackHours * 3600
+        var unknownBand = 0
+        var paired: Set<Date> = []
+
+        let days = s.rows.compactMap { row -> HeadacheEvaluation.ScoredDay? in
+            // A band raw value this build doesn't know can only come from a newer build's row after
+            // a downgrade. We cannot say whether it was flagged, so it is dropped rather than read
+            // as `.typical` — which would quietly deflate the flagged count and inflate precision.
+            guard let band = HeadacheSignals.Band(rawValue: row.bandRaw) else {
+                unknownBand += 1
+                return nil
+            }
+
+            // Latest qualifying onset on the in-progress side (the attack we were inside), earliest
+            // on the outcome side (the first thing that followed).
+            let onset = s.onsets.last {
+                $0 <= row.computedAt && $0 >= row.computedAt.addingTimeInterval(-lookback)
+            } ?? s.onsets.first {
+                $0 > row.computedAt && $0 <= row.computedAt.addingTimeInterval(outcome)
+            }
+            if let onset { paired.insert(onset) }
+
+            return HeadacheEvaluation.ScoredDay(
+                day: row.day,
+                computedAt: row.computedAt,
+                // Rounded to Int exactly as `HeadacheEngine.snapshot` rounds it for `priorIndices`,
+                // so the series the monitor ranks is the series the banding budget was drawn from.
+                // Two different roundings of one column would let the flagged days and the ranked
+                // days disagree at the margin.
+                index: Int(row.index.rounded()),
+                band: band,
+                headacheOnset: onset,
+                // Handed over as facts; the Kit decides what they cost. Nothing is filtered here, so
+                // `Metrics` can report how many days each exclusion removed instead of the panel
+                // showing a denominator it cannot explain.
+                sleepRestaged: row.sleepRestaged,
+                postUnlock: row.postUnlock,
+                alerted: row.alerted)
+        }
+
+        // Logged headaches no row could be paired with at all. The Kit cannot see these — a day with
+        // no frozen row never becomes a `ScoredDay` — yet they are the largest single reason a user
+        // who logged 20 headaches is told 12 were usable, and the one with an obvious cause (the
+        // ring was off that night).
+        let unpaired = s.onsets.suffix(s.onsetsInWindow).filter { !paired.contains($0) }.count
+        return (days, unknownBand, unpaired)
+    }
+
+    static func report(_ s: HeadacheMonitorSnapshot) -> HeadacheMonitorReport {
+        let joined = scoredDays(s)
+        let status = HeadacheEvaluation.status(joined.days, now: s.now)
+        // Taken from the status rather than by calling `metrics` a second time: `status` already
+        // computed it over the same rows, and a second independent call is a second chance for the
+        // two to disagree about what the panel is describing.
+        let metrics: HeadacheEvaluation.Metrics? = {
+            switch status {
+            case .building:                       return nil
+            case .monitoring(let m), .working(let m): return m
+            case .retired(let m, _):              return m
+            }
+        }()
+        return HeadacheMonitorReport(
+            status: status,
+            metrics: metrics,
+            daysNeeded: HeadacheEvaluation.Tuning().minFrozenDaysForNotification,
+            loggedHeadaches: s.onsetsInWindow,
+            labelsWithNoScore: joined.labelsWithNoScore,
+            rowsWithUnknownBand: joined.unknownBand,
+            lookCount: s.lookCount,
+            lastDecisionAt: s.lastDecisionAt,
+            windowDays: s.windowDays)
+    }
+}
+
+// MARK: Engine
+
+@MainActor
+extension HeadacheEngine {
+
+    /// How far back the fetch reaches. Read LIVE from the Kit rather than copied: it is the same
+    /// window the Kit then filters on (`HeadacheEvaluation.metrics` re-applies its own cutoff), so a
+    /// local copy could only ever make the app fetch too little and silently shorten the evidence.
+    static var monitorWindowDays: Int { HeadacheEvaluation.Tuning().evaluationWindowDays }
+
+    /// Slack on the ONSET fetch only, so a headache that began just before the window and was still
+    /// under way at its first score is visible to the Kit's in-progress test (whose lookback is 24 h).
+    /// Never widens the denominator — `onsetsInWindow` counts onsets inside the window itself.
+    static let monitorOnsetSlackDays = 2
+
+    /// The key the NOTIFICATION gate reads to know it has been withdrawn.
+    ///
+    /// Referenced, never re-typed: `HealthNotificationCenter` declares it as READ-ONLY there and
+    /// names this monitor as the owner of every write (HealthNotificationCenter.swift:415-428). Two
+    /// spellings of one flag is exactly the drift hazard `HeadacheDefaults` exists to prevent, and
+    /// here it would fail SILENTLY — the panel would say alerts were off while they kept arriving.
+    /// It lives in that file rather than `HeadacheDefaults` only because neither change owns that
+    /// file; hoisting it there later must keep the string value, or every retired user is un-retired.
+    static var retiredKey: String { HealthNotificationCenter.headacheRetiredKey }
+
+    /// Minimum gap between monitor DECISIONS. 🔴 PROVISIONAL — §5.4's `decisionIntervalDays`.
+    ///
+    /// The reason survives the polarity flip intact. Re-testing an accumulating window on every wake
+    /// is a multiple-comparisons machine: run it several times an hour for a year and the extreme
+    /// tail is certain to be visited. Under the old design that produced false UNLOCKS; under this
+    /// one it produces false RETIREMENTS, which is a feature silently disappearing on a user whose
+    /// detector was fine. `lookCount` is persisted and shown for the same reason it always was.
+    static let monitorDecisionIntervalDays = 28
+
+    /// Consecutive decisions that must ALL recommend retirement before the notification is actually
+    /// withdrawn. 🔴 PROVISIONAL — §5.4's `requiredConsecutivePasses`, inverted with the polarity.
+    ///
+    /// This is not defensiveness, it is the Kit's explicit caller contract
+    /// (`HeadacheEvaluation.shouldRetire`): that function is stateless, so asking it more often
+    /// finds more bad-luck runs, and its own measured synthetic-year number is that a chance-level
+    /// detector retires for 15 % of users at a single look but 24 % when the same year is
+    /// re-examined every 28 days. Acting on one look would have imported that 24 % wholesale.
+    ///
+    /// The cost is stated plainly: a detector that genuinely does not help takes ~56 days rather
+    /// than ~28 to go quiet. That is the right direction to be slow in. The user is not being harmed
+    /// while we wait — they are receiving a notification that only ever reports a MEASUREMENT — and
+    /// the alternative error, silently deleting a working feature from someone's phone, is the one
+    /// they cannot diagnose or appeal.
+    static let requiredRetirementDecisions = 2
+
+    // MARK: Write path
+
+    /// Take the monitor's rare look. Safe to call from every wake path: once the notification has
+    /// gone live, almost every pass is two `UserDefaults` reads and a return.
+    ///
+    /// Two decisions live here and they are deliberately asymmetric.
+    ///
+    /// ON is granted ONCE, the first time a band exists, and never again. `promotedOnDayKey` is the
+    /// latch. Without it, this pass would re-grant the notification every wake and quietly overrule
+    /// a user who had just switched it off in Settings — an automatic decision must never be able to
+    /// undo an explicit one.
+    ///
+    /// OFF is the only thing a later decision can do, and it takes `requiredRetirementDecisions`
+    /// consecutive decisions that all agree. The monitor can withdraw the notification; it can never
+    /// restore it. Restoring is the user's, through the detail screen (`resumeAlerts(now:)`),
+    /// because a detector that we measured as not tracking anything and then turned back on by
+    /// ourselves would be a loop with no one in it.
+    ///
+    /// `HeadacheDefaults.consecutivePasses` is reused for that run. Its comment in that file still
+    /// describes the pre-inversion design ("the unlock requires more than one, so a single lucky
+    /// window can't promote"); the STORED MEANING is unchanged — a run of agreeing decisions — only
+    /// the direction the run points has flipped, so the key keeps its value and no user's state is
+    /// re-interpreted. That comment belongs to a file this change does not own; it should be
+    /// re-worded there, not the key renamed here.
+    func refreshMonitor(store: LocalStore, now: Date = Date()) async {
+        HeadacheDefaults.register()
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: HeadacheDefaults.enabled) else { return }
+
+        let cal = Calendar.current
+        if defaults.integer(forKey: HeadacheDefaults.promotedOnDayKey) == 0 {
+            // The one pass that costs a fetch on every wake, and only ever before the notification
+            // has gone live once. It is a bounded predicate fetch of at most `bandWindowDays` small
+            // rows — smaller than the `recentSleepSummaries(limit:)` the freeze path above already
+            // pays on the same wake — and it stops for good the day it succeeds.
+            Self.unlockIfBandExists(store: store, now: now, calendar: cal, defaults: defaults)
+            return
+        }
+
+        // Cadence. A missing/zero `lastDecisionAt` after promotion means an interrupted upgrade;
+        // start the clock rather than deciding immediately on data we have never looked at.
+        let stamp = defaults.double(forKey: HeadacheDefaults.lastDecisionAt)
+        guard stamp > 0 else {
+            defaults.set(now.timeIntervalSince1970, forKey: HeadacheDefaults.lastDecisionAt)
+            return
+        }
+        let last = Date(timeIntervalSince1970: stamp)
+        let interval = TimeInterval(Self.monitorDecisionIntervalDays) * 86_400
+        // `>=` on the elapsed gap, and a FUTURE stamp (clock moved back, restore from backup) also
+        // waits: taking a decision early is exactly the extra look the interval exists to prevent.
+        guard now >= last.addingTimeInterval(interval) else { return }
+
+        // CLAIM the look before suspending, and record it whatever it goes on to conclude.
+        //
+        // Two overlapping wake paths can both clear the cadence guard above and then suspend on the
+        // await below. Claiming first means the second one finds the interval unexpired and leaves,
+        // instead of both peeking at the same window and both acting on it. An unrecorded look is a
+        // free extra test, which is exactly what the interval exists to ration.
+        //
+        // The cost of claiming early is that a pass killed mid-evaluation spends a look without
+        // concluding. That can only ever DELAY a retirement by one interval — the conservative
+        // direction, because the irreversible-feeling action here is switching a feature off.
+        defaults.set(now.timeIntervalSince1970, forKey: HeadacheDefaults.lastDecisionAt)
+        let looks = defaults.integer(forKey: HeadacheDefaults.lookCount) + 1
+        defaults.set(looks, forKey: HeadacheDefaults.lookCount)
+
+        let snapshot = Self.monitorSnapshot(store: store, now: now, calendar: cal)
+        let report = await Task.detached { HeadacheMonitorBuilder.report(snapshot) }.value
+
+        // A run of AGREEING decisions, not one look. The counter resets the moment a decision
+        // declines to retire, so only a CONSECUTIVE run counts — a single unlucky window cannot
+        // accumulate toward a withdrawal months later.
+        guard case .retired = report.status else {
+            defaults.set(0, forKey: HeadacheDefaults.consecutivePasses)
+            return
+        }
+        let agreeing = defaults.integer(forKey: HeadacheDefaults.consecutivePasses) + 1
+        defaults.set(agreeing, forKey: HeadacheDefaults.consecutivePasses)
+        guard agreeing >= Self.requiredRetirementDecisions else {
+            ringLog.notice("headache signals: monitor recommends retiring (\(agreeing, privacy: .public) of \(Self.requiredRetirementDecisions, privacy: .public) agreeing decisions)")
+            return
+        }
+
+        // Already withdrawn: nothing to do, and re-logging it every interval would bury the one
+        // breadcrumb that says when it happened. This guard is also what lets a RESUMED user be
+        // withdrawn a second time — `resumeAlerts` clears the flag and the counter, so a fresh run
+        // of agreeing decisions can set it again, which is exactly what the detail screen promises
+        // in words.
+        guard !defaults.bool(forKey: Self.retiredKey) else { return }
+
+        // BOTH KEYS, ALWAYS, TOGETHER. The fire path gates on `retiredKey` and does not read
+        // `unlocked` at all (HealthNotificationCenter.headacheCandidate, and the Kit's
+        // `HeadacheSignsNotifications.candidates(retired:)` behind it). Writing only `unlocked`
+        // would leave the notification firing while every screen in the app said it had been
+        // switched off — a failure whose only symptom is the alert the user was told had stopped.
+        // `unlocked` stays as the mirror the detail screen (`alertsLive`), the Diagnostics export
+        // and the freeze path's `postUnlock` column read, so the two are complements and are never
+        // written apart.
+        defaults.set(true, forKey: Self.retiredKey)
+        defaults.set(false, forKey: HeadacheDefaults.unlocked)
+        ringLog.notice("headache signals: monitor withdrew the morning notification at look \(looks, privacy: .public)")
+    }
+
+    /// Grant the notification the first time this user HAS a band.
+    ///
+    /// The test is not a new threshold. `HeadacheSignals.band` returns `.typical` unconditionally
+    /// until it holds `minDaysForBanding` prior frozen indices (HeadacheSignals.swift:482-484), so
+    /// below that line no day can ever be `.flagged` and there is literally nothing to notify about.
+    ///
+    /// Asked over the TRAILING BANDING WINDOW, excluding today, because that is what this app
+    /// actually feeds `band`: `snapshot` builds `priorIndices` from `riskDays(from: bandStart, to:
+    /// day)` — the trailing `bandWindowDays` CALENDAR days, not the last 60 rows. So this is the
+    /// exact condition under which a `.flagged` day becomes possible, which is the only honest
+    /// moment to tell a user their alerts are on. `HeadacheEvaluation.status` measures `.building`
+    /// over its own 365-day window instead, which is looser; the two agree for anyone wearing the
+    /// ring most nights, and where they don't, the detail screen says which one is speaking
+    /// (`HeadacheSignalsView.alertStateLine`) rather than papering over it.
+    ///
+    /// Nothing re-locks when the count later falls back under the line (a month off the ring). It
+    /// does not need to: `band` stops returning `.flagged` on its own, so the notification goes
+    /// quiet structurally rather than by a flag we would have to keep in step.
+    private static func unlockIfBandExists(store: LocalStore, now: Date, calendar: Calendar,
+                                           defaults: UserDefaults) {
+        let day = calendar.startOfDay(for: now)
+        let start = calendar.date(byAdding: .day, value: -HeadacheSignals.Tuning().bandWindowDays,
+                                  to: day) ?? day
+        let priorDays = ((try? store.riskDays(from: start, to: day)) ?? []).count
+        // Read through the Kit's own knob, which reads `minDaysForBanding` live, so the number that
+        // switches the notification on and the number the panel counts toward cannot drift apart.
+        guard priorDays >= HeadacheEvaluation.Tuning().minFrozenDaysForNotification else { return }
+
+        // Both keys, together, per the rule stated in `refreshMonitor`. Retirement cannot have
+        // happened yet on this path (it runs only while `promotedOnDayKey == 0`, and only a
+        // post-promotion decision can retire), so the `false` is a no-op today. It is written
+        // anyway because "these two are never written apart" is only a real invariant if it has no
+        // exceptions to remember.
+        defaults.set(false, forKey: retiredKey)
+        defaults.set(true, forKey: HeadacheDefaults.unlocked)
+        defaults.set(TempFeverNotifications.dayKey(for: day, calendar: calendar),
+                     forKey: HeadacheDefaults.promotedOnDayKey)
+        // Start the decision clock here, so the first retirement decision is taken a full interval
+        // after the notification went live rather than on the next wake with almost no fired days
+        // behind it.
+        defaults.set(now.timeIntervalSince1970, forKey: HeadacheDefaults.lastDecisionAt)
+        ringLog.notice("headache signals: morning notification live (\(priorDays, privacy: .public) scored days in the banding window)")
+    }
+
+    /// Put the notification back on at the user's request, after the monitor withdrew it.
+    ///
+    /// Resets the decision clock deliberately. Otherwise the very next wake would land on an overdue
+    /// decision, re-run the same window that has barely changed, and switch it straight back off —
+    /// the user would tap a button that visibly does nothing. A month is also long enough for the
+    /// window to actually contain new evidence, which is what the detail screen promises in words.
+    func resumeAlerts(now: Date = Date()) {
+        HeadacheDefaults.register()
+        let defaults = UserDefaults.standard
+        // RESUME only — never a first grant. The 21-night floor is the one thing that cannot be
+        // waived by a tap: below it `HeadacheSignals.band` has no percentile window, so an alert
+        // switched on here could not fire and the button would be a promise the app cannot keep.
+        // The detail screen only offers it once `promotedOnDayKey` is set; this re-checks rather
+        // than trusting a caller, because it is the policy that matters, not the button.
+        guard defaults.bool(forKey: HeadacheDefaults.enabled),
+              defaults.integer(forKey: HeadacheDefaults.promotedOnDayKey) != 0 else { return }
+        // `retiredKey` FIRST and always: it is the flag the fire path actually reads, so clearing
+        // only `unlocked` would leave the button visibly doing nothing while the panel claimed the
+        // alerts were back on. `unlocked` follows as its mirror.
+        defaults.set(false, forKey: Self.retiredKey)
+        defaults.set(true, forKey: HeadacheDefaults.unlocked)
+        // Clear the run of agreeing decisions too, for the same reason the clock is reset: leaving
+        // it at the count that just triggered a withdrawal would let the very next decision meet
+        // `requiredRetirementDecisions` on its own, and the button would visibly undo itself.
+        defaults.set(0, forKey: HeadacheDefaults.consecutivePasses)
+        defaults.set(now.timeIntervalSince1970, forKey: HeadacheDefaults.lastDecisionAt)
+    }
+
+    // MARK: Read path
+
+    /// The monitor's current reading, for the detail screen. WRITES NOTHING — opening a screen must
+    /// not be able to spend a decision, or the cadence above is decoration.
+    func monitorReport(store: LocalStore, now: Date = Date()) async -> HeadacheMonitorReport? {
+        HeadacheDefaults.register()
+        guard UserDefaults.standard.bool(forKey: HeadacheDefaults.enabled) else { return nil }
+        let snapshot = Self.monitorSnapshot(store: store, now: now, calendar: Calendar.current)
+        return await Task.detached { HeadacheMonitorBuilder.report(snapshot) }.value
+    }
+
+    // MARK: Fetching
+
+    /// Fetch the frozen rows and the labels and flatten both, ON THE MAIN ACTOR. Nothing below the
+    /// return may be touched off it.
+    static func monitorSnapshot(store: LocalStore, now: Date,
+                                calendar: Calendar) -> HeadacheMonitorSnapshot {
+        let defaults = UserDefaults.standard
+        let windowDays = monitorWindowDays
+        let day = calendar.startOfDay(for: now)
+        let end = nextDay(after: day, calendar)
+        let windowStart = calendar.date(byAdding: .day, value: -windowDays, to: day) ?? day
+        let onsetStart = calendar.date(byAdding: .day, value: -monitorOnsetSlackDays,
+                                       to: windowStart) ?? windowStart
+
+        let rows = ((try? store.riskDays(from: windowStart, to: end)) ?? [])
+            .map(HeadacheFrozenRow.init)
+
+        // Severity 1 is `notPresent` — a record that there was NO headache. It is a label the user
+        // gave us and it is not a headache; counting it as one would fabricate an event and inflate
+        // every number on the panel. Same rule the freeze path applies to the suppression check.
+        let onsets = ((try? store.headacheEntries(from: onsetStart, to: end)) ?? [])
+            .filter { $0.severityRaw != 1 }
+            .map(\.onset)
+
+        let stamp = defaults.double(forKey: HeadacheDefaults.lastDecisionAt)
+        return HeadacheMonitorSnapshot(
+            now: now,
+            rows: rows,
+            onsets: onsets,
+            onsetsInWindow: onsets.filter { $0 >= windowStart }.count,
+            lookCount: defaults.integer(forKey: HeadacheDefaults.lookCount),
+            lastDecisionAt: stamp > 0 ? Date(timeIntervalSince1970: stamp) : nil,
+            windowDays: windowDays)
+    }
+}
+
+extension HeadacheFrozenRow {
+    /// Flatten a frozen SwiftData row. MAIN-ACTOR ONLY — the value crosses into the detached task,
+    /// the `@Model` never does.
+    @MainActor
+    init(_ row: StoredHeadacheRisk) {
+        self.init(day: row.day,
+                  index: row.index,
+                  bandRaw: row.bandRaw,
+                  computedAt: row.computedAt,
+                  sleepRestaged: row.sleepRestaged,
+                  postUnlock: row.postUnlock,
+                  alerted: row.alerted)
     }
 }

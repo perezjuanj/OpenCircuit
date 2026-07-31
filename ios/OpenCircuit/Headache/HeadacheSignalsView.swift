@@ -54,6 +54,20 @@ struct HeadacheSignalsView: View {
     /// actor from a value snapshot.
     @State private var frozen: [Date: FrozenDay] = [:]
 
+    /// The quality monitor's current reading (Phase 3). `nil` until loaded, or when the feature is
+    /// off — the panel is simply absent rather than showing a reassuring placeholder.
+    @State private var monitor: HeadacheMonitorReport?
+
+    /// Whether the morning notification is live right now. Read from the defaults rather than from
+    /// `monitor`, so the "turn it back on" button below changes the panel the instant it is tapped.
+    @AppStorage(HeadacheDefaults.unlocked) private var alertsLive = false
+
+    /// `yyyymmdd` of the day the notification first went live, or 0 if it never has. The panel needs
+    /// the distinction: "alerts are off because they were never switched on" and "alerts are off
+    /// because something switched them off" are different sentences, and only one of them may
+    /// mention this check as the reason.
+    @AppStorage(HeadacheDefaults.promotedOnDayKey) private var promotedOnDayKey = 0
+
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
 
     /// Two years of frozen rows — the same window the Apple Health import uses, and far more than
@@ -84,6 +98,8 @@ struct HeadacheSignalsView: View {
     var body: some View {
         List {
             todaySignalsSection
+
+            monitorSection
 
             if entries.isEmpty {
                 emptySection
@@ -140,6 +156,11 @@ struct HeadacheSignalsView: View {
             verdict = await HeadacheEngine().todaysVerdict(store: LocalStore(modelContext))
             signalsLoaded = true
         }
+        // The quality monitor's reading. Same discipline again, and this one WRITES NOTHING: opening
+        // a screen must never be able to spend one of the monitor's rationed decisions.
+        .task(id: monitorKey) {
+            monitor = await HeadacheEngine().monitorReport(store: LocalStore(modelContext))
+        }
         // Same discipline for the history join: snapshot to Sendable values on the main actor,
         // build the lookup on `Task.detached`.
         .task(id: frozenKey) {
@@ -161,6 +182,14 @@ struct HeadacheSignalsView: View {
 
     private var frozenKey: String {
         "\(riskRows.count)|\(riskRows.first?.updatedAt.timeIntervalSince1970 ?? 0)"
+    }
+
+    /// Identity for the monitor recompute. Deliberately NOT `alertsLive`: the alert state is read
+    /// live from `@AppStorage` and re-runs nothing, so tapping the resume button updates the panel
+    /// without paying for a whole re-evaluation of the year.
+    private var monitorKey: String {
+        let day = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        return "\(day)|\(riskRows.count)|\(entries.count)|\(entries.first?.updatedAt.timeIntervalSince1970 ?? 0)"
     }
 
     /// Join key is the LOCAL start of day, matching `StoredHeadacheRisk.day` (the start of the day
@@ -405,6 +434,127 @@ struct HeadacheSignalsView: View {
         Text("These signals are a statistical estimate computed on your device from your own 7–60 night baseline. They measure how unusual a night was for you, in either direction — not how bad it was, so an unusually restful night scores like a rough one. A hangover, a late night out and a hard training day look exactly the same to a ring. OpenCircuit is not a medical device, this is not a diagnosis, and it does not predict headaches. If your headaches are new, worsening or severe, consult a qualified healthcare professional.")
             .font(.caption2)
             .foregroundStyle(.tertiary)
+    }
+
+    // MARK: Is this working for you?
+
+    /// The panel no vendor ships: what this feature has actually done for THIS user, in words they
+    /// can check against their own log.
+    ///
+    /// Three rules shape everything below.
+    ///
+    /// 1. NO RAW STATISTIC IS EVER THE HEADLINE. The evaluation produces an AUC, a 95 % interval and
+    ///    an exact p-value, and none of them appear as such. A number the reader cannot interpret is
+    ///    not honesty, it is decoration — and worse, it is decoration that looks like rigour. The
+    ///    AUC and its interval are stated as what they literally mean (how often a headache morning
+    ///    outscored an ordinary one, and how tightly that is pinned down); the p-value is not shown
+    ///    at all, because there is no plain-language rendering of it that is both short and true.
+    /// 2. `.monitoring` MUST NOT READ AS A FAILURE. It is the default and most users live there for
+    ///    months or forever — §1.1's own arithmetic says a year of a WORKING detector often still
+    ///    cannot settle the question. Copy that reads as an error would be telling most users their
+    ///    feature is broken when nothing is.
+    /// 3. THE EXCLUSIONS ARE SHOWN. A user who logged 20 headaches and is told 12 were usable is
+    ///    owed the other 8, itemised. Hiding the gap is how a denominator quietly becomes a lie.
+    @ViewBuilder
+    private var monitorSection: some View {
+        if let monitor {
+            let head = HeadacheMonitorCopy.headline(monitor, alertsLive: alertsLive)
+            Section {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(head.title)
+                        .font(.subheadline.weight(.semibold))
+                    ForEach(Array(head.lines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 2)
+
+                if let metrics = monitor.metrics {
+                    exclusionRow(monitor, metrics)
+                }
+                lookRow(monitor)
+                alertStateRow(monitor)
+            } header: {
+                Text("Is this working for you?")
+            } footer: {
+                Text("These numbers come from your own log and only from days OpenCircuit was able to score. They describe whether flagged mornings have actually been different for you — never whether a headache is coming.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    /// What was logged, what was usable, and — itemised — where the difference went.
+    @ViewBuilder
+    private func exclusionRow(_ report: HeadacheMonitorReport,
+                              _ metrics: HeadacheEvaluation.Metrics) -> some View {
+        let reasons = HeadacheMonitorCopy.exclusions(report, metrics)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(HeadacheMonitorCopy.usableLine(report, metrics))
+                .font(.subheadline.weight(.medium))
+            if reasons.isEmpty {
+                Text("Nothing was left out.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            } else {
+                ForEach(Array(reasons.enumerated()), id: \.offset) { _, reason in
+                    Text("· \(reason)")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// How many times this check has been run. Shown because repeated looks at accumulating data are
+    /// what make a rare result likely by chance alone: a reader who can see the count can judge the
+    /// verdict for themselves, and it keeps us honest about a decision cadence nobody can audit.
+    @ViewBuilder
+    private func lookRow(_ report: HeadacheMonitorReport) -> some View {
+        if let line = HeadacheMonitorCopy.lookLine(report) {
+            Text(line)
+                .font(.caption2).foregroundStyle(.tertiary)
+                .padding(.vertical, 2)
+        }
+    }
+
+    /// The alert state, stated separately from the finding above it.
+    ///
+    /// They are genuinely two different facts and can point opposite ways — the check can say "still
+    /// too early to tell" on a phone whose alerts are off, and can say "not tracking anything" on
+    /// one where the user has switched them back on. A single merged sentence would have to guess
+    /// which of those it was looking at, and would be wrong some of the time.
+    @ViewBuilder
+    private func alertStateRow(_ report: HeadacheMonitorReport) -> some View {
+        let retired = HeadacheMonitorCopy.isRetired(report.status)
+        VStack(alignment: .leading, spacing: 4) {
+            Text(HeadacheMonitorCopy.alertStateLine(report,
+                                                    alertsLive: alertsLive,
+                                                    everLive: promotedOnDayKey != 0,
+                                                    retired: retired))
+                .font(.caption).foregroundStyle(.secondary)
+
+            // Offered only once the notification HAS been live: before that there is nothing to turn
+            // back on, and a button that pre-empts the 21-night floor would switch on an alert that
+            // structurally cannot fire (`HeadacheSignals.band` has no percentile window yet).
+            if !alertsLive, promotedOnDayKey != 0 {
+                Button("Turn morning alerts back on") {
+                    HeadacheEngine().resumeAlerts()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption.weight(.semibold))
+
+                // Shown with the button rather than gated on the CURRENT reading. The button only
+                // appears for someone the monitor has already switched off once, and what happens
+                // next is the same for them whether today's reading still says "retire" or has
+                // since drifted back to "too close to call" — it looks again in a month either way.
+                // Gating it on the reading hid the consequence from exactly the user whose alerts
+                // had recovered, leaving them a button with no explanation of what tapping it buys.
+                Text("We'll look again in about a month, and switch them off again if they still aren't tracking anything for you.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.vertical, 2)
     }
 
     // MARK: Empty state
@@ -953,5 +1103,240 @@ enum HeadacheSignalCopy {
     static func minutes(_ m: Int) -> String {
         if m < 60 { return "\(m) min" }
         return m % 60 == 0 ? "\(m / 60) h" : "\(m / 60) h \(m % 60) min"
+    }
+}
+
+// MARK: - Quality-monitor copy
+
+/// Every string the "Is this working for you?" panel says, in one place and free of SwiftUI, so the
+/// wording can be read (and argued with) without reading a view hierarchy.
+///
+/// THE VOCABULARY RULE. Nothing here may use the words the statistics are written in. No "AUC", no
+/// "p-value", no "confidence interval", no "precision", no "base rate", no "lift" — the reader did
+/// not opt into a statistics course, and a term they cannot check is indistinguishable from a term
+/// we made up. Every quantity is either restated as the thing it literally counts ("of the 22
+/// mornings it flagged, 6 were followed by a headache") or left out.
+///
+/// THE p-VALUE IS DELIBERATELY NEVER SHOWN. There is no short plain-language rendering of it that
+/// is also true — every honest one is a paragraph — and a p-value printed as a decimal is the
+/// clearest example there is of a number that decorates rather than informs.
+///
+/// AND THE ONE THAT MATTERS MOST: nothing here may be phrased as a forecast. The panel reports what
+/// HAS happened on this user's own logged days. It never says a headache is coming, never attaches a
+/// likelihood to tomorrow, and never converts a measured difference into a prediction.
+enum HeadacheMonitorCopy {
+    typealias Metrics = HeadacheEvaluation.Metrics
+    typealias Status = HeadacheEvaluation.Status
+
+    static func isRetired(_ status: Status) -> Bool {
+        if case .retired = status { return true }
+        return false
+    }
+
+    // MARK: Headline
+
+    /// Title plus supporting lines for the current status. The four branches are four genuinely
+    /// different situations and share no wording by accident.
+    static func headline(_ report: HeadacheMonitorReport,
+                         alertsLive: Bool) -> (title: String, lines: [String]) {
+        let tuning = HeadacheEvaluation.Tuning()
+        let window = windowPhrase(report)
+
+        switch report.status {
+        case .building(let daysRemaining):
+            // Stated as progress, never as a lack. Nothing has been checked yet because there is
+            // nothing checkable yet, which is a fact about the calendar rather than about the user.
+            let scored = max(0, report.daysNeeded - daysRemaining)
+            return ("Still learning — \(scored) of \(report.daysNeeded) nights scored.",
+                    ["With fewer than \(report.daysNeeded) scored nights there is no usual to compare a night against, so nothing here has been measured yet. Wearing the ring overnight is all it needs."])
+
+        case .monitoring(let m):
+            var lines: [String] = []
+            let title: String
+            if m.labelledDays < tuning.minPositivesForWorking {
+                // NOT "not enough headaches logged". The gate is `labelledDays` — scored mornings a
+                // logged headache could be paired with — and the two part company for exactly the
+                // user the exclusions list below is written for: someone who imported years of
+                // Apple Health entries, or logged before switching this on, has logged plenty and
+                // still has almost none that LANDED anywhere. Telling them they haven't logged
+                // enough is false, and it asks them to fix something that is already done.
+                title = "Not enough of your headaches have landed on a scored morning to tell yet."
+                lines.append("\(m.labelledDays) of your logged headaches landed on a morning this check could use. It needs at least \(tuning.minPositivesForWorking) before it can conclude anything either way, and usually a good deal more.")
+            } else if m.scoredDays < tuning.minScoredDaysForWorking {
+                title = "Not enough scored days yet to tell whether this is meaningful for you."
+                lines.append("\(m.scoredDays) days scored of the \(tuning.minScoredDaysForWorking) this check needs, with \(count(m.labelledDays, "headache", "headaches")) among them.")
+            } else {
+                title = "Measured, and still too close to call."
+                lines.append(contentsOf: [comparisonLine(m, window: window),
+                                          rankingLine(m)].compactMap { $0 })
+            }
+            // The line that stops the whole panel reading as a fault report. §1.1's own arithmetic:
+            // at the realistic operating point a detector that genuinely works still cannot clear
+            // the bar inside a year for most people. Staying here is the expected outcome.
+            lines.append("This is the ordinary place to be, not a fault. For most people a year does not contain enough headaches to settle the question in either direction.")
+            return (title, lines)
+
+        case .working(let m):
+            var lines = [comparisonLine(m, window: window), rankingLine(m)].compactMap { $0 }
+            // Attached to the good news, not tucked into a footer. A user who has just read that
+            // flagged mornings beat their normal rate is precisely the user about to over-read it.
+            lines.append("That is a measured difference, not a forecast. Most of the mornings it flags are still followed by nothing at all.")
+            return ("On the mornings this flagged, a headache followed more often than usual.", lines)
+
+        case .retired(let m, let reason):
+            let title = alertsLive
+                ? "Switched off once — and back on because you asked for it."
+                : "Morning alerts are off."
+            var lines = [retirementLine(m, reason: reason, window: window)]
+            // Said plainly and immediately. The feature being switched off must not leave any doubt
+            // that the user's own entries survived it — that log is the most irreplaceable data in
+            // the app, and a person who suspects it was cleared will stop logging.
+            lines.append("Your headache log is untouched. Every entry is still here, and last night's signals are still measured and shown above — only the notification stopped.")
+            return (title, lines)
+        }
+    }
+
+    // MARK: Numbers, in words
+
+    /// "It flagged N mornings … M were followed by a headache — X %. Across all its scored days, Y %."
+    ///
+    /// The user's OWN rate is always in the same sentence as ours. A flagged-morning percentage on
+    /// its own is unreadable: 27 % sounds poor next to nothing and is excellent next to 13 %.
+    static func comparisonLine(_ m: Metrics, window: String) -> String? {
+        guard let precision = m.precision, let base = m.baseRate, m.flaggedDays > 0 else { return nil }
+        return "It flagged \(count(m.flaggedDays, "morning", "mornings")) in \(window). \(m.truePositives) of those were followed by a headache within a day — \(pct(precision)). Across all \(count(m.scoredDays, "day", "days")) it scored, \(pct(base)) were."
+    }
+
+    /// The AUC and its 95 % interval, stated as the thing they literally measure.
+    ///
+    /// This IS the confidence interval, in plain language: the point estimate is the head-to-head
+    /// rate, and the interval is the range the data actually supports for it. Written as "AUC 0.71
+    /// (95 % CI 0.55–0.87)" it would be unreadable to almost everyone and would read as authority
+    /// rather than as uncertainty — which is the opposite of what an interval is for.
+    static func rankingLine(_ m: Metrics) -> String? {
+        guard let auc = m.auc, let low = m.aucCILow, let high = m.aucCIHigh else { return nil }
+        return "Put two of your mornings side by side — one that was followed by a headache, one that wasn't. This scored the headache morning higher \(pct(auc)) of the time, and your data narrows that to somewhere between \(pct(low)) and \(pct(high)). A coin toss would be 50%."
+    }
+
+    /// Why the notification was withdrawn — the measured finding, in the user's own numbers.
+    static func retirementLine(_ m: Metrics,
+                               reason: HeadacheEvaluation.Reason,
+                               window: String) -> String {
+        switch reason {
+        case .noBetterThanChance:
+            let measured = m.auc.map { " It put a headache morning above an ordinary one \(pct($0)) of the time, where a coin toss is 50%." } ?? ""
+            return "Over \(window), this did no better than chance at telling your headache mornings apart from your ordinary ones, so OpenCircuit stopped sending the alert.\(measured)"
+        case .noUsefulPrecisionGain:
+            guard let precision = m.precision, let base = m.baseRate else {
+                return "Over \(window), the mornings this flagged were followed by a headache no more often than any other morning, so OpenCircuit stopped sending the alert."
+            }
+            return "Over \(window), the mornings this flagged were followed by a headache about as often as any other morning — \(pct(precision)) against \(pct(base)) — so OpenCircuit stopped sending the alert."
+        }
+    }
+
+    // MARK: Exclusions
+
+    /// "You logged N … K of them landed on a morning this check could use."
+    static func usableLine(_ report: HeadacheMonitorReport, _ m: Metrics) -> String {
+        let window = windowPhrase(report)
+        guard report.loggedHeadaches > 0 else { return "No headaches logged in \(window)." }
+        return "You logged \(count(report.loggedHeadaches, "headache", "headaches")) in \(window). \(m.labelledDays) landed on a morning this check could use."
+    }
+
+    /// Every reason a day or a label was left out, itemised, non-zero terms only.
+    ///
+    /// TWO DIFFERENT CATEGORIES, AND THE UNITS DIFFER TOO. The first line counts LOGGED HEADACHES
+    /// that never had a score to be paired with; every line after it counts MORNINGS that WERE
+    /// scored and then could not be used. The wording says which is which — they are different
+    /// quantities and printing them as if they subtracted from one another would be an arithmetic
+    /// the reader could not reproduce.
+    ///
+    /// That first line must not be worded as a ring failure. Its largest population is a headache
+    /// that predates any score at all: an entry from before this feature was switched on, or one
+    /// imported from Apple Health with years of history behind it. Telling that user the ring
+    /// wasn't worn is simply untrue, and it is the kind of untrue that makes a person distrust the
+    /// device rather than the sentence. (It also, more rarely, catches a second headache on a day
+    /// whose one score was already paired with the first — still "no score to pair with", still not
+    /// the ring's doing.)
+    static func exclusions(_ report: HeadacheMonitorReport, _ m: Metrics) -> [String] {
+        var out: [String] = []
+        // Never scored — outside what the check can see, rather than something it rejected.
+        if report.labelsWithNoScore > 0 {
+            out.append("\(count(report.labelsWithNoScore, "headache", "headaches")) fell on a day OpenCircuit hadn't scored — from before you turned this on, imported from Apple Health, or a night the ring wasn't worn or hadn't synced.")
+        }
+        // Scored, then set aside for a stated reason. Each says "scored" out loud so the reader can
+        // tell this group from the one above it.
+        if m.excludedInProgress > 0 {
+            out.append("\(count(m.excludedInProgress, "morning was", "mornings were")) scored while a headache was already under way. Those can't count either way — we didn't predict something that had already started.")
+        }
+        if m.excludedRestaged > 0 {
+            out.append("\(count(m.excludedRestaged, "morning", "mornings")) had the night re-staged after the score was frozen, so the score no longer describes the night that was kept.")
+        }
+        if m.excludedUnresolved > 0 {
+            out.append("\(count(m.excludedUnresolved, "scored morning is", "scored mornings are")) still too recent — the day after them isn't over yet.")
+        }
+        if report.rowsWithUnknownBand > 0 {
+            out.append("\(count(report.rowsWithUnknownBand, "score was", "scores were")) written by a newer version of OpenCircuit and can't be read by this one.")
+        }
+        return out
+    }
+
+    // MARK: Cadence and state
+
+    /// How many times the check has been run, and when it last was.
+    static func lookLine(_ report: HeadacheMonitorReport) -> String? {
+        guard report.lookCount > 0 else { return nil }
+        let times = report.lookCount == 1 ? "once" : "\(report.lookCount) times"
+        guard let at = report.lastDecisionAt else { return "Checked \(times)." }
+        return "Checked \(times), most recently on \(at.formatted(.dateTime.day().month(.wide)))."
+    }
+
+    /// Whether the morning notification is live, and — only when we can honestly say so — why not.
+    ///
+    /// The "never live yet" branch exists because the notification switches on when a band becomes
+    /// possible at all, which is measured over the trailing banding window, while the panel's status
+    /// is measured over the evaluation year. A user with a scattered year can therefore be told
+    /// "still too early to tell" while alerts have not started; without this line that pair of
+    /// statements is simply baffling.
+    ///
+    /// Note what the last branch does NOT say, and why that matters. `retired` is the check's
+    /// CURRENT reading, which is not the same fact as why the alerts are off right now: a user the
+    /// monitor withdrew months ago whose trailing year has since drifted back over the retirement
+    /// bar reads as `.monitoring` while still being switched off. An earlier draft told exactly that
+    /// user "this check isn't the reason — it has found nothing against them", which was false for
+    /// the one person it was aimed at. Nothing in the stored state can support an attribution here
+    /// (a future settings toggle would be another route to off), so none is claimed at all: the
+    /// finding is stated in the headline above and this line reports only the state and the remedy.
+    static func alertStateLine(_ report: HeadacheMonitorReport,
+                               alertsLive: Bool,
+                               everLive: Bool,
+                               retired: Bool) -> String {
+        if alertsLive {
+            return retired ? "Morning alerts are on because you turned them back on."
+                           : "Morning alerts are on."
+        }
+        if !everLive {
+            return "Morning alerts haven't started yet. They begin once \(report.daysNeeded) nights have been scored inside the last \(HeadacheSignals.Tuning().bandWindowDays) days — that is the point at which an unusual night can be told apart from an ordinary one at all."
+        }
+        return "Morning alerts are off. You can turn them back on below."
+    }
+
+    // MARK: Formatting
+
+    /// Whole percent. Rounded once, here, so the same fraction never renders two ways on one screen.
+    /// Unspaced, matching the percentages already shipped on this screen (`coverageRow`,
+    /// `featureRow`) — two spacings of the same unit on one screen reads as two different units.
+    static func pct(_ fraction: Double) -> String {
+        "\(Int((fraction * 100).rounded()))%"
+    }
+
+    static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
+        "\(n) \(n == 1 ? singular : plural)"
+    }
+
+    /// The evaluation window in words. Kept in step with the Kit's own value rather than hardcoded,
+    /// so a retuned window can't leave the copy quoting a horizon nobody measures over any more.
+    static func windowPhrase(_ report: HeadacheMonitorReport) -> String {
+        report.windowDays == 365 ? "the last year" : "the last \(report.windowDays) days"
     }
 }

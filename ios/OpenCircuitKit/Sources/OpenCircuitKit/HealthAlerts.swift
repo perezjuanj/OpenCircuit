@@ -36,6 +36,13 @@ public enum HealthNotification: String, CaseIterable, Codable, Sendable {
     case bedtimeReminder   = "reminder.bedtime"
     // #86 — battery charging complete
     case chargingComplete  = "battery.chargingComplete"
+    // #183 — the once-a-morning overnight-signals verdict. APPENDED AT THE VERY END, NEVER
+    // INSERTED: `NotificationGate.filter` returns survivors in `allCases` DECLARATION ORDER, so
+    // appending leaves the relative order of every already-shipped pair byte-identical while an
+    // insertion would silently reorder delivery for the four shipped families. The explicit String
+    // rawValue keeps the persisted `alerts.health.lastFired` / `alerts.health.lastNight` ledger keys
+    // stable. Pinned by `HealthNotificationOrderTests`.
+    case headacheSigns     = "headache.signs"
 }
 
 // MARK: - Quiet hours (shared DND window)
@@ -329,5 +336,252 @@ public enum TempFeverNotifications {
             guard let last = lastNotifiedNight[n] else { return true }
             return night > last
         }
+    }
+}
+
+// MARK: - #183 routing (overnight-signals verdict → the morning notification)
+
+/// The once-a-morning "last night was unusual for you" notification (#183).
+///
+/// ══ READ THE COPY RULE BEFORE YOU TOUCH ANY STRING IN HERE ══
+///
+/// This notification reports WHAT WE MEASURED. It never states, implies, or numerically hints that
+/// a headache is coming, and the word "headache" appears nowhere in its title or body.
+///
+/// The arithmetic behind that rule is in `HeadacheSignals.swift` §1: the published ceiling for
+/// physiology-only headache forecasting is AUC ≈ 0.62–0.68, and at this feature's operating point
+/// (flag the top 10 % of the user's OWN days) that is ~26 % precision — about three in four flagged
+/// mornings do not become a headache. A FORECAST at that precision is wrong three times in four. A
+/// MEASUREMENT at that precision is true every single time, because the thing being asserted is the
+/// deviation itself, which we actually observed. That is the entire difference, and it is why the
+/// notification exists at all rather than waiting on proof that may never arrive.
+///
+/// The user opted into a feature called "Headache signals", so the context is already theirs.
+/// Putting the word into the alert converts a true statement ("these signals drifted") into a false
+/// one ("you are about to get a headache") without adding one bit of information.
+///
+/// Consequences, so nobody has to re-derive them:
+///  - NO probability, percentage, score, "risk", "early warning", "likely" or "may get" phrasing;
+///  - NO actions on the notification — see the category registration in `AppDelegate.swift` for the
+///    label-bias reason. Quick-reply buttons that appear only on flagged mornings would collect
+///    ground-truth labels conditioned on our own flag and permanently inflate every later precision
+///    number by construction;
+///  - it fires AT MOST ONCE PER CALENDAR DAY (`freshForDay`), never on the rolling 2 h backoff.
+public enum HeadacheSignsNotifications {
+
+    /// Membership, as its own set rather than a case added to `TempFeverNotifications`. That
+    /// separation is load-bearing: the temp family's set also drives the per-NIGHT ledger filter and
+    /// the disclaimer branch, and widening it by accident would put this notification on the wrong
+    /// ledger convention.
+    public static let notificationSet: Set<HealthNotification> = [.headacheSigns]
+
+    /// The `UNNotificationCategory` identifier, so the registration site (`AppDelegate`) and the
+    /// posting site (`HealthNotificationCenter.post`) read ONE constant. The category carries no
+    /// actions — deliberately; see the type comment above.
+    public static let categoryIdentifier = "headache.signs"
+
+    // MARK: Delivery window
+
+    /// Hard never-fire window, in minutes since local midnight, enforced INDEPENDENTLY of the user's
+    /// quiet-hours toggle. 🔴 PROVISIONAL.
+    ///
+    /// Quiet hours ship DISABLED (`HealthAlertDefaults` registers `quietEnabled: false`, and
+    /// `QuietHours.init` defaults `enabled: false`), so on a default install the shared DND gate
+    /// protects nothing overnight. Every other family in this file is an ACUTE reading the user
+    /// asked to hear about the moment it happens; this one is a summary of a night that is already
+    /// over. Holding it until morning costs nothing, while a 04:00 buzz costs sleep — which is one
+    /// of the very inputs being measured. A verdict computed before the window simply waits: the
+    /// day ledger is still fresh, so the next evaluate pass inside the window delivers it.
+    public static let earliestMinutes = 7 * 60
+    public static let latestMinutes = 21 * 60
+
+    /// Whether `date`'s local time-of-day is inside the hard delivery window.
+    public static func withinDeliveryWindow(_ date: Date, calendar: Calendar = .current) -> Bool {
+        let c = calendar.dateComponents([.hour, .minute], from: date)
+        let m = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+        return m >= earliestMinutes && m < latestMinutes
+    }
+
+    // MARK: Per-DAY ledger
+
+    /// Timezone-stable `yyyymmdd` key for a calendar day. Forwards to `TempFeverNotifications` so
+    /// there is exactly ONE implementation of the day-key math in the codebase — an instant would
+    /// shift under westward travel between two syncs of the same morning and re-fire the duplicate;
+    /// calendar day components do not.
+    public static func dayKey(for day: Date, calendar: Calendar = .current) -> Int {
+        TempFeverNotifications.dayKey(for: day, calendar: calendar)
+    }
+
+    /// Per-DAY de-dupe. The verdict describes ONE night, so once a day has been notified it must not
+    /// re-fire on any later sync that day.
+    ///
+    /// This must NOT be left to the shared 2 h anti-spam backoff. That is exactly the bug the #85
+    /// temp flags hit and documented in `freshForNight` above: with a 2 h backoff the same morning's
+    /// verdict re-appears after every sync, all day. The rule is identical to `freshForNight` —
+    /// keep only candidates whose key is strictly newer than the one already notified — so it
+    /// forwards rather than re-implementing it; the separate NAME exists so a reader at the call
+    /// site sees "day", and the separate `notificationSet` keeps the temp family's night ledger and
+    /// disclaimer branch from being widened by accident.
+    public static func freshForDay(_ candidates: [HealthNotification], day: Int,
+                                   lastNotifiedDay: [HealthNotification: Int]) -> [HealthNotification] {
+        TempFeverNotifications.freshForNight(candidates, night: day, lastNotifiedNight: lastNotifiedDay)
+    }
+
+    // MARK: The decision
+
+    /// Whether this morning's frozen verdict may be raised as a notification candidate NOW.
+    ///
+    /// UNLOCK — `frozenDayCount >= tuning.minDaysForBanding` (21). This is the NATURAL floor, not a
+    /// proof gate: below it `HeadacheSignals.band` cannot produce a band at all, so there is
+    /// literally nothing to report. It deliberately replaces the plan-of-record's
+    /// "no alert until this user's own logged headaches show the detector beats chance", which for a
+    /// typical episodic user is ~10 months (§1.1) — an unshippable wait for a notification that only
+    /// ever claims to have measured something. Those per-user statistics are still computed; they
+    /// now drive `retired` below (fire, measure, and switch it OFF for users it demonstrably does
+    /// not help) instead of gating the first fire. Same statistics, inverted polarity.
+    ///
+    /// `frozenDayCount` must be counted over the SAME trailing `bandWindowDays` window the band was
+    /// taken against — a lifetime count would unlock a user who has 21 rows spread over two years
+    /// and whose percentile budget is therefore built on almost nothing.
+    ///
+    /// `band` is the FROZEN band of record, never a live recompute: re-deriving it at notify time
+    /// would let the alert disagree with the card the user opens two seconds later.
+    ///
+    /// `suppressedBy` withholds only the NOTIFICATION — the score is still computed, stored and
+    /// shown (`HeadacheSignals.assess` gates 5/6). Fever wins because HRV↓ + RHR↑ + temp↑ IS the
+    /// fever signature and the existing fever alert is the more actionable one; "already logged one
+    /// today" wins because telling someone their morning was unusual while they are already in it
+    /// is noise.
+    public static func candidates(enabled: Bool,
+                                  band: HeadacheSignals.Band?,
+                                  suppressedBy: HeadacheSignals.Suppression?,
+                                  frozenDayCount: Int,
+                                  retired: Bool,
+                                  now: Date,
+                                  lastNotifiedDay: [HealthNotification: Int],
+                                  tuning: HeadacheSignals.Tuning = HeadacheSignals.Tuning(),
+                                  calendar: Calendar = .current) -> [HealthNotification] {
+        guard enabled,
+              // The auto-retire QUALITY MONITOR has switched this off for this user, because their
+              // own logged headaches show the flag is not helping them. A retired user keeps the
+              // card and the log; they just stop being interrupted.
+              !retired,
+              band == .flagged,
+              suppressedBy == nil,
+              frozenDayCount >= tuning.minDaysForBanding,
+              withinDeliveryWindow(now, calendar: calendar)
+        else { return [] }
+        return freshForDay([.headacheSigns], day: dayKey(for: now, calendar: calendar),
+                           lastNotifiedDay: lastNotifiedDay)
+    }
+
+    // MARK: Copy
+
+    /// Plain words for one feature, for the "what drifted" sentence. Lower-case; the copy builder
+    /// capitalises the first one.
+    ///
+    /// These name the OBSERVABLE, not the analytic term. "Arousal let-down" and "schedule shift" are
+    /// our vocabulary, not the user's, and a notification is the worst place to teach it.
+    public static func plainName(_ feature: HeadacheSignals.Feature) -> String {
+        switch feature {
+        case .sleepEfficiencyDrop:    return "sleep efficiency"
+        case .arousalLetdown:         return "daytime heart rate"
+        case .hrvDeviation:           return "heart rate variability"
+        case .restingHRDeviation:     return "resting heart rate"
+        case .sleepFragmentation:     return "time awake in bed"
+        case .sleepDurationDeviation: return "sleep duration"
+        case .scheduleShift:          return "bedtime"
+        case .skinTempDeviation:      return "skin temperature"
+        case .perimenstrual:          return "cycle phase"
+        }
+    }
+
+    /// The RING-DERIVED features that drifted furthest, largest first, at most `limit`.
+    ///
+    /// `weighted` maps a feature to its WEIGHTED contribution (effective weight × ramp position) —
+    /// the share of the index that feature actually supplied. Ranking on the ramp alone would let a
+    /// 0.08-weight feature outrank a 0.18-weight one that moved the number more.
+    ///
+    /// `perimenstrual` is EXCLUDED even though it can carry weight: it is a calendar lookup, and it
+    /// did not "drift from your usual range" — saying so would misdescribe a date as a measurement.
+    /// Ties break by `Feature.allCases` declaration order, so the same morning always words itself
+    /// the same way.
+    public static func topSignals(_ weighted: [HeadacheSignals.Feature: Double],
+                                  limit: Int = 2) -> [HeadacheSignals.Feature] {
+        let order = Dictionary(uniqueKeysWithValues:
+            HeadacheSignals.Feature.allCases.enumerated().map { ($0.element, $0.offset) })
+        return weighted
+            .filter { $0.key.isRingDerived && $0.value > 0 }
+            .sorted {
+                $0.value == $1.value ? (order[$0.key] ?? 0) < (order[$1.key] ?? 0) : $0.value > $1.value
+            }
+            .prefix(max(0, limit))
+            .map(\.key)
+    }
+
+    /// The period a named feature was actually MEASURED over, as a trailing phrase.
+    ///
+    /// Eight of the nine features are nightly; `arousalLetdown` is the exception, and the whole
+    /// reason this exists. It compares yesterday's WAKING heart rate with the day before's
+    /// (`HeadacheSignals.assess`, the let-down term), so the blanket "last night" this copy used to
+    /// append to whatever it named asserted a measurement of a night that term never looks at. The
+    /// one sentence this entire design rests on being LITERALLY TRUE cannot carry a timeframe that
+    /// is sometimes wrong. The app-side `HeadacheSignalCopy.unreadClause` solved the same problem
+    /// for the missing-input sentence; this mirrors its approach.
+    /// The one phrase that means "overnight". Extracted so the TITLE can ask whether every named
+    /// signal is nightly without re-encoding the answer — a second copy of the string is how the
+    /// title and the body drift apart, which is the exact defect this pair of functions exists to
+    /// prevent.
+    static let nightlyPhrase = "last night"
+
+    public static func timeframe(_ feature: HeadacheSignals.Feature) -> String {
+        feature == .arousalLetdown ? "over the past two days" : nightlyPhrase
+    }
+
+    /// The notification copy. A MEASUREMENT, never a forecast — see the type comment.
+    ///
+    /// The timeframe FOLLOWS the signals that were named rather than being a constant suffix. Two
+    /// signals measured over the same period share one trailing phrase — the common all-nightly
+    /// case, which keeps the compact sentence it always had; only a mixed pair pays the extra words
+    /// to spell both out. A notification body that wraps to four lines is its own failure.
+    ///
+    /// Pinned by `HealthAlertsHeadacheTests.testCopyIsAMeasurementNeverAForecast`: no "headache",
+    /// no percentage, no probability, no "risk"/"warning"/"likely"/"predict"/"will"; and by
+    /// `testTheTimeframeFollowsTheNamedSignals` for the daytime term.
+    public static func copy(topSignals: [HeadacheSignals.Feature]) -> (title: String, body: String) {
+        let drifted = " drifted furthest from your usual range"
+        let subject: String
+        switch topSignals.count {
+        case 0:
+            // The frozen row carried no legible per-feature detail (an older row, or a decode
+            // miss). Still true, still a measurement — just less specific. Naming a feature we
+            // cannot actually evidence would be the one thing worse than being vague. Nothing
+            // daytime can be named here, so the nightly phrase is the correct one.
+            subject = "Several of your overnight signals" + drifted + " last night"
+        case 1:
+            subject = sentenceCased(plainName(topSignals[0])) + drifted
+                + " " + timeframe(topSignals[0])
+        default:
+            let (first, second) = (topSignals[0], topSignals[1])
+            subject = timeframe(first) == timeframe(second)
+                ? sentenceCased(plainName(first)) + " and " + plainName(second)
+                    + drifted + " " + timeframe(first)
+                : sentenceCased(plainName(first)) + " " + timeframe(first)
+                    + " and " + plainName(second) + " " + timeframe(second) + drifted
+        }
+        // The TITLE has to follow the signals too, for the same reason the body does. When the only
+        // named driver is the daytime let-down term (a D−2 → D−1 comparison), "last night" asserts a
+        // timeframe nothing was measured over — the title would contradict the body directly beneath
+        // it. Reachable, if uncommon: gate 4 requires a nightly anchor to be PRESENT, not to
+        // CONTRIBUTE, so a day can score entirely on the daytime term.
+        let allDaytime = !topSignals.isEmpty && topSignals.allSatisfy { timeframe($0) != nightlyPhrase }
+        let title = allDaytime ? "Your recent signals stood out" : "Last night was unusual for you"
+        return (title,
+                subject + " (estimate). That is what we measured — it is not a forecast.")
+    }
+
+    private static func sentenceCased(_ s: String) -> String {
+        guard let first = s.first else { return s }
+        return String(first).uppercased() + s.dropFirst()
     }
 }
