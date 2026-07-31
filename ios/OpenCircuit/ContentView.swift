@@ -43,6 +43,10 @@ struct ContentView: View {
     /// `HeadacheDefaults.enabled` rather than a second copy of the raw string — the drift hazard the
     /// duplicated `userProfile.womensHealthEnabled` literal above already demonstrates.
     @AppStorage(HeadacheDefaults.enabled) private var headacheEnabled = false
+    /// A headache just banked by the `opencircuit://headache/log` deep link (the Control Centre /
+    /// Lock Screen control). Non-nil presents the log sheet on that entry so the user can correct
+    /// it. See `handleQuickLogLink`.
+    @State private var quickLogged: QuickLoggedHeadache?
 
     /// Persisted user ordering of the reorderable dashboard sections (long-press-drag QoL). Stored
     /// as a comma-joined list of `DashboardSection.rawValue`; unknown/duplicate entries are ignored
@@ -274,6 +278,20 @@ struct ContentView: View {
             // card, while the activity-probe share lives in the Profile debug card).
             .sheet(isPresented: $showProbeShareSheet) {
                 if let url = probeExportURL { ShareActivityView(url: url) }
+            }
+            // Quick-log deep link (`opencircuit://headache/log?when=…`) from the Control Centre /
+            // Lock Screen control. Hoisted to the TabView so it lands whichever tab is showing.
+            .onOpenURL { url in handleQuickLogLink(url) }
+            // The correction sheet for a JUST-BANKED quick log. The row is already stored by the
+            // time this appears (see `handleQuickLogLink`), so dismissing without saving still
+            // leaves the label captured — that is the point of the whole path.
+            .sheet(item: $quickLogged, onDismiss: {
+                // Mirror it into Apple Health once the user has finished correcting it, rather than
+                // on arrival: an immediate write would be superseded by any edit and cost a
+                // delete-then-rewrite through their Health store for nothing.
+                flushHealth()
+            }) { logged in
+                quickLogCorrectionSheet(onset: logged.onset)
             }
             // Battery: TTE + charging-complete notification (#86).
             .onChange(of: session?.batteryPercent) { _, pct in
@@ -551,6 +569,73 @@ struct ContentView: View {
         case .cycle:       CycleCalendarView()
         case .headache:    HeadacheSignalsView()
         case .activityLog: ActivityLogView(session: session)
+        }
+    }
+
+    // MARK: - Headache quick-log deep link (#183)
+
+    /// Handle `opencircuit://headache/log?when=…`, opened by the Control Centre / Lock Screen
+    /// control (`WorkoutWidget/HeadacheLogControl.swift`).
+    ///
+    /// The row is STORED FIRST and the sheet is opened on it second. That order is the whole design:
+    /// a headache label that isn't captured in the moment is usually never captured at all, so the
+    /// user must not have to complete a form — or even keep the app open — for the label to exist.
+    /// Correction is optional, and the entry stays fully editable and deletable from that sheet and
+    /// from the history screen afterwards.
+    ///
+    /// Near-duplicates are handled by `HeadacheQuickLog.record`, which folds a second log within two
+    /// hours into the existing entry rather than creating a second row for one headache. It also
+    /// flips `HeadacheDefaults.enabled` on once the row is stored, so the log the user just wrote to
+    /// is actually reachable in the UI.
+    @MainActor
+    private func handleQuickLogLink(_ url: URL) {
+        guard let when = HeadacheQuickLink.parse(url) else { return }
+        let store = LocalStore(modelContext)
+        guard let outcome = try? HeadacheQuickLog.record(onset: when.resolvedOnset(),
+                                                         severityRaw: nil, store: store) else {
+            // The store write failed (it throws only on a SwiftData save error). Say nothing and
+            // present nothing rather than opening a sheet on a row that isn't there.
+            return
+        }
+        selectedTab = .today
+        quickLogged = QuickLoggedHeadache(onset: outcome.onset)
+    }
+
+    /// The log sheet opened on a just-banked quick log, in EDIT mode — so the severity, the time
+    /// (including the yesterday path's admitted noon placeholder), symptoms and notes are all one
+    /// tap away, and "Delete this entry" is there for a mis-tap.
+    @ViewBuilder
+    private func quickLogCorrectionSheet(onset: Date) -> some View {
+        // Re-fetched by its store key rather than captured, because the entry is a `@Model` and a
+        // reference held in view state can outlive the row. The ±1 s window (not an equality fetch)
+        // absorbs the sub-second round-trip a `Date` makes through the store's Double column; the
+        // nearest match is taken rather than the first, so a neighbouring row can't be picked up
+        // instead — though the two-hour merge rule means there should never be one that close.
+        if let entry = (try? LocalStore(modelContext)
+            .headacheEntries(from: onset.addingTimeInterval(-1), to: onset.addingTimeInterval(1)))?
+            .min(by: { abs($0.onset.timeIntervalSince(onset)) < abs($1.onset.timeIntervalSince(onset)) }) {
+            HeadacheLogSheet(editing: entry, onDelete: { deleteQuickLogged(onset: $0) }) { draft in
+                try LocalStore(modelContext).saveHeadacheEntry(
+                    onset: draft.onset, end: draft.end, severityRaw: draft.severityRaw,
+                    symptoms: draft.symptoms, customSymptoms: draft.customSymptoms,
+                    factors: draft.factors, notes: draft.notes,
+                    originalOnset: draft.originalOnset)
+            }
+        }
+    }
+
+    /// Delete a quick-logged entry and any Apple Health sample it already wrote, so a mis-tap
+    /// doesn't leave an orphan behind in Health. Mirrors `HeadacheSignalsView.delete`.
+    @MainActor
+    private func deleteQuickLogged(onset: Date) {
+        // Drop the sheet's reference BEFORE destroying the row: the delete invalidates the model
+        // object, and the re-render it triggers would otherwise re-read a deleted instance while
+        // rebuilding the sheet (a SwiftData trap, not a graceful nil).
+        quickLogged = nil
+        let store = LocalStore(modelContext)
+        let staleUUIDs = (try? store.deleteHeadacheEntry(onset: onset)) ?? []
+        if !staleUUIDs.isEmpty {
+            Task { await HealthKitWriter().deleteHeadacheSamples(uuidStrings: staleUUIDs) }
         }
     }
 
@@ -1821,6 +1906,15 @@ private enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
 /// top of the cards' custom ones.
 private enum Route: Hashable {
     case cycle, headache, activityLog
+}
+
+/// A headache the quick-log deep link just stored, identified by its `onset` — the store key — so
+/// `.sheet(item:)` re-presents on a NEW quick log while staying stable across re-renders of the
+/// same one. Carries only the key, never the `@Model`: a model reference held in view state can be
+/// re-read after the row is deleted, which SwiftData traps on rather than nils out.
+private struct QuickLoggedHeadache: Identifiable {
+    let onset: Date
+    var id: Date { onset }
 }
 
 /// Home-page calories card. Headline = today's estimated burn; secondary lines break it

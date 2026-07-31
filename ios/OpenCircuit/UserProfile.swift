@@ -93,6 +93,8 @@ struct UserProfileSettingsView: View {
     // than a second copy of the literal (the `userProfile.womensHealthEnabled` string above is
     // typed out in both files, which is exactly the drift hazard we're not repeating).
     @AppStorage(HeadacheDefaults.enabled) private var headacheEnabled = false
+    /// Distinct from the app-wide `showOnboarding` above — this is the headache-specific explainer.
+    @State private var showHeadacheOnboarding = false
 
     // Unit preferences (#83). Default to locale-appropriate units out of the box.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
@@ -442,10 +444,22 @@ struct UserProfileSettingsView: View {
                 // feature schedules NO notification, so asking for notification authorization here
                 // would burn the one-time system prompt (#133) on something that can never post.
                 Toggle("Show headache log", isOn: $headacheEnabled)
-                Text("Adds a headache log to the dashboard. You record when a headache started, "
-                     + "when it eased off and how bad it was, and OpenCircuit mirrors each entry "
-                     + "into Apple Health. Headaches already in Apple Health can be imported. "
-                     + "That is all it does today.")
+                    // The explainer fires on the ENABLE edge only. The ask this feature makes is
+                    // entirely front-loaded (log everything, for months, for something that may
+                    // never pay off), and release notes never reach someone who flips a setting
+                    // weeks after installing.
+                    .onChange(of: headacheEnabled) { _, isOn in
+                        guard isOn,
+                              !UserDefaults.standard.bool(forKey: HeadacheDefaults.onboardingShown)
+                        else { return }
+                        UserDefaults.standard.set(true, forKey: HeadacheDefaults.onboardingShown)
+                        showHeadacheOnboarding = true
+                    }
+                Text("Adds a headache log to the dashboard, and an \"overnight signals\" view "
+                     + "showing whether last night looked unusual for you. You record when a "
+                     + "headache started, when it eased off and how bad it was, and OpenCircuit "
+                     + "mirrors each entry into Apple Health; headaches already in Apple Health can "
+                     + "be imported. It does not predict headaches and it sends no alerts.")
                     .font(.caption).foregroundStyle(.secondary)
                 // Read-only on purpose: there is nothing to switch on, so this is a status line and
                 // not a control the user can act on.
@@ -553,6 +567,9 @@ struct UserProfileSettingsView: View {
 
         }
         .navigationTitle("User Profile")
+        .sheet(isPresented: $showHeadacheOnboarding) {
+            HeadacheOnboardingView()
+        }
         .sheet(isPresented: $showOnboarding) {
             OnboardingView { showOnboarding = false }
         }

@@ -2,8 +2,8 @@ import SwiftUI
 import SwiftData
 import OpenCircuitKit
 
-// The dashboard's headache-log card: the two-tap log, the shared Apple Health import control, and
-// (Phase 2, #183) last night's overnight signals.
+// The dashboard's headache-log card: the two-tap log, the morning-after prompt, the shared Apple
+// Health import control, and (Phase 2, #183) last night's overnight signals.
 //
 // The LOG half is the point of the feature. The user's entries are the only ground-truth labels
 // anything here could ever be validated against, and a headache that isn't logged can't be filled
@@ -49,7 +49,22 @@ struct HeadacheCardView: View {
     /// happens to arrive. The row's band is read inside that task, through the engine.
     @Query private var recentRisk: [StoredHeadacheRisk]
 
+    /// Existence probe for the day the morning-after prompt asks about. `fetchLimit = 1` because the
+    /// only question asked of it is "is this day empty?" — the rows themselves are never rendered.
+    @Query private var yesterdayEntries: [StoredHeadacheEntry]
+
     @State private var showLogSheet = false
+
+    /// The onset the log sheet should OPEN on, when it is being opened for a specific past day
+    /// (the morning-after prompt). `nil` = the plain "Log a headache" path, which opens on now.
+    @State private var pendingOnset: Date?
+
+    /// The prompt follows the same switch the dashboard uses to show this card at all. Read here as
+    /// well as by the caller so the prompt cannot outlive the feature being turned off mid-session.
+    @AppStorage(HeadacheDefaults.enabled) private var headacheEnabled = false
+
+    /// `yyyymmdd` of the day whose prompt the user has already dismissed. 0 = none.
+    @AppStorage(HeadacheDefaults.yesterdayPromptDismissedDay) private var promptDismissedDay = 0
 
     /// Last night's verdict, computed OFF the render path (see the `.task(id:)` below). `nil` once
     /// `signalsLoaded` is true means the engine had nothing to say — which is rendered as "not
@@ -73,6 +88,14 @@ struct HeadacheCardView: View {
 
     /// So a skin-temperature reason reads in the unit the rest of the app uses (#83).
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
+
+    /// The day the morning-after prompt asks about, fixed at INIT and shared by the emptiness query,
+    /// the sheet's prefill and the dismissal key so all three always mean the same day.
+    ///
+    /// A card that survives midnight therefore asks a slightly STALE question rather than an
+    /// inconsistent one: it prefills, and remembers the dismissal for, the day it actually asked
+    /// about. (Any dashboard invalidation rebuilds the view and moves the window on.)
+    private let promptDayStart: Date
 
     private static let monthFetchLimit = 100
     /// Three days of frozen rows: enough to see this morning's appear, small enough that the
@@ -98,6 +121,19 @@ struct HeadacheCardView: View {
             sortBy: [SortDescriptor(\.day, order: .reverse)])
         riskDesc.fetchLimit = Self.riskFetchLimit
         _recentRisk = Query(riskDesc)
+
+        // Yesterday, as its own bounded query rather than a filter over `monthEntries`: on the 1st
+        // of a month yesterday is in the PREVIOUS month, so the month query would report it empty
+        // and the card would ask about a day the user had already logged.
+        let dayStart = cal.startOfDay(for: Date())
+        let prevStart = cal.date(byAdding: .day, value: -1, to: dayStart)
+            ?? dayStart.addingTimeInterval(-86_400)
+        promptDayStart = prevStart
+        var yesterdayDesc = FetchDescriptor<StoredHeadacheEntry>(
+            predicate: #Predicate { $0.onset >= prevStart && $0.onset < dayStart },
+            sortBy: [SortDescriptor(\.onset, order: .forward)])
+        yesterdayDesc.fetchLimit = 1
+        _yesterdayEntries = Query(yesterdayDesc)
     }
 
     var body: some View {
@@ -113,9 +149,15 @@ struct HeadacheCardView: View {
                 header
             }
 
+            // Above the signals divider, in the LOG half of the card. Deliberately not adjacent to
+            // "Overnight signals": a question sitting under a band reads as being asked BECAUSE of
+            // the band, which is the one thing this prompt must never imply.
+            yesterdayPrompt
+
             signalsSection
 
             Button {
+                pendingOnset = nil          // a plain log opens on NOW, never on the prompt's day
                 showLogSheet = true
             } label: {
                 Label("Log a headache", systemImage: "plus.circle.fill")
@@ -126,13 +168,28 @@ struct HeadacheCardView: View {
 
             HeadacheImportControl(oneTimePrompt: true)
         }
-        .sheet(isPresented: $showLogSheet) {
-            HeadacheLogSheet(editing: nil) { draft in
+        .sheet(isPresented: $showLogSheet, onDismiss: { pendingOnset = nil }) {
+            // `editing:` is doing PREFILL duty here, not edit duty. `HeadacheLogSheet` takes its
+            // opening onset from the entry it is handed, and the morning-after prompt has to open on
+            // yesterday — opening on `now` would file yesterday's headache under today unless the
+            // user noticed and corrected the picker, which is a corrupted label, not a missing one.
+            //
+            // The carrier is never inserted into the context, and holding an un-inserted `@Model` is
+            // already how this feature works elsewhere: `HeadacheEngine` builds a `StoredHeadacheRisk`
+            // and hands it to `insertRiskDayIfAbsent`, which drops it unused when the day is already
+            // frozen (HeadacheStore.swift:342).
+            HeadacheLogSheet(editing: pendingOnset.map { StoredHeadacheEntry(onset: $0) }) { draft in
                 try LocalStore(modelContext).saveHeadacheEntry(
                     onset: draft.onset, end: draft.end, severityRaw: draft.severityRaw,
                     symptoms: draft.symptoms, customSymptoms: draft.customSymptoms,
                     factors: draft.factors, notes: draft.notes,
-                    originalOnset: draft.originalOnset)
+                    // Always a plain upsert. This card never opens on a STORED row — `editing:` is
+                    // either nil or the prefill carrier above — so there is no original row to
+                    // relocate, and handing the carrier's onset over as `originalOnset` would send
+                    // the store down its relocate path: moving the picker would then DELETE whatever
+                    // real entry occupies the new onset (HeadacheStore.swift:218-227). Editing an
+                    // existing entry belongs to the history screen (HeadacheSignalsView.swift:127).
+                    originalOnset: nil)
             }
         }
         // Last night's verdict, OFF the render path. `HeadacheEngine` owns the other half of the
@@ -152,6 +209,98 @@ struct HeadacheCardView: View {
             recordedFeatureCount = recorded?.ringFeatureCount
             signalsLoaded = true
         }
+    }
+
+    // MARK: - Morning-after prompt
+
+    /// Whether to ask about yesterday: the feature is on, the day is EMPTY, and the user hasn't
+    /// already waved this day away.
+    ///
+    /// The trigger is emptiness and nothing else. It is deliberately NOT conditioned on the signals
+    /// score, the band, or anything the detector produced: asking "did you have a headache?" because
+    /// we flagged the night would pull the answer toward our own output, and these labels are the
+    /// only ground truth the detector can ever be measured against — a biased label set can't be
+    /// spotted later and can't be repaired.
+    ///
+    /// "Empty" counts ANY row for the day, including a `notPresent` (severity 1) one. That is a
+    /// looser test than the engine's own suppression check, which excludes `notPresent` because an
+    /// absence isn't a headache (HeadacheEngine.swift:511-514) — but here the question is "do we
+    /// have the user's answer for this day?", and "no headache" is an answer. Re-asking it would be
+    /// nagging someone who already told us.
+    private var showsYesterdayPrompt: Bool {
+        headacheEnabled && yesterdayEntries.isEmpty && promptDismissedDay != promptDayKey
+    }
+
+    /// Timezone-stable `yyyymmdd` key for the day being asked about — the house form for a per-day
+    /// ledger (HealthAlerts.swift:296-303). An instant would shift under travel and could re-arm a
+    /// prompt the user already dismissed.
+    private var promptDayKey: Int { TempFeverNotifications.dayKey(for: promptDayStart) }
+
+    /// The onset the prefilled sheet OPENS on: midday of the day being asked about.
+    ///
+    /// A placeholder, and deliberately an obvious one. The user is answering a DAY-level question
+    /// and has stated no clock time, so any time we choose is ours, not theirs; midday is round
+    /// enough to read as a default and the picker shows it before anything is saved. This is the
+    /// sheet's own rule for its end-time default — "a wrong 'now' is at least visible and
+    /// correctable" (HeadacheLogSheet.swift:96-101) — rather than an invented plausible-looking
+    /// time. Severity stays Unspecified: the quick path records no rating the user didn't give.
+    ///
+    /// It cannot collide with the store's unique `onset` key either: the prompt only appears when
+    /// the day holds no rows at all.
+    private var yesterdayPrefillOnset: Date {
+        Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: promptDayStart)
+            ?? promptDayStart
+    }
+
+    /// Most headaches are remembered the NEXT morning rather than logged during, and the card is
+    /// already on screen at exactly the moment that memory is still recoverable. Unlike ring data a
+    /// missed label cannot be back-filled from anywhere — if the user doesn't type it, it never
+    /// existed — so the card asks instead of waiting to be found.
+    ///
+    /// It asks; it never asserts. Nothing here says a headache was likely, nothing references the
+    /// signals section, and a dismissal records NOTHING: "no" is not filed as a `notPresent` label,
+    /// because a tap that may well have meant "not now" would then become a health fact the user
+    /// never stated.
+    @ViewBuilder
+    private var yesterdayPrompt: some View {
+        if showsYesterdayPrompt {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Did you have a headache yesterday?")
+                    .font(.subheadline.weight(.medium))
+                // Names the actual reason it is being asked — the day is blank — so the question
+                // can't be read as the app having noticed something.
+                Text("Nothing is logged for \(promptDayName). You can add it now and set the time yourself.")
+                    .font(.caption).foregroundStyle(.secondary)
+
+                HStack(spacing: 12) {
+                    Button("Log it") {
+                        pendingOnset = yesterdayPrefillOnset
+                        showLogSheet = true
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Log a headache for \(promptDayName)")
+
+                    Button("Nothing to log") {
+                        promptDismissedDay = promptDayKey
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .accessibilityHint("Stops asking about \(promptDayName). Nothing is recorded.")
+                }
+                .font(.caption.weight(.semibold))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            // The NEUTRAL house surface (ContentView.swift:1011), never the orange one warnings use
+            // (ContentView.swift:1052): this is a question about a blank day, not an alert.
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.08)))
+        }
+    }
+
+    /// Weekday name of the day being asked about. Spelled out rather than left as "yesterday" so a
+    /// card that has been on screen since before midnight still names the day it actually queried.
+    private var promptDayName: String {
+        promptDayStart.formatted(.dateTime.weekday(.wide))
     }
 
     // MARK: - Overnight signals (#183, Phase 2)

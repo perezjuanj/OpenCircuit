@@ -49,6 +49,29 @@ enum HeadacheDefaults {
     /// Whether the 90-day "still logging?" nudge has been shown.
     static let ninetyDayNudgeShown = "headache.nudge.ninetyDayShown"
 
+    /// Whether the one-time explainer has been shown (on first enable).
+    ///
+    /// Shown ONCE, at the moment the user opts in, because the ask this feature makes is unusual and
+    /// entirely front-loaded: log every headache for months, for something that may never tell you
+    /// anything. A user who never learns that is a user whose labels quietly go incomplete, and
+    /// incomplete labels cannot be repaired later.
+    static let onboardingShown = "headache.onboarding.shown"
+
+    /// `yyyymmdd` of the day the morning-after prompt ASKED ABOUT, once the user has dismissed it
+    /// for that day. `0` = never dismissed.
+    ///
+    /// The day asked about — not "the last day we showed it", and not a bare `Bool`:
+    ///  - a `Bool` would silence the prompt permanently after one dismissal, and the prompt's whole
+    ///    job is to recover a label the user would otherwise never enter;
+    ///  - keying it to the ASKED-ABOUT day (rather than to today) means a dismissal can only ever
+    ///    silence the question it answered. A card built just before midnight goes on asking about
+    ///    the previous day for a few minutes, and dismissing that stale question must not swallow
+    ///    tomorrow's fresh one.
+    ///
+    /// An Int `yyyymmdd` (`TempFeverNotifications.dayKey`) rather than an instant, for the same
+    /// reason that ledger uses one: an instant shifts under travel, calendar day components do not.
+    static let yesterdayPromptDismissedDay = "headache.prompt.yesterdayDismissedDay"
+
     /// Register defaults so a first read never returns a spurious `false`/`0` that differs from the
     /// documented default. Call alongside `HealthAlertDefaults.register`.
     static func register(_ defaults: UserDefaults = .standard) {
@@ -59,6 +82,7 @@ enum HeadacheDefaults {
             consecutivePasses: 0,
             importPromptShown: false,
             ninetyDayNudgeShown: false,
+            yesterdayPromptDismissedDay: 0,
         ])
     }
 }
