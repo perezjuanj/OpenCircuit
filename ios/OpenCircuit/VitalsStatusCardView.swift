@@ -109,7 +109,8 @@ struct VitalsStatusCardView: View {
             let hr = hrSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
             let spo2 = spo2Samples.map { (start: $0.start, value: $0.value) }
             let hrv = hrvSamples.map { (start: $0.start, value: $0.value) }
-            let nights = sleepNights.map { (night: $0.night, skinTempC: $0.skinTempC) }
+            let nights = sleepNights.map { (night: $0.night, skinTempC: $0.skinTempC,
+                                            inBedStart: $0.inBedStart, inBedEnd: $0.inBedEnd) }
             let fbRestingHR = healthBaselineReport?.restingHR.map { (day: $0.day, value: $0.value) }
             let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
             let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
@@ -135,7 +136,7 @@ struct VitalsStatusCardView: View {
         hr: [HRSample],
         spo2: [(start: Date, value: Double)],
         hrv: [(start: Date, value: Double)],
-        nights: [(night: Date, skinTempC: Double)],
+        nights: [(night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date)],
         fallbackRestingHR: [(day: Date, value: Double)]?,
         fallbackSpO2: [(day: Date, value: Double)]?,
         fallbackHRV: [(day: Date, value: Double)]?,
@@ -149,7 +150,15 @@ struct VitalsStatusCardView: View {
         if let i = vitalInput(.overnightSpO2, localDays: dailyMeans(spo2, scale: 100),
                               fallback: fallbackSpO2,
                               config: config) { inputs.append(i) }
-        if let i = vitalInput(.overnightHRV, localDays: dailyMeans(hrv, scale: 1),
+        // MUST stay night-scoped (#185). Since #185 the ring also emits HRV from QUIET daytime
+        // `0x12` activity epochs, so `dailyMeans` — a whole-calendar-day mean — would hand a vital
+        // literally named `.overnightHRV` (concern `.low`, the falling-HRV illness/stress flag) a
+        // day/night blend whose value depends on how still the user sat that day, not on their
+        // physiology. Before #185 HRV existed essentially only overnight, so the calendar-day mean
+        // WAS the overnight mean and this was benign. `nightlyMeans` mirrors the night-scoping the
+        // Apple-Health fallback branch already applies (`HealthKitHistoryInspector.nightlyMeans`),
+        // so the local and fallback series stay the same quantity rather than silently diverging.
+        if let i = vitalInput(.overnightHRV, localDays: nightlyMeans(hrv, nights: nights, scale: 1),
                               fallback: fallbackHRV,
                               config: config) { inputs.append(i) }
         let offset = skinTempOffset(nights) ?? fallbackSkinTempOffsetC
@@ -198,8 +207,29 @@ struct VitalsStatusCardView: View {
         }
     }
 
+    /// Per-NIGHT mean of a sample kind, intersected with that night's recorded in-bed window and
+    /// keyed by the night's start-of-day so it drops straight into `VitalsBaseline`'s day series.
+    /// A night with no stored window, or no samples inside it, contributes nothing — absence of
+    /// coverage must not become a fabricated data point. See the `.overnightHRV` call site for why
+    /// this exists rather than `dailyMeans` (#185).
+    nonisolated private static func nightlyMeans(
+        _ samples: [(start: Date, value: Double)],
+        nights: [(night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date)],
+        scale: Double
+    ) -> [(day: Date, value: Double)] {
+        nights.compactMap { n in
+            guard n.inBedEnd > n.inBedStart else { return nil }
+            let inWindow = samples.filter { $0.start >= n.inBedStart && $0.start <= n.inBedEnd }
+            guard !inWindow.isEmpty else { return nil }
+            return (day: Calendar.current.startOfDay(for: n.night),
+                    value: inWindow.reduce(0.0) { $0 + $1.value * scale } / Double(inWindow.count))
+        }
+    }
+
     /// Latest night's signed skin-temp offset from the rolling baseline (#69), or nil.
-    nonisolated private static func skinTempOffset(_ nights: [(night: Date, skinTempC: Double)]) -> Double? {
+    nonisolated private static func skinTempOffset(
+        _ nights: [(night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date)]
+    ) -> Double? {
         let valid = nights.filter { $0.skinTempC > 0 }
         guard let latest = valid.max(by: { $0.night < $1.night }) else { return nil }
         let cal = Calendar.current

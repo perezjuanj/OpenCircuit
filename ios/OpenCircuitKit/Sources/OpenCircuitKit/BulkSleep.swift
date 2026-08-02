@@ -16,8 +16,13 @@
 //   • Activity/awake epoch ([8]=0x12/0x13): [4]=HR bpm 🟢 (ALL-DAY HR — same head as sleep;
 //     confirmed 2026-06-17 by sleep↔activity continuity across all captures, ±4.6 bpm / corr +0.76),
 //     [10:20]=acti_counts (motion/intensity blob; [15:20] is just its tail, NOT a separate
-//     steps/distance payload — that claim was retracted, PROTOCOL.md §5.3 #93). No valid HRV/SpO2
-//     under motion. The real steps/distance/activeSeconds record (历史活动响应) is a SEPARATE,
+//     steps/distance payload — that claim was retracted, PROTOCOL.md §5.3 #93).
+//     byte[5] HRV and byte[7] RR ARE present and valid on these epochs (🟢 #185, 6 independent
+//     archives): byte[5] is only artifact-inflated while the [15:20] intensity tail is NON-ZERO.
+//     SpO2 genuinely is absent — [8] IS the activity tag. The recovered values reach the HealthKit
+//     sample path ONLY (measuredHRVRMSSD / measuredRespiratoryRate); the strict sleep-vitals
+//     accessors below remain the "ring is measuring sleep" MODE signal that staging consumes.
+//     The real steps/distance/activeSeconds record (历史活动响应) is a SEPARATE,
 //     still-uncaptured stream — §5.3.1, `RingSession.probeActivityChannels`.
 // Respiratory rate IS per-epoch ([7]÷8, ground-truthed). Skin temp is NOT per-epoch here (it's
 // read live off the 0x10/0x87 descriptor, §5.4). Sleep stages are not on the wire — compute them
@@ -101,6 +106,14 @@ public struct BulkRecord: Equatable {
 
     /// HRV in ms — `[5]` on a sleep-vitals epoch (🟢). The ring reports RMSSD; HealthKit
     /// only has SDNN (different statistic, same unit) — see HEALTHKIT_MAPPING.md.
+    ///
+    /// ⚠️ THIS IS A MODE SIGNAL AS WELL AS A VALUE, and the mode signal is the load-bearing half.
+    /// `!= nil` means "the ring emitted a sleep-vitals template here". Sleep DETECTION
+    /// (`sleepVitalTimeline` → `ActivityPeriod.sleepVitalsRescue`), STAGING (`SleepStaging`
+    /// forward-fill + the raw `vitals` flag), NAPS (`NapDetection.sleepVitalsShare`) and
+    /// `SleepStress` all read it that way — widening its layout scope MOVES THE DETECTED NIGHT.
+    /// It therefore deliberately does NOT recover the HRV that 0x12/0x13 activity epochs also
+    /// carry: that is `measuredHRVRMSSD`, which only `BulkSleep.samples` may use (#185).
     public var hrvRMSSD: Int? {
         guard layout == .sleepVitals, raw[5] > 0 else { return nil }
         return Int(raw[5])
@@ -120,9 +133,79 @@ public struct BulkRecord: Equatable {
     /// ground-truthed 2026-06-15): per-epoch `[7]/8` matches the RingConn app's nightly
     /// average 15.1 and its low/high 14.5–16.1 at the p5–p95 of the asleep epochs. (The
     /// raw field is RR×8; exact divisor ≈8.07, but 8 is the natural 1/8-brpm fixed point.)
+    ///
+    /// ⚠️ Sleep-vitals-scoped like `hrvRMSSD`, and `SleepStaging` forward-fills it (:530).
+    /// The activity-epoch RR is `measuredRespiratoryRate` — sample path only (#185).
     public var respiratoryRate: Double? {
         guard layout == .sleepVitals, raw[7] > 0 else { return nil }
         return Double(raw[7]) / 8.0
+    }
+
+    // MARK: - Measured vitals (#185) — HealthKit sample emission ONLY
+    //
+    // `hrvRMSSD` / `respiratoryRate` above are SLEEP-VITALS-SCOPED, and detection/staging/naps/
+    // stress consume that scope as the ring's "I am measuring sleep" MODE flag. But the ring also
+    // puts a real RMSSD in [5] and a real RR in [7] on 0x12/0x13 ACTIVITY epochs, so those two
+    // accessors discard roughly half of both metrics before they can reach Apple Health.
+    //
+    // The two accessors below answer a DIFFERENT question — "did the ring MEASURE this value on
+    // this epoch, whichever record template carried it?" — and are consumed by `BulkSleep.samples`
+    // and NOTHING else. They are deliberately INTERNAL, not public: the app target physically
+    // cannot reference them, so every sleep-pipeline consumer stays byte-identical by construction.
+    //
+    // 🟢 MEASURED over 6 INDEPENDENT real archives (5 Gen-2/Gen-3 + 1 Gen-2-Air FR04; 3679 distinct
+    // 0x4c records after de-duplicating four contained captures). Matching each activity epoch's [5]
+    // to its nearest sleep-vitals neighbour within 300 s gives a median delta of −1.5…+2.5 ms on
+    // every Gen-2/Gen-3 archive — ordinary epoch-to-epoch RMSSD variation, i.e. the values are REAL.
+    // 🟡 OPEN PROTOCOL QUESTION: the FR04 Gen-2-Air alone runs ≈ −11…−15 ms (the exact median moves
+    // with the neighbour tie-break, the sign and scale do not). Recorded and deliberately NOT
+    // "corrected" — a per-generation offset needs ring-generation knowledge the Kit refuses to carry.
+
+    /// Physiological RMSSD ceiling (ms) for an EMITTED HRV sample. 🟢 MEASURED: the max byte[5] over
+    /// every worn epoch of every archive is exactly 200 (2671 non-zero HRV bytes), so this rejects
+    /// only the never-observed 201…255 byte space and drops 0 of the 1109 samples we ship today.
+    /// A byte-garbage backstop, NOT the motion discriminator — that is the quiet gate below.
+    /// (Bands with teeth were measured: 5...200 would drop 1 shipped sample, 5...150 four,
+    /// 15...200 twenty-eight. 1...200 is the only one that drops nothing.)
+    static let maxPlausibleHRVMs = 200
+
+    /// HRV in ms the ring MEASURED on this epoch, on EITHER record template (#185). Sleep-vitals
+    /// epochs pass through as `hrvRMSSD` does; activity epochs must ADDITIONALLY be QUIET
+    /// (`motionIntensityTailIsZero` — the ring's own "nothing moved" verdict, #184).
+    ///
+    /// WHY the quiet gate, and why ONLY on activity epochs. 🟢 MEASURED, pooled over the deduped
+    /// union: QUIET activity epochs run p50 58 / p90 86 / p99 111 / max 142 — statistically the same
+    /// population as sleep-vitals (p50 60 / p90 88 / p99 119) — while MOVING activity epochs run
+    /// p90 98 / p99 196 / max 200. A 200 ms RMSSD on a moving awake wrist is PPG artifact. Applying
+    /// the SAME gate to sleep-vitals epochs would DROP 382 of the 1109 HRV samples we ship today
+    /// (34.4 %), so the asymmetry is deliberate.
+    ///
+    /// ⚠️ FOR `BulkSleep.samples` ONLY. Detection, staging, naps and `SleepStress` keep using
+    /// `hrvRMSSD`, whose sleep-vitals scope is the signal they actually consume.
+    var measuredHRVRMSSD: Int? {
+        guard layout != .idle, raw[5] > 0, Int(raw[5]) <= Self.maxPlausibleHRVMs else { return nil }
+        guard layout == .sleepVitals || motionIntensityTailIsZero else { return nil }
+        return Int(raw[5])
+    }
+
+    /// Plausible adult respiratory-rate band (brpm) for an EMITTED sample. 🟢 MEASURED: every
+    /// byte[7] > 0 epoch in the corpus (2511, all layouts, all generations) has a raw value in
+    /// 101…141 → 12.625…17.625 brpm, so this drops 0 of the 1084 samples we ship today and rejects
+    /// only raw 1…31 and 241…255 — sentinel / stuck-byte space. The ceiling is REACHABLE inside a
+    /// UInt8 (255/8 = 31.875), so unlike a 40 brpm ceiling it is a real, testable clamp.
+    static let plausibleRespiratoryRate: ClosedRange<Double> = 4.0 ... 30.0
+
+    /// RR in brpm the ring MEASURED on this epoch, on EITHER record template (#185): [7]/8 on ANY
+    /// worn epoch, band-guarded. 🟢 MEASURED: motion does NOT corrupt this field — sleep-vitals
+    /// epochs run p50 15.125 / p99 16.875 / max 17.625 and activity epochs p50 15.25 / p99 17.0 /
+    /// max 17.625 — so unlike HRV there is NO quiet gate. The idle template carries [7] == 0 by
+    /// construction (0 exceptions in the corpus), so `layout != .idle` is belt-and-braces.
+    ///
+    /// ⚠️ FOR `BulkSleep.samples` ONLY — `SleepStaging` keeps using `respiratoryRate` (#185).
+    var measuredRespiratoryRate: Double? {
+        guard layout != .idle, raw[7] > 0 else { return nil }
+        let rr = Double(raw[7]) / 8.0
+        return Self.plausibleRespiratoryRate.contains(rr) ? rr : nil
     }
 
     /// `[10:15]` — 5 per-30 s motion/activity counts (🟢 role). `01` baseline = still.
@@ -448,6 +531,11 @@ public enum BulkSleep {
     /// signal `detectFromMotion`'s sleep-vitals rescue uses to tell a moving-but-ASLEEP morning (ring
     /// still measuring sleep vitals at cadence) from true wake (the sleep-vitals stream stops). Built
     /// from the SAME records as the motion/HR timelines, so no extra channel is threaded.
+    ///
+    /// ⚠️ MUST keep using the strict `hrvRMSSD`, never `measuredHRVRMSSD`: this timeline IS the
+    /// "ring is measuring sleep" evidence `sleepVitalsRescue` extends the night on. Quiet activity
+    /// epochs carry HRV on 745 of 3679 corpus records, so feeding them here would extend nights
+    /// through the awake evening/morning (#185 constraint 1).
     public static func sleepVitalTimeline(from records: [BulkRecord],
                                           epoch: Int = Command.syncEpoch) -> [Date] {
         records.compactMap { $0.hrvRMSSD != nil ? $0.date(epoch: epoch) : nil }
@@ -611,11 +699,14 @@ public enum BulkSleep {
                               epoch: epoch, baseline: baseline)
     }
 
-    /// HR / HRV / SpO2 / RR samples from worn epochs, with device timestamps. Iterates ALL
-    /// records (not just sleep-vitals) so ALL-DAY HR from activity/awake epochs (byte[4], 🟢) is
-    /// emitted too — the per-field accessors gate the rest: HRV/SpO2/RR stay sleep-vitals-only and
-    /// the idle template yields nothing. SpO2 is a 0…1 fraction (HealthKit oxygenSaturation); HRV is
-    /// the ring's RMSSD written to the SDNN type (unit-compatible; see mapping).
+    /// HR / HRV / SpO2 / RR samples from worn epochs, with device timestamps. Iterates ALL records
+    /// (not just sleep-vitals): ALL-DAY HR rides byte[4] on activity epochs (🟢), and since #185 so
+    /// do HRV (byte[5], QUIET epochs only) and RR (byte[7]) — via `measuredHRVRMSSD` /
+    /// `measuredRespiratoryRate`, which exist so the recovery reaches HealthKit WITHOUT reaching
+    /// sleep detection/staging/naps/stress. SpO2 stays sleep-vitals-only and always will: byte[8] IS
+    /// the 0x12/0x13 activity tag, so there is no SpO2 there to recover. The idle template still
+    /// yields nothing. SpO2 is a 0…1 fraction (HealthKit oxygenSaturation); HRV is the ring's RMSSD
+    /// written to the SDNN type (unit-compatible; see HEALTHKIT_MAPPING.md).
     public static func samples(from records: [BulkRecord],
                                epoch: Int = Command.syncEpoch) -> [QuantitySample] {
         var out: [QuantitySample] = []
@@ -624,13 +715,13 @@ public enum BulkSleep {
             if let hr = r.heartRate {
                 out.append(QuantitySample(kind: .heartRate, start: t, value: Double(hr)))
             }
-            if let hrv = r.hrvRMSSD {
+            if let hrv = r.measuredHRVRMSSD {
                 out.append(QuantitySample(kind: .hrvSDNN, start: t, value: Double(hrv)))
             }
-            if let spo2 = r.spo2Percent {
+            if let spo2 = r.spo2Percent {                    // UNCHANGED (#185 constraint 2)
                 out.append(QuantitySample(kind: .spo2, start: t, value: Double(spo2) / 100.0))
             }
-            if let rr = r.respiratoryRate {
+            if let rr = r.measuredRespiratoryRate {
                 out.append(QuantitySample(kind: .respiratoryRate, start: t, value: rr))
             }
         }

@@ -83,19 +83,101 @@ final class BulkSleepTests: XCTestCase {
         // the adjacent sleep epoch's 84). HRV/SpO2 stay sleep-vitals-only (motion corrupts them and
         // [8] is the activity tag, not SpO2), so only HR is surfaced for activity epochs.
         XCTAssertEqual(recs[0].heartRate, 85, "activity epoch exposes all-day HR at [4]")
-        XCTAssertNil(recs[0].hrvRMSSD, "HRV stays sleep-vitals-only (unreliable under motion)")
+        XCTAssertNil(recs[0].hrvRMSSD, "the STRICT accessor stays sleep-vitals-only (#185)")
         XCTAssertNil(recs[0].spo2Percent, "no SpO2 on an activity epoch ([8] is the activity tag)")
     }
 
-    func testSamplesFromActivityEpochEmitsAllDayHROnly() {
-        // ALL-DAY HR (#45/#38): an activity/awake epoch emits HR (byte[4]) but NOT HRV/SpO2/RR —
-        // so daytime + workout HR now reaches the store, while motion-corrupted HRV/SpO2 don't.
+    // MARK: - #185 — HRV/RR recovered from activity epochs, sample path ONLY
+
+    func testSamplesFromMovingActivityEpochEmitsHRAndRRButNotHRV() {
+        // #185: an activity/awake epoch emits HR (byte[4]) AND respiratory rate (byte[7]/8), but its
+        // HRV (byte[5]=33) is suppressed because [15:20] is non-zero — the ring says this epoch
+        // MOVED, and the moving pool is where the 146–200 ms artifact tail lives.
         let r = BulkRecord(hex("0c22a16b55210a7d120a01010101010000040240040000"))!
         XCTAssertEqual(r.layout, .activity)
+        XCTAssertFalse(r.motionIntensityTailIsZero, "fixture is a MOVING activity epoch")
         let s = BulkSleep.samples(from: [r])
-        XCTAssertEqual(s.count, 1, "activity epoch emits HR only")
-        XCTAssertEqual(s.first?.kind, .heartRate)
-        XCTAssertEqual(s.first?.value, 85)
+        XCTAssertEqual(Set(s.map(\.kind)), [.heartRate, .respiratoryRate])
+        XCTAssertEqual(s.first(where: { $0.kind == .heartRate })?.value, 85)
+        XCTAssertEqual(s.first(where: { $0.kind == .respiratoryRate })?.value, 15.625)
+        XCTAssertNil(r.hrvRMSSD, "the strict accessor is unchanged")
+        XCTAssertNil(r.measuredHRVRMSSD, "moving activity epoch -> HRV suppressed")
+        XCTAssertNil(r.spo2Percent, "byte[8] is the activity tag — never SpO2")
+    }
+
+    /// Same epoch with a ZEROED [15:20] tail — the ring's own "nothing moved" verdict — so the
+    /// recovered HRV is admitted.
+    func testQuietActivityEpochRecoversHRVAndRR() {
+        let r = BulkRecord(hex("0c22a16b55210a7d120a01010101010000000000040000"))!
+        XCTAssertEqual(r.layout, .activity, "must NOT be the idle template ([4]=0x55, not 0x05)")
+        XCTAssertTrue(r.motionIntensityTailIsZero)
+        XCTAssertNil(r.hrvRMSSD, "strict accessor unchanged — detection/staging see nothing new")
+        XCTAssertNil(r.respiratoryRate, "strict accessor unchanged")
+        XCTAssertEqual(r.measuredHRVRMSSD, 33)
+        XCTAssertEqual(r.measuredRespiratoryRate, 15.625)
+        XCTAssertEqual(Set(BulkSleep.samples(from: [r]).map(\.kind)),
+                       [.heartRate, .hrvSDNN, .respiratoryRate])
+    }
+
+    /// THE ISOLATION PIN (#185 constraint 1). A recovered epoch must be invisible to every
+    /// sleep-pipeline entry point.
+    func testRecoveredVitalsAreInvisibleToSleepPipeline() {
+        let quiet = BulkRecord(hex("0c22a16b55210a7d120a01010101010000000000040000"))!
+        XCTAssertTrue(BulkSleep.sleepVitalTimeline(from: [quiet]).isEmpty,
+                      "recovered HRV must never seed sleepVitalsRescue")
+        XCTAssertNil(SleepStress.overnightScore(records: [quiet]),
+                     "recovered HRV must never enter the stress median")
+        XCTAssertTrue(SleepStress.stateDurations(records: [quiet]).isEmpty)
+    }
+
+    /// Guard boundaries, both sides, both metrics. Constants justified in the accessor docs.
+    func testMeasuredVitalGuardBoundaries() {
+        func quiet(hrv: UInt8, rr: UInt8) -> BulkRecord {
+            var b = hex("0c22a16b55210a7d120a01010101010000000000040000")
+            b[5] = hrv; b[7] = rr
+            return BulkRecord(b)!
+        }
+        XCTAssertEqual(quiet(hrv: 200, rr: 125).measuredHRVRMSSD, 200, "200 ms is the corpus max — kept")
+        XCTAssertNil(quiet(hrv: 201, rr: 125).measuredHRVRMSSD, "201 ms is byte garbage — dropped")
+        XCTAssertNil(quiet(hrv: 0, rr: 125).measuredHRVRMSSD, "HRV byte 0 = no measurement")
+        XCTAssertEqual(quiet(hrv: 33, rr: 32).measuredRespiratoryRate, 4.0,   "4.0 brpm floor — kept")
+        XCTAssertNil(quiet(hrv: 33, rr: 31).measuredRespiratoryRate,          "3.875 brpm — dropped")
+        XCTAssertEqual(quiet(hrv: 33, rr: 240).measuredRespiratoryRate, 30.0, "30.0 brpm ceiling — kept")
+        XCTAssertNil(quiet(hrv: 33, rr: 241).measuredRespiratoryRate,         "30.125 brpm — dropped")
+        XCTAssertNil(quiet(hrv: 33, rr: 0).measuredRespiratoryRate,           "RR byte 0 = no measurement")
+    }
+
+    /// The idle/unworn template must stay silent on BOTH new accessors even if its payload bytes
+    /// were non-zero — `layout != .idle` is the first guard on each.
+    func testIdleTemplateYieldsNoMeasuredVitals() {
+        let idleRec = "0c0000000500" + "0c0001" + "0a" + "0101010101" + "00000000000000" + "00"
+        let r = BulkRecord(hex(idleRec))!
+        XCTAssertEqual(r.layout, .idle)
+        XCTAssertNil(r.measuredHRVRMSSD)
+        XCTAssertNil(r.measuredRespiratoryRate)
+        XCTAssertTrue(BulkSleep.samples(from: [r]).isEmpty, "idle epoch emits nothing (unchanged)")
+    }
+
+    /// The band's ONE deliberate divergence, stated out loud (measured 0 occurrences in 1109
+    /// shipped sleep-vitals HRV samples and 1084 RR samples): a sleep-vitals epoch with byte[5]
+    /// in 201…255 or byte[7] in 1…31 is counted by STAGING but dropped from the HealthKit sample.
+    func testSleepVitalsBandDivergenceIsDeliberate() {
+        var b = hex("0c22d5bf444d057a620a01010101012aa0000090000004"); b[5] = 255
+        let r = BulkRecord(b)!
+        XCTAssertEqual(r.layout, .sleepVitals)
+        XCTAssertEqual(r.hrvRMSSD, 255, "staging still sees it — its input is provably unchanged")
+        XCTAssertNil(r.measuredHRVRMSSD, "but 255 ms never becomes a HealthKit sample")
+    }
+
+    /// A MOVING sleep-vitals epoch keeps emitting HRV — the quiet gate is activity-only. Measured:
+    /// a symmetric gate would drop 382 of the 1109 HRV samples we ship today (34.4 %).
+    func testMovingSleepVitalsEpochStillEmitsHRV() {
+        var b = hex("0c22d5bf444d057a620a01010101012aa0000090000004")
+        b[15] = 0x40                                   // non-zero intensity tail on a SLEEP epoch
+        let r = BulkRecord(b)!
+        XCTAssertEqual(r.layout, .sleepVitals)
+        XCTAssertFalse(r.motionIntensityTailIsZero)
+        XCTAssertEqual(r.measuredHRVRMSSD, 77, "quiet gate must NOT apply to sleep-vitals epochs")
     }
 
     func testSamplesFromSleepVitals() {

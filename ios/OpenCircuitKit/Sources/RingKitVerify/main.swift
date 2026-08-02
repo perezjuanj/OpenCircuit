@@ -328,6 +328,22 @@ let idleRec = BulkRecord(hex("0c099dbf05000c00120a01010101010000000000000000"))!
 check(idleRec.layout == .idle && BulkSleep.samples(from: [idleRec]).isEmpty,
       "idle template -> no samples")
 
+// #185: HRV/RR ARE carried on 0x12 activity epochs. HRV is admitted only when the ring's own
+// [15:20] intensity tail says the epoch was QUIET (the moving pool is where the 146–200 ms PPG
+// artifact tail lives); RR is motion-insensitive and needs no such gate. `measuredHRVRMSSD` /
+// `measuredRespiratoryRate` are internal, so assert through the PUBLIC `samples` surface — which
+// is what actually ships — plus the strict accessors, which must be untouched on both.
+let quietAct = BulkRecord(hex("0c22a16b55210a7d120a01010101010000000000040000"))!
+let movingAct = BulkRecord(hex("0c22a16b55210a7d120a01010101010000040240040000"))!
+let qs = Set(BulkSleep.samples(from: [quietAct]).map(\.kind))
+let ms = Set(BulkSleep.samples(from: [movingAct]).map(\.kind))
+check(qs == [.heartRate, .hrvSDNN, .respiratoryRate], "#185: QUIET activity epoch -> HR + HRV + RR")
+check(ms == [.heartRate, .respiratoryRate],           "#185: MOVING activity epoch -> HR + RR, HRV suppressed")
+check(quietAct.hrvRMSSD == nil && movingAct.hrvRMSSD == nil,
+      "#185: the strict sleep-vitals accessor is UNCHANGED on both")
+check(BulkSleep.sleepVitalTimeline(from: [quietAct, movingAct]).isEmpty,
+      "#185: recovered HRV never seeds sleep detection")
+
 // Motion-channel sleep detection: active -> still(9h) -> active finds the night.
 func bulkRec(_ c: UInt32, motion: UInt8, sub: UInt8) -> BulkRecord {
     var b = [UInt8](repeating: 0, count: 23)
