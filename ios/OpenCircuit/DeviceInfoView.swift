@@ -28,6 +28,13 @@ struct DeviceInfoView: View {
 
     private var info: FirmwareInfo { session?.firmwareInfo ?? FirmwareInfo() }
 
+    /// True only for a POSITIVELY identified Gen 2 Air, the one model RingConn doesn't ship the
+    /// sleep-apnea assessment on (#186). Deliberately fails OPEN: `generation` is `.unknown` until
+    /// the DIS Firmware-Revision read lands (and while `session` is nil), and every other case —
+    /// Gen 1/2/3, unknown — keeps the normal toggle, so the unavailable state can never flash
+    /// during connection.
+    private var sleepApneaUnavailable: Bool { info.generation == .gen2Air }
+
     var body: some View {
         List {
             // FW-pin warning banner — only when a version IS known and it mismatches.
@@ -94,21 +101,44 @@ struct DeviceInfoView: View {
 
             // Sleep-apnea assessment (#91). Arms the ring's dense overnight blood-oxygen recording;
             // the morning sync drains it and the results land on the Sleep card. Experimental.
+            //
+            // Gen 2 Air (#186): RingConn does NOT ship this feature on the Air (vendor comparison
+            // table — Sleep Apnea Pattern: Gen 3 yes / Gen 2 yes / Gen 2 Air no). That's a PRODUCT
+            // removal, not a sensor one: the Air still streams 0x47 PPG and real SpO₂, so we say
+            // "not available" out loud instead of silently hiding the row, and nothing else on the
+            // Air is gated. UI-layer only — OpenCircuitKit stays device-agnostic.
             Section {
-                Toggle(isOn: Binding(
-                    get: { session?.osaAssessmentArmed ?? false },
-                    set: { session?.setOSAAssessment(armed: $0) }
-                )) {
-                    Label("Sleep apnea assessment", systemImage: "lungs.fill")
+                if sleepApneaUnavailable {
+                    HStack {
+                        Label("Sleep apnea assessment", systemImage: "lungs.fill")
+                        Spacer()
+                        Text("Not available")
+                    }
+                    .foregroundStyle(.secondary)
+                    .accessibilityElement(children: .combine)
+                } else {
+                    Toggle(isOn: Binding(
+                        get: { session?.osaAssessmentArmed ?? false },
+                        set: { session?.setOSAAssessment(armed: $0) }
+                    )) {
+                        Label("Sleep apnea assessment", systemImage: "lungs.fill")
+                    }
+                    .disabled(session?.ready != true)
                 }
-                .disabled(session?.ready != true)
             } header: {
                 Text("Sleep apnea (experimental)")
             } footer: {
-                Text("Turn this on before bed and wear the ring overnight — it records a dense "
-                     + "blood-oxygen reading. Open the app in the morning to sync, and the results appear "
-                     + "on the Sleep card. Charge the ring above ~30% first so it lasts the night. This is "
-                     + "an experimental estimate, not a medical diagnosis.")
+                if sleepApneaUnavailable {
+                    Text("Not available on RingConn Gen 2 Air. RingConn doesn't offer the sleep-apnea "
+                         + "assessment on this model, so the ring never records the overnight burst — "
+                         + "this isn't something OpenCircuit can turn on. Your ring's blood oxygen, "
+                         + "heart rate, and sleep tracking all work normally.")
+                } else {
+                    Text("Turn this on before bed and wear the ring overnight — it records a dense "
+                         + "blood-oxygen reading. Open the app in the morning to sync, and the results appear "
+                         + "on the Sleep card. Charge the ring above ~30% first so it lasts the night. This is "
+                         + "an experimental estimate, not a medical diagnosis.")
+                }
             }
 
             Section {

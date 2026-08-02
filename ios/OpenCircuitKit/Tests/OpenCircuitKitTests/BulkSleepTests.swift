@@ -138,7 +138,7 @@ final class BulkSleepTests: XCTestCase {
         XCTAssertEqual(tl[0].movement, 1, "motion baseline 01 = still")
     }
 
-    func testSleepDetectionFindsNight() {
+    func testSleepDetectionFindsNight() throws {
         // 20 active epochs, then ~9 h still (216 epochs @150 s), then 20 active.
         var recs: [BulkRecord] = []
         var c: UInt32 = 0x0c220000
@@ -148,15 +148,13 @@ final class BulkSleepTests: XCTestCase {
         let wake = c
         for i in 0..<20 { recs.append(rec(c, motion: activeMotion(i), sub: 0x12)); c += 150 }
 
-        let block = BulkSleep.mainSleep(from: recs)
-        XCTAssertNotNil(block)
-        XCTAssertEqual(block?.activity, .sleep)
+        let block = try XCTUnwrap(BulkSleep.mainSleep(from: recs))
+        XCTAssertEqual(block.activity, .sleep)
         // ~9 h block, boundaries near onset/wake (within the 15-min merge window).
-        XCTAssertEqual(block!.duration, 216 * 150, accuracy: 30 * 60)
+        XCTAssertEqual(block.duration, 216 * 150, accuracy: 30 * 60)
         let segs = BulkSleep.sleepSegments(from: recs)
-        XCTAssertTrue(segs.contains { $0.stage == .inBed }, "emits an inBed span")
         XCTAssertTrue(segs.contains { $0.stage == .asleepCore }, "emits asleep core")
-        let inBed = segs.first { $0.stage == .inBed }!
+        let inBed = try XCTUnwrap(segs.first { $0.stage == .inBed }, "emits an inBed span")
         XCTAssertEqual(inBed.start.timeIntervalSince1970,
                        Double(Int(onset) + Command.syncEpoch), accuracy: 20 * 60)
         XCTAssertEqual(inBed.end.timeIntervalSince1970,

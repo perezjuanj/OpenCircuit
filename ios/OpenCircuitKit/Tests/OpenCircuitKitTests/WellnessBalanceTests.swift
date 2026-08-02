@@ -14,21 +14,19 @@ final class WellnessBalanceTests: XCTestCase {
         XCTAssertEqual(WellnessBalance.Tier.of(59), .needsImprovement)
     }
 
-    func testGoodDayScoresHigh() {
-        let r = WellnessBalance.score(.init(sleepScore: 90, overnightStress: 20,
-                                            vitalsStatus: .normal, activityScore: 85))
-        XCTAssertNotNil(r)
-        XCTAssertGreaterThanOrEqual(r!.score, 85)
-        XCTAssertEqual(r!.tier, .excellent)
-        XCTAssertEqual(r!.factors.count, 4)
+    func testGoodDayScoresHigh() throws {
+        let r = try XCTUnwrap(WellnessBalance.score(.init(sleepScore: 90, overnightStress: 20,
+                                                          vitalsStatus: .normal, activityScore: 85)))
+        XCTAssertGreaterThanOrEqual(r.score, 85)
+        XCTAssertEqual(r.tier, .excellent)
+        XCTAssertEqual(r.factors.count, 4)
     }
 
-    func testPoorDayScoresLow() {
-        let r = WellnessBalance.score(.init(sleepScore: 45, overnightStress: 85,
-                                            vitalsStatus: .anomaly, activityScore: 30))
-        XCTAssertNotNil(r)
-        XCTAssertLessThan(r!.score, 60)
-        XCTAssertEqual(r!.tier, .needsImprovement)
+    func testPoorDayScoresLow() throws {
+        let r = try XCTUnwrap(WellnessBalance.score(.init(sleepScore: 45, overnightStress: 85,
+                                                          vitalsStatus: .anomaly, activityScore: 30)))
+        XCTAssertLessThan(r.score, 60)
+        XCTAssertEqual(r.tier, .needsImprovement)
     }
 
     func testGoodDayOutScoresPoorDay() {
@@ -69,14 +67,13 @@ final class WellnessBalanceTests: XCTestCase {
         XCTAssertEqual(WellnessBalance.vitalsFactor(.anomaly), 0.0)
     }
 
-    func testMissingFactorsAreRenormalised() {
+    func testMissingFactorsAreRenormalised() throws {
         // Only sleep present → the score equals the sleep sub-score (renormalised to 1 factor).
-        let r = WellnessBalance.score(.init(sleepScore: 80))
-        XCTAssertNotNil(r)
-        XCTAssertEqual(r!.factors.count, 1)
-        XCTAssertEqual(r!.score, 80)
+        let r = try XCTUnwrap(WellnessBalance.score(.init(sleepScore: 80)))
+        XCTAssertEqual(r.factors.count, 1)
+        XCTAssertEqual(r.score, 80)
         // Sleep + activity only → weighted mean over just those two.
-        let r2 = WellnessBalance.score(.init(sleepScore: 90, activityScore: 60))!
+        let r2 = try XCTUnwrap(WellnessBalance.score(.init(sleepScore: 90, activityScore: 60)))
         XCTAssertEqual(r2.factors.count, 2)
         // 0.40*0.9 + 0.15*0.6 = 0.45 over 0.55 → 0.8181… → 82
         XCTAssertEqual(r2.score, 82)

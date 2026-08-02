@@ -39,12 +39,11 @@ final class CyclePredictorTests: XCTestCase {
 
     // MARK: cycleStats — interval math
 
-    func testCycleStats_SingleInterval_28Days() {
+    func testCycleStats_SingleInterval_28Days() throws {
         let periods = [period(startDaysAgo: 28), period(startDaysAgo: 0)]
-        let stats = CyclePredictor.cycleStats(from: periods)
-        XCTAssertNotNil(stats)
-        XCTAssertEqual(stats!.avgCycleLengthDays, 28, accuracy: 0.01)
-        XCTAssertEqual(stats!.sampleCount, 1)
+        let stats = try XCTUnwrap(CyclePredictor.cycleStats(from: periods))
+        XCTAssertEqual(stats.avgCycleLengthDays, 28, accuracy: 0.01)
+        XCTAssertEqual(stats.sampleCount, 1)
     }
 
     func testCycleStats_MultipleIntervals_Average() {
@@ -98,13 +97,13 @@ final class CyclePredictorTests: XCTestCase {
 
     // MARK: cycleStats — period duration
 
-    func testCycleStats_AvgDurationFromCompletedPeriods() {
+    func testCycleStats_AvgDurationFromCompletedPeriods() throws {
         // One completed period (5 days), one ongoing
         let p1 = CyclePredictor.PeriodEntry(start: daysAgo(30), end: daysAgo(25))
         let p2 = CyclePredictor.PeriodEntry(start: daysAgo(0))
-        let stats = CyclePredictor.cycleStats(from: [p1, p2])!
-        XCTAssertNotNil(stats.avgPeriodDurationDays)
-        XCTAssertEqual(stats.avgPeriodDurationDays!, 5, accuracy: 0.1)
+        let stats = try XCTUnwrap(CyclePredictor.cycleStats(from: [p1, p2]))
+        let avgDuration = try XCTUnwrap(stats.avgPeriodDurationDays)
+        XCTAssertEqual(avgDuration, 5, accuracy: 0.1)
     }
 
     func testCycleStats_NilDurationWhenNoneCompleted() {
