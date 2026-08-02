@@ -145,6 +145,22 @@ public struct BulkRecord: Equatable {
         return m.allSatisfy { $0 == m.first }
     }
 
+    /// True when the five 30-s sub-samples all sit within `motionStillThreshold` of one another —
+    /// the epoch on its OWN cannot express movement. This is precisely the component of the motion
+    /// channel that `ActivityPeriod.motionAboveLocalFloor` CANNOT remove: the rolling floor subtracts
+    /// a per-window LEVEL, so a flat plateau at any level cancels (Gen-2 `01`, Gen-3 `0f`, and the
+    /// drifting `16→24→39` plateaus alike), but a step INSIDE one epoch survives de-flooring intact.
+    /// `motionIsPlaceholder` (all five EQUAL) is the zero-spread special case of this.
+    var motionResolvesStillness: Bool {
+        guard layout != .idle else { return false }
+        let m = raw[10..<15]
+        guard let lo = m.min(), let hi = m.max() else { return false }
+        return Float(hi - lo) <= ActivityPeriod.motionStillThreshold
+    }
+
+    /// True when `[15:20]` is all zero — the ring's OWN "nothing moved in this epoch" verdict.
+    var motionIntensityTailIsZero: Bool { raw[15..<20].allSatisfy { $0 == 0 } }
+
     /// Confidence / signal quality, `[6]` (🟢 named, PROTOCOL.md §5.3 — range ~0...12,
     /// not yet bounded precisely). Decoded but NOT currently consumed by any analytic —
     /// available for the supervised sleep-stage fitter (`desktop/ringconn_sleep_fit.py`)
@@ -167,9 +183,9 @@ public struct BulkRecord: Equatable {
     /// `[15:20]` — the intensity half of `activityCounts`. This is NOT a second step counter or a
     /// separately timed five-sample motion channel, but it remains zero while still and carries
     /// measured activity when some firmware sessions replace `[10:15]` with a constant filler.
-    /// Consumers may use it only through `BulkSleep.usesMotionIntensityFallback`, which requires the
-    /// primary channel to be structurally absent across a run; normal primary-motion nights never mix
-    /// the two signals.
+    /// Consumers may use it only through `BulkSleep.motionSource`, which requires the primary channel
+    /// to be structurally ABSENT (a constant filler) or structurally UNABLE TO RESOLVE STILLNESS
+    /// (#184) across a run; normal primary-motion nights never mix the two signals.
     public var motionIntensityTail: [UInt8] { Array(raw[15..<20]) }
 }
 
@@ -221,14 +237,21 @@ public enum BulkSleep {
 
     /// Expand 0x4c records into a per-30 s motion timeline (5 sub-samples per
     /// 150 s epoch from the [10:15] channel) for `SleepDetection.detectFromMotion`.
-    /// Motion counts are passed through directly (baseline `01` = still); callers
-    /// should scope `records` to a worn period (charging data reads as still too).
+    /// Motion counts are passed through directly (baseline `01` = still) unless `motionSource`
+    /// rejects the primary channel for this run; callers should scope `records` to a worn period
+    /// (charging data reads as still too).
     public static func motionTimeline(from records: [BulkRecord],
                                       epoch: Int = Command.syncEpoch) -> [MotionSample] {
-        let useIntensityFallback = usesMotionIntensityFallback(records)
-        let fallbackMagnitudes = useIntensityFallback
-            ? motionIntensityFallbackMagnitudes(records)
-            : []
+        let source = motionSource(records)
+        let fallbackMagnitudes: [Float]
+        let useIntensityFallback: Bool
+        if case .intensityTail(let degenerate) = source {
+            useIntensityFallback = true
+            fallbackMagnitudes = motionIntensityFallbackMagnitudes(records, degenerate: degenerate)
+        } else {
+            useIntensityFallback = false
+            fallbackMagnitudes = []
+        }
         var out: [MotionSample] = []
         out.reserveCapacity(records.count * 5)
         for (recordIndex, r) in records.enumerated() {
@@ -246,22 +269,112 @@ public enum BulkSleep {
         return out
     }
 
-    /// True only for the captured failure shape where the normal five-byte motion field is a
-    /// constant filler on EVERY worn epoch while the intensity half still reports repeated activity.
-    /// Requiring a run (not one record) plus at least two non-zero tail epochs keeps ordinary still
-    /// nights and isolated/noisy records byte-identical to the primary-motion path.
-    static func usesMotionIntensityFallback(_ records: [BulkRecord]) -> Bool {
+    /// Which channel a run's motion is read from. `.intensityTail` carries WHY the primary was
+    /// rejected, because the two reasons need different tail→magnitude mappings (see
+    /// `motionIntensityFallbackMagnitudes`).
+    enum MotionSource: Equatable {
+        /// `[10:15]`, the normal path. Every input that reaches it is byte-identical to pre-#184.
+        case primary
+        /// `[15:20]`. `degenerate == false` is the original 2026-07-12 constant-filler shape;
+        /// `degenerate == true` is the FR04.009 non-expressive-primary shape (#184).
+        case intensityTail(degenerate: Bool)
+    }
+
+    /// Pick the motion channel for a run. The primary `[10:15]` channel is unusable in TWO
+    /// structurally distinct ways, and either one falls through to the `[15:20]` intensity tail:
+    ///   • CONSTANT FILLER — every worn epoch is a constant run (`motionIsPlaceholder`); the channel
+    ///     carries no measurement at all. 🟢 the 2026-07-12 Gen-3 capture.
+    ///   • NON-EXPRESSIVE — the channel varies, but never in a way that can read still, and its
+    ///     variation is a fixed intra-epoch template rather than movement (`primaryMotionIsDegenerate`).
+    ///     🟢 FR04.009 (#184): a fixed two-level step (slots 0–1 ≈ 27.6, slots 2–4 ≈ 34.9 on EVERY
+    ///     epoch) plus ±2 noise, which no cross-sample rolling floor can cancel.
+    /// The two are mutually exclusive by construction: a constant run has zero intra-epoch spread, so
+    /// it always `motionResolvesStillness` and can never be degenerate. Either way the run must ALSO
+    /// show at least two non-zero tail epochs, exactly as before, so a genuinely motionless archive
+    /// keeps the primary path.
+    static func motionSource(_ records: [BulkRecord]) -> MotionSource {
         let worn = records.filter { $0.layout != .idle }
-        guard worn.count >= 4,
-              !worn.contains(where: { !$0.motionIsPlaceholder }) else { return false }
-        return worn.lazy.filter { $0.motionIntensityTail.contains(where: { $0 > 0 }) }.prefix(2).count == 2
+        guard worn.count >= 4 else { return .primary }
+        let constantFiller = !worn.contains(where: { !$0.motionIsPlaceholder })
+        let degenerate = constantFiller ? false : primaryMotionIsDegenerate(worn)
+        guard constantFiller || degenerate else { return .primary }
+        guard worn.lazy.filter({ $0.motionIntensityTail.contains(where: { $0 > 0 }) }).prefix(2).count == 2
+        else { return .primary }
+        return .intensityTail(degenerate: degenerate)
+    }
+
+    /// True when this run reads motion off the `[15:20]` intensity tail instead of `[10:15]`.
+    static func usesMotionIntensityFallback(_ records: [BulkRecord]) -> Bool {
+        if case .intensityTail = motionSource(records) { return true }
+        return false
+    }
+
+    /// Minimum all-zero-tail ("the ring itself says nothing moved") epochs before the
+    /// non-expressive-primary test will judge a run. 24 × `BulkRecord.epochSeconds` (150 s) = 1 h =
+    /// `ActivityPeriod.minSleepDuration`: below that there is no stageable night to rescue and the
+    /// statistic is too thin to trust.
+    static let degenerateMinQuietEpochs = 24
+
+    /// At most this share of those epochs may resolve stillness on the primary channel. 🟢 MEASURED
+    /// EXHAUSTIVELY over every contiguous window of 9 real captures (270 029 evaluable windows):
+    /// FR04.009 0.000–0.269, real Gen-2/Gen-3 0.792–1.000. 0.50 sits between, ≥0.23 clear of both.
+    static let degenerateMaxQuietStillFraction = 0.50
+
+    /// A sub-sample slot pair must keep the SAME ordering on at least this share of those epochs.
+    /// Real wrist motion has no reason to prefer the 3rd–5th 30-s slot of every 2.5-min epoch, so a
+    /// persistent ordering is instrumentation, not movement. 🟢 MEASURED over the same windows:
+    /// FR04.009 0.833–1.000; real Gen-2/Gen-3 never exceeds 0.167.
+    static let degenerateMinSlotOrderFraction = 0.75
+
+    /// Strength of a fixed intra-epoch template: the largest share of `epochs` on which one ordered
+    /// slot pair keeps the same ordering. ≈0.5 for independent noise, 0 for constant runs (every
+    /// comparison ties), ≈1 for a fixed step. O(10 × n), no allocation.
+    static func slotOrderConsistency(_ epochs: [BulkRecord]) -> Double {
+        guard !epochs.isEmpty else { return 0 }
+        var best = 0
+        for j in 0 ..< 4 {
+            for k in (j + 1) ..< 5 {
+                var less = 0, greater = 0
+                for r in epochs {
+                    let a = r.raw[10 + j], b = r.raw[10 + k]
+                    if a < b { less += 1 } else if b < a { greater += 1 }
+                }
+                best = max(best, max(less, greater))
+            }
+        }
+        return Double(best) / Double(epochs.count)
+    }
+
+    /// True when the primary `[10:15]` channel is structurally unable to express stillness on this
+    /// run, so `motionAboveLocalFloor` can never de-floor it to still and `detect()` can never reach
+    /// `gravityStillFraction` — the #184 blank-card shape. Decided entirely from the run's OWN
+    /// distribution, never a device label or firmware string (the Kit is generation-agnostic by
+    /// design, FirmwareInfo.swift:12), by the same logic that let the Gen-3 rolling floor cancel a
+    /// plateau at any level.
+    ///
+    /// The test CONDITIONS on the ring's own verdict: look only at epochs whose `[15:20]` intensity
+    /// tail is all zero — i.e. epochs the ring itself says had no movement — and ask whether the
+    /// primary channel agrees. On a healthy channel it always does (a zero-tail epoch IS a flat
+    /// epoch). Two gates must both hold:
+    ///   (a) fewer than `degenerateMaxQuietStillFraction` of those epochs resolve stillness — the
+    ///       primary refuses to read still even where the ring says nothing moved; and
+    ///   (b) the residual is a FIXED template: some slot pair keeps the same ordering on at least
+    ///       `degenerateMinSlotOrderFraction` of them.
+    /// Each gate separates the measured populations on its own; together they are defence in depth.
+    static func primaryMotionIsDegenerate(_ worn: [BulkRecord]) -> Bool {
+        let quiet = worn.filter(\.motionIntensityTailIsZero)
+        guard quiet.count >= degenerateMinQuietEpochs else { return false }
+        let stillCount = quiet.filter(\.motionResolvesStillness).count
+        guard Double(stillCount) < Double(quiet.count) * degenerateMaxQuietStillFraction else { return false }
+        return slotOrderConsistency(quiet) >= degenerateMinSlotOrderFraction
     }
 
     /// One magnitude per epoch using the same run-level signal selection as `motionTimeline`.
     /// The staging model subtracts its rolling local floor afterward, exactly as on primary motion.
     static func motionMagnitudes(from records: [BulkRecord]) -> [Float] {
-        let useIntensityFallback = usesMotionIntensityFallback(records)
-        if useIntensityFallback { return motionIntensityFallbackMagnitudes(records) }
+        if case .intensityTail(let degenerate) = motionSource(records) {
+            return motionIntensityFallbackMagnitudes(records, degenerate: degenerate)
+        }
         return records.map { record in
             Float(record.motion.reduce(0) { $0 + Int($1) })
         }
@@ -273,12 +386,47 @@ public enum BulkSleep {
     /// position shifts from becoming wake while retaining substantial, sustained movement as an
     /// awakening cue. Values deliberately straddle the existing thresholds: `1` is still/light for
     /// detection and staging, `16` is active (`motionStillThreshold == 2`, `awakeMotion == 15`).
-    private static func motionIntensityFallbackMagnitudes(_ records: [BulkRecord]) -> [Float] {
+    ///
+    /// `degenerate:` selects WHERE the light/active seam is drawn, and nothing else:
+    ///   • `false` — the constant-filler branch keeps the fixed 0.80 quantile, byte for byte.
+    ///   • `true` — the non-expressive-primary branch (#184) uses an Otsu two-class seam over the
+    ///     same positive pool. WHY: the quantile presumes the run is ~80 % sleep. On the FR04.009
+    ///     archive the tail is the ONLY movement measurement, so the run contains its awake evening
+    ///     too; p80 then lands INSIDE the awake mass (🟢 measured cut 549 vs Otsu 370) and moderate
+    ///     evening movement maps to `1`, which is BELOW `motionStillThreshold` — the tail's real
+    ///     discriminator (0 vs > 0) becomes invisible and detection calls the evening sleep. 🟢
+    ///     measured on the tester's archive: p80 detects 02:30→15:21 (12.86 h), Otsu 05:55→15:21
+    ///     (9.44 h), against the ring's own onset evidence — the `[15:20]` tail-zero rate and the
+    ///     sleep-vitals cadence both step at 06:00 — of ~06:00.
+    /// `positive` must be sorted ascending and non-empty (the caller guarantees both).
+    static func otsuIntensityCut(_ positive: [Int]) -> Int {
+        let n = positive.count
+        guard let last = positive.last else { return 0 }
+        guard n >= 2 else { return last }
+        let total = positive.reduce(0, +)
+        var lowSum = 0
+        var best = last
+        var bestVariance = -1.0
+        for i in 1 ..< n {
+            lowSum += positive[i - 1]
+            guard positive[i] != positive[i - 1] else { continue }   // never split a tie
+            let w0 = Double(i) / Double(n), w1 = 1 - Double(i) / Double(n)
+            let m0 = Double(lowSum) / Double(i)
+            let m1 = Double(total - lowSum) / Double(n - i)
+            let v = w0 * w1 * (m0 - m1) * (m0 - m1)
+            if v > bestVariance { bestVariance = v; best = positive[i] }
+        }
+        return best
+    }
+
+    static func motionIntensityFallbackMagnitudes(_ records: [BulkRecord],
+                                                  degenerate: Bool) -> [Float] {
         let sums = records.map { $0.motionIntensityTail.reduce(0) { $0 + Int($1) } }
         let positive = sums.filter { $0 > 0 }.sorted()
         guard !positive.isEmpty else { return [Float](repeating: 0, count: records.count) }
-        let activeIndex = Int((Double(positive.count - 1) * 0.80).rounded())
-        let activeCut = positive[activeIndex]
+        let activeCut = degenerate
+            ? otsuIntensityCut(positive)
+            : positive[Int((Double(positive.count - 1) * 0.80).rounded())]
         return sums.map { magnitude in
             guard magnitude > 0 else { return 0 }
             return magnitude >= activeCut ? 16 : 1

@@ -69,27 +69,25 @@ final class BackgroundSyncPolicyTests: XCTestCase {
 
     // MARK: relevantWindow
 
-    func testEveningResolvesTonightsWindowNotThisMornings() {
-        let eightPM = cal.date(bySettingHour: 20, minute: 0, second: 0,
-                               of: Date(timeIntervalSince1970: 1_750_000_000))!
-        let w = BackgroundSyncPolicy.relevantWindow(now: eightPM,
-                                                    bedMinutes: 22 * 60 + 30,
-                                                    wakeMinutes: 6 * 60 + 30,
-                                                    calendar: cal)
-        XCTAssertNotNil(w)
-        XCTAssertGreaterThan(w!.end, eightPM, "the relevant window's end must still be ahead")
-        XCTAssertLessThan(w!.end.timeIntervalSince(eightPM), 24 * 3600, "…and within the coming day")
+    func testEveningResolvesTonightsWindowNotThisMornings() throws {
+        let eightPM = try XCTUnwrap(cal.date(bySettingHour: 20, minute: 0, second: 0,
+                                             of: Date(timeIntervalSince1970: 1_750_000_000)))
+        let w = try XCTUnwrap(BackgroundSyncPolicy.relevantWindow(now: eightPM,
+                                                                  bedMinutes: 22 * 60 + 30,
+                                                                  wakeMinutes: 6 * 60 + 30,
+                                                                  calendar: cal))
+        XCTAssertGreaterThan(w.end, eightPM, "the relevant window's end must still be ahead")
+        XCTAssertLessThan(w.end.timeIntervalSince(eightPM), 24 * 3600, "…and within the coming day")
     }
 
-    func testMidNightResolvesTheWindowInProgress() {
-        let twoAM = cal.date(bySettingHour: 2, minute: 0, second: 0,
-                             of: Date(timeIntervalSince1970: 1_750_000_000))!
-        let w = BackgroundSyncPolicy.relevantWindow(now: twoAM,
-                                                    bedMinutes: 22 * 60 + 30,
-                                                    wakeMinutes: 6 * 60 + 30,
-                                                    calendar: cal)
-        XCTAssertNotNil(w)
-        XCTAssertTrue(w!.contains(twoAM), "2 AM sits inside the in-progress window")
+    func testMidNightResolvesTheWindowInProgress() throws {
+        let twoAM = try XCTUnwrap(cal.date(bySettingHour: 2, minute: 0, second: 0,
+                                           of: Date(timeIntervalSince1970: 1_750_000_000)))
+        let w = try XCTUnwrap(BackgroundSyncPolicy.relevantWindow(now: twoAM,
+                                                                  bedMinutes: 22 * 60 + 30,
+                                                                  wakeMinutes: 6 * 60 + 30,
+                                                                  calendar: cal))
+        XCTAssertTrue(w.contains(twoAM), "2 AM sits inside the in-progress window")
     }
 
     func testDegenerateScheduleYieldsNilWindow() {

@@ -11,13 +11,12 @@ final class BatteryTTETests: XCTestCase {
 
     // MARK: - timeToEmpty
 
-    func testCleanDischarge() {
+    func testCleanDischarge() throws {
         // 10 % drop in 1 hour starting at 100 % → rate = 10 %/hr → TTE = 90% / 10%/hr = 9 h
         let samples = [sample(100, hours: 0), sample(90, hours: 1)]
-        let tte = BatteryTTE.timeToEmpty(samples, now: t0.addingTimeInterval(1 * 3_600))
-        XCTAssertNotNil(tte)
+        let tte = try XCTUnwrap(BatteryTTE.timeToEmpty(samples, now: t0.addingTimeInterval(1 * 3_600)))
         // Expected: 90 % / 10 %/hr × 3600 = 32 400 s (9 h)
-        XCTAssertEqual(tte!, 32_400, accuracy: 1)
+        XCTAssertEqual(tte, 32_400, accuracy: 1)
     }
 
     func testNilOnRisingTrend() {
@@ -43,13 +42,12 @@ final class BatteryTTETests: XCTestCase {
         XCTAssertNil(BatteryTTE.timeToEmpty(samples))
     }
 
-    func testRisingThenFallingResetsWindow() {
+    func testRisingThenFallingResetsWindow() throws {
         // [70, 80, 75]: rises then falls. The window after the rise-reset is [80, 75].
         // Drop = 5 pp, elapsed = 1 h → rate = 5 %/hr → TTE = 75/5 × 3600 = 54 000 s
         let samples = [sample(70, hours: 0), sample(80, hours: 1), sample(75, hours: 2)]
-        let tte = BatteryTTE.timeToEmpty(samples)
-        XCTAssertNotNil(tte)
-        XCTAssertEqual(tte!, 54_000, accuracy: 1)
+        let tte = try XCTUnwrap(BatteryTTE.timeToEmpty(samples))
+        XCTAssertEqual(tte, 54_000, accuracy: 1)
     }
 
     func testFlatSamplesSkipped() {
@@ -64,13 +62,12 @@ final class BatteryTTETests: XCTestCase {
 
     // MARK: - estimatedDepletionDate
 
-    func testEstimatedDepletionDate() {
+    func testEstimatedDepletionDate() throws {
         let samples = [sample(100, hours: 0), sample(90, hours: 1)]
         let now = t0.addingTimeInterval(1 * 3_600)  // now = end of last sample
-        let depletion = BatteryTTE.estimatedDepletionDate(samples, now: now)
-        XCTAssertNotNil(depletion)
+        let depletion = try XCTUnwrap(BatteryTTE.estimatedDepletionDate(samples, now: now))
         // TTE = 9 h → depletion at now + 9 h
-        XCTAssertEqual(depletion!.timeIntervalSince(now), 9 * 3_600, accuracy: 1)
+        XCTAssertEqual(depletion.timeIntervalSince(now), 9 * 3_600, accuracy: 1)
     }
 
     func testEstimatedDepletionNilWhenNoTTE() {
@@ -129,15 +126,15 @@ final class BatteryTTETests: XCTestCase {
         XCTAssertEqual(out.map(\.percent), [75])
     }
 
-    func testRecordPersistsAcrossReconnectIntoUsableEstimate() {
+    func testRecordPersistsAcrossReconnectIntoUsableEstimate() throws {
         // Simulate readings folded over hours, then confirm a clean TTE comes out — the
         // "survives reconnect" guarantee is that the array itself is the persisted state.
         var h: [BatteryTTE.Sample] = []
         h = BatteryTTE.record(h, percent: 90, at: t0, charging: false)
         h = BatteryTTE.record(h, percent: 88, at: t0.addingTimeInterval(2 * 3_600), charging: false)
-        let tte = BatteryTTE.timeToEmpty(h, now: t0.addingTimeInterval(2 * 3_600))
-        XCTAssertNotNil(tte, "2 pp over 2 h → 1 %/hr → ~88 h left")
-        XCTAssertEqual(tte!, 88.0 * 3_600, accuracy: 60)
+        let tte = try XCTUnwrap(BatteryTTE.timeToEmpty(h, now: t0.addingTimeInterval(2 * 3_600)),
+                                "2 pp over 2 h → 1 %/hr → ~88 h left")
+        XCTAssertEqual(tte, 88.0 * 3_600, accuracy: 60)
     }
 
     func testRecordPrunesByCap() {
@@ -163,13 +160,12 @@ final class BatteryTTETests: XCTestCase {
 
     // MARK: - timeToFull + recordCharge (time-to-full, #61)
 
-    func testTimeToFullCleanCharge() {
+    func testTimeToFullCleanCharge() throws {
         // 66→74 % over 6 min = 80 %/hr; 26 % left → 26/80 h = 0.325 h = 1170 s
         let s = [BatteryTTE.Sample(percent: 66, at: t0),
                  BatteryTTE.Sample(percent: 74, at: t0.addingTimeInterval(6 * 60))]
-        let ttf = BatteryTTE.timeToFull(s, now: t0.addingTimeInterval(6 * 60))
-        XCTAssertNotNil(ttf)
-        XCTAssertEqual(ttf!, 1170, accuracy: 5)
+        let ttf = try XCTUnwrap(BatteryTTE.timeToFull(s, now: t0.addingTimeInterval(6 * 60)))
+        XCTAssertEqual(ttf, 1170, accuracy: 5)
     }
 
     func testTimeToFullZeroWhenAlreadyFull() {

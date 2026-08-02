@@ -55,20 +55,22 @@ final class Gen3MotionFloorTests: XCTestCase {
 
     // MARK: - The regression itself
 
-    func testGen3ElevatedConstantFloorDetectsSleep() {
+    func testGen3ElevatedConstantFloorDetectsSleep() throws {
         // A flat Gen-3 night at a CONSTANT elevated floor (16) — what previously detected as zero sleep.
         let recs = driftingNight(floors: [16], plateauEpochs: 120, onset: 6, wake: 6)   // ~5 h still
-        let block = BulkSleep.mainSleep(from: recs)
-        XCTAssertNotNil(block, "an elevated but still Gen-3 floor must detect as sleep (was nil → blank cards)")
-        XCTAssertGreaterThan(block!.duration, 4 * 3600, "≈5 h still block recovered")
+        // XCTUnwrap, not `!`: a regression here must FAIL this test, not trap and abort the run.
+        let block = try XCTUnwrap(
+            BulkSleep.mainSleep(from: recs),
+            "an elevated but still Gen-3 floor must detect as sleep (was nil → blank cards)")
+        XCTAssertGreaterThan(block.duration, 4 * 3600, "≈5 h still block recovered")
     }
 
-    func testGen3DriftingFloorStaysOneNight() {
+    func testGen3DriftingFloorStaysOneNight() throws {
         // Floor steps 16 → 24 → 39 across the night (posture drift). Must read as ONE block, not three.
         let recs = driftingNight(floors: [16, 24, 39], plateauEpochs: 40)   // 3 × ~1.7 h = ~5 h
-        let block = BulkSleep.mainSleep(from: recs)
-        XCTAssertNotNil(block)
-        XCTAssertGreaterThan(block!.duration, 4 * 3600,
+        let block = try XCTUnwrap(BulkSleep.mainSleep(from: recs),
+                                  "the drifting Gen-3 night must detect as sleep")
+        XCTAssertGreaterThan(block.duration, 4 * 3600,
                              "drift-stepped plateaus bridge into one ~5 h night, not three short fragments")
         // And the staged night is populated (HRV/Respiratory/Sleep cards have data to show).
         let segs = BulkSleep.sleepSegments(from: recs)

@@ -7,14 +7,13 @@ final class VitalsBaselineTests: XCTestCase {
 
     // MARK: Baseline window
 
-    func testBaselineNeedsMinimumHistory() {
+    func testBaselineNeedsMinimumHistory() throws {
         // 6 days < default minBaselineDays (7) → no baseline.
         XCTAssertNil(VitalsBaseline.stats(Array(repeating: 60.0, count: 6)))
-        let s = VitalsBaseline.stats(Array(repeating: 60.0, count: 7))
-        XCTAssertNotNil(s)
-        XCTAssertEqual(s!.mean, 60, accuracy: 1e-9)
-        XCTAssertEqual(s!.sd, 0, accuracy: 1e-9)
-        XCTAssertEqual(s!.n, 7)
+        let s = try XCTUnwrap(VitalsBaseline.stats(Array(repeating: 60.0, count: 7)))
+        XCTAssertEqual(s.mean, 60, accuracy: 1e-9)
+        XCTAssertEqual(s.sd, 0, accuracy: 1e-9)
+        XCTAssertEqual(s.n, 7)
     }
 
     func testBaselineTrailingWindowCaps() {

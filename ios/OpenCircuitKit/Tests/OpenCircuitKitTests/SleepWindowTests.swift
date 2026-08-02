@@ -108,20 +108,19 @@ final class SleepWindowTests: XCTestCase {
     /// night — the bug the fixed 22:30→06:30 default caused (woke 3 h after the window closed, so
     /// no temp was ever captured). With margins the learned window starts before onset and ends
     /// well after wake.
-    func testLateSleeperWindowCoversTheNight() {
+    func testLateSleeperWindowCoversTheNight() throws {
         let onsets = [date("2026-06-13T00:30:00Z"), date("2026-06-14T00:40:00Z"),
                       date("2026-06-15T00:20:00Z")]
         let wakes  = [date("2026-06-13T09:30:00Z"), date("2026-06-14T09:20:00Z"),
                       date("2026-06-15T09:40:00Z")]
         let ref = date("2026-06-15T14:00:00Z")
-        let w = SleepWindow.habitualInterval(onsets: onsets, wakes: wakes,
-                                             nightEndingNear: ref, calendar: utc)
-        XCTAssertNotNil(w)
+        let w = try XCTUnwrap(SleepWindow.habitualInterval(onsets: onsets, wakes: wakes,
+                                                           nightEndingNear: ref, calendar: utc))
         // The actual night (00:37 → 09:34) falls inside the learned window.
-        XCTAssertLessThanOrEqual(w!.start, date("2026-06-15T00:37:00Z"), "window starts before real onset")
-        XCTAssertGreaterThanOrEqual(w!.end, date("2026-06-15T09:34:00Z"), "window ends after real wake — the fix")
+        XCTAssertLessThanOrEqual(w.start, date("2026-06-15T00:37:00Z"), "window starts before real onset")
+        XCTAssertGreaterThanOrEqual(w.end, date("2026-06-15T09:34:00Z"), "window ends after real wake — the fix")
         // And the old fixed default (06:30) would NOT have covered the 09:34 wake.
-        XCTAssertGreaterThan(w!.end, date("2026-06-15T06:30:00Z"))
+        XCTAssertGreaterThan(w.end, date("2026-06-15T06:30:00Z"))
     }
 
     /// Onsets straddling midnight (23:50 and 00:30) must average to ~00:10, not to midday — the

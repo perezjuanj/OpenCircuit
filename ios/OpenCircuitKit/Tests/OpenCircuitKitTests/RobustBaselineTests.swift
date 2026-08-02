@@ -91,12 +91,11 @@ final class RobustBaselineTests: XCTestCase {
 
     // MARK: Window selection
 
-    func testNilBelowMinBaselineDays() {
+    func testNilBelowMinBaselineDays() throws {
         XCTAssertNil(RobustBaseline.stats(Array(repeating: 60.0, count: 6)))
-        let s = RobustBaseline.stats(Array(repeating: 60.0, count: 7))
-        XCTAssertNotNil(s)
-        XCTAssertEqual(s!.n, 7)
-        XCTAssertEqual(s!.median, 60, accuracy: 1e-9)
+        let s = try XCTUnwrap(RobustBaseline.stats(Array(repeating: 60.0, count: 7)))
+        XCTAssertEqual(s.n, 7)
+        XCTAssertEqual(s.median, 60, accuracy: 1e-9)
         // Degenerate arguments are refused rather than producing a nonsense estimate.
         XCTAssertNil(RobustBaseline.stats(Array(repeating: 60.0, count: 30), minDays: 0))
         XCTAssertNil(RobustBaseline.stats(Array(repeating: 60.0, count: 30), minDays: 5, maxDays: 3))

@@ -87,16 +87,15 @@ final class OSASpO2Tests: XCTestCase {
 
     // MARK: ratio-of-ratios + calibration (GOLDEN 3)
 
-    func testWindowRatioAnalytic() {
+    func testWindowRatioAnalytic() throws {
         // R = (AC_red/DC_red)/(AC_ir/DC_ir). Leakage at the locked fstar cancels in the ratio,
         // so R is exact: (120/8000)/(100/10000) = 1.5.
         let f = OSASpO2.freqs[20]
         let ir  = (0 ..< 128).map { 10000.0 + 100 * cos(2 * Double.pi * f * Double($0)) }
         let red = (0 ..< 128).map { 8000.0 + 120 * cos(2 * Double.pi * f * Double($0)) }
         let grn = (0 ..< 128).map { 5000.0 + 200 * cos(2 * Double.pi * f * Double($0)) }
-        let R = OSASpO2.windowRatio(ir: ir, red: red, green: grn)
-        XCTAssertNotNil(R)
-        XCTAssertEqual(R!, 1.5, accuracy: 0.01)
+        let R = try XCTUnwrap(OSASpO2.windowRatio(ir: ir, red: red, green: grn))
+        XCTAssertEqual(R, 1.5, accuracy: 0.01)
     }
 
     func testCalibrationCurve() {
@@ -123,7 +122,7 @@ final class OSASpO2Tests: XCTestCase {
         XCTAssertEqual(f[5], 96, "median filter removes the lone spike")
     }
 
-    func testSummarizeOnCleanDesaturatedSignal() {
+    func testSummarizeOnCleanDesaturatedSignal() throws {
         // Constant R=1.5 signal -> every window SpO2 = 82.14; all windows pass the gates
         // (PI_ir = 100/10000 = 1% > 0.15%, high SNR clean pulse).
         let f = OSASpO2.freqs[20]
@@ -131,9 +130,8 @@ final class OSASpO2Tests: XCTestCase {
         let ir  = (0 ..< n).map { Int(10000.0 + 100 * cos(2 * Double.pi * f * Double($0))) }
         let red = (0 ..< n).map { Int(8000.0 + 120 * cos(2 * Double.pi * f * Double($0))) }
         let grn = (0 ..< n).map { Int(5000.0 + 200 * cos(2 * Double.pi * f * Double($0))) }
-        let summary = OSASpO2.summarize(ir: ir, red: red, green: grn)
-        XCTAssertNotNil(summary)
-        XCTAssertEqual(summary!.averageSpO2, 82.14, accuracy: 0.2)
-        XCTAssertGreaterThan(summary!.validWindows, 0)
+        let summary = try XCTUnwrap(OSASpO2.summarize(ir: ir, red: red, green: grn))
+        XCTAssertEqual(summary.averageSpO2, 82.14, accuracy: 0.2)
+        XCTAssertGreaterThan(summary.validWindows, 0)
     }
 }
