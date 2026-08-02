@@ -40,6 +40,11 @@ public enum EpochArchiveDiagnostics {
         let offLabel = "UTC\(offH >= 0 ? "+" : "")\(offH)"
 
         var idle = 0, sleepV = 0, activity = 0, hr = 0, hrv = 0, spo2 = 0
+        // #185: what the HealthKit SAMPLE path actually emits, which is now a superset of the
+        // strict sleep-vitals counts above (quiet activity epochs carry real HRV, any worn epoch
+        // carries RR). Reported on its OWN line — the `Vitals coverage:` line deliberately keeps
+        // counting the strict accessors so tester bundles stay comparable across builds.
+        var mHRV = 0, mRR = 0
         for r in sorted {
             switch r.layout {
             case .idle: idle += 1
@@ -49,11 +54,14 @@ public enum EpochArchiveDiagnostics {
             if r.heartRate != nil { hr += 1 }
             if r.hrvRMSSD != nil { hrv += 1 }
             if r.spo2Percent != nil { spo2 += 1 }
+            if r.measuredHRVRMSSD != nil { mHRV += 1 }
+            if r.measuredRespiratoryRate != nil { mRR += 1 }
         }
 
         lines.append("Epochs: \(sorted.count)   span: \(t(first.date(epoch: epoch))) → \(t(last.date(epoch: epoch))) (\(offLabel))")
         lines.append("Layout: sleepV \(sleepV) · activity \(activity) · idle \(idle)")
         lines.append("Vitals coverage: HR \(hr) · HRV \(hrv) · SpO2 \(spo2)")
+        lines.append("Measured (#185): HRV \(mHRV) · RR \(mRR)")
         lines.append("")
         lines.append("Gaps > \(Int(gapThreshold / 60)) min (a hole = history NEVER drained — the key sleep-loss signal):")
         var anyGap = false

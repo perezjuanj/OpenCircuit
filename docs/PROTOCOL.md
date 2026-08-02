@@ -396,10 +396,32 @@ time (no 12 h offset in this capture; bears on §5.6/§6.6). Reassemble + decode
   distinct `byte[6]` sync-open selector for HR (only `0x00`/`0x03` across all captures) — there is no
   separate `HrSync`/`0x0a` stream on the wire; all-day HR is the activity-epoch `[4]` we had been
   discarding (`BulkSleep.heartRate` was gated to sleep-vitals). Resolves the daytime/workout-HR gap
-  (#45/#38). HRV `[5]`/SpO2 stay sleep-vitals-only (motion corrupts them). On these epochs
-  `acti_counts` `[10:20]` is elevated and `[15:20]` is its **intensity tail** — not a separate
-  activity payload (corrected by the #93 reconciliation above; the real steps/activeSeconds
-  record is the uncaptured `历史活动响应` stream in §5.3.1).
+  (#45/#38). On these epochs `acti_counts` `[10:20]` is elevated and `[15:20]` is its **intensity
+  tail** — not a separate activity payload (corrected by the #93 reconciliation above; the real
+  steps/activeSeconds record is the uncaptured `历史活动响应` stream in §5.3.1).
+  - 🟢 **HRV `[5]` and RR `[7]` ARE present and valid on activity epochs** (#185, corrected
+    2026-08-02 — the earlier "HRV/SpO2 stay sleep-vitals-only, motion corrupts them" claim was
+    half wrong and cost us ~half of both metrics). Measured over 6 independent archives (5
+    Gen-2/Gen-3 + 1 Gen-2-Air FR04; 3679 distinct records after de-duplicating four contained
+    captures): matching each activity epoch's `[5]` to its nearest sleep-vitals neighbour within
+    300 s gives a **median delta of −1.5…+2.5 ms** on every Gen-2/Gen-3 archive — ordinary
+    epoch-to-epoch RMSSD variation.
+  - 🟢 What motion *does* corrupt is the **upper tail of `[5]`, not its centre**, and `[15:20]`
+    is the discriminator. Pooled: QUIET activity epochs (`[15:20]` all zero) run p50 58 / p90 86 /
+    p99 111 / max 142 ms — the same population as sleep-vitals (p50 60 / p90 88 / p99 119) —
+    while MOVING epochs run p90 98 / p99 196 / **max 200**. An RMSSD of 200 ms on a moving awake
+    wrist is PPG artifact, so HRV is emitted from an activity epoch only while `[15:20]` is zero.
+  - 🟢 **RR `[7]` is motion-insensitive** and needs no such gate: sleep-vitals p50 15.125 / p99
+    16.875, activity p50 15.25 / p99 17.0 (every `[7] > 0` byte in the corpus lands in 101…141).
+  - 🟢 **SpO2 genuinely is absent** on these epochs and always will be — `[8]` **IS** the
+    `0x12`/`0x13` activity tag, so there is no SpO2 there to recover.
+  - 🟡 **OPEN:** the FR04 Gen-2-Air alone runs ≈ **−11…−15 ms** against its sleep-vitals
+    neighbours (the exact median moves with the neighbour tie-break; the sign and scale do not).
+    Recorded, deliberately **not** "corrected" — a per-generation offset would need ring-generation
+    knowledge `OpenCircuitKit` refuses to carry.
+  - 🟡 **Watch item:** the quiet gate trusts firmware to populate `[15:20]`. Firmware that stopped
+    would make every activity epoch read "quiet" and let the artifact tail through; `DecodeAnomaly`
+    does not currently watch for an all-zero `[15:20]` across a whole capture.
 - **Sleep-vitals epoch**: per-epoch vitals in `[4:9]`, motion `[10:15]` at `01` baseline,
   `[15:22]` ≈ zero. `[8]` is the **SpO2 %** (typically `0x57–0x63` = 87–99, but lower on a real
   desaturation). ⚠️ Layout is decided **structurally** (#39), NOT by this band: classify as

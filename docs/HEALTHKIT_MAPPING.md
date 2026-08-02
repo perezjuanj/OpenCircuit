@@ -8,10 +8,10 @@ device's own timestamps (so historical sync backfills correctly).
 |---|---|---|---|---|
 | Heart rate | `HKQuantityType(.heartRate)` | Quantity | count/min | live + history |
 | Resting heart rate | `.restingHeartRate` | Quantity | count/min | daily, derived on-device (sleep mean → low-activity floor); see notes |
-| HRV (RMSSD) | `.heartRateVariabilitySDNN` | Quantity | ms | ring reports **RMSSD**; written into the SDNN field and **tagged via metadata** (no fake conversion) — see notes |
+| HRV (RMSSD) | `.heartRateVariabilitySDNN` | Quantity | ms | ring reports **RMSSD**; written into the SDNN field and **tagged via metadata** (no fake conversion) — see notes. Sourced from **any worn epoch**, not sleep-vitals only (#185) — see below |
 | Blood oxygen (SpO₂) | `.oxygenSaturation` | Quantity | % (0–1.0) | HealthKit wants a fraction |
 | Skin / sleeping-wrist temperature | `.bodyTemperature` | Quantity | °C | general writable temperature type; the ideal `.appleSleepingWristTemperature` is Apple-computed/read-only for third parties, and `.basalBodyTemperature` is hard-wired to Cycle Tracking's BBT chart — see notes |
-| Respiratory rate | `.respiratoryRate` | Quantity | count/min | |
+| Respiratory rate | `.respiratoryRate` | Quantity | count/min | sourced from **any worn epoch**, not sleep-vitals only (#185) — see below |
 | Steps | `.stepCount` | Quantity | count | cumulative; avoid double-counting with phone |
 | Active energy | `.activeEnergyBurned` | Quantity | kcal | |
 | Sleep stages | `HKCategoryType(.sleepAnalysis)` | Category | — | values: `inBed`, `asleepCore`, `asleepDeep`, `asleepREM`, `awake` |
@@ -79,6 +79,36 @@ conversion. Instead each HRV sample is written to the SDNN field with metadata
 `OpenCircuitHRVStatistic = "RMSSD"` (`HealthKitWriter.metadata(for:)`), so the value is
 honest and a reader can tell which statistic it actually is. If a future capture shows the
 ring also reports true SDNN, switch to writing that directly and drop the tag.
+
+### HRV and RR come from ANY worn epoch, not sleep-vitals only (#185)
+
+Both metrics ride the `0x4c` history stream, which has two record templates (PROTOCOL.md §5.3).
+Until #185 we emitted HRV `[5]` and RR `[7]` **only** from *sleep-vitals* records, so roughly half
+of both never reached Apple Health even though the ring had measured them: `0x12`/`0x13`
+**activity** epochs carry a real RMSSD and a real RR too (🟢 measured, 6 independent archives —
+median delta vs the nearest sleep-vitals neighbour within 300 s is −1.5…+2.5 ms on Gen-2/Gen-3).
+
+What the sample path now writes:
+
+- **RR** — from any worn epoch, `[7]/8`, clamped to 4.0…30.0 brpm. Motion does not corrupt this
+  field, so there is no motion gate.
+- **HRV** — from sleep-vitals epochs as before, and from activity epochs **only while the ring's own
+  `[15:20]` intensity tail is zero** (the epoch did not move), clamped to 1…200 ms. Moving epochs
+  are excluded because that is where the 146–200 ms PPG artifact tail lives.
+- **SpO₂** — unchanged, still sleep-vitals only, permanently: `[8]` **is** the activity tag, so
+  there is no SpO₂ on an activity epoch to recover.
+
+Expected yield on the measurement corpus: **HRV +67 %, RR +132 %** samples per drain. Nightly *mean*
+HRV therefore shifts slightly (≤2 ms on Gen-2/Gen-3; −6.9 ms on the FR04 Gen-2-Air) because the
+sample population widened — anything z-scoring HRV against a rolling baseline (`HeadacheEngine`)
+re-baselines across the changeover. `SyncCursor` is forward-only, so already-synced nights are not
+retro-filled; only new drains benefit.
+
+⚠️ The recovery is confined to the HealthKit sample path. Sleep **detection, staging, naps and
+`SleepStress`** still read the strict sleep-vitals-scoped accessors, because for them "the ring
+emitted a sleep-vitals record" is a *mode* signal, not just a value — widening it would move the
+detected night. The two recovering accessors are deliberately `internal` to `OpenCircuitKit` so the
+app target cannot reach them; `StrictVitalsPinningTests` pins the whole sleep pipeline byte-identical.
 
 ### Resting HR: derived daily, idempotent (#18, #37)
 
