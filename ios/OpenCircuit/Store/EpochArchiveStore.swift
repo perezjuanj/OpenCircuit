@@ -17,6 +17,8 @@ struct EpochArchiveStore {
     // `flushHealth()` can re-use them when a fresh/nil session has empty stagedSegments.
     private let pendingCoarseSleepKey: String
     private let pendingStagedSleepKey: String
+    /// Last DECIDED HRV-pooling verdict (#185 gate). See `loadHRVPoolingVerdict`.
+    private let hrvPoolingKey: String
 
     /// `namespace` scopes the keys to a single ring (its CoreBluetooth identifier) so two rings'
     /// epoch archives can't collide on the UInt32 epoch counter (which would corrupt overnight
@@ -29,6 +31,28 @@ struct EpochArchiveStore {
         self.lastDrainKey = "sleep.lastHistoryDrainAt\(suffix)"
         self.pendingCoarseSleepKey = "sleep.pendingCoarseSegments\(suffix)"
         self.pendingStagedSleepKey = "sleep.pendingStagedSegments\(suffix)"
+        self.hrvPoolingKey = "sleep.hrvPoolingVerdict\(suffix)"
+    }
+
+    /// The last DECIDED HRV-pooling verdict for this ring (#185 regression gate), or nil before the
+    /// first decision. Persisted per ring for the same reason the archive is: the verdict describes
+    /// the ring's own two record templates, so it must never be shared between rings.
+    func loadHRVPoolingVerdict() -> BulkSleep.HRVPooling? {
+        switch defaults.string(forKey: hrvPoolingKey) {
+        case "agree": return .agree
+        case "disagree": return .disagree
+        default: return nil          // never persist `.noEvidence` — it is the ABSENCE of a decision
+        }
+    }
+
+    /// Record a DECIDED verdict. `.noEvidence` is deliberately not persistable: it means "this run
+    /// could not judge", which must leave any earlier decision standing rather than erase it.
+    func saveHRVPoolingVerdict(_ verdict: BulkSleep.HRVPooling) {
+        switch verdict {
+        case .agree: defaults.set("agree", forKey: hrvPoolingKey)
+        case .disagree: defaults.set("disagree", forKey: hrvPoolingKey)
+        case .noEvidence: break
+        }
     }
 
     /// The stored archive (decoded), or `[]` when none yet.

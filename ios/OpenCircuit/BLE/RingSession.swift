@@ -3012,7 +3012,36 @@ final class RingSession: NSObject {
         let mainSleepBlock = BulkSleep.mainSleep(from: nightRecords, temperatures: temps)
         ringLog.notice("sleep-diag: union=\(union.count) nightRecords=\(nightRecords.count) temps=\(temps.count) mainSleep=\(mainSleepBlock != nil ? "\(mainSleepBlock!.start)..\(mainSleepBlock!.end)" : "nil", privacy: .public)")
         // HealthKit path: THIS batch's new samples (the SyncCursor dedups against what's written).
-        historySamples = BulkSleep.samples(from: bulkRecords)
+        // The HRV POOLING VERDICT, however, is measured on the 30-h archive union (#185 regression):
+        // a single drain is far too short to judge, and gating on the slice would either ship the
+        // disagreeing device's ~15 ms HRV deficit or gut the Gen-2/Gen-3 recovery. Per-ring
+        // namespacing on EpochArchiveStore means the calibration pool can never mix two rings.
+        // The verdict CARRIES MEMORY. `hrvPooling` is recomputed from a 30-h rolling union on every
+        // commit and this function has three call sites, so a memoryless gate would let one night be
+        // committed under two verdicts — a nightly HRV mean that is an artifact of BGTask scheduling.
+        // Worse, both of its pools are conditioned on the ring's quiet tail, so `.noEvidence`
+        // correlates with RESTLESSNESS (the physiology being measured), and the forward-only
+        // SyncCursor means a suppressed slice is never re-offered. So: persist the last DECIDED
+        // verdict per ring, and treat `.noEvidence` as "keep the previous decision", falling back to
+        // suppression only before the first-ever decision — 🟢 measured as the right cold-start
+        // default (default-open still leaks −2.77 ms into the disagreeing device's FIRST day, which
+        // is the day that becomes its `VitalsBaseline.overnightHRV`). (Adversarial review.)
+        let measuredVerdict = BulkSleep.hrvPooling(union)
+        let hrvVerdict: BulkSleep.HRVPooling
+        if measuredVerdict == .noEvidence {
+            hrvVerdict = epochArchiveStore.loadHRVPoolingVerdict() ?? .noEvidence
+        } else {
+            hrvVerdict = measuredVerdict
+            epochArchiveStore.saveHRVPoolingVerdict(measuredVerdict)
+        }
+        historySamples = BulkSleep.samples(from: bulkRecords, verdict: hrvVerdict)
+        // Breadcrumb. A silent verdict flip (firmware that stops zeroing sleep-vitals tails would
+        // starve the reference pool → permanent `.noEvidence`) is otherwise invisible: it shows up
+        // only as a quietly thinner HRV chart. `ringLog` is os_log and NEVER reaches a tester's
+        // Diagnostics export, so this ALSO goes to ObservabilityStore, which does. (Review.)
+        let hrvDetail = "measured=\(measuredVerdict) effective=\(hrvVerdict) union=\(union.count) slice=\(bulkRecords.count)"
+        observability.recordMetricEvent(source: "hrv-pool", detail: hrvDetail)
+        ringLog.notice("hrv-pool: \(hrvDetail, privacy: .public)")
         // Sleep staging + persistence are conservative: a partial / PPG-only / no-ack sleep drain
         // must NOT overwrite a fuller stored night. We still keep the raw records + scalar samples.
         var committedSleep = false

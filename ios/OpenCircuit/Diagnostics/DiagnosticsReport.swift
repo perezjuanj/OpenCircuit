@@ -89,7 +89,12 @@ enum DiagnosticsReport {
         // a "SUBMIT FAILED — …" line names the cause (refresh disabled / id missing from Info.plist).
         s.append("# Background scheduling")
         s.append("  Last (re)scheduled: \(t(observability.bgLastScheduled))")
-        let bgSources: Set<String> = ["bgregister", "bgschedule", "bgpending", "bgtask"]
+        // `hrv-pool` (#185 gate) and `sleep-sync` were being recorded but never surfaced — this
+        // filter is the only thing that reaches a tester, and os_log does not. A permanently
+        // suppressed HRV recovery, or a sleep drain that keeps skipping its re-stage, is otherwise
+        // invisible in the one channel a TestFlight tester has. (Adversarial review.)
+        let bgSources: Set<String> = ["bgregister", "bgschedule", "bgpending", "bgtask",
+                                      "hrv-pool", "sleep-sync"]
         let bgLog = observability.metricRecords()
             .filter { bgSources.contains($0.source) }
             .sorted { $0.date > $1.date }
