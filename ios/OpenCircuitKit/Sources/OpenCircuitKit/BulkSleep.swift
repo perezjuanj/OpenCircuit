@@ -159,7 +159,9 @@ public struct BulkRecord: Equatable {
     // every Gen-2/Gen-3 archive — ordinary epoch-to-epoch RMSSD variation, i.e. the values are REAL.
     // 🟡 OPEN PROTOCOL QUESTION: the FR04 Gen-2-Air alone runs ≈ −11…−15 ms (the exact median moves
     // with the neighbour tie-break, the sign and scale do not). Recorded and deliberately NOT
-    // "corrected" — a per-generation offset needs ring-generation knowledge the Kit refuses to carry.
+    // "corrected". A run whose two populations disagree by more than `hrvPoolingNoiseFloorMs`
+    // simply stops pooling — see `BulkSleep.hrvPooling`. The offset itself is still an OPEN protocol
+    // question; the gate makes such a run no worse than pre-#185, it does not explain the Air.
 
     /// Physiological RMSSD ceiling (ms) for an EMITTED HRV sample. 🟢 MEASURED: the max byte[5] over
     /// every worn epoch of every archive is exactly 200 (2671 non-zero HRV bytes), so this rejects
@@ -452,6 +454,115 @@ public enum BulkSleep {
         return slotOrderConsistency(quiet) >= degenerateMinSlotOrderFraction
     }
 
+    // MARK: - HRV pooling gate (#185 regression)
+    //
+    // #185 pools the HRV that 0x12/0x13 activity epochs carry into `samples`. On every Gen-2 and
+    // Gen-3 archive that is correct — the two record templates measure the same thing. On one
+    // device family they do NOT: the activity template runs ~13–20 ms LOW, 43 % of that archive's
+    // HRV samples are recovered ones, and the depressed mean propagates into Apple Health, into
+    // `VitalsBaseline.overnightHRV` and into the headache HRV z-score, where a new user has no
+    // history to contradict it.
+    //
+    // Decide from the RUN'S OWN DATA whether the two populations agree, exactly as `motionSource`
+    // decides which motion channel a run can use. NO ring generation, NO firmware string
+    // (FirmwareInfo.swift:12). NO per-device correction: a disagreeing run simply stops pooling and
+    // falls back to sleep-vitals HRV alone.
+
+    /// Widest |HRV shift| (ms) between the two record templates that still reads as AGREEMENT.
+    /// 🟢 MEASURED over 10 real archives / 3092 30-h union windows (N ≥ 20 per pool): every window
+    /// on a device whose templates agree lands at |shift| ≤ 5.0; every window on the one archive
+    /// whose templates disagree lands at ≥ 13.0 (p50 14.8, max 20.0). ANY threshold in [5.0, 13.0)
+    /// splits the corpus perfectly; 9.0 is the midpoint, 4.0 ms clear of both classes.
+    /// Independently corroborated by a matched-count permutation null (relabel the two pools inside
+    /// each agreeing window, group sizes fixed, 8748 relabelings): p50 2.0 / p90 5.0 / p95 6.0 /
+    /// p99 8.0 — so 9.0 sits above the null's p99 and sampling noise alone false-suppresses < 1 %
+    /// of agreeing runs. ABSOLUTE, not relative: the agreeing archives stay ≤ 5.0 at sleep-HRV
+    /// medians spanning 22…73 ms, while the disagreeing one is ≈ 15 ms at a 45 ms mean, so a
+    /// percentage floor would have to be ~33 % and would then swallow the 22 ms-median archive.
+    /// 🟡 The METHOD is measured over 10 archives; the class boundary rests on ONE archive of the
+    /// disagreeing class. Re-run the union sweep against any new capture of that family before
+    /// trusting this number.
+    static let hrvPoolingNoiseFloorMs = 9.0
+
+    /// Minimum epochs in EACH population before the comparison is judged at all. 🟢 MEASURED: the
+    /// separation gap at the union basis is 3.0 ms at N=8, 5.0 at 12, 7.0 at 16, and **8.0 at 20**,
+    /// where it saturates (unchanged at 24/30/40 while decidability falls 57 %→47 %). Below 20 the
+    /// statistic is noise AND the chosen 9.0 threshold stops being safe — at N=12 an agreeing
+    /// archive already reaches 8.0. The two constants are jointly, not independently, calibrated.
+    /// GEN2_osa3 is the cautionary case: 8 records, 1 activity vs 2 sleep-vitals HRV values, and an
+    /// unguarded shift of −18.0 ms that is pure sampling artifact. It is correctly refused.
+    static let hrvPoolingMinEpochs = 20
+
+    /// Deterministic per-side cap on the pairwise difference set — an uncapped Hodges–Lehmann is
+    /// O(|a|·|b|). Stride-subsampling the SORTED pool preserves its shape and uses no RNG, so it is
+    /// unit-testable. 🟢 MEASURED: caps of 32/64/128/256/512 change 0 of 3092 union-window verdicts
+    /// versus uncapped, and the largest pool the 30-h union can hold on the corpus is 149, so this
+    /// never binds in practice — it exists only to bound a caller that passes an unpruned set.
+    static let hrvPoolingSampleCap = 512
+
+    /// Hodges–Lehmann two-sample shift: the median of all pairwise `a - b` differences. Robust
+    /// (50 % breakdown) and, unlike a difference of medians, it uses the whole distribution —
+    /// 🟢 MEASURED, the difference of medians separates this corpus by 7.0 ms (2.00×) against
+    /// HL's 8.0 ms (2.60×).
+    static func hrvShift(_ a: [Int], _ b: [Int]) -> Double {
+        func thinned(_ v: [Int]) -> [Int] {
+            let s = v.sorted()
+            guard s.count > hrvPoolingSampleCap else { return s }
+            let step = Double(s.count) / Double(hrvPoolingSampleCap)
+            return (0 ..< hrvPoolingSampleCap).map { s[Int(Double($0) * step)] }
+        }
+        let x = thinned(a), y = thinned(b)
+        guard !x.isEmpty, !y.isEmpty else { return 0 }
+        var diffs: [Int] = []
+        diffs.reserveCapacity(x.count * y.count)
+        for i in x { for j in y { diffs.append(i - j) } }
+        diffs.sort()
+        let n = diffs.count
+        return n % 2 == 1 ? Double(diffs[n / 2])
+                          : Double(diffs[n / 2 - 1] + diffs[n / 2]) / 2.0
+    }
+
+    /// Verdict of the run-level HRV pooling gate. `public` only so the drain path can log it —
+    /// a silent verdict flip must be visible in a Diagnostics export, not only in a wrong number.
+    public enum HRVPooling: Equatable { case agree, disagree, noEvidence }
+
+    /// Do the two record templates' HRV populations agree on THIS run?
+    ///
+    /// BOTH sides are conditioned on the ring's own `[15:20]` "nothing moved" verdict. The activity
+    /// side already is — that is `measuredHRVRMSSD`'s quiet gate (#184/#185) — and quieting the
+    /// sleep-vitals side too is what removes the awake-vs-asleep physiology confound. 🟢 MEASURED:
+    /// it lifts corpus separation from 6.5 ms (1.76×, worst agreeing archive 8.5 = flush against
+    /// the noise null's p99) to 8.0 ms (2.60×, worst agreeing 5.0 = the null's p90). Do NOT
+    /// "simplify" this back to comparing against all sleep-vitals epochs.
+    /// Conditioning on the PRIMARY `[10:15]` channel instead was tested and rejected — it makes the
+    /// FR04.009 shape undecidable, because its primary channel is the #184 degenerate template.
+    /// Key on the tail, never on `[10:15]`.
+    ///
+    /// A calibration set with NO usable sleep-vitals pool — a ring worn only in the daytime, or a
+    /// firmware that stops zeroing sleep-vitals tails — returns `.noEvidence` and therefore emits no
+    /// recovered HRV at all. That floor is exactly the population the project shipped for its whole
+    /// life before #185 (`hrvRMSSD` is sleep-vitals-scoped, so a daytime-only archive never had any
+    /// HRV), so it is a lost improvement, never a new error. `RingSession` logs the verdict so the
+    /// firmware case shows up in a Diagnostics export instead of only in a thinner Health chart.
+    public static func hrvPooling(_ calibration: [BulkRecord]) -> HRVPooling {
+        var act: [Int] = [], sv: [Int] = []
+        for r in calibration where r.motionIntensityTailIsZero {
+            if r.layout == .activity {
+                if let v = r.measuredHRVRMSSD { act.append(v) }
+            } else if let v = r.hrvRMSSD, v <= BulkRecord.maxPlausibleHRVMs {
+                // Band-guard the REFERENCE side too. `measuredHRVRMSSD` already rejects > 200 ms, but
+                // `hrvRMSSD` does not, so without this a 201…255 garbage byte could enter the
+                // reference pool while being structurally unable to enter the activity pool. Garbage
+                // biases the shift NEGATIVE → spurious `.disagree` → silent suppression, i.e. the
+                // gate's own reference would be the thing that breaks it. Does not bind on the
+                // corpus (max byte[5] is exactly 200); this guards firmware drift. (Review.)
+                sv.append(v)
+            }
+        }
+        guard act.count >= hrvPoolingMinEpochs, sv.count >= hrvPoolingMinEpochs else { return .noEvidence }
+        return abs(hrvShift(act, sv)) <= hrvPoolingNoiseFloorMs ? .agree : .disagree
+    }
+
     /// One magnitude per epoch using the same run-level signal selection as `motionTimeline`.
     /// The staging model subtracts its rolling local floor afterward, exactly as on primary motion.
     static func motionMagnitudes(from records: [BulkRecord]) -> [Float] {
@@ -707,15 +818,67 @@ public enum BulkSleep {
     /// the 0x12/0x13 activity tag, so there is no SpO2 there to recover. The idle template still
     /// yields nothing. SpO2 is a 0…1 fraction (HealthKit oxygenSaturation); HRV is the ring's RMSSD
     /// written to the SDNN type (unit-compatible; see HEALTHKIT_MAPPING.md).
+    ///
+    /// `calibratedBy:` is the record set the HRV POOLING GATE is judged on (`hrvPooling`) — pass the
+    /// rolling `EpochArchive` union, NOT this slice. Omitting it leaves the gate inert; see the
+    /// warning in the body. It gates ONLY the recovered activity-epoch HRV: HR, SpO2 and RR are
+    /// emitted identically either way (RR shifts ≤ 0.06 brpm between the templates on every archive,
+    /// so gating it would cost recovery for no measurable benefit).
     public static func samples(from records: [BulkRecord],
+                               calibratedBy calibration: [BulkRecord]? = nil,
                                epoch: Int = Command.syncEpoch) -> [QuantitySample] {
+        // #185 regression fix. `records` is ONE DRAIN'S SLICE (`RingSession.commitDrainedRecords`)
+        // and is far
+        // too short to judge: 🟢 MEASURED, a 1-h slice is UNDECIDABLE on 100 % of windows of all 10
+        // archives, and no slice under 3 h ever decides the disagreeing one. Gating on the slice
+        // alone therefore either pools the disagreeing device on essentially every short drain, or
+        // suppresses 45–69 % of the agreeing devices' recovery at 4 h. So the DRAIN PATH passes the
+        // 30-h `EpochArchive` union as `calibration` and this emits from the slice — 🟢 MEASURED on
+        // that basis: 0.0 % wrong POOL on the disagreeing archive and 0.0 % wrong SUPPRESS on all
+        // eight agreeing ones, over every look-back window. Undecided ⇒ SUPPRESS: measured on a
+        // cold start, default-open still leaks −2.77 ms into the disagreeing device's first day —
+        // the exact day that becomes its `VitalsBaseline.overnightHRV` — while default-closed costs
+        // the agreeing devices only a one-time 4.7–27.1 % of their RECOVERED half during warm-up
+        // (0.0 % after the first decision, 0.0 % at a 24 h cadence).
+        //
+        // ⚠️ `calibration == nil` leaves the gate INERT (pre-gate behaviour). It exists only so the
+        // fixture/RE callers that pass a SINGLE record — `RingKitVerify`'s #185 block,
+        // `BulkSleepTests.testQuietActivityEpochRecoversHRVAndRR` — keep asserting the #185 recovery
+        // itself, which no calibration set of one record could ever decide. EVERY PATH THAT REACHES
+        // APPLE HEALTH MUST PASS A CALIBRATION SET. There is exactly one such path today and it does
+        // (`RingSession.commitDrainedRecords`); `HRVPoolingGateTests.testNilCalibrationLeavesGateInert`
+        // pins this default so it stays a documented contract rather than an accident.
+        return samples(from: records,
+                       verdict: calibration.map { hrvPooling($0) } ?? .agree,
+                       epoch: epoch)
+    }
+
+    /// `samples` with an ALREADY-RESOLVED pooling verdict.
+    ///
+    /// Exists because the verdict must be able to carry MEMORY, which a pure function over one
+    /// calibration set cannot: `hrvPooling` is recomputed from a 30-h rolling union on every commit,
+    /// and `commitDrainedRecords` has three call sites, so without memory one night's epochs can be
+    /// committed under two different verdicts — a nightly HRV mean that is an artifact of BGTask
+    /// scheduling rather than of the night. Worse, both pools are conditioned on the ring's quiet
+    /// tail, so `.noEvidence` correlates with restlessness — the very physiology being measured —
+    /// and the SyncCursor is a forward high-water mark, so a suppressed slice is never re-offered.
+    /// `RingSession` therefore persists the last DECIDED verdict per ring and treats `.noEvidence`
+    /// as "keep the previous decision" rather than "suppress". (Adversarial review.)
+    public static func samples(from records: [BulkRecord],
+                               verdict: HRVPooling,
+                               epoch: Int = Command.syncEpoch) -> [QuantitySample] {
+        let poolActivityHRV = verdict == .agree
         var out: [QuantitySample] = []
         for r in records {
             let t = r.date(epoch: epoch)
             if let hr = r.heartRate {
                 out.append(QuantitySample(kind: .heartRate, start: t, value: Double(hr)))
             }
-            if let hrv = r.measuredHRVRMSSD {
+            // Sleep-vitals HRV is NEVER gated: that is the pre-#185 population (modulo the ≤200 ms
+            // band guard, which 🟢 MEASURED drops 0 of the corpus's 1541 sleep-vitals HRV bytes),
+            // and it is pinned by StrictVitalsPinningTests. Only the RECOVERED activity-epoch half
+            // waits on the run's verdict.
+            if let hrv = r.measuredHRVRMSSD, r.layout == .sleepVitals || poolActivityHRV {
                 out.append(QuantitySample(kind: .hrvSDNN, start: t, value: Double(hrv)))
             }
             if let spo2 = r.spo2Percent {                    // UNCHANGED (#185 constraint 2)
