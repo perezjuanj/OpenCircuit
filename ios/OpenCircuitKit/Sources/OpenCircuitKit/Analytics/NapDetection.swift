@@ -63,6 +63,10 @@ public enum NapDetection {
             // Daytime only: a block whose MIDPOINT is at night is (another) night/long sleep,
             // not a nap — reuse the overnight-block test (inverted) so the rule matches the
             // main-night gate exactly.
+            // Deliberately the TWO-ARGUMENT form: the `onsetIsUnobserved:` overload presumes a
+            // cut-off onset and extrapolates a 7 h night backwards, which is meaningless for a nap — a
+            // nap is judged as ITSELF, exactly as observed. (Using it here would let a nap whose onset
+            // sits behind a data hole be reclassified as night and silently dropped from the list.)
             if SleepWindow.isOvernightBlock(start: p.start, end: p.end) { return nil }
             // Real nap vs awake stillness: require the block to be predominantly ring-measured
             // sleep, so the all-day channel's activity-tagged sedentary stillness is excluded

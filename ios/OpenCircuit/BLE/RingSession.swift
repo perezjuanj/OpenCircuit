@@ -1420,7 +1420,8 @@ final class RingSession: NSObject {
     /// bug through the sync door. Gating to an overnight window (by overlap, never clipping, so the
     /// real night's totals are preserved) means a daytime block yields `[]`, and the card then
     /// falls back to the stored real night. (Adversarial review #1.)
-    private func overnightStagedSegments(from records: [BulkRecord]) -> [SleepSegment] {
+    private func overnightStagedSegments(from records: [BulkRecord],
+                                         archive: [BulkRecord]) -> [SleepSegment] {
         let segs = BulkSleep.stagedSegments(from: records, baseline: personalSleepBaseline(from: records))
         // A stitched night carries one `inBed` segment PER fragment (sorted by start), so gate on the
         // WHOLE-NIGHT envelope — earliest onset to latest wake — not just the first fragment. Testing
@@ -1429,7 +1430,31 @@ final class RingSession: NSObject {
         // daytime midpoint. (Adversarial review.)
         let inBeds = segs.filter { $0.stage == .inBed }
         guard let lo = inBeds.map(\.start).min(), let hi = inBeds.map(\.end).max() else { return segs }
-        return SleepWindow.isOvernightBlock(start: lo, end: hi) ? segs : []
+        // Pass 1 — HEAD's rule, unchanged. If the envelope is plainly overnight we are done and the
+        // correction is never consulted.
+        if SleepWindow.isOvernightBlock(start: lo, end: hi) { return segs }
+        // Pass 2 — TRUNCATED-NIGHT CORRECTION. A night can reach us as a TAIL only (a missed overnight
+        // drain, a re-pair, the ring off the finger for the first half); its late observed midpoint
+        // would otherwise lose the whole night.
+        //
+        // `BulkSleep.latestNightRecords` states the discipline as "only when the plain rule accepted
+        // NOTHING", because there it is choosing between competing candidate nights and a corrected
+        // one must never outrank a real one. HERE THERE ARE NO COMPETING CANDIDATES: this site is
+        // handed ONE already-scoped night and computes ONE `inBed` envelope from it, so "the plain
+        // rule accepted nothing" and "the plain rule rejected this envelope" are the same statement —
+        // which is why the check is a `guard`-shaped early return rather than a second filter pass.
+        // There is nothing for the correction to evict, reorder or clip; the only outcomes are the
+        // `[]` this function already returns and the recovered night.
+        //
+        // Judged against `archive` — the FULL union, NOT `records`. `records` is the night-scoped
+        // slice, whose own leading edge says nothing: it is 30 min before the onset for a normal night
+        // by construction, so judging against it would misread every night. The union is where the
+        // evidence lives — a hole big enough to have held the presumed onset is what proves it was
+        // never recorded.
+        let onsetIsUnobserved = BulkSleep.onsetIsUnobserved(DateInterval(start: lo, end: max(hi, lo)),
+                                                            in: archive)
+        return SleepWindow.isOvernightBlock(start: lo, end: hi,
+                                            onsetIsUnobserved: onsetIsUnobserved) ? segs : []
     }
 
     /// The user's rolling deep-sleep HR baseline from recent stored nights (RingConn is believed to key
@@ -1500,7 +1525,7 @@ final class RingSession: NSObject {
         }
         let nightRecords = BulkSleep.latestNightRecords(from: scopedArchive,
                                                         temperatures: wearTemperatureSamples())
-        let base = overnightStagedSegments(from: nightRecords)
+        let base = overnightStagedSegments(from: nightRecords, archive: scopedArchive)
         let segments = SleepEdit.recompute(baseSegments: base, times: times)
         guard !segments.isEmpty else { return nil }
         let summary = SleepStaging.summary(segments)
@@ -3047,7 +3072,7 @@ final class RingSession: NSObject {
         var committedSleep = false
         if sleepCanCommit, sleepHasFreshRecords {
             sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)   // wear gate (#41)
-            stagedSegments = overnightStagedSegments(from: nightRecords)   // overnight gate (review #1)
+            stagedSegments = overnightStagedSegments(from: nightRecords, archive: union)   // overnight gate (review #1)
             persistSleepAndSteps(nightRecords: nightRecords)   // summary + extras from the stitched night
             // Persist segments to the archive store so they survive session teardown. Without this,
             // a background task expiry or session reconnect clears the in-memory arrays and
@@ -3102,7 +3127,7 @@ final class RingSession: NSObject {
         let temps = wearTemperatureSamples()
         let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temps)
         sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)
-        stagedSegments = overnightStagedSegments(from: nightRecords)
+        stagedSegments = overnightStagedSegments(from: nightRecords, archive: union)
         persistSleepAndSteps(nightRecords: nightRecords)
         ringLog.notice("sync: re-staged last night from archive union (\(union.count) epochs)")
     }

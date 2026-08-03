@@ -46,6 +46,9 @@ public enum NapEdit {
         // daytime gate (a nap that overlaps the night reports "overlaps your sleep", not "not daytime").
         if let n = night, w.start < n.end && w.end > n.start { return .overlapsNight }
         for o in otherNaps where w.start < o.end && w.end > o.start { return .overlapsNap }
+        // Two-argument form on purpose: this validates a USER-ASSERTED window, which is complete by
+        // construction — there is no truncated onset to extrapolate, so the `onsetIsUnobserved:`
+        // overload has no meaning here.
         if SleepWindow.isOvernightBlock(start: w.start, end: w.end) { return .notDaytime }
         return nil
     }
