@@ -760,6 +760,63 @@ public enum BulkSleep {
     /// persisted. Capping the window to the latest `maxNightSpan` before the wake keeps it to one night.
     public static let maxNightSpan: TimeInterval = 14 * 3600
 
+    /// Floor on the hole that `onsetIsUnobserved` demands: below this a gap is ordinary recording
+    /// jitter, not missing data. Epoch cadence is 150 s (`BulkRecord.epochSeconds`), so contiguous
+    /// recording puts the predecessor one epoch back; 450 s is three epochs.
+    ///
+    /// ⚠️ This is NO LONGER the load-bearing test, and the "empty band" an earlier revision claimed for
+    /// it does not exist. 🟢 RE-MEASURED over the two Gen 2 Air exports of 2026-08-02 (AA55: 360 unique
+    /// records; 2F9F: 533): AA55's largest interior gap all day is 2532 s, and 2F9F has real gaps at
+    /// 190 / 300 / **450 / 450** / 600 / 600 / 900 / 1500 / 1800 s (the two exact-450 s ones are
+    /// 08-01 18:26:33 -> 18:34:03 and 08-02 06:31:48 -> 06:39:18). So the margin on the low side is
+    /// ZERO, not 23x, and gaps of 5–30 min are routine while the ring is worn. What actually keeps a
+    /// morning doze out is the SIZE requirement in `onsetIsUnobserved`, which scales with how much
+    /// data the presumption claims is missing and is measured in HOURS; this constant survives only as
+    /// a floor for the degenerate case where a block is already nearly as long as the presumed span
+    /// (there the size requirement falls to ~0 while the correction is all but inert anyway).
+    public static let onsetContiguityGap: TimeInterval = 3 * TimeInterval(BulkRecord.epochSeconds)
+
+    /// Whether `block`'s ONSET is genuinely absent from `records` — the first of the two gates on
+    /// presuming a 7 h night in `SleepWindow.isOvernightBlock(start:end:onsetIsUnobserved:)`. (The
+    /// second is the two-pass filter in `latestNightRecords`: the correction runs only when the plain
+    /// rule accepted nothing.)
+    ///
+    /// THE RULE: **you may only presume data that is actually missing.** Calling a `d`-long block the
+    /// tail of a `presumedTruncatedNightSpan` night asserts that `presumedTruncatedNightSpan - d` of
+    /// recording was lost, so require a hole back to the previous record at least that big. A 1.5 h
+    /// tail must clear 5.5 h of absence; a 4 h tail, 3 h. No record at all before the block (first-ever
+    /// sync, a wiped archive) is an unbounded hole and passes.
+    ///
+    /// This is deliberately self-scaling: the shorter the tail, the more the presumption claims, and
+    /// the more absence it must show for it. It is also what kills the reported false-positive class —
+    /// a late-morning doze sitting behind a 600 s gap presumes ~6 h that plainly IS in the archive.
+    ///
+    /// ⚠️ Judge this against the FULL archive union, never a night-scoped slice: a slice's leading edge
+    /// is an artefact of the scoping, not evidence of a hole. ⚠️ Also note the union-relative form
+    /// ("start == min(all records)") is WRONG and was measured to no-op on real devices — the 30 h
+    /// `EpochArchive` prunes relative to the NEWEST record, so yesterday's epochs survive and the
+    /// archive minimum is a full day before the night. A truncation is a HOLE; a hole is what this
+    /// looks for.
+    ///
+    /// ⚠️ KNOWN LIMITATION, stated rather than hidden: if the ring was ON the finger but not detecting
+    /// sleep for the first half of the night it still emits epochs, so there is no hole and no
+    /// correction. This gate only recovers nights whose first half was never RECORDED (missed drain,
+    /// re-pair, ring off the finger with the buffer since overwritten).
+    public static func onsetIsUnobserved(_ block: DateInterval,
+                                         in records: [BulkRecord],
+                                         epoch: Int = Command.syncEpoch) -> Bool {
+        // How much absence the presumption claims. Never below the jitter floor; zero (or negative)
+        // for a block already at/over the presumed span, where the `min` in `isOvernightBlock` makes
+        // the correction inert anyway.
+        let requiredHole = max(onsetContiguityGap,
+                               SleepWindow.presumedTruncatedNightSpan - block.duration)
+        guard let previous = records.map({ $0.date(epoch: epoch) })
+            .filter({ $0 < block.start }).max() else {
+            return true   // nothing before the block at all: an unbounded hole
+        }
+        return block.start.timeIntervalSince(previous) > requiredHole
+    }
+
     public static func latestNightRecords(from records: [BulkRecord],
                                           temperatures: [TemperatureSample] = [],
                                           epoch: Int = Command.syncEpoch) -> [BulkRecord] {
@@ -770,10 +827,38 @@ public enum BulkSleep {
                                                       temperatureSamples: temperatures,
                                                       heartRateSamples: heartRateTimeline(from: records, epoch: epoch),
                                                       sleepVitalTimes: sleepVitalTimeline(from: records, epoch: epoch))
-        let nights = periods.filter {
-            $0.activity == .sleep
-                && $0.duration > ActivityPeriod.minSleepDuration
-                && SleepWindow.isOvernightBlock(start: $0.start, end: $0.end)
+        let sleepBlocks = periods.filter {
+            $0.activity == .sleep && $0.duration > ActivityPeriod.minSleepDuration
+        }
+        // TWO-PASS. Pass 1 is HEAD's rule, unchanged. Pass 2 — the TRUNCATED-NIGHT CORRECTION — runs
+        // ONLY when pass 1 accepted nothing, which is exactly the reported bug (blank Sleep card,
+        // nothing in Apple Health) and nothing else.
+        //
+        // ⚠️ THE "ONLY WHEN EMPTY" IS LOAD-BEARING, not tidiness. `SleepWindow.isOvernightBlock`'s
+        // corrected form is never LESS accepting, but this function is not monotone in it, because a
+        // newly-accepted block can only push `anchor.end` LATER and everything downstream keys off
+        // `anchor`:
+        //   * ANCHOR EVICTION — `anchor` is the latest-ENDING night. A qualifying 11:25 -> 12:29 doze
+        //     outranks a real night ending 05:00, and 6 h 25 m > `maxIntraNightGap`, so the real night
+        //     is not even absorbed into the cluster: it is dropped outright.
+        //   * HEAD CLIPPING — `clusterStart` is floored at `anchor.end - maxNightSpan`, so moving the
+        //     anchor later moves the floor later by the same delta. A real 21:00 -> 05:00 night plus a
+        //     qualifying 10:20 -> 12:20 block moves the floor to 22:20 and silently drops 21:00–21:50.
+        //   * INFLATION — if the block IS within `maxIntraNightGap` it gets clustered INTO the night,
+        //     staging inflates, and `SleepSummaryMerge.shouldReplace` prefers the larger asleep total,
+        //     so the inflated night replaces the correct one permanently.
+        // Gating on "pass 1 found nothing" makes all three impossible BY CONSTRUCTION rather than by
+        // argument: whenever any real night exists, this function returns records byte-identical to
+        // HEAD's. Do not hoist the correction into a single filter.
+        var nights = sleepBlocks.filter { SleepWindow.isOvernightBlock(start: $0.start, end: $0.end) }
+        if nights.isEmpty {
+            nights = sleepBlocks.filter {
+                SleepWindow.isOvernightBlock(
+                    start: $0.start, end: $0.end,
+                    onsetIsUnobserved: onsetIsUnobserved(DateInterval(start: $0.start,
+                                                                      end: max($0.end, $0.start)),
+                                                         in: records, epoch: epoch))
+            }
         }
         guard let anchor = nights.max(by: { $0.end < $1.end }) else { return records }
         // Cluster the night: starting from the latest-ending overnight block, absorb EARLIER overnight
