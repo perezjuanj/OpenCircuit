@@ -73,6 +73,16 @@ public struct HistoryChannelTrace: Equatable, Codable, Sendable {
 
     public var recordsAdded: Int { max(recordsAtEnd - recordsAtStart, 0) }
     public var sawAnyPage: Bool { page4CCount > 0 || page47Count > 0 }
+
+    /// `firstOpcode` is stamped by the first frame seen AFTER this trace was installed. A healthy
+    /// attempt sees its OWN handshake first — `0x81` (auth challenge) or `0x82` (sync-open ACK). A
+    /// `0x4c` first means the ring was ALREADY mid-handoff when we started counting, i.e. pages were
+    /// in flight and uncounted before this drain existed.
+    ///
+    /// 🟢 This is the 2026-08-04 fingerprint (#188), present on BOTH testers' bundles and on no
+    /// other bundle in either export. Computed, NOT stored: adding a stored field here would break
+    /// every previously-persisted evidence bundle (see the `openWriteFailed` note above).
+    public var openedOntoLiveStream: Bool { firstOpcode == 0x4C }
     public var durationSeconds: TimeInterval? {
         guard let finishedAt else { return nil }
         return finishedAt.timeIntervalSince(startedAt)

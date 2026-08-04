@@ -371,6 +371,10 @@ final class RingSession: NSObject {
     /// flush have no BLE traffic — without this, iOS can suspend us mid-commit.
     private var drainAssertion: UIBackgroundTaskIdentifier = .invalid
     private var drainTraces: [HistoryChannelTrace] = []
+    /// This pass's channel traces, read-only. `performHistoryDrain` clears them at the head and
+    /// `finalizeSync` flips `syncing` at the tail, so an observer watching `syncing` go false sees
+    /// exactly this drain's traces (#188).
+    var lastDrainTraces: [HistoryChannelTrace] { drainTraces }
     private var activeDrainTrace: HistoryChannelTrace?
     private var historySyncTrigger = "foreground"
 
@@ -383,6 +387,46 @@ final class RingSession: NSObject {
     private var syncQuietTicks = 0      // seconds since the last page arrived
     private var drainSawPage = false    // a 0x47/0x4c page arrived since last check (live-enter drain)
     private var drainDone = false       // 0x50 end-of-history seen during live-enter drain
+
+    // MARK: Unattributed history pages (#188) — "if we ACK it, we KEEP it"
+    //
+    // The `0x4c` handler ACKs every page unconditionally (that ack is what keeps the ring
+    // streaming) but used to BANK a page only while `syncing || livePreparing`. Because
+    // `Command.pageAck4C` advances the ring's single resume pointer, a page acked outside that
+    // gate was consumed from the ring AND thrown away — silent, permanent loss.
+    //
+    // 🟢 MEASURED on two independent testers, both on 2026-08-04, on different hardware,
+    // firmware and timezones:
+    //   • Gen 2 / FR02.018 (ET): the ring streamed 208 contiguous records (00:15→08:53, 8.6 h) as
+    //     35 pages between 08:56:16 and 08:57:02, remaining-counter 202→0 unbroken. 174 records
+    //     were acked with no drain open and dropped; the night was reported as 1 h 25 m.
+    //   • Gen 2 Air / FR04.009 (Paris): 189 records (08-03 22:38→08-04 06:28, 7.8 h) streamed at
+    //     06:31:22; the app's first drain opened at 06:32:06.6 and banked 3. No summary at all.
+    // Both captures show the same shape: a `0x82` sync-open ACK that produced NO evidence bundle,
+    // then a ~10 s / 7-page `0x47` PPG preamble, then the history dump landing on a closed gate,
+    // then the real drain attaching mid-stream (`firstOpcode == 0x4c`).
+    //
+    // Retention is therefore NOT conditional any more. Pages that arrive with no drain open land
+    // here, are banked to the EpochArchive on a short quiet debounce (durability), and are ADOPTED
+    // by the next drain so the sample path and the sleep commit see them too.
+    /// The retention decision itself lives in `OpenCircuitKit.UnattributedPageBuffer` so the
+    /// "if we ACK it, we KEEP it" invariant is unit-testable off-device.
+    private var unattributedBuffer = UnattributedPageBuffer()
+    private var unattributedFlushTask: Task<Void, Never>?
+    /// Banked orphans not yet folded into a drain's `bulkRecords`.
+    private var pendingAdoption: [BulkRecord] = []
+    /// How many of the current `bulkRecords` came from `pendingAdoption` rather than this drain's
+    /// own wire traffic. Keeps `HistoryChannelTrace.recordsAdded` an honest measure of what THIS
+    /// attempt pulled, while still letting an adopted-only night commit.
+    private var adoptedRecordCount = 0
+    /// Wall-clock of the last inbound `0x4c`, whatever the drain state. Diagnostic witness for
+    /// "was the ring mid-handoff when this drain opened?" — the `firstOpcode == 0x4c` tell.
+    private(set) var lastHistoryPageAt: Date?
+    /// Same leak bound the buffer uses, applied to the post-bank adoption queue.
+    private static let unattributedRecordCap = UnattributedPageBuffer.defaultCap
+    /// Quiet window after the last orphaned page before banking. Longer than the ring's ~1 s
+    /// inter-page cadence so one burst banks once, short enough to survive an imminent teardown.
+    private static let unattributedFlushQuiet: Duration = .seconds(3)
 
     // MARK: OSA dense-PPG burst (#91)
     /// Raw `0x48` frames collected during the current store-and-forward burst. `0x48` is a
@@ -767,6 +811,11 @@ final class RingSession: NSObject {
         // reconnect-backoff window so the hint stays live while reconnecting.
         UserDefaults.standard.set(inferredCharging, forKey: Self.inferredChargingKey)
         flushDrainedToArchive()   // a sync may be in flight — bank its pages before we cancel it (#119)
+        // …and any orphaned pages the debounce hasn't banked yet (#188). Load-bearing: the session
+        // SWAP (`RingScanner.teardownSession` → a fresh `RingSession` while the peripheral stays
+        // connected) is exactly the window in which pages arrive with no drain open, so the buffer
+        // must not die with the session that collected it.
+        bankUnattributedRecords(restage: false)   // teardown — keep it cheap; next session re-stages
         monitorTask?.cancel(); monitorTask = nil
         keepaliveTask?.cancel(); keepaliveTask = nil
         autoMeasureTask?.cancel(); autoMeasureTask = nil
@@ -835,7 +884,9 @@ final class RingSession: NSObject {
         liveHRTrend.removeAll()   // fresh convergence window
         liveHRWarmup = nil
         flushDrainedToArchive()   // an in-flight sync just cancelled above — bank its pages before the wipe (#119)
+        bankUnattributedRecords() // …and any orphaned pages still buffered (#188)
         bulkRecords.removeAll()   // any pages we drain below land here (don't lose them)
+        adoptedRecordCount = 0    // this buffer is this path's own capture, nothing adopted (#188)
         bulkFinalized = false
         drainSawPage = false
         drainDone = false
@@ -2666,7 +2717,19 @@ final class RingSession: NSObject {
         let inBackground = UIApplication.shared.applicationState != .active
         if inBackground { beginDrainAssertion() }
         flushDrainedToArchive()                  // bank any pages a prior interrupted drain left uncommitted (#119)
+        bankUnattributedRecords(restage: false)  // …and any orphaned pages (adopted below, so no re-stage)
         bulkRecords.removeAll()
+        // ADOPT orphaned pages (#188). They are physically in hand and already durable in the
+        // archive, but `historySamples` and the sleep commit both run off `bulkRecords` — so without
+        // this an orphaned night would sit on disk and never reach Health or the summary. Adopted
+        // BEFORE `drainChannel` snapshots `recordsAtStart`, so `recordsAdded` stays an honest
+        // measure of what THIS attempt pulled off the wire.
+        adoptedRecordCount = pendingAdoption.count
+        bulkRecords = pendingAdoption
+        pendingAdoption.removeAll()
+        if adoptedRecordCount > 0 {
+            ringLog.notice("sync: adopted \(self.adoptedRecordCount) orphaned records into this drain (#188)")
+        }
         bulkFinalized = false                    // fresh capture — uncommitted until finalizeSync
         historySamples.removeAll()
         drainTraces.removeAll()
@@ -3029,7 +3092,12 @@ final class RingSession: NSObject {
         let sleepTrace = drainTraces.first { $0.label == "sleep" }
         let sleepOutcome = sleepTrace?.outcome
         let sleepCanCommit = sleepOutcome?.allowsSleepCommit ?? false
-        let sleepHasFreshRecords = (sleepTrace?.recordsAdded ?? 0) > 0
+        // An ADOPTED orphan set counts as fresh records too (#188): those epochs reached the phone on
+        // this connection and are already in the archive union above — they are simply older than
+        // this attempt's own trace. Without this, a drain that adopts a full night but pulls nothing
+        // new off the wire would classify `recordsAdded == 0` and skip the re-stage, leaving the
+        // rescued night on disk behind a truncated summary (the Gen 2 Air tester's exact case).
+        let sleepHasFreshRecords = (sleepTrace?.recordsAdded ?? 0) > 0 || adoptedRecordCount > 0
         // TEMP DIAGNOSTIC (sleep-empty investigation): pinpoint which stage of the staging pipeline
         // loses the night — archive union size, the night-scoped slice `latestNightRecords` picked,
         // and whether `mainSleep`'s motion-based block detector finds anything at all in that slice.
@@ -3098,6 +3166,11 @@ final class RingSession: NSObject {
         persist(historySamples)   // auto-persist HR/HRV/SpO2 for the dashboard
         recordHistorySyncEvidence(sleepCommitted: committedSleep)
         bulkFinalized = true      // committed — the stop-time safety net can skip these records
+        // Consume the adoption credit (#188). `commitDrainedRecords` has three call sites
+        // (`finalizeSync`, `startLiveMonitoring`, `stopLiveMonitoring`); leaving this set would let a
+        // LATER commit with no fresh records inherit a stale "has fresh records" and re-stage a night
+        // it never pulled — exactly the kind of unearned commit `allowsSleepCommit` exists to block.
+        adoptedRecordCount = 0
     }
 
     /// Durably merge any not-yet-committed drained pages into the persisted EpochArchive BEFORE they're
@@ -3112,6 +3185,54 @@ final class RingSession: NSObject {
         guard !bulkRecords.isEmpty, !bulkFinalized else { return }
         _ = epochArchiveStore.merge(bulkRecords)
         ringLog.notice("sync: flushed \(self.bulkRecords.count) uncommitted page-records to archive before teardown")
+    }
+
+    /// Hold a `0x4c` page that arrived with NO drain open (#188). We have already acked it — the ring
+    /// has dropped its copy — so the ONLY correct action is to keep it. Banking is debounced so one
+    /// burst costs one archive write, and capped so a pathological stream can't grow unbounded.
+    private func retainUnattributedPage(_ records: [BulkRecord]) {
+        guard !records.isEmpty else { return }
+        if unattributedBuffer.retain(records) {   // cap reached → bank now, never drop
+            bankUnattributedRecords()
+            return
+        }
+        unattributedFlushTask?.cancel()
+        unattributedFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.unattributedFlushQuiet)
+            guard !Task.isCancelled else { return }
+            self?.bankUnattributedRecords()
+        }
+    }
+
+    /// Durably bank orphaned pages and surface them as a night. `EpochArchive.merge` dedups by
+    /// counter (idempotent) and `saveSleepSummary` is merge-protected (`SleepSummaryMerge`), so this
+    /// can only ever GROW a stored night, never shrink one.
+    ///
+    /// The `restageFromArchive()` at the end is what actually rescues the user-visible summary: when
+    /// NO drain follows (the Gen 2 Air tester's 06:31 case — her only drain banked 3 records) the
+    /// archive would otherwise hold a full night behind a summary that never got recomputed. It is
+    /// skipped while `syncing`, because the in-flight drain's own `commitDrainedRecords` will stage
+    /// the union anyway and re-staging underneath it would churn the card (`sleep-shrinks-per-sync`).
+    ///
+    /// `restage: false` is for callers that are ABOUT to stage anyway (`performHistoryDrain`, which
+    /// adopts these records one line later) or that must stay cheap (`invalidate`, mid-teardown —
+    /// the records are durable in the archive and the next session's `restageFromArchive` surfaces
+    /// them). Banking itself is never optional.
+    private func bankUnattributedRecords(restage: Bool = true) {
+        unattributedFlushTask?.cancel(); unattributedFlushTask = nil
+        guard !unattributedBuffer.isEmpty else { return }
+        let pages = unattributedBuffer.pages
+        let banked = unattributedBuffer.drain()
+        _ = epochArchiveStore.merge(banked)          // durability NOW — survives session teardown
+        pendingAdoption += banked                    // sample path + sleep commit on the next drain
+        if pendingAdoption.count > Self.unattributedRecordCap {
+            pendingAdoption.removeFirst(pendingAdoption.count - Self.unattributedRecordCap)
+        }
+        let detail = "banked=\(banked.count) pages=\(pages) syncing=\(syncing) monitoring=\(monitoring)"
+        observability.recordMetricEvent(source: "history-orphan", detail: detail)
+        ringLog.notice("sync: banked \(banked.count) UNATTRIBUTED 0x4c records from \(pages) pages — arrived with no drain open (#188)")
+        print("[OC] sync ORPHAN banked=\(banked.count) pages=\(pages)")
+        if restage, !syncing { restageFromArchive() }
     }
 
     /// Re-stage last night from the PERSISTED archive union (not the in-memory drain slice) and refresh
@@ -3712,10 +3833,19 @@ extension RingSession: CBPeripheralDelegate {
                 return
             case 0x4C:
                 self.drainSawPage = true
+                self.lastHistoryPageAt = Date()
+                // RETAIN WHATEVER WE ACK (#188). `write(Command.pageAck4C)` below is UNCONDITIONAL
+                // and that ack advances the ring's single resume pointer, so a page dropped here can
+                // NEVER be re-offered. Any state in which the ack and the retention disagree is
+                // silent, permanent data loss — it cost two testers a whole night each on
+                // 2026-08-04. See `unattributedBuffer` for the measured evidence.
+                let pageRecords = BulkSleep.records(fromPage: bytes)
                 if self.syncing || self.livePreparing {   // keep records during a sync OR a live-enter drain
-                    self.bulkRecords += BulkSleep.records(fromPage: bytes)
+                    self.bulkRecords += pageRecords
                     self.syncQuietTicks = 0
                     if self.syncing { self.activeDrainPageCount += 1 }
+                } else {
+                    self.retainUnattributedPage(pageRecords)
                 }
                 ringLog.debug("← 0x4c sleep page (\(bytes.count)B) → records=\(self.bulkRecords.count), ack")
                 self.write(Command.pageAck4C)
