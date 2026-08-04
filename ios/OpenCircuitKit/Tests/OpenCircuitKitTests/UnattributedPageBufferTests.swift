@@ -97,11 +97,17 @@ final class UnattributedPageBufferTests: XCTestCase {
         XCTAssertEqual(pages.count, 35, "35 pages, as the ring sent")
         XCTAssertEqual(pages.filter { $0.count == 142 }.count, 34, "34 × 142 B six-record pages")
         XCTAssertEqual(pages.last?.count, 96, "terminal page is 96 B = 4 records")
-        for p in pages {
-            XCTAssertTrue(Frame.isValid(p), "every synthesized page carries a valid XOR trailer")
-        }
         let decoded = pages.flatMap { BulkSleep.records(fromPage: $0) }
-        XCTAssertEqual(decoded.count, 208)
+        XCTAssertEqual(decoded.count, 208, "every page really parses through Frame.parse's XOR check")
+
+        // A trailer check against our OWN builder is tautological (the builder appends
+        // `Frame.xorTrailer`), so assert it has teeth instead: corrupt a byte and require the real
+        // decoder to reject the page.
+        var corrupt = try XCTUnwrap(pages.first)
+        corrupt[10] ^= 0xFF
+        XCTAssertFalse(Frame.isValid(corrupt))
+        XCTAssertTrue(BulkSleep.records(fromPage: corrupt).isEmpty,
+                      "a corrupted page must decode to nothing, not to garbage epochs")
     }
 
     // MARK: - the regression
@@ -150,9 +156,9 @@ final class UnattributedPageBufferTests: XCTestCase {
         XCTAssertEqual(Double(span) / 3600.0, 8.625, accuracy: 0.001)
     }
 
-    /// The Gen 2 Air shape: the drain banks almost nothing of its own, so the night exists ONLY if
-    /// the adopted orphans are treated as committable. This is what `sleepHasFreshRecords ||
-    /// adoptedRecordCount > 0` protects in `commitDrainedRecords`.
+    /// The Gen 2 Air shape at the RECORD level: 204 orphans + a 4-record drain still union into one
+    /// whole night. (The staging DECISION for this shape is asserted separately, in
+    /// `HistoryCommitGateTests` — this test only proves the records survive.)
     func testAdoptedOnlyNightIsStillAWholeNight() throws {
         let pages = try nightPages()
         var buffer = UnattributedPageBuffer()

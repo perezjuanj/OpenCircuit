@@ -742,12 +742,17 @@ struct ContentView: View {
         let traces = session?.lastDrainTraces ?? []
         let pages = traces.reduce(0) { $0 + $1.page4CCount + $1.page47Count }
         let records = traces.reduce(0) { $0 + $1.recordsAdded }
+        // Adoption is deliberately excluded from `recordsAdded`, so read it separately — otherwise a
+        // drain that rescues a whole night off the unattributed buffer while pulling nothing new
+        // logs "ring returned no history", which is the opposite of what happened (#188).
+        let adopted = session?.lastAdoptedRecordCount ?? 0
         let ranADrain = !traces.isEmpty
         var detail: String
         if !ranADrain {
             detail = "session replaced — no drain ran"
-        } else if pages > 0 || records > 0 {
+        } else if pages > 0 || records > 0 || adopted > 0 {
             detail = "synced from ring — \(records) epochs, \(pages) pages"
+            if adopted > 0 { detail += " (+\(adopted) adopted)" }
         } else {
             detail = "ring returned no history ("
                 + traces.map { "\($0.label)=\($0.outcome.rawValue)" }.joined(separator: " ") + ")"

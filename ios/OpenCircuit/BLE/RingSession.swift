@@ -375,6 +375,12 @@ final class RingSession: NSObject {
     /// `finalizeSync` flips `syncing` at the tail, so an observer watching `syncing` go false sees
     /// exactly this drain's traces (#188).
     var lastDrainTraces: [HistoryChannelTrace] { drainTraces }
+    /// Records the last drain ADOPTED from the unattributed buffer. Deliberately excluded from
+    /// `HistoryChannelTrace.recordsAdded` (which must stay an honest measure of what a drain pulled
+    /// off the wire), so the activity log reads it separately (#188). Distinct from the live
+    /// `adoptedRecordCount` credit, which `commitDrainedRecords` CONSUMES — this one survives for
+    /// reporting, since the log row is written after the commit.
+    private(set) var lastAdoptedRecordCount = 0
     private var activeDrainTrace: HistoryChannelTrace?
     private var historySyncTrigger = "foreground"
 
@@ -419,9 +425,10 @@ final class RingSession: NSObject {
     /// own wire traffic. Keeps `HistoryChannelTrace.recordsAdded` an honest measure of what THIS
     /// attempt pulled, while still letting an adopted-only night commit.
     private var adoptedRecordCount = 0
-    /// Wall-clock of the last inbound `0x4c`, whatever the drain state. Diagnostic witness for
-    /// "was the ring mid-handoff when this drain opened?" — the `firstOpcode == 0x4c` tell.
-    private(set) var lastHistoryPageAt: Date?
+    /// When the current orphan buffer started filling — bounds the total hold, not just the quiet gap.
+    private var unattributedFirstRetainedAt: Date?
+    /// Longest an acked-but-unbanked page may sit in volatile memory before a forced bank.
+    private static let unattributedMaxHold: TimeInterval = 10
     /// Same leak bound the buffer uses, applied to the post-bank adoption queue.
     private static let unattributedRecordCap = UnattributedPageBuffer.defaultCap
     /// Quiet window after the last orphaned page before banking. Longer than the ring's ~1 s
@@ -2725,6 +2732,7 @@ final class RingSession: NSObject {
         // BEFORE `drainChannel` snapshots `recordsAtStart`, so `recordsAdded` stays an honest
         // measure of what THIS attempt pulled off the wire.
         adoptedRecordCount = pendingAdoption.count
+        lastAdoptedRecordCount = adoptedRecordCount   // survives the commit-time consume, for the log
         bulkRecords = pendingAdoption
         pendingAdoption.removeAll()
         if adoptedRecordCount > 0 {
@@ -3091,13 +3099,13 @@ final class RingSession: NSObject {
         let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temps)
         let sleepTrace = drainTraces.first { $0.label == "sleep" }
         let sleepOutcome = sleepTrace?.outcome
-        let sleepCanCommit = sleepOutcome?.allowsSleepCommit ?? false
-        // An ADOPTED orphan set counts as fresh records too (#188): those epochs reached the phone on
-        // this connection and are already in the archive union above — they are simply older than
-        // this attempt's own trace. Without this, a drain that adopts a full night but pulls nothing
-        // new off the wire would classify `recordsAdded == 0` and skip the re-stage, leaving the
-        // rescued night on disk behind a truncated summary (the Gen 2 Air tester's exact case).
-        let sleepHasFreshRecords = (sleepTrace?.recordsAdded ?? 0) > 0 || adoptedRecordCount > 0
+        // The staging decision lives in `OpenCircuitKit.HistoryCommitGate` so its two rules — the
+        // conservative "only a `.complete` drain may overwrite a stored night" and the #188
+        // adopted-night rescue — are asserted by tests rather than inferred from this call site.
+        let commitDecision = HistoryCommitGate.decide(
+            outcome: sleepOutcome,
+            recordsAdded: sleepTrace?.recordsAdded ?? 0,
+            adoptedRecordCount: adoptedRecordCount)
         // TEMP DIAGNOSTIC (sleep-empty investigation): pinpoint which stage of the staging pipeline
         // loses the night — archive union size, the night-scoped slice `latestNightRecords` picked,
         // and whether `mainSleep`'s motion-based block detector finds anything at all in that slice.
@@ -3138,7 +3146,7 @@ final class RingSession: NSObject {
         // Sleep staging + persistence are conservative: a partial / PPG-only / no-ack sleep drain
         // must NOT overwrite a fuller stored night. We still keep the raw records + scalar samples.
         var committedSleep = false
-        if sleepCanCommit, sleepHasFreshRecords {
+        if commitDecision == .stage {
             sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)   // wear gate (#41)
             stagedSegments = overnightStagedSegments(from: nightRecords, archive: union)   // overnight gate (review #1)
             persistSleepAndSteps(nightRecords: nightRecords)   // summary + extras from the stitched night
@@ -3150,10 +3158,16 @@ final class RingSession: NSObject {
             ringLog.notice("sleep-persist: saved coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count) segments to archive (survives teardown)")
             print("[OC] sleep COMMITTED coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count)")
             committedSleep = true
-        } else if let sleepOutcome {
-            let detail = "outcome=\(sleepOutcome.rawValue) recordsAdded=\(sleepTrace?.recordsAdded ?? 0) 4c=\(sleepTrace?.page4CCount ?? 0) 47=\(sleepTrace?.page47Count ?? 0) 50=\(sleepTrace?.endMarkerCount ?? 0)"
-            observability.recordMetricEvent(source: "sleep-sync", detail: detail)
-            ringLog.notice("sleep: skip re-stage/persist — \(detail, privacy: .public)")
+        } else {
+            if let sleepOutcome {
+                let detail = "outcome=\(sleepOutcome.rawValue) recordsAdded=\(sleepTrace?.recordsAdded ?? 0) 4c=\(sleepTrace?.page4CCount ?? 0) 47=\(sleepTrace?.page47Count ?? 0) 50=\(sleepTrace?.endMarkerCount ?? 0) decision=\(commitDecision.rawValue)"
+                observability.recordMetricEvent(source: "sleep-sync", detail: detail)
+                ringLog.notice("sleep: skip re-stage/persist — \(detail, privacy: .public)")
+            }
+            if commitDecision == .restageFromArchive {
+                ringLog.notice("sleep: this drain may not stage its own slice, but \(self.adoptedRecordCount) adopted records are in the archive — re-staging from the union (#188)")
+                restageFromArchive()
+            }
         }
         // TEMP DIAGNOSTIC (HR-not-recording investigation): how many of THIS drain's raw records
         // decoded a valid HR (byte[4]) vs how many HR samples that produced, BEFORE ingest. If this
@@ -3192,7 +3206,19 @@ final class RingSession: NSObject {
     /// burst costs one archive write, and capped so a pathological stream can't grow unbounded.
     private func retainUnattributedPage(_ records: [BulkRecord]) {
         guard !records.isEmpty else { return }
+        if unattributedFirstRetainedAt == nil { unattributedFirstRetainedAt = Date() }
         if unattributedBuffer.retain(records) {   // cap reached → bank now, never drop
+            bankUnattributedRecords()
+            return
+        }
+        // The debounce re-arms on EVERY page, so a continuous handoff (both testers' rings streamed
+        // for ~40 s straight) would otherwise hold ALREADY-ACKED records in volatile memory for the
+        // whole burst + 3 s, with no background assertion protecting it. Bound the total window too:
+        // once the buffer is older than `unattributedMaxHold`, bank what we have and start a new
+        // window. Banking is idempotent (EpochArchive dedups by counter), so splitting one burst
+        // across two banks costs nothing. (#188 review)
+        if let first = unattributedFirstRetainedAt,
+           Date().timeIntervalSince(first) >= Self.unattributedMaxHold {
             bankUnattributedRecords()
             return
         }
@@ -3223,8 +3249,23 @@ final class RingSession: NSObject {
         guard !unattributedBuffer.isEmpty else { return }
         let pages = unattributedBuffer.pages
         let banked = unattributedBuffer.drain()
+        unattributedFirstRetainedAt = nil            // a fresh hold window starts with the next page
         _ = epochArchiveStore.merge(banked)          // durability NOW — survives session teardown
-        pendingAdoption += banked                    // sample path + sleep commit on the next drain
+        // Convert to vitals samples HERE, not at adoption (#188 review). `BulkSleep.samples` has
+        // exactly one other call site — `commitDrainedRecords`, off `bulkRecords` — and
+        // `pendingAdoption` is in-memory session state that `invalidate()` cannot carry across a
+        // session SWAP, which is the very window these pages arrive in. Without this, a swap between
+        // the bank and the next drain leaves a whole night of HR/HRV/SpO₂/RR durable in the archive
+        // but permanently absent from LocalStore, Trends and Health — `restageFromArchive` writes
+        // only the sleep summary and deliberately leaves `historySamples` alone.
+        //
+        // Uses the LAST DECIDED pooling verdict rather than recomputing: a banked slice is far too
+        // short to judge HRV pooling on (#185), and banking is not a commit, so it must not move the
+        // stored verdict. `persist` dedups through the forward-only SyncCursor, so the adoption path
+        // re-persisting these same epochs later is a no-op.
+        let bankVerdict = epochArchiveStore.loadHRVPoolingVerdict() ?? .noEvidence
+        persist(BulkSleep.samples(from: banked, verdict: bankVerdict))
+        pendingAdoption += banked                    // sleep-commit credit on the next drain
         if pendingAdoption.count > Self.unattributedRecordCap {
             pendingAdoption.removeFirst(pendingAdoption.count - Self.unattributedRecordCap)
         }
@@ -3833,7 +3874,16 @@ extension RingSession: CBPeripheralDelegate {
                 return
             case 0x4C:
                 self.drainSawPage = true
-                self.lastHistoryPageAt = Date()
+                // A page arriving AFTER a commit starts a FRESH batch. `commitDrainedRecords` sets
+                // `bulkFinalized = true` without clearing `bulkRecords`, and `livePreparing` stays
+                // true for ~750 ms afterwards — so without this reset, a page landing in that window
+                // is appended to an already-finalized buffer that BOTH rescue paths skip
+                // (`flushDrainedToArchive` and `stopLiveMonitoring` guard on `!bulkFinalized`),
+                // making it unrescuable. Pre-existing, same loss class. (#188 review)
+                if self.bulkFinalized, self.syncing || self.livePreparing {
+                    self.bulkRecords.removeAll()     // already committed + merged into the archive
+                    self.bulkFinalized = false
+                }
                 // RETAIN WHATEVER WE ACK (#188). `write(Command.pageAck4C)` below is UNCONDITIONAL
                 // and that ack advances the ring's single resume pointer, so a page dropped here can
                 // NEVER be re-offered. Any state in which the ack and the retention disagree is
