@@ -26,6 +26,11 @@ struct DeviceInfoView: View {
     @State private var diagnosticsError: String?
     @State private var showRepairImporter = false
     @State private var repairResult: String?
+    /// Set when the picked export's ring identity doesn't match this one — the merge waits on an
+    /// explicit confirmation rather than silently polluting a per-ring archive.
+    @State private var pendingForeignImport: (DiagnosticsFrameImport.Result, String, String)?
+    /// A real export with the 1500-frame cap is well under 1 MB.
+    private static let maxRepairFileBytes = 8 * 1_000_000
     /// Confirmation gate for airplane mode — it turns the ring's radio off and drops the link (#96).
     @State private var showAirplaneConfirm = false
 
@@ -286,6 +291,22 @@ struct DeviceInfoView: View {
                  + "Repair reads an older diagnostics file from this ring and restores any sleep epochs "
                  + "it contains that are missing from the app. It only ever adds data.")
         }
+        .alert("Different ring?", isPresented: Binding(
+            get: { pendingForeignImport != nil },
+            set: { if !$0 { pendingForeignImport = nil } })) {
+            Button("Cancel", role: .cancel) { pendingForeignImport = nil }
+            Button("Import anyway", role: .destructive) {
+                if let (parsed, _, _) = pendingForeignImport, let session {
+                    applyRepair(parsed, session: session)
+                }
+                pendingForeignImport = nil
+            }
+        } message: {
+            if let (_, from, mine) = pendingForeignImport {
+                Text("That file looks like it came from \(from), but this ring is \(mine). "
+                     + "Importing it would mix another ring's history into this one.")
+            }
+        }
         .fileImporter(isPresented: $showRepairImporter,
                       allowedContentTypes: [.plainText, .text, .data],
                       allowsMultipleSelection: false) { result in
@@ -299,12 +320,20 @@ struct DeviceInfoView: View {
     private func repairFromDiagnostics(_ result: Swift.Result<[URL], Error>) {
         repairResult = nil
         diagnosticsError = nil
+        pendingForeignImport = nil
         guard let session else { return }
         do {
             guard let url = try result.get().first else { return }
-            // Security-scoped: the picked file lives outside our container.
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            // The picker accepts any file, so guard the size BEFORE reading it whole into memory on
+            // the main actor. A real export (1500-frame cap) is well under 1 MB (#188 review).
+            if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+               size > Self.maxRepairFileBytes {
+                diagnosticsError = "That file is too large to be a diagnostics export "
+                    + "(\(size / 1_000_000) MB). Pick the .txt this app produced."
+                return
+            }
             let text = try String(contentsOf: url, encoding: .utf8)
             let parsed = DiagnosticsFrameImport.records(fromDiagnosticsText: text)
             guard !parsed.isEmpty else {
@@ -313,17 +342,47 @@ struct DeviceInfoView: View {
                     : "Found \(parsed.pagesSeen) frames but none decoded (\(parsed.pagesRejected) rejected). Nothing imported."
                 return
             }
-            let added = session.repairFromRecoveredRecords(parsed.records)
-            let span = parsed.coverage.map {
-                let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"
-                return " (\(f.string(from: $0.lowerBound)) → \(f.string(from: $0.upperBound)))"
-            } ?? ""
-            repairResult = added > 0
-                ? "Recovered \(added) epochs\(span) from \(parsed.pagesSeen) frames. Sleep has been re-staged."
-                : "All \(parsed.records.count) epochs in that file were already in the app — nothing was missing."
+            // RING IDENTITY. The archive is per-ring; merging another ring's (or another person's)
+            // export would silently corrupt this one's history with no way to tell afterwards. The
+            // check is conservative — unknown on either side is NOT a match — so an older export
+            // without a device header prompts rather than merging blind (#188 review).
+            let mine = session.sourceRingIdentity
+            if !parsed.sourceRing.matches(mine) {
+                pendingForeignImport = (parsed, describe(parsed.sourceRing), describe(mine))
+                return
+            }
+            applyRepair(parsed, session: session)
         } catch {
             diagnosticsError = "Couldn't read that file: \(error.localizedDescription)"
         }
+    }
+
+    private func applyRepair(_ parsed: DiagnosticsFrameImport.Result, session: RingSession) {
+        let outcome = session.repairFromRecoveredRecords(parsed.records)
+        let span = parsed.coverage.map {
+            let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"
+            return " (\(f.string(from: $0.lowerBound)) → \(f.string(from: $0.upperBound)))"
+        } ?? ""
+        var msg: String
+        if outcome.added > 0 {
+            msg = "Recovered \(outcome.added) epochs\(span) from \(parsed.pagesSeen) frames."
+            msg += outcome.restagedNights > 0
+                ? " Re-staged \(outcome.restagedNights) night\(outcome.restagedNights == 1 ? "" : "s")."
+                : " Nothing to re-stage."
+        } else {
+            msg = "All \(parsed.records.count) epochs in that file were already in the app."
+        }
+        // Never claim success for records the 30 h retention refused to keep.
+        if outcome.agedOut > 0 {
+            msg += " \(outcome.agedOut) were too old to store (the app keeps ~30 hours of raw epochs) "
+                + "and could not be recovered."
+        }
+        repairResult = msg
+    }
+
+    private func describe(_ r: DiagnosticsFrameImport.SourceRing) -> String {
+        let parts = [r.model, r.firmware, r.macSuffix.map { "…\($0)" }].compactMap { $0 }
+        return parts.isEmpty ? "an unknown ring" : parts.joined(separator: " · ")
     }
 
     /// Build the diagnostics bundle, write it to a temp file, and present the share sheet.

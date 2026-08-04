@@ -59,8 +59,15 @@ public enum SleepEdit {
     /// So `dataCoverage` — the span of epochs we actually HOLD for this night — may widen the
     /// bounds outward, capped at `maxNightSpan`. The guarantee that survives: an edit may only
     /// reach where the ring has data or within the parity margin, never into open space.
+    /// - Parameter existingEdit: the night's already-SAVED edited window, if any. Always inside the
+    ///   returned bounds. `dataCoverage` can legitimately CONTRACT — `EpochArchive` prunes anything
+    ///   older than 30 h behind its newest record — so without this, re-opening an edited night days
+    ///   later could return bounds that no longer contain the user's own saved times, and
+    ///   `EditSleepView.init`'s clamp would silently drag them inward (a Save then "corrects" a night
+    ///   the user had already corrected). Applied AFTER the caps so it can never be trimmed away.
     public static func bounds(recordedOnset: Date, recordedWake: Date,
                               dataCoverage: ClosedRange<Date>? = nil,
+                              existingEdit: ClosedRange<Date>? = nil,
                               maxNightSpan: TimeInterval = defaultMaxNightSpan) -> Bounds {
         let floorEarliest = recordedOnset.addingTimeInterval(-editMargin)
         let floorLatest = recordedWake.addingTimeInterval(editMargin)
@@ -70,10 +77,33 @@ public enum SleepEdit {
             earliest = min(earliest, coverage.lowerBound)
             latest = max(latest, coverage.upperBound)
         }
-        // Cap the total span. Trim from the EARLY side (a truncated night loses its beginning, so
-        // that is the side worth keeping wide), but never tighter than the parity floor.
-        if latest.timeIntervalSince(earliest) > maxNightSpan {
-            earliest = min(floorEarliest, max(earliest, latest.addingTimeInterval(-maxNightSpan)))
+        // ⚠️ BOTH CAPS ARE ANCHORED ON THE *FLOOR*, NEVER ON THE COVERAGE-WIDENED EDGE. Do not
+        // "simplify" either line to use `latest`/`earliest` after widening.
+        //
+        // The first draft capped the early edge with `latest.addingTimeInterval(-maxNightSpan)`,
+        // where `latest` had already been widened to `coverage.upperBound`. On a worn ring the
+        // all-day channel keeps feeding the archive, so `coverage.upperBound` tracks WALL-CLOCK NOW
+        // — which made the editable window a 14 h span TRAILING the current time. Adversarial review
+        // MEASURED the result on the exact night this fix exists for (recorded 07:30–08:55, true
+        // bedtime 00:15): reachable if edited at 09:00, still reachable at 14:00, GONE by 15:00, and
+        // by 19:00 `earliest` was back to 04:30 — bit-identical to the bug the user reported. The fix
+        // silently expired a few hours after wake.
+        //
+        // Anchoring on the floor makes both edges time-invariant, which also makes `bounds` MONOTONE
+        // in coverage: growing the archive can only ever widen, never contract. That monotonicity is
+        // load-bearing for two more failures review found — a drain landing while the sheet is open
+        // could otherwise make Save reject a time the picker had offered, and re-opening an edited
+        // night could clamp the user's own stored edit inward.
+        earliest = min(floorEarliest, max(earliest, floorLatest.addingTimeInterval(-maxNightSpan)))
+        // Now cap the LATE edge too — the first draft never did, so the "one plausible night" claim
+        // was not actually enforced and a sheet opened in the evening would accept "I slept until
+        // 19:00" (`recompute` credits a user extension as core sleep).
+        latest = max(floorLatest, min(latest, earliest.addingTimeInterval(maxNightSpan)))
+        // A night the user has ALREADY edited must always remain fully selectable. Deliberately
+        // outside the caps above.
+        if let existing = existingEdit {
+            earliest = min(earliest, existing.lowerBound)
+            latest = max(latest, existing.upperBound)
         }
         return Bounds(earliest: earliest, latest: latest)
     }
@@ -140,9 +170,10 @@ public enum SleepEdit {
     /// window, not to the longer in-bed envelope.
     public static func validate(_ times: Times, recordedOnset: Date, recordedWake: Date,
                                 minDuration: TimeInterval = 0,
-                                dataCoverage: ClosedRange<Date>? = nil) -> Invalid? {
+                                dataCoverage: ClosedRange<Date>? = nil,
+                                existingEdit: ClosedRange<Date>? = nil) -> Invalid? {
         let b = bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
-                       dataCoverage: dataCoverage)
+                       dataCoverage: dataCoverage, existingEdit: existingEdit)
         if times.sleepOnset < times.inBedStart { return .onsetBeforeBedtime }
         if times.sleepWake <= times.sleepOnset { return .wakeNotAfterOnset }
         if times.inBedStart < b.earliest { return .startBeforeEarliest }
@@ -155,9 +186,11 @@ public enum SleepEdit {
 
     public static func isValid(_ times: Times, recordedOnset: Date, recordedWake: Date,
                                minDuration: TimeInterval = 0,
-                               dataCoverage: ClosedRange<Date>? = nil) -> Bool {
+                               dataCoverage: ClosedRange<Date>? = nil,
+                               existingEdit: ClosedRange<Date>? = nil) -> Bool {
         validate(times, recordedOnset: recordedOnset, recordedWake: recordedWake,
-                 minDuration: minDuration, dataCoverage: dataCoverage) == nil
+                 minDuration: minDuration, dataCoverage: dataCoverage,
+                 existingEdit: existingEdit) == nil
     }
 
     /// Validate a proposed window against the recorded onset/wake bounds. Returns nil when valid.

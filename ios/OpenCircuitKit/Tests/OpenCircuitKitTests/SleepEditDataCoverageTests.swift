@@ -84,6 +84,93 @@ final class SleepEditDataCoverageTests: XCTestCase {
         XCTAssertEqual(cov.upperBound, d(4, 8, 53))
     }
 
+    // MARK: - composition: dataCoverage → bounds (what production actually does)
+
+    /// Every earlier `bounds` test hand-built a coverage range. Production always feeds
+    /// `dataCoverage(recordDates:)` — over the WHOLE archive, which on a worn ring keeps growing
+    /// through the day — straight into `bounds`. That composition is where the first draft failed.
+    private func archiveDates(from start: Date, to end: Date) -> [Date] {
+        var out: [Date] = []
+        var t = start
+        while t <= end { out.append(t); t = t.addingTimeInterval(150) }
+        return out
+    }
+
+    /// THE REGRESSION. The first draft capped the early edge against the coverage-widened `latest`,
+    /// which tracks wall-clock now — so the editable window trailed the clock and the fix expired a
+    /// few hours after wake. Sweep the time-of-edit across the whole day; the early bound must not
+    /// move, and the real 00:15 bedtime must stay reachable at every hour.
+    func testBoundsDoNotMoveAsTheDayGoesOn() {
+        let trueBedtime = d(4, 0, 15)
+        var earliestSeen: Set<Date> = []
+        for hour in [9, 11, 13, 15, 18, 21, 23] {
+            let dates = archiveDates(from: d(3, 12, 0), to: d(4, hour, 0))
+            let coverage = SleepEdit.dataCoverage(recordDates: dates,
+                                                  recordedOnset: recordedOnset,
+                                                  recordedWake: recordedWake)
+            let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
+                                     dataCoverage: coverage)
+            earliestSeen.insert(b.earliest)
+            XCTAssertLessThanOrEqual(b.earliest, trueBedtime,
+                                     "editing at \(hour):00 must still reach the real bedtime")
+        }
+        XCTAssertEqual(earliestSeen.count, 1,
+                       "bounds.earliest must be time-invariant, not a window trailing the clock")
+    }
+
+    /// The late edge must be capped too, or an evening edit could assert "I slept until 19:00" —
+    /// `recompute` credits a user extension as core sleep.
+    func testLateEdgeIsCappedAtOneNightSpan() {
+        let dates = archiveDates(from: d(3, 12, 0), to: d(4, 21, 0))
+        let coverage = SleepEdit.dataCoverage(recordDates: dates,
+                                              recordedOnset: recordedOnset, recordedWake: recordedWake)
+        let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
+                                 dataCoverage: coverage)
+        XCTAssertLessThanOrEqual(b.latest.timeIntervalSince(b.earliest), SleepEdit.defaultMaxNightSpan)
+        XCTAssertLessThan(b.latest, d(4, 19, 0), "must not let the user claim sleep into the evening")
+    }
+
+    // MARK: - rules that must not be deletable without a test failing
+
+    /// Pins the parity FLOOR inside the cap. With a long recorded night the cap arithmetic would
+    /// otherwise be free to push `earliest` later than onset − 3 h.
+    func testParityFloorSurvivesTheCapOnALongNight() {
+        let onset = d(3, 22, 0), wake = d(4, 8, 0)          // a 10 h night
+        let noCoverage = SleepEdit.bounds(recordedOnset: onset, recordedWake: wake)
+        XCTAssertEqual(noCoverage.earliest, d(3, 19, 0), "exactly onset − 3 h")
+        XCTAssertEqual(noCoverage.latest, d(4, 11, 0), "exactly wake + 3 h")
+
+        let wide = SleepEdit.bounds(recordedOnset: onset, recordedWake: wake,
+                                    dataCoverage: d(2, 20, 0)...d(4, 20, 0))
+        XCTAssertLessThanOrEqual(wide.earliest, d(3, 19, 0), "floor is a floor — widening only adds")
+        XCTAssertGreaterThanOrEqual(wide.latest, d(4, 11, 0))
+    }
+
+    /// A saved edit must stay selectable even after retention prunes the coverage that allowed it.
+    func testAnAlreadySavedEditIsAlwaysStillSelectable() {
+        let saved = d(4, 0, 15)...d(4, 8, 53)
+        let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
+                                 dataCoverage: nil, existingEdit: saved)   // coverage fully pruned
+        XCTAssertLessThanOrEqual(b.earliest, saved.lowerBound)
+        XCTAssertGreaterThanOrEqual(b.latest, saved.upperBound)
+        let times = SleepEdit.Times(inBedStart: saved.lowerBound,
+                                    sleepOnset: saved.lowerBound.addingTimeInterval(900),
+                                    sleepWake: saved.upperBound)
+        XCTAssertNil(SleepEdit.validate(times, recordedOnset: recordedOnset,
+                                        recordedWake: recordedWake, existingEdit: saved),
+                     "re-opening an edited night must not silently clamp the user's own times")
+    }
+
+    func testCoverageExcludesRecordsPastTheForwardWindow() {
+        // Pins the `$0 <= hi` half of the night scoping — deleting it left every test green.
+        let dates = [d(3, 22, 0), d(4, 2, 0), d(4, 23, 0)]   // last is > recordedOnset + 14 h
+        let cov = try! XCTUnwrap(SleepEdit.dataCoverage(recordDates: dates,
+                                                        recordedOnset: recordedOnset,
+                                                        recordedWake: recordedWake))
+        XCTAssertEqual(cov.lowerBound, d(3, 22, 0))
+        XCTAssertEqual(cov.upperBound, d(4, 2, 0), "d(4,23,0) is beyond onset + 14 h and excluded")
+    }
+
     func testCoverageIsNilWhenNoRecordsFallInTheWindow() {
         XCTAssertNil(SleepEdit.dataCoverage(recordDates: [d(1, 4, 0)],
                                             recordedOnset: recordedOnset, recordedWake: recordedWake))

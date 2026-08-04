@@ -1278,8 +1278,9 @@ struct ContentView: View {
     /// reflects a just-finished sync instantly via the live staged segments. (See SleepCardView.)
     private var sleepCard: some View {
         SleepCardView(liveSegments: session?.stagedSegments ?? [], lastSyncAt: lastSyncAt,
-                      onEditSleep: { night, times in
-                          await session?.applySleepEdit(night: night, times: times) ?? nil
+                      onEditSleep: { night, times, uiCoverage in
+                          await session?.applySleepEdit(night: night, times: times,
+                                                        uiCoverage: uiCoverage) ?? nil
                       },
                       // Same helper `applySleepEdit` validates against, so the picker's range and
                       // the server-side check are computed from one place (#188 fallout).

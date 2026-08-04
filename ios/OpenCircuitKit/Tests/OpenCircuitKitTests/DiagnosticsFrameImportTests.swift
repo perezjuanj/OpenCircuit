@@ -125,6 +125,71 @@ final class DiagnosticsFrameImportTests: XCTestCase {
         XCTAssertEqual(r.pagesSeen, 0, "declared length no longer matches — not treated as a frame")
     }
 
+    /// A CRLF-converted export (mailed, Windows round-trip) must still parse. In Swift `\r\n` is a
+    /// single grapheme cluster that is NOT equal to `\n`, so splitting on the literal "\n" does not
+    /// split at all — the whole file becomes one line and recovers ZERO frames, while the UI tells
+    /// the user their only copy of the night contains nothing.
+    func testCRLFExportStillParses() {
+        let lf = report([captureLine(hex(realPage))])
+        let crlf = lf.replacingOccurrences(of: "\n", with: "\r\n")
+        let r = DiagnosticsFrameImport.records(fromDiagnosticsText: crlf)
+        XCTAssertEqual(r.pagesSeen, 1)
+        XCTAssertEqual(r.records.count, 6)
+    }
+
+    // MARK: - ring identity (the archive is per-ring; a foreign merge is silent and irreversible)
+
+    func testReadsTheSourceRingFromTheDeviceHeader() {
+        let text = [
+            "# Device",
+            "Firmware:     FR02.018",
+            "Generation:   Gen 2",
+            "Model:        RingConn Gen2-03AD",
+            "MAC:          ··:··:··:··:··:AD",
+            "# Frames (oldest → newest)",
+        ].joined(separator: "\n")
+        let ring = DiagnosticsFrameImport.sourceRing(fromDiagnosticsText: text)
+        XCTAssertEqual(ring.firmware, "FR02.018")
+        XCTAssertEqual(ring.model, "RingConn Gen2-03AD")
+        XCTAssertEqual(ring.macSuffix, "AD", "redaction keeps the last octet, which still identifies")
+    }
+
+    /// TRAP: the redacted MAC's padding character IS the `·` field separator, so a parser that
+    /// splits on `·` before reading MAC shreds it — and the identity check then silently degrades to
+    /// "never matches", i.e. prompts on every import including the user's own file. Both real
+    /// exports use the combined one-line header, which is why this only showed up against real data.
+    func testCombinedOneLineHeaderAndRedactedMACBothParse() {
+        let text = [
+            "OpenCircuit — diagnostics bundle",
+            "App: 1.0 (build 36)",
+            "Firmware: FR02.018 · Generation: Gen 2 · Model: RingConn Gen2-03AD",
+            "MAC: ··:··:··:··:··:AD",
+            "# Frames (oldest → newest)",
+        ].joined(separator: "\n")
+        let ring = DiagnosticsFrameImport.sourceRing(fromDiagnosticsText: text)
+        XCTAssertEqual(ring.firmware, "FR02.018", "must not swallow the rest of the line")
+        XCTAssertEqual(ring.model, "RingConn Gen2-03AD")
+        XCTAssertEqual(ring.macSuffix, "AD", "the `·` split must not shred the redacted MAC")
+        XCTAssertTrue(ring.matches(ring), "a ring must match itself, or every import prompts")
+    }
+
+    func testDifferentRingsDoNotMatch() {
+        let a = DiagnosticsFrameImport.SourceRing(model: "RingConn Gen2-03AD",
+                                                  firmware: "FR02.018", macSuffix: "AD")
+        let b = DiagnosticsFrameImport.SourceRing(model: "RingConn Gen2 Air-2F9F",
+                                                  firmware: "FR04.009", macSuffix: "9F")
+        XCTAssertFalse(a.matches(b))
+        XCTAssertTrue(a.matches(a))
+    }
+
+    func testUnknownIdentityIsNotAMatch() {
+        // Conservative on purpose: an export with no device header must PROMPT, not merge blind.
+        let known = DiagnosticsFrameImport.SourceRing(model: "RingConn Gen2-03AD",
+                                                      firmware: "FR02.018", macSuffix: "AD")
+        XCTAssertFalse(known.matches(DiagnosticsFrameImport.SourceRing()))
+        XCTAssertFalse(DiagnosticsFrameImport.SourceRing().matches(known))
+    }
+
     func testEmptyReportRecoversNothing() {
         let r = DiagnosticsFrameImport.records(fromDiagnosticsText: report([]))
         XCTAssertTrue(r.isEmpty)
