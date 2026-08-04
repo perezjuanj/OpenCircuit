@@ -1,6 +1,6 @@
 # OpenCircuit
 
-Local-first, no-cloud health data for the **RingConn Gen 2/3** smart ring — read all
+Local-first, no-cloud health data for the **RingConn Gen 2/3 and Air** smart ring — read all
 metrics over Bluetooth LE and write them to **Apple Health**. Inspired by
 [openwhoop](https://github.com/bWanShiTong/openwhoop), which does the same for the
 Whoop 4.0.
