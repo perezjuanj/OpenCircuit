@@ -216,7 +216,10 @@ struct VitalsTableView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            row("Heart Rate", value: hrText, time: timeFor(.heartRate))
+            measurableRow("Heart Rate", value: hrText, mode: .hr, active: hrActive,
+                          time: hrActive && session?.liveHR == nil
+                              ? (session?.livePreparing == true ? "preparing..." : "measuring...")
+                              : timeFor(.heartRate, live: hrLive))
             divider
             spo2Row
             divider
@@ -242,8 +245,8 @@ struct VitalsTableView: View {
         }
     }
 
-    /// SpO₂ row with estimate caveat. The home screen shows the latest RECORDED reading and when
-    /// it was recorded, not an in-progress measurement session.
+    /// SpO₂ row with estimate caveat. Time logic mirrors `measurableRow` so the
+    /// "preparing..."/"measuring..." split is preserved for user-initiated reads.
     @ViewBuilder private var spo2Row: some View {
         HStack(spacing: 10) {
             Text("SpO₂").font(.subheadline).foregroundStyle(.primary)
@@ -251,10 +254,13 @@ struct VitalsTableView: View {
             VStack(alignment: .trailing, spacing: 1) {
                 Text(spo2Text).font(.subheadline.weight(.semibold)).monospacedDigit()
                 Text("est.").font(.caption2).foregroundStyle(.tertiary)
-                if let time = timeFor(.spo2) {
+                if let time = (spo2Active && session?.liveSpO2 == nil
+                    ? (session?.livePreparing == true ? "preparing..." : "measuring...")
+                    : timeFor(.spo2, live: spo2Live)) {
                     Text(time).font(.caption2).foregroundStyle(.secondary)
                 }
             }
+            measureButton(.spo2, active: spo2Active)
         }
         .padding(.vertical, 8)
     }
@@ -273,14 +279,83 @@ struct VitalsTableView: View {
         .padding(.vertical, 8)
     }
 
+    // MARK: On-demand metrics (HR / SpO2)
+
+    /// The stop button belongs only to a user-initiated measurement. Auto-measure and workout
+    /// cycles keep ownership of the link, so their live reads cannot be stopped from this row.
+    private var hrActive: Bool { userMeasureActive(.hr) }
+    private var spo2Active: Bool { userMeasureActive(.spo2) }
+
+    private func userMeasureActive(_ mode: RingSession.LiveMode) -> Bool {
+        session?.userMeasuring == true
+            && session?.monitoring == true
+            && session?.liveMode == mode
+    }
+
+    /// True when the link has gone quiet so a lingering live value must not read as current (#36).
+    private var liveStale: Bool { session?.liveReadingsStale == true }
+
+    /// A vitals row carrying an inline start/stop measure control for an on-demand metric.
+    private func measurableRow(_ label: String, value: String, mode: RingSession.LiveMode,
+                               active: Bool, time: String?) -> some View {
+        HStack(spacing: 10) {
+            Text(label).font(.subheadline).foregroundStyle(.primary)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(value).font(.subheadline.weight(.semibold)).monospacedDigit()
+                if let time { Text(time).font(.caption2).foregroundStyle(.secondary) }
+            }
+            measureButton(mode, active: active)
+        }
+        .padding(.vertical, 8)
+    }
+
+    /// Small circular start/stop control. Appears only when the ring link is ready. Starting one
+    /// user measurement can switch between HR and SpO2, but auto/workout/calibration-owned live
+    /// cycles are left alone.
+    @ViewBuilder
+    private func measureButton(_ mode: RingSession.LiveMode, active: Bool) -> some View {
+        if session?.ready == true {
+            let color: Color = mode == .hr ? .red : .blue
+            let icon = mode == .hr ? "heart.fill" : "lungs.fill"
+            Button {
+                if active { session?.stopLiveMonitoring() }
+                else { session?.startMonitoring(mode: mode, userInitiated: true, quickLiveRead: true) }
+            } label: {
+                Image(systemName: active ? "stop.fill" : icon)
+                    .font(.caption2.weight(.bold))
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(active ? color : Color(.systemGray5)))
+                    .foregroundStyle(active ? .white : color)
+                    .symbolEffect(.pulse, isActive: active)
+            }
+            .buttonStyle(.plain)
+            .disabled(measureDisabled())
+        }
+    }
+
+    private func measureDisabled() -> Bool {
+        guard let session else { return true }
+        if session.syncing || session.notStreaming || session.calibrationCapturing { return true }
+        if session.capturingHistoricPull || session.capturingForensicSweep || session.probing { return true }
+        return session.workoutHolding
+    }
+
     private var divider: some View { Divider().opacity(0.4) }
 
-    // MARK: value formatting (recorded values only on the home screen)
+    // MARK: value formatting (live user reads override stored values)
+
+    /// HR/SpO2 count as "live" only for user-initiated reads whose frames are still fresh.
+    /// Auto-measure/workout cycles persist their samples through the existing owner paths.
+    private var hrLive: Bool { hrActive && session?.liveHR != nil && !liveStale }
+    private var spo2Live: Bool { spo2Active && session?.liveSpO2 != nil && !liveStale }
 
     private var hrText: String {
+        if hrLive, let hr = session?.liveHR { return "\(hr) bpm" }
         return valueText(.heartRate) { "\(Int($0)) bpm" }
     }
     private var spo2Text: String {
+        if spo2Live, let s = session?.liveSpO2 { return "\(s) %" }
         return valueText(.spo2) { "\(Int(($0 * 100).rounded())) %" }
     }
     // MARK: Skin temp (headline = latest reading; overnight average shown as context)
@@ -402,7 +477,8 @@ struct VitalsTableView: View {
     private static let rel: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter(); f.unitsStyle = .abbreviated; return f
     }()
-    private func timeFor(_ kind: MetricKind) -> String? {
+    private func timeFor(_ kind: MetricKind, live: Bool = false) -> String? {
+        if live { return "live" }
         guard let r = latestReading(kind) else { return nil }
         return Self.rel.localizedString(for: r.start, relativeTo: Date())
     }
