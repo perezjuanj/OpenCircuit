@@ -13,6 +13,12 @@ struct EditSleepView: View {
     let night: Date
     let recordedOnset: Date
     let recordedWake: Date
+    /// Span of epoch records we actually hold for this night. Widens the editable bounds beyond the
+    /// ±3 h parity margin so a badly TRUNCATED night is still correctable (#188 fallout — a night
+    /// detected as 07:30–08:55 offered an "In bed" picker of 04:30–07:30, making the real 00:15
+    /// bedtime unreachable). Computed by the caller via `SleepEdit.dataCoverage` and passed to
+    /// `applySleepEdit` too, so the picker can never offer a time the validator rejects.
+    let dataCoverage: ClosedRange<Date>?
     /// Runs the edit, returning the new asleep minutes (nil = failed). Injected by SleepCardView.
     let onSave: (SleepEdit.Times) async -> Int?
 
@@ -28,13 +34,16 @@ struct EditSleepView: View {
 
     init(night: Date, inBedStart: Date, sleepOnset: Date, sleepWake: Date,
          recordedOnset: Date, recordedWake: Date,
+         dataCoverage: ClosedRange<Date>? = nil,
          onSave: @escaping (SleepEdit.Times) async -> Int?) {
         self.night = night
         self.recordedOnset = recordedOnset
         self.recordedWake = recordedWake
+        self.dataCoverage = dataCoverage
         self.onSave = onSave
         // Clamp the initial values into the editable bounds so the DatePickers never start out of range.
-        let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
+        let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
+                                 dataCoverage: dataCoverage)
         var start = SleepEdit.clamp(inBedStart, to: b)
         var asleep = SleepEdit.clamp(sleepOnset, to: b)
         var end = SleepEdit.clamp(sleepWake, to: b)
@@ -52,14 +61,15 @@ struct EditSleepView: View {
     }
 
     private var bounds: SleepEdit.Bounds {
-        SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
+        SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
+                         dataCoverage: dataCoverage)
     }
     private var times: SleepEdit.Times {
         .init(inBedStart: bedtime, sleepOnset: onset, sleepWake: wake)
     }
     private var invalid: SleepEdit.Invalid? {
         SleepEdit.validate(times, recordedOnset: recordedOnset, recordedWake: recordedWake,
-                           minDuration: Self.minimumDuration)
+                           minDuration: Self.minimumDuration, dataCoverage: dataCoverage)
     }
     private var hasChanges: Bool {
         !SleepEdit.isSamePickerMinute(times.inBedStart, initialTimes.inBedStart)

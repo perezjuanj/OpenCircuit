@@ -1281,6 +1281,11 @@ struct ContentView: View {
                       onEditSleep: { night, times in
                           await session?.applySleepEdit(night: night, times: times) ?? nil
                       },
+                      // Same helper `applySleepEdit` validates against, so the picker's range and
+                      // the server-side check are computed from one place (#188 fallout).
+                      sleepEditDataCoverage: { onset, wake in
+                          session?.sleepEditDataCoverage(recordedOnset: onset, recordedWake: wake)
+                      },
                       onNap: { originalStart, window in
                           // Through the scanner, not session — nap add/edit works offline (no ring needed).
                           await scanner.applyNapEdit(originalStart: originalStart, window: window)

@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import UIKit
+import UniformTypeIdentifiers
 import OpenCircuitKit
 
 /// Read-only device information screen (#79). Shows the DIS fields recovered from the
@@ -23,6 +24,8 @@ struct DeviceInfoView: View {
     @State private var diagnosticsURL: URL?
     @State private var showDiagnosticShare = false
     @State private var diagnosticsError: String?
+    @State private var showRepairImporter = false
+    @State private var repairResult: String?
     /// Confirmation gate for airplane mode — it turns the ring's radio off and drops the link (#96).
     @State private var showAirplaneConfirm = false
 
@@ -246,6 +249,20 @@ struct DeviceInfoView: View {
             } label: {
                 Label("Reschedule & probe background tasks", systemImage: "arrow.clockwise")
             }
+            // Repair from a PREVIOUS export (#188). The raw-frame capture taps the inbound stream
+            // above the retention gate, so a page that was acked-and-discarded is still in the
+            // exported text even though its epoch never reached the archive — and the ring's resume
+            // pointer moved past it long ago, so this file is the only remaining copy. Import merges
+            // those records back and re-stages the night.
+            Button {
+                showRepairImporter = true
+            } label: {
+                Label("Repair from a diagnostics file", systemImage: "bandage")
+            }
+            .disabled(session == nil)
+            if let repairResult {
+                Text(repairResult).font(.caption).foregroundStyle(.secondary)
+            }
             Toggle("Capture raw history frames", isOn: $captureEnabled)
             LabeledContent("Frames captured", value: "\(session?.diagnosticsFrameCount ?? 0)")
             if (session?.diagnosticsFrameCount ?? 0) > 0 {
@@ -265,7 +282,47 @@ struct DeviceInfoView: View {
                  + "us the file — it tells us exactly what your ring synced. The optional frame capture "
                  + "records raw bytes to help support new ring models; turn it on, wear the ring "
                  + "overnight, then export in the morning. The file contains your overnight HR/HRV/SpO₂ "
-                 + "data — share it only with someone you trust.")
+                 + "data — share it only with someone you trust.\n\n"
+                 + "Repair reads an older diagnostics file from this ring and restores any sleep epochs "
+                 + "it contains that are missing from the app. It only ever adds data.")
+        }
+        .fileImporter(isPresented: $showRepairImporter,
+                      allowedContentTypes: [.plainText, .text, .data],
+                      allowsMultipleSelection: false) { result in
+            repairFromDiagnostics(result)
+        }
+    }
+
+    /// Merge epoch records recovered from a previously exported diagnostics file back into the
+    /// archive, then re-stage. Additive only — `EpochArchive.merge` dedups by counter and
+    /// `saveSleepSummary` is merge-protected, so a repair can only ever GROW a night.
+    private func repairFromDiagnostics(_ result: Swift.Result<[URL], Error>) {
+        repairResult = nil
+        diagnosticsError = nil
+        guard let session else { return }
+        do {
+            guard let url = try result.get().first else { return }
+            // Security-scoped: the picked file lives outside our container.
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let parsed = DiagnosticsFrameImport.records(fromDiagnosticsText: text)
+            guard !parsed.isEmpty else {
+                repairResult = parsed.pagesSeen == 0
+                    ? "No raw history frames in that file — it was exported with frame capture off, so there is nothing to recover."
+                    : "Found \(parsed.pagesSeen) frames but none decoded (\(parsed.pagesRejected) rejected). Nothing imported."
+                return
+            }
+            let added = session.repairFromRecoveredRecords(parsed.records)
+            let span = parsed.coverage.map {
+                let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"
+                return " (\(f.string(from: $0.lowerBound)) → \(f.string(from: $0.upperBound)))"
+            } ?? ""
+            repairResult = added > 0
+                ? "Recovered \(added) epochs\(span) from \(parsed.pagesSeen) frames. Sleep has been re-staged."
+                : "All \(parsed.records.count) epochs in that file were already in the app — nothing was missing."
+        } catch {
+            diagnosticsError = "Couldn't read that file: \(error.localizedDescription)"
         }
     }
 

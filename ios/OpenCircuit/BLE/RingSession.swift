@@ -1548,6 +1548,40 @@ final class RingSession: NSObject {
     ///
     /// Editing is offered only for the persisted night currently shown by the Sleep card. Archive
     /// records are scoped to that night's immutable ±3 h edit bounds before staging.
+    /// Merge epoch records recovered from a PREVIOUSLY EXPORTED diagnostics file back into the
+    /// archive, then re-stage (#188 repair). Returns how many epochs were genuinely new.
+    ///
+    /// Strictly additive and idempotent: `EpochArchive.merge` dedups by counter, and the follow-up
+    /// `restageFromArchive` goes through the merge-protected `saveSleepSummary`, which can only GROW
+    /// a stored night. Importing the same file twice is a no-op.
+    ///
+    /// This exists because the raw-frame capture taps ABOVE the retention gate — so on any build
+    /// where a page was acked-and-discarded, the export still holds bytes the archive never got, and
+    /// the ring cannot re-send them (its resume pointer advanced on the ack). The exported file is
+    /// the only remaining copy.
+    @discardableResult
+    func repairFromRecoveredRecords(_ records: [BulkRecord]) -> Int {
+        guard !records.isEmpty else { return 0 }
+        let before = epochArchiveStore.load().count
+        let union = epochArchiveStore.merge(records)
+        let added = max(0, union.count - before)
+        let detail = "recovered=\(records.count) new=\(added) union=\(union.count)"
+        observability.recordMetricEvent(source: "archive-repair", detail: detail)
+        ringLog.notice("repair: imported \(records.count) recovered records — \(added) new (#188)")
+        print("[OC] REPAIR imported=\(records.count) new=\(added)")
+        if added > 0 { restageFromArchive() }
+        return added
+    }
+
+    /// Span of archive epochs that plausibly belong to the night anchored on the recorded
+    /// onset/wake. THE single source of this value — both the editor sheet (via `SleepCardView`)
+    /// and `applySleepEdit`'s validation call it, so the picker's range and the server-side check
+    /// can never disagree (#188 fallout).
+    func sleepEditDataCoverage(recordedOnset: Date, recordedWake: Date) -> ClosedRange<Date>? {
+        SleepEdit.dataCoverage(recordDates: epochArchiveStore.load().map { $0.date() },
+                               recordedOnset: recordedOnset, recordedWake: recordedWake)
+    }
+
     @discardableResult
     func applySleepEdit(night: Date, times: SleepEdit.Times) async -> Int? {
         guard let store = localStore else { return nil }
@@ -1560,8 +1594,13 @@ final class RingSession: NSObject {
             ? row.sleepEditRecordedOnset : row.sleepEditRecordedInBedStart
         let recordedWake = row.sleepEditRecordedWake > recordedOnset
             ? row.sleepEditRecordedWake : row.sleepEditRecordedInBedEnd
+        // Widen the bounds by the epochs we actually HOLD for this night (#188 fallout): a badly
+        // truncated night is otherwise uncorrectable, because ±3 h around a wrong detection cannot
+        // reach the real bedtime. Computed HERE from the same pure helper the picker uses, so the
+        // UI can never offer a time this validator then rejects.
+        let coverage = sleepEditDataCoverage(recordedOnset: recordedOnset, recordedWake: recordedWake)
         guard SleepEdit.validate(times, recordedOnset: recordedOnset, recordedWake: recordedWake,
-                                 minDuration: 30 * 60) == nil else { return nil }
+                                 minDuration: 30 * 60, dataCoverage: coverage) == nil else { return nil }
 
         // An unchanged Save is a no-op. In particular, it must not turn an unedited recorded row
         // into a manual one merely because the same dates were submitted programmatically.
@@ -1574,7 +1613,8 @@ final class RingSession: NSObject {
         // Scope the archive to THIS stored night before asking the staging model to pick a block.
         // The 30 h archive can contain two nights; calling `latestNightRecords` on the whole union
         // silently edits the newer one while persisting the result under the requested row's key.
-        let editBounds = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
+        let editBounds = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
+                                          dataCoverage: coverage)
         let archiveMargin: TimeInterval = 30 * 60
         let scopedArchive = epochArchiveStore.load().filter { record in
             let date = record.date()
