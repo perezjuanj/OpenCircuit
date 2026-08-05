@@ -454,6 +454,14 @@ enum ExportBuilder {
             sleepOnset: realDate(row.sleepEditCurrentOnset),
             sleepWake: realDate(row.sleepEditCurrentWake),
             isManuallyEdited: row.isManuallyEdited,
+            // The pre-edit values, so an edited night exports as a supervised LABEL (detector said
+            // X / sleeper says Y) rather than only the corrected answer. Emitted only when the night
+            // was actually edited — on an unedited night these ARE the values above, and repeating
+            // them would make "the user agreed" indistinguishable from "the user never looked".
+            recordedInBedStart: row.isManuallyEdited ? realDate(row.sleepEditRecordedInBedStart) : nil,
+            recordedInBedEnd: row.isManuallyEdited ? realDate(row.sleepEditRecordedInBedEnd) : nil,
+            recordedOnset: row.isManuallyEdited ? realDate(row.sleepEditRecordedOnset) : nil,
+            recordedWake: row.isManuallyEdited ? realDate(row.sleepEditRecordedWake) : nil,
             // Decoded off the ROW already in hand, never re-fetched by day bucket.
             // `store.hypnogram(night:)` re-derives its key as `startOfDay(night)` in the CURRENT
             // timezone, but `row.night` was bucketed in the zone the night was STAGED in — so after

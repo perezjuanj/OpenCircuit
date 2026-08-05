@@ -80,7 +80,11 @@ SLEEPTYPE_MAP = {
 # --- Tuning: mirrors Swift SleepStaging.Tuning EXACTLY, plus experimental extensions --
 @dataclass
 class Tuning:
-    # --- These 21 fields mirror Swift SleepStaging.Tuning one-for-one (same defaults) --
+    # --- These fields mirror Swift SleepStaging.Tuning one-for-one (same defaults) ------
+    #     NOTE: Swift has since grown passes this port does NOT yet mirror
+    #     (markLeadInWakeOnset, rescueSecondBoutHRWake, motionAwakeVitalsHalfWindow,
+    #     minConsolidatedSleepEpochs, deepBaselineMarginBPM, preOnsetBedtime*). Pre-existing
+    #     drift — fits are approximate for nights those passes touch.
     awakeMotion: int = 15
     deepHRPercentile: float = 0.42
     remHRPercentile: float = 0.86
@@ -103,6 +107,17 @@ class Tuning:
     onsetMinDescentBPM: float = 10.0
     onsetScanEpochs: int = 12
     onsetSearchEpochs: int = 48
+    # Point-of-no-return OFFSET (the "quiet morning wake" fix) — mirrors Swift one-for-one.
+    # 0 = disabled = byte-identical, exactly as the Swift default ships. See
+    # SleepStaging.markPointOfNoReturnOffset for why the trailing edge needs its own,
+    # tighter margin than the shared wakeHRMarginBPM.
+    offsetNoReturnSpreadFraction: float = 0.5
+    offsetNoReturnMinMarginBPM: float = 2.0
+    # Mirrors Swift's knob of the same name. Used HERE only as the offset pass's survival guard
+    # (the Swift value is 16); the other Swift passes that consume it are not ported yet.
+    minConsolidatedSleepEpochs: int = 16
+    # Mirrors Swift; used here only by the offset pass's terminal-REM guard.
+    hrWakeRescueVitalsFraction: float = 0.5
 
     # --- Experimental extensions (NOT in Swift Tuning yet; off by default). The fit
     #     reports whether turning these on helps; if so, add them to the Swift struct. --
@@ -110,7 +125,7 @@ class Tuning:
     spo2DipEnabled: bool = False    # treat an SpO2 dip vs the night median as a REM cue
     spo2DipDelta: float = 3.0       # %SpO2 below the night median to count as a dip
 
-    # Names of the 21 fields that map to the real Swift initializer.
+    # Names of the fields that map to the real Swift initializer.
     SWIFT_FIELDS = (
         "awakeMotion", "deepHRPercentile", "remHRPercentile", "deepVarPercentile",
         "remVarPercentile", "variabilityHalfWindow", "deepVarFloor", "remVarFloor",
@@ -118,6 +133,7 @@ class Tuning:
         "sleepFloorPercentile", "wakeHRMarginBPM", "hrWakeHalfWindow",
         "onsetSustainEpochs", "minHRWakeRunEpochs",
         "onsetSettleFraction", "onsetMinDescentBPM", "onsetScanEpochs", "onsetSearchEpochs",
+        "offsetNoReturnSpreadFraction", "offsetNoReturnMinMarginBPM",
     )
 
 
@@ -482,6 +498,59 @@ def _mark_descent_onset_awake(awake, sm_hr, motion_awake, floor, t):
             awake[k] = True
 
 
+def _mark_point_of_no_return_offset(awake, sm_hr, hr, vitals, floor, t):
+    """Port of SleepStaging.markPointOfNoReturnOffset (mutates `awake`): mark the trailing
+    "HR rose and never returned to the sleeping floor" run as awake.
+
+    Margin is DERIVED from the night's own sleeping-HR spread (median - floor), never absolute.
+    Guards, all mirroring Swift: suffix-by-construction; refuses to reach the onset; bounded to
+    the last onsetSearchEpochs; reverts unless a CONSOLIDATED run survives; and a TERMINAL-REM
+    guard requiring the suffix's sleep-vitals share to be materially thinner than the sleep
+    behind it (HR alone cannot tell a final REM period from a quiet wake).
+
+    DIVERGENCE: Swift also passes `notBefore` = the last epoch rescueSecondBoutHRWake or the
+    motion-awake vitals softening reclaimed. Neither pass is ported here, so this is MORE
+    aggressive than Swift on mid-night-wake nights; treat a fitted fraction as an upper bound.
+    """
+    if t.offsetNoReturnSpreadFraction <= 0 or not awake or len(sm_hr) != len(awake):
+        return
+    span = _sleep_span(awake, t.onsetSustainEpochs)
+    if span is None:
+        return
+    lo, _ = span
+    spread = max(0.0, percentile(sorted(hr), 0.50) - floor)
+    margin = max(t.offsetNoReturnMinMarginBPM, t.offsetNoReturnSpreadFraction * spread)
+    search_floor = len(awake) - min(t.onsetSearchEpochs, len(awake))
+    earliest = max(lo, search_floor)
+    threshold = floor + margin
+    start = None
+    suffix_min = float("inf")
+    for i in range(len(sm_hr) - 1, -1, -1):
+        suffix_min = min(suffix_min, sm_hr[i])
+        if suffix_min > threshold:
+            start = i
+        else:
+            break
+    if start is None or start <= earliest:
+        return
+    # TERMINAL-REM guard.
+    if vitals and len(vitals) == len(awake):
+        suf = vitals[start:]
+        body = vitals[lo:start]
+        suf_share = (sum(1 for v in suf if v) / len(suf)) if suf else 0.0
+        body_share = (sum(1 for v in body if v) / len(body)) if body else 0.0
+        if body_share <= 0:
+            return
+        if suf_share > body_share * t.hrWakeRescueVitalsFraction:
+            return
+    candidate = list(awake)
+    for i in range(start, len(candidate)):
+        candidate[i] = True
+    if _sleep_span(candidate, t.minConsolidatedSleepEpochs) is None:
+        return
+    awake[:] = candidate
+
+
 def _sleep_span(awake, sustain):
     """Port of SleepStaging.sleepSpan: (first, last) of sustained asleep runs, or None."""
     n = len(awake)
@@ -615,6 +684,7 @@ def classify_prepared(pf, t, band_pool=None):
     awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
     _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
     _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
+    _mark_point_of_no_return_offset(awake, sm_hr, hr, [v is not None for v in pf.hrv], sleep_floor, t)
 
     span = _sleep_span(awake, t.onsetSustainEpochs)
     if span is None:
@@ -695,6 +765,7 @@ def baseline_band_pool(nights_prepared, t):
             awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
             _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
             _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
+            _mark_point_of_no_return_offset(awake, sm_hr, pf.hr, [v is not None for v in pf.hrv], sleep_floor, t)
             span = _sleep_span(awake, t.onsetSustainEpochs)
             if span is None:
                 continue
@@ -780,6 +851,97 @@ def score_tuning(nights_prepared, nights_truth, t, mode="blend", band_pool_per_n
     return objective(m, mode), m
 
 
+
+# ====================================================================================
+# Sleep-EDIT labels — supervised ground truth harvested from the user's own corrections
+# ====================================================================================
+# Mirrors OpenCircuitKit's `SleepEditLabel`. The app's Data Export (schema v3) emits, for
+# every MANUALLY EDITED night, both the corrected clocks and a `recorded` object holding
+# what the detector originally said. That pair is a label: detector said X, sleeper says Y.
+#
+# ⚠️ BIASED SAMPLE. People correct nights that look wrong and leave nights that look right,
+# so this over-represents failures. Good for "how wrong are we when we are wrong" and for
+# fitting a knob that must not worsen those cases; useless as an overall accuracy estimate.
+
+MIN_CORRECTION_MINUTES = 3.0     # below this an "edit" is picker friction, not an assertion
+MIN_NIGHTS_TO_FIT = 10           # mirrors SleepEditLabels.minimumNightsToFit
+
+
+def _parse_iso(v):
+    if not v:
+        return None
+    txt = v.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+
+
+def load_edit_labels(path):
+    """Read [(night, onset_err_min, wake_err_min)] from an app Data Export JSON.
+
+    Errors are SIGNED, detector minus truth: positive wake error = the detector held the
+    night open too long (the placeholder-flat-motion failure mode).
+    """
+    with open(path) as fh:
+        doc = json.load(fh)
+    out = []
+    for sess in doc.get("sleepSessions", []):
+        if not sess.get("isManuallyEdited"):
+            continue
+        rec = sess.get("recorded") or {}
+        pairs = (("sleepOnset", "onset"), ("sleepWake", "wake"))
+        errs = {}
+        for key, name in pairs:
+            r, t = _parse_iso(rec.get(key)), _parse_iso(sess.get(key))
+            errs[name] = (r - t).total_seconds() / 60 if (r and t) else None
+        if any(e is not None and abs(e) >= MIN_CORRECTION_MINUTES for e in errs.values()):
+            out.append((sess.get("night"), errs["onset"], errs["wake"]))
+    return out
+
+
+def report_edit_labels(paths):
+    """Summarise the label set and say whether it is enough to fit a knob against."""
+    labels = []
+    for p in paths:
+        labels.extend(load_edit_labels(p.strip()))
+    if not labels:
+        print("no usable sleep-edit labels found "
+              "(need nights edited by >= %g min in the Data Export)" % MIN_CORRECTION_MINUTES)
+        return 1
+    print("sleep-edit labels: %d night(s)" % len(labels))
+    print("  night        onset err (min)   wake err (min)")
+    for night, on, wk in sorted(labels, key=lambda r: r[0] or ""):
+        print("  %-11s %14s %16s" % (night,
+                                     "-" if on is None else "%+.0f" % on,
+                                     "-" if wk is None else "%+.0f" % wk))
+
+    def stats(vals):
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return None, None
+        mean = sum(vals) / len(vals)
+        a = sorted(abs(v) for v in vals)
+        med = a[len(a) // 2] if len(a) % 2 else (a[len(a) // 2 - 1] + a[len(a) // 2]) / 2
+        return mean, med
+
+    for name, idx in (("onset", 1), ("wake", 2)):
+        mean, med = stats([r[idx] for r in labels])
+        if mean is None:
+            print("  %s: no labelled edge" % name)
+        else:
+            print("  %s: mean signed %+.1f min (systematic bias), median |err| %.1f min"
+                  % (name, mean, med))
+    n = len(labels)
+    if n < MIN_NIGHTS_TO_FIT:
+        print("\nNOT ENOUGH TO FIT: %d/%d nights. A knob may not be promoted off this "
+              "(change-control N8)." % (n, MIN_NIGHTS_TO_FIT))
+    else:
+        print("\nEnough to fit (%d >= %d). Remember the selection bias above: these are the "
+              "nights that looked wrong." % (n, MIN_NIGHTS_TO_FIT))
+    return 0
+
+
 # ====================================================================================
 # Fit — coordinate descent over candidate grids (scipy used if available, else this)
 # ====================================================================================
@@ -804,6 +966,9 @@ SEARCH_GRID = {
     "onsetSettleFraction": [0.25, 0.35, 0.45, 0.6],
     "onsetMinDescentBPM": [8, 10, 14],
     "onsetSearchEpochs": [36, 48, 72],
+    # 0 first: coordinate descent starts from the default and never worsens, so the
+    # offset pass must EARN its way on against real labels rather than being assumed.
+    "offsetNoReturnSpreadFraction": [0.0, 0.25, 0.5, 0.75, 1.0],
 }
 
 
@@ -1135,7 +1300,13 @@ def main(argv=None):
     ap.add_argument("--nights", type=int, default=3, help="synthetic night count")
     ap.add_argument("--seed", type=int, default=7, help="synthetic RNG seed")
     ap.add_argument("--verbose", action="store_true", help="trace coordinate-descent moves")
+    ap.add_argument("--edit-labels",
+                    help="app Data Export JSON(s), comma-separated: report the supervised "
+                         "labels harvested from the user's own sleep edits")
     args = ap.parse_args(argv)
+
+    if args.edit_labels:
+        return report_edit_labels(args.edit_labels.split(","))
 
     if args.synthetic:
         return run_synthetic(seed=args.seed, nights=args.nights,
