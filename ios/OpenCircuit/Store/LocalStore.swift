@@ -125,6 +125,16 @@ final class StoredSleepSummary {
     /// persist so the movement chart redraws offline.
     var movementLevels: [Int] = []
 
+    /// The night's staged hypnogram, `SleepHypnogramCodec`-encoded. Empty = not recorded (every night
+    /// staged before this column existed). Persisted because the stage MINUTES above are a rollup that
+    /// cannot be un-summed: without the segments a session export can say "1 h 10 m deep" but never
+    /// WHEN. DEFAULTED so SwiftData lightweight migration adds it to existing stores (cf. #21).
+    /// Written ONLY in the same branch that writes the minutes (`saveSleepSummary` / `applySleepEdit`),
+    /// so a night's segments and its minutes can never describe two different captures — and only when
+    /// that caller actually STATED a timeline: `applySleepEdit`'s `hypnogram` is nil-defaulted so an
+    /// omitted argument leaves a recorded timeline in place rather than silently erasing it.
+    var hypnogramData: Data = Data()
+
     // MARK: OSA sleep-apnea SpO₂ (#91) — decoded locally from the dense `0x48` assessment burst.
     // Every column DEFAULTED for SwiftData lightweight migration (cf. #21). `osaValidWindows == 0`
     // = no assessment drained that night (the card row stays hidden). `osaAvgSpO2` is validated
@@ -480,11 +490,12 @@ struct LocalStore {
 
     /// The store-ingest cursor rows (live `@Model` objects, so mutating `.last` updates the
     /// context). Skips the `hk:`-prefixed HealthKit-watermark rows (see `pendingHealthSamples`)
-    /// — they live in the same table but track a separate concern and must not pollute the
-    /// store-ingest cursor.
+    /// and the `export:`-prefixed export watermark — they live in the same table but track
+    /// separate concerns and must not pollute the store-ingest cursor.
     private func storeCursorRows() throws -> [StoredCursor] {
         try context.fetch(FetchDescriptor<StoredCursor>())
-            .filter { !$0.kindRaw.hasPrefix(Self.healthCursorPrefix) }
+            .filter { !$0.kindRaw.hasPrefix(Self.healthCursorPrefix)
+                && !$0.kindRaw.hasPrefix(Self.exportCursorPrefix) }
     }
 
     /// Dry-run of `ingest(_:)` for logging/observability. Lets the caller tell whether a captured
@@ -976,6 +987,67 @@ struct LocalStore {
         return SyncCursor(lastByKind: map)
     }
 
+    // MARK: Export watermark ("only the sessions I haven't exported yet")
+    //
+    // A third watermark in the same `StoredCursor` table, under an `export:` prefix — mirroring the
+    // `hk:` convention above, so no new table and no schema migration. FORWARD-ONLY like every other
+    // cursor here: moving it backward would silently re-offer nights the user already exported, and a
+    // watermark that can regress is not a watermark.
+
+    private static let exportCursorPrefix = "export:"
+    /// The export NIGHT watermark row. The prefix is what keeps it out of `storeCursorRows` (and
+    /// therefore out of the ingest `SyncCursor`), exactly as the `hk:` rows are kept out.
+    private static let exportSessionsCursorKey = exportCursorPrefix + "sleepSessions"
+    /// The export CONTENT watermark row: the instant the last committed export READ its rows.
+    ///
+    /// The night watermark alone answers "which nights have I seen", which is the wrong question —
+    /// a night keeps growing after it is first exported (the ring hands the rest off hours later,
+    /// #187/#188; the diagnostics repair widens one days later; a manual edit rewrites it whenever).
+    /// Because the night watermark is forward-only and single-valued, a night that grew after being
+    /// consumed could never be re-offered and the automated archive would keep only the truncated
+    /// version. Comparing `StoredSleepSummary.updatedAt` against this second watermark catches every
+    /// one of those rewrites — `updatedAt` is bumped by all of them.
+    private static let exportContentCursorKey = exportCursorPrefix + "sleepSessions.content"
+
+    /// End of the newest sleep session already exported, or nil before any export has been written.
+    func lastExportWatermark() -> Date? {
+        let key = Self.exportSessionsCursorKey
+        let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
+        return try? context.fetch(descriptor).first?.last
+    }
+
+    /// When the last committed export read its rows, or nil before any export has been written.
+    /// A summary whose `updatedAt` is later than this changed after that file was produced.
+    func lastExportContentWatermark() -> Date? {
+        let key = Self.exportContentCursorKey
+        let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
+        return try? context.fetch(descriptor).first?.last
+    }
+
+    /// Advance the export watermarks. BOTH are FORWARD-ONLY: an earlier (or equal) date is a no-op,
+    /// not a regression, and they advance INDEPENDENTLY — a payload that consumed no settled night
+    /// still recorded which content it carried, and blocking that on the night watermark would leave
+    /// a re-offered older night re-offered forever. Call it only AFTER the export file is durably
+    /// written — the same advance-after-a-durable-write ordering the ingest cursor uses (#22), so a
+    /// failed write leaves those sessions pending instead of marking them exported into a file that
+    /// doesn't exist.
+    func markExported(through: Date, contentAsOf: Date? = nil) throws {
+        var dirty = false
+        if advanceExportCursor(key: Self.exportSessionsCursorKey, to: through) { dirty = true }
+        if let contentAsOf,
+           advanceExportCursor(key: Self.exportContentCursorKey, to: contentAsOf) { dirty = true }
+        if dirty { try context.save() }
+    }
+
+    /// Forward-only upsert of one `export:` cursor. Returns whether it actually moved.
+    private func advanceExportCursor(key: String, to date: Date) -> Bool {
+        let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
+        let existing = (try? context.fetch(descriptor).first?.last) ?? nil
+        guard (existing ?? .distantPast) < date else { return false }
+        upsertCursor(kind: key, last: date)
+        return true
+    }
+
     // MARK: Sleep summary + daily steps (offline dashboard, separate from `ingest`)
 
     /// Upsert the nightly sleep summary, keyed by start-of-day of `night`. Re-syncing the
@@ -992,6 +1064,9 @@ struct LocalStore {
         var stressScore: Int = 0
         var hrByStage: [SleepStage: Int] = [:]
         var movementLevels: [Int] = []
+        /// The staged segments the stage minutes were rolled up FROM. Travels with the summary so both
+        /// are written by the same call — see `applyExtras`.
+        var hypnogram: [SleepSegment] = []
     }
 
     func saveSleepSummary(_ summary: SleepStaging.Summary, night: Date,
@@ -1079,6 +1154,11 @@ struct LocalStore {
         if let v = extras.hrByStage[.asleepREM] { row.hrRem = v }
         if let v = extras.hrByStage[.awake] { row.hrAwake = v }
         if !extras.movementLevels.isEmpty { row.movementLevels = extras.movementLevels }
+        // Deliberately NOT keep-if-empty like the values above: the caller just wrote this row's stage
+        // MINUTES from `extras.hypnogram`, so retaining an older night's segments here would leave a
+        // row whose timeline and whose minutes came from two different captures — a divergence no
+        // consumer could detect. Empty in ⇒ empty stored ("not recorded"), which is honest.
+        row.hypnogramData = SleepHypnogramCodec.encode(extras.hypnogram)
     }
 
     /// Attach a decoded OSA SpO₂ summary (#91) to the most recent night's stored summary. The
@@ -1131,6 +1211,15 @@ struct LocalStore {
         return try context.fetch(descriptor).first
     }
 
+    /// The stored staged hypnogram for `night`, or `[]` when the night isn't stored, was staged before
+    /// the column existed, or holds an unreadable blob. Non-throwing on purpose: the hypnogram is an
+    /// export/display nicety, and one bad night must not abort a whole multi-night export
+    /// (`SleepHypnogramCodec.decode` never throws and never fabricates a segment either).
+    func hypnogram(night: Date) -> [SleepSegment] {
+        guard let row = try? sleepSummary(night: night) else { return [] }
+        return SleepHypnogramCodec.decode(row.hypnogramData)
+    }
+
     /// The stored summary whose IN-BED window best overlaps `[start, end]`. Used by the Health mirror
     /// to resolve the night by its actual span rather than `startOfDay(firstSegmentStart)` — a bedtime
     /// that straddles midnight (or a lead-in trim that moves the earliest start across it) can otherwise
@@ -1169,9 +1258,25 @@ struct LocalStore {
     /// `saveSleepSummary`). `feelScore` is left as the user set it. Returns false if the night isn't
     /// in the store. The caller (RingSession) re-stages from the archive and appends the extension to
     /// Apple Health separately (append-only; nothing is deleted).
+    ///
+    /// `hypnogram` is the recomputed segment timeline `summary` was rolled up from. It is written in the
+    /// same branch as the minutes for the same reason as in `saveSleepSummary`: an edited night whose
+    /// stored segments still described the pre-edit staging would silently contradict its own totals.
+    ///
+    /// It is `nil`-defaulted, NOT `[]`-defaulted: an omitted argument means "I have no timeline to
+    /// state", and it leaves the stored blob ALONE. Writing `[]` there — the original behaviour —
+    /// meant any caller that simply forgot the parameter DESTROYED the night's segment timeline,
+    /// which cannot be rebuilt once the ~30 h epoch archive rolls over, and the export contract then
+    /// reports the night as "not recorded" (`ExportEngine.SleepSessionRow`) when it was recorded.
+    /// Silent, unrecoverable, and one omitted argument away at every future call site. A caller that
+    /// genuinely wants the timeline cleared still says so explicitly by passing `[]`.
+    ///
+    /// The only production caller (`RingSession.applySleepEdit`) always passes the recomputed
+    /// segments, so the pass-through branch exists to make the omission safe rather than to be used.
     @discardableResult
     func applySleepEdit(night: Date, times: SleepEdit.Times,
-                        summary: SleepStaging.Summary) throws -> Bool {
+                        summary: SleepStaging.Summary,
+                        hypnogram: [SleepSegment]? = nil) throws -> Bool {
         let dayStart = Calendar.current.startOfDay(for: night)
         let descriptor = FetchDescriptor<StoredSleepSummary>(predicate: #Predicate { $0.night == dayStart })
         guard let row = try? context.fetch(descriptor).first else { return false }
@@ -1193,6 +1298,7 @@ struct LocalStore {
         row.remMin = m.rem
         row.awakeMin = m.awake
         row.efficiency = summary.efficiency
+        if let hypnogram { row.hypnogramData = SleepHypnogramCodec.encode(hypnogram) }
         // Recompute the duration-driven Sleep Score from the edited night (HR/temp factors dropped →
         // renormalised, per SleepScore's contract — never fabricated).
         row.sleepScore = SleepScore.composite(.init(
@@ -1205,14 +1311,16 @@ struct LocalStore {
 
     /// Compatibility entry point for callers/tests built around the original two-edge editor.
     /// Its explicit onset/wake arguments now become the persisted sleep window instead of being
-    /// silently ignored.
+    /// silently ignored. `hypnogram` is `nil`-defaulted and pass-through for the same reason as
+    /// above: an omitted timeline must never erase a stored one.
     @discardableResult
     func applySleepEdit(night: Date, editedWindow: SleepEdit.Window,
-                        summary: SleepStaging.Summary, sleepOnset: Date, sleepWake: Date) throws -> Bool {
+                        summary: SleepStaging.Summary, sleepOnset: Date, sleepWake: Date,
+                        hypnogram: [SleepSegment]? = nil) throws -> Bool {
         try applySleepEdit(night: night,
                            times: .init(inBedStart: editedWindow.inBedStart,
                                         sleepOnset: sleepOnset, sleepWake: sleepWake),
-                           summary: summary)
+                           summary: summary, hypnogram: hypnogram)
     }
 
     struct PendingSleepEditHealthWrite {

@@ -679,6 +679,9 @@ final class RingSession: NSObject {
     /// DIS fields collected from the ring (firmware version, generation, manufacturer, etc.) (#79).
     /// Populated incrementally as each DIS characteristic is read; `DeviceInfoView` observes this.
     private(set) var firmwareInfo = FirmwareInfo()
+    /// Mirrors the ring's identity out to UserDefaults so an EXPORT taken while disconnected can still
+    /// name the device — `firmwareInfo` lives only as long as the connection. MAC never included.
+    private let ringMetadataStore = RingMetadataStore()
     /// Rolling battery % samples for the TTE estimate (#86), **persisted per-ring** across
     /// reconnects/relaunches so the discharge slope isn't wiped each session — that wipe was why
     /// "time to empty" almost never appeared. Loaded in `init`, rewritten on every reading via the
@@ -775,6 +778,7 @@ final class RingSession: NSObject {
         // Seed the model name from the peripheral's advertised name; may be overridden later
         // by a dedicated DIS Model Number characteristic if the ring exposes one. (#79)
         firmwareInfo.modelName = peripheral.name ?? ""
+        cacheRingMetadata()   // model + identifier now; firmware/generation land with the DIS read
         // Re-discovery guard (#42): on a restored / already-connected peripheral the services are
         // usually already cached, so re-scanning them on every relaunch is wasted work. When they're
         // cached, go straight to (re-)matching characteristics — that still re-fires
@@ -1629,6 +1633,15 @@ final class RingSession: NSObject {
                      macSuffix: suffix)
     }
 
+    /// Mirror this ring's identity into `RingMetadataStore` so an export taken while the ring is
+    /// DISCONNECTED can still say which device produced the data. Called wherever `firmwareInfo` gains
+    /// a field. Cheap (a few UserDefaults string writes) and the store keeps earlier reads for the same
+    /// ring, so calling it on a partially-populated `firmwareInfo` never erases what we already knew.
+    /// The MAC is deliberately not passed — see the privacy note on `RingMetadataStore`.
+    private func cacheRingMetadata() {
+        ringMetadataStore.record(from: firmwareInfo, identifier: peripheral.identifier.uuidString)
+    }
+
     /// Span of archive epochs that plausibly belong to the night anchored on the recorded
     /// onset/wake. THE single source of this value — both the editor sheet (via `SleepCardView`)
     /// and `applySleepEdit`'s validation call it, so the picker's range and the server-side check
@@ -1710,7 +1723,10 @@ final class RingSession: NSObject {
         let segments = SleepEdit.recompute(baseSegments: base, times: times)
         guard !segments.isEmpty else { return nil }
         let summary = SleepStaging.summary(segments)
-        guard (try? store.applySleepEdit(night: night, times: times, summary: summary)) == true else { return nil }
+        // The recomputed segments go in with the recomputed minutes so the stored timeline always
+        // matches the stored totals for an edited night too.
+        guard (try? store.applySleepEdit(night: night, times: times, summary: summary,
+                                         hypnogram: segments)) == true else { return nil }
 
         if HealthKitWriter.isAvailable {
             // Mirror the EDITED night to Apple Health by delete-then-rewrite (see
@@ -1748,8 +1764,12 @@ final class RingSession: NSObject {
             // the sleep latency, so the card can show "fell asleep at X" instead of conflating it with
             // bedtime. nil → unknown (no asleep block); persisted as distantPast and the card falls back.
             let sleep = SleepStaging.sleepWindow(stagedSegments)
-            let extras = computeSleepExtras(summary: summary, start: start, end: end,
+            var extras = computeSleepExtras(summary: summary, start: start, end: end,
                                             store: localStore, records: nightRecords)
+            // Persist the timeline the stage MINUTES were just rolled up from, in the same call — the
+            // minutes alone can't be un-summed, so an export could otherwise say how much deep sleep
+            // there was but never when. Travelling in `extras` is what keeps the two writes atomic.
+            extras.hypnogram = stagedSegments
             try? localStore.saveSleepSummary(summary, night: start, inBedStart: start, inBedEnd: end,
                                              sleepOnset: sleep?.onset ?? .distantPast,
                                              sleepWake: sleep?.wake ?? .distantPast,
@@ -3744,7 +3764,10 @@ extension RingSession: CBPeripheralDelegate {
             }
             // DIS string reads (firmware/manufacturer/hardware revision) — UTF-8 strings (#79).
             if characteristic.uuid == self.firmwareRevUUID {
-                if let s = String(bytes: bytes, encoding: .utf8) { self.firmwareInfo.version = s }
+                if let s = String(bytes: bytes, encoding: .utf8) {
+                    self.firmwareInfo.version = s
+                    self.cacheRingMetadata()   // version → generation; both are export metadata
+                }
                 return
             }
             if characteristic.uuid == self.manufacturerUUID {

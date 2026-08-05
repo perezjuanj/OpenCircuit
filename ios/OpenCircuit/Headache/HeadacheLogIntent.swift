@@ -368,5 +368,19 @@ struct OpenCircuitAppShortcuts: AppShortcutsProvider {
             ],
             shortTitle: "Log Yesterday’s Headache",
             systemImageName: "brain.head.profile")
+
+        // Data export (#80). It lives in THIS provider, not a second one: an app may declare only a
+        // single `AppShortcutsProvider`, and a second declaration makes every shortcut — including
+        // the headache ones above — silently disappear from Shortcuts. The intent itself is in
+        // Export/ExportDataIntent.swift.
+        AppShortcut(
+            intent: ExportRingDataIntent(),
+            phrases: [
+                "Export my \(.applicationName) data",
+                "Export my ring data with \(.applicationName)",
+                "Export health data from \(.applicationName)",
+            ],
+            shortTitle: "Export Ring Data",
+            systemImageName: "square.and.arrow.up")
     }
 }

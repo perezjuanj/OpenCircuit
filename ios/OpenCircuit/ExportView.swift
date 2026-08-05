@@ -1,45 +1,139 @@
 import SwiftUI
 import SwiftData
+import UniformTypeIdentifiers
 import OpenCircuitKit
 
-/// Local data export screen (#80). Lets the user pick a date range and format
-/// (CSV or JSON), then shares the exported file via the system share sheet.
+/// Local data export screen (#80). Lets the user choose WHAT to export (a date range, one recorded
+/// night, or only the nights they haven't exported yet), pick CSV or JSON, and either save straight
+/// into a folder they chose once or share the file through the system sheet.
 ///
-/// All exported data comes from the local SwiftData store — no network calls.
+/// All exported data comes from the local SwiftData store — no network calls, no BLE, no HealthKit.
 /// The export is entirely opt-in and is triggered only by an explicit user tap.
+///
+/// The row collection itself lives in `ExportBuilder`, shared with `ExportRingDataIntent`, so the
+/// file a Shortcut produces is byte-for-byte the file this screen produces.
 struct ExportView: View {
     @Environment(\.modelContext) private var modelContext
 
+    @State private var mode: ModeChoice = .dateRange
     @State private var startDate: Date = Calendar.current.date(
         byAdding: .day, value: -30, to: Date()) ?? Date()
     @State private var endDate: Date = Date()
-    @State private var format: ExportFormat = .csv
+    @State private var format: ExportBuilder.Format = .csv
+    @State private var selectedNight: Date?
+    @State private var nights: [NightOption] = []
+    @State private var lastExported: Date?
+    @State private var newSessionCount = 0
+
     @State private var exportURL: URL?
     @State private var showShareSheet = false
     @State private var isExporting = false
     @State private var errorMessage: String?
+    @State private var statusMessage: String?
 
-    enum ExportFormat: String, CaseIterable {
-        case csv  = "CSV"
-        case json = "JSON"
+    /// Held between building the file and the share sheet CLOSING, so the export watermark advances
+    /// only once the user has actually sent the file somewhere — a cancelled share must not consume
+    /// the nights it contained.
+    @State private var pendingSharePayload: ExportBuilder.Payload?
+
+    @State private var showFolderImporter = false
+    @State private var folderName: String? = ExportDestination.chosenFolderName
+
+    enum ModeChoice: String, CaseIterable, Identifiable {
+        case dateRange
+        case singleSession
+        case newSessions
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .dateRange:     return "Date range"
+            case .singleSession: return "One night"
+            case .newSessions:   return "New only"
+            }
+        }
+    }
+
+    /// One selectable recorded night.
+    struct NightOption: Identifiable, Equatable {
+        let night: Date
+        let asleepMin: Int
+        var id: Date { night }
+
+        var label: String {
+            let day = night.formatted(date: .abbreviated, time: .omitted)
+            guard asleepMin > 0 else { return day }
+            return "\(day) — \(asleepMin / 60)h \(asleepMin % 60)m"
+        }
     }
 
     var body: some View {
         Form {
-            Section("Date range") {
-                DatePicker("Start", selection: $startDate,
-                           in: ...endDate, displayedComponents: .date)
-                DatePicker("End", selection: $endDate,
-                           in: startDate..., displayedComponents: .date)
+            Section("What to export") {
+                Picker("Mode", selection: $mode) {
+                    ForEach(ModeChoice.allCases) { m in
+                        Text(m.label).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                switch mode {
+                case .dateRange:
+                    DatePicker("Start", selection: $startDate,
+                               in: ...endDate, displayedComponents: .date)
+                    DatePicker("End", selection: $endDate,
+                               in: startDate..., displayedComponents: .date)
+                    Text("Up to \(ExportBuilder.maxExportDays) days per file. A longer range is "
+                         + "exported one year at a time, ending on the End date.")
+                        .font(.caption).foregroundStyle(.secondary)
+
+                case .singleSession:
+                    if nights.isEmpty {
+                        Text("No recorded nights yet — sync the ring first.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Picker("Night", selection: $selectedNight) {
+                            ForEach(nights) { option in
+                                Text(option.label).tag(Optional(option.night))
+                            }
+                        }
+                    }
+
+                case .newSessions:
+                    LabeledContent("Last exported",
+                                   value: lastExported.map {
+                                       $0.formatted(date: .abbreviated, time: .omitted)
+                                   } ?? "Never")
+                    Text(newSessionsSummary)
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
 
             Section("Format") {
                 Picker("Format", selection: $format) {
-                    ForEach(ExportFormat.allCases, id: \.self) { f in
+                    ForEach(ExportBuilder.Format.allCases, id: \.self) { f in
                         Text(f.rawValue).tag(f)
                     }
                 }
                 .pickerStyle(.segmented)
+            }
+
+            Section("Destination") {
+                LabeledContent("Save to", value: folderName ?? "Share sheet")
+                Button("Choose folder…") { showFolderImporter = true }
+                if folderName != nil {
+                    Button("Use share sheet instead", role: .destructive) {
+                        ExportDestination.forget()
+                        folderName = nil
+                        statusMessage = nil
+                    }
+                }
+                Text(folderName == nil
+                     ? "Exports open the share sheet so you can file them wherever you like. Pick a "
+                       + "folder to save straight there every time."
+                     : "Exports are written into this folder. If it ever becomes unavailable, "
+                       + "OpenCircuit falls back to the share sheet instead of failing.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {
@@ -60,24 +154,107 @@ struct ExportView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(isExporting)
 
+                if let status = statusMessage {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                }
                 if let err = errorMessage {
                     Text(err).font(.caption).foregroundStyle(.red)
                 }
             }
 
             Section {
-                Text("Exports the full local ring-data cache for the selected range: scalar vitals, "
-                     + "nightly sleep summaries and extras, intraday step deltas, naps, daytime "
-                     + "temperature, daily rollups, and recent history-sync evidence. Data stays on "
-                     + "your device and is only shared when YOU tap Export.")
+                // "how much of this night the app holds" — NOT "how much the ring delivered". The
+                // file's own coverage note says the export cannot tell an unworn ring, an undrained
+                // backlog and lost epochs apart, so the screen must not attribute a shortfall to the
+                // ring either.
+                Text("Each export carries the raw timestamped measurements the ring delivered — heart "
+                     + "rate, HRV, SpO₂, respiratory rate, skin temperature, step deltas — plus one "
+                     + "row per sleep session: bedtime and wake times, the per-epoch sleep stages, the "
+                     + "overnight SpO₂ (apnea) figures, and a coverage measurement showing how much of "
+                     + "the night this app currently holds. Every section is labelled measured, "
+                     + "derived or diagnostic, and the file records the app build, ring model and "
+                     + "firmware, and which timezone its timestamps are in.")
+                    .font(.caption).foregroundStyle(.secondary)
+                // The honest half. These caveats are also written into the file's own `notes` — in
+                // BOTH formats, CSV included — but a reader who never opens the file should still
+                // meet them before they act on a number.
+                Text("Sleep stages are an ON-DEVICE ESTIMATE — the ring transmits no hypnogram, so "
+                     + "stage totals approximate the RingConn app's but the placement of individual "
+                     + "cycles is not validated. The overnight lowest SpO₂, time below 90 % and ODI "
+                     + "are EXPERIMENTAL estimates; only the average SpO₂ is validated (±1 %) against "
+                     + "the RingConn app. Nothing leaves this device unless you share or save the file "
+                     + "yourself, and the ring's MAC address and your device's name are never included.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .navigationTitle("Data Export")
+        .task { refreshSessions() }
+        .fileImporter(isPresented: $showFolderImporter,
+                      allowedContentTypes: [.folder],
+                      allowsMultipleSelection: false) { result in
+            chooseFolder(result)
+        }
         .sheet(isPresented: $showShareSheet) {
             if let url = exportURL {
-                ShareActivityView(url: url)
+                ShareActivityView(url: url) { completed in
+                    shareFinished(completed)
+                }
             }
+        }
+    }
+
+    /// Wording for the "New only" mode. Split out because "nothing new SINCE THEN" is a lie on an
+    /// install that has never exported anything — there is no "then" yet.
+    private var newSessionsSummary: String {
+        if newSessionCount > 0 {
+            return "\(newSessionCount) session\(newSessionCount == 1 ? "" : "s") ready to export."
+        }
+        return lastExported == nil
+            ? "No sleep sessions recorded yet — sync the ring first."
+            : "No sleep sessions recorded since then."
+    }
+
+    // MARK: - Loading
+
+    /// Refresh the night list and the watermark state.
+    ///
+    /// The 120-night limit is arbitrary and display-only — it has no bearing on what an export
+    /// contains, it just keeps a long-lived install from scanning its whole sleep table to fill a
+    /// picker. `.newSessions` still asks the STORE what is unexported, not this list.
+    private func refreshSessions() {
+        let store = LocalStore(modelContext)
+        let rows = (try? store.recentSleepSummaries(limit: 120)) ?? []
+        nights = rows.map { NightOption(night: $0.night, asleepMin: $0.asleepMin) }
+        if selectedNight == nil || !nights.contains(where: { $0.night == selectedNight }) {
+            selectedNight = nights.first?.night
+        }
+        let watermark = store.lastExportWatermark()
+        lastExported = watermark
+        // Counted from the same bounded window, so it is a floor rather than a total. The store is
+        // still the authority at export time — this number only sizes the user's expectation.
+        newSessionCount = rows.filter { row in
+            guard let watermark else { return true }
+            return row.night > watermark
+        }.count
+    }
+
+    // MARK: - Destination
+
+    private func chooseFolder(_ result: Swift.Result<[URL], Error>) {
+        errorMessage = nil
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            if ExportDestination.remember(folder: url) {
+                folderName = ExportDestination.chosenFolderName
+                statusMessage = "Exports will be saved to \(url.lastPathComponent)."
+            } else {
+                // Keeping the bookmark failed, so a later export could not reach the folder. Say so
+                // now rather than showing a folder name that silently won't be used.
+                errorMessage = "Couldn't keep access to that folder — exports will use the share sheet."
+            }
+        case .failure(let error):
+            errorMessage = "Couldn't open that folder: \(error.localizedDescription)"
         }
     }
 
@@ -87,125 +264,93 @@ struct ExportView: View {
     private func runExport() async {
         isExporting = true
         errorMessage = nil
+        statusMessage = nil
         defer { isExporting = false }
 
+        // Give the main runloop a turn before the build takes the main thread, so the disabled
+        // button and its spinner get a chance to render. `ExportBuilder` and `LocalStore` are both
+        // `@MainActor` and the build is synchronous, so without a suspension point the whole export
+        // ran inside the SAME main-actor turn that set `isExporting`: the progress state was
+        // written and never drawn, and the screen simply froze with an enabled-looking button.
+        //
+        // This is a scheduling hop, not a fix for a long build — the actual protection against a
+        // main-thread stall is the bound (`ExportBuilder.maxExportDays`), not this line.
+        await Task.yield()
+
         let store = LocalStore(modelContext)
-        let rangeStart = Calendar.current.startOfDay(for: startDate)
-        let rangeEnd   = Calendar.current.date(byAdding: .day, value: 1,
-                                               to: Calendar.current.startOfDay(for: endDate)) ?? endDate
-
-        // Collect samples for all mirrored kinds
-        var sampleRows: [ExportEngine.SampleRow] = []
-        for kind in LocalStore.healthMirroredKinds {
-            let samples = (try? store.samples(kind: kind, from: rangeStart, to: rangeEnd)) ?? []
-            sampleRows += samples.map {
-                ExportEngine.SampleRow(kind: $0.kind.rawValue,
-                                       start: $0.start, end: $0.end, value: $0.value)
-            }
-        }
-        sampleRows.sort { $0.start < $1.start }
-
-        // Collect sleep summaries + sleep-side extras
-        let sleepRows = ((try? store.sleepSummaries(from: rangeStart, to: rangeEnd)) ?? [])
-            .map {
-                ExportEngine.SleepRow(
-                    night: $0.night, asleepMin: $0.asleepMin,
-                    deepMin: $0.deepMin, lightMin: $0.lightMin,
-                    remMin: $0.remMin, awakeMin: $0.awakeMin,
-                    efficiency: $0.efficiency,
-                    inBedStart: $0.inBedStart == .distantPast ? nil : $0.inBedStart,
-                    inBedEnd: $0.inBedEnd == .distantPast ? nil : $0.inBedEnd,
-                    skinTempC: $0.skinTempC, sleepScore: $0.sleepScore, stressScore: $0.stressScore,
-                    feelScore: $0.feelScore, hrDeep: $0.hrDeep, hrLight: $0.hrLight,
-                    hrRem: $0.hrRem, hrAwake: $0.hrAwake, movementLevels: $0.movementLevels)
-            }
-
-        // Collect daily rollups + timestamped step deltas
-        let dailyRows = ((try? store.dailies(from: rangeStart, to: rangeEnd)) ?? [])
-            .map { ExportEngine.DailyRow(day: $0.day, steps: $0.steps) }
-        let stepSampleRows = ((try? store.stepSamples(from: rangeStart, to: rangeEnd)) ?? [])
-            .map { ExportEngine.StepSampleRow(start: $0.start, end: $0.end, delta: $0.delta) }
-
-        // Collect naps + daytime temperatures
-        let napRows = ((try? store.naps(from: rangeStart, to: rangeEnd)) ?? [])
-            .map {
-                ExportEngine.NapRow(start: $0.start, end: $0.end,
-                                    asleepMin: $0.asleepMin, isLongNap: $0.isLongNap)
-            }
-        let daytimeTemperatureRows = ((try? store.daytimeTemperatures(from: rangeStart, to: rangeEnd)) ?? [])
-            .map { ExportEngine.DaytimeTemperatureRow(time: $0.time, celsius: $0.celsius) }
-
-        // Recent sync-forensics whose capture time falls in the export window
-        let evidenceRows = ObservabilityStore().historySyncEvidence()
-            .filter { $0.date >= rangeStart && $0.date < rangeEnd }
-            .map {
-                ExportEngine.HistorySyncEvidenceRow(
-                    capturedAt: $0.date,
-                    ringID: $0.ringID,
-                    trigger: $0.trigger,
-                    sleepCommitted: $0.sleepCommitted,
-                    stagedSleepSegments: $0.stagedSleepSegments,
-                    mergedRecordCount: $0.mergedRecordCount,
-                    historySampleCount: $0.historySampleCount,
-                    rawRecordBlobBase64: $0.rawRecordBlob.base64EncodedString(),
-                    channels: $0.channels
-                )
-            }
-
-        // Serialise
-        let content: String
-        let ext: String
-        switch format {
-        case .csv:
-            content = [
-                ExportEngine.samplesCSV(sampleRows),
-                "",
-                ExportEngine.sleepCSV(sleepRows),
-                "",
-                ExportEngine.dailyCSV(dailyRows),
-                "",
-                ExportEngine.stepSamplesCSV(stepSampleRows),
-                "",
-                ExportEngine.napsCSV(napRows),
-                "",
-                ExportEngine.daytimeTemperatureCSV(daytimeTemperatureRows),
-                "",
-                ExportEngine.historySyncEvidenceCSV(evidenceRows)
-            ].joined(separator: "\n")
-            ext = "csv"
-        case .json:
-            guard let json = ExportEngine.toJSON(samples: sampleRows, sleep: sleepRows,
-                                                 daily: dailyRows,
-                                                 stepSamples: stepSampleRows,
-                                                 naps: napRows,
-                                                 daytimeTemperatures: daytimeTemperatureRows,
-                                                 historySyncEvidence: evidenceRows) else {
-                errorMessage = "Failed to serialise JSON — please try again."
+        let builderMode: ExportBuilder.Mode
+        switch mode {
+        case .dateRange:
+            builderMode = .dateRange(start: startDate, end: endDate)
+        case .singleSession:
+            guard let night = selectedNight else {
+                errorMessage = "Pick a night to export."
                 return
             }
-            content = json
-            ext = "json"
+            builderMode = .singleSession(night: night)
+        case .newSessions:
+            builderMode = .newSessions
         }
 
-        // Write to a temp file
-        let fileName = "opencircuit-export-\(isoDate(Date())).\(ext)"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
         do {
-            try content.write(to: url, atomically: true, encoding: .utf8)
-        } catch {
-            errorMessage = "Failed to write export file: \(error.localizedDescription)"
-            return
-        }
+            switch try ExportBuilder.build(store: store, mode: builderMode, format: format) {
+            case .nothingNew(let since):
+                // An empty file would look like a night that contained nothing. Say what actually
+                // happened instead.
+                statusMessage = since.map {
+                    "Nothing new — every night up to "
+                    + "\($0.formatted(date: .abbreviated, time: .omitted)) has already been exported."
+                } ?? "There are no recorded nights to export yet."
 
-        exportURL = url
-        showShareSheet = true
+            case .file(let payload):
+                switch try ExportDestination.deliver(payload) {
+                case .savedToFolder(_, let folder):
+                    // Durably written: the watermark may advance now (I2/I3).
+                    commitWatermark(payload, store: store)
+                    statusMessage = joined("Saved \(payload.fileName) to \(folder).",
+                                           payload.rangeNotice)
+                    refreshSessions()
+
+                case .temporaryFile(let url, let reason):
+                    // NOT yet delivered — the user still has to pick a destination in the sheet, and
+                    // they may cancel. The watermark waits for `shareFinished`.
+                    pendingSharePayload = payload
+                    exportURL = url
+                    statusMessage = joined(reason, payload.rangeNotice)
+                    showShareSheet = true
+                }
+            }
+        } catch ExportBuilder.Failure.sessionNotStored {
+            errorMessage = "That night is no longer in the local store."
+        } catch ExportBuilder.Failure.serializationFailed {
+            errorMessage = "Failed to serialise the export — please try again."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
-    private func isoDate(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"
-        f.locale = Locale(identifier: "en_US_POSIX")
-        return f.string(from: date)
+    /// Join the delivery message with the range notice, dropping whichever is absent. The notice
+    /// must survive on BOTH delivery paths — a clamped range the user is never told about is a file
+    /// that quietly covers less than they asked for.
+    private func joined(_ parts: String?...) -> String? {
+        let text = parts.compactMap { $0 }.joined(separator: " ")
+        return text.isEmpty ? nil : text
+    }
+
+    /// The share sheet closed. `completed` is true only when the user actually sent the file
+    /// somewhere; a cancel leaves the watermark where it was, so those nights stay claimable.
+    private func shareFinished(_ completed: Bool) {
+        guard let payload = pendingSharePayload else { return }
+        pendingSharePayload = nil
+        guard completed else { return }
+        commitWatermark(payload, store: LocalStore(modelContext))
+        refreshSessions()
+    }
+
+    /// Failing to persist the watermark costs a duplicate export next time, which is strictly better
+    /// than telling the user their finished export failed — so it is swallowed on purpose.
+    private func commitWatermark(_ payload: ExportBuilder.Payload, store: LocalStore) {
+        try? ExportBuilder.commitWatermark(payload, store: store)
     }
 }
 
@@ -215,9 +360,16 @@ struct ExportView: View {
 /// Internal (not file-private) — also reused by the Debug card's raw-capture export (ContentView).
 struct ShareActivityView: UIViewControllerRepresentable {
     let url: URL
+    /// Called when the sheet closes, with whether the user actually completed a share. Optional and
+    /// defaulted so existing call sites that only want to present the sheet are unchanged.
+    var onFinish: ((Bool) -> Void)?
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        let controller = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let onFinish {
+            controller.completionWithItemsHandler = { _, completed, _, _ in onFinish(completed) }
+        }
+        return controller
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
