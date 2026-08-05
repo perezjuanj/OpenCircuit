@@ -227,19 +227,29 @@ public enum SleepStaging {
         // either, which is why the pass must not overrule `rescueSecondBoutHRWake`. See
         // `markPointOfNoReturnOffset` for the guards that follow from this.
 
-        /// bpm above the sleeping floor that the ENTIRE remaining night must stay above for the
-        /// scan to call final wake. **0 disables the pass — byte-identical to the pre-offset
-        /// staging** (every existing night, every existing test).
+        /// How far above the sleeping floor the ENTIRE remaining night must stay for the scan to
+        /// call final wake — expressed as a FRACTION of the night's own sleeping-HR spread
+        /// (`median − floor`), never an absolute bpm. **0 disables the pass entirely.**
         ///
-        /// 🟡 NOT YET FIT. Held at 0 exactly as `rrVarWeight` is, until supervised-fit against
-        /// captured labels (`docs/RUNBOOK_SLEEP_GROUNDTRUTH.md`). MEASURED on the single night
-        /// available so far (2026-08-04, FR02.018, user-reported wake 08:02):
-        ///   k=2 → 07:52:44 · k=3 → 08:00:14 · k=4 → 08:00:14 · k=5 → 08:10:14
-        ///   k=6 → 08:12:44 · k=8 → 08:15:14 · k=10 → 08:47:44
-        /// The flat k=3…4 plateau landing 2 min from the reported wake is SUGGESTIVE, and is the
-        /// reason this pass exists — it is NOT sufficient to set a default. One night is one night
-        /// (N8): do not promote off this number alone.
-        public var offsetNoReturnMarginBPM: Double
+        /// DERIVED, not absolute, for the same reason `motionAboveLocalFloor` and `derivedActiveCut`
+        /// are: an absolute bpm cut cannot serve two people (or two nights) whose HR spreads differ.
+        /// A sleeper whose HR barely varies gets a tight margin; a fragmented or restless night —
+        /// where the median is dragged up — automatically gets a more conservative one. The resolved
+        /// margin is floored at `offsetNoReturnMinMarginBPM` so a very flat night cannot derive a
+        /// near-zero (hair-trigger) threshold.
+        ///
+        /// 🟡 PROBABLE, fit against ONE night (2026-08-04, FR02.018; user-reported wake 08:02).
+        /// Measured there: fraction 0.5 → margin 3.0 bpm → wake 08:00:14 (2 min error). Absolute
+        /// sweeps on the same night, for reference: 2 → 07:52:44, 3/4 → 08:00:14, 5 → 08:10:14,
+        /// 6 → 08:12:44, 8 → 08:15:14, 10 → 08:47:44; `median−floor` (6.0) and IQR (7.0) both land
+        /// 08:12:44. One night is one night (N8) — this is a starting point to be FIT against
+        /// accumulated user sleep-edit labels (`SleepEditLabel`), not a settled value.
+        public var offsetNoReturnSpreadFraction: Double
+
+        /// Floor on the derived offset margin, in bpm. The ring reports INTEGER bpm and the wake
+        /// scan runs on a rolling MEDIAN of integers, so ~1 bpm is pure quantisation; 2 bpm is twice
+        /// that. Instrument-derived, not fitted.
+        public var offsetNoReturnMinMarginBPM: Double
 
         // --- Lead-in wake ONSET (the "lay awake still for hours" fix) ----------------
         // The descent trim above keys off a clean HR DESCENT into the floor. But the hardest night
@@ -317,7 +327,8 @@ public enum SleepStaging {
                     onsetMinDescentBPM: Double = 10,
                     onsetScanEpochs: Int = 12,
                     onsetSearchEpochs: Int = 48,
-                    offsetNoReturnMarginBPM: Double = 0,
+                    offsetNoReturnSpreadFraction: Double = 0.5,
+                    offsetNoReturnMinMarginBPM: Double = 2,
                     minConsolidatedSleepEpochs: Int = 16,
                     deepBaselineMarginBPM: Double = 18,
                     preOnsetBedtimeReachEpochs: Int = 24,
@@ -347,7 +358,8 @@ public enum SleepStaging {
             self.onsetMinDescentBPM = onsetMinDescentBPM
             self.onsetScanEpochs = onsetScanEpochs
             self.onsetSearchEpochs = onsetSearchEpochs
-            self.offsetNoReturnMarginBPM = offsetNoReturnMarginBPM
+            self.offsetNoReturnSpreadFraction = offsetNoReturnSpreadFraction
+            self.offsetNoReturnMinMarginBPM = offsetNoReturnMinMarginBPM
             self.minConsolidatedSleepEpochs = minConsolidatedSleepEpochs
             self.deepBaselineMarginBPM = deepBaselineMarginBPM
             self.preOnsetBedtimeReachEpochs = preOnsetBedtimeReachEpochs
@@ -661,6 +673,8 @@ public enum SleepStaging {
         let lastVitalsSoftened = rows.indices.last { motionAwakeStrict[$0] && !motionAwake[$0] }
         let notBefore = [lastRescuedIndex, lastVitalsSoftened].compactMap { $0 }.max()
         markPointOfNoReturnOffset(&awake, smHR: smHR, floor: sleepFloor,
+                                  margin: resolvedOffsetMargin(hr: hr, floor: sleepFloor, tuning: tuning),
+                                  vitals: rows.map(\.vitals),
                                   notBefore: notBefore, tuning: tuning)
 
         // --- ONSET / OFFSET: trim leading & trailing awake -------------------------
@@ -1020,6 +1034,21 @@ public enum SleepStaging {
         for k in 0 ... be { awake[k] = true }
     }
 
+    /// The offset margin for a night, DERIVED from its own sleeping-HR spread rather than fixed in
+    /// bpm — the same self-calibrating principle as `motionAboveLocalFloor` / `derivedActiveCut` /
+    /// `sleepHRFloor`. `median − floor` is "how far a typical epoch sits above this night's sleeping
+    /// floor"; a fraction of that scales with the person AND with how settled the night was. Floored
+    /// at `offsetNoReturnMinMarginBPM` so a near-flat night can't derive a hair-trigger threshold.
+    /// Returns 0 (disabled) when the fraction is 0 or the HR series is empty.
+    /// Test seam for the percentile helper (which is `private`).
+    static func percentileForTesting(_ xs: [Double], _ q: Double) -> Double { percentile(xs.sorted(), q) }
+
+    static func resolvedOffsetMargin(hr: [Double], floor: Double, tuning: Tuning) -> Double {
+        guard tuning.offsetNoReturnSpreadFraction > 0, !hr.isEmpty else { return 0 }
+        let spread = max(0, percentile(hr.sorted(), 0.50) - floor)
+        return max(tuning.offsetNoReturnMinMarginBPM, tuning.offsetNoReturnSpreadFraction * spread)
+    }
+
     /// Mark the trailing "HR rose and never settled again" run as awake — the OFFSET counterpart to
     /// the two onset passes above.
     ///
@@ -1063,22 +1092,24 @@ public enum SleepStaging {
     /// ⚠️ The premise — "at true final wake HR rises and never returns to the floor, while a REM bump
     /// or a stir always settles back" — is 🟡 PROBABLE, not established. It is measured on one night,
     /// and property 3 exists precisely because a real 3 a.m. arousal REFUTES the second half of it.
-    /// No-op when `offsetNoReturnMarginBPM == 0` (the default) — byte-identical to pre-offset staging.
+    /// `margin` is the RESOLVED bpm cut, derived by the caller from the night's own HR spread (see
+    /// `resolvedOffsetMargin`); a non-positive margin disables the pass.
     ///
     /// `internal` rather than `private` (unlike every sibling pass) ON PURPOSE: its tests drive it
     /// directly, because a synthetic record fixture carries a CONSTANT motion byte that de-floors to
     /// "still" everywhere, so an "awake" fixture silently stages as sleep and the assertions go
     /// vacuous. Feeding the HR array in directly is the only way to test this honestly.
     static func markPointOfNoReturnOffset(_ awake: inout [Bool], smHR: [Double],
-                                          floor: Double, notBefore: Int? = nil, tuning: Tuning) {
-        guard tuning.offsetNoReturnMarginBPM > 0,
+                                          floor: Double, margin: Double, vitals: [Bool] = [],
+                                          notBefore: Int? = nil, tuning: Tuning) {
+        guard margin > 0,
               !awake.isEmpty, smHR.count == awake.count,
               let (lo, _) = sleepSpan(awake, sustain: tuning.onsetSustainEpochs) else { return }
         // The scan may not begin at or before the onset, a rescued second bout, or a vitals-softened
         // morning; nor further back than the onset passes are allowed to reach from their own edge.
         let searchFloor = awake.count - min(tuning.onsetSearchEpochs, awake.count)
         let earliest = max(lo, notBefore ?? lo, searchFloor)
-        let threshold = floor + tuning.offsetNoReturnMarginBPM
+        let threshold = floor + margin
         // Earliest index whose ENTIRE suffix stays above the threshold. Walking backwards and
         // breaking on the first dip makes this a suffix by construction.
         var start: Int?
@@ -1089,6 +1120,30 @@ public enum SleepStaging {
         }
         // `> earliest`, not `>=`: the onset epoch (and the last rescued epoch) must remain asleep.
         guard let s = start, s > earliest else { return }
+
+        // TERMINAL-REM GUARD. HR alone cannot tell a final REM period from a quiet wake — both sit
+        // elevated and neither returns to the floor — and REM periods LENGTHEN toward morning, so
+        // this scan would systematically eat the last REM of every night. The ring settles it: during
+        // REM it keeps emitting sleep-vitals (HRV-bearing) epochs at cadence, and at true wake that
+        // stream thins. 🟢 MEASURED on the 2026-08-04 night: the sleep-vitals fraction holds
+        // 0.42–0.50 from 23:26 through 07:26 and drops to 0.23 in the 08:26 hour. So require the
+        // suffix to be materially thinner than the sleep behind it, reusing the same "at most this
+        // share" bar `rescueSecondBoutHRWake` uses. No vitals coverage → this guard cannot judge and
+        // stays out of the way (absence of data is not evidence of wake).
+        // A night with NO sleep-vitals anywhere cannot be judged this way — and since this pass
+        // REMOVES sleep, no evidence means no cut (the same "absence of data is not evidence"
+        // stance the wear and HR gates take). Passing an empty `vitals` skips the guard entirely;
+        // that is for the direct unit tests, not for production, which always threads it.
+        if !vitals.isEmpty, vitals.count == awake.count {
+            let suffix = vitals[s...]
+            let body = vitals[lo..<s]
+            let suffixShare = suffix.isEmpty ? 0
+                : Double(suffix.filter { $0 }.count) / Double(suffix.count)
+            let bodyShare = body.isEmpty ? 0
+                : Double(body.filter { $0 }.count) / Double(body.count)
+            guard bodyShare > 0 else { return }
+            guard suffixShare <= bodyShare * tuning.hrWakeRescueVitalsFraction else { return }
+        }
         var candidate = awake
         for i in s ..< candidate.count { candidate[i] = true }
         // Only commit if a CONSOLIDATED asleep run survives. `onsetSustainEpochs` (6 ≈ 15 min) is far

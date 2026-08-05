@@ -111,10 +111,13 @@ class Tuning:
     # 0 = disabled = byte-identical, exactly as the Swift default ships. See
     # SleepStaging.markPointOfNoReturnOffset for why the trailing edge needs its own,
     # tighter margin than the shared wakeHRMarginBPM.
-    offsetNoReturnMarginBPM: float = 0.0
+    offsetNoReturnSpreadFraction: float = 0.5
+    offsetNoReturnMinMarginBPM: float = 2.0
     # Mirrors Swift's knob of the same name. Used HERE only as the offset pass's survival guard
     # (the Swift value is 16); the other Swift passes that consume it are not ported yet.
     minConsolidatedSleepEpochs: int = 16
+    # Mirrors Swift; used here only by the offset pass's terminal-REM guard.
+    hrWakeRescueVitalsFraction: float = 0.5
 
     # --- Experimental extensions (NOT in Swift Tuning yet; off by default). The fit
     #     reports whether turning these on helps; if so, add them to the Swift struct. --
@@ -130,7 +133,7 @@ class Tuning:
         "sleepFloorPercentile", "wakeHRMarginBPM", "hrWakeHalfWindow",
         "onsetSustainEpochs", "minHRWakeRunEpochs",
         "onsetSettleFraction", "onsetMinDescentBPM", "onsetScanEpochs", "onsetSearchEpochs",
-        "offsetNoReturnMarginBPM",
+        "offsetNoReturnSpreadFraction", "offsetNoReturnMinMarginBPM",
     )
 
 
@@ -495,30 +498,31 @@ def _mark_descent_onset_awake(awake, sm_hr, motion_awake, floor, t):
             awake[k] = True
 
 
-def _mark_point_of_no_return_offset(awake, sm_hr, floor, t):
+def _mark_point_of_no_return_offset(awake, sm_hr, hr, vitals, floor, t):
     """Port of SleepStaging.markPointOfNoReturnOffset (mutates `awake`): mark the trailing
-    "HR rose and never returned to the sleeping floor" run as awake. Suffix-by-construction,
-    refuses to start at or before the onset, and reverts unless sustained sleep survives.
-    No-op when offsetNoReturnMarginBPM == 0 (the default).
+    "HR rose and never returned to the sleeping floor" run as awake.
 
-    ⚠️ DIVERGENCE: Swift additionally passes `notBefore` = the last epoch
-    rescueSecondBoutHRWake reclaimed, so the scan cannot delete a second sleep bout that
-    sleeps ABOVE the night's floor. This port does NOT implement that rescue at all, so it
-    has no bout to protect and will be MORE aggressive than Swift on mid-night-wake nights.
-    Treat a fitted offsetNoReturnMarginBPM as an UPPER bound on aggressiveness until the
-    rescue is ported."""
-    if t.offsetNoReturnMarginBPM <= 0 or not awake or len(sm_hr) != len(awake):
+    Margin is DERIVED from the night's own sleeping-HR spread (median - floor), never absolute.
+    Guards, all mirroring Swift: suffix-by-construction; refuses to reach the onset; bounded to
+    the last onsetSearchEpochs; reverts unless a CONSOLIDATED run survives; and a TERMINAL-REM
+    guard requiring the suffix's sleep-vitals share to be materially thinner than the sleep
+    behind it (HR alone cannot tell a final REM period from a quiet wake).
+
+    DIVERGENCE: Swift also passes `notBefore` = the last epoch rescueSecondBoutHRWake or the
+    motion-awake vitals softening reclaimed. Neither pass is ported here, so this is MORE
+    aggressive than Swift on mid-night-wake nights; treat a fitted fraction as an upper bound.
+    """
+    if t.offsetNoReturnSpreadFraction <= 0 or not awake or len(sm_hr) != len(awake):
         return
     span = _sleep_span(awake, t.onsetSustainEpochs)
     if span is None:
         return
     lo, _ = span
-    # MAGNITUDE bound: the cut point must lie within the last onsetSearchEpochs epochs, the same
-    # bound the onset passes use at the head. Without it the scan is positionally unbounded and a
-    # merely DRIFTING (still asleep) later night reads as "never returned".
+    spread = max(0.0, percentile(sorted(hr), 0.50) - floor)
+    margin = max(t.offsetNoReturnMinMarginBPM, t.offsetNoReturnSpreadFraction * spread)
     search_floor = len(awake) - min(t.onsetSearchEpochs, len(awake))
     earliest = max(lo, search_floor)
-    threshold = floor + t.offsetNoReturnMarginBPM
+    threshold = floor + margin
     start = None
     suffix_min = float("inf")
     for i in range(len(sm_hr) - 1, -1, -1):
@@ -529,10 +533,19 @@ def _mark_point_of_no_return_offset(awake, sm_hr, floor, t):
             break
     if start is None or start <= earliest:
         return
+    # TERMINAL-REM guard.
+    if vitals and len(vitals) == len(awake):
+        suf = vitals[start:]
+        body = vitals[lo:start]
+        suf_share = (sum(1 for v in suf if v) / len(suf)) if suf else 0.0
+        body_share = (sum(1 for v in body if v) / len(body)) if body else 0.0
+        if body_share <= 0:
+            return
+        if suf_share > body_share * t.hrWakeRescueVitalsFraction:
+            return
     candidate = list(awake)
     for i in range(start, len(candidate)):
         candidate[i] = True
-    # SURVIVAL: require a CONSOLIDATED run, not the far weaker onsetSustainEpochs.
     if _sleep_span(candidate, t.minConsolidatedSleepEpochs) is None:
         return
     awake[:] = candidate
@@ -671,7 +684,7 @@ def classify_prepared(pf, t, band_pool=None):
     awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
     _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
     _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
-    _mark_point_of_no_return_offset(awake, sm_hr, sleep_floor, t)
+    _mark_point_of_no_return_offset(awake, sm_hr, hr, [v is not None for v in pf.hrv], sleep_floor, t)
 
     span = _sleep_span(awake, t.onsetSustainEpochs)
     if span is None:
@@ -752,7 +765,7 @@ def baseline_band_pool(nights_prepared, t):
             awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
             _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
             _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
-            _mark_point_of_no_return_offset(awake, sm_hr, sleep_floor, t)
+            _mark_point_of_no_return_offset(awake, sm_hr, pf.hr, [v is not None for v in pf.hrv], sleep_floor, t)
             span = _sleep_span(awake, t.onsetSustainEpochs)
             if span is None:
                 continue
@@ -864,7 +877,7 @@ SEARCH_GRID = {
     "onsetSearchEpochs": [36, 48, 72],
     # 0 first: coordinate descent starts from the default and never worsens, so the
     # offset pass must EARN its way on against real labels rather than being assumed.
-    "offsetNoReturnMarginBPM": [0.0, 2.0, 3.0, 4.0, 5.0, 8.0],
+    "offsetNoReturnSpreadFraction": [0.0, 0.25, 0.5, 0.75, 1.0],
 }
 
 
