@@ -89,17 +89,80 @@ struct OpenCircuitApp: App {
     /// Phase-2 risk rows never need a second migration — each migration is a launch-crash surface
     /// whose recovery path wipes un-resyncable raw history (#40).
     ///
-    /// V4 IS STILL UNRELEASED, so its shape is edited IN PLACE rather than superseded — Phase 2
-    /// added `StoredHeadacheRisk.nightKey` here without bumping the identifier. That is deliberate
-    /// and it is the only correct option: SwiftData derives a version's checksum from its model
-    /// SHAPES, so a V5 listing the same models is rejected outright with "duplicate version
-    /// checksums" (measured — it does not merely warn). The cost is that a device carrying an
-    /// INTERMEDIATE build of this branch has a V4 store whose checksum no longer matches and will
-    /// hit the container-open failure path; delete and reinstall such a dev build. No shipped build
-    /// has ever written V4, so no user store is exposed. Once this merges, V4 is frozen and the
-    /// next shape change must be a real V5.
+    /// V4 IS FROZEN. It shipped in build 34 (`v1.0-b34`, 2026-07-31) and every build since, so its
+    /// shape is now the shape on real phones and may no longer be edited in place. While it was
+    /// unreleased it WAS edited in place (Phase 2 added `StoredHeadacheRisk.nightKey` without a
+    /// bump), which was correct then and is not correct now.
+    ///
+    /// `StoredSleepSummary` is therefore pinned to the shape build 34 wrote, as a NESTED snapshot,
+    /// rather than pointing at the live type. MEASURED, not assumed: with V4 listing the live type
+    /// after `hypnogramData` was added, opening a store written by build 34 fails with
+    /// `NSCocoaErrorDomain 134504 "Cannot use staged migration with an unknown model version."` —
+    /// SwiftData identifies a store by its model-shape checksum, so a changed V4 no longer matches
+    /// anything on disk and the whole store is unidentifiable. That routes straight to
+    /// `wipeAndRecoverForeground`, which keeps only the rollups and deletes every raw
+    /// `StoredSample`/`StoredCursor`/`StoredStepSample`/`StoredDaytimeTemp` row — history the ring
+    /// cannot re-supply. With the snapshot below plus a real V5, the same store opens, keeps its
+    /// rows, and gains the column by lightweight migration (both arms measured on this toolchain).
+    ///
+    /// The snapshot is also what makes a V5 legal at all: the "duplicate version checksums"
+    /// rejection the previous note warned about happens only when two versions describe the SAME
+    /// shapes. V4 (pinned) and V5 (live) now differ by exactly `hypnogramData`.
     enum SchemaV4: VersionedSchema {
         static var versionIdentifier = Schema.Version(4, 0, 0)
+        static var models: [any PersistentModel.Type] {
+            // `StoredSleepSummary` here resolves to the nested snapshot below — deliberately.
+            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
+             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
+             StoredHeadacheEntry.self, StoredHeadacheRisk.self]
+        }
+
+        /// `StoredSleepSummary` EXACTLY as build 34 wrote it — the pre-`hypnogramData` shape.
+        ///
+        /// It exists only to give V4 the checksum that is on disk; nothing reads or writes through
+        /// it, and the live type in `Store/LocalStore.swift` remains the one the app uses. Keep the
+        /// property names, types and attributes byte-for-byte identical to build 34's: the class
+        /// name is the CoreData entity name, and any divergence re-breaks store identification.
+        /// Do NOT add to it — a new column belongs on the live type plus a new schema version.
+        @Model final class StoredSleepSummary {
+            @Attribute(.unique) var night: Date = Date.distantPast
+            var asleepMin: Int = 0
+            var deepMin: Int = 0
+            var lightMin: Int = 0
+            var remMin: Int = 0
+            var awakeMin: Int = 0
+            var efficiency: Double = 0
+            var inBedStart: Date = Date.distantPast
+            var inBedEnd: Date = Date.distantPast
+            var sleepOnset: Date = Date.distantPast
+            var sleepWake: Date = Date.distantPast
+            var updatedAt: Date = Date.distantPast
+            var skinTempC: Double = 0
+            var sleepScore: Int = 0
+            var stressScore: Int = 0
+            var feelScore: Int = 0
+            var hrDeep: Int = 0
+            var hrLight: Int = 0
+            var hrRem: Int = 0
+            var hrAwake: Int = 0
+            var movementLevels: [Int] = []
+            var osaAvgSpO2: Double = 0
+            var osaMinSpO2: Double = 0
+            var osaTimeBelow90Sec: Double = 0
+            var osaODI: Double = 0
+            var osaValidWindows: Int = 0
+            var editedInBedStart: Date = Date.distantPast
+            var editedInBedEnd: Date = Date.distantPast
+            var isManuallyEdited: Bool = false
+            init() {}
+        }
+    }
+
+    /// Adds `StoredSleepSummary.hypnogramData` — the night's staged segments, so a session export can
+    /// say WHEN a stage happened and not only how many minutes of it there were. One defaulted column
+    /// on an existing model: lightweight migration, not a custom stage (cf. #21).
+    enum SchemaV5: VersionedSchema {
+        static var versionIdentifier = Schema.Version(5, 0, 0)
         static var models: [any PersistentModel.Type] {
             [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
              StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
@@ -109,12 +172,13 @@ struct OpenCircuitApp: App {
 
     enum MigrationPlan: SchemaMigrationPlan {
         static var schemas: [any VersionedSchema.Type] {
-            [SchemaV1.self, SchemaV2.self, SchemaV3.self, SchemaV4.self]
+            [SchemaV1.self, SchemaV2.self, SchemaV3.self, SchemaV4.self, SchemaV5.self]
         }
         static var stages: [MigrationStage] {
             [.lightweight(fromVersion: SchemaV1.self, toVersion: SchemaV2.self),
              .lightweight(fromVersion: SchemaV2.self, toVersion: SchemaV3.self),
-             .lightweight(fromVersion: SchemaV3.self, toVersion: SchemaV4.self)]
+             .lightweight(fromVersion: SchemaV3.self, toVersion: SchemaV4.self),
+             .lightweight(fromVersion: SchemaV4.self, toVersion: SchemaV5.self)]
         }
     }
 
@@ -150,8 +214,9 @@ struct OpenCircuitApp: App {
     /// The schema + default configuration shared by BOTH container builders, so the foreground
     /// (recovering) and background (non-destructive) paths can never drift apart. (#131)
     private static func makeSchemaAndConfig() -> (Schema, ModelConfiguration) {
-        // Must list exactly `SchemaV4.models` — the container is built from THIS array, so a model
-        // present only in the versioned schema enum would migrate in and then be unreachable.
+        // Must list exactly `SchemaV5.models` (the CURRENT version) — the container is built from
+        // THIS array, so a model present only in the versioned schema enum would migrate in and then
+        // be unreachable. `StoredSleepSummary` here is the LIVE type, never SchemaV4's snapshot.
         let schema = Schema([StoredSample.self, StoredCursor.self,
                              StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
                              StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
