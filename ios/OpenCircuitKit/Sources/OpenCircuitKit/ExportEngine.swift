@@ -243,6 +243,15 @@ public enum ExportEngine {
         public let sleepOnset: Date?
         public let sleepWake: Date?
         public let isManuallyEdited: Bool
+        /// What the ALGORITHM originally produced, before any manual correction. Present only on an
+        /// edited night; `nil` otherwise (nothing was overridden, so the fields above already are the
+        /// algorithm's output). Paired with the edited values above these form a supervised LABEL:
+        /// "the detector said X, the person who slept the night says Y". That is the only ground
+        /// truth this project can obtain without the vendor app — see `SleepEditLabel`.
+        public let recordedInBedStart: Date?
+        public let recordedInBedEnd: Date?
+        public let recordedOnset: Date?
+        public let recordedWake: Date?
         public let hypnogram: [SleepSegment]
         public let summary: SleepRow
         public let osa: OSARow?
@@ -251,6 +260,8 @@ public enum ExportEngine {
                     inBedStart: Date? = nil, inBedEnd: Date? = nil,
                     sleepOnset: Date? = nil, sleepWake: Date? = nil,
                     isManuallyEdited: Bool = false,
+                    recordedInBedStart: Date? = nil, recordedInBedEnd: Date? = nil,
+                    recordedOnset: Date? = nil, recordedWake: Date? = nil,
                     hypnogram: [SleepSegment] = [],
                     summary: SleepRow,
                     osa: OSARow? = nil,
@@ -259,6 +270,8 @@ public enum ExportEngine {
             self.inBedStart = inBedStart; self.inBedEnd = inBedEnd
             self.sleepOnset = sleepOnset; self.sleepWake = sleepWake
             self.isManuallyEdited = isManuallyEdited
+            self.recordedInBedStart = recordedInBedStart; self.recordedInBedEnd = recordedInBedEnd
+            self.recordedOnset = recordedOnset; self.recordedWake = recordedWake
             self.hypnogram = hypnogram; self.summary = summary
             self.osa = osa; self.coverage = coverage
         }
@@ -792,6 +805,17 @@ public enum ExportEngine {
                     "isManuallyEdited": session.isManuallyEdited,
                     "summary": sleepJSON(session.summary, iso: { offsetISO8601($0) })
                 ]
+                // Supervised LABEL for an edited night: what the detector said, alongside the
+                // corrected values above. Key omitted entirely on an unedited night — absence means
+                // "nothing was overridden", which is not the same as "the detector agreed".
+                if session.isManuallyEdited {
+                    var recorded: [String: Any] = [:]
+                    if let v = session.recordedInBedStart { recorded["inBedStart"] = offsetISO8601(v) }
+                    if let v = session.recordedInBedEnd { recorded["inBedEnd"] = offsetISO8601(v) }
+                    if let v = session.recordedOnset { recorded["sleepOnset"] = offsetISO8601(v) }
+                    if let v = session.recordedWake { recorded["sleepWake"] = offsetISO8601(v) }
+                    if !recorded.isEmpty { obj["recorded"] = recorded }
+                }
                 // Omitted when no timeline was recorded, `[]` when one was recorded and holds no
                 // stage blocks — the same absence-is-not-zero rule `hypnogramSegments` follows in
                 // the CSV, and the same omit-the-key convention `osa`/`coverage` use below. An

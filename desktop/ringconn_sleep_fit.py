@@ -851,6 +851,97 @@ def score_tuning(nights_prepared, nights_truth, t, mode="blend", band_pool_per_n
     return objective(m, mode), m
 
 
+
+# ====================================================================================
+# Sleep-EDIT labels — supervised ground truth harvested from the user's own corrections
+# ====================================================================================
+# Mirrors OpenCircuitKit's `SleepEditLabel`. The app's Data Export (schema v3) emits, for
+# every MANUALLY EDITED night, both the corrected clocks and a `recorded` object holding
+# what the detector originally said. That pair is a label: detector said X, sleeper says Y.
+#
+# ⚠️ BIASED SAMPLE. People correct nights that look wrong and leave nights that look right,
+# so this over-represents failures. Good for "how wrong are we when we are wrong" and for
+# fitting a knob that must not worsen those cases; useless as an overall accuracy estimate.
+
+MIN_CORRECTION_MINUTES = 3.0     # below this an "edit" is picker friction, not an assertion
+MIN_NIGHTS_TO_FIT = 10           # mirrors SleepEditLabels.minimumNightsToFit
+
+
+def _parse_iso(v):
+    if not v:
+        return None
+    txt = v.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+
+
+def load_edit_labels(path):
+    """Read [(night, onset_err_min, wake_err_min)] from an app Data Export JSON.
+
+    Errors are SIGNED, detector minus truth: positive wake error = the detector held the
+    night open too long (the placeholder-flat-motion failure mode).
+    """
+    with open(path) as fh:
+        doc = json.load(fh)
+    out = []
+    for sess in doc.get("sleepSessions", []):
+        if not sess.get("isManuallyEdited"):
+            continue
+        rec = sess.get("recorded") or {}
+        pairs = (("sleepOnset", "onset"), ("sleepWake", "wake"))
+        errs = {}
+        for key, name in pairs:
+            r, t = _parse_iso(rec.get(key)), _parse_iso(sess.get(key))
+            errs[name] = (r - t).total_seconds() / 60 if (r and t) else None
+        if any(e is not None and abs(e) >= MIN_CORRECTION_MINUTES for e in errs.values()):
+            out.append((sess.get("night"), errs["onset"], errs["wake"]))
+    return out
+
+
+def report_edit_labels(paths):
+    """Summarise the label set and say whether it is enough to fit a knob against."""
+    labels = []
+    for p in paths:
+        labels.extend(load_edit_labels(p.strip()))
+    if not labels:
+        print("no usable sleep-edit labels found "
+              "(need nights edited by >= %g min in the Data Export)" % MIN_CORRECTION_MINUTES)
+        return 1
+    print("sleep-edit labels: %d night(s)" % len(labels))
+    print("  night        onset err (min)   wake err (min)")
+    for night, on, wk in sorted(labels, key=lambda r: r[0] or ""):
+        print("  %-11s %14s %16s" % (night,
+                                     "-" if on is None else "%+.0f" % on,
+                                     "-" if wk is None else "%+.0f" % wk))
+
+    def stats(vals):
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return None, None
+        mean = sum(vals) / len(vals)
+        a = sorted(abs(v) for v in vals)
+        med = a[len(a) // 2] if len(a) % 2 else (a[len(a) // 2 - 1] + a[len(a) // 2]) / 2
+        return mean, med
+
+    for name, idx in (("onset", 1), ("wake", 2)):
+        mean, med = stats([r[idx] for r in labels])
+        if mean is None:
+            print("  %s: no labelled edge" % name)
+        else:
+            print("  %s: mean signed %+.1f min (systematic bias), median |err| %.1f min"
+                  % (name, mean, med))
+    n = len(labels)
+    if n < MIN_NIGHTS_TO_FIT:
+        print("\nNOT ENOUGH TO FIT: %d/%d nights. A knob may not be promoted off this "
+              "(change-control N8)." % (n, MIN_NIGHTS_TO_FIT))
+    else:
+        print("\nEnough to fit (%d >= %d). Remember the selection bias above: these are the "
+              "nights that looked wrong." % (n, MIN_NIGHTS_TO_FIT))
+    return 0
+
+
 # ====================================================================================
 # Fit — coordinate descent over candidate grids (scipy used if available, else this)
 # ====================================================================================
@@ -1209,7 +1300,13 @@ def main(argv=None):
     ap.add_argument("--nights", type=int, default=3, help="synthetic night count")
     ap.add_argument("--seed", type=int, default=7, help="synthetic RNG seed")
     ap.add_argument("--verbose", action="store_true", help="trace coordinate-descent moves")
+    ap.add_argument("--edit-labels",
+                    help="app Data Export JSON(s), comma-separated: report the supervised "
+                         "labels harvested from the user's own sleep edits")
     args = ap.parse_args(argv)
+
+    if args.edit_labels:
+        return report_edit_labels(args.edit_labels.split(","))
 
     if args.synthetic:
         return run_synthetic(seed=args.seed, nights=args.nights,
