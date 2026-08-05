@@ -40,7 +40,11 @@ struct SleepCardView: View {
     var liveSegments: [SleepSegment]
     /// Runs a manual sleep-time edit (#176) for a night → new asleep minutes (nil = failed). Injected
     /// by ContentView (→ RingSession.applySleepEdit). nil hides the Edit affordance entirely.
-    var onEditSleep: ((Date, SleepEdit.Times) async -> Int?)? = nil
+    var onEditSleep: ((Date, SleepEdit.Times, ClosedRange<Date>?) async -> Int?)? = nil
+    /// Resolves the archive coverage for a night's recorded onset/wake. Injected (rather than
+    /// computed here) so it is the SAME `RingSession.sleepEditDataCoverage` the server-side
+    /// validator uses — the picker must never offer a time `applySleepEdit` would reject (#188).
+    var sleepEditDataCoverage: ((Date, Date) -> ClosedRange<Date>?)? = nil
     @State private var editTarget: EditTarget?
     /// Runs a manual nap add/edit (#nap-parity) → success. nil originalStart = add, else edit.
     /// Injected by ContentView (→ RingSession.applyNapEdit). nil hides the nap edit/add affordance.
@@ -65,11 +69,13 @@ struct SleepCardView: View {
     private static let historyNights = 35
 
     init(liveSegments: [SleepSegment] = [], lastSyncAt: Date? = nil,
-         onEditSleep: ((Date, SleepEdit.Times) async -> Int?)? = nil,
+         onEditSleep: ((Date, SleepEdit.Times, ClosedRange<Date>?) async -> Int?)? = nil,
+         sleepEditDataCoverage: ((Date, Date) -> ClosedRange<Date>?)? = nil,
          onNap: ((Date?, NapEdit.Window) async -> Bool)? = nil) {
         self.liveSegments = liveSegments
         self.lastSyncAt = lastSyncAt
         self.onEditSleep = onEditSleep
+        self.sleepEditDataCoverage = sleepEditDataCoverage
         self.onNap = onNap
         var d = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
         d.fetchLimit = Self.historyNights
@@ -126,6 +132,11 @@ struct SleepCardView: View {
         let sleepWake: Date
         let recordedOnset: Date
         let recordedWake: Date
+        /// Epochs we actually hold for this night — widens the editable bounds so a truncated
+        /// night stays correctable (#188 fallout). nil = fall back to the ±3 h parity margin.
+        let dataCoverage: ClosedRange<Date>?
+        /// The night's already-saved edited window (nil when never edited).
+        let existingEdit: ClosedRange<Date>?
     }
 
     /// Value snapshot for the nap add/edit sheet, independent of the live SwiftData row.
@@ -300,7 +311,11 @@ struct SleepCardView: View {
                 inBedStart: target.inBedStart,
                 sleepOnset: target.sleepOnset, sleepWake: target.sleepWake,
                 recordedOnset: target.recordedOnset, recordedWake: target.recordedWake,
-                onSave: { window in await onEditSleep?(target.night, window) ?? nil })
+                dataCoverage: target.dataCoverage,
+                existingEdit: target.existingEdit,
+                onSave: { window, coverage in
+                    await onEditSleep?(target.night, window, coverage) ?? nil
+                })
         }
     }
 
@@ -313,7 +328,12 @@ struct SleepCardView: View {
                           inBedStart: row.sleepEditCurrentInBedStart,
                           sleepOnset: row.sleepEditCurrentOnset,
                           sleepWake: row.sleepEditCurrentWake,
-                          recordedOnset: onset, recordedWake: wake)
+                          recordedOnset: onset, recordedWake: wake,
+                          dataCoverage: sleepEditDataCoverage?(onset, wake),
+                          // A night already edited must stay fully selectable even if the archive
+                          // has since pruned the coverage that first allowed it (#188 review).
+                          existingEdit: row.sleepEditCurrentWake > row.sleepEditCurrentInBedStart
+                              ? row.sleepEditCurrentInBedStart...row.sleepEditCurrentWake : nil)
     }
 
     @ViewBuilder

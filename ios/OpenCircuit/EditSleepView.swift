@@ -1,7 +1,9 @@
 // Manual sleep-time edit sheet (#176) — RingConn parity (EditSleepStagePage / SleepEditableTimeRange).
 //
-// Three independent time pickers for bedtime, sleep onset, and wake, hard-bounded to ±3 h of the
-// recorded onset/wake (SleepEdit.bounds), with live in-bed and asleep-window previews. On Save it
+// Three independent time pickers for bedtime, sleep onset, and wake, bounded by `SleepEdit.bounds`
+// — the ±3 h parity margin around the recorded onset/wake, WIDENED by the epochs we actually hold
+// for the night (#188: a night truncated to its tail was otherwise uncorrectable). Live in-bed and
+// asleep-window previews. On Save it
 // runs the NON-DESTRUCTIVE edit via the injected closure (→ RingSession.applySleepEdit): extending a
 // truncated night APPENDS the added sleep to Apple Health; trimming updates the in-app view only.
 // Nothing in Apple Health is ever deleted.
@@ -13,8 +15,19 @@ struct EditSleepView: View {
     let night: Date
     let recordedOnset: Date
     let recordedWake: Date
+    /// Span of epoch records we actually hold for this night. Widens the editable bounds beyond the
+    /// ±3 h parity margin so a badly TRUNCATED night is still correctable (#188 fallout — a night
+    /// detected as 07:30–08:55 offered an "In bed" picker of 04:30–07:30, making the real 00:15
+    /// bedtime unreachable). Computed by the caller via `SleepEdit.dataCoverage` and passed to
+    /// `applySleepEdit` too, so the picker can never offer a time the validator rejects.
+    let dataCoverage: ClosedRange<Date>?
+    /// The night's already-SAVED edited window, if any. Keeps a prior edit selectable even if the
+    /// archive has since pruned the coverage that first allowed it (#188 review).
+    let existingEdit: ClosedRange<Date>?
     /// Runs the edit, returning the new asleep minutes (nil = failed). Injected by SleepCardView.
-    let onSave: (SleepEdit.Times) async -> Int?
+    /// The sheet hands back the coverage snapshot its pickers were bounded by, so
+    /// the server-side validator can honour exactly what the user was offered (#188 review).
+    let onSave: (SleepEdit.Times, ClosedRange<Date>?) async -> Int?
 
     @Environment(\.dismiss) private var dismiss
 
@@ -28,13 +41,18 @@ struct EditSleepView: View {
 
     init(night: Date, inBedStart: Date, sleepOnset: Date, sleepWake: Date,
          recordedOnset: Date, recordedWake: Date,
-         onSave: @escaping (SleepEdit.Times) async -> Int?) {
+         dataCoverage: ClosedRange<Date>? = nil,
+         existingEdit: ClosedRange<Date>? = nil,
+         onSave: @escaping (SleepEdit.Times, ClosedRange<Date>?) async -> Int?) {
         self.night = night
         self.recordedOnset = recordedOnset
         self.recordedWake = recordedWake
+        self.dataCoverage = dataCoverage
+        self.existingEdit = existingEdit
         self.onSave = onSave
         // Clamp the initial values into the editable bounds so the DatePickers never start out of range.
-        let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
+        let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
+                                 dataCoverage: dataCoverage, existingEdit: existingEdit)
         var start = SleepEdit.clamp(inBedStart, to: b)
         var asleep = SleepEdit.clamp(sleepOnset, to: b)
         var end = SleepEdit.clamp(sleepWake, to: b)
@@ -52,14 +70,16 @@ struct EditSleepView: View {
     }
 
     private var bounds: SleepEdit.Bounds {
-        SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
+        SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
+                         dataCoverage: dataCoverage, existingEdit: existingEdit)
     }
     private var times: SleepEdit.Times {
         .init(inBedStart: bedtime, sleepOnset: onset, sleepWake: wake)
     }
     private var invalid: SleepEdit.Invalid? {
         SleepEdit.validate(times, recordedOnset: recordedOnset, recordedWake: recordedWake,
-                           minDuration: Self.minimumDuration)
+                           minDuration: Self.minimumDuration, dataCoverage: dataCoverage,
+                           existingEdit: existingEdit)
     }
     private var hasChanges: Bool {
         !SleepEdit.isSamePickerMinute(times.inBedStart, initialTimes.inBedStart)
@@ -90,7 +110,7 @@ struct EditSleepView: View {
                 } header: {
                     Text("Editable Time Range")
                 } footer: {
-                    Text("To help improve accuracy, edits are limited to within 3 hours before your recorded sleep time and within 3 hours after your recorded wake time.")
+                    Text(boundsFooter)
                 }
                 Section {
                     LabeledContent("Time in bed", value: durationText)
@@ -120,6 +140,21 @@ struct EditSleepView: View {
         }
     }
 
+    /// Describe the ACTUAL rule. The ±3 h sentence was RingConn's copy and stopped being true once
+    /// `dataCoverage` may widen the bounds — showing the real clock times is both honest and more
+    /// useful than a margin the user cannot compute in their head (#188 review).
+    private var boundsFooter: String {
+        "To help improve accuracy, edits are limited to the period your ring recorded around this "
+            + "night — \(clock(bounds.earliest)) to \(clock(bounds.latest))."
+    }
+
+    private func clock(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate(
+            Calendar.current.isDate(d, inSameDayAs: bounds.latest) ? "jmm" : "EEEjmm")
+        return f.string(from: d)
+    }
+
     private var durationText: String {
         let mins = Int(max(0, wake.timeIntervalSince(bedtime)) / 60)
         return "\(mins / 60)h \(mins % 60)m"
@@ -135,8 +170,8 @@ struct EditSleepView: View {
         case .endNotAfterStart:    return "Wake time must be after bedtime."
         case .onsetBeforeBedtime:  return "Fell asleep can’t be before In bed."
         case .wakeNotAfterOnset:   return "Woke up must be after Fell asleep."
-        case .startBeforeEarliest: return "Bedtime can’t be more than 3 hours before your recorded sleep."
-        case .endAfterLatest:      return "Wake time can’t be more than 3 hours after your recorded wake."
+        case .startBeforeEarliest: return "Bedtime can’t be earlier than \(clock(bounds.earliest))."
+        case .endAfterLatest:      return "Wake time can’t be later than \(clock(bounds.latest))."
         case .tooShort:            return "That window is too short for a night."
         }
     }
@@ -144,7 +179,7 @@ struct EditSleepView: View {
     private func save() async {
         saving = true
         saveFailed = false
-        let saved = await onSave(times) != nil
+        let saved = await onSave(times, dataCoverage) != nil
         saving = false
         if saved { dismiss() } else { saveFailed = true }
     }
