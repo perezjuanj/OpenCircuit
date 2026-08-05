@@ -210,6 +210,37 @@ public enum SleepStaging {
         /// "awake until 2 a.m." ~48 ≈ 2 h.
         public var onsetSearchEpochs: Int
 
+        // --- Point-of-no-return OFFSET (the "quiet morning wake" fix) ----------------
+        // `wakeHRMarginBPM` is ONE knob doing TWO jobs: it must sit ABOVE typical REM elevation
+        // (or REM reads as wake) AND catch the morning rise. When a night's morning rise is SMALLER
+        // than its evening wind-down spread, no single value can do both. 🟢 MEASURED on ONE night
+        // (2026-08-04, FR02.018, primary motion channel placeholder-flat on 250/253 epochs so HR was
+        // the only lever; user-reported wake 08:02): margins 18→12 all leave the wake at 08:52:44;
+        // 11→08:47:44; 9→08:15:14; and at 8 the ONSET COLLAPSES 00:05:14→02:02:44 (117 min of the
+        // window reclassified awake), taking total asleep from 527 to 370 min. So on THIS night
+        // lowering the shared knob shed more sleep at the head than it recovered at the tail. That is
+        // one night, not a proof — but it is why the tail gets its own test rather than a retune.
+        //
+        // The trailing edge admits a threshold-LIGHT test the interior cannot use: at final wake the
+        // smoothed HR rises and does not return to the sleeping floor, whereas a REM bump settles
+        // back. 🟡 PROBABLE, and knowingly incomplete — a real mid-night arousal does NOT settle back
+        // either, which is why the pass must not overrule `rescueSecondBoutHRWake`. See
+        // `markPointOfNoReturnOffset` for the guards that follow from this.
+
+        /// bpm above the sleeping floor that the ENTIRE remaining night must stay above for the
+        /// scan to call final wake. **0 disables the pass — byte-identical to the pre-offset
+        /// staging** (every existing night, every existing test).
+        ///
+        /// 🟡 NOT YET FIT. Held at 0 exactly as `rrVarWeight` is, until supervised-fit against
+        /// captured labels (`docs/RUNBOOK_SLEEP_GROUNDTRUTH.md`). MEASURED on the single night
+        /// available so far (2026-08-04, FR02.018, user-reported wake 08:02):
+        ///   k=2 → 07:52:44 · k=3 → 08:00:14 · k=4 → 08:00:14 · k=5 → 08:10:14
+        ///   k=6 → 08:12:44 · k=8 → 08:15:14 · k=10 → 08:47:44
+        /// The flat k=3…4 plateau landing 2 min from the reported wake is SUGGESTIVE, and is the
+        /// reason this pass exists — it is NOT sufficient to set a default. One night is one night
+        /// (N8): do not promote off this number alone.
+        public var offsetNoReturnMarginBPM: Double
+
         // --- Lead-in wake ONSET (the "lay awake still for hours" fix) ----------------
         // The descent trim above keys off a clean HR DESCENT into the floor. But the hardest night
         // is lying still and AWAKE for hours with FLUCTUATING HR (the 2026-06-26 capture: HR bouncing
@@ -286,6 +317,7 @@ public enum SleepStaging {
                     onsetMinDescentBPM: Double = 10,
                     onsetScanEpochs: Int = 12,
                     onsetSearchEpochs: Int = 48,
+                    offsetNoReturnMarginBPM: Double = 0,
                     minConsolidatedSleepEpochs: Int = 16,
                     deepBaselineMarginBPM: Double = 18,
                     preOnsetBedtimeReachEpochs: Int = 24,
@@ -315,6 +347,7 @@ public enum SleepStaging {
             self.onsetMinDescentBPM = onsetMinDescentBPM
             self.onsetScanEpochs = onsetScanEpochs
             self.onsetSearchEpochs = onsetSearchEpochs
+            self.offsetNoReturnMarginBPM = offsetNoReturnMarginBPM
             self.minConsolidatedSleepEpochs = minConsolidatedSleepEpochs
             self.deepBaselineMarginBPM = deepBaselineMarginBPM
             self.preOnsetBedtimeReachEpochs = preOnsetBedtimeReachEpochs
@@ -593,8 +626,15 @@ public enum SleepStaging {
         // onset passes below (which only ever ADD leading awake) so those still get the last word at the
         // head — though the rescue's "consolidated sleep already behind it" guard means it can never
         // reach the head anyway. No-op when `hrWakeRescueCeilingBPM == 0` (byte-identical to pre-rescue).
+        // Remember what the second-bout rescue reclaimed. `markPointOfNoReturnOffset` below must not
+        // undo it: a second bout that sleeps at a HIGHER level than the night's floor never "returns
+        // to the floor", so the offset scan would otherwise read the whole bout as final wake and
+        // delete it. 🟢 MEASURED before this guard existed: a 96-epoch second bout at 71 bpm over a
+        // 50 bpm floor lost all 240 min (total asleep 485 → 245) at k=4.
+        let beforeSecondBoutRescue = awake
         rescueSecondBoutHRWake(&awake, smHR: smHR, motionAwake: motionAwake,
                                vitals: rows.map(\.vitals), floor: sleepFloor, tuning: tuning)
+        let lastRescuedIndex = awake.indices.last { beforeSecondBoutRescue[$0] && !awake[$0] }
 
         // --- Descent-relative onset: trim the quiet pre-sleep wind-down -------------
         // Mark the LEADING in-bed stretch as awake while HR is still settling DOWN toward the
@@ -609,6 +649,19 @@ public enum SleepStaging {
         // if a sustained awake block still lies ahead in the search window (and no real sleep preceded
         // it), onset hasn't happened yet — mark everything up to that block's end as awake-in-bed.
         markLeadInWakeOnset(&awake, tuning: tuning)
+
+        // --- Point-of-no-return OFFSET: mark the trailing "never settled again" run -
+        // Runs AFTER both onset passes so they keep the last word at the head, and only ever ADDS
+        // trailing awake. Two earlier passes in THIS function already judged specific epochs asleep
+        // against the HR gate, and the offset scan must not overturn either of them:
+        //   • `rescueSecondBoutHRWake` — a second bout after a mid-night wake.
+        //   • the motion-awake VITALS SOFTENING above — a moving-but-asleep morning the ring was
+        //     still measuring sleep vitals through (`motionAwakeStrict[i] && !motionAwake[i]`).
+        // `notBefore` is the later of the two, so the scan may only cut AFTER both.
+        let lastVitalsSoftened = rows.indices.last { motionAwakeStrict[$0] && !motionAwake[$0] }
+        let notBefore = [lastRescuedIndex, lastVitalsSoftened].compactMap { $0 }.max()
+        markPointOfNoReturnOffset(&awake, smHR: smHR, floor: sleepFloor,
+                                  notBefore: notBefore, tuning: tuning)
 
         // --- ONSET / OFFSET: trim leading & trailing awake -------------------------
         // The kept window runs from the start of the first SUSTAINED asleep run to the
@@ -965,6 +1018,85 @@ public enum SleepStaging {
         }
         guard longest < tuning.minConsolidatedSleepEpochs else { return }
         for k in 0 ... be { awake[k] = true }
+    }
+
+    /// Mark the trailing "HR rose and never settled again" run as awake — the OFFSET counterpart to
+    /// the two onset passes above.
+    ///
+    /// Its opposite number in THIS function is the motion-awake VITALS SOFTENING (which removes
+    /// trailing wake where the ring was still measuring sleep vitals); `sleepVitalsRescue` is a
+    /// different stage entirely — it rewrites `[ActivityPeriod]` during BLOCK DETECTION, before
+    /// staging runs, so it is not the counterpart it may look like. Both same-stage passes that add
+    /// trailing SLEEP take precedence over this one via `notBefore`.
+    ///
+    /// WHY A SEPARATE TEST. The interior wake gate keys off `wakeHRMarginBPM`, which must sit ABOVE
+    /// typical REM elevation or REM reads as wake. That ceiling is exactly what puts a quiet morning
+    /// wake out of reach when the morning rise is smaller than the evening wind-down spread, and
+    /// lowering the shared knob collapses the ONSET first (🟢 measured — see the knob's doc). The
+    /// trailing edge does not need that ceiling: at TRUE final wake the smoothed HR rises and NEVER
+    /// RETURNS to the sleeping floor, while a REM bump or a stir always settles back. Asking "does
+    /// the whole REMAINING night stay up?" is a far stronger question than "is this epoch high?",
+    /// so it can run at a much tighter margin without eating REM.
+    ///
+    /// SAFETY. This pass REMOVES sleep, so it is bounded in MAGNITUDE as well as shape. Five
+    /// properties, all pinned by tests in `SleepStagingOffsetTests`:
+    ///   1. SHAPE — the suffix-minimum scan is monotone from the END, so the marked region is always
+    ///      a SUFFIX; it can never punch a hole in the interior.
+    ///   2. HEAD — it refuses to start at or before the onset (`start > lo`), so it can never reach
+    ///      the head or blank a night from the front.
+    ///   3. PRECEDENCE — it refuses to start at or before `notBefore`: the last epoch reclaimed by
+    ///      `rescueSecondBoutHRWake` or by the motion-awake vitals softening. A SECOND SLEEP BOUT
+    ///      after a mid-night wake often sleeps at a HIGHER level than the night's floor, so it never
+    ///      "returns to the floor" and this scan would read the whole bout as final wake. 🟢 MEASURED
+    ///      without this guard: a 96-epoch second bout at 71 bpm over a 50 bpm floor was deleted
+    ///      whole — 240 min of sleep, night total 485 → 245 at k=4.
+    ///   4. MAGNITUDE — the cut point must lie within the last `onsetSearchEpochs` epochs, the same
+    ///      bound the two ONSET passes use at the head. Without it the pass was positionally
+    ///      unbounded: 🟢 MEASURED on a night containing NO WAKE AT ALL (HR drifting 52→57 across the
+    ///      later half, which never dips back under the p12 floor because `smHR` is a rolling MEDIAN),
+    ///      it destroyed 101.5 min at k=4 and 196.5 min at k=2. This models the MORNING RISE, so a
+    ///      cut point hours from the end is by definition not what it is looking for.
+    ///   5. SURVIVAL — it is REVERTED unless a CONSOLIDATED asleep run (`minConsolidatedSleepEpochs`,
+    ///      not the much weaker `onsetSustainEpochs`) still survives, so it cannot reduce a night to
+    ///      a token fragment.
+    ///
+    /// ⚠️ The premise — "at true final wake HR rises and never returns to the floor, while a REM bump
+    /// or a stir always settles back" — is 🟡 PROBABLE, not established. It is measured on one night,
+    /// and property 3 exists precisely because a real 3 a.m. arousal REFUTES the second half of it.
+    /// No-op when `offsetNoReturnMarginBPM == 0` (the default) — byte-identical to pre-offset staging.
+    ///
+    /// `internal` rather than `private` (unlike every sibling pass) ON PURPOSE: its tests drive it
+    /// directly, because a synthetic record fixture carries a CONSTANT motion byte that de-floors to
+    /// "still" everywhere, so an "awake" fixture silently stages as sleep and the assertions go
+    /// vacuous. Feeding the HR array in directly is the only way to test this honestly.
+    static func markPointOfNoReturnOffset(_ awake: inout [Bool], smHR: [Double],
+                                          floor: Double, notBefore: Int? = nil, tuning: Tuning) {
+        guard tuning.offsetNoReturnMarginBPM > 0,
+              !awake.isEmpty, smHR.count == awake.count,
+              let (lo, _) = sleepSpan(awake, sustain: tuning.onsetSustainEpochs) else { return }
+        // The scan may not begin at or before the onset, a rescued second bout, or a vitals-softened
+        // morning; nor further back than the onset passes are allowed to reach from their own edge.
+        let searchFloor = awake.count - min(tuning.onsetSearchEpochs, awake.count)
+        let earliest = max(lo, notBefore ?? lo, searchFloor)
+        let threshold = floor + tuning.offsetNoReturnMarginBPM
+        // Earliest index whose ENTIRE suffix stays above the threshold. Walking backwards and
+        // breaking on the first dip makes this a suffix by construction.
+        var start: Int?
+        var suffixMin = Double.infinity
+        for i in stride(from: smHR.count - 1, through: 0, by: -1) {
+            suffixMin = min(suffixMin, smHR[i])
+            if suffixMin > threshold { start = i } else { break }
+        }
+        // `> earliest`, not `>=`: the onset epoch (and the last rescued epoch) must remain asleep.
+        guard let s = start, s > earliest else { return }
+        var candidate = awake
+        for i in s ..< candidate.count { candidate[i] = true }
+        // Only commit if a CONSOLIDATED asleep run survives. `onsetSustainEpochs` (6 ≈ 15 min) is far
+        // too weak a backstop for a pass that removes sleep — it would let an 8-hour night commit down
+        // to a quarter of an hour. `minConsolidatedSleepEpochs` (16 ≈ 40 min) is the same bar
+        // `markLeadInWakeOnset` uses to decide a real night happened.
+        guard sleepSpan(candidate, sustain: tuning.minConsolidatedSleepEpochs) != nil else { return }
+        awake = candidate
     }
 
     /// Centered rolling standard deviation over a ±`half`-epoch window.

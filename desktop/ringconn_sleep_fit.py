@@ -80,7 +80,11 @@ SLEEPTYPE_MAP = {
 # --- Tuning: mirrors Swift SleepStaging.Tuning EXACTLY, plus experimental extensions --
 @dataclass
 class Tuning:
-    # --- These 21 fields mirror Swift SleepStaging.Tuning one-for-one (same defaults) --
+    # --- These fields mirror Swift SleepStaging.Tuning one-for-one (same defaults) ------
+    #     NOTE: Swift has since grown passes this port does NOT yet mirror
+    #     (markLeadInWakeOnset, rescueSecondBoutHRWake, motionAwakeVitalsHalfWindow,
+    #     minConsolidatedSleepEpochs, deepBaselineMarginBPM, preOnsetBedtime*). Pre-existing
+    #     drift — fits are approximate for nights those passes touch.
     awakeMotion: int = 15
     deepHRPercentile: float = 0.42
     remHRPercentile: float = 0.86
@@ -103,6 +107,14 @@ class Tuning:
     onsetMinDescentBPM: float = 10.0
     onsetScanEpochs: int = 12
     onsetSearchEpochs: int = 48
+    # Point-of-no-return OFFSET (the "quiet morning wake" fix) — mirrors Swift one-for-one.
+    # 0 = disabled = byte-identical, exactly as the Swift default ships. See
+    # SleepStaging.markPointOfNoReturnOffset for why the trailing edge needs its own,
+    # tighter margin than the shared wakeHRMarginBPM.
+    offsetNoReturnMarginBPM: float = 0.0
+    # Mirrors Swift's knob of the same name. Used HERE only as the offset pass's survival guard
+    # (the Swift value is 16); the other Swift passes that consume it are not ported yet.
+    minConsolidatedSleepEpochs: int = 16
 
     # --- Experimental extensions (NOT in Swift Tuning yet; off by default). The fit
     #     reports whether turning these on helps; if so, add them to the Swift struct. --
@@ -110,7 +122,7 @@ class Tuning:
     spo2DipEnabled: bool = False    # treat an SpO2 dip vs the night median as a REM cue
     spo2DipDelta: float = 3.0       # %SpO2 below the night median to count as a dip
 
-    # Names of the 21 fields that map to the real Swift initializer.
+    # Names of the fields that map to the real Swift initializer.
     SWIFT_FIELDS = (
         "awakeMotion", "deepHRPercentile", "remHRPercentile", "deepVarPercentile",
         "remVarPercentile", "variabilityHalfWindow", "deepVarFloor", "remVarFloor",
@@ -118,6 +130,7 @@ class Tuning:
         "sleepFloorPercentile", "wakeHRMarginBPM", "hrWakeHalfWindow",
         "onsetSustainEpochs", "minHRWakeRunEpochs",
         "onsetSettleFraction", "onsetMinDescentBPM", "onsetScanEpochs", "onsetSearchEpochs",
+        "offsetNoReturnMarginBPM",
     )
 
 
@@ -482,6 +495,49 @@ def _mark_descent_onset_awake(awake, sm_hr, motion_awake, floor, t):
             awake[k] = True
 
 
+def _mark_point_of_no_return_offset(awake, sm_hr, floor, t):
+    """Port of SleepStaging.markPointOfNoReturnOffset (mutates `awake`): mark the trailing
+    "HR rose and never returned to the sleeping floor" run as awake. Suffix-by-construction,
+    refuses to start at or before the onset, and reverts unless sustained sleep survives.
+    No-op when offsetNoReturnMarginBPM == 0 (the default).
+
+    ⚠️ DIVERGENCE: Swift additionally passes `notBefore` = the last epoch
+    rescueSecondBoutHRWake reclaimed, so the scan cannot delete a second sleep bout that
+    sleeps ABOVE the night's floor. This port does NOT implement that rescue at all, so it
+    has no bout to protect and will be MORE aggressive than Swift on mid-night-wake nights.
+    Treat a fitted offsetNoReturnMarginBPM as an UPPER bound on aggressiveness until the
+    rescue is ported."""
+    if t.offsetNoReturnMarginBPM <= 0 or not awake or len(sm_hr) != len(awake):
+        return
+    span = _sleep_span(awake, t.onsetSustainEpochs)
+    if span is None:
+        return
+    lo, _ = span
+    # MAGNITUDE bound: the cut point must lie within the last onsetSearchEpochs epochs, the same
+    # bound the onset passes use at the head. Without it the scan is positionally unbounded and a
+    # merely DRIFTING (still asleep) later night reads as "never returned".
+    search_floor = len(awake) - min(t.onsetSearchEpochs, len(awake))
+    earliest = max(lo, search_floor)
+    threshold = floor + t.offsetNoReturnMarginBPM
+    start = None
+    suffix_min = float("inf")
+    for i in range(len(sm_hr) - 1, -1, -1):
+        suffix_min = min(suffix_min, sm_hr[i])
+        if suffix_min > threshold:
+            start = i
+        else:
+            break
+    if start is None or start <= earliest:
+        return
+    candidate = list(awake)
+    for i in range(start, len(candidate)):
+        candidate[i] = True
+    # SURVIVAL: require a CONSOLIDATED run, not the far weaker onsetSustainEpochs.
+    if _sleep_span(candidate, t.minConsolidatedSleepEpochs) is None:
+        return
+    awake[:] = candidate
+
+
 def _sleep_span(awake, sustain):
     """Port of SleepStaging.sleepSpan: (first, last) of sustained asleep runs, or None."""
     n = len(awake)
@@ -615,6 +671,7 @@ def classify_prepared(pf, t, band_pool=None):
     awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
     _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
     _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
+    _mark_point_of_no_return_offset(awake, sm_hr, sleep_floor, t)
 
     span = _sleep_span(awake, t.onsetSustainEpochs)
     if span is None:
@@ -695,6 +752,7 @@ def baseline_band_pool(nights_prepared, t):
             awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
             _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
             _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
+            _mark_point_of_no_return_offset(awake, sm_hr, sleep_floor, t)
             span = _sleep_span(awake, t.onsetSustainEpochs)
             if span is None:
                 continue
@@ -804,6 +862,9 @@ SEARCH_GRID = {
     "onsetSettleFraction": [0.25, 0.35, 0.45, 0.6],
     "onsetMinDescentBPM": [8, 10, 14],
     "onsetSearchEpochs": [36, 48, 72],
+    # 0 first: coordinate descent starts from the default and never worsens, so the
+    # offset pass must EARN its way on against real labels rather than being assumed.
+    "offsetNoReturnMarginBPM": [0.0, 2.0, 3.0, 4.0, 5.0, 8.0],
 }
 
 
