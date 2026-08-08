@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import UIKit
+import OpenCircuitKit
 
 @main
 struct OpenCircuitApp: App {
@@ -21,6 +22,10 @@ struct OpenCircuitApp: App {
                 // One-time scrub of samples with a corrupted/implausible timestamp (e.g. a
                 // misaligned bulk-page decode dated years off — surfaces as "13y ago").
                 .task { OpenCircuitApp.purgeImplausibleTimestampsOnce(container) }
+                // One-time re-key of stored nights from the bedtime day onto the WAKE day
+                // (`SleepNightKey`). Must run before any sleep write this launch, or a night staged
+                // under the new key could land beside its own un-migrated row.
+                .task { OpenCircuitApp.rekeySleepNightsOnce(container) }
                 // Repair of any SyncCursor watermark stuck in the future by a corrupted-timestamp
                 // sample, BEFORE `ingest` guarded plausibility ahead of the cursor advance — run
                 // every launch (not one-time; see the function doc), after the sample scrubs so
@@ -400,6 +405,23 @@ struct OpenCircuitApp: App {
         } catch { /* leave the flag unset so it retries next launch */ }
     }
 
+    /// Re-key stored sleep summaries from the bedtime day onto the WAKE day, at most once — same
+    /// gating pattern as the scrubs above. Fixes the key collision that let one night silently
+    /// discard another (`SleepNightKey`); `rekeySleepNightsToWakeDay` is idempotent and
+    /// non-destructive, so a retry after a failure is safe.
+    ///
+    /// This is the BACKSTOP, not the guarantee. A background launch (BGTask / CoreBluetooth
+    /// restoration) connects no scene, so this `.task` never runs there — `LocalStore` therefore
+    /// gates its own first sleep write on the same flag. This path exists so a launch that writes no
+    /// sleep at all still migrates the history the UI reads.
+    @MainActor
+    static func rekeySleepNightsOnce(_ container: ModelContainer) {
+        // Routed through `ensureNightKeyMigrated` rather than duplicating the latch: it is the one
+        // place that knows not to latch over a store it never saw a row in (the #131 in-memory
+        // fallback container is empty by construction) and not to latch on a refused run.
+        LocalStore(container.mainContext).ensureNightKeyMigrated()
+    }
+
     /// Run the `SyncCursor` future-watermark repair (`LocalStore.repairFutureSyncCursors`) on
     /// EVERY launch — deliberately NOT gated to once like the scrubs above. A single one-time run
     /// was observed to NOT reliably clear the `hk:heartRate` mirror cursor (still stuck after the
@@ -588,14 +610,26 @@ struct RollupBackup: Codable {
         return backup
     }
 
-    /// Re-insert the backed-up rollups into the fresh store, then remove the JSON file. The
-    /// unique `night`/`day` keys keep this idempotent. Best-effort — a failure just means the
-    /// dashboard starts without past history.
+    /// Re-insert the backed-up rollups into the fresh store, then remove the JSON file.
+    ///
+    /// ⚠️ The unique `night`/`day` keys do NOT make this idempotent — that belief is MEASURED false:
+    /// inserting a duplicate unique key makes `save()` succeed and silently destroy a row (see
+    /// `LocalStore.rekeySleepNightsToWakeDay`). So keys are normalised through `SleepNightKey` and
+    /// de-duplicated here, rather than trusting whatever scheme the backup JSON was written under —
+    /// a backup taken before the night-key migration would otherwise re-seed old-scheme keys into a
+    /// store that will never be migrated again. Best-effort: a failure just means the dashboard
+    /// starts without past history.
     func restore(into container: ModelContainer) {
         let ctx = ModelContext(container)
+        var seenNights = Set<Date>()
         for s in sleep {
+            // Same refusal rule as the migration: a row with no usable in-bed window keeps its key.
+            let night = SleepNightKey.rekeyed(storedNight: s.night,
+                                              inBedStart: s.inBedStart,
+                                              inBedEnd: s.inBedEnd) ?? s.night
+            guard seenNights.insert(Calendar.current.startOfDay(for: night)).inserted else { continue }
             let row = StoredSleepSummary(
-                night: s.night, asleepMin: s.asleepMin, deepMin: s.deepMin, lightMin: s.lightMin,
+                night: night, asleepMin: s.asleepMin, deepMin: s.deepMin, lightMin: s.lightMin,
                 remMin: s.remMin, awakeMin: s.awakeMin, efficiency: s.efficiency,
                 inBedStart: s.inBedStart, inBedEnd: s.inBedEnd,
                 sleepOnset: s.sleepOnset ?? .distantPast,

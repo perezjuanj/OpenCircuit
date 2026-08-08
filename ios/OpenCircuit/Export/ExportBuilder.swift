@@ -131,7 +131,9 @@ enum ExportBuilder {
 
         // Resolve the mode into (a) the nights this export is ABOUT and (b) the [from, to) window
         // the v2 sections are collected over.
-        let from: Date
+        // `var`: `.dateRange` widens it backwards after its clamp, so a night bucketed on the day it
+        // ENDS still carries the pre-midnight samples its own hypnogram covers.
+        var from: Date
         let to: Date
         let nights: [StoredSleepSummary]
         let fileStem: String
@@ -155,6 +157,14 @@ enum ExportBuilder {
                 from = requestedFrom
             }
             nights = (try? store.sleepSummaries(from: from, to: to)) ?? []
+            // Widen AFTER the maxExportDays clamp, and only backwards: a night is bucketed on the day
+            // it ENDS (`SleepNightKey`), so the oldest night in range began the previous evening and
+            // its pre-midnight samples — sleep onset among them — sit before `from`. Without this the
+            // file carries a hypnogram for hours it has no raw data for.
+            if let oldest = nights.first,
+               let onsetDay = effectiveInBedStart(oldest).map({ calendar.startOfDay(for: $0) }) {
+                from = min(from, onsetDay)
+            }
             fileStem = "opencircuit-export-\(ExportEngine.dayStamp(now))"
             watermarkAdvance = nil
 
@@ -166,10 +176,15 @@ enum ExportBuilder {
                 throw Failure.sessionNotStored
             }
             nights = [session]
-            from = bucket
-            // A night bucketed on day D wakes on day D+1, so the window has to run to the end of the
-            // day the session ENDED on — clipping it at the bucket day would drop every sample after
-            // midnight, i.e. most of the night.
+            // A night is bucketed on the day it ENDS (`SleepNightKey`), so it BEGAN on day D-1
+            // whenever bedtime was pre-midnight. Anchoring the raw-sample window on the bucket day's
+            // midnight would silently drop every sample before it — the evening hours including
+            // sleep onset — from a file whose session row still claims that bedtime. Anchor on the
+            // night's real span instead, and keep the bucket as the floor for a row with no
+            // recorded in-bed start.
+            from = min(bucket, effectiveInBedStart(session).map { calendar.startOfDay(for: $0) } ?? bucket)
+            // …and run to the end of the day the session ENDED on, so a post-midnight wake is not
+            // clipped either.
             let sessionEnd = effectiveInBedEnd(session) ?? bucket
             to = calendar.date(byAdding: .day, value: 1,
                                to: calendar.startOfDay(for: sessionEnd)) ?? bucket
@@ -233,7 +248,12 @@ enum ExportBuilder {
                 return .nothingNew(since: watermark)
             }
             nights = fresh
-            from = calendar.startOfDay(for: oldest.night)
+            // Same reasoning as `.singleSession`: a night bucketed on the day it ENDS began the
+            // evening before, so anchor on its real span. This mode compounds the cost — the night
+            // watermark is forward-only, so hours omitted here are never re-offered.
+            from = min(calendar.startOfDay(for: oldest.night),
+                       effectiveInBedStart(oldest).map { calendar.startOfDay(for: $0) }
+                        ?? calendar.startOfDay(for: oldest.night))
             let sessionEnd = effectiveInBedEnd(last) ?? last.night
             to = calendar.date(byAdding: .day, value: 1,
                                to: calendar.startOfDay(for: sessionEnd)) ?? today
@@ -483,6 +503,13 @@ enum ExportBuilder {
 
     private static func effectiveInBedEnd(_ row: StoredSleepSummary) -> Date? {
         realDate(row.sleepEditCurrentInBedEnd)
+    }
+
+    /// The night's real in-bed START (edited value when the user edited it). Anchors the raw-sample
+    /// window's lower bound: a night keyed on the day it ENDS began the previous evening, so the
+    /// bucket day alone would clip the pre-midnight hours out of the export.
+    private static func effectiveInBedStart(_ row: StoredSleepSummary) -> Date? {
+        realDate(row.sleepEditCurrentInBedStart)
     }
 
     // MARK: - Metadata

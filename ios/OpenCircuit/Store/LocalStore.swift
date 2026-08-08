@@ -72,10 +72,13 @@ final class StoredCursor {
 }
 
 /// Persisted nightly sleep summary (total asleep + estimated stage breakdown) so the
-/// dashboard shows the last night OFFLINE, after the ring disconnects. Keyed by `night`
-/// (start-of-day of the sleep window's start) and UPSERTED so re-syncing the same night
-/// replaces rather than duplicates. Stage minutes are an on-device ESTIMATE — the ring
-/// doesn't transmit stage labels (PROTOCOL.md §5.3).
+/// dashboard shows the last night OFFLINE, after the ring disconnects. Keyed by `night` — the start
+/// of the day the sleep block ENDS on (`SleepNightKey`; it used to be the day it STARTED, which
+/// aliased two consecutive nights onto one key and silently ate one of them) — and UPSERTED so
+/// re-syncing the same night replaces rather than duplicates. The night's IDENTITY is its in-bed
+/// SPAN, though, not this key: `saveSleepSummary` resolves the row by overlap first, because a night
+/// staged in pieces can produce different keys as it grows past midnight. Stage minutes are an
+/// on-device ESTIMATE — the ring doesn't transmit stage labels (PROTOCOL.md §5.3).
 ///
 /// Every non-optional attribute has a default so SwiftData lightweight migration can add
 /// this table to stores written before it existed without trapping at launch (cf. #21).
@@ -251,6 +254,42 @@ final class StoredSleepSummary {
     }
 }
 
+/// Move a night-scoped UserDefaults value from one night key to another. Used ONLY by the one-shot
+/// night-key re-key migration (`LocalStore.rekeySleepNightsToWakeDay`): every overlay below is keyed
+/// by `startOfDay(row.night)`, so moving a row's key without moving its overlays would strand the
+/// user's edited onset, the Health sample UUIDs a later edit must delete, and the mirror signature.
+///
+/// STRICTLY NON-DESTRUCTIVE. An occupied destination returns `false` and leaves BOTH values where
+/// they are — it must never keep the sitting tenant while dropping the value it was asked to move.
+/// (The first version did exactly that: it wrote only when the destination was free but removed the
+/// source unconditionally, so a stale orphaned overlay silently ate the live night's. For the Health
+/// sample UUIDs that means a later edit deletes the WRONG samples and the night's real ones are
+/// orphaned in Apple Health forever — a sample the user can never delete through our UI.)
+///
+/// Callers pre-flight every key with `canMoveNightScopedDefault` and refuse the whole row move if
+/// any one of them is blocked, so a row is never half-relocated.
+@discardableResult
+private func moveNightScopedDefault(from oldKey: String, to newKey: String) -> Bool {
+    let defaults = UserDefaults.standard
+    guard let value = defaults.object(forKey: oldKey) else { return true }   // nothing to move
+    guard defaults.object(forKey: newKey) == nil else { return false }       // occupied — hands off
+    defaults.set(value, forKey: newKey)
+    defaults.removeObject(forKey: oldKey)
+    return true
+}
+
+/// Whether the destination is free.
+///
+/// ⚠️ IT IS THE DESTINATION THAT MATTERS, NOT THE SOURCE. The first version short-circuited to `true`
+/// whenever the source was empty — but "I have nothing to move" is not "the move is safe". A row with
+/// no overlay of its own would then be relocated onto a key holding an ORPHANED overlay (one whose own
+/// row was eaten by the original collision bug, or written by `mirrorSettledNight` before any row
+/// existed) and silently INHERIT it: a foreign night's mirror span widening this night's Health delete
+/// window, or a foreign night's sample UUIDs becoming what a later edit deletes.
+private func canMoveNightScopedDefault(from oldKey: String, to newKey: String) -> Bool {
+    UserDefaults.standard.object(forKey: newKey) == nil
+}
+
 /// One extra edited clock value is needed beyond the existing two-edge SwiftData overlay. Keeping
 /// it in UserDefaults avoids changing the production SwiftData schema (and therefore avoids a
 /// destructive migration on phones with an existing sleep database). Wake remains editedInBedEnd.
@@ -266,6 +305,16 @@ private enum SleepEditOnsetOverlay {
 
     static func save(_ onset: Date, night: Date) {
         UserDefaults.standard.set(onset, forKey: key(night))
+    }
+
+    /// One-shot night-key migration hook — see `moveNightScopedDefault`.
+    static func rename(from oldNight: Date, to newNight: Date) {
+        moveNightScopedDefault(from: key(oldNight), to: key(newNight))
+    }
+
+    /// Pre-flight for `rename` — see `canMoveNightScopedDefault`.
+    static func canRename(from oldNight: Date, to newNight: Date) -> Bool {
+        canMoveNightScopedDefault(from: key(oldNight), to: key(newNight))
     }
 }
 
@@ -294,6 +343,18 @@ enum SleepEditHealthSampleOverlay {
         var seen = Set<String>()
         let merged = (load(night: night) + uuids).filter { seen.insert($0).inserted }
         save(merged, night: night)
+    }
+
+    /// One-shot night-key migration hook — see `moveNightScopedDefault`. Load-bearing: these UUIDs
+    /// are what a later edit DELETES from Apple Health. Stranded under the old key, a re-edit would
+    /// leave the previous samples orphaned in Health and write a duplicate night alongside them.
+    static func rename(from oldNight: Date, to newNight: Date) {
+        moveNightScopedDefault(from: key(oldNight), to: key(newNight))
+    }
+
+    /// Pre-flight for `rename` — see `canMoveNightScopedDefault`.
+    static func canRename(from oldNight: Date, to newNight: Date) -> Bool {
+        canMoveNightScopedDefault(from: key(oldNight), to: key(newNight))
     }
 }
 
@@ -325,6 +386,18 @@ enum MirroredNightOverlay {
     static func save(_ record: MirroredNightRecord, night: Date) {
         UserDefaults.standard.set(try? JSONEncoder().encode(record), forKey: key(night))
     }
+
+    /// One-shot night-key migration hook — see `moveNightScopedDefault`. Without it every migrated
+    /// night would look "never mirrored", and the next flush would delete-and-replace it in Apple
+    /// Health for no reason.
+    static func rename(from oldNight: Date, to newNight: Date) {
+        moveNightScopedDefault(from: key(oldNight), to: key(newNight))
+    }
+
+    /// Pre-flight for `rename` — see `canMoveNightScopedDefault`.
+    static func canRename(from oldNight: Date, to newNight: Date) -> Bool {
+        canMoveNightScopedDefault(from: key(oldNight), to: key(newNight))
+    }
 }
 
 /// A sleep-edit Health reconcile that couldn't run because the periodic flush held the Health-write
@@ -355,6 +428,32 @@ enum PendingSleepReconcileStore {
     static func clear(night: Date) {
         let items = all().filter { Calendar.current.isDate($0.night, inSameDayAs: night) == false }
         UserDefaults.standard.set(try? JSONEncoder().encode(items), forKey: key)
+    }
+
+    /// Whether `rekey` can run without breaking `upsert`'s one-item-per-day invariant. False when
+    /// items exist for BOTH nights: rewriting would leave two items for one day, and the next flush
+    /// would drain both against the same night — the second reconcile's delete/rewrite running over
+    /// the first one's freshly written samples, then `clear(night:)` removing both, so one night's
+    /// trim silently never reaches Apple Health.
+    static func canRekey(from oldNight: Date, to newNight: Date) -> Bool {
+        let items = all()
+        let hasOld = items.contains { Calendar.current.isDate($0.night, inSameDayAs: oldNight) }
+        let hasNew = items.contains { Calendar.current.isDate($0.night, inSameDayAs: newNight) }
+        return !(hasOld && hasNew)
+    }
+
+    /// One-shot night-key migration hook. A reconcile queued under the OLD key would otherwise be
+    /// drained against a night that no longer exists, so the user's trim would never reach Health.
+    static func rekey(from oldNight: Date, to newNight: Date) {
+        let items = all()
+        guard items.contains(where: { Calendar.current.isDate($0.night, inSameDayAs: oldNight) }) else { return }
+        let updated = items.map { item -> PendingSleepReconcile in
+            guard Calendar.current.isDate(item.night, inSameDayAs: oldNight) else { return item }
+            var moved = item
+            moved.night = newNight
+            return moved
+        }
+        UserDefaults.standard.set(try? JSONEncoder().encode(updated), forKey: key)
     }
 }
 
@@ -1069,18 +1168,188 @@ struct LocalStore {
         var hypnogram: [SleepSegment] = []
     }
 
+    /// Compact local timestamp for observability breadcrumbs (never user-facing, never a health
+    /// value — just enough to identify a night in a diagnostics bundle).
+    private static let breadcrumbFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f
+    }()
+
+    private static func stamp(_ date: Date) -> String { breadcrumbFormatter.string(from: date) }
+
+    /// Latch for the one-shot night-key migration. Read by `App` too, so both entry points share it.
+    static let nightRekeyDoneKey = "store.rekeyedSleepNightsToWakeDay.v1"
+
+    enum StoreError: Error {
+        /// The night-key migration has not succeeded yet, so a sleep write under the new key scheme
+        /// would split a night across two rows. Deferred, not lost — see `ensureNightKeyMigrated`.
+        case nightKeyMigrationPending
+        /// The migration found the store in a shape it will not touch (two rows normalising to one
+        /// calendar day, or its own occupancy bookkeeping tripping). Nothing was changed. THROWN
+        /// rather than returned so the caller cannot mistake "refused to run" for "ran successfully"
+        /// and latch the one-way done-flag over an unmigrated table.
+        case nightKeyMigrationUnsafe
+    }
+
+    /// Run the night-key migration if it hasn't run yet.
+    ///
+    /// ⚠️ THIS IS THE REAL CHOKEPOINT, and it is not optional. The migration used to be wired ONLY
+    /// to a SwiftUI `.task` on `ContentView` — i.e. only on a launch where a scene connects. But
+    /// iOS creates the App instance for a BGTask / CoreBluetooth-restoration launch WITHOUT ever
+    /// connecting a scene (App.swift says so in as many words), and that launch drains the ring and
+    /// writes sleep summaries. So the very first write under the NEW key could land before any
+    /// migration, inserting a SECOND row for a night whose un-migrated row still sits under the old
+    /// key — with the user's manual edit, feelScore and OSA fields stranded on the row the card no
+    /// longer shows. The later foreground migration would then find the destination occupied,
+    /// refuse the move, and latch the flag: the split becomes permanent.
+    ///
+    /// Every sleep-summary write passes through `saveSleepSummary`, so gating it here closes the
+    /// window for foreground, BGTask and restoration launches alike. The launch `.task` stays as the
+    /// path that migrates history on a launch where no sleep is written at all.
+    /// Returns whether the store is now on the new key scheme. A `false` return means the migration
+    /// FAILED this attempt and the table is still on old keys.
+    ///
+    /// ⚠️ A FAILED MIGRATION MUST BLOCK THE WRITE, not just be retried later. Swallowing the error
+    /// and writing anyway files the summary under the NEW key while all of history is still on the
+    /// OLD one — which, for a night already stored from an earlier drain, inserts a SECOND row. The
+    /// later successful migration then finds that destination occupied, refuses the move, and
+    /// latches the flag: the split becomes permanent, with the user's manual edit, feelScore and OSA
+    /// fields stranded on the row the card no longer shows. Deferring one drain is recoverable — the
+    /// epochs are still in the ring's 30 h archive and the next drain re-stages them. A split row is
+    /// not recoverable.
+    @discardableResult
+    func ensureNightKeyMigrated() -> Bool {
+        guard !UserDefaults.standard.bool(forKey: Self.nightRekeyDoneKey) else { return true }
+        do {
+            let outcome = try rekeySleepNightsToWakeDay()
+            // ⚠️ ONLY LATCH ON A STORE THAT ACTUALLY HELD ROWS. `store.rekeyedSleepNightsToWakeDay.v1`
+            // lives in UserDefaults while the rows live in SwiftData, and the two can be built over
+            // DIFFERENT stores: on a pre-first-unlock background launch `resolveContainer` falls back
+            // to an in-memory throwaway container (#131), which is empty by construction. Latching
+            // against that would mark a store "migrated" that was never even opened — UserDefaults
+            // survives the relaunch, so the real history would stay on old keys forever while every
+            // new night is written on the new scheme. An empty real store has nothing to migrate
+            // either, and re-checking it costs one fetch per launch until it has a row.
+            guard outcome.examined > 0 else { return true }
+            UserDefaults.standard.set(true, forKey: Self.nightRekeyDoneKey)
+            return true
+        } catch {
+            // Visible in a diagnostics bundle rather than silent — a failed migration that blocks
+            // sleep writes must be diagnosable from the tester's export alone.
+            ObservabilityStore().recordMetricEvent(
+                source: "sleep-rekey",
+                detail: "FAILED \(error) — sleep writes deferred until the migration succeeds")
+            return false
+        }
+    }
+
+    /// The stored row this staging belongs to: by in-bed OVERLAP first (identity), then by calendar
+    /// bucket (index). See the call site for why the order matters.
+    private func resolveSleepRow(dayStart: Date, inBedStart: Date, inBedEnd: Date) -> StoredSleepSummary? {
+        if inBedEnd > inBedStart,
+           let overlapping = try? sleepSummaryOverlapping(start: inBedStart, end: inBedEnd) {
+            return overlapping
+        }
+        let descriptor = FetchDescriptor<StoredSleepSummary>(predicate: #Predicate { $0.night == dayStart })
+        return try? context.fetch(descriptor).first
+    }
+
+    /// Move a row that was resolved by span onto the key its current staging says it belongs to.
+    ///
+    /// Best-effort and strictly non-destructive: refused outright if another row already holds the
+    /// destination, or if any night-scoped overlay could not move with it. `@Attribute(.unique)` does
+    /// NOT protect this — a duplicate key makes `save()` succeed and silently destroy one row (see
+    /// `rekeySleepNightsToWakeDay`) — so the occupancy check here is the only guard there is. A row
+    /// left on its first-slice key is merely indexed a day off; a deleted row is unrecoverable.
+    private func realignNightKey(of row: StoredSleepSummary, to dayStart: Date) {
+        let occupiedDescriptor = FetchDescriptor<StoredSleepSummary>(
+            predicate: #Predicate { $0.night == dayStart })
+        guard ((try? context.fetch(occupiedDescriptor).first) ?? nil) == nil else { return }
+        let oldKey = Calendar.current.startOfDay(for: row.night)
+        guard canRenameNightScopedOverlays(from: oldKey, to: dayStart),
+              (try? renameNightScopedOverlays(from: oldKey, to: dayStart)) != nil else { return }
+        row.night = dayStart
+        ObservabilityStore().recordMetricEvent(
+            source: "sleep-rekey",
+            detail: "REALIGNED night=\(Self.stamp(oldKey)) -> \(Self.stamp(dayStart)) "
+                + "reason=night-resolved-by-span-grew-past-midnight")
+    }
+
     func saveSleepSummary(_ summary: SleepStaging.Summary, night: Date,
                           inBedStart: Date, inBedEnd: Date,
                           sleepOnset: Date = .distantPast, sleepWake: Date = .distantPast,
                           extras: SleepNightExtras = SleepNightExtras()) throws {
+        // Before the FIRST write under the new key — see `ensureNightKeyMigrated`. A failed
+        // migration DEFERS the write rather than filing it under a scheme the rest of the table has
+        // not adopted; the epochs survive in the archive and the next drain re-stages them.
+        guard ensureNightKeyMigrated() else { throw StoreError.nightKeyMigrationPending }
         let dayStart = Calendar.current.startOfDay(for: night)
         let m = summary.minutes
-        let descriptor = FetchDescriptor<StoredSleepSummary>(
-            predicate: #Predicate { $0.night == dayStart })
-        if let existing = try? context.fetch(descriptor).first {
+        // ⚠️ IDENTITY IS THE SPAN; THE KEY IS ONLY AN INDEX. Resolve by in-bed OVERLAP before falling
+        // back to the calendar bucket, because a night can legitimately produce two different keys as
+        // it grows. `isOvernightBlock` accepts any block whose midpoint is in [21:00, 09:00), so an
+        // evening drain that completes before midnight stages a pre-midnight-only partial keyed to
+        // TODAY, while the same night's completed staging hours later is keyed TOMORROW. Bucket-only
+        // resolution files those as two rows — a permanent 1 h 30 m phantom night alongside the real
+        // one, double-counted in Trends, the goal rings and every export. (Under the old
+        // start-anchored key both keyed to the same day and the merge healed it, so this regression
+        // would have been INTRODUCED by end-anchoring.) Overlap resolution heals it instead: the
+        // completed night finds the partial's row and grows it, exactly as it always did.
+        let existingRow = resolveSleepRow(dayStart: dayStart, inBedStart: inBedStart, inBedEnd: inBedEnd)
+        if let existing = existingRow {
+            // ⚠️ COLLISION GUARD — applies to EDITED AND UNEDITED ROWS ALIKE.
+            //
+            // A night silently ate another night on a real device (2026-08-08): under the old
+            // start-anchored key two consecutive nights collided, the stored one was manually
+            // edited, and the incoming 9 h night hit the preserve-the-edit return below — no row, no
+            // log, no metric, and permanently, since every retry hit it again. `SleepNightKey` fixes
+            // that particular collision, but changing the key does not make collisions impossible:
+            // it changes WHICH pattern collides (two blocks ENDING on one day instead of two
+            // STARTING on one day). `SleepWindow.isOvernightBlock` accepts a block whose midpoint is
+            // in [21:00, 09:00), so an evening drain that completes before midnight stages a partial
+            // that keys to TODAY — which is last night's key.
+            //
+            // On an UNEDITED row that case is worse than the edited one, because the merge below
+            // decides purely on totals: a 110-minute evening fragment "wider" than a truncated 60-
+            // minute stored night would REPLACE it outright, hypnogram and all. So the window test
+            // is hoisted above both branches and refuses the write either way.
+            //
+            // Only applied when BOTH windows are known — legacy rows predating the in-bed columns
+            // carry `.distantPast` edges, and those must keep falling through to the merge as before
+            // rather than being refused on a comparison that means nothing.
+            //
+            // The test allows ABUTTING windows (`>=` plus one epoch of slack): two halves of one
+            // night handed off separately can meet exactly on an epoch boundary, and a strict `>`
+            // would call those disjoint and throw the second half away.
+            //
+            // ⚠️ A DISJOINT WINDOW IS NOT AUTOMATICALLY A DIFFERENT NIGHT, and refusing every
+            // non-overlap would itself lose data. A night handed off in two pieces with the middle
+            // missing (the documented #188 late-handoff) produces two disjoint blocks that BOTH end
+            // in the morning — before this guard existed, `SleepSummaryMerge` kept the fuller one,
+            // and it must keep doing so. What actually distinguishes the case this guard was written
+            // for is that the intruder ends in the EVENING: `isOvernightBlock` accepts a midpoint in
+            // [21:00, 09:00), so a pre-midnight-only block keys to today and contends with the night
+            // that genuinely ended this morning. So refuse only when the incoming block does NOT end
+            // in the wake window while the stored one does — the key names the morning you woke into.
+            // Everything else falls through to the completeness merge exactly as it always did.
+            let bothWindowsKnown = existing.inBedEnd > existing.inBedStart && inBedEnd > inBedStart
+            let slack = TimeInterval(BulkRecord.epochSeconds)
+            let overlaps = min(existing.inBedEnd, inBedEnd) + slack >= max(existing.inBedStart, inBedStart)
+            let incomingIsAnUnfinishedEveningBout =
+                !SleepNightKey.endsInWakeWindow(inBedEnd)
+                && SleepNightKey.endsInWakeWindow(existing.inBedEnd)
+            if bothWindowsKnown, !overlaps, incomingIsAnUnfinishedEveningBout {
+                let detail = "night=\(Self.stamp(dayStart)) kept=[\(Self.stamp(existing.inBedStart))..\(Self.stamp(existing.inBedEnd))] "
+                    + "DISCARDED=[\(Self.stamp(inBedStart))..\(Self.stamp(inBedEnd))] "
+                    + "edited=\(existing.isManuallyEdited) reason=night-key-collision"
+                ObservabilityStore().recordMetricEvent(source: "sleep-drop", detail: detail)
+                return
+            }
             // A manually edited night (#176) is authoritative: a later re-sync must not overwrite the
             // user's window/durations. Preserve it. The raw epoch archive still holds the original
-            // staging, so the edit stays reversible by re-editing.
+            // staging, so the edit stays reversible by re-editing. Reaching here means the incoming
+            // staging genuinely overlaps the edited night, which is the case this guard is FOR.
             if existing.isManuallyEdited { return }
             // Non-destructive upsert. A night can be drained in MORE THAN ONE piece (e.g. a
             // background drain mid-night, then the foreground morning sync) — the ring hands off
@@ -1110,6 +1379,15 @@ struct LocalStore {
                 newAsleep: TimeInterval(m.asleep) * 60,
                 sameCoverage: sameCoverage) else {
                 return   // keep the fuller existing night (its window, stages, extras + feelScore)
+            }
+            // Only NOW — every early return above is behind us, so this reaches `context.save()`.
+            // A row resolved by SPAN may still be filed under the key its first slice produced; move
+            // it onto the key this fuller staging says it belongs to. Deliberately not done at
+            // resolution time: `realignNightKey` commits the UserDefaults overlay moves immediately
+            // (UserDefaults has no rollback), so running it on a path that then returns early would
+            // leave the overlays on the new key while the row stayed on the old one.
+            if Calendar.current.startOfDay(for: existing.night) != dayStart {
+                realignNightKey(of: existing, to: dayStart)
             }
             existing.asleepMin = m.asleep
             existing.deepMin = m.deep
@@ -1334,6 +1612,252 @@ struct LocalStore {
 
     private static func sleepEditLeadingAsleepCursorKey(_ night: Date) -> String {
         "hk:sleep-edit-leading-asleep:\(Calendar.current.startOfDay(for: night).timeIntervalSince1970)"
+    }
+
+    // MARK: One-shot night-key re-key (bedtime-day → wake-day)
+    //
+    // Rows written before `SleepNightKey` were keyed `startOfDay(inBedSTART)`. That aliases a
+    // pre-midnight bedtime onto the day BEFORE the wake day, which is how two consecutive nights
+    // collided on one key and one of them was silently discarded (see SleepNightKey for the
+    // byte-exact device case). New writes are keyed on the wake day; this moves the existing rows
+    // onto the same scheme so history, the Health mirror and the sleep-edit overlays all agree.
+
+    /// Whether every night-scoped overlay for `oldKey` can move to `newKey` without clobbering an
+    /// existing value. All-or-nothing: a row is never HALF relocated, because a half-move strands
+    /// exactly the artefacts (Health sample UUIDs, edited onset) whose loss is unrecoverable.
+    /// The SwiftData cursors are excluded — they fold forward rather than collide.
+    private func canRenameNightScopedOverlays(from oldKey: Date, to newKey: Date) -> Bool {
+        SleepEditOnsetOverlay.canRename(from: oldKey, to: newKey)
+            && SleepEditHealthSampleOverlay.canRename(from: oldKey, to: newKey)
+            && MirroredNightOverlay.canRename(from: oldKey, to: newKey)
+            && PendingSleepReconcileStore.canRekey(from: oldKey, to: newKey)
+            && ((try? canRenameCursor(from: Self.sleepEditLeadingCursorKey(oldKey),
+                                      to: Self.sleepEditLeadingCursorKey(newKey))) ?? false)
+            && ((try? canRenameCursor(from: Self.sleepEditLeadingAsleepCursorKey(oldKey),
+                                      to: Self.sleepEditLeadingAsleepCursorKey(newKey))) ?? false)
+    }
+
+    /// Move every night-scoped overlay that hangs off a row's key. MUST run before `row.night` is
+    /// reassigned — each helper derives its key from the night it is passed, so the old key has to
+    /// still be the row's key when they are called. Call `canRenameNightScopedOverlays` first.
+    private func renameNightScopedOverlays(from oldKey: Date, to newKey: Date) throws {
+        // THROWING SwiftData work FIRST. Everything below it is UserDefaults, which has no rollback
+        // of its own — if a fetch throws after the overlays moved, the row snaps back on rollback and
+        // the two stores are left disagreeing, which is precisely the half-relocation the caller's
+        // all-or-nothing rule exists to prevent. Ordered this way, a throw leaves UserDefaults clean.
+        try renameCursor(from: Self.sleepEditLeadingCursorKey(oldKey),
+                         to: Self.sleepEditLeadingCursorKey(newKey))
+        try renameCursor(from: Self.sleepEditLeadingAsleepCursorKey(oldKey),
+                         to: Self.sleepEditLeadingAsleepCursorKey(newKey))
+        try renameFrozenHeadacheNightKey(from: oldKey, to: newKey)
+        SleepEditOnsetOverlay.rename(from: oldKey, to: newKey)
+        SleepEditHealthSampleOverlay.rename(from: oldKey, to: newKey)
+        MirroredNightOverlay.rename(from: oldKey, to: newKey)
+        PendingSleepReconcileStore.rekey(from: oldKey, to: newKey)
+        Self.renameMorningNotificationLedger(from: oldKey, to: newKey)
+    }
+
+    /// `morning.lastNotifiedNight` (RingSession) dedups the one-per-night lock-screen summary by the
+    /// row's `night` stamp. Left behind, a migrated night compares unequal and the notification is
+    /// posted a SECOND time for the same night — or, if the stale value happens to equal some other
+    /// night's new key, that night's genuine notification is suppressed. Scalar, so it is rewritten
+    /// only when it names exactly the night being moved.
+    private static func renameMorningNotificationLedger(from oldKey: Date, to newKey: Date) {
+        let defaults = UserDefaults.standard
+        let key = RingSession.lastNotifiedNightKey
+        guard defaults.object(forKey: key) != nil,
+              defaults.double(forKey: key) == oldKey.timeIntervalSince1970 else { return }
+        defaults.set(newKey.timeIntervalSince1970, forKey: key)
+    }
+
+    /// The export NIGHT watermark names an already-exported night BY ITS KEY, so a re-key leaves it
+    /// pointing one day behind: every migrated night would sort after it and be offered again under
+    /// a new `sessionID`, giving the user's automated archive two files for one night that can't be
+    /// reconciled by id. Nudge it along with the night it names. Forward-only by construction here —
+    /// every move is +1 day.
+    private func advanceExportWatermarkIfItNamesAMovedNight(_ moves: [SleepNightRekeyPlan.Move]) {
+        guard let watermark = lastExportWatermark(),
+              let move = moves.first(where: { $0.from == watermark }) else { return }
+        let key = Self.exportSessionsCursorKey
+        let descriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == key })
+        guard let row = try? context.fetch(descriptor).first else { return }
+        row.last = move.to
+    }
+
+    /// `StoredHeadacheRisk.nightKey` persists a `StoredSleepSummary.night` value expressly as a
+    /// TIMEZONE-STABLE identity for the night a frozen risk score belongs to (HeadacheStore's own
+    /// doc: "`nightKey` comes from a persisted `StoredSleepSummary.night`, so it survives the
+    /// move"). Re-keying the summary without it would point every historical risk row at a key that
+    /// no longer exists, disarming the duplicate-freeze guard it was added to provide. No unique
+    /// index there, so no fold is needed — and there can legitimately be more than one row.
+    private func renameFrozenHeadacheNightKey(from oldKey: Date, to newKey: Date) throws {
+        let descriptor = FetchDescriptor<StoredHeadacheRisk>(predicate: #Predicate { $0.nightKey == oldKey })
+        for row in (try? context.fetch(descriptor)) ?? [] { row.nightKey = newKey }
+    }
+
+    /// Rename one `StoredCursor`. `kindRaw` is uniquely indexed, so an occupied destination is
+    /// REFUSED (the caller pre-flights and then declines the whole row move) — never folded.
+    ///
+    /// ⚠️ DO NOT "improve" this into a max-fold. The first version did, on the reasoning that a
+    /// cursor may only move forward. That is true of the `MetricKind` cursors and FALSE of the two
+    /// this migration renames: `hk:sleep-edit-leading:` / `-asleep:` are LEADING watermarks that
+    /// `markSleepEditHealthWritten` only ever moves EARLIER, and `pendingSleepEditHealthWrites`
+    /// emits `[editedInBedStart, writtenStart)` whenever the edited bedtime precedes them. Keeping
+    /// the max would record LESS coverage than was actually written and make the next flush write a
+    /// duplicate `.inBed`/`.asleepCore` pair into Apple Health that the user must delete by hand.
+    /// Two watermarks belonging to DIFFERENT nights have no correct fold at all.
+    private func renameCursor(from oldKey: String, to newKey: String) throws {
+        let sourceDescriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == oldKey })
+        guard let source = try context.fetch(sourceDescriptor).first else { return }
+        guard try canRenameCursor(from: oldKey, to: newKey) else { return }
+        source.kindRaw = newKey
+    }
+
+    /// Whether `renameCursor` would succeed: nothing to move, or a free destination.
+    private func canRenameCursor(from oldKey: String, to newKey: String) throws -> Bool {
+        let sourceDescriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == oldKey })
+        guard try context.fetch(sourceDescriptor).first != nil else { return true }
+        let destDescriptor = FetchDescriptor<StoredCursor>(predicate: #Predicate { $0.kindRaw == newKey })
+        return try context.fetch(destDescriptor).first == nil
+    }
+
+    /// Re-key stored sleep summaries from the bedtime day onto the wake day. Idempotent — a second
+    /// run moves nothing, because `SleepNightKey.rekeyed` returns nil for an already-correct row.
+    ///
+    /// ⚠️ THE UNIQUE INDEX IS NOT A GUARD. An earlier version of this doc claimed `@Attribute(.unique)`
+    /// would refuse a move onto an occupied key. That is FALSE, and it was MEASURED to be false: with
+    /// a unique `Date` attribute, mutating one row onto another's key makes `save()` SUCCEED and
+    /// DESTROYS one of the rows — silently, with no throw to catch. So occupancy has to be enforced
+    /// here, in code, before every assignment. Two independent mechanisms do it:
+    ///
+    ///   1. `occupied` is maintained LIVE against the rows' current keys, and re-checked immediately
+    ///      before each `row.night = ` — never trusted from the plan. The plan's ordering guarantee
+    ///      only holds if EVERY planned move runs, and this loop has its own refusal reason (an
+    ///      occupied OVERLAY) that the pure plan cannot see; one such skip would otherwise leave a
+    ///      later move writing onto the skipped row's key.
+    ///   2. A final uniqueness assertion over all rows before `save()`. If it ever trips, nothing is
+    ///      committed.
+    ///
+    /// ALL-OR-NOTHING. A throw anywhere — including out of the middle of the loop — rolls the
+    /// SwiftData changes back AND reverses the UserDefaults overlay moves already applied, so the two
+    /// stores can never be left disagreeing. The caller's done-flag stays unset, and the next attempt
+    /// replays the (idempotent) plan from scratch.
+    ///
+    /// A refused row keeps its old key and gets a `sleep-rekey` breadcrumb naming both nights. That
+    /// can legitimately happen with two sleeps ending on the same calendar day (biphasic sleep) —
+    /// leaving both rows intact under mixed keys is strictly better than dropping one, which is
+    /// exactly the class of silent loss this migration exists to end.
+    @discardableResult
+    func rekeySleepNightsToWakeDay(calendar: Calendar = .current)
+        throws -> (examined: Int, moved: Int, skipped: Int) {
+        let rows = try context.fetch(FetchDescriptor<StoredSleepSummary>())
+        // `examined` lets the caller tell "nothing to migrate" from "migrated" — it must NOT latch
+        // the one-way done-flag over a store it never saw a row in (see `ensureNightKeyMigrated`).
+        guard !rows.isEmpty else { return (0, 0, 0) }
+        // The decision is made by a PURE, TESTED function (SleepNightRekeyPlan) — ordering,
+        // idempotence, partial-replay and the refusal to touch a row with no in-bed window are all
+        // asserted in OpenCircuitKitTests, which actually runs. Its occupancy verdict is advisory
+        // here; this method re-derives its own (see above).
+        let plan = SleepNightRekeyPlan.plan(
+            rows: rows.map { .init(night: $0.night, inBedStart: $0.inBedStart, inBedEnd: $0.inBedEnd) },
+            calendar: calendar)
+        guard !plan.moves.isEmpty || !plan.refused.isEmpty else { return (rows.count, 0, 0) }
+
+        // Two rows normalising to one calendar day would make `byOldKey` lose one of them and let the
+        // same row be moved twice while its sibling is silently left behind. Today's writer always
+        // stores a midnight-aligned `night`, so this is a defensive bail-out, not an expected path.
+        var byOldKey: [Date: StoredSleepSummary] = [:]
+        for row in rows {
+            let key = calendar.startOfDay(for: row.night)
+            if byOldKey[key] != nil {
+                ObservabilityStore().recordMetricEvent(
+                    source: "sleep-rekey",
+                    detail: "ABORTED night=\(Self.stamp(key)) reason=two-rows-normalise-to-one-day "
+                        + "(nothing moved; store left exactly as it was)")
+                throw StoreError.nightKeyMigrationUnsafe
+            }
+            byOldKey[key] = row
+        }
+
+        var occupied = Set(byOldKey.keys)
+        var moved = 0
+        var skipped = plan.refused.count
+        var appliedMoves: [SleepNightRekeyPlan.Move] = []
+
+        for refusal in plan.refused {
+            ObservabilityStore().recordMetricEvent(
+                source: "sleep-rekey",
+                detail: "SKIPPED night=\(Self.stamp(refusal.from)) wanted=\(Self.stamp(refusal.to)) "
+                    + "reason=destination-occupied (row left on its old key; nothing deleted)")
+        }
+
+        func abandon() {
+            // Reverse the non-transactional half first — UserDefaults has no rollback of its own, and
+            // leaving overlays on new keys while the rows snap back to old ones strands the user's
+            // edited onset, the Health sample UUIDs a later edit must delete, and any queued reconcile.
+            for move in appliedMoves.reversed() {
+                // Guarded like the forward move. Unguarded, a forward move that relocated NOTHING
+                // (the row had no overlay of its own) would reverse into a move of an ORPHAN that was
+                // never ours — handing this row a foreign night's mirror span or sample UUIDs.
+                guard canRenameNightScopedOverlays(from: move.to, to: move.from) else { continue }
+                try? renameNightScopedOverlays(from: move.to, to: move.from)
+            }
+            context.rollback()
+        }
+
+        do {
+            for move in plan.moves {
+                guard let row = byOldKey[move.from] else { continue }
+                // Re-check occupancy against the LIVE set, not the plan's snapshot.
+                guard !occupied.contains(move.to) else {
+                    skipped += 1
+                    ObservabilityStore().recordMetricEvent(
+                        source: "sleep-rekey",
+                        detail: "SKIPPED night=\(Self.stamp(move.from)) wanted=\(Self.stamp(move.to)) "
+                            + "reason=destination-occupied-at-apply (row left on its old key; nothing deleted)")
+                    continue
+                }
+                // All-or-nothing per row: if any overlay can't move, the row stays put too, so a row
+                // and its overlays can never end up on different keys.
+                guard canRenameNightScopedOverlays(from: move.from, to: move.to) else {
+                    skipped += 1
+                    ObservabilityStore().recordMetricEvent(
+                        source: "sleep-rekey",
+                        detail: "SKIPPED night=\(Self.stamp(move.from)) wanted=\(Self.stamp(move.to)) "
+                            + "reason=overlay-occupied (row left on its old key; nothing deleted)")
+                    continue
+                }
+                try renameNightScopedOverlays(from: move.from, to: move.to)
+                row.night = move.to
+                occupied.remove(move.from)
+                occupied.insert(move.to)
+                appliedMoves.append(move)
+                moved += 1
+            }
+            advanceExportWatermarkIfItNamesAMovedNight(appliedMoves)
+
+            // Belt and braces: the unique index will not save us (see the doc above), so prove it
+            // ourselves before committing. A trip here means the occupancy bookkeeping is wrong —
+            // discard everything rather than let `save()` quietly delete a night.
+            let keys = rows.map { calendar.startOfDay(for: $0.night) }
+            guard Set(keys).count == keys.count else {
+                ObservabilityStore().recordMetricEvent(
+                    source: "sleep-rekey",
+                    detail: "ABORTED reason=duplicate-night-key-before-save (nothing committed)")
+                abandon()
+                throw StoreError.nightKeyMigrationUnsafe
+            }
+            guard moved > 0 || skipped > 0 else { return (rows.count, 0, 0) }
+            try context.save()
+        } catch {
+            abandon()
+            throw error
+        }
+
+        ObservabilityStore().recordMetricEvent(
+            source: "sleep-rekey",
+            detail: "bedtime-day -> wake-day: moved=\(moved) skipped=\(skipped) of \(rows.count) nights")
+        return (rows.count, moved, skipped)
     }
 
     private func sleepEditLeadingWatermark(_ night: Date) throws -> Date? {
