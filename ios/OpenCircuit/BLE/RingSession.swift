@@ -2970,6 +2970,30 @@ final class RingSession: NSObject {
         if adoptedRecordCount > 0 {
             ringLog.notice("sync: adopted \(self.adoptedRecordCount) orphaned records into this drain (#188)")
         }
+        // …and RE-HYDRATE any archive records that were banked but never reached LocalStore.
+        //
+        // The eager in-drain bank makes the RAW records durable, and `restageFromArchive` rebuilds the
+        // sleep SUMMARY from them — but `BulkSleep.samples` runs only off `bulkRecords`, so a night
+        // recovered from the bank healed its summary while its per-epoch HR/HRV/SpO₂/RR stayed
+        // stranded on disk forever. Folding them into THIS drain's buffer is what finally closes that:
+        // they ride the drain's single `persist(historySamples)` call.
+        //
+        // ⚠️ WHY HERE AND NOT A SECOND `persist` CALL. `SyncCursor` is strictly forward-only, but
+        // `LocalStore.ingest` filters a batch against the PRE-batch watermark and advances once — so
+        // out-of-order timestamps are safe WITHIN one batch and unsafe ACROSS two. A standalone
+        // persist of the archive would push the watermark to the newest epoch we hold and then
+        // silently reject this drain's own all-day channel, which legitimately carries OLDER records
+        // than the sleep channel. Adoption keeps it to one batch, so ordering cannot bite.
+        //
+        // Deliberately NOT counted in `adoptedRecordCount`: that value is sleep-commit CREDIT
+        // (`HistoryCommitGate`), and re-hydrated records must not, on their own, earn a re-stage.
+        let stranded = strandedArchiveRecords(alreadyHeld: bulkRecords)
+        if !stranded.isEmpty {
+            bulkRecords += stranded
+            ringLog.notice("sync: re-hydrated \(stranded.count) banked-but-unpersisted archive records into this drain")
+            observability.recordMetricEvent(source: "history-orphan",
+                                            detail: "rehydrated=\(stranded.count) (banked but never sample-persisted)")
+        }
         bulkFinalized = false                    // fresh capture — uncommitted until finalizeSync
         historySamples.removeAll()
         drainTraces.removeAll()
@@ -3470,6 +3494,28 @@ final class RingSession: NSObject {
         guard !bulkRecords.isEmpty, !bulkFinalized else { return }
         _ = epochArchiveStore.merge(bulkRecords)
         ringLog.notice("sync: flushed \(self.bulkRecords.count) uncommitted page-records to archive before teardown")
+    }
+
+    /// Archive records that are provably NEWER than the last vitals sample we persisted — i.e. banked
+    /// (durable) but never turned into HR/HRV/SpO₂/RR rows in LocalStore.
+    ///
+    /// The heart-rate cursor is the probe: `LocalStore.ingest` advances it on every committed batch,
+    /// and it is the densest of the mirrored kinds, so "archive newer than the HR watermark" is
+    /// exactly the set a commit never got to. On a healthy ring this returns empty every time — the
+    /// last commit left the watermark at the archive's newest record.
+    ///
+    /// Self-limiting: once these ride a drain's `persist`, the watermark moves past them and the next
+    /// call finds nothing. Bounded by the archive's own 30 h retention.
+    ///
+    /// Records already in hand are excluded so a re-hydration can never duplicate an adopted orphan
+    /// (`EpochArchive.merge` would dedup on the archive side, but `BulkSleep.samples` runs off the
+    /// in-memory buffer and would otherwise emit the same epoch twice).
+    private func strandedArchiveRecords(alreadyHeld: [BulkRecord]) -> [BulkRecord] {
+        guard let localStore,
+              let cursor = try? localStore.loadCursor(),
+              let watermark = cursor.last(.heartRate) else { return [] }
+        let held = Set(alreadyHeld.map(\.counter))
+        return epochArchiveStore.load().filter { $0.date() > watermark && !held.contains($0.counter) }
     }
 
     /// Arm a durable bank for the pages this drain has ALREADY ACKED but not yet committed
