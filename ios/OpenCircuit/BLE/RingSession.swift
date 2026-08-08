@@ -1862,7 +1862,13 @@ final class RingSession: NSObject {
         if let nightlyTemp { extras.skinTempC = nightlyTemp }
 
         // Rolling baseline from PRIOR nights (exclude tonight's day), for the composite temp factor.
-        let tonightDay = Calendar.current.startOfDay(for: start)
+        // Keyed with `SleepNightKey` because the comparison below is against STORED ROW KEYS —
+        // start-of-day of the block's start would, for a pre-midnight bedtime, fail to exclude
+        // tonight's own row (folding tonight into its own baseline) AND wrongly exclude the genuine
+        // previous night. That double error makes the stored sleepScore differ between the first
+        // drain and a re-stage, which is exactly the non-idempotence `personalSleepBaseline`'s doc
+        // says this exclusion exists to prevent.
+        let tonightDay = SleepNightKey.night(inBedStart: start, inBedEnd: end)
         let priorNights: [SkinTempBaseline.NightlyTemp] = ((try? store.recentSleepSummaries(limit: 40)) ?? [])
             .filter { $0.skinTempC > 0 && Calendar.current.startOfDay(for: $0.night) != tonightDay }
             .map { SkinTempBaseline.NightlyTemp(night: $0.night, celsius: $0.skinTempC) }

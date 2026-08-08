@@ -127,6 +127,30 @@ final class SleepNightKeyTests: XCTestCase {
                      "a re-keyed row must not move again on a second migration pass")
     }
 
+    /// 🔒 `rekeyed` must REFUSE a row it has no evidence for. `inBedStart`/`inBedEnd` default to
+    /// `.distantPast` on rows written before those columns existed, and `night(...)`'s start-anchored
+    /// fallback maps that to `startOfDay(.distantPast)` — year 0. Letting the migration act on it
+    /// would relocate a real night outside every date-ranged query, behind a one-way latch.
+    func testRekeyedRefusesARowWithNoInBedWindow() {
+        XCTAssertNil(SleepNightKey.rekeyed(storedNight: day(2026, 3, 1),
+                                           inBedStart: .distantPast, inBedEnd: .distantPast,
+                                           calendar: cal))
+    }
+
+    func testRekeyedRefusesAnInvertedWindow() {
+        XCTAssertNil(SleepNightKey.rekeyed(storedNight: day(2026, 8, 7),
+                                           inBedStart: at(2026, 8, 7, 23, 56),
+                                           inBedEnd: at(2026, 8, 7, 20, 0), calendar: cal))
+    }
+
+    /// The unguarded `night(...)` fallback is still start-anchored for the WRITE path — proving the
+    /// guard lives in `rekeyed`, not in the rule, so this pair can't drift apart unnoticed.
+    func testDegenerateWindowStillKeysDeterministicallyOnTheWritePath() {
+        XCTAssertEqual(SleepNightKey.night(inBedStart: at(2026, 8, 7, 23, 56),
+                                           inBedEnd: .distantPast, calendar: cal),
+                       day(2026, 8, 7))
+    }
+
     /// A stored key that isn't already midnight-aligned still compares correctly — the migration
     /// must not move a row just because its stored value carries a time component.
     func testRekeyedNormalisesTheStoredKeyBeforeComparing() {

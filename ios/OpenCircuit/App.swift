@@ -408,13 +408,17 @@ struct OpenCircuitApp: App {
     /// gating pattern as the scrubs above. Fixes the key collision that let one night silently
     /// discard another (`SleepNightKey`); `rekeySleepNightsToWakeDay` is idempotent and
     /// non-destructive, so a retry after a failure is safe.
-    private static let nightRekeyDoneKey = "store.rekeyedSleepNightsToWakeDay.v1"
+    ///
+    /// This is the BACKSTOP, not the guarantee. A background launch (BGTask / CoreBluetooth
+    /// restoration) connects no scene, so this `.task` never runs there — `LocalStore` therefore
+    /// gates its own first sleep write on the same flag. This path exists so a launch that writes no
+    /// sleep at all still migrates the history the UI reads.
     @MainActor
     static func rekeySleepNightsOnce(_ container: ModelContainer) {
-        guard !UserDefaults.standard.bool(forKey: nightRekeyDoneKey) else { return }
+        guard !UserDefaults.standard.bool(forKey: LocalStore.nightRekeyDoneKey) else { return }
         do {
             _ = try LocalStore(container.mainContext).rekeySleepNightsToWakeDay()
-            UserDefaults.standard.set(true, forKey: nightRekeyDoneKey)
+            UserDefaults.standard.set(true, forKey: LocalStore.nightRekeyDoneKey)
         } catch { /* leave the flag unset so it retries next launch */ }
     }
 

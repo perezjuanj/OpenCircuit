@@ -48,12 +48,28 @@ public enum SleepNightKey {
         return night(inBedStart: start, inBedEnd: end, calendar: calendar)
     }
 
-    /// The key a stored row SHOULD have, or nil when it is already correct.
+    /// The key a stored row SHOULD have, or nil when it is already correct — or when the row gives
+    /// no evidence to judge it by.
     ///
     /// Drives the one-shot re-key migration. Returning nil for an already-correct row is what makes
     /// the migration idempotent and keeps it from touching rows it does not need to move.
+    ///
+    /// ⚠️ THE DEGENERATE GUARD IS LOAD-BEARING, NOT DEFENSIVE. `StoredSleepSummary.inBedStart` /
+    /// `inBedEnd` are DEFAULTED to `.distantPast` so SwiftData lightweight migration could add them
+    /// to stores written before those columns existed — so rows with no in-bed clock times really do
+    /// exist on real phones (the app defends against them in several other places). Without this
+    /// guard such a row falls into `night(...)`'s start-anchored fallback, which returns
+    /// `startOfDay(.distantPast)` — MEASURED as `0000-12-31` — and the migration would then move the
+    /// row, and its overlays, to a year-0 key: outside every date-ranged query, sorted to the bottom
+    /// of every list, behind a one-way latch with no reverse mapping. A row we cannot judge must
+    /// keep whatever key it already has.
+    ///
+    /// The fallback stays in `night(inBedStart:inBedEnd:)` itself — the WRITE path always has a real
+    /// window, and a degenerate one there still needs some deterministic key — but it must never
+    /// drive a migration.
     public static func rekeyed(storedNight: Date, inBedStart: Date, inBedEnd: Date,
                                calendar: Calendar = .current) -> Date? {
+        guard inBedEnd > inBedStart, inBedStart > .distantPast else { return nil }
         let correct = night(inBedStart: inBedStart, inBedEnd: inBedEnd, calendar: calendar)
         return correct == calendar.startOfDay(for: storedNight) ? nil : correct
     }

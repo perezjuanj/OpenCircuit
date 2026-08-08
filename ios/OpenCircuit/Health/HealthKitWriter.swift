@@ -1772,7 +1772,13 @@ final class HealthKitWriter {
         // Resolve the night by in-bed overlap so the key matches the card's summary across midnight;
         // fall back to start-of-day when no summary row exists yet (first-ever mirror of a new night).
         let row = try? local.sleepSummaryOverlapping(start: start, end: end)
-        let night = row?.night ?? Calendar.current.startOfDay(for: start)
+        // The fallback MUST use the same rule the writer will file the row under (`SleepNightKey` —
+        // the day the block ends on). Start-of-day of the block's start resolves to the PREVIOUS
+        // night's key for any pre-midnight bedtime: `mirroredNight(night:)` would then return the
+        // previous night's record, whose spanStart/spanEnd widen this night's delete window over it
+        // — deleting last night's app-written sleep from Apple Health — and `setMirroredNight` would
+        // overwrite its signature so the loss went undetected on the next flush too.
+        let night = row?.night ?? SleepNightKey.night(inBedStart: start, inBedEnd: end)
         // A manually-edited night is OWNED by the edit reconcile, which writes the EDITED picture.
         // The raw staging here must never overwrite it, so leave edited nights entirely alone.
         if row?.isManuallyEdited == true { return .unchanged }
