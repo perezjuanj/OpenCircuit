@@ -304,7 +304,7 @@ final class RingSession: NSObject {
     /// worse than today. Not a detection threshold; a safety cap on how long quiet may hold.
     private static let maxQuietPastLearnedWake: TimeInterval = 6 * 3600
 
-    private static let drainEmptyNoPagesCap = 12   // seconds: cut a zero-page, no-end-signal channel here instead of the 45 s backstop — safely above first-page latency
+    private static let drainEmptyNoPagesCap = 12   // seconds: cut a zero-page, no-end-signal channel here instead of the drainTickCap backstop — safely above first-page latency
 
     /// Sleep-vitals samples (HR/HRV/SpO2) decoded from the last history sync,
     /// finalized when the ring reports end-of-history (0x50). Feed to HealthKitWriter.
@@ -447,19 +447,30 @@ final class RingSession: NSObject {
     /// quiet gap — a continuous handoff re-arms the debounce on every page.
     private var inDrainFirstUnbankedAt: Date?
 
-    /// Nominal per-channel drain budget, in 1 s ticks (`drainChannel`). Unchanged from the fixed cap
-    /// this replaced — it still governs a channel that has gone QUIET.
+    // ⚠️ TICKS, NOT SECONDS. `drainChannel`'s loop sleeps 1 s per tick, but the class is `@MainActor`
+    // and the tester's own bundles measure the loop running 1.2–1.9× nominal (a deterministic 12-tick
+    // cut took 15.4–24.9 s wall). So a tick is ≥1 s and these bound ITERATIONS; the wall-clock is
+    // whatever the main actor grants. Reason in ticks, and never size a wall-clock budget off them.
+
+    /// Nominal per-channel drain budget, in ticks. Unchanged from the fixed cap it replaced — it
+    /// still governs a channel that has gone QUIET.
     private static let drainTickCap = 45
 
     /// Absolute ceiling for a channel that keeps STREAMING past `drainTickCap`. Bounds a
     /// never-quiet ring; it is not a budget for healthy data.
     ///
     /// 🟢 Basis (2026-08-07, Gen 2 Air): the whole-night catch-up delivered 20 pages / 119 records in
-    /// 43 s — i.e. ~2.2 s per page, ~2.7 records/s — against the old FIXED 45 s cap. Two seconds of
-    /// margin. A longer night simply loses: 10 h of 150 s epochs is ~240 records ≈ 88 s of handoff,
-    /// which would have exited `.hardTimeout` → `.partial` → `allowsSleepCommit == false` → the night
-    /// banked but never staged. 180 ticks covers ~490 records (~20 h of epochs), ~4× the measured
-    /// handoff, while still bounding a pathological stream.
+    /// 43 s of page flow, its `0x50` landing ~55 s after the open — i.e. it cleared the old FIXED
+    /// 45-tick cap only on tick inflation, by about a second. A longer night simply loses: 10 h of
+    /// 150 s epochs is ~240 records ≈ 88 s of handoff, which would have exited `.hardTimeout` →
+    /// `.partial` → `allowsSleepCommit == false` → the night banked but never staged. At the measured
+    /// ~2.2 s/page × 6 records, 180 ticks admits ~490 records (~20 h of epochs) — ~4× the measured
+    /// handoff — while still bounding a pathological stream.
+    ///
+    /// ⚠️ WHOLE-DRAIN worst case: `performHistoryDrain` runs up to 3 channels in sequence, so a
+    /// foreground sync can in principle hold `syncing` for 3 × this. Only a channel that keeps
+    /// streaming can get there, and callers with their own latency budget must bound their WAIT
+    /// rather than this loop — see `runGuardedHistoryDrain(maxWait:)`.
     private static let drainTickCeiling = 180
 
     // MARK: OSA dense-PPG burst (#91)
@@ -2060,6 +2071,13 @@ final class RingSession: NSObject {
     /// Overall wall-clock budget for the reach-idle WAITS (in-flight-sync + fast-path descriptor probe)
     /// before we give up the fast path. The lossless recovery drain runs to its own natural end.
     private static let sportReachIdleBudget: TimeInterval = 18
+    /// How long the sport-enter prime will WAIT for its all-day drain before starting the workout
+    /// anyway. The drain itself is never shortened — it runs to its natural end and keeps `syncTask`,
+    /// which routes the retry loop to the (lossless) live-poll fallback. Matched to
+    /// `sportReachIdleBudget` because it is the same kind of budget: the most a workout start may
+    /// spend waiting on the link before the user gets a heart rate. (#188 follow-up: `drainChannel`
+    /// can now legitimately run several times longer than the old fixed cap.)
+    private static let sportPrimeDrainBudget: TimeInterval = 18
     /// Fast-path descriptor-probe window when the ring was already idle (no live poll running): give
     /// the `0x10`/`0x87` mode byte a moment to confirm idle before `06 03`. Also the post-drain confirm.
     private static let sportFastPathIdle: TimeInterval = 5
@@ -2187,7 +2205,21 @@ final class RingSession: NSObject {
                 // doesn't apply, and the official app itself primes+starts sport overnight (00:05 snoop).
                 // allDayOnly: even overnight, touch ONLY the all-day channel (0x03) — never the sleep
                 // pointer — so priming a workout can't fragment/truncate a sleep night (#119).
-                await self.runGuardedHistoryDrain(trigger: "sport-enter", allowInSleepWindow: true, allDayOnly: true)
+                // maxWait: bound the WAIT, never the drain (#188 follow-up). `drainChannel` may now
+                // extend to `drainTickCeiling` while the ring is still streaming, and this await used
+                // to block the whole workout start for however long that took — with live monitoring
+                // already stopped (above) and `06 03` not yet sent, i.e. NO HR source for the entire
+                // wait. Every other step on this path is budgeted; this one was not.
+                //
+                // Timing out is lossless: the drain keeps running and still owns `syncTask`, so the
+                // SportStart retry loop below takes its `syncTask != nil` branch and hands off to
+                // `fallBackToLivePoll` → `startLiveMonitoring`, which cancels the sync only AFTER
+                // `flushDrainedToArchive()` banks its pages. And `allDayOnly` stages no sleep, so no
+                // commit verdict is lost either. ⚠️ Do NOT "fix" this by shortening `drainChannel` —
+                // a bounded mid-stream drain cut is the known data-loss bug.
+                await self.runGuardedHistoryDrain(trigger: "sport-enter", allowInSleepWindow: true,
+                                                  allDayOnly: true,
+                                                  maxWait: RingSession.sportPrimeDrainBudget)
                 guard self.sportSessionActive, !self.sportGotFirstFrame, !Task.isCancelled else { return }
             }
             // App-faithful SportStart retry (ground truth: `fresh_decoded.txt` L389–401). Re-send the
@@ -2370,7 +2402,7 @@ final class RingSession: NSObject {
 
     /// Force the ring out of live-HR into idle for a workout start via a FULL, LOSSLESS history drain
     /// (#174). Opening a sync kicks the ring out of the dashboard's live-HR mode; letting it run to its
-    /// natural end (both channels → `0x50`/quiet, with `drainChannel`'s existing 45 s/channel backstop)
+    /// natural end (both channels → `0x50`/quiet, with `drainChannel`'s own per-channel tick backstop)
     /// returns the ring to idle AND banks every page. We deliberately do NOT cut the drain short: a
     /// mid-stream cut would ack-and-DISCARD the streamed remainder — the `0x4c`/`0x47` handlers ack
     /// every page unconditionally, so the ring advances its resume pointer past pages that a stopped
@@ -2386,9 +2418,13 @@ final class RingSession: NSObject {
     /// (same-ring A/B snoop, 2026-07-12). Paired with `allDayOnly: true` so even overnight the prime
     /// touches ONLY the all-day channel (0x03), never the sleep pointer — so it can't fragment a night.
     @discardableResult
+    /// - Parameter maxWait: bound the CALLER'S wait (not the drain) when the caller has its own
+    ///   latency budget. On timeout the drain keeps running and keeps owning `syncTask`; the caller
+    ///   must be able to cope with that. Nil = wait for the drain to finish, the original behaviour.
     private func runGuardedHistoryDrain(trigger: String,
                                         allowInSleepWindow: Bool = false,
-                                        allDayOnly: Bool = false) async -> Bool {
+                                        allDayOnly: Bool = false,
+                                        maxWait: TimeInterval? = nil) async -> Bool {
         guard ready, syncTask == nil, !calibrationCapturing, allowInSleepWindow || !isInSleepWindow else {
             ringLog.notice("\(trigger, privacy: .public): drain SKIP (link busy or sleep-window)")
             return false
@@ -2401,7 +2437,15 @@ final class RingSession: NSObject {
             await self.performHistoryDrain(allDayOnly: allDayOnly)
         }
         syncTask = task            // block any concurrent sync for the drain's duration
-        await task.value           // performHistoryDrain runs finalizeSync and clears syncing/syncTask
+        if let maxWait {
+            // Bounded wait: `awaitInFlightSyncForIdle` polls until `finalizeSync` nils `syncTask`.
+            await awaitInFlightSyncForIdle(deadline: Date().addingTimeInterval(maxWait))
+            if syncTask != nil {
+                ringLog.notice("\(trigger, privacy: .public): prime drain still running after \(maxWait)s — proceeding without it")
+            }
+        } else {
+            await task.value       // performHistoryDrain runs finalizeSync and clears syncing/syncTask
+        }
         return true
     }
 
@@ -3111,7 +3155,8 @@ final class RingSession: NSObject {
 
     /// Open ONE history channel at cursor ≈ now and drain its 0x4c/0x47 pages — the frame handler
     /// folds 0x4c records into `bulkRecords` while `syncing`. Bounded by the channel's `0x50` end
-    /// marker, by 3 s of quiet AFTER pages have started (a lost end-marker), or a 45 s hard cap, so
+    /// marker, by 3 s of quiet AFTER pages have started (a lost end-marker), or the `drainTickCap`
+    /// backstop — which EXTENDS while pages are still streaming (see the loop), so
     /// nothing can hang the sync. `syncDone`/`syncQuietTicks` reset per channel so each channel's
     /// end-marker is awaited independently.
     private func drainChannel(channel: UInt8, label: String) async {
@@ -3139,7 +3184,7 @@ final class RingSession: NSObject {
         // sending `01 00 00` before every open plainly does not prevent the failure this tester saw.
         // Track whether the open actually got onto the wire. `write` returns false when the link is
         // down/half-open and it dropped the bytes; before this, drainChannel ignored that and then
-        // sat in the tick loop below for 12–45 s waiting for a reply to a command the ring never
+        // sat in the tick loop below for 12+ s waiting for a reply to a command the ring never
         // received — burning a bounded background window and reporting `noAck`, which reads as "the
         // ring refused" (see `HistoryChannelOutcome.linkDown`).
         var openDelivered = true
@@ -3172,8 +3217,7 @@ final class RingSession: NSObject {
         // the user sees no sleep summary.
         //
         // The cap now only bounds a channel that has gone QUIET: it extends by another `drainTickCap`
-        // whenever the budget runs out while pages are still landing (`syncQuietTicks <= 1` — the
-        // `0x4c` handler zeroes it on every page and it is incremented once per tick below), up to
+        // whenever the budget runs out while the channel has NOT taken its quiet exit, up to
         // `drainTickCeiling`. Every existing exit is untouched and still fires first: the `0x50`
         // end-marker (`syncDone`), the 3-quiet-tick rule, the 12 s empty-channel cut, cancellation and
         // the link-down bail. So this can only ever let a LIVE stream finish — it can never delay a
@@ -3189,7 +3233,7 @@ final class RingSession: NSObject {
                 return
             }
             // Link died mid-drain with NOTHING received → stop waiting; no page can arrive on a
-            // dead link no matter how long we sit here, so the remaining 12–45 s is pure waste.
+            // dead link no matter how long we sit here, so the rest of the budget is pure waste.
             //
             // ⚠️ GATED ON `activeDrainPageCount == 0` ON PURPOSE — do not "simplify" this to bail
             // whenever the link drops. Once pages HAVE arrived, the shipped path is: pages stop,
@@ -3210,7 +3254,7 @@ final class RingSession: NSObject {
             // Count seconds since the last page (the frame handler zeroes `syncQuietTicks` on every
             // 0x47/0x4c). The quiet-exit only applies once pages have actually started this channel,
             // so a slow open can't cut the drain off before the stream begins — an empty channel
-            // exits on its 0x50 (`syncDone`); only a lost 0x50 falls through to the 45 s cap.
+            // exits on its 0x50 (`syncDone`); only a lost 0x50 falls through to the tick backstop.
             // Exception: when the ring's 0x82 ACK carries byte[1]==0xff (pointer-at-end signal, 🟡),
             // we know no pages are coming. Apply the same 3-tick quiet exit without waiting for pages
             // to start — saves up to 42 s per empty channel (observed: all-day channel 2026-06-28).
@@ -3224,7 +3268,7 @@ final class RingSession: NSObject {
                 ringLog.notice("sync: ch=\(label, privacy: .public) first page at ~\(tick + 1)s")
             }
             // T3: a channel that has streamed ZERO pages and given NO end signal (no 0x50 `syncDone`,
-            // no 0x82-ff `ackedEmpty`) would otherwise burn the full 45 s. Once ANY page lands, `sawPages`
+            // no 0x82-ff `ackedEmpty`) would otherwise burn the full `drainTickCap`. Once ANY page lands, `sawPages`
             // is true and this never applies — so this only ever cuts a genuinely empty channel, above
             // first-page latency. Lossless: nothing acked-but-unbanked (no pages were streamed).
             if !sawPages, !ackedEmpty, !syncDone, tick + 1 >= Self.drainEmptyNoPagesCap {
@@ -3243,12 +3287,23 @@ final class RingSession: NSObject {
             }
             tick += 1
             // Budget exhausted but the ring is STILL handing pages over → buy another `drainTickCap`
-            // rather than cutting it off. `syncQuietTicks <= 1` means a page landed within the last
-            // tick (the `0x4c` handler zeroes it, we incremented once above), so this only ever
-            // extends a genuinely live stream. Bounded by `drainTickCeiling`.
-            if tick >= cap, syncQuietTicks <= 1, activeDrainPageCount > 0, cap < Self.drainTickCeiling {
-                cap = min(cap + Self.drainTickCap, Self.drainTickCeiling)
-                ringLog.notice("sync: ch=\(label, privacy: .public) still streaming at \(tick)s — drain budget extended to \(cap)s")
+            // rather than cutting it off. Bounded by `drainTickCeiling`.
+            //
+            // "Still streaming" is defined by NOT having taken the quiet exit above, not by a fresh
+            // page on this exact tick. ⚠️ An earlier revision tested `syncQuietTicks <= 1` and that
+            // was WRONG: reaching here with pages means the 3-quiet-tick exit did not fire, so
+            // `syncQuietTicks ∈ {1, 2}` — and the measured inter-page gap is 2.26 s against 1 s
+            // ticks, so `<= 1` would refuse to extend roughly half the time, purely on tick phase.
+            // A refused extension falls through to `.hardTimeout` → `.partial` →
+            // `allowsSleepCommit == false` → the night is banked but never staged, which is the exact
+            // harm this rule exists to prevent. `syncQuietTicks < 3` is provably always true at this
+            // point; `DrainBudget` encodes and tests that reasoning so it cannot silently regress.
+            if DrainBudget.shouldExtend(tick: tick, cap: cap, ceiling: Self.drainTickCeiling,
+                                        sawPages: activeDrainPageCount > 0,
+                                        quietTicks: syncQuietTicks) {
+                cap = DrainBudget.extendedCap(cap: cap, step: Self.drainTickCap,
+                                              ceiling: Self.drainTickCeiling)
+                ringLog.notice("sync: ch=\(label, privacy: .public) still streaming at tick \(tick) — drain budget extended to \(cap) ticks")
             }
         }
         if activeDrainTrace != nil {

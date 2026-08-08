@@ -659,7 +659,8 @@ struct ContentView: View {
         session.syncHistory(manual: true)   // user-initiated: bypass the overnight-quiet gate
         // `syncHistory()` latches `syncing` from inside its own Task, so wait briefly for it to
         // start, then hold until it finalizes. The drain now covers TWO channels (sleep 0x00 +
-        // all-day 0x03), each with its own end-marker/quiet/45 s-cap watchdog, so the hold cap is
+        // all-day 0x03), each with its own end-marker/quiet/tick-cap watchdog (which extends while the
+        // ring is still streaming, so a big backlog can outlast the hold below), so the hold cap is
         // sized for both; a degraded sync that exceeds it just releases the spinner while the
         // remaining channel commits in the background (the flag-flip guard, so it can't hang forever).
         for _ in 0 ..< 20 {            // ~1 s: wait for the sync to latch on
