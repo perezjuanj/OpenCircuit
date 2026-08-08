@@ -48,6 +48,24 @@ public enum SleepNightKey {
         return night(inBedStart: start, inBedEnd: end, calendar: calendar)
     }
 
+    /// Hour of the key day before which a block's END is read as "woke up into this morning".
+    ///
+    /// This is a SEMANTIC boundary, not a measured threshold: the key names the day the sleeper woke
+    /// up, so noon splits "ended this morning" (owns the key) from "ended this evening" (a bout still
+    /// in progress, which will own TOMORROW's key once it finishes). Nothing physiological is claimed.
+    public static let wakeWindowEndHour = 12
+
+    /// Whether a block that ends at `inBedEnd` is the night the key it lands on actually NAMES.
+    ///
+    /// Needed because `SleepWindow.isOvernightBlock` accepts any block whose midpoint falls in
+    /// [21:00, 09:00), so an evening drain completing before midnight stages a pre-midnight-only
+    /// block that keys to TODAY — the same key as the night that genuinely ended this morning. When
+    /// those two contend for one key, the one that ended in the morning is the night; the evening one
+    /// is an unfinished bout and must not displace it.
+    public static func endsInWakeWindow(_ inBedEnd: Date, calendar: Calendar = .current) -> Bool {
+        calendar.component(.hour, from: inBedEnd) < wakeWindowEndHour
+    }
+
     /// The key a stored row SHOULD have, or nil when it is already correct — or when the row gives
     /// no evidence to judge it by.
     ///

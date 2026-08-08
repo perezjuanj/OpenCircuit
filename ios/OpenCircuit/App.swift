@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import UIKit
+import OpenCircuitKit
 
 @main
 struct OpenCircuitApp: App {
@@ -415,11 +416,10 @@ struct OpenCircuitApp: App {
     /// sleep at all still migrates the history the UI reads.
     @MainActor
     static func rekeySleepNightsOnce(_ container: ModelContainer) {
-        guard !UserDefaults.standard.bool(forKey: LocalStore.nightRekeyDoneKey) else { return }
-        do {
-            _ = try LocalStore(container.mainContext).rekeySleepNightsToWakeDay()
-            UserDefaults.standard.set(true, forKey: LocalStore.nightRekeyDoneKey)
-        } catch { /* leave the flag unset so it retries next launch */ }
+        // Routed through `ensureNightKeyMigrated` rather than duplicating the latch: it is the one
+        // place that knows not to latch over a store it never saw a row in (the #131 in-memory
+        // fallback container is empty by construction) and not to latch on a refused run.
+        LocalStore(container.mainContext).ensureNightKeyMigrated()
     }
 
     /// Run the `SyncCursor` future-watermark repair (`LocalStore.repairFutureSyncCursors`) on
@@ -610,14 +610,26 @@ struct RollupBackup: Codable {
         return backup
     }
 
-    /// Re-insert the backed-up rollups into the fresh store, then remove the JSON file. The
-    /// unique `night`/`day` keys keep this idempotent. Best-effort — a failure just means the
-    /// dashboard starts without past history.
+    /// Re-insert the backed-up rollups into the fresh store, then remove the JSON file.
+    ///
+    /// ⚠️ The unique `night`/`day` keys do NOT make this idempotent — that belief is MEASURED false:
+    /// inserting a duplicate unique key makes `save()` succeed and silently destroy a row (see
+    /// `LocalStore.rekeySleepNightsToWakeDay`). So keys are normalised through `SleepNightKey` and
+    /// de-duplicated here, rather than trusting whatever scheme the backup JSON was written under —
+    /// a backup taken before the night-key migration would otherwise re-seed old-scheme keys into a
+    /// store that will never be migrated again. Best-effort: a failure just means the dashboard
+    /// starts without past history.
     func restore(into container: ModelContainer) {
         let ctx = ModelContext(container)
+        var seenNights = Set<Date>()
         for s in sleep {
+            // Same refusal rule as the migration: a row with no usable in-bed window keeps its key.
+            let night = SleepNightKey.rekeyed(storedNight: s.night,
+                                              inBedStart: s.inBedStart,
+                                              inBedEnd: s.inBedEnd) ?? s.night
+            guard seenNights.insert(Calendar.current.startOfDay(for: night)).inserted else { continue }
             let row = StoredSleepSummary(
-                night: s.night, asleepMin: s.asleepMin, deepMin: s.deepMin, lightMin: s.lightMin,
+                night: night, asleepMin: s.asleepMin, deepMin: s.deepMin, lightMin: s.lightMin,
                 remMin: s.remMin, awakeMin: s.awakeMin, efficiency: s.efficiency,
                 inBedStart: s.inBedStart, inBedEnd: s.inBedEnd,
                 sleepOnset: s.sleepOnset ?? .distantPast,

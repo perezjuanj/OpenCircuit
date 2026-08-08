@@ -1540,6 +1540,13 @@ final class RingSession: NSObject {
     /// falls back to the stored real night. (Adversarial review #1.)
     private func overnightStagedSegments(from records: [BulkRecord],
                                          archive: [BulkRecord]) -> [SleepSegment] {
+        // The night-key migration has to precede `personalSleepBaseline`, which is a STORE READ:
+        // it compares a `SleepNightKey`-derived day against stored `row.night` values to keep
+        // tonight out of its own Deep-HR baseline. Run against an un-migrated table that filter
+        // matches nothing, so tonight folds into its own baseline, the Deep/REM bands shift, and the
+        // whole hypnogram — plus the sleepScore derived from it — is stored from a contaminated
+        // reference. Gating only the WRITE (`saveSleepSummary`) is too late for that.
+        localStore?.ensureNightKeyMigrated()
         let segs = BulkSleep.stagedSegments(from: records, baseline: personalSleepBaseline(from: records))
         // A stitched night carries one `inBed` segment PER fragment (sorted by start), so gate on the
         // WHOLE-NIGHT envelope — earliest onset to latest wake — not just the first fragment. Testing
@@ -1817,11 +1824,14 @@ final class RingSession: NSObject {
         // it inside `saveSleepSummary` would leave those reads comparing a new-scheme key against
         // old-scheme rows — folding tonight into its own skin-temp and deep-HR baselines while
         // excluding the genuine previous night. That night's score is stored, so it sticks.
-        guard localStore.ensureNightKeyMigrated() else {
-            ringLog.error("sleep: night-key migration pending — deferring this staging pass")
-            return
+        let nightKeyReady = localStore.ensureNightKeyMigrated()
+        if !nightKeyReady {
+            ringLog.error("sleep: night-key migration pending — deferring the night summary (naps still persist)")
         }
-        if !stagedSegments.isEmpty {
+        // ⚠️ The deferral covers the NIGHT only. `persistNaps` below runs off THIS drain's buffer
+        // (minus re-hydrated counters) and the next drain clears it, so a nap skipped here is gone —
+        // unlike the night, which `restageFromArchive` re-derives from the 30 h archive.
+        if nightKeyReady, !stagedSegments.isEmpty {
             let summary = SleepStaging.summary(stagedSegments)
             // Real sleep-window clock times (segments carry the dates; Summary doesn't) — so a
             // night-temp window aligns to actual onset/wake, not midnight. The upsert key is

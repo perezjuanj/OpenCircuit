@@ -101,6 +101,32 @@ final class SleepNightKeyTests: XCTestCase {
                        SleepNightKey.night(for: [b, a], calendar: cal))
     }
 
+    // MARK: endsInWakeWindow (breaks a same-key tie between a night and an evening fragment)
+
+    func testMorningWakeOwnsTheKey() {
+        XCTAssertTrue(SleepNightKey.endsInWakeWindow(at(2026, 8, 8, 7, 0), calendar: cal))
+        XCTAssertTrue(SleepNightKey.endsInWakeWindow(at(2026, 8, 8, 9, 45), calendar: cal))
+    }
+
+    /// The pre-midnight evening fragment `isOvernightBlock` lets through: it keys to today, the same
+    /// key as the night that genuinely ended this morning, and must lose the tie.
+    func testEveningBlockDoesNotOwnTheKey() {
+        XCTAssertFalse(SleepNightKey.endsInWakeWindow(at(2026, 8, 8, 23, 20), calendar: cal))
+        XCTAssertFalse(SleepNightKey.endsInWakeWindow(at(2026, 8, 8, 21, 30), calendar: cal))
+    }
+
+    /// Both halves of a night split by the #188 late-handoff end in the MORNING, so neither is
+    /// demoted — they fall through to the completeness merge, which is what recovers the fuller one.
+    func testBothHalvesOfASplitNightEndInTheWakeWindow() {
+        XCTAssertTrue(SleepNightKey.endsInWakeWindow(at(2026, 8, 3, 1, 0), calendar: cal))
+        XCTAssertTrue(SleepNightKey.endsInWakeWindow(at(2026, 8, 3, 9, 0), calendar: cal))
+    }
+
+    func testWakeWindowBoundaryIsNoon() {
+        XCTAssertTrue(SleepNightKey.endsInWakeWindow(at(2026, 8, 8, 11, 59), calendar: cal))
+        XCTAssertFalse(SleepNightKey.endsInWakeWindow(at(2026, 8, 8, 12, 0), calendar: cal))
+    }
+
     // MARK: rekeyed (drives the one-shot migration)
 
     func testRekeyedIsNilWhenTheStoredKeyIsAlreadyCorrect() {
