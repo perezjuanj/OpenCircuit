@@ -93,13 +93,39 @@ enum DiagnosticsReport {
         // filter is the only thing that reaches a tester, and os_log does not. A permanently
         // suppressed HRV recovery, or a sleep drain that keeps skipping its re-stage, is otherwise
         // invisible in the one channel a TestFlight tester has. (Adversarial review.)
+        // `focus` and `bgphase` join the whitelist: the Sleep Focus filter is OPT-IN (iOS never
+        // invokes it until the user attaches it under Settings ▸ Focus ▸ Sleep ▸ Add Filter), and
+        // without its breadcrumb "did Focus-off ever fire a sync?" is UNANSWERABLE from a tester
+        // bundle — which is exactly the question the 2026-08-07 report turned on. Both are
+        // low-volume (a couple of rows a day), so they cannot crowd out the scheduling lines.
         let bgSources: Set<String> = ["bgregister", "bgschedule", "bgpending", "bgtask",
-                                      "hrv-pool", "sleep-sync"]
+                                      "bgphase", "focus", "hrv-pool", "sleep-sync"]
         let bgLog = observability.metricRecords()
             .filter { bgSources.contains($0.source) }
             .sorted { $0.date > $1.date }
         if bgLog.isEmpty { s.append("  (no scheduling events recorded)") }
         for r in bgLog.prefix(24) {
+            s.append("  \(t(r.date))  \(r.source)  \(r.detail)")
+        }
+        s.append("")
+
+        // 4c) Per-channel drain outcomes (#188 follow-up). These were being recorded and never
+        // surfaced, so diagnosing the 2026-08-07 whole-night loss required decoding the raw-frame
+        // capture by hand to find out what the morning drain actually did. `history-drain` carries
+        // one line per channel (outcome / ack / page counts / records added) and `history-orphan`
+        // records acked-but-unattributed pages — together they say whether a drain ran, what it
+        // pulled, and whether anything arrived outside it.
+        //
+        // Kept in its OWN section with its own budget on purpose: these fire ~2-3× per drain and
+        // ~20 drains a day, so folding them into the scheduling whitelist above would evict the
+        // bgschedule/bgtask lines that answer a different question.
+        let drainSources: Set<String> = ["history-drain", "history-orphan", "archive-repair"]
+        let drainLog = observability.metricRecords()
+            .filter { drainSources.contains($0.source) }
+            .sorted { $0.date > $1.date }
+        s.append("# History drains (latest \(min(drainLog.count, 40)) of \(drainLog.count))")
+        if drainLog.isEmpty { s.append("  (no drain events recorded)") }
+        for r in drainLog.prefix(40) {
             s.append("  \(t(r.date))  \(r.source)  \(r.detail)")
         }
         s.append("")

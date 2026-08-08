@@ -435,6 +435,33 @@ final class RingSession: NSObject {
     /// inter-page cadence so one burst banks once, short enough to survive an imminent teardown.
     private static let unattributedFlushQuiet: Duration = .seconds(3)
 
+    // MARK: In-drain page durability (#188 follow-up)
+    //
+    // The orphan buffer above closed the "acked with NO drain open" hole. The pages acked WITH a
+    // drain open had no equivalent: they accumulate in the volatile `bulkRecords` and are durable
+    // only once `commitDrainedRecords` runs. For a whole-night catch-up that is ~45 s of ACKED,
+    // un-re-requestable data held in memory — see `OpenCircuitKit.DrainBankCadence` for the
+    // measured 2026-08-07 loss (119 contiguous records, a clean `0x50`, nothing persisted).
+    private var inDrainBankTask: Task<Void, Never>?
+    /// When the oldest not-yet-banked in-drain page arrived. Bounds the TOTAL hold, not just the
+    /// quiet gap — a continuous handoff re-arms the debounce on every page.
+    private var inDrainFirstUnbankedAt: Date?
+
+    /// Nominal per-channel drain budget, in 1 s ticks (`drainChannel`). Unchanged from the fixed cap
+    /// this replaced — it still governs a channel that has gone QUIET.
+    private static let drainTickCap = 45
+
+    /// Absolute ceiling for a channel that keeps STREAMING past `drainTickCap`. Bounds a
+    /// never-quiet ring; it is not a budget for healthy data.
+    ///
+    /// 🟢 Basis (2026-08-07, Gen 2 Air): the whole-night catch-up delivered 20 pages / 119 records in
+    /// 43 s — i.e. ~2.2 s per page, ~2.7 records/s — against the old FIXED 45 s cap. Two seconds of
+    /// margin. A longer night simply loses: 10 h of 150 s epochs is ~240 records ≈ 88 s of handoff,
+    /// which would have exited `.hardTimeout` → `.partial` → `allowsSleepCommit == false` → the night
+    /// banked but never staged. 180 ticks covers ~490 records (~20 h of epochs), ~4× the measured
+    /// handoff, while still bounding a pathological stream.
+    private static let drainTickCeiling = 180
+
     // MARK: OSA dense-PPG burst (#91)
     /// Raw `0x48` frames collected during the current store-and-forward burst. `0x48` is a
     /// free-running stream (no per-frame ack) that the ring dumps unprompted during the morning
@@ -834,6 +861,11 @@ final class RingSession: NSObject {
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
         automaticWorkoutReassertTask?.cancel(); automaticWorkoutReassertTask = nil
         syncTask?.cancel(); syncTask = nil
+        // The in-drain bank debounce is cancelled AFTER `flushDrainedToArchive()` above has already
+        // banked the same records, so nothing is dropped by cancelling it — this only stops a
+        // pending timer from firing against a torn-down session. (#188 follow-up)
+        inDrainBankTask?.cancel(); inDrainBankTask = nil
+        inDrainFirstUnbankedAt = nil
         rssiPollTask?.cancel(); rssiPollTask = nil   // Find My Ring RSSI poll (#96)
         // #reconnect (review HIGH): tear down SPORT too. Without this the sport-enter task — its `06 03`
         // retry loop OR its stall-watchdog `while sportSessionActive` — survives teardown (it retains
@@ -896,6 +928,8 @@ final class RingSession: NSObject {
         liveHRWarmup = nil
         flushDrainedToArchive()   // an in-flight sync just cancelled above — bank its pages before the wipe (#119)
         bankUnattributedRecords() // …and any orphaned pages still buffered (#188)
+        inDrainBankTask?.cancel(); inDrainBankTask = nil   // banked above; start a fresh hold window
+        inDrainFirstUnbankedAt = nil
         bulkRecords.removeAll()   // any pages we drain below land here (don't lose them)
         adoptedRecordCount = 0    // this buffer is this path's own capture, nothing adopted (#188)
         bulkFinalized = false
@@ -944,7 +978,14 @@ final class RingSession: NSObject {
                 if self.drainSawPage { self.drainSawPage = false; quiet = 0 }
                 else { quiet += 1; if quiet >= 3 { break } }
                 tick += 1
-                if tick >= cap, quiet == 0, cap < 30 { cap = 30 }   // quick read still streaming a backlog → drain it fully (#45)
+                // NOTE: a `if tick >= cap, quiet == 0, cap < 30 { cap = 30 }` "still streaming →
+                // drain it fully" rescue used to sit here and was DEAD CODE — `cap` is only ever 0
+                // or 30 (above), so `cap < 30` could never hold, and every caller of
+                // `startMonitoring` takes or passes `quickLiveRead: true` (default at the
+                // declaration), which makes `cap == 0` and skips this loop entirely. Removed rather
+                // than "fixed": the mid-stream truncation hazard it was reaching for lives in
+                // `drainChannel`'s tick loop, which is the loop a real backlog actually runs
+                // through — see the extend-while-streaming rule there.
             }
             // Surface anything drained so overnight sleep/vitals aren't lost — the ring
             // discards delivered pages, so this is the only chance to keep them.
@@ -2868,6 +2909,10 @@ final class RingSession: NSObject {
         if inBackground { beginDrainAssertion() }
         flushDrainedToArchive()                  // bank any pages a prior interrupted drain left uncommitted (#119)
         bankUnattributedRecords(restage: false)  // …and any orphaned pages (adopted below, so no re-stage)
+        // Both banks above are durable, so the pending in-drain debounce has nothing left to save;
+        // clear it so this drain's hold window starts at its own first page. (#188 follow-up)
+        inDrainBankTask?.cancel(); inDrainBankTask = nil
+        inDrainFirstUnbankedAt = nil
         bulkRecords.removeAll()
         // ADOPT orphaned pages (#188). They are physically in hand and already durable in the
         // archive, but `historySamples` and the sleep commit both run off `bulkRecords` — so without
@@ -3118,7 +3163,26 @@ final class RingSession: NSObject {
             return
         }
         var firstPageTick: Int? = nil
-        for tick in 0 ..< 45 {
+        // EXTEND WHILE STREAMING, never cut. This was a fixed `for tick in 0 ..< 45`, i.e. an absolute
+        // wall that fired even while the ring was mid-handoff. 🟢 2026-08-07: the whole-night catch-up
+        // streamed for 43 s and its `0x50` end-of-history landed at ~55 s from the open — INSIDE the
+        // old cap by about a second of scheduling luck. A longer night loses outright: the loop falls
+        // through to `finishActiveDrainTrace(.hardTimeout)` below → `.partial` → `allowsSleepCommit`
+        // is false → `HistoryCommitGate` denies `.stage`, so the night is banked but never staged and
+        // the user sees no sleep summary.
+        //
+        // The cap now only bounds a channel that has gone QUIET: it extends by another `drainTickCap`
+        // whenever the budget runs out while pages are still landing (`syncQuietTicks <= 1` — the
+        // `0x4c` handler zeroes it on every page and it is incremented once per tick below), up to
+        // `drainTickCeiling`. Every existing exit is untouched and still fires first: the `0x50`
+        // end-marker (`syncDone`), the 3-quiet-tick rule, the 12 s empty-channel cut, cancellation and
+        // the link-down bail. So this can only ever let a LIVE stream finish — it can never delay a
+        // quiet channel, and it never shortens anything.
+        //
+        // ⚠️ Do NOT re-narrow this into a mid-stream cut; that is the known data-loss bug.
+        var cap = Self.drainTickCap
+        var tick = 0
+        while tick < cap {
             try? await Task.sleep(for: .seconds(1))
             if Task.isCancelled {
                 finishActiveDrainTrace(.cancelled)
@@ -3176,6 +3240,15 @@ final class RingSession: NSObject {
                 print("[OC] sync DRAIN ch=\(label) added=\(added) ackedEmpty=\(ackedEmpty)")
                 finishActiveDrainTrace(syncDone ? .endMarker : .quietAfterPages)
                 break
+            }
+            tick += 1
+            // Budget exhausted but the ring is STILL handing pages over → buy another `drainTickCap`
+            // rather than cutting it off. `syncQuietTicks <= 1` means a page landed within the last
+            // tick (the `0x4c` handler zeroes it, we incremented once above), so this only ever
+            // extends a genuinely live stream. Bounded by `drainTickCeiling`.
+            if tick >= cap, syncQuietTicks <= 1, activeDrainPageCount > 0, cap < Self.drainTickCeiling {
+                cap = min(cap + Self.drainTickCap, Self.drainTickCeiling)
+                ringLog.notice("sync: ch=\(label, privacy: .public) still streaming at \(tick)s — drain budget extended to \(cap)s")
             }
         }
         if activeDrainTrace != nil {
@@ -3342,6 +3415,52 @@ final class RingSession: NSObject {
         guard !bulkRecords.isEmpty, !bulkFinalized else { return }
         _ = epochArchiveStore.merge(bulkRecords)
         ringLog.notice("sync: flushed \(self.bulkRecords.count) uncommitted page-records to archive before teardown")
+    }
+
+    /// Arm a durable bank for the pages this drain has ALREADY ACKED but not yet committed
+    /// (#188 follow-up).
+    ///
+    /// `write(Command.pageAck4C)` is unconditional and advances the ring's single resume pointer, so
+    /// from the ack onward the phone holds the only copy. Until this existed that copy lived solely
+    /// in `bulkRecords` until `commitDrainedRecords` — for the once-a-morning whole-night catch-up,
+    /// tens of seconds of un-re-requestable data with no durability behind it.
+    ///
+    /// 🟢 MEASURED 2026-08-07 (Gen 2 Air / FR04.009, build 38): a 43 s burst delivered 119 contiguous
+    /// records (01:31:47 → 06:26:46 local, 150 s cadence) terminated by a clean `0x50`, and not one
+    /// reached the archive — while the epochs either side of the burst are both present. Every
+    /// graceful teardown path banks correctly (`invalidate`, `stopLiveMonitoring`,
+    /// `performHistoryDrain`, the background-assertion expiry), which leaves this window as the only
+    /// one that can lose an acked page.
+    ///
+    /// Cadence lives in the pure `OpenCircuitKit.DrainBankCadence` so the "a continuous burst must
+    /// still bank on the way through" half is unit-tested rather than inferred — the orphan path
+    /// above shipped without that half and needed `unattributedMaxHold` added in review.
+    private func scheduleInFlightDrainBank() {
+        if inDrainFirstUnbankedAt == nil { inDrainFirstUnbankedAt = Date() }
+        if DrainBankCadence.decide(firstUnbankedAt: inDrainFirstUnbankedAt, now: Date()) == .bankNow {
+            bankInFlightDrainPages()
+            return
+        }
+        inDrainBankTask?.cancel()
+        inDrainBankTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(DrainBankCadence.quiet))
+            guard !Task.isCancelled else { return }
+            self?.bankInFlightDrainPages()
+        }
+    }
+
+    /// Durably merge the in-flight drain's acked pages into the EpochArchive WITHOUT finalizing them.
+    ///
+    /// Deliberately does NOT set `bulkFinalized` and does NOT stage: `commitDrainedRecords` still
+    /// runs at `finalizeSync` and remains the sole owner of staging, the sample path and the sleep
+    /// summary. `EpochArchive.merge` is idempotent dedup-by-counter (`EpochArchive.swift:32-46`), so
+    /// merging the same records again at commit is a no-op and can neither double-count nor reorder.
+    private func bankInFlightDrainPages() {
+        inDrainBankTask?.cancel(); inDrainBankTask = nil
+        inDrainFirstUnbankedAt = nil          // a fresh hold window starts with the next page
+        guard !bulkRecords.isEmpty, !bulkFinalized else { return }
+        _ = epochArchiveStore.merge(bulkRecords)
+        ringLog.debug("sync: banked \(self.bulkRecords.count) in-flight drain records to archive (#188)")
     }
 
     /// Hold a `0x4c` page that arrived with NO drain open (#188). We have already acked it — the ring
@@ -4040,6 +4159,11 @@ extension RingSession: CBPeripheralDelegate {
                     self.bulkRecords += pageRecords
                     self.syncQuietTicks = 0
                     if self.syncing { self.activeDrainPageCount += 1 }
+                    // …and make that retention DURABLE while the burst is still running, not only at
+                    // commit. The ack below has already cost us the ring's copy, so `bulkRecords`
+                    // alone is not retention — it is a promise to retain later. (#188 follow-up,
+                    // measured 2026-08-07: see `scheduleInFlightDrainBank`.)
+                    if !pageRecords.isEmpty { self.scheduleInFlightDrainBank() }
                 } else {
                     self.retainUnattributedPage(pageRecords)
                 }
