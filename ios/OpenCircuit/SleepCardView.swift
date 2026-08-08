@@ -167,7 +167,12 @@ struct SleepCardView: View {
             let start = liveSegments.map(\.start).min()
             let end = liveSegments.map(\.end).max()
             let sleep = SleepStaging.sleepWindow(liveSegments)
-            return Night(nightKey: Calendar.current.startOfDay(for: start ?? end ?? Date()),
+            // Same keying rule as the stored row (`SleepNightKey` — the day the block ENDS on), so
+            // the live/stored reconciliation below (`latest.night == night.nightKey`) still lines
+            // up for a pre-midnight bedtime. Anchoring on `start` here would key the live night a
+            // day earlier than the row it is compared against.
+            return Night(nightKey: SleepNightKey.night(for: liveSegments)
+                            ?? Calendar.current.startOfDay(for: Date()),
                          summary: s, inBedStart: start, inBedEnd: end,
                          onset: sleep?.onset, wake: sleep?.wake,
                          when: end ?? start ?? Date(), wakeKnown: end != nil,

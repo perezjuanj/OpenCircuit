@@ -1591,7 +1591,11 @@ final class RingSession: NSObject {
     /// deterministic and the Sleep card can't diverge from what was written to Health. (Code review.)
     private func personalSleepBaseline(from records: [BulkRecord]) -> SleepStaging.PersonalBaseline? {
         guard let localStore else { return nil }
-        let stagedDay = BulkSleep.mainSleep(from: records).map { Calendar.current.startOfDay(for: $0.start) }
+        // Keyed the same way the row it must match is keyed (`SleepNightKey`) — start-of-day of the
+        // block's START would miss the stored row for any pre-midnight bedtime and let tonight
+        // contaminate its own baseline.
+        let stagedDay = BulkSleep.mainSleep(from: records)
+            .map { SleepNightKey.night(inBedStart: $0.start, inBedEnd: $0.end) }
         let recentDeepHR = ((try? localStore.recentSleepSummaries(limit: 8)) ?? [])
             .filter { stagedDay == nil || Calendar.current.startOfDay(for: $0.night) != stagedDay! }
             .prefix(7)
@@ -1650,9 +1654,11 @@ final class RingSession: NSObject {
     private func restageNights(covering recovered: [BulkRecord], union: [BulkRecord]) -> Int {
         let temps = wearTemperatureSamples()
         let cal = Calendar.current
-        // Group the recovered epochs by the night they belong to. A night key is the start of the
-        // day the sleep block ENDS on, matching `persistSleepAndSteps`; using the epoch's own day
-        // would split one night across midnight.
+        // Bucket the recovered epochs by their OWN calendar day. These are only WINDOW ANCHORS for
+        // the slice below — never night keys. Each slice is widened by a full night span and handed
+        // to `latestNightRecords`, which re-derives the actual night, and the summary is then filed
+        // under `SleepNightKey` by `persistSleepAndSteps`. So a night split across midnight is
+        // recovered from either day's anchor and lands on one key either way.
         let touchedDays = Set(recovered.map { cal.startOfDay(for: $0.date()) })
         var restaged = 0
         for day in touchedDays.sorted() {
@@ -1808,8 +1814,11 @@ final class RingSession: NSObject {
         if !stagedSegments.isEmpty {
             let summary = SleepStaging.summary(stagedSegments)
             // Real sleep-window clock times (segments carry the dates; Summary doesn't) — so a
-            // night-temp window aligns to actual onset/wake, not midnight. `night` (start-of-day)
-            // remains the upsert key.
+            // night-temp window aligns to actual onset/wake, not midnight. The upsert key is
+            // `SleepNightKey` — the start of the day the block ENDS on. It used to be `start`,
+            // which aliased two consecutive nights onto one key whenever bedtime crossed midnight
+            // in opposite directions (00:13 one night, 23:56 the next) and silently discarded the
+            // second. See SleepNightKey for the byte-exact device case.
             // `start` is the in-bed window start — which the bedtime widen (SleepStaging) may have
             // moved earlier over a measured awake-in-bed lead-in. So the extras below (temp/stress
             // window, movement timeline, per-stage HR) intentionally span that recovered pre-onset
@@ -1826,7 +1835,8 @@ final class RingSession: NSObject {
             // minutes alone can't be un-summed, so an export could otherwise say how much deep sleep
             // there was but never when. Travelling in `extras` is what keeps the two writes atomic.
             extras.hypnogram = stagedSegments
-            try? localStore.saveSleepSummary(summary, night: start, inBedStart: start, inBedEnd: end,
+            let nightKey = SleepNightKey.night(inBedStart: start, inBedEnd: end)
+            try? localStore.saveSleepSummary(summary, night: nightKey, inBedStart: start, inBedEnd: end,
                                              sleepOnset: sleep?.onset ?? .distantPast,
                                              sleepWake: sleep?.wake ?? .distantPast,
                                              extras: extras)

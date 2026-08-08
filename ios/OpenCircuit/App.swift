@@ -21,6 +21,10 @@ struct OpenCircuitApp: App {
                 // One-time scrub of samples with a corrupted/implausible timestamp (e.g. a
                 // misaligned bulk-page decode dated years off — surfaces as "13y ago").
                 .task { OpenCircuitApp.purgeImplausibleTimestampsOnce(container) }
+                // One-time re-key of stored nights from the bedtime day onto the WAKE day
+                // (`SleepNightKey`). Must run before any sleep write this launch, or a night staged
+                // under the new key could land beside its own un-migrated row.
+                .task { OpenCircuitApp.rekeySleepNightsOnce(container) }
                 // Repair of any SyncCursor watermark stuck in the future by a corrupted-timestamp
                 // sample, BEFORE `ingest` guarded plausibility ahead of the cursor advance — run
                 // every launch (not one-time; see the function doc), after the sample scrubs so
@@ -397,6 +401,20 @@ struct OpenCircuitApp: App {
         do {
             _ = try LocalStore(container.mainContext).purgeImplausibleTimestamps()
             UserDefaults.standard.set(true, forKey: timestampPurgeDoneKey)
+        } catch { /* leave the flag unset so it retries next launch */ }
+    }
+
+    /// Re-key stored sleep summaries from the bedtime day onto the WAKE day, at most once — same
+    /// gating pattern as the scrubs above. Fixes the key collision that let one night silently
+    /// discard another (`SleepNightKey`); `rekeySleepNightsToWakeDay` is idempotent and
+    /// non-destructive, so a retry after a failure is safe.
+    private static let nightRekeyDoneKey = "store.rekeyedSleepNightsToWakeDay.v1"
+    @MainActor
+    static func rekeySleepNightsOnce(_ container: ModelContainer) {
+        guard !UserDefaults.standard.bool(forKey: nightRekeyDoneKey) else { return }
+        do {
+            _ = try LocalStore(container.mainContext).rekeySleepNightsToWakeDay()
+            UserDefaults.standard.set(true, forKey: nightRekeyDoneKey)
         } catch { /* leave the flag unset so it retries next launch */ }
     }
 
