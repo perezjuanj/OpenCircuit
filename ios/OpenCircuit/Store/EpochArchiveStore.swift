@@ -19,6 +19,9 @@ struct EpochArchiveStore {
     private let pendingStagedSleepKey: String
     /// Last DECIDED HRV-pooling verdict (#185 gate). See `loadHRVPoolingVerdict`.
     private let hrvPoolingKey: String
+    /// Counters banked to the archive WITHOUT their vitals samples being persisted. See
+    /// `loadUnpersistedCounters`.
+    private let unpersistedKey: String
 
     /// `namespace` scopes the keys to a single ring (its CoreBluetooth identifier) so two rings'
     /// epoch archives can't collide on the UInt32 epoch counter (which would corrupt overnight
@@ -32,6 +35,45 @@ struct EpochArchiveStore {
         self.pendingCoarseSleepKey = "sleep.pendingCoarseSegments\(suffix)"
         self.pendingStagedSleepKey = "sleep.pendingStagedSegments\(suffix)"
         self.hrvPoolingKey = "sleep.hrvPoolingVerdict\(suffix)"
+        self.unpersistedKey = "sleep.unpersistedEpochCounters\(suffix)"
+    }
+
+    // MARK: Banked-but-unpersisted ledger (#188 follow-up)
+    //
+    // The archive banks RAW records the moment they are acked; their vitals samples only reach
+    // LocalStore when a drain commits. A drain that banks and then dies leaves the two out of step,
+    // and nothing downstream could tell which epochs were affected.
+    //
+    // ⚠️ THE CURSOR CANNOT ANSWER THIS. The first attempt inferred it from `SyncCursor.last(.heartRate)`
+    // ("archive newer than the HR watermark was never persisted"). That is unsound: the watermark is a
+    // shared forward high-water mark, not a coverage record. `bankUnattributedRecords` persists orphan
+    // samples 35 lines EARLIER in the same `performHistoryDrain`, and `stopLiveMonitoring` persists a
+    // live HR stamped at ≈now — either one pushes the watermark past genuinely unpersisted history and
+    // silently blinds the probe. An explicit ledger is exact and order-independent.
+
+    /// Counters banked to the archive whose samples have not reached LocalStore yet.
+    func loadUnpersistedCounters() -> Set<UInt32> {
+        guard let raw = defaults.array(forKey: unpersistedKey) as? [NSNumber] else { return [] }
+        return Set(raw.map { $0.uint32Value })
+    }
+
+    /// Note that `counters` were banked without persisting their samples. Idempotent (a set).
+    func markUnpersisted(_ counters: some Sequence<UInt32>) {
+        let updated = StrandedEpochLedger.mark(ledger: loadUnpersistedCounters(), banked: counters)
+        guard !updated.isEmpty else { return }
+        defaults.set(updated.map { NSNumber(value: $0) }, forKey: unpersistedKey)
+    }
+
+    /// Retire `counters` once a commit has run them through `persist`.
+    ///
+    /// Retired unconditionally, NOT only when a sample was produced: an `.idle` (unworn/charging)
+    /// record yields no samples at all, so a yield-based rule would re-select it on every drain
+    /// forever — the archive prunes by age and these are the NEWEST records, so retention could never
+    /// clear them either. One pass through `persist` is all the recovery that exists.
+    func clearUnpersisted(_ counters: some Sequence<UInt32>) {
+        let remaining = StrandedEpochLedger.retire(ledger: loadUnpersistedCounters(), committed: counters)
+        if remaining.isEmpty { defaults.removeObject(forKey: unpersistedKey) }
+        else { defaults.set(remaining.map { NSNumber(value: $0) }, forKey: unpersistedKey) }
     }
 
     /// The last DECIDED HRV-pooling verdict for this ring (#185 regression gate), or nil before the

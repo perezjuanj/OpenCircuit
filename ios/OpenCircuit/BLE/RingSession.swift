@@ -446,6 +446,10 @@ final class RingSession: NSObject {
     /// When the oldest not-yet-banked in-drain page arrived. Bounds the TOTAL hold, not just the
     /// quiet gap — a continuous handoff re-arms the debounce on every page.
     private var inDrainFirstUnbankedAt: Date?
+    /// Counters folded into THIS drain's `bulkRecords` from the banked-but-unpersisted ledger rather
+    /// than pulled off the wire. Lets same-day consumers (`persistNaps`) and the user-facing sync
+    /// status scope themselves to what the drain actually fetched. (#188 follow-up)
+    private var rehydratedCounters: Set<UInt32> = []
 
     // ⚠️ TICKS, NOT SECONDS. `drainChannel`'s loop sleeps 1 s per tick, but the class is `@MainActor`
     // and the tester's own bundles measure the loop running 1.2–1.9× nominal (a deterministic 12-tick
@@ -1885,9 +1889,17 @@ final class RingSession: NSObject {
     /// overnight block so naps never double-count against the night; the wear gate (#41) drops
     /// off-wrist/charging stillness the same way the night does.
     private func persistNaps(store: LocalStore) {
-        guard !bulkRecords.isEmpty else { return }
-        let main = BulkSleep.mainSleep(from: bulkRecords, temperatures: wearTemperatureSamples())
-        let naps = NapDetection.naps(from: bulkRecords, mainSleep: main,
+        // Scoped to what this drain actually PULLED, not the whole buffer. `bulkRecords` can now also
+        // carry re-hydrated archive records spanning the full 30 h retention (#188 follow-up), and
+        // `EpochArchive` explicitly warns that retention holds TWO nights. `mainSleep` picks the
+        // single longest still-block, so over a two-night span it excludes one night and leaves the
+        // OTHER one eligible — which `NapDetection` would then write out as a multi-hour "nap".
+        // Every other consumer of a widened buffer scopes itself (`latestNightRecords`); this one did
+        // not. Nap detection is a same-day feature, so the drain's own slice is the right domain.
+        let napRecords = bulkRecords.filter { !rehydratedCounters.contains($0.counter) }
+        guard !napRecords.isEmpty else { return }
+        let main = BulkSleep.mainSleep(from: napRecords, temperatures: wearTemperatureSamples())
+        let naps = NapDetection.naps(from: napRecords, mainSleep: main,
                                      temperatures: wearTemperatureSamples())
         for nap in naps {
             // Don't re-add a detected nap that overlaps a MANUAL nap (user-added/edited): the manual
@@ -2957,6 +2969,7 @@ final class RingSession: NSObject {
         // clear it so this drain's hold window starts at its own first page. (#188 follow-up)
         inDrainBankTask?.cancel(); inDrainBankTask = nil
         inDrainFirstUnbankedAt = nil
+        rehydratedCounters.removeAll()
         bulkRecords.removeAll()
         // ADOPT orphaned pages (#188). They are physically in hand and already durable in the
         // archive, but `historySamples` and the sleep commit both run off `bulkRecords` — so without
@@ -2988,6 +3001,7 @@ final class RingSession: NSObject {
         // Deliberately NOT counted in `adoptedRecordCount`: that value is sleep-commit CREDIT
         // (`HistoryCommitGate`), and re-hydrated records must not, on their own, earn a re-stage.
         let stranded = strandedArchiveRecords(alreadyHeld: bulkRecords)
+        rehydratedCounters = Set(stranded.map(\.counter))
         if !stranded.isEmpty {
             bulkRecords += stranded
             ringLog.notice("sync: re-hydrated \(stranded.count) banked-but-unpersisted archive records into this drain")
@@ -3473,6 +3487,9 @@ final class RingSession: NSObject {
         let hrSampleCount = historySamples.filter { $0.kind == .heartRate }.count
         ringLog.notice("hr-diag: bulkRecords=\(self.bulkRecords.count) decodedHR=\(decodedHRCount) hrSamplesPreIngest=\(hrSampleCount)")
         persist(historySamples)   // auto-persist HR/HRV/SpO2 for the dashboard
+        // Everything in this buffer has now been through `persist`, so retire it from the
+        // banked-but-unpersisted ledger. Unconditional by design — see `clearUnpersisted`. (#188)
+        epochArchiveStore.clearUnpersisted(bulkRecords.map(\.counter))
         recordHistorySyncEvidence(sleepCommitted: committedSleep)
         bulkFinalized = true      // committed — the stop-time safety net can skip these records
         // Consume the adoption credit (#188). `commitDrainedRecords` has three call sites
@@ -3493,29 +3510,27 @@ final class RingSession: NSObject {
     private func flushDrainedToArchive() {
         guard !bulkRecords.isEmpty, !bulkFinalized else { return }
         _ = epochArchiveStore.merge(bulkRecords)
+        // Banked WITHOUT their samples — this is a teardown path, not a commit. Ledger them so the
+        // next drain re-hydrates them into its `persist` (#188 follow-up).
+        epochArchiveStore.markUnpersisted(bulkRecords.map(\.counter))
         ringLog.notice("sync: flushed \(self.bulkRecords.count) uncommitted page-records to archive before teardown")
     }
 
-    /// Archive records that are provably NEWER than the last vitals sample we persisted — i.e. banked
-    /// (durable) but never turned into HR/HRV/SpO₂/RR rows in LocalStore.
+    /// Archive records that were banked (durable) but whose vitals samples never reached LocalStore,
+    /// read from the explicit ledger `EpochArchiveStore` keeps for exactly this.
     ///
-    /// The heart-rate cursor is the probe: `LocalStore.ingest` advances it on every committed batch,
-    /// and it is the densest of the mirrored kinds, so "archive newer than the HR watermark" is
-    /// exactly the set a commit never got to. On a healthy ring this returns empty every time — the
-    /// last commit left the watermark at the archive's newest record.
+    /// Records already in hand are excluded so a re-hydration can never duplicate an adopted orphan:
+    /// `EpochArchive.merge` dedups on the archive side, but `BulkSleep.samples` runs off the in-memory
+    /// buffer and would otherwise emit the same epoch twice (and `LocalStore.ingest` has no
+    /// within-batch dedup).
     ///
-    /// Self-limiting: once these ride a drain's `persist`, the watermark moves past them and the next
-    /// call finds nothing. Bounded by the archive's own 30 h retention.
-    ///
-    /// Records already in hand are excluded so a re-hydration can never duplicate an adopted orphan
-    /// (`EpochArchive.merge` would dedup on the archive side, but `BulkSleep.samples` runs off the
-    /// in-memory buffer and would otherwise emit the same epoch twice).
+    /// On a healthy ring the ledger is empty and this returns `[]` every time.
     private func strandedArchiveRecords(alreadyHeld: [BulkRecord]) -> [BulkRecord] {
-        guard let localStore,
-              let cursor = try? localStore.loadCursor(),
-              let watermark = cursor.last(.heartRate) else { return [] }
-        let held = Set(alreadyHeld.map(\.counter))
-        return epochArchiveStore.load().filter { $0.date() > watermark && !held.contains($0.counter) }
+        let unpersisted = epochArchiveStore.loadUnpersistedCounters()
+        guard !unpersisted.isEmpty else { return [] }
+        return StrandedEpochLedger.select(archive: epochArchiveStore.load(),
+                                          ledger: unpersisted,
+                                          alreadyHeld: Set(alreadyHeld.map(\.counter)))
     }
 
     /// Arm a durable bank for the pages this drain has ALREADY ACKED but not yet committed
@@ -3561,6 +3576,8 @@ final class RingSession: NSObject {
         inDrainFirstUnbankedAt = nil          // a fresh hold window starts with the next page
         guard !bulkRecords.isEmpty, !bulkFinalized else { return }
         _ = epochArchiveStore.merge(bulkRecords)
+        // Durable but NOT yet persisted as samples — `commitDrainedRecords` retires them.
+        epochArchiveStore.markUnpersisted(bulkRecords.map(\.counter))
         ringLog.debug("sync: banked \(self.bulkRecords.count) in-flight drain records to archive (#188)")
     }
 
@@ -3726,10 +3743,15 @@ final class RingSession: NSObject {
             let sleepOutcome = drainTraces.first { $0.label == "sleep" }?.outcome
             ringLog.notice("sync: FINALIZE records=\(self.bulkRecords.count) samples=\(self.historySamples.count) sleepSegs=\(self.sleepSegments.count) sleepOutcome=\(sleepOutcome?.rawValue ?? "none", privacy: .public) steps=\(self.steps ?? -1)")
             print("[OC] sync FINALIZE records=\(self.bulkRecords.count) sleepSegs=\(self.sleepSegments.count) sleepOutcome=\(sleepOutcome?.rawValue ?? "none") steps=\(self.steps ?? -1)")
+            // Count only what came off the WIRE: a drain that pulled nothing but re-hydrated banked
+            // epochs must not report "Synced N epochs" (#188 follow-up).
+            let wireRecords = bulkRecords.count - rehydratedCounters.count
             if let sleepOutcome, sleepOutcome != .complete, sleepOutcome != .empty {
                 syncStatus = "Partial sync — sleep channel \(sleepOutcome.rawValue); raw data kept for retry"
+            } else if wireRecords > 0 {
+                syncStatus = "Synced \(wireRecords) epochs"
             } else {
-                syncStatus = "Synced \(bulkRecords.count) epochs"
+                syncStatus = "Up to date — recovered \(self.rehydratedCounters.count) stored epochs"
             }
         }
         syncing = false
