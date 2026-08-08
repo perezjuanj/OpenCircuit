@@ -131,7 +131,9 @@ enum ExportBuilder {
 
         // Resolve the mode into (a) the nights this export is ABOUT and (b) the [from, to) window
         // the v2 sections are collected over.
-        let from: Date
+        // `var`: `.dateRange` widens it backwards after its clamp, so a night bucketed on the day it
+        // ENDS still carries the pre-midnight samples its own hypnogram covers.
+        var from: Date
         let to: Date
         let nights: [StoredSleepSummary]
         let fileStem: String
@@ -155,6 +157,14 @@ enum ExportBuilder {
                 from = requestedFrom
             }
             nights = (try? store.sleepSummaries(from: from, to: to)) ?? []
+            // Widen AFTER the maxExportDays clamp, and only backwards: a night is bucketed on the day
+            // it ENDS (`SleepNightKey`), so the oldest night in range began the previous evening and
+            // its pre-midnight samples — sleep onset among them — sit before `from`. Without this the
+            // file carries a hypnogram for hours it has no raw data for.
+            if let oldest = nights.first,
+               let onsetDay = effectiveInBedStart(oldest).map({ calendar.startOfDay(for: $0) }) {
+                from = min(from, onsetDay)
+            }
             fileStem = "opencircuit-export-\(ExportEngine.dayStamp(now))"
             watermarkAdvance = nil
 

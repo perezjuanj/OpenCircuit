@@ -1811,6 +1811,16 @@ final class RingSession: NSObject {
     /// outside the night-scoped union).
     private func persistSleepAndSteps(nightRecords: [BulkRecord]) {
         guard let localStore else { return }
+        // Migrate BEFORE the reads, not just before the write. `computeSleepExtras` and
+        // `personalSleepBaseline` both compare a `SleepNightKey`-derived day against STORED row keys
+        // to exclude tonight from its own baseline; on the one launch where the migration runs, doing
+        // it inside `saveSleepSummary` would leave those reads comparing a new-scheme key against
+        // old-scheme rows — folding tonight into its own skin-temp and deep-HR baselines while
+        // excluding the genuine previous night. That night's score is stored, so it sticks.
+        guard localStore.ensureNightKeyMigrated() else {
+            ringLog.error("sleep: night-key migration pending — deferring this staging pass")
+            return
+        }
         if !stagedSegments.isEmpty {
             let summary = SleepStaging.summary(stagedSegments)
             // Real sleep-window clock times (segments carry the dates; Summary doesn't) — so a
