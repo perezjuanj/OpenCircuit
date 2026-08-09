@@ -729,13 +729,15 @@ public enum SleepStaging {
         // the one ring with no diagnostics bundle and an unknown timezone) losing 32 min for no
         // reason we can adjudicate.
         //
-        // The 08-05 ±5 min step is `tailStart` below, not this. 🟢 With the floor pinned at 53 and
-        // `sleepSpan` pinned at 39…232, the interior motion-awake epochs {55, 89, 140, 193, 221}
-        // still toggled asleep↔awake cut by cut (5 → 3 → 5 → 3 → … → 0 awake in span) purely
-        // because the strict span's end — hence the morning-tail softening boundary — moves as the
-        // capture grows. #191 saw the same quantity flicker (`lastVitalsSoftened`, derived from
-        // `tailStart`) and de-gated its pass on it for that reason. Anything aimed at this defect
-        // belongs there, and must argue with the 24-test `sleepVitalsRescue` family.
+        // The 08-05 ±5 min step is NEITHER this floor NOR `tailStart`. It is
+        // `BulkSleep.motionIntensityFallbackMagnitudes`'s p80 RANK — see #197, where it is measured
+        // end-to-end. 🟢 That mapping's "is this movement?" cut is a quantile of however much
+        // history has drained, so on 08-05 (which stages through `.intensityTail(degenerate: false)`)
+        // it oscillates 249 → 247 → 247 → 249 across consecutive 5-minute cuts, and the two interior
+        // epochs 89 and 193 sit exactly on it — magnitude 1 (still) at cut 249, magnitude 16 (above
+        // `awakeMotion` 15, so awake) at cut 247. Reported asleep tracks it exactly: 478 · 473 · 473
+        // · 478. The HR floor is 53 on BOTH sides of the step, and `tailStart == n` on both, so
+        // neither can be the mover; both were proposed and both are refuted in #197.
         let sleepFloor = percentile(hr.sorted(), tuning.sleepFloorPercentile)
         let wakeThreshold = sleepFloor + tuning.wakeHRMarginBPM
         let smHR = rollingMedian(hr, half: tuning.hrWakeHalfWindow)
