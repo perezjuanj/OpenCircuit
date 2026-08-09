@@ -138,7 +138,15 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// device-agnostic (openwhoop port); the RingConn 0x4c step is 150 s (BulkRecord.epochSeconds).
     static let rescueEpochStep: TimeInterval = 150
 
-    private struct Temp { var activity: Activity; var start: Date; var end: Date }
+    private struct Temp {
+        var activity: Activity
+        var start: Date
+        var end: Date
+        /// This run begins immediately after a DATA HOLE (`detect` broke here on `maxGap`, not on a
+        /// class change). Nothing was recorded between the previous run's end and this run's start,
+        /// so no merge may carry a boundary across it — see `filterMerge` (#193).
+        var afterHole: Bool = false
+    }
 
     /// First Sleep period longer than `minSleepDuration`, removed from `events`.
     public static func findSleep(_ events: inout [ActivityPeriod]) -> ActivityPeriod? {
@@ -217,8 +225,45 @@ public struct ActivityPeriod: Equatable, Sendable {
         let history = history.sorted { $0.time < $1.time }
         let relative = motionAboveLocalFloor(history)
         return detect(times: history.map(\.time), deltas: relative,
-                      stillThreshold: motionStillThreshold)
+                      stillThreshold: motionStillThreshold,
+                      maxGap: gravityMaxGap - motionGapSubSampleCorrection,
+                      fenceMergesAtHoles: motionGapSubSampleCorrection > 0)
     }
+
+    /// How far past an epoch's START its LAST motion sub-sample sits (#193).
+    ///
+    /// `BulkSleep.motionTimeline` expands each 150 s `0x4c` epoch into five samples at
+    /// `start + k*30 s`, k = 0…4 (🟢 `BulkSleep.swift:347-352`). So the distance between the last
+    /// sample of one epoch and the first of the next is `hole - 120 s`, where `hole` is the real
+    /// distance between the two RECORDS. `detect`'s gap-break compares SAMPLE times, so without this
+    /// correction it under-measures every data hole by exactly 120 s and bridges holes it should
+    /// break on.
+    ///
+    /// 🟢 MEASURED, 2026-08-09 (AD/Gen2, diagnostics bundle 08-09@14-06). The ring sat in its
+    /// charging case 22:19:38 → 22:35:12 — witnessed by 59 `0x10`/`0x87` descriptors reading the
+    /// decoded charger byte `[2] == 0x04` (PROTOCOL.md §5.4 🟢), battery 58 % → 81 %, 3936 → 4385 mV,
+    /// skin temp 23.8–25.1 °C, case byte docked. The resulting hole between records is
+    /// 22:14:57 → 22:36:18 = **1281 s**, which `BulkSleep.contiguousFragments` (record-to-record)
+    /// correctly splits on, but which `detect` saw as 1161 s — 39 s under `gravityMaxGap` — so it
+    /// did NOT break, and `BulkSleep.mainSleep` returned a block opening at **22:10:27**: 25 min
+    /// before the staged envelope and *spanning the charging session*, including the two `.idle`
+    /// epochs at 22:12:27 and 22:14:57. With the correction the block opens at 22:36:18, matching
+    /// the staged envelope.
+    ///
+    /// This also makes `contiguousFragments`' documented contract ("the threshold matches
+    /// SleepDetection's gap-break so a fragment never contains a gap the detector would itself split
+    /// on") TRUE — it was off by exactly this 120 s, in the direction that let the detector bridge a
+    /// hole the fragmenter had already split.
+    ///
+    /// KILL SWITCH — this ONE constant gates the whole #193 pass: at `0` the gap budget is
+    /// `gravityMaxGap` verbatim AND `detect` never flags a run `afterHole`, so `filterMerge` reverts
+    /// to openwhoop's branch order. **0 = disabled = byte-identical to pre-#193**, verified across
+    /// the 18-night corpus (staged output identical on 18/18 at BOTH settings; at 120 four nights'
+    /// detection diagnostics move and none of their staged values do).
+    ///
+    /// The correction only ever SHORTENS the sample-space budget, so it can only ever break runs the
+    /// old code bridged — it can never bridge a hole the old code broke on.
+    public static let motionGapSubSampleCorrection: TimeInterval = 120
 
     /// Target span of the rolling idle-floor window for DETECTION (finding the in-bed block).
     /// Long enough that a brief movement burst never lifts its own local floor and that the block
@@ -411,8 +456,17 @@ public struct ActivityPeriod: Equatable, Sendable {
 
     /// Shared core: classify a stillness-magnitude timeline into Sleep/Active runs.
     /// `deltas[i]` < `stillThreshold` => still at sample i. Faithful to activity.rs.
+    /// `maxGap` is the SAMPLE-space budget for a data hole. The gravity front-end's samples are 1:1
+    /// with readings so it passes `gravityMaxGap` verbatim; the motion front-end's samples are a 5×
+    /// sub-sample expansion of a 150 s epoch and so passes a budget reduced by
+    /// `motionGapSubSampleCorrection` (see there).
+    /// `fenceMergesAtHoles` marks each run that begins on the far side of a data hole so
+    /// `filterMerge` refuses to carry a boundary across it (#193). Off for the gravity front-end,
+    /// whose merge semantics are openwhoop's and are not in scope here.
     private static func detect(times: [Date], deltas: [Float],
-                               stillThreshold: Float) -> [ActivityPeriod] {
+                               stillThreshold: Float,
+                               maxGap: TimeInterval = gravityMaxGap,
+                               fenceMergesAtHoles: Bool = false) -> [ActivityPeriod] {
         guard times.count == deltas.count, times.count >= 2 else { return [] }
 
         // Median sample interval (seconds), bounded like openwhoop.
@@ -437,18 +491,22 @@ public struct ActivityPeriod: Equatable, Sendable {
             isSleep[i] = Float(still) / Float(window.count) >= gravityStillFraction
         }
 
-        // Segment into runs; break on class change or a data gap > maxGap.
+        // Segment into runs; break on class change or a data gap > maxGap. A run broken by a GAP is
+        // followed by a run that starts on the far side of unobserved time — flagged so `filterMerge`
+        // can refuse to carry a boundary across it (#193).
         var temps: [Temp] = []
         var runStart = 0
+        var runFollowsHole = false
         for i in 1 ... n {
             let endOfData = (i == n)
             let classChange = !endOfData && isSleep[i] != isSleep[runStart]
             let gapBreak = !endOfData &&
-                times[i].timeIntervalSince(times[i - 1]) > gravityMaxGap
+                times[i].timeIntervalSince(times[i - 1]) > maxGap
             if endOfData || classChange || gapBreak {
                 temps.append(Temp(activity: isSleep[runStart] ? .sleep : .active,
-                                  start: times[runStart], end: times[i - 1]))
-                if !endOfData { runStart = i }
+                                  start: times[runStart], end: times[i - 1],
+                                  afterHole: runFollowsHole))
+                if !endOfData { runStart = i; runFollowsHole = fenceMergesAtHoles && gapBreak }
             }
         }
 
@@ -457,7 +515,30 @@ public struct ActivityPeriod: Equatable, Sendable {
         }
     }
 
-    /// Merge sub-`activityChangeThreshold` segments into neighbors (openwhoop logic).
+    /// Merge sub-`activityChangeThreshold` segments into neighbors (openwhoop logic), with one
+    /// added rule: **no merge may carry a boundary across a data hole** (#193).
+    ///
+    /// openwhoop's timeline has no holes — it is a continuous accelerometer stream — so its merge
+    /// is free to hand a short run's START to the run after it. On a RingConn `0x4c` archive that is
+    /// not safe: `detect` breaks a run at a hole precisely BECAUSE nothing was recorded there, and
+    /// the forward merge then hands the start straight back across it, re-manufacturing the bridge.
+    ///
+    /// 🟢 MEASURED on 2026-08-09 (AD/Gen2). The ring was in its charging case 22:19:38 → 22:35:12
+    /// (59 descriptors with the decoded charger byte `[2] == 0x04`, battery 58 → 81 %, skin temp
+    /// 23.8–25.1 °C), leaving a 1281 s hole 22:14:57 → 22:36:18. With `motionGapSubSampleCorrection`
+    /// the detector now breaks there, but the 6.5-minute still stub before the hole (22:10:27 →
+    /// 22:16:57, two of whose epochs are `.idle`) was under 15 min, so the forward merge donated its
+    /// start to the run on the far side and `BulkSleep.mainSleep` still opened the night at
+    /// **22:10:27** — 26 min before the ring was back on a wrist. Refusing the across-hole merge
+    /// folds that stub into the preceding ACTIVE run instead and the block opens at 22:36:18.
+    ///
+    /// A short run fenced by holes on BOTH sides has nothing it may legally merge into and is
+    /// dropped — the same outcome the original already produced for a lone short run with no
+    /// neighbours.
+    ///
+    /// BYTE-IDENTICAL WHEN NO HOLE EXISTS: `afterHole` is false on every run of a gap-free timeline
+    /// (every existing test, every contiguous fragment), so both guards vanish and the branch order
+    /// below is openwhoop's, unchanged.
     private static func filterMerge(_ input: [Temp]) -> [Temp] {
         guard !input.isEmpty else { return [] }
         var activities = input
@@ -466,17 +547,29 @@ public struct ActivityPeriod: Equatable, Sendable {
         while i < activities.count {
             let current = activities[i]
             if current.end.timeIntervalSince(current.start) < activityChangeThreshold {
-                if i > 0, i + 1 < activities.count,
+                let nextExists = i + 1 < activities.count
+                // A hole sits between `current` and its NEXT run / between `current` and its PREVIOUS
+                // run respectively. Either one fences the corresponding merge.
+                let acrossNextHole = nextExists && activities[i + 1].afterHole
+                let acrossPrevHole = current.afterHole
+                if i > 0, nextExists, !acrossNextHole, !acrossPrevHole,
                    activities[i - 1].activity == activities[i + 1].activity, !merged.isEmpty {
                     let prev = merged.removeLast()
-                    merged.append(Temp(activity: prev.activity, start: prev.start, end: activities[i + 1].end))
+                    merged.append(Temp(activity: prev.activity, start: prev.start,
+                                       end: activities[i + 1].end, afterHole: prev.afterHole))
                     i += 1 // skip the next; it's merged
-                } else if i + 1 < activities.count {
+                } else if nextExists, !acrossNextHole {
+                    // The rewritten run now STARTS where `current` did, so it inherits `current`'s
+                    // hole flag. Keeping the old flag loses the fence one step later: a subsequent
+                    // prev+next merge would then weld `merged.last` (pre-hole) to it. 🟢 measured —
+                    // that leak produced a single 0→5301 s period across a 1281 s hole.
                     activities[i + 1] = Temp(activity: activities[i + 1].activity,
-                                             start: current.start, end: activities[i + 1].end)
-                } else if !merged.isEmpty {
+                                             start: current.start, end: activities[i + 1].end,
+                                             afterHole: current.afterHole || activities[i + 1].afterHole)
+                } else if !merged.isEmpty, !acrossPrevHole {
                     let prev = merged.removeLast()
-                    merged.append(Temp(activity: prev.activity, start: prev.start, end: current.end))
+                    merged.append(Temp(activity: prev.activity, start: prev.start, end: current.end,
+                                       afterHole: prev.afterHole))
                 }
             } else {
                 merged.append(current)
