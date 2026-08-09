@@ -12,7 +12,7 @@ device's own timestamps (so historical sync backfills correctly).
 | Blood oxygen (SpO₂) | `.oxygenSaturation` | Quantity | % (0–1.0) | HealthKit wants a fraction |
 | Skin / sleeping-wrist temperature | `.bodyTemperature` | Quantity | °C | general writable temperature type; the ideal `.appleSleepingWristTemperature` is Apple-computed/read-only for third parties, and `.basalBodyTemperature` is hard-wired to Cycle Tracking's BBT chart — see notes |
 | Respiratory rate | `.respiratoryRate` | Quantity | count/min | sourced from **any worn epoch**, not sleep-vitals only (#185) — see below |
-| Steps | `.stepCount` | Quantity | count | cumulative; avoid double-counting with phone |
+| Steps | `.stepCount` | Quantity | count | the wire field is a **quarter-hour bucket, not a running day total** (#192) — see notes; avoid double-counting with phone |
 | Active energy | `.activeEnergyBurned` | Quantity | kcal | |
 | Sleep stages | `HKCategoryType(.sleepAnalysis)` | Category | — | values: `inBed`, `asleepCore`, `asleepDeep`, `asleepREM`, `awake` |
 | Workout / strain | `HKWorkout` | Workout | — | openwhoop "strain" has no native type; store as workout + metadata |
@@ -109,6 +109,32 @@ retro-filled; only new drains benefit.
 emitted a sleep-vitals record" is a *mode* signal, not just a value — widening it would move the
 detected night. The two recovering accessors are deliberately `internal` to `OpenCircuitKit` so the
 app target cannot reach them; `StrictVitalsPinningTests` pins the whole sleep pipeline byte-identical.
+
+### Steps: the wire field is a quarter-hour bucket (#192)
+
+The `0x10`/`0x87` descriptor's `[4:6]` step field is **not** a running daily total — it counts
+steps since the last wall-clock `:00`/`:15`/`:30`/`:45` and clears at each boundary 🟢 (re-derived
+over 10,327 descriptor frames from two rings; 268 clears, every one at a quarter boundary; the
+field never exceeds 746 on days the app itself folded to 2,611–4,566). Consequences for what we
+can honestly write to Health:
+
+* **The day total is the sum of the quarter-hour buckets we were connected for.** There is no
+  cumulative counter anywhere on this wire, so a quarter nobody observed cannot be back-filled —
+  steps are the only metric with **no ring-side backlog** to heal a gap. A missed session is a
+  permanent undercount, which is why the force-quit residency failure (iOS blocking BGTask +
+  CoreBluetooth restoration after a swipe-close) shows up on steps first and hardest.
+* `OpenCircuitKit.StepAccumulator.update` folds it: credit the increment while the bucket climbs,
+  credit the raw value whole when it drops. That *is* "sum the observed buckets". The tempting
+  "credit in full at every wall-clock boundary" rule measures **+4.9 % over** (+8.2 % with a lag
+  margin) on the real corpus, because the ring can keep reporting the previous bucket for up to
+  **108 s** after a boundary. Do not reintroduce it.
+* Each delta is written as its own timestamped `StoredStepSample`, and its window START is floored
+  to the sample's own bucket (`StepAccumulator.windowStart`). Before #192, a reconnect stamped the
+  previous reading from hours earlier and the day's first reading stamped local midnight —
+  measured, 22 of 989 credits (5.3 % of all step mass) were smeared that way, six of them across
+  11–22 hours. Totals were unaffected; only the time placement in Health was wrong.
+* **A reading of 0 says nothing about wear or wake.** It means "no steps in this quarter yet",
+  which is what most of a night — and a morning spent in bed — looks like.
 
 ### Resting HR: derived daily, idempotent (#18, #37)
 
