@@ -33,9 +33,16 @@ final class MotionTailFallbackTests: XCTestCase {
         }
     }
 
+    /// ⚠️ FIXTURE MAGNITUDES RESCALED BY #197, INTENT UNCHANGED. This used to pair a tail of 32 with
+    /// one of 48 and expect 1 / 16. That only ever worked because the seam was a per-set RANK: with
+    /// two positive epochs in the whole night the larger one is "the top 20 %" however small it is.
+    /// Against the real corpus a sum of 48 is a trivial stir — positive tail sums run p10 = 25,
+    /// p50 = 230, p90 = 547 — so the old pairing asserted the rank artefact, not a measurement.
+    /// The distinction under test (small tail → light, real movement → active) is preserved, now
+    /// against the absolute `motionIntensityActiveCut`.
     func testTimelineUsesRepeatedEpochIntensityWhenPrimaryRunIsEntirelyFiller() {
-        let records = fillerNight(movingEpochs: [40: [0, 0, 32, 0, 0],
-                                                  41: [0, 16, 32, 0, 0]])
+        let records = fillerNight(movingEpochs: [40: [0, 0, 32, 0, 0],          // a stir, well below the seam
+                                                  41: [0, 200, 200, 0, 0]])     // 400 — real movement
         XCTAssertTrue(BulkSleep.usesMotionIntensityFallback(records))
 
         let timeline = BulkSleep.motionTimeline(from: records)
@@ -43,6 +50,21 @@ final class MotionTailFallbackTests: XCTestCase {
                        [1, 1, 1, 1, 1])
         XCTAssertEqual(Array(timeline[41 * 5..<(41 * 5 + 5)]).map(\.movement),
                        [16, 16, 16, 16, 16])
+    }
+
+    /// The rank artefact itself, now pinned as REMOVED (#197). A night whose only tail activity is a
+    /// couple of small stirs must read as light movement, not as an awakening — under the legacy
+    /// per-set rank the largest stir was promoted to `16` no matter how small it was.
+    func testSmallStirsAloneAreLightNotActive() {
+        let records = fillerNight(movingEpochs: [40: [0, 0, 32, 0, 0],
+                                                  41: [0, 16, 32, 0, 0]])
+        let timeline = BulkSleep.motionTimeline(from: records)
+        XCTAssertEqual(Array(timeline[41 * 5..<(41 * 5 + 5)]).map(\.movement), [1, 1, 1, 1, 1],
+                       "a 48-unit tail is a stir; only a per-set rank could call it an awakening")
+        XCTAssertEqual(BulkSleep.motionIntensityFallbackMagnitudes(records, degenerate: false,
+                                                                   absoluteActiveCut: 0)[41], 16,
+                       "fixture sanity: the legacy rank DID promote it — this test would be vacuous "
+                       + "if the fixture no longer reproduced the artefact")
     }
 
     func testMovementChartDoesNotReportAllZeroWhenIntensityStillHasMotion() {
@@ -56,9 +78,12 @@ final class MotionTailFallbackTests: XCTestCase {
         XCTAssertGreaterThan(summary.active, 0)
     }
 
+    /// ⚠️ Magnitudes rescaled by #197 (64 → 400, i.e. above the absolute seam rather than merely the
+    /// largest in a synthetic night); the assertions are untouched. See the note on
+    /// `testTimelineUsesRepeatedEpochIntensityWhenPrimaryRunIsEntirelyFiller`.
     func testConsecutiveIntensityMovementProducesAnAwakeInterval() {
-        let records = fillerNight(movingEpochs: [60: [0, 0, 64, 0, 0],
-                                                  61: [0, 0, 64, 0, 0]])
+        let records = fillerNight(movingEpochs: [60: [0, 200, 200, 0, 0],
+                                                  61: [0, 200, 200, 0, 0]])
         let summary = SleepStaging.summary(SleepStaging.classify(from: records)).minutes
 
         XCTAssertGreaterThan(summary.awake, 0,

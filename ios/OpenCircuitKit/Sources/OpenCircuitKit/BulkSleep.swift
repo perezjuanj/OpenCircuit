@@ -665,9 +665,11 @@ public enum BulkSleep {
 
     /// One magnitude per epoch using the same run-level signal selection as `motionTimeline`.
     /// The staging model subtracts its rolling local floor afterward, exactly as on primary motion.
-    static func motionMagnitudes(from records: [BulkRecord]) -> [Float] {
+    static func motionMagnitudes(from records: [BulkRecord],
+                                 absoluteActiveCut: Int = motionIntensityActiveCut) -> [Float] {
         if case .intensityTail(let degenerate) = motionSource(records) {
-            return motionIntensityFallbackMagnitudes(records, degenerate: degenerate)
+            return motionIntensityFallbackMagnitudes(records, degenerate: degenerate,
+                                                     absoluteActiveCut: absoluteActiveCut)
         }
         return records.map { record in
             Float(record.motion.reduce(0) { $0 + Int($1) })
@@ -676,12 +678,15 @@ public enum BulkSleep {
 
     /// Convert the secondary intensity distribution into the scale shared by coarse detection and
     /// staging. Any non-zero tail remains visible as LIGHT movement in `SleepDetailMetrics`, but only
-    /// the night's upper intensity quintile becomes motion-awake here. This keeps ordinary sleeping
+    /// a tail above `motionIntensityActiveCut` becomes motion-awake here. This keeps ordinary sleeping
     /// position shifts from becoming wake while retaining substantial, sustained movement as an
     /// awakening cue. Values deliberately straddle the existing thresholds: `1` is still/light for
     /// detection and staging, `16` is active (`motionStillThreshold == 2`, `awakeMotion == 15`).
     ///
-    /// `degenerate:` selects WHERE the light/active seam is drawn, and nothing else:
+    /// ⚠️ SINCE #197 the seam is the ABSOLUTE `motionIntensityActiveCut`, and `degenerate:` only
+    /// selects between the two LEGACY per-set ranks, which are reachable solely by passing
+    /// `absoluteActiveCut: 0`. Both descriptions below are therefore history — kept because they
+    /// record WHY the two branches once differed, and because `0` still reproduces them exactly:
     ///   • `false` — the constant-filler branch keeps the fixed 0.80 quantile, byte for byte.
     ///   • `true` — the non-expressive-primary branch (#184) uses an Otsu two-class seam over the
     ///     same positive pool. WHY: the quantile presumes the run is ~80 % sleep. On the FR04.009
@@ -713,14 +718,48 @@ public enum BulkSleep {
         return best
     }
 
+    /// The ABSOLUTE light/active seam for the intensity tail, in raw `[15:20]` byte-sum units.
+    /// **`0` restores the legacy per-set rank** (p80 / Otsu) byte-for-byte — the one-line revert.
+    ///
+    /// WHY AN ABSOLUTE NUMBER AT ALL (#197). Both legacy seams — the 0.80 quantile and the Otsu
+    /// two-class split — are computed over `positive`, i.e. over **whatever has drained so far**. The
+    /// threshold was therefore a function of sync timing, not of the wearer, and 🟢 MEASURED on
+    /// 2026-08-05 (AD/Gen2) it moved 249 → 247 → 247 → 249 across consecutive 5-minute truncation
+    /// cuts while two interior epochs sat exactly on it, flipping them between magnitude 1 (still)
+    /// and 16 (awake) and swinging the reported night 478 · 473 · 473 · 478. A rank also FORCES a
+    /// fixed share of positive epochs to be "movement" on every night — a night barely stirred and a
+    /// night of thrashing both got their top 20 % called awake, which is a rank artefact, not a
+    /// measurement.
+    ///
+    /// WHY 345, AND WHAT IT IS NOT. It is **the fixed value the per-night rank was already choosing,
+    /// on average** — the median per-night legacy cut over the 16 corpus sources that stage a night
+    /// is 344.5, and the primary user's own ring (AD/Gen2, n = 11) has median 343, so the number is
+    /// not driven by one ring. Choosing it this way deliberately PRESERVES the operating point, which
+    /// is what keeps the three calibrations fitted to this population valid
+    /// (`degenerateMaxQuietStillFraction` 0.50, `degenerateMinSlotOrderFraction` 0.75,
+    /// `hrvPoolingNoiseFloorMs` 9.0) and what keeps the #184 Otsu case byte-identical.
+    ///
+    /// 🔴 IT IS **NOT** A FITTED PHYSIOLOGICAL THRESHOLD, and must not be described as one. Fitting
+    /// one was attempted and ABANDONED on the evidence: taking the primary channel's own still/active
+    /// verdict as the label — the very verdict this fallback exists to substitute for — the best
+    /// achievable Youden J is only **0.414** (byte-sum) / 0.441 (decoded magnitudes), the optimum is
+    /// flat from 150 to 300, and the two rings with a usable label disagree (280 vs 390). That is
+    /// 471 labelled epochs from 2 rings, NEITHER of them the primary user's, because a night whose
+    /// primary channel is expressive enough to label is by definition not a night that needs this
+    /// fallback. A real threshold needs `[15:23)`'s decoded `activityMagnitudes` and supervised
+    /// labels; see #197.
+    static let motionIntensityActiveCut = 345
+
     static func motionIntensityFallbackMagnitudes(_ records: [BulkRecord],
-                                                  degenerate: Bool) -> [Float] {
+                                                  degenerate: Bool,
+                                                  absoluteActiveCut: Int = motionIntensityActiveCut) -> [Float] {
         let sums = records.map { $0.motionIntensityTail.reduce(0) { $0 + Int($1) } }
         let positive = sums.filter { $0 > 0 }.sorted()
         guard !positive.isEmpty else { return [Float](repeating: 0, count: records.count) }
-        let activeCut = degenerate
+        // A fixed seam does not care how much history has drained; the legacy ranks did.
+        let activeCut = absoluteActiveCut > 0 ? absoluteActiveCut : (degenerate
             ? otsuIntensityCut(positive)
-            : positive[Int((Double(positive.count - 1) * 0.80).rounded())]
+            : positive[Int((Double(positive.count - 1) * 0.80).rounded())])
         return sums.map { magnitude in
             guard magnitude > 0 else { return 0 }
             return magnitude >= activeCut ? 16 : 1
