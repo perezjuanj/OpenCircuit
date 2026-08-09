@@ -369,6 +369,26 @@ public enum SleepStaging {
         /// measured here and below the u4 regime.
         public var cadenceWakeMaxQuietEpochs: Int
 
+        // --- Wear gate on the STAGED path (#41 / #194) ------------------------------
+        // `BulkSleep.mainSleep` has always accepted `temperatures:` so an off-wrist / charging
+        // block — perfectly still, and so indistinguishable from a night by motion alone — can be
+        // reclassified `.active` (#41). The COARSE path (`BulkSleep.sleepSegments`) and the
+        // night-SCOPING pass (`BulkSleep.latestNightRecords`) both pass it; `classifyContiguous`
+        // did not, so the gate was inert on the path that actually produces the hypnogram and the
+        // two paths could disagree about what counts as a worn night. Threading the samples is the
+        // whole fix; this flag is its kill switch.
+
+        /// Whether the staged path honours the skin-temperature wear gate. `false` DROPS the samples
+        /// at the `classifyContiguous` boundary, restoring the pre-#194 behaviour byte-identically
+        /// (the regression escape hatch every other pass in this file carries). Inert either way
+        /// when the caller passes no temperature samples — which is why the local corpus is
+        /// byte-identical with it ON: every persisted sample there reads WORN (🟢 24 073 samples
+        /// across the 7 export bundles, min 28.00 °C, none below the 28 °C `wornMinTemperatureC`
+        /// line), because the store persists worn readings only and the cold ones live in
+        /// `RingSession.nightTemperatureLog`, which no export carries. The evidence for the flip is
+        /// therefore a synthetic unworn block over REAL night bytes, not a corpus night. See #194.
+        public var stagedWearGate: Bool
+
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
                     remHRPercentile: Double = 0.86,
@@ -401,7 +421,8 @@ public enum SleepStaging {
                     preOnsetBedtimeReachEpochs: Int = 24,
                     preOnsetBedtimeMaxGapEpochs: Int = 5,
                     cadenceWakeQuietEpochs: Int = 20,
-                    cadenceWakeMaxQuietEpochs: Int = 240) {
+                    cadenceWakeMaxQuietEpochs: Int = 240,
+                    stagedWearGate: Bool = true) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -435,6 +456,7 @@ public enum SleepStaging {
             self.preOnsetBedtimeMaxGapEpochs = preOnsetBedtimeMaxGapEpochs
             self.cadenceWakeQuietEpochs = cadenceWakeQuietEpochs
             self.cadenceWakeMaxQuietEpochs = cadenceWakeMaxQuietEpochs
+            self.stagedWearGate = stagedWearGate
         }
 
         public static let `default` = Tuning()
@@ -509,15 +531,27 @@ public enum SleepStaging {
     /// fragment survived (the "sleep shrinks on every sync" bug). Each fragment carries its own `inBed`
     /// segment (gaps are NOT counted as in-bed); `summary` sums them. A single-fragment input (every
     /// existing caller of a contiguous night, and every unit test) is staged exactly as before.
+    ///
+    /// WEAR GATE (#41 / #194): pass `temperatures:` — the night's skin-temp samples INCLUDING the
+    /// cold/charging ones — so an off-wrist block can't masquerade as a night. It is the SAME set
+    /// the coarse `BulkSleep.sleepSegments` and the night-scoping `BulkSleep.latestNightRecords`
+    /// already take; omitting it here (as every caller did before #194) left the gate inert on the
+    /// path that produces the hypnogram while the other two enforced it, so the two could disagree
+    /// about what counts as a worn night. Empty ⇒ motion-only, exactly as before: absence of
+    /// temperature data is not evidence of being unworn.
     public static func classify(from records: [BulkRecord],
+                                temperatures: [TemperatureSample] = [],
                                 epoch: Int = Command.syncEpoch,
                                 tuning: Tuning = .default,
                                 baseline: PersonalBaseline? = nil) -> [SleepSegment] {
+        let temps = tuning.stagedWearGate ? temperatures : []
         let frags = BulkSleep.contiguousFragments(records)
         let staged: [SleepSegment] = frags.count > 1
-            ? frags.flatMap { classifyContiguous(from: $0, epoch: epoch, tuning: tuning, baseline: baseline) }
+            ? frags.flatMap { classifyContiguous(from: $0, temperatures: temps, epoch: epoch,
+                                                 tuning: tuning, baseline: baseline) }
                    .sorted { $0.start < $1.start }
-            : classifyContiguous(from: records, epoch: epoch, tuning: tuning, baseline: baseline)
+            : classifyContiguous(from: records, temperatures: temps, epoch: epoch,
+                                 tuning: tuning, baseline: baseline)
         // Re-open the in-bed envelope over a MEASURED pre-onset awake-in-bed lead-in the still-block
         // missed (the "inBed == asleep / 100 % efficiency" fix). Runs over the FULL record set so it
         // sees a lead-in that a data gap split into a discarded fragment. No-op when the knob is 0.
@@ -610,10 +644,16 @@ public enum SleepStaging {
 
     /// Stage ONE contiguous record run (no internal data gaps) into `inBed` + stage segments.
     private static func classifyContiguous(from records: [BulkRecord],
+                                           temperatures: [TemperatureSample] = [],
                                            epoch: Int = Command.syncEpoch,
                                            tuning: Tuning = .default,
                                            baseline: PersonalBaseline? = nil) -> [SleepSegment] {
-        guard let block = BulkSleep.mainSleep(from: records, epoch: epoch) else { return [] }
+        // `temperatures:` is the #41 wear gate, and `mainSleep` is the ONLY place it acts — an
+        // off-wrist/charging block is reclassified out of sleep there. Dropping the argument here
+        // (pre-#194) is what made the staged hypnogram disagree with both the coarse segments and
+        // the night scoping, which pass it. Empty ⇒ motion-only, unchanged.
+        guard let block = BulkSleep.mainSleep(from: records, temperatures: temperatures,
+                                              epoch: epoch) else { return [] }
 
         // Epochs inside the in-bed window, forward-filling HR/HRV across dropped reads.
         let inBlock = records
@@ -676,6 +716,28 @@ public enum SleepStaging {
         // The motion still-block treats "lying still but awake" as sleep, so on its own
         // the in-bed window starts before real onset and a quiet morning wake is missed.
         // Gate on HR: awake/active HR rides well above the night's sleeping floor.
+        //
+        // ⚠️ THIS FLOOR DRIFTS WITH SYNC TIME, AND FIXING THAT IS A MEASURED DEAD END (#194 item 2).
+        // The pool is every epoch in the motion block, and the block ends at the LAST RECORD, so
+        // each drain adds post-wake epochs and creeps the low percentile up. It is real — 🟢 on
+        // 2026-08-05 (FR02.018) `blockFloor` steps 53 → 54 bpm across the 5-minute trailing-edge
+        // cuts — but it is NOT what moves the reported total. Re-deriving the floor from the epochs
+        // up to the located wake and re-running the whole mask to a FIXED POINT was implemented and
+        // measured: it converged on every night, held the floor at a constant 53 bpm across exactly
+        // the cuts where the raw floor moved, and changed **nothing** — 514 truncation cuts over 6
+        // nights, byte-identical output, and 17 of 18 corpus nights unchanged with the 18th (`u4`,
+        // the one ring with no diagnostics bundle and an unknown timezone) losing 32 min for no
+        // reason we can adjudicate.
+        //
+        // The 08-05 ±5 min step is NEITHER this floor NOR `tailStart`. It is
+        // `BulkSleep.motionIntensityFallbackMagnitudes`'s p80 RANK — see #197, where it is measured
+        // end-to-end. 🟢 That mapping's "is this movement?" cut is a quantile of however much
+        // history has drained, so on 08-05 (which stages through `.intensityTail(degenerate: false)`)
+        // it oscillates 249 → 247 → 247 → 249 across consecutive 5-minute cuts, and the two interior
+        // epochs 89 and 193 sit exactly on it — magnitude 1 (still) at cut 249, magnitude 16 (above
+        // `awakeMotion` 15, so awake) at cut 247. Reported asleep tracks it exactly: 478 · 473 · 473
+        // · 478. The HR floor is 53 on BOTH sides of the step, and `tailStart == n` on both, so
+        // neither can be the mover; both were proposed and both are refuted in #197.
         let sleepFloor = percentile(hr.sorted(), tuning.sleepFloorPercentile)
         let wakeThreshold = sleepFloor + tuning.wakeHRMarginBPM
         let smHR = rollingMedian(hr, half: tuning.hrWakeHalfWindow)
