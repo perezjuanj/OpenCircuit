@@ -356,14 +356,15 @@ Record (23 B): `[0]`=`0x0c` · `[1:4]`=BE counter **+0x96/rec** (cursor space) �
 > | `hrv` | 0x8·1 | `[5]` | **HRV / RMSSD (ms)** | 🟢 |
 > | `conf` | 0x9·1 | `[6]` | **confidence / signal quality** 0..~12 (was "[6] quality? 🟡") | 🟢 |
 > | `resprate` | 0xa·1 | `[7]` | **RR × 8** (÷8 → brpm) | 🟢 |
-> | `spo2` | 0xb·1 | `[8]` | **SpO2 %** asleep; `0x12`/`0x13` = awake-"no SpO2" sentinel | 🟢 |
+> | `spo2` | 0xb·1 | `[8]` | **SpO2 %** asleep; `0x12`/`0x13`/`0x11` = "no SpO2" sentinels | 🟢 |
 > | `item2p5` | 0xc·1 | `[9]` | 2.5-min marker (~`0x0a`) | 🟡 |
 > | `acti_counts` | 0xd·0xa | **`[10:20]`** | **10-B activity-magnitude blob** (motion/intensity) | 🟢 role |
 > | `info` | 0x17·1 | `[20]` | per-epoch flag | 🟡 |
 >
-> The V2 measurement map bit-packs `acti_counts` as **length 7.5** (`info` = 0.5 B),
-> so the exact sub-field boundaries inside `[10:20]` are 🟡 (the old "`[10:15]` =
-> 5× motion" is just its first 5 bytes). Confirmed in data: on worn epochs `[4]`
+> The V2 measurement map bit-packs `acti_counts` as **length 7.5** (`info` = 0.5 B) —
+> **now resolved, see "The `[15:23)` sub-layout" below**: that 7.5 + 0.5 = 8 bytes is
+> `[15]…[22]`, five 12-bit magnitudes plus a 4-bit `info` nibble. (The old "`[10:15]`
+> = 5× motion" remains the blob's first 5 bytes.) Confirmed in data: on worn epochs `[4]`
 > reads as physiological HR (median 53, max 96), while decoding `[4:6]` as the
 > *activity* map's `steps` gives non-monotonic garbage (median ~13600). Reproduce
 > with `desktop/decode_activity.py`.
@@ -376,6 +377,47 @@ Record (23 B): `[0]`=`0x0c` · `[1:4]`=BE counter **+0x96/rec** (cursor space) �
 > shows the differential: worn-active epochs `Σacti_counts−5` ranges 1→1254, idle is a
 > flat 0 (walk & steps captures). The genuine activity fields live in a **separate**
 > record (next subsection) that our `byte[6]=0x00` syncs never pull.
+
+**The `[15:23)` sub-layout: five 12-bit magnitudes + a 4-bit `info` flag** 🟢 (2026-08-09, #195).
+The 8 bytes `[15]…[22]` are **five 12-bit big-endian magnitudes, nibble-packed, followed by a
+4-bit flag** — 60 + 4 = 64 bits. Magnitude *k* is nibbles 3*k*, 3*k*+1, 3*k*+2 counting from the
+high nibble of `[15]`; `info` is the **LOW nibble of `[22]`**. This is exactly the APK V2 map's
+`acti_counts` length **7.5** + `info` **0.5** — the open item at the top of this section.
+
+Measured over the **5648 unique non-idle records** of the local corpus (5 rings), reproduce with
+`decode_tail()` in `desktop/decode_bulk.py`:
+
+| test | this phase | phase +1 nibble | phase +2 nibbles |
+|---|---|---|---|
+| **CARRY TEST** `P(v ≡ 0 mod 256 \| v > 0)`, per field | **0.0017–0.0030** | 0.0172–0.0317 | 0.1491–0.1627 |
+| the same, per ring (5 rings, n = 360…3431) | **0.0000–0.0029** | 0.0117–0.0253 | 0.1377–0.2560 |
+
+A genuine 12-bit integer whose low byte is ~uniform predicts **1/256 = 0.0039**; a window
+straddling a field boundary has a "low byte" built from one field's LAST nibble and the next
+field's FIRST, both zero about half the time, so it must be far larger — and is, by 6–10× at one
+nibble off and 50–65× at two. Two model-free corroborations of the same 1.5-byte period: the mean
+nibble value over the 16 nibble positions repeats **1.21 / 3.37 / 3.97** five times (the
+most-significant nibble lands on positions 0, 3, 6, 9, 12 and nowhere else), and the mean BYTE
+value repeats **22.5 / 65 / 57** with a 3-byte period. The flag is at the END, not the start: the
+low nibble of `[22]` is categorical — `0` (66.3 %) and `4` (31.6 %) cover 97.9 % of records, 9
+distinct values against 15–16 for every magnitude nibble — and a LEADING flag would put the
+magnitudes at phase +1, which the carry test rejects.
+
+🔴 **What the five numbers physically are is NOT established.** They are **not** a
+higher-precision copy of `[10:15]`'s five 30-s slots: over the 3021 records whose primary channel
+is not a placeholder, magnitude *k* vs motion byte *j* is +0.13…+0.19 for **every** pair with no
+diagonal, and Σmagnitudes vs Σmotion is only +0.20. Range 0…4095 (the full 12-bit span), p50 10,
+p90 1302, 46.9 % exactly zero. The section's existing 🟢 claim — the region is non-zero iff moving
+— is untouched; only its internal boundaries are now known.
+
+⚠️ **Consequence for the byte-aligned `[15:20]` predicate.** `BulkRecord.motionIntensityTailIsZero`
+reads five BYTES, so it covers magnitudes 0–2 in full and only the top nibble of magnitude 3, and
+cannot see magnitudes 3 and 4 at all. 🟢 Of the 1950 corpus epochs it calls quiet, **253 (13.0 %)
+carry a non-zero magnitude**, and all 253 are a magnitude 3 (97) or 4 (194). It is nevertheless
+**left exactly as it is**: `primaryMotionIsDegenerate`'s 0.50 / 0.75 constants, `measuredHRVRMSSD`'s
+quiet gate and `hrvPoolingNoiseFloorMs` = 9.0 are all fitted to *that* population. The correct
+decode is exposed alongside it as `BulkRecord.activityMagnitudes` / `activityInfoNibble` /
+`activityMagnitudesAreZero`; migrating the three calibrations is a separate, measured job.
 
 **+0x96 counter step = exactly 150 s** (the counter is seconds, §5.6) → **each record
 is a 150 s / 2.5-min epoch.** 🟢 Confirmed by `captures/sleep_sync_btsnoop.log`
@@ -425,8 +467,27 @@ time (no 12 h offset in this capture; bears on §5.6/§6.6). Reassemble + decode
 - **Sleep-vitals epoch**: per-epoch vitals in `[4:9]`, motion `[10:15]` at `01` baseline,
   `[15:22]` ≈ zero. `[8]` is the **SpO2 %** (typically `0x57–0x63` = 87–99, but lower on a real
   desaturation). ⚠️ Layout is decided **structurally** (#39), NOT by this band: classify as
-  sleep-vitals = "not the idle template AND `[8]` ∉ {`0x12`,`0x13`}", so a sub-87 % desaturation
-  still keeps its HR/HRV/SpO2 (the old value-gate dropped the whole epoch — see `BulkSleep.swift`).
+  sleep-vitals = "not the idle template AND `[8]` ∉ {`0x12`,`0x13`,`0x11`}", so a sub-87 %
+  desaturation still keeps its HR/HRV/SpO2 (the old value-gate dropped the whole epoch — see
+  `BulkSleep.swift`).
+- **`0x11` is a THIRD "no SpO2 here" sentinel** 🟢 (2026-08-09, #195) — a "nothing measured"
+  block terminator, not a 17 % saturation and not a desaturation #39 must protect. Measured over
+  the 5648 unique non-idle records of the 5-ring local corpus, 13 occurrences:
+  - **13 of 13 carry `[4] == 0x04`**, the ring's own `<30` "PR unmeasured" sentinel, and 12 of 13
+    carry the whole dead head `04 00 00 00` (HR/HRV/conf/RR all unmeasured). **No** record with a
+    real SpO2 byte ever carries `[4] == 0x04` (0 of 1750); 14 of 3869 `0x12` epochs do. There are
+    no vitals here for the fall-through to preserve.
+  - **13 of 13 sit at the tail of a contiguous run** — 11 are the last record before a
+    multi-epoch hole, the other 2 are immediately followed by another `0x11` that is — and every
+    one is preceded by an ACTIVITY epoch, never a sleep-vitals one. None sits in an SpO2 slot of
+    the duty cycle below.
+  - ⚠️ The corpus's other impossible-SpO2 bytes — **`0x00`/`0x0a`/`0x0e`, 16 records — are the
+    OPPOSITE shape and stay `.sleepVitals`.** 12 of the 16 sit in an SpO2 slot with an activity
+    epoch on both sides, and 14 of 16 carry a plausible `[4:8]` head. They are sleep-vitals
+    epochs whose SpO2 byte failed — exactly the case #39's fall-through exists for. The
+    `70…100` guard on the emitted value already stops the impossible number becoming a sample.
+    (🟡 open: 2 of the 16 `0x00` records carry the same dead head + `[9]==0x22` and terminate a
+    run, i.e. they look like the `0x11` family under a different tag. 2 records is not a rule.)
 
 **The SpO2 DUTY CYCLE — the ring's own "I am measuring sleep" witness** 🟢 (2026-08-09, #190).
 While the ring runs its sleep-measurement program it takes an SpO2 reading every **300 s**. Epochs
@@ -449,8 +510,15 @@ teardown+reconnect inside a 191-epoch run), and the apparent 3.2× page-boundary
 **0.0 %** under regime control (147 cross-page pairs inside the quiet regime, zero violations).
 
 ⚠️ **Name it correctly.** This is a rule about **`[8]`, the SpO2 byte** — `BulkRecord.layout` is a
-discriminator *computed* from it (`0x12`/`0x13` ⇒ activity), not a device mode tag. Any change to
-that discriminator's fall-through silently moves this signal.
+discriminator *computed* from it (`0x12`/`0x13`/`0x11` ⇒ activity), not a device mode tag. Any
+change to that discriminator's fall-through silently moves this signal. #195 added `0x11` to that
+set, and MEASURED the consequence rather than assuming it: 20 of the corpus's 6788 epoch-to-epoch
+steps flip from "alternating" to "violation" (2577 → 2597) — every one of them a step INTO a
+`0x11` record, i.e. at the tail of a contiguous run — and all 18 corpus nights stage
+**byte-identically**, including both ground-truthed wakes (08-09 575 min / 09:08:51 and 08-05
+485 min / 08:10:14). The direction is the one the wire demands: reading `0x11` as an SpO2 read made
+`activity → 0x11` look like a continuation of the duty cycle and could only ever push a trusted run
+LATER.
 
 ⚠️ **Two caveats before building on it.** (1) It is **jitter- and gap-sensitive**: 91 of 3432 steps
 on ring AD are 151–221 s with no record missing, so an exact `dt == 150` test suppresses 57 genuine
@@ -520,8 +588,10 @@ Baseline `01` = "still", not "unworn".
 > **Status:** HR `[4]`, HRV `[5]`, conf `[6]`, RR `[7]`, SpO2 `[8]`, `acti_counts` `[10:20]`
 > and the 150 s cadence are 🟢 (app-aligned §6.2 + APK-map cross-confirmed, #93). Resolved
 > the old "`[6]`/`[7]` semantics, `[15:22]` payload" opens: `[6]`=confidence, `[7]`=RR×8,
-> `[15:22]`=`acti_counts` tail (intensity, not steps). Open: exact `acti_counts` bit-layout
-> `[10:20]` and `item2p5` `[9]`/`info` `[20]`; skin temp + RR-summary (not in this stream).
+> `[15:22]`=`acti_counts` tail (intensity, not steps). #195 closed the bit-layout of the tail
+> (`[15:23)` = 5 × 12-bit BE + a 4-bit `info` nibble 🟢) and added `0x11` to `[8]`'s sentinel set
+> 🟢. Open: the bit-layout of `[10:15]` inside the blob, what the five 12-bit magnitudes each
+> MEAN 🔴, `item2p5` `[9]`; skin temp + RR-summary (not in this stream).
 
 #### 5.3.1 `历史活动响应` — the per-epoch ACTIVITY record (steps/distance/…) — 🔴 NOT YET CAPTURED (#93)
 The decompiled app has a **second** per-2.5-min offset map, `历史活动响应`

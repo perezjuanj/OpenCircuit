@@ -17,20 +17,24 @@ keyed on [8]:
     [0:4]   BE counter, +0x96 (150 s) per record
     [4]     heart rate (bpm)            CONFIRMED
     [5]     HRV / RMSSD (ms)            CONFIRMED
-    [6]     ~1-10, signal quality?      unresolved
-    [7]     ~120, pulse amplitude?      unresolved
+    [6]     confidence / signal quality CONFIRMED  (0..~12; APK `conf`, #93 reconciliation)
+    [7]     respiratory rate x 8        CONFIRMED  (/8 -> brpm, ground-truthed 2026-06-15)
     [8]     SpO2 (%)                    CONFIRMED
     [9]     ~0x0a                       flag
     [10:15] 5x per-30s motion counts (01 baseline = still)
-    [15:22] ~zero during sleep
-    [22]    trailer flags
+    [15:23) acti_counts tail: 5x 12-bit BE magnitudes, nibble-packed, + a 4-bit
+            `info` flag in the LOW nibble of [22]  (60 + 4 = 8 bytes)  CONFIRMED (#195)
+            -> decode_tail() below; ~zero during sleep
 
-  Activity/awake epoch ([8]=0x12/0x13):
+  Activity/awake epoch ([8]=0x12/0x13, and 0x11 = "nothing measured" block terminator):
     [4]     heart rate (bpm)   CONFIRMED  <- ALL-DAY HR (same head as sleep-vitals;
             mined 2026-06-17: activity [4] tracks adjacent sleep HR +-4.6 bpm / corr +0.76,
             continuous across layout boundaries). No separate 0x0a HrSync stream exists.
     [10:15] 5x motion counts (elevated when moving)
-    [15:22] 7-byte activity/physiology payload (unresolved, #93)
+    [15:23) the SAME acti_counts tail as above -- NOT a separate 7-byte
+            steps/distance/activeSeconds payload. That #93 claim was RETRACTED
+            on 2026-06-17; see PROTOCOL.md 5.3. The real activity record is the
+            still-uncaptured 历史活动响应 stream (PROTOCOL.md 5.3.1).
 
 Respiratory rate + skin temp are NOT per-epoch here (derived/summary).
 Sleep stages are app-computed from these signals, not stored on the wire.
@@ -77,6 +81,19 @@ def is_idle(r):
 
 def is_sleep_vitals(r):
     return 0x57 <= r[8] <= 0x63
+
+
+def decode_tail(r):
+    """[15:23) -> (5 x 12-bit BE magnitudes, 4-bit info flag).  CONFIRMED #195.
+
+    Carry test P(v % 256 == 0 | v > 0) over 5648 unique non-idle records / 5 rings:
+    this nibble phase 0.0017-0.0030 (prediction for a real 12-bit int: 1/256 = 0.0039),
+    phase +1 nibble 0.0172-0.0317, phase +2 nibbles 0.1491-0.1627.
+    """
+    nib = [(r[15 + i // 2] >> 4) if i % 2 == 0 else (r[15 + i // 2] & 0xF)
+           for i in range(16)]
+    mags = [(nib[3 * k] << 8) | (nib[3 * k + 1] << 4) | nib[3 * k + 2] for k in range(5)]
+    return mags, nib[15]
 
 
 def main(path):
