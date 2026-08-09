@@ -1547,7 +1547,17 @@ final class RingSession: NSObject {
         // whole hypnogram — plus the sleepScore derived from it — is stored from a contaminated
         // reference. Gating only the WRITE (`saveSleepSummary`) is too late for that.
         localStore?.ensureNightKeyMigrated()
-        let segs = BulkSleep.stagedSegments(from: records, baseline: personalSleepBaseline(from: records))
+        // Calls `SleepStaging.classify` DIRECTLY rather than `BulkSleep.stagedSegments`, for one
+        // reason: the wear gate (#41). Every other consumer of this night — the coarse
+        // `BulkSleep.sleepSegments` and the night-scoping `BulkSleep.latestNightRecords` — is
+        // handed `wearTemperatureSamples()`, but `stagedSegments` has no `temperatures:` parameter
+        // to forward, so the STAGED hypnogram was the one path where an off-wrist/charging block
+        // could still be staged as sleep (#194). With no hint and the default epoch the two
+        // spellings are otherwise the same call. The samples are re-read here rather than passed
+        // in so no future call site can forget them again.
+        let segs = SleepStaging.classify(from: records,
+                                         temperatures: wearTemperatureSamples(),
+                                         baseline: personalSleepBaseline(from: records))
         // A stitched night carries one `inBed` segment PER fragment (sorted by start), so gate on the
         // WHOLE-NIGHT envelope — earliest onset to latest wake — not just the first fragment. Testing
         // `first(where: .inBed)` would judge the night by its earliest fragment's midpoint and wrongly
