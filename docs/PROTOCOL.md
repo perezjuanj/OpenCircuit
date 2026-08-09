@@ -428,6 +428,38 @@ time (no 12 h offset in this capture; bears on §5.6/§6.6). Reassemble + decode
   sleep-vitals = "not the idle template AND `[8]` ∉ {`0x12`,`0x13`}", so a sub-87 % desaturation
   still keeps its HR/HRV/SpO2 (the old value-gate dropped the whole epoch — see `BulkSleep.swift`).
 
+**The SpO2 DUTY CYCLE — the ring's own "I am measuring sleep" witness** 🟢 (2026-08-09, #190).
+While the ring runs its sleep-measurement program it takes an SpO2 reading every **300 s**. Epochs
+are 150 s, so consecutive `0x4c` records ALTERNATE sleep-vitals / activity **1:1**, and the
+alternation stops when the program exits — which is at, or just after, final wake. Measured over
+5650 unique records / 4 rings, re-derived independently from raw frames by a second decoder with
+**0 byte conflicts**:
+
+| observation | value |
+|---|---|
+| sleep-vitals inter-arrival, modal bin | **300 s** on every ring (AD 68.3 %, 9F 63.1 %, u3 83.6 %, u4 78.1 %) |
+| consecutive same-template pairs, ring AD | activity-activity 1305 vs sleepVitals-sleepVitals **24** — the ring essentially never emits two SpO2 reads in a row |
+| same-template ("violation") rate | **6.0 %** inside the staged sleep window vs **43.6 %** outside |
+| split at the user-reported wake | 3.9 % → 23.8 % (08-09); 1.6 % → 34.8 % (08-05) |
+| Mann-Whitney AUC vs wake | **0.819–1.000**, far above SpO2 (0.44/0.41), RR (0.61/0.59), HRV (0.79/0.50) or the confidence byte (0.42/0.27) |
+
+Confounds are REFUTED, not assumed: 20 sync, drain and BLE-reconnect events sit strictly INSIDE
+violation-free runs (including four successful drains inside one 5.7 h run, and a BLE
+teardown+reconnect inside a 191-epoch run), and the apparent 3.2× page-boundary enrichment goes to
+**0.0 %** under regime control (147 cross-page pairs inside the quiet regime, zero violations).
+
+⚠️ **Name it correctly.** This is a rule about **`[8]`, the SpO2 byte** — `BulkRecord.layout` is a
+discriminator *computed* from it (`0x12`/`0x13` ⇒ activity), not a device mode tag. Any change to
+that discriminator's fall-through silently moves this signal.
+
+⚠️ **Two caveats before building on it.** (1) It is **jitter- and gap-sensitive**: 91 of 3432 steps
+on ring AD are 151–221 s with no record missing, so an exact `dt == 150` test suppresses 57 genuine
+violations; and dropping ONE interior epoch makes its neighbours same-template in 90.5 % of
+positions by construction. Use `round(dt/150)` and bridge a single hole by parity. (2) It does **not**
+hold for a whole night on every ring: `9F`/Air fragments into 1.3–3.8 h pieces (two per night), and
+`u4` holds the cadence for a continuous **11.96 h**, which no timezone makes a night — most likely
+continuous SpO2 enabled. Consumed by `SleepStaging.cadenceSteps` / `markCadenceWakeOffset`.
+
 **Sleep-vitals fields — confirmed against the RingConn app's readout for the
 2026-06-13 night** (avg HR 68 / HRV 65 ms / SpO2 98 %, low 93 % ~02:30–03:00):
 - **`[4]` = heart rate (bpm)** 🟢. Sleep-window mean ~60, dips to 56–57 in deep-sleep
