@@ -61,7 +61,11 @@ public struct BulkRecord: Equatable {
     public enum Layout: Equatable {
         case idle          // unworn / no measurement: motion 01×5 and zero payload
         case sleepVitals   // [8] is an SpO2 %; HR/HRV/SpO2 live in [4:9]
-        case activity      // awake/active epoch; payload in [15:22]
+        // No SpO2 read in this epoch: [8] is a sentinel (0x12/0x13 awake-active, 0x11 the
+        // ring's "nothing measured" block terminator), NOT a percentage. The old comment here
+        // claimed a separate "[15:22] payload" — that is the #93 claim PROTOCOL.md §5.3
+        // RETRACTED on 2026-06-17; [15:22] is just the tail of `acti_counts`.
+        case activity
     }
 
     public var layout: Layout {
@@ -74,16 +78,34 @@ public struct BulkRecord: Equatable {
         //     [15:22]=00×7. The FULL template matters: a deep-sleep epoch is also still with
         //     a zero [15:22] payload, but carries real HR/HRV in [4:8] — so matching only
         //     "still + zero payload" would mistake deep sleep for idle and drop its vitals.
-        //   • activity/awake epoch (🟢 §5.3): [8] subtype tag 0x12 / 0x13.
+        //   • activity/awake epoch (🟢 §5.3): [8] subtype tag 0x12 / 0x13 / 0x11.
         // A low-SpO2 sleep epoch matches neither → .sleepVitals, so its vitals survive. The
         // emitted SpO2 is range-guarded in `spo2Percent`, but the band no longer gates layout.
+        //
+        // 0x11 IS A THIRD "no SpO2 here" SENTINEL 🟢 (#195, §5.3). It is not a 17 % saturation
+        // and not a desaturation #39 must protect — measured over the 5648 unique non-idle
+        // records of the 5-ring local corpus:
+        //   • ALL 13 of them carry [4] == 0x04, the ring's <30 "PR unmeasured" sentinel, and
+        //     12 of 13 carry the whole dead head `04 00 00 00` (HR/HRV/conf/RR all unmeasured).
+        //     NO record with a real SpO2 byte ever carries [4] == 0x04 (0 of 1750); among the
+        //     0x12 activity epochs 14 of 3869 do. So there are no vitals here to preserve.
+        //   • ALL 13 sit at the tail of a contiguous run — 11 are the last record before a
+        //     multi-epoch hole and the other 2 are immediately followed by another 0x11 that
+        //     is. Every one is preceded by an ACTIVITY epoch, never by a sleep-vitals one, so
+        //     none of them sits in an SpO2 slot of the §5.3 duty cycle.
+        // ⚠️ The other impossible-SpO2 bytes in the corpus — 0x00 / 0x0a / 0x0e, 16 records —
+        // are DELIBERATELY LEFT ALONE. They are the opposite shape: 12 of the 16 sit in an
+        // SpO2 slot with an activity epoch on BOTH sides, and 14 of 16 carry a plausible
+        // `[4:8]` head. They are sleep-vitals epochs whose SpO2 byte failed, which is exactly
+        // the case #39's fall-through exists for; `spo2Percent`'s 70…100 guard already stops
+        // the impossible value reaching a sample.
         if raw[4] == 0x05 && raw[5] == 0x00 && raw[6] == 0x0c && raw[7] == 0x00
             && raw[9] == 0x0a
             && raw[10..<15] == [1, 1, 1, 1, 1]
             && raw[15..<22] == [0, 0, 0, 0, 0, 0, 0] {
             return .idle
         }
-        if raw[8] == 0x12 || raw[8] == 0x13 { return .activity }
+        if raw[8] == 0x12 || raw[8] == 0x13 || raw[8] == 0x11 { return .activity }
         return .sleepVitals
     }
 
@@ -244,7 +266,66 @@ public struct BulkRecord: Equatable {
     }
 
     /// True when `[15:20]` is all zero — the ring's OWN "nothing moved in this epoch" verdict.
+    ///
+    /// ⚠️ THIS PREDICATE IS BYTE-ALIGNED AND THE FIELD IS NOT (#195). `[15:23)` is really five
+    /// 12-bit magnitudes (`activityMagnitudes`), so a byte window of `[15:20]` covers magnitudes
+    /// 0–2 in full and only the top nibble of magnitude 3 — it cannot see magnitudes 3 and 4 at
+    /// all. 🟢 MEASURED on the 5648-record local corpus: of the 1950 epochs this calls quiet,
+    /// **253 (13.0 %) carry a non-zero magnitude**, and every one of those 253 is a magnitude 3
+    /// (97) or 4 (194), i.e. exactly the two the window cannot reach.
+    /// It is kept EXACTLY as it is on purpose. Three shipped calibrations are fitted to this
+    /// predicate's population, not to the correct one: `primaryMotionIsDegenerate`'s
+    /// `degenerateMaxQuietStillFraction` (0.50) and `degenerateMinSlotOrderFraction` (0.75),
+    /// `measuredHRVRMSSD`'s quiet gate, and `hrvPoolingNoiseFloorMs` (9.0). Redefining it moves
+    /// all three off their measured separations at once. Use `activityMagnitudesAreZero` for new
+    /// work; retiring this one is a separate, measured migration.
     var motionIntensityTailIsZero: Bool { raw[15..<20].allSatisfy { $0 == 0 } }
+
+    /// `[15:23)` decoded correctly: **five 12-bit big-endian magnitudes, nibble-packed** — the
+    /// `acti_counts` V2 sub-layout PROTOCOL.md §5.3 had open as "length 7.5, `info` = 0.5 B"
+    /// (60 bits + a 4-bit flag = the 8 bytes `[15]…[22]`). Magnitude *k* is nibbles 3k, 3k+1,
+    /// 3k+2 counting from the high nibble of `[15]`; the leftover LOW nibble of `[22]` is
+    /// `activityInfoNibble`.
+    ///
+    /// 🟢 THE BIT LAYOUT IS MEASURED, over the 5648 unique non-idle records of the 5-ring local
+    /// corpus (#195). CARRY TEST — for a genuine 12-bit integer whose low byte is ~uniform,
+    /// `P(value ≡ 0 mod 256 | value > 0)` is 1/256 = 0.0039; a window straddling a field boundary
+    /// has a "low byte" made of one field's LAST nibble and the next field's FIRST, both of which
+    /// are 0 about half the time, so it must be orders of magnitude larger. Measured:
+    ///   • this nibble phase — 0.0017…0.0030 per field, and 0.0000…0.0029 per ring (5 rings);
+    ///   • phase +1 nibble — 0.0172…0.0317; phase +2 nibbles — 0.1491…0.1627.
+    /// Two model-free corroborations of the same 1.5-byte period: the mean nibble value over the
+    /// 16 nibble positions repeats 1.21 / 3.37 / 3.97 five times (the most-significant nibble
+    /// lands on 0, 3, 6, 9, 12 — nowhere else), and the mean BYTE value repeats 22.5 / 65 / 57
+    /// with a 3-byte period. The trailing nibble is categorical, not a digit: `0` (66.3 %) and
+    /// `4` (31.6 %) cover 97.9 % of records with 9 distinct values, against 15–16 for every
+    /// magnitude nibble — and a LEADING flag would put the magnitudes at phase +1, which the
+    /// carry test rejects by 6–10×.
+    ///
+    /// 🔴 WHAT THE FIVE NUMBERS PHYSICALLY ARE is NOT established. They are NOT a higher-precision
+    /// copy of `[10:15]`'s five 30-s slots: over the 3021 records whose primary channel is not a
+    /// placeholder, magnitude *k* vs motion byte *j* is +0.13…+0.19 for EVERY pair with no
+    /// diagonal, and Σmagnitudes vs Σmotion is only +0.20. Observed range 0…4095 (the full 12-bit
+    /// span), p50 10, p90 1302, 46.9 % exactly zero. Treat as `confidence`/`activityCounts` are
+    /// treated: decoded and exposed for the supervised sleep-stage fitter to test, NOT a licence
+    /// to hand-tune `SleepStaging`.
+    public var activityMagnitudes: [Int] {
+        func nibble(_ i: Int) -> Int {
+            let b = Int(raw[15 + i / 2])
+            return i.isMultiple(of: 2) ? (b >> 4) : (b & 0x0f)
+        }
+        return (0 ..< 5).map { (nibble($0 * 3) << 8) | (nibble($0 * 3 + 1) << 4) | nibble($0 * 3 + 2) }
+    }
+
+    /// The 4-bit `info` flag that closes the `[15:23)` block — the LOW nibble of `[22]`
+    /// (🟢 boundary, 🟡 meaning: 97.9 % of records read `0` or `4`).
+    public var activityInfoNibble: UInt8 { raw[22] & 0x0f }
+
+    /// The layout-correct counterpart of `motionIntensityTailIsZero`: every one of the five 12-bit
+    /// magnitudes is zero. 🟢 MEASURED: 1697 of 5648 corpus records (30.0 %), against the byte-
+    /// aligned predicate's 1950 (34.5 %) — the 253-record difference is the 13.0 % the old window
+    /// cannot see. Deliberately NOT wired into any existing analytic (see `motionIntensityTailIsZero`).
+    var activityMagnitudesAreZero: Bool { activityMagnitudes.allSatisfy { $0 == 0 } }
 
     /// Confidence / signal quality, `[6]` (🟢 named, PROTOCOL.md §5.3 — range ~0...12,
     /// not yet bounded precisely). Decoded but NOT currently consumed by any analytic —
@@ -377,6 +458,25 @@ public enum BulkSleep {
     /// it always `motionResolvesStillness` and can never be degenerate. Either way the run must ALSO
     /// show at least two non-zero tail epochs, exactly as before, so a genuinely motionless archive
     /// keeps the primary path.
+    ///
+    /// ⚠️ `constantFiller` IS DEAD CODE, AND WIDENING IT IS A MEASURED TRAP (#195 / #190). The
+    /// all-or-nothing quantifier fires on **0 of the 18 sources** in the local corpus while the
+    /// flat-placeholder failure it was written for is everywhere: worn-epoch placeholder share is
+    /// 82–99.6 % on the Gen-2 nights and never 100 %, so a handful of getting-up epochs disqualify
+    /// the whole run. It is left alone anyway, because the obvious repair is unsafe and that is
+    /// MEASURED, not assumed — the `degenerate: false` branch maps the tail through a fixed p80
+    /// QUANTILE (`motionIntensityFallbackMagnitudes`), a rank with no absolute floor, so widening
+    /// the gate moves nights onto a mapping whose "movement" threshold is a function of the record
+    /// set. Replacing the quantifier with a placeholder-SHARE threshold and re-running the corpus:
+    ///   • ≥ 0.90 — 8 of 18 sources flip, staged sleep −5…−85 min. Both ground-truthed WAKE times
+    ///     are unchanged, so the only labels this project has cannot adjudicate any of it.
+    ///   • ≥ 0.50 — 15 of 18 move, −100…+45 min, and the SAME night (2026-08-04 22:26 → 08-05)
+    ///     goes −12 min in one bundle and +45 min in another. Scope-dependent, i.e. exactly the
+    ///     "the answer depends on when you synced" class #190/#191 exist to remove.
+    /// This corroborates the earlier REFUTED branch `fix/motion-source-dead-primary-run`
+    /// (rank-based `magnitude >= positive[p80] ? 16 : 1`, end-to-end −158/−212/−265 min and one
+    /// night reduced to zero). Fixing this needs an ABSOLUTE-floor tail→magnitude mapping fitted
+    /// against real labels first; the gate is the second half of that job, not the first.
     static func motionSource(_ records: [BulkRecord]) -> MotionSource {
         let worn = records.filter { $0.layout != .idle }
         guard worn.count >= 4 else { return .primary }
