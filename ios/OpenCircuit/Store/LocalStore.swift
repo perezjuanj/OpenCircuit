@@ -2102,14 +2102,15 @@ struct LocalStore {
     /// Accumulate a SAME-DAY step delta into the running total for `day`, UPSERTED by
     /// start-of-day, AND record a timestamped `StoredStepSample` snapshot (#steps-history) so the
     /// delta's actual observation window survives alongside the rollup. `RingSession` derives the
-    /// delta from the descriptor's current-day raw total: within one day it stores only the
-    /// increment between repeated reads, while the first read of a new day credits that day's
-    /// full already-taken count. New day = new row. `day` is the SAMPLE time of the reading (when
-    /// the descriptor arrived), so a value observed just after midnight is stamped onto its own
-    /// day, not the prior one. `windowStart` is when the PREVIOUS reading was observed (the start
-    /// of the window this delta was folded over); falls back to the day boundary when the caller
-    /// doesn't know one (fresh baseline / day rollover), matching the rollup's own "today so far"
-    /// fallback.
+    /// delta from the descriptor's **quarter-hour step bucket** (🟢 #192, NOT a day total): while
+    /// the bucket climbs it stores only the increment between repeated reads, and when the bucket
+    /// rolls — or the calendar day turns — it credits the new raw value whole. The day total is
+    /// therefore the sum of the buckets we were connected for; quarters nobody observed are gone
+    /// (the ring keeps no cumulative counter to back-fill them). New day = new row. `day` is the
+    /// SAMPLE time of the reading (when the descriptor arrived), so a value observed just after
+    /// midnight is stamped onto its own day, not the prior one. `windowStart` comes from
+    /// `StepAccumulator.windowStart`: the previous reading's timestamp, floored to the sample's
+    /// own bucket so a delta is never smeared back over hours it cannot cover.
     func addDailySteps(_ delta: Int, day: Date = Date(), windowStart: Date? = nil) throws {
         guard delta > 0 else { return }
         let dayStart = Calendar.current.startOfDay(for: day)

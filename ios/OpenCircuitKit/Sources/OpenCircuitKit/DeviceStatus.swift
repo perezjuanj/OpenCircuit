@@ -5,6 +5,11 @@
 // from-scratch sync: the app showed 81 steps and `[4:6]` read exactly 81, `0` when idle.
 // This is the ring's own count; the official app normally shows a cloud-aggregated daily
 // total that can differ.
+//
+// ⚠️ It is a **QUARTER-HOUR BUCKET, not a running day total** 🟢 (#192, re-derived 2026-08-09
+// over 10,327 descriptor frames from two rings: 268 drops, every one at a wall-clock
+// `:00`/`:15`/`:30`/`:45`, max value ever observed 746 against 2,611–4,566-step days). See
+// `StepAccumulator` for the derivation, the ~108 s clear lag, and why the fold is what it is.
 
 import Foundation
 
@@ -19,7 +24,13 @@ public struct SkinTemperature: Equatable, Sendable {
 
 public enum DeviceStatus {
     /// The ring's onboard step count from a 0x10/0x87 descriptor frame, or nil if the
-    /// frame isn't one. The value can legitimately be 0 (no steps yet).
+    /// frame isn't one.
+    ///
+    /// 🟢 **Steps so far in the ring's CURRENT WALL-CLOCK QUARTER-HOUR**, cleared to 0 at every
+    /// `:00`/`:15`/`:30`/`:45` (#192). It is not cumulative over the day, so it must never be
+    /// read as "today's steps" and cannot back-fill a quarter nobody observed. `0` is both
+    /// legitimate and common — it means "no steps counted yet in this quarter", which is what
+    /// most of a night looks like. Fold it with `StepAccumulator`.
     public static func steps(_ frame: [UInt8]) -> Int? {
         guard frame.count >= 19, frame[0] == 0x10 || frame[0] == 0x87 else { return nil }
         return (Int(frame[4]) << 8) | Int(frame[5])

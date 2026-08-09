@@ -648,7 +648,7 @@ within the day and `active_seconds` ≤ 150/epoch.
 | Source (decoded) | Confidence | HealthKit type | Notes |
 |---|---|---|---|
 | `acti_counts` `[10:20]` intensity (this record) | 🟢 role | `HKWorkout` / `appleExerciseTime` (heuristic) | active-epoch detector; band thresholds 🔴 |
-| descriptor `[4:6]` cumulative steps (§5.4) | 🟢 | `HKQuantityType stepCount` | ring's running daily total; already decoded |
+| descriptor `[4:6]` steps (§5.4) | 🟢 | `HKQuantityType stepCount` | **quarter-hour bucket, NOT a running daily total** (#192) — the day total is the sum of the buckets we were connected for; unobserved quarters are unrecoverable |
 | activity `steps` `[4:6]` (predicted) | 🔴 | `stepCount` (per-epoch history) | needs the §5.3.1 capture |
 | derived `distance = steps×0.248` | 🟡 (formula) | `distanceWalkingRunning` | client-computed, not wire |
 | activity `active_seconds` (predicted) | 🔴 | `appleExerciseTime` | 0..150 s/epoch |
@@ -699,7 +699,7 @@ XOR-valid. **`[1]`=BATTERY %** 🟢 (ground-truthed 2026-06-15: `0x4c`=76 matche
 curve — it is NOT a per-session marker) · **`[2]`=CHARGE/STATE/WORK-MODE: `0x04`=ON CHARGER** 🟢
 (`0x02`/`0x03`=idle worn-streaming toggle, `0x01`=startup/settle, **`0x06`=NATIVE SPORT MODE ACTIVE**
 🟢 #174 — see below) ·
-**`[4:6]`=STEP COUNT (16-bit BE)** 🟢 ·
+**`[4:6]`=STEP COUNT (16-bit BE), a QUARTER-HOUR BUCKET — not a daily total** 🟢 (#192) ·
 **`[6:8]`/`[8:10]`=SKIN TEMPERATURE, two channels, 0.1 °C BE** 🟢 (each prefixed `01`=
 valid; see below) · **`[14:16]`=BATTERY VOLTAGE mV (16-bit BE)** 🟢 (#89, see below) ·
 **`[17]`=CASE BATTERY: low 7 bits = case %, bit `0x80` = case charging, `0xff` = not in case** 🟢
@@ -763,10 +763,39 @@ fell **31.4→26.6 °C**; against that ground truth:
 **`[4:6]` = the ring's onboard step count** 🟢 (live test 2026-06-14). After clearing
 the official app and forcing a from-scratch ring re-sync, the app showed **81 steps** and
 `[4:6]` in the descriptor frames read **exactly 81** (`00 51`); it is `0` overnight (no
-steps) and climbs through the day (6→24→35→79→80→81). NOTE this is the **ring's own
+steps) and climbs (6→24→35→79→80→81). NOTE this is the **ring's own
 count**, which differs from the app's normal display (cloud-aggregated daily total, e.g.
 917 earlier same day) — search for the *ring's* value, not the app's. Decoded by
 `OpenCircuitKit.DeviceStatus.steps`.
+
+**…and it is a QUARTER-HOUR BUCKET, not a running day total** 🟢 (**#192**, re-derived
+2026-08-09 from the local diagnostics corpus: **10,327 descriptor frames**, **two rings** —
+`RingConn Gen2-03AD` FR02.018 America/New_York and `RingConn Gen2 Air-2F9F` FR04.009
+Europe/Paris — across 11 bundles, 06-26…08-09). `[4:6]` counts steps since the last
+wall-clock `:00`/`:15`/`:30`/`:45` and is cleared to 0 at each boundary:
+- **268 drops, every one bracketing a quarter boundary.** Nothing else explains any of them.
+  Only 5 sit near local midnight, and those are simply the `00:00`/`00:15` boundaries.
+  Sharpest brackets: `Gen2 Air-2F9F` 07:14:24 = 66 → 07:15:06 = 0 (42 s);
+  `Gen2-03AD` 08-08 17:14:52 = 98 → 17:16:41 = 0.
+- **The day-count reading is refuted arithmetically too.** The field never exceeds **746** in
+  any capture, while the app's own folded day totals for those same days are **2,611–4,566**.
+  A daily counter cannot be 4–6× smaller than the day it counts.
+- **Clear lag:** a descriptor arriving within ~2 min after a boundary can still carry the
+  PREVIOUS bucket — measured max **108 s** (06-27 bundle: the 13:15 bucket cleared at
+  13:16:49; 08-05 bundle: the 09:00 bucket cleared at 09:01:05). Two consecutive frames one
+  second apart can straddle the clear.
+- The 2026-06-14 ground truth above is untouched — 81 was a partial bucket. Reading a *day*
+  count into it was the over-reach.
+- **Consequence:** the ring keeps **no cumulative step counter anywhere on this wire**, so a
+  quarter-hour nobody was connected for is unrecoverable — steps are the one metric with no
+  ring-side backlog to heal a gap. `OpenCircuitKit.StepAccumulator` folds the observed buckets
+  (increment while climbing, credit the raw value whole on a drop = "sum the buckets"); see its
+  header for why a wall-clock boundary rule measures **+4.9 %/+8.2 % OVER** and must not be
+  reintroduced.
+- **Zero is normal and means nothing about wear.** On 2026-08-09 the field read 0 on ~40
+  consecutive frames from 08:41 to 10:04 with the ring plainly worn (skin temp 34–36 °C,
+  battery 70–71 %) — i.e. no steps *in each of those quarters*. Steps therefore **cannot bound
+  an in-bed / wake window** (#190).
 
 ### 5.5 `0x50` — end-of-history cursor report (NO XOR trailer) 🟡
 Spontaneous after the last bulk page. Distinct class: **no XOR trailer** (last byte

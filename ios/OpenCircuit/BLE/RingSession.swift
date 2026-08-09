@@ -4084,12 +4084,13 @@ extension RingSession: CBPeripheralDelegate {
             // Frames arriving while the link isn't `ready` mean discovery didn't land on this
             // (restored) reconnect — re-run it so we can ack and the buttons enable. #reconnect
             if !self.ready { self.rediscoverIfNeeded() }
-            // The ring's onboard step field (descriptor [4:6], §5.4) is the ring's current-day
-            // total. Fold repeated same-day reads into deltas so the keepalive doesn't re-add the
-            // whole total every time, but once the calendar day changes treat the next raw value as
-            // "today so far" so a reconnect later that day still catches the steps already taken.
-            // The pure, unit-tested StepAccumulator owns that day-boundary math; this stays a thin
-            // caller.
+            // The ring's onboard step field (descriptor [4:6], §5.4) is a QUARTER-HOUR BUCKET —
+            // steps since the last :00/:15/:30/:45, cleared at each boundary (🟢 #192, 268 rolls
+            // measured across two rings). Fold repeated reads into deltas so the keepalive doesn't
+            // re-add the bucket every time, and credit the raw value whole whenever it drops (the
+            // bucket rolled) or the calendar day turns. That fold IS "sum the observed buckets";
+            // what it can never do is recover a quarter nobody was connected for. The pure,
+            // unit-tested StepAccumulator owns that math; this stays a thin caller.
             // Track the ring's work-mode from every 0x10/0x87 descriptor byte[2] (idle 0x02/0x03,
             // charger 0x04, sport 0x06) so the sport-enter fast path can send `06 03` the instant the
             // ring is confirmably idle (#174). Gated on the descriptor opcode (the whole block runs for
@@ -4116,24 +4117,26 @@ extension RingSession: CBPeripheralDelegate {
                 let dayChanged = previousRaw != nil && self.persistedLastRawStepsDay != sampleDay
                 let update = StepAccumulator.update(previousRaw: previousRaw, newRaw: v, dayChanged: dayChanged)
                 if update.isReset {
-                    // Disambiguate a mid-day reset/handoff (unexpected — log loudly) from the
-                    // official app's normal midnight reset (expected) so we never silently miscount.
-                    if update.isAnomalousReset {
-                        ringLog.notice("steps: mid-day counter reset \(previousRaw ?? -1)→\(v) — counting \(v) as new (handoff/reboot/wrap)")
-                    } else {
-                        ringLog.debug("steps: counter reset across midnight \(previousRaw ?? -1)→\(v) — counting \(v) on new day (expected)")
-                    }
+                    // The ring's quarter-hour bucket rolled. EXPECTED and frequent (~24×/day
+                    // measured) — it used to be logged at .notice as an anomalous "handoff/reboot/
+                    // wrap", which was the day-count premise talking and buried the real signals
+                    // in the tester logs (#192). A genuine reboot/16-bit wrap is not separable
+                    // from a roll on the wire, so there is nothing louder to say.
+                    ringLog.debug("steps: bucket rolled \(previousRaw ?? -1)→\(v) — counting \(v) as the new quarter-hour")
                 }
                 if update.deltaToAdd > 0 {
                     // Window this delta to when it was actually observed (#steps-history): from
                     // the LAST same-day reading we saw, so a steady ~30-60s descriptor poll yields
-                    // narrow, accurately-timed snapshots instead of crediting steps to the whole
-                    // elapsed day. Falls back to the day boundary on a rollover/fresh baseline,
-                    // where there genuinely is no prior same-day reading to anchor to. Clamped so a
-                    // stale/cross-session timestamp can never produce an inverted or pre-midnight
-                    // window.
-                    var windowStart = dayChanged ? sampleDay : (self.persistedLastStepSampleAt ?? sampleDay)
-                    if windowStart < sampleDay || windowStart > sampleDate { windowStart = sampleDay }
+                    // narrow, accurately-timed snapshots. FLOORED to the sample's own quarter-hour
+                    // bucket (#192): a bucket delta cannot represent a step taken before that
+                    // bucket began, so a reconnect after a gap — and the day's first reading, which
+                    // used to stamp local midnight — must not smear it backwards. Measured: 22 of
+                    // 989 credits (5.3% of all step mass) were smeared, six across 11–22 hours.
+                    // StepAccumulator.windowStart also does the ordering/day clamping.
+                    let windowStart = StepAccumulator.windowStart(
+                        sampleDate: sampleDate,
+                        previousSampleAt: dayChanged ? nil : self.persistedLastStepSampleAt,
+                        dayStart: sampleDay)
                     try? localStore?.addDailySteps(update.deltaToAdd, day: sampleDate, windowStart: windowStart)
                     // Record activity time for the sedentary reminder (#84).
                     UserDefaults.standard.set(sampleDate.timeIntervalSince1970,
@@ -4142,10 +4145,14 @@ extension RingSession: CBPeripheralDelegate {
                     // earliest wake = the user is up. End overnight-quiet so the ONE morning drain fires
                     // at real wake instead of at the learned median (which lands mid-sleep on a lie-in and
                     // truncates the night). MUST be a real same-day increment: `dayChanged` / fresh-baseline
-                    // / reset branches return `deltaToAdd = newRaw` (the whole onboard count, NOT a walk),
-                    // and a single post-midnight step is a blip — either would falsely open the gate
-                    // mid-sleep and re-truncate (review F2/Trigger-B). Requires a real prior-same-day delta
-                    // over `morningWakeStepThreshold`. Stamped with the night's start so a stale latch
+                    // / reset branches return `deltaToAdd = newRaw` (a whole bucket handed to us at once,
+                    // NOT an observed walk), and a single post-midnight step is a blip — either would
+                    // falsely open the gate mid-sleep and re-truncate (review F2/Trigger-B). Requires a
+                    // real prior-same-day delta over `morningWakeStepThreshold`. (#192: `isReset` is now
+                    // known to be the ordinary quarter-hour bucket roll, ~24×/day, so this skips the FIRST
+                    // reading of each new bucket. Deliberately kept — a real bout is sampled every ~1.8 min,
+                    // so the next reading inside the same bucket clears the threshold and the latch still
+                    // fires within one descriptor period.) Stamped with the night's start so a stale latch
                     // can't leak across nights (see the read bound in `isInSleepWindow`).
                     if self.morningWakeConfirmedAt == nil, !self.nightWindowIsExplicit,
                        !update.isReset, !dayChanged, previousRaw != nil,
