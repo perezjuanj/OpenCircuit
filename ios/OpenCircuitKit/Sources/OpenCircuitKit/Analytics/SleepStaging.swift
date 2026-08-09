@@ -302,6 +302,73 @@ public enum SleepStaging {
         /// ~5 ≈ 12.5 min, covering the device-observed 2026-07-18 11-minute dropout.
         public var preOnsetBedtimeMaxGapEpochs: Int
 
+        // --- SpO2-CADENCE wake OFFSET (the "reported wake is when you synced" fix, #190) ---------
+        // Every pass above locates final wake from the SLEEPER (HR, motion, HRV density). When the
+        // primary motion channel is a flat placeholder and the morning HR rise is small, all of them
+        // miss, and the staged night then runs to the LAST RECORD — so the reported wake is
+        // `lastRecord + 120 s`, i.e. whenever the user last synced. 🟢 MEASURED on 2026-08-09
+        // (FR02.018, build 39): truncating the same capture in 49 five-minute steps moved reported
+        // sleep 367 → 625 min, one +5 per step, with no byte of physiology changed.
+        //
+        // This pass locates the wake from the RING instead. While the ring runs its sleep-measurement
+        // program it takes an SpO2 reading every 300 s, which makes consecutive 150-second epochs
+        // alternate sleep-vitals / activity 1:1 (`BulkRecord.layout`). That duty cycle EXITS near
+        // wake. 🟢 CONFIRMED over 5650 unique records / 4 rings, re-derived independently from raw
+        // frames by a second decoder with 0 byte conflicts:
+        //   • sleep-vitals inter-arrival is modal at 300 s on every ring (63–84 %);
+        //   • on the primary ring, activity-activity same-template pairs number 1305 against just 24
+        //     sleepVitals-sleepVitals — the ring essentially never emits two SpO2 reads in a row;
+        //   • the same-template ("violation") rate is 6.0 % inside the staged sleep window and 43.6 %
+        //     outside it; split at the user-reported wake it goes 3.9 %→23.8 % (08-09) and
+        //     1.6 %→34.8 % (08-05);
+        //   • Mann-Whitney AUC 0.819–1.000 on the two labelled nights, far above every vitals channel
+        //     (SpO2 0.44/0.41, RR 0.61/0.59, HRV 0.79/0.50, confidence byte 0.42/0.27).
+        // Sync/drain/BLE confounds are REFUTED: 20 sync, drain and reconnect events sit strictly
+        // INSIDE violation-free runs, including four successful drains inside one 5.7 h run and a BLE
+        // teardown+reconnect inside 08-09's 191-epoch run. Cross-page enrichment goes to 0.0 % under
+        // regime control (147 cross-page pairs inside the quiet regime, zero violations).
+        //
+        // ⚠️ NAME IT CORRECTLY. `raw[8]` is the SpO2 byte (PROTOCOL §5.3; APK `spo2` loc 0xb) with
+        // `0x12`/`0x13` as "no SpO2 here" sentinels. `layout` is a discriminator COMPUTED at
+        // `BulkSleep.layout`, not a device mode tag — this is an SpO2-CADENCE rule, and any change to
+        // that discriminator's fall-through silently moves it.
+
+        /// Minimum length, in epochs, of the unbroken sleep-vitals/activity ALTERNATION that the wake
+        /// locator will trust as "the ring was running its sleep-measurement program here". The wake
+        /// candidate is the epoch immediately after the LAST such run. **0 DISABLES the pass entirely
+        /// — byte-identical to the pre-cadence staging** (the regression escape hatch every other
+        /// pass in this file carries: `motionAwakeVitalsHalfWindow`, `hrWakeRescueCeilingBPM`,
+        /// `preOnsetBedtimeReachEpochs`, `offsetNoReturnSpreadFraction`).
+        ///
+        /// 🟢 The admissible band is MEASURED, not guessed. Sweeping K over the 16-night local corpus
+        /// gives, per night, the closed interval of K that yields the SAME committed cut:
+        /// 08-09 [12,191] · 08-05 [7,119] · 08-05(export) [6,119] · 08-04 [6,27] · 08-04(export)
+        /// [6,27] · 08-02 [2,40] · 06-27 [4,161] · 06-30 [2,137]. The binding constraints are
+        /// 08-09's 11-epoch post-wake quiet run (K must exceed it) and 08-04's 27-epoch final run
+        /// (K must not exceed it), so every night in the corpus agrees for K ∈ [12, 27]. 20 is the
+        /// value that MAXIMISES the worst-case headroom over that corpus (7 epochs ≈ 17 min either
+        /// side); 12 — the value a naive `minConsolidatedSleepEpochs` reuse would pick — sits on a
+        /// ONE-epoch margin worth 43 minutes on 08-09.
+        ///
+        /// 🟡 The corpus behind that band is 16 nights / 5 rings, but the two nights carrying WAKE
+        /// GROUND TRUTH are the same person on the same ring (08-09 → 09:06, 08-05 → 08:02). That is
+        /// below this project's own evidence bar; see `docs/RUNBOOK_SLEEP_GROUNDTRUTH.md` and
+        /// `SleepEditLabel` for the supervised labels that should re-fit it.
+        public var cadenceWakeQuietEpochs: Int
+
+        /// Upper bound, in epochs, on a quiet run the locator will trust. A run LONGER than this is
+        /// not a night's sleep-measurement program — it is a ring left in continuous SpO2 mode, and
+        /// its "end" carries no information about when anyone woke up.
+        ///
+        /// 🔴 This gate does NOT fire anywhere in the local corpus (the longest trusted run is 191
+        /// epochs ≈ 7.96 h, on 08-09). It exists because the corpus DID produce the failure it guards
+        /// against: ring `u4` holds the 300 s cadence for a continuous 11.96 h — timezone-independent,
+        /// no zone makes that a night. On that ring the run happens to reach the data edge, which the
+        /// locator already declines; this bound is what stops the same ring being cut at a stray
+        /// violation once more data drains in behind it. 240 ≈ 10 h, i.e. above every real night
+        /// measured here and below the u4 regime.
+        public var cadenceWakeMaxQuietEpochs: Int
+
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
                     remHRPercentile: Double = 0.86,
@@ -332,7 +399,9 @@ public enum SleepStaging {
                     minConsolidatedSleepEpochs: Int = 16,
                     deepBaselineMarginBPM: Double = 18,
                     preOnsetBedtimeReachEpochs: Int = 24,
-                    preOnsetBedtimeMaxGapEpochs: Int = 5) {
+                    preOnsetBedtimeMaxGapEpochs: Int = 5,
+                    cadenceWakeQuietEpochs: Int = 20,
+                    cadenceWakeMaxQuietEpochs: Int = 240) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -364,6 +433,8 @@ public enum SleepStaging {
             self.deepBaselineMarginBPM = deepBaselineMarginBPM
             self.preOnsetBedtimeReachEpochs = preOnsetBedtimeReachEpochs
             self.preOnsetBedtimeMaxGapEpochs = preOnsetBedtimeMaxGapEpochs
+            self.cadenceWakeQuietEpochs = cadenceWakeQuietEpochs
+            self.cadenceWakeMaxQuietEpochs = cadenceWakeMaxQuietEpochs
         }
 
         public static let `default` = Tuning()
@@ -554,6 +625,10 @@ public enum SleepStaging {
         // (forward-filled for variability) because forward-fill would make every post-onset epoch read
         // as sleep-vitals.
         var rows: [(time: Date, hr: Int, hrv: Int?, motion: Int, spo2: Int?, rr: Double?, vitals: Bool)] = []
+        // Parallel to `rows`: the record TEMPLATE each row came from. Kept out of the tuple because it
+        // is not a physiological channel — it is the ring's own SpO2 duty cycle, read by
+        // `markCadenceWakeOffset` alone (#190).
+        var rowLayouts: [BulkRecord.Layout] = []
         // Per-epoch motion energy is measured ABOVE a LOCAL idle floor (same rolling estimate as
         // detection). Gen 2 idles at ~1, Gen 3 at ~15–16 and DRIFTS across the night with posture
         // (16→24→39, 🟢 FR05.008 capture 2026-06-23). The old `$1 == 1 ? 0 : …` hard-coded Gen 2's
@@ -576,6 +651,7 @@ public enum SleepStaging {
             guard let hr = lastHR else { continue }   // skip until the first HR reading
             let motion = max(0, Int(rawMotion[idx] - floor[idx]))
             rows.append((r.date(epoch: epoch), hr, lastHRV, motion, lastSpo2, lastRR, r.hrvRMSSD != nil))
+            rowLayouts.append(r.layout)
         }
         guard rows.count >= 2 else { return [] }
 
@@ -676,6 +752,20 @@ public enum SleepStaging {
                                   margin: resolvedOffsetMargin(hr: hr, floor: sleepFloor, tuning: tuning),
                                   vitals: rows.map(\.vitals),
                                   notBefore: notBefore, tuning: tuning)
+
+        // --- SpO2-CADENCE OFFSET: where the ring LEFT its sleep-measurement program -
+        // The LOCATOR the pass above lacks (#190). Everything before this point reads the sleeper;
+        // this reads the RING. Runs AFTER the HR pass, and like it only ever ADDS trailing awake, so
+        // whichever of the two cuts EARLIER wins and neither can undo an onset pass or a rescue. It
+        // is bound by `lastRescuedIndex` — but DELIBERATELY NOT by `lastVitalsSoftened`. See the
+        // "WHY NOT `notBefore`" note on `markCadenceWakeOffset`: gating this pass on the softening
+        // is what made the whole result oscillate with sync time (🟢 measured, three sign changes and
+        // a 47-minute swing on 08-05 from 25 minutes of extra data).
+        markCadenceWakeOffset(&awake,
+                              cadence: cadenceSteps(times: rows.map(\.time), layouts: rowLayouts),
+                              smHR: smHR, floor: sleepFloor,
+                              margin: resolvedOffsetMargin(hr: hr, floor: sleepFloor, tuning: tuning),
+                              notBefore: lastRescuedIndex, tuning: tuning)
 
         // --- ONSET / OFFSET: trim leading & trailing awake -------------------------
         // The kept window runs from the start of the first SUSTAINED asleep run to the
@@ -1043,6 +1133,13 @@ public enum SleepStaging {
     /// Test seam for the percentile helper (which is `private`).
     static func percentileForTesting(_ xs: [Double], _ q: Double) -> Double { percentile(xs.sorted(), q) }
 
+    /// Test seam for the consolidated-run helper (which is `private`), so a fixture can ASSERT it is
+    /// exercising the survival guard rather than tripping an earlier one — the mutation that survived
+    /// round 1's suite was exactly a survival guard whose test declined for a different reason.
+    static func sleepSpanForTesting(_ awake: [Bool], sustain: Int) -> (Int, Int)? {
+        sleepSpan(awake, sustain: sustain)
+    }
+
     static func resolvedOffsetMargin(hr: [Double], floor: Double, tuning: Tuning) -> Double {
         guard tuning.offsetNoReturnSpreadFraction > 0, !hr.isEmpty else { return 0 }
         let spread = max(0, percentile(hr.sorted(), 0.50) - floor)
@@ -1150,6 +1247,165 @@ public enum SleepStaging {
         // too weak a backstop for a pass that removes sleep — it would let an 8-hour night commit down
         // to a quarter of an hour. `minConsolidatedSleepEpochs` (16 ≈ 40 min) is the same bar
         // `markLeadInWakeOnset` uses to decide a real night happened.
+        guard sleepSpan(candidate, sustain: tuning.minConsolidatedSleepEpochs) != nil else { return }
+        awake = candidate
+    }
+
+    // MARK: - SpO2-cadence wake locator (#190)
+
+    /// What one epoch-to-epoch step says about the ring's SpO2 duty cycle.
+    ///
+    /// While the ring runs its sleep-measurement program it reads SpO2 every 300 s, so consecutive
+    /// 150-second epochs alternate `.sleepVitals` / `.activity` 1:1 (see `Tuning.cadenceWakeQuietEpochs`
+    /// for the evidence). `.violation` is the ring emitting the SAME template twice in a row — the duty
+    /// cycle broke. `.unknown` is a step that carries NO cadence information and must never be read as
+    /// either.
+    enum CadenceStep: Equatable {
+        /// The template flipped exactly as the duty cycle demands (allowing for one bridged hole).
+        case alternating
+        /// Two same-template epochs in a row: the duty cycle broke here.
+        case violation
+        /// No cadence information: an unworn/idle epoch on either side, or a hole of more than one
+        /// missing epoch. **Absence of evidence, never evidence of a wake.**
+        case unknown
+    }
+
+    /// Classify every epoch-to-epoch step of the row series against the ring's SpO2 duty cycle.
+    ///
+    /// ⚠️ GAP- AND JITTER-AWARENESS IS LOAD-BEARING, not politeness. The naive test
+    /// `dt == epochSeconds && layout[i] == layout[i-1]` fails in BOTH directions, and they are
+    /// complementary, so neither can be traded for the other:
+    ///   • DROPPING one interior epoch makes its neighbours same-template in 90.5 % of positions BY
+    ///     CONSTRUCTION. A gap-blind rule reads that as a violation storm and severs the night; a
+    ///     blind-bridging rule was measured joining 70 missing epochs into a 25-epoch phantom
+    ///     *daytime* run. So exactly ONE missing epoch is bridged — its template is inferred from
+    ///     PARITY (after an even number of steps the template returns to itself) — and anything
+    ///     longer becomes `.unknown`.
+    ///   • JITTER: 91 of 3432 steps on the primary ring are not exactly 150 s (151–221 s) with no
+    ///     record missing at all. An exact-equality test silently suppresses 57 genuine violations,
+    ///     so the step count is `round(dt / 150)`, not `dt == 150`.
+    /// 🟢 Monte-Carlo dropout on 08-09 measured the two definitions failing in opposite directions: a
+    /// page lost at 08:36 makes the gap-aware rule cut 29.6 min EARLY, one lost at 09:06 makes the
+    /// gap-blind rule cut 17.9 min LATE.
+    ///
+    /// `index 0` is always `.unknown` — there is no step INTO the first row.
+    static func cadenceSteps(times: [Date], layouts: [BulkRecord.Layout]) -> [CadenceStep] {
+        guard times.count == layouts.count, !times.isEmpty else { return [] }
+        var out = [CadenceStep](repeating: .unknown, count: times.count)
+        for i in 1 ..< times.count {
+            let previous = layouts[i - 1], current = layouts[i]
+            // An unworn epoch is outside the measurement program altogether; it is not a violation.
+            guard previous != .idle, current != .idle else { continue }
+            let dt = times[i].timeIntervalSince(times[i - 1])
+            let steps = max(1, Int((dt / Double(BulkRecord.epochSeconds)).rounded()))
+            guard steps <= 2 else { continue }   // more than one epoch missing → no information
+            // One flip per epoch step, so after an EVEN number of steps the template returns to itself.
+            let expectedSame = steps.isMultiple(of: 2)
+            out[i] = ((previous == current) == expectedSame) ? .alternating : .violation
+        }
+        return out
+    }
+
+    /// Mark final wake at the point the ring LEFT its sleep-measurement program (#190).
+    ///
+    /// The wake candidate is the epoch right after the END of the LAST unbroken alternating run of at
+    /// least `tuning.cadenceWakeQuietEpochs` epochs. Every other pass in this file infers wake from the
+    /// SLEEPER; when the primary motion channel is a flat placeholder and the morning HR rise is small,
+    /// all of them miss and the night silently runs to the last record — so the reported wake becomes
+    /// `lastRecord + 120 s`, a function of when the user synced rather than of when they woke.
+    ///
+    /// It is deliberately the LAST qualifying run, not the LONGEST. 🟢 MEASURED: "end of the longest
+    /// violation-free run" is catastrophic — 06-29 → 04:38 (−4 h 28 m), 08-04 → 07:25 (−1 h 29 m) — and
+    /// "last" is also what protects a ring left in continuous SpO2 mode, whose final long run always
+    /// reaches the data edge and is therefore declined.
+    ///
+    /// GUARDS, in order. Each one is a decline, never a weaker cut:
+    ///  1. `cadenceWakeQuietEpochs == 0` — the pass is off; byte-identical to pre-cadence staging.
+    ///  2. No run of at least K anywhere after onset — the cadence never held for a plausible night.
+    ///  3. The run ends at the DATA EDGE — the ring was still in the program when the capture stopped,
+    ///     so no wake has been observed. This is the guard that keeps the pass from re-manufacturing
+    ///     the very "wake == last record" artefact it exists to remove.
+    ///  4. The run ends at a `.unknown` step (a hole) rather than a `.violation` — absence of evidence.
+    ///  5. The run is longer than `cadenceWakeMaxQuietEpochs` — not a night, a ring in continuous SpO2.
+    ///  6. `s > earliest` — suffix-only by construction, never reaching onset, a rescued second bout
+    ///     (`notBefore`), or further back from the tail than `onsetSearchEpochs` (48 ≈ 2 h), which is
+    ///     what bounds the total damage this pass can do.
+    ///  7. The HR NO-RETURN confirmation: smoothed HR must stay above `floor + margin` for the WHOLE
+    ///     remainder of the night. 🟢 This is the guard doing the real adjudicating work — it is what
+    ///     declines the cadence cut on 06-29 (which would otherwise remove 75 minutes from an
+    ///     UNLABELLED night) and on 08-07.
+    ///  8. A consolidated asleep run must still survive, the same bar `markPointOfNoReturnOffset` uses.
+    ///
+    /// ⚠️ It does NOT carry `markPointOfNoReturnOffset`'s terminal-REM VITALS guard, and that omission
+    /// is deliberate and measured. That guard's premise — "the sleep-vitals stream thins at true wake" —
+    /// is 🔴 REFUTED on this hardware: measured FROM the user-reported wake, the suffix/body vitals
+    /// ratio is 1.00 on 08-09 and 0.53 on 08-05 against a 0.50 bar, so it declines a perfectly placed
+    /// cut on both labelled nights, and no setting of `hrWakeRescueVitalsFraction` can rescue it
+    /// (08-09 needs 0.481 ≤ 0.476). The guard was a PROXY for "is the ring still measuring sleep here";
+    /// the cadence is that question asked directly, which is exactly why this pass can afford to drop it.
+    ///
+    /// ⚠️ WHY NOT THE FULL `notBefore`. `markPointOfNoReturnOffset` is held back by BOTH the second-bout
+    /// rescue and the motion-awake VITALS SOFTENING (`motionAwakeStrict[i] && !motionAwake[i]`). This
+    /// pass is held back only by the FORMER, and that is a measured decision, not an oversight. The
+    /// softening's last index is UNSTABLE UNDER SYNC TIME — it is derived from `tailStart`, from a
+    /// night-wide HR floor, and from a rolling median whose window is truncated at the data edge — so on
+    /// 2026-08-05 it flickered nil → 241 → 245 → nil → 245 → nil across consecutive 5-minute truncation
+    /// cuts. Gating on it reintroduced exactly the defect this pass exists to remove: 🟢 MEASURED
+    /// end-to-end, the reported night went 478 · 473 · 473 · 497 · 502 · 507 · 512 · 517 · 485 — three
+    /// sign changes and a 47-minute swing produced by nothing but when the user synced. With the
+    /// softening out of the gate the located wake is IDENTICAL (08:10:14) on every one of those cuts.
+    /// The two mechanisms also answer the SAME question at different fidelity — the softening infers
+    /// "the ring was still measuring sleep" from HRV epochs within ±3 epochs, the cadence reads the
+    /// ring's duty cycle directly — so deferring the direct witness to the proxy is backwards. What
+    /// still protects the moving-but-asleep restless morning the softening was written for is guard 7:
+    /// a sleeper whose HR is still near the floor fails the HR no-return confirmation and is not cut.
+    ///
+    /// `internal` rather than `private`, for the same reason as `markPointOfNoReturnOffset`: a synthetic
+    /// record fixture carries a constant motion byte that de-floors to "still" everywhere, so an "awake"
+    /// fixture stages as sleep and the assertions go vacuous. Its tests drive it directly.
+    static func markCadenceWakeOffset(_ awake: inout [Bool], cadence: [CadenceStep], smHR: [Double],
+                                      floor: Double, margin: Double, notBefore: Int? = nil,
+                                      tuning: Tuning) {
+        guard tuning.cadenceWakeQuietEpochs > 0, margin > 0,
+              !awake.isEmpty, cadence.count == awake.count, smHR.count == awake.count,
+              let (lo, _) = sleepSpan(awake, sustain: tuning.onsetSustainEpochs) else { return }
+        let n = awake.count
+        guard lo + 1 <= n else { return }
+        // The scan may not begin at or before onset or a rescued second bout (`notBefore`), nor
+        // further back than the onset passes are allowed to reach from their own edge. It is NOT held
+        // back by the motion-awake vitals softening — see "WHY NOT THE FULL `notBefore`" above.
+        let searchFloor = n - min(tuning.onsetSearchEpochs, n)
+        let earliest = max(lo, notBefore ?? lo, searchFloor)
+
+        // The LAST maximal alternating run of >= K epochs, and WHY it ended. `i == n` is the virtual
+        // step past the end of the data — the "regime never exited" terminator.
+        var trusted: (end: Int, length: Int, terminator: CadenceStep?)?
+        var start = lo
+        for i in (lo + 1) ... n {
+            let terminator: CadenceStep? = i < n ? cadence[i] : nil
+            guard terminator != .alternating else { continue }
+            let end = i - 1
+            if end - start + 1 >= tuning.cadenceWakeQuietEpochs {
+                trusted = (end, end - start + 1, terminator)
+            }
+            start = i
+        }
+        guard let run = trusted else { return }              // the cadence never held for a night
+        guard run.terminator == .violation else { return }   // data edge or hole: no wake observed
+        guard run.length <= tuning.cadenceWakeMaxQuietEpochs else { return }   // not a night
+
+        let s = run.end + 1
+        // `> earliest`, not `>=`: the onset epoch (and the last rescued epoch) must remain asleep.
+        guard s < n, s > earliest else { return }
+        // HR NO-RETURN CONFIRMATION — the same test `markPointOfNoReturnOffset` scans for, used here
+        // as a second, INDEPENDENT witness on a cut the cadence has already located. The cadence says
+        // where the ring stopped measuring sleep; this says the body never settled back afterwards.
+        guard let suffixMin = smHR[s...].min(), suffixMin > floor + margin else { return }
+
+        var candidate = awake
+        for i in s ..< n { candidate[i] = true }
+        // Only commit if a CONSOLIDATED asleep run survives — a pass that REMOVES sleep must not be
+        // able to commit a night down to a token fragment.
         guard sleepSpan(candidate, sustain: tuning.minConsolidatedSleepEpochs) != nil else { return }
         awake = candidate
     }
