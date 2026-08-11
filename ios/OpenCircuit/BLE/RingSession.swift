@@ -347,6 +347,12 @@ final class RingSession: NSObject {
     /// HR-aware Light/Deep/REM/Awake staging (the descent-onset trim lives here). The PREFERRED
     /// source for both the dashboard and Apple Health (#15); see `healthSleepSegments`.
     private(set) var stagedSegments: [SleepSegment] = []
+    /// What the LAST attempt to store `stagedSegments` actually did (#204). nil until a drain has
+    /// tried. Read by the Sleep card so the wearer is told when the night on screen is live staging
+    /// that no stored row backs — the state in which it vanishes on relaunch and never reaches
+    /// Apple Health. It is deliberately a REPORT of the store's own verdict, not a re-derivation:
+    /// the card cannot tell "not written" from "not written YET" by looking at the query.
+    private(set) var lastSleepPersistOutcome: SleepPersistOutcome?
     /// The segments to mirror to Apple Health and persist: the HR-aware `stagedSegments` when a
     /// real overnight block was staged, else the coarse `sleepSegments`. Returns empty when the
     /// coarse wear gate is empty (charging/off-wrist), so nothing is written for a non-worn night.
@@ -1840,6 +1846,11 @@ final class RingSession: NSObject {
         if !nightKeyReady {
             ringLog.error("sleep: night-key migration pending — deferring the night summary (naps still persist)")
         }
+        // #204 — every path out of this function now names itself. Before, three of the four ways to
+        // store nothing were silent (the `try?` below swallowed the migration throw outright), so the
+        // only signal a tester's export carried was `sleepCommitted: true`, which meant "the stage
+        // path ran" and was reported on drain after drain for a night that had NO stored row.
+        var outcome: SleepPersistOutcome = nightKeyReady ? .noStagedSegments : .deferredNightKeyMigration
         // ⚠️ The deferral covers the NIGHT only. `persistNaps` below runs off THIS drain's buffer
         // (minus re-hydrated counters) and the next drain clears it, so a nap skipped here is gone —
         // unlike the night, which `restageFromArchive` re-derives from the 30 h archive.
@@ -1868,10 +1879,28 @@ final class RingSession: NSObject {
             // there was but never when. Travelling in `extras` is what keeps the two writes atomic.
             extras.hypnogram = stagedSegments
             let nightKey = SleepNightKey.night(inBedStart: start, inBedEnd: end)
-            try? localStore.saveSleepSummary(summary, night: nightKey, inBedStart: start, inBedEnd: end,
-                                             sleepOnset: sleep?.onset ?? .distantPast,
-                                             sleepWake: sleep?.wake ?? .distantPast,
-                                             extras: extras)
+            do {
+                outcome = try localStore.saveSleepSummary(
+                    summary, night: nightKey, inBedStart: start, inBedEnd: end,
+                    sleepOnset: sleep?.onset ?? .distantPast,
+                    sleepWake: sleep?.wake ?? .distantPast,
+                    extras: extras)
+            } catch {
+                // NOT swallowed any more. A throw here is the branch that produced a wearer with no
+                // persisted sleep history at all — nothing to mirror to Health, nothing to survive a
+                // relaunch — while naps kept landing and the card kept showing a live-staged night.
+                outcome = .failed
+                ringLog.error("sleep: saveSleepSummary THREW — \(String(describing: error), privacy: .public)")
+            }
+        }
+        lastSleepPersistOutcome = outcome
+        let detail = "outcome=\(outcome.rawValue) staged=\(stagedSegments.count) "
+            + "wroteRow=\(outcome.wroteRow) nightIsStored=\(outcome.nightIsStored)"
+        observability.recordMetricEvent(source: "sleep-persist", detail: detail)
+        if outcome.isSilentLoss {
+            ringLog.error("sleep: NO stored night for this staging — \(detail, privacy: .public) (#204)")
+        } else {
+            ringLog.notice("sleep-persist: \(detail, privacy: .public)")
         }
         // Naps are detected over the whole drained window (independent of the overnight gate)
         // so a daytime-only sync still records them, never folded into the main night (#76).
@@ -3503,7 +3532,9 @@ final class RingSession: NSObject {
         // Sleep staging + persistence are conservative: a partial / PPG-only / no-ack sleep drain
         // must NOT overwrite a fuller stored night. We still keep the raw records + scalar samples.
         var committedSleep = false
+        var stagedThisDrain = false
         if commitDecision == .stage {
+            stagedThisDrain = true
             sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)   // wear gate (#41)
             stagedSegments = overnightStagedSegments(from: nightRecords, archive: union)   // overnight gate (review #1)
             persistSleepAndSteps(nightRecords: nightRecords)   // summary + extras from the stitched night
@@ -3514,7 +3545,8 @@ final class RingSession: NSObject {
             epochArchiveStore.savePendingSleepSegments(coarse: sleepSegments, staged: stagedSegments)
             ringLog.notice("sleep-persist: saved coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count) segments to archive (survives teardown)")
             print("[OC] sleep COMMITTED coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count)")
-            committedSleep = true
+            // #204: "committed" now means the STORE took it, not that we walked the stage path.
+            committedSleep = lastSleepPersistOutcome?.wroteRow ?? false
         } else {
             if let sleepOutcome {
                 let detail = "outcome=\(sleepOutcome.rawValue) recordsAdded=\(sleepTrace?.recordsAdded ?? 0) 4c=\(sleepTrace?.page4CCount ?? 0) 47=\(sleepTrace?.page47Count ?? 0) 50=\(sleepTrace?.endMarkerCount ?? 0) decision=\(commitDecision.rawValue)"
@@ -3523,7 +3555,9 @@ final class RingSession: NSObject {
             }
             if commitDecision == .restageFromArchive {
                 ringLog.notice("sleep: this drain may not stage its own slice, but \(self.adoptedRecordCount) adopted records are in the archive — re-staging from the union (#188)")
-                restageFromArchive()
+                let restaged = restageFromArchive()
+                stagedThisDrain = restaged != nil
+                committedSleep = restaged?.wroteRow ?? false
             }
         }
         // TEMP DIAGNOSTIC (HR-not-recording investigation): how many of THIS drain's raw records
@@ -3538,7 +3572,9 @@ final class RingSession: NSObject {
         // Everything in this buffer has now been through `persist`, so retire it from the
         // banked-but-unpersisted ledger. Unconditional by design — see `clearUnpersisted`. (#188)
         epochArchiveStore.clearUnpersisted(bulkRecords.map(\.counter))
-        recordHistorySyncEvidence(sleepCommitted: committedSleep)
+        // A drain that did not stage reports NO outcome rather than the previous drain's — a stale
+        // `updated` on an empty poll would read as "last night landed just now".
+        recordHistorySyncEvidence(nightRow: stagedThisDrain ? lastSleepPersistOutcome : nil)
         bulkFinalized = true      // committed — the stop-time safety net can skip these records
         // Consume the adoption credit (#188). `commitDrainedRecords` has three call sites
         // (`finalizeSync`, `startLiveMonitoring`, `stopLiveMonitoring`); leaving this set would let a
@@ -3711,15 +3747,19 @@ final class RingSession: NSObject {
     /// merge-protected (SleepSummaryMerge) so this can only GROW a fuller night, never shrink one, and it
     /// leaves `historySamples` alone (no new HealthKit samples to write). Run once per session (at
     /// connect) so retained-but-unstaged data surfaces without churning the periodic empty-poll path.
-    private func restageFromArchive() {
+    /// Returns what the re-staged night's write did, or nil when there was nothing to re-stage —
+    /// so a caller can never report a PREVIOUS drain's outcome as this one's (#204).
+    @discardableResult
+    private func restageFromArchive() -> SleepPersistOutcome? {
         let union = epochArchiveStore.load()
-        guard !union.isEmpty else { return }
+        guard !union.isEmpty else { return nil }
         let temps = wearTemperatureSamples()
         let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temps)
         sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)
         stagedSegments = overnightStagedSegments(from: nightRecords, archive: union)
         persistSleepAndSteps(nightRecords: nightRecords)
         ringLog.notice("sync: re-staged last night from archive union (\(union.count) epochs)")
+        return lastSleepPersistOutcome
     }
 
     /// Decode a completed OSA `0x48` burst into a SpO₂ night summary (#91). Fired ~5 s after the
@@ -3785,7 +3825,7 @@ final class RingSession: NSObject {
             syncStatus = steps != nil
                 ? "Up to date — last night is likely already in the vitals dashboard. The ring clears history after each sync, so nothing new to fetch."
                 : "No data received — is the ring bonded/awake?"
-            recordHistorySyncEvidence(sleepCommitted: false)
+            recordHistorySyncEvidence(nightRow: nil)
         } else {
             commitDrainedRecords()
             let sleepOutcome = drainTraces.first { $0.label == "sleep" }?.outcome
@@ -3846,17 +3886,29 @@ final class RingSession: NSObject {
         activeDrainTrace = trace
     }
 
-    private func recordHistorySyncEvidence(sleepCommitted: Bool) {
+    /// ⚠️ `sleepCommitted` MEANS "A NIGHT ROW WAS WRITTEN" (#204). It used to mean "the stage path
+    /// was taken", which is why a tester's export could report it `true` on drain after drain for a
+    /// night that had no `StoredSleepSummary` row at all. `nightRowOutcome` names the branch, so a
+    /// `false` here is never ambiguous: a deliberate keep (`keptFullerStoredNight`, `keptManualEdit`)
+    /// is a healthy drain, while `noStagedSegments` / `deferredNightKeyMigration` /
+    /// `refusedNightKeyCollision` / `failed` mean the wearer has nothing stored.
+    ///
+    /// ⚠️ `mergedRecordCount` and `rawRecordBlob` ARE THE SAME ARRAY (#203). Comparing the blob's
+    /// record count against `mergedRecordCount` is therefore VACUOUS — it can never disagree, and it
+    /// proves nothing about whether the export covers everything the app holds. See
+    /// `ExportEngine.ArchiveCoverage` for the check that actually answers that.
+    private func recordHistorySyncEvidence(nightRow: SleepPersistOutcome?) {
         let entry = HistorySyncEvidence(
             date: Date(),
             ringID: peripheral.identifier.uuidString,
             trigger: historySyncTrigger,
-            sleepCommitted: sleepCommitted,
+            sleepCommitted: nightRow?.wroteRow ?? false,
             stagedSleepSegments: sleepSegments.count,
             mergedRecordCount: bulkRecords.count,
             historySampleCount: historySamples.count,
             channels: drainTraces,
-            rawRecordBlob: EpochArchive.encode(bulkRecords)
+            rawRecordBlob: EpochArchive.encode(bulkRecords),
+            nightRowOutcome: nightRow?.rawValue
         )
         observability.recordHistorySyncEvidence(entry)
     }

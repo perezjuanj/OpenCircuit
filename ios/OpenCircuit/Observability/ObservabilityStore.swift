@@ -41,6 +41,8 @@ struct HistorySyncEvidence: Codable, Identifiable, Equatable {
     var date: Date
     var ringID: String
     var trigger: String
+    /// ⚠️ A NIGHT ROW WAS WRITTEN — not "the stage path was taken" (#204). See
+    /// `RingSession.recordHistorySyncEvidence` for why the old meaning was actively misleading.
     var sleepCommitted: Bool
     var stagedSleepSegments: Int
     var mergedRecordCount: Int
@@ -48,7 +50,18 @@ struct HistorySyncEvidence: Codable, Identifiable, Equatable {
     var channels: [HistoryChannelTrace]
     /// Reconstructed raw 0x4c records captured this sync (fixed 23-byte records concatenated).
     /// Stored for a few days so a failed overnight sync can be replayed/analyzed later.
+    ///
+    /// ⚠️ THIS IS THIS DRAIN'S SLICE, NOT THE ARCHIVE (#203). It is encoded from the same
+    /// `bulkRecords` array that `mergedRecordCount` counts, so those two can never disagree and a
+    /// blob-vs-count check proves nothing. Epochs the app persisted through a drain whose evidence
+    /// row is missing — the ring buffer is only `historySyncEvidenceLimit` deep — appear NOWHERE in
+    /// the union of these blobs, and a replay then sees a data hole the app never had.
     var rawRecordBlob: Data
+    /// Which branch of the sleep-summary write ran (`SleepPersistOutcome.rawValue`), or nil when
+    /// this drain did not stage a night. Optional so a bundle written before #204 still decodes —
+    /// a non-optional addition would fail `JSONDecoder` on the whole array and silently wipe the
+    /// wearer's evidence history on upgrade (the trap `HistorySyncAssessment` documents).
+    var nightRowOutcome: String?
 }
 
 /// Reads/writes the observability timestamps + bounded outcome log in UserDefaults.

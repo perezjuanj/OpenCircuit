@@ -170,6 +170,12 @@ final class ExportSchemaV3Tests: XCTestCase {
             "mergedRecordCount": 8,
             "historySampleCount": 10,
             "rawRecordBlobBase64": "AQID",
+            // ADDITIVE (#204). The superset promise is that every key v2 emitted is still emitted
+            // at the same path with the same bytes — a NEW key inside a v2 section does not break a
+            // v2 consumer, which reads the keys it knows. `sleepCommitted` alone cannot tell "merge
+            // protection kept a fuller stored night" from "nothing is stored", and that ambiguity
+            // is what let a tester run for days with no persisted sleep at all.
+            "nightRowOutcome": NSNull(),
             "channels": [[
                 "label": "sleep",
                 "channel": 0,
@@ -780,10 +786,56 @@ final class ExportSchemaV3Tests: XCTestCase {
         "page4CCount", "page47Count", "endMarkerCount",
         "recordsAtStart", "recordsAtEnd", "recordsAdded",
         "validWindows", "expectedSamples", "observedSamples",
+        // #203 — archive-vs-evidence coverage: plain counts of epochs, and one duration that DOES
+        // carry a unit (`longestMissingRunSeconds` → `units["seconds"]` covers the suffix form).
+        "recordCount", "archiveRecordCount", "evidenceRecordCount", "missingFromEvidenceCount",
+        "longestMissingRunSeconds",
         // `samples[].value`'s unit is per-ROW: it is `units[kind]` for that row's `kind`, which is
         // exactly why the sample units come from `MetricKind` rather than being restated.
         "value"
     ]
+
+    // MARK: - #203 — the epoch-archive section
+
+    /// The export must carry the record set staging actually ran on, not only the per-drain blobs.
+    /// 🟢 The blobs were measurably incomplete on a real tester export (13 epochs the app had
+    /// decoded, persisted and staged appeared in NO blob), and a replay that trusted them read a
+    /// 35-minute phantom hole as 33 minutes of fabricated Light sleep.
+    func testEpochArchiveSectionCarriesTheRecordsAndItsOwnCoverage() {
+        let archive = ExportEngine.EpochArchiveRow(
+            ringID: "ring-1", recordsBase64: "AQID", recordCount: 380,
+            firstEpoch: t0, lastEpoch: t1,
+            coverage: ArchiveEvidenceCoverage.Report(
+                archiveRecordCount: 380, evidenceRecordCount: 367,
+                missingFromEvidence: Array(1...13), longestMissingRunSeconds: 1950))
+        let obj = parsed(ExportEngine.toJSON(samples: [], sleep: [], daily: [], now: t0,
+                                             epochArchives: [archive]))
+        guard let rows = obj["epochArchive"] as? [[String: Any]], let row = rows.first else {
+            return XCTFail("epochArchive section missing")
+        }
+        XCTAssertEqual(row["ringID"] as? String, "ring-1")
+        XCTAssertEqual(row["recordsBase64"] as? String, "AQID")
+        XCTAssertEqual(row["recordCount"] as? Int, 380)
+        guard let cov = row["evidenceBlobCoverage"] as? [String: Any] else {
+            return XCTFail("coverage missing — the section without it is just another blob")
+        }
+        XCTAssertEqual(cov["missingFromEvidenceCount"] as? Int, 13)
+        XCTAssertEqual(cov["longestMissingRunSeconds"] as? Int, 1950)
+        XCTAssertEqual(cov["isComplete"] as? Bool, false)
+        guard let provenance = obj["provenance"] as? [String: String] else {
+            return XCTFail("provenance block missing")
+        }
+        XCTAssertEqual(provenance["epochArchive"], "measured")
+        XCTAssertEqual(provenance["epochArchive.evidenceBlobCoverage"], "diagnostic")
+    }
+
+    /// Absent by default: an export from a build with no archive (or a fresh install) must not gain
+    /// an empty section, and the v2 superset lock must keep passing untouched.
+    func testEpochArchiveSectionIsOmittedWhenThereIsNoArchive() {
+        let obj = parsed(ExportEngine.toJSON(samples: [], sleep: [], daily: [], now: t0))
+        XCTAssertNil(obj["epochArchive"])
+        XCTAssertNil((obj["provenance"] as? [String: String])?["epochArchive"])
+    }
 
     func testEveryNumericLeafInTheJSONHasAUnitOrIsAnExplicitCount() {
         let coverage = ExportCoverage.assess(

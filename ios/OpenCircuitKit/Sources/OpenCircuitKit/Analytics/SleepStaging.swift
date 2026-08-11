@@ -130,6 +130,12 @@ public enum SleepStaging {
         /// to asleep so a transient REM-ish HR bump can't punch a hole in sleep. Motion-
         /// driven awake epochs are exempt (a real movement is awake however brief).
         public var minHRWakeRunEpochs: Int
+        /// Exempt the awake run that OPENS the block from `minHRWakeRunEpochs` erosion (#202).
+        /// Erosion repairs a hole punched IN sleep; the head run has no sleep before it, so eroding
+        /// it manufactures onset out of the pre-sleep wind-down instead. `false` restores the
+        /// un-guarded sweep and is byte-identical to pre-#202. See `erodeShortHRWake` for the
+        /// byte-exact device night this was measured on.
+        public var protectsLeadingHRWake: Bool
 
         // --- Second-bout HR-wake rescue (the "sleep never continues after a 3 a.m. wake" fix) ----
         // The wake gate above condemns an epoch on a SINGLE night-wide floor (`sleepFloorPercentile`
@@ -408,6 +414,7 @@ public enum SleepStaging {
                     motionAwakeVitalsHalfWindow: Int = 3,
                     onsetSustainEpochs: Int = 6,
                     minHRWakeRunEpochs: Int = 5,
+                    protectsLeadingHRWake: Bool = true,
                     hrWakeRescueCeilingBPM: Double = 25,
                     hrWakeRescueVitalsFraction: Double = 0.5,
                     onsetSettleFraction: Double = 0.60,
@@ -442,6 +449,7 @@ public enum SleepStaging {
             self.motionAwakeVitalsHalfWindow = motionAwakeVitalsHalfWindow
             self.onsetSustainEpochs = onsetSustainEpochs
             self.minHRWakeRunEpochs = minHRWakeRunEpochs
+            self.protectsLeadingHRWake = protectsLeadingHRWake
             self.hrWakeRescueCeilingBPM = hrWakeRescueCeilingBPM
             self.hrWakeRescueVitalsFraction = hrWakeRescueVitalsFraction
             self.onsetSettleFraction = onsetSettleFraction
@@ -769,7 +777,8 @@ public enum SleepStaging {
         var awake = rows.indices.map { smHR[$0] >= wakeThreshold || motionAwake[$0] }
         // Erode HR-only awake runs shorter than the floor so a transient REM-ish HR bump
         // doesn't read as an awakening (motion-driven awakes are kept, however brief).
-        erodeShortHRWake(&awake, motionAwake: motionAwake, minRun: tuning.minHRWakeRunEpochs)
+        erodeShortHRWake(&awake, motionAwake: motionAwake, minRun: tuning.minHRWakeRunEpochs,
+                         protectsLeading: tuning.protectsLeadingHRWake)
         // Rescue a LONG HR-only awake run that is really a SECOND SLEEP BOUT after a mid-night wake —
         // the ADD-only counterpart to the erode above, and the only pass that may relabel a night's
         // INTERIOR awake→asleep. Runs on the settled mask AFTER erosion, and BEFORE the two leading-edge
@@ -1009,7 +1018,32 @@ public enum SleepStaging {
     /// Relabel awake runs that are driven ONLY by HR elevation (no motion epoch inside)
     /// and shorter than `minRun` back to asleep, so a transient REM-ish HR bump doesn't
     /// read as an awakening. A run containing any motion-awake epoch is left untouched.
-    private static func erodeShortHRWake(_ awake: inout [Bool], motionAwake: [Bool], minRun: Int) {
+    ///
+    /// ⚠️ THE PREMISE IS "A HOLE PUNCHED IN SLEEP", AND THAT PREMISE FAILS AT THE HEAD (#202). A run
+    /// starting at index 0 opens the block: there is no sleep before it for the bump to interrupt,
+    /// so eroding it does not repair a hole — it declares the pre-sleep wind-down to be sleep, and
+    /// `sleepSpan` then anchors ONSET on the block's very first epoch. `rescueSecondBoutHRWake`, the
+    /// ADD-only counterpart, already states this asymmetry as design intent: its guard (d) exists so
+    /// that "the leading edge is never touched, so onset detection and the two onset passes below
+    /// keep byte-identical inputs". Erosion had no such guard, and it runs BEFORE both onset passes,
+    /// so what it eats at the head they never see.
+    ///
+    /// 🟢 MEASURED on the 2026-08-10→11 Gen-3 tester night (FR05.010, build 39, Europe/Paris),
+    /// byte-exact from that wearer's own records: the block opens 21:56:39 and the HR gate CORRECTLY
+    /// flags the first four epochs awake (smoothed HR 72, 72, 67, 66 against a night floor of 48 and
+    /// a wake threshold of 66). The motion channel is the `1,1,1,1,1` placeholder throughout, so the
+    /// run is HR-only and 4 < `minHRWakeRunEpochs` (5) — erosion wiped all four, and the reported
+    /// onset became 21:58:39 AT HR 74, 26 bpm above the night's floor. Neither onset pass can undo
+    /// it: `markDescentOnsetAwake` needs a ≥ `onsetMinDescentBPM` evening→floor descent and the
+    /// elevated head is only 4 of the 12 epochs its median samples (evening 55, floor 48, descent
+    /// 7 < 10), and `markLeadInWakeOnset` needs a surviving sustained awake run, which erosion just
+    /// removed. With the head exempt the night opens at 22:08:39 instead.
+    ///
+    /// `protectsLeadingHRWake == false` restores the un-guarded sweep — byte-identical to pre-#202.
+    /// Internal (not `private`) so the head-exemption can be driven DIRECTLY by a test, the way
+    /// `markPointOfNoReturnOffset` is — a synthetic night cannot prove which pass moved the onset.
+    static func erodeShortHRWake(_ awake: inout [Bool], motionAwake: [Bool], minRun: Int,
+                                 protectsLeading: Bool) {
         let n = awake.count
         var i = 0
         while i < n {
@@ -1018,7 +1052,9 @@ public enum SleepStaging {
             while j + 1 < n && awake[j + 1] { j += 1 }
             let run = j - i + 1
             let hasMotion = (i ... j).contains { motionAwake[$0] }
-            if run < minRun && !hasMotion { for k in i ... j { awake[k] = false } }
+            // The head run is exempt: no sleep precedes it, so there is no hole to repair.
+            let opensTheBlock = protectsLeading && i == 0
+            if run < minRun && !hasMotion && !opensTheBlock { for k in i ... j { awake[k] = false } }
             i = j + 1
         }
     }
