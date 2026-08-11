@@ -56,6 +56,12 @@ struct SleepCardView: View {
     /// missing-night banner is suppressed in favour of a soft "not synced yet" note. nil ⇒ never
     /// synced. Uses the SYNC time, not a sample timestamp (device timestamps can be 60+ min stale).
     var lastSyncAt: Date?
+    /// What the last drain's attempt to STORE the night actually did (#204). nil = no drain has
+    /// tried this session. When it reports a silent loss AND the night on screen has no stored row,
+    /// the card says so instead of quietly presenting live staging that will not survive relaunch
+    /// and will never reach Apple Health. Injected rather than inferred: a query that has not
+    /// refreshed yet is indistinguishable from a row that was never written.
+    var sleepPersistOutcome: SleepPersistOutcome? = nil
     /// Sleep-vitals samples (HR / HRV / SpO₂) over the last few days — narrowed in memory to the
     /// resolved night window for the "overnight average" row under the stage breakdown. Bounded
     /// (value-positive + windowed) so it never scans all history (#32), mirroring
@@ -69,11 +75,13 @@ struct SleepCardView: View {
     private static let historyNights = 35
 
     init(liveSegments: [SleepSegment] = [], lastSyncAt: Date? = nil,
+         sleepPersistOutcome: SleepPersistOutcome? = nil,
          onEditSleep: ((Date, SleepEdit.Times, ClosedRange<Date>?) async -> Int?)? = nil,
          sleepEditDataCoverage: ((Date, Date) -> ClosedRange<Date>?)? = nil,
          onNap: ((Date?, NapEdit.Window) async -> Bool)? = nil) {
         self.liveSegments = liveSegments
         self.lastSyncAt = lastSyncAt
+        self.sleepPersistOutcome = sleepPersistOutcome
         self.onEditSleep = onEditSleep
         self.sleepEditDataCoverage = sleepEditDataCoverage
         self.onNap = onNap
@@ -234,14 +242,48 @@ struct SleepCardView: View {
     /// invariant: whenever this is true the Goals Sleep ring is empty).
     private var lastNightMissing: Bool { recencyStatus == .missing }
 
-    /// The recency note to show above the stage details, if any: the orange miss banner, the soft
-    /// "not synced yet" note, or nothing.
+    /// The night on screen exists ONLY in memory: the last drain's write stored nothing, and no
+    /// persisted row covers this night's key (#204).
+    ///
+    /// Both halves are required, and each rules out one false positive. The outcome alone would fire
+    /// on a drain that legitimately stored nothing while a perfectly good row from an earlier drain
+    /// still backs the night; the missing row alone would fire in the frame between staging and the
+    /// `@Query` refresh. Together they are exactly the state the tester hit — a full hypnogram on
+    /// screen, `"sleep": []` in the export — which is otherwise completely invisible.
+    private var nightIsUnsaved: Bool {
+        guard let outcome = sleepPersistOutcome, outcome.isSilentLoss, let night else { return false }
+        return !storedSleep.contains { $0.night == night.nightKey && $0.asleepMin > 0 }
+    }
+
+    /// Says the one thing the wearer can act on — this night is not saved yet — without asking them
+    /// to care which branch of the write path declined. Deliberately not phrased as data loss: the
+    /// epochs are still in the ring's rolling archive for `deferredNightKeyMigration`,
+    /// `noStagedSegments` and `failed`, so another sync genuinely can recover it.
+    private var unsavedNightNotice: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "exclamationmark.icloud").font(.caption2).foregroundStyle(.orange)
+            Text(sleepPersistOutcome?.isRecoverableByRetry == true
+                 ? "This night hasn’t been saved yet, so it isn’t in Apple Health and won’t survive a restart. Sync again near the ring — the epochs are still on it."
+                 : "This night couldn’t be saved. It isn’t in Apple Health and won’t survive a restart. Send a diagnostics export from Device Info if it keeps happening.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    /// The recency note to show above the stage details, if any: the unsaved-night warning, the
+    /// orange miss banner, the soft "not synced yet" note, or nothing. The unsaved warning outranks
+    /// the recency notes — a night that is on screen but unstored is a stronger statement than
+    /// anything about how recent it is.
     @ViewBuilder
     private var recencyNotice: some View {
-        switch recencyStatus {
-        case .missing:      missedNightNotice
-        case .notSyncedYet: notSyncedYetNotice
-        case .ok:           EmptyView()
+        if nightIsUnsaved {
+            unsavedNightNotice
+        } else {
+            switch recencyStatus {
+            case .missing:      missedNightNotice
+            case .notSyncedYet: notSyncedYetNotice
+            case .ok:           EmptyView()
+            }
         }
     }
 

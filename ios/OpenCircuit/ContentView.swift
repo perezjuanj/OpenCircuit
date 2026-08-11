@@ -1282,6 +1282,7 @@ struct ContentView: View {
     /// reflects a just-finished sync instantly via the live staged segments. (See SleepCardView.)
     private var sleepCard: some View {
         SleepCardView(liveSegments: session?.stagedSegments ?? [], lastSyncAt: lastSyncAt,
+                      sleepPersistOutcome: session?.lastSleepPersistOutcome,
                       onEditSleep: { night, times, uiCoverage in
                           await session?.applySleepEdit(night: night, times: times,
                                                         uiCoverage: uiCoverage) ?? nil

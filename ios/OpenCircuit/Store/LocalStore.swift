@@ -1276,10 +1276,17 @@ struct LocalStore {
                 + "reason=night-resolved-by-span-grew-past-midnight")
     }
 
+    /// Store (or deliberately decline to store) a night's summary.
+    ///
+    /// Returns WHICH of its branches ran (#204). Every `return` below used to be indistinguishable
+    /// from a successful write at the call site — three of them logged nothing at all — so a wearer
+    /// could end a night with no stored row, no error and a Sleep card happily rendering live
+    /// staging. The outcome is the caller's signal; the metric events are the tester's.
+    @discardableResult
     func saveSleepSummary(_ summary: SleepStaging.Summary, night: Date,
                           inBedStart: Date, inBedEnd: Date,
                           sleepOnset: Date = .distantPast, sleepWake: Date = .distantPast,
-                          extras: SleepNightExtras = SleepNightExtras()) throws {
+                          extras: SleepNightExtras = SleepNightExtras()) throws -> SleepPersistOutcome {
         // Before the FIRST write under the new key — see `ensureNightKeyMigrated`. A failed
         // migration DEFERS the write rather than filing it under a scheme the rest of the table has
         // not adopted; the epochs survive in the archive and the next drain re-stages them.
@@ -1344,13 +1351,19 @@ struct LocalStore {
                     + "DISCARDED=[\(Self.stamp(inBedStart))..\(Self.stamp(inBedEnd))] "
                     + "edited=\(existing.isManuallyEdited) reason=night-key-collision"
                 ObservabilityStore().recordMetricEvent(source: "sleep-drop", detail: detail)
-                return
+                return .refusedNightKeyCollision
             }
             // A manually edited night (#176) is authoritative: a later re-sync must not overwrite the
             // user's window/durations. Preserve it. The raw epoch archive still holds the original
             // staging, so the edit stays reversible by re-editing. Reaching here means the incoming
             // staging genuinely overlaps the edited night, which is the case this guard is FOR.
-            if existing.isManuallyEdited { return }
+            if existing.isManuallyEdited {
+                ObservabilityStore().recordMetricEvent(
+                    source: "sleep-drop",
+                    detail: "night=\(Self.stamp(dayStart)) kept=MANUAL-EDIT "
+                        + "incoming=[\(Self.stamp(inBedStart))..\(Self.stamp(inBedEnd))] asleep=\(m.asleep)")
+                return .keptManualEdit
+            }
             // Non-destructive upsert. A night can be drained in MORE THAN ONE piece (e.g. a
             // background drain mid-night, then the foreground morning sync) — the ring hands off
             // un-delivered history incrementally, so each drain stages only its own slice. Blindly
@@ -1378,7 +1391,13 @@ struct LocalStore {
                 storedAsleep: TimeInterval(existing.asleepMin) * 60,
                 newAsleep: TimeInterval(m.asleep) * 60,
                 sameCoverage: sameCoverage) else {
-                return   // keep the fuller existing night (its window, stages, extras + feelScore)
+                // Keep the fuller existing night (its window, stages, extras + feelScore). NAMED,
+                // not silent (#204) — but deliberately without a metric event of its own: this is
+                // the most common outcome of all (every periodic re-drain of a settled night hits
+                // it), and the caller's single `sleep-persist` event already carries the name. A
+                // second event here would triple the metric log's fill rate and evict the rarer
+                // breadcrumbs (`sleep-rekey`, `sleep-drop`, `archive-repair`) that testers need.
+                return .keptFullerStoredNight
             }
             // Only NOW — every early return above is behind us, so this reaches `context.save()`.
             // A row resolved by SPAN may still be filed under the key its first slice produced; move
@@ -1419,6 +1438,7 @@ struct LocalStore {
             context.insert(row)
         }
         try context.save()
+        return existingRow == nil ? .inserted : .updated
     }
 
     private func applyExtras(_ extras: SleepNightExtras, to row: StoredSleepSummary) {
