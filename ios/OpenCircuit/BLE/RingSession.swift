@@ -3555,9 +3555,9 @@ final class RingSession: NSObject {
             }
             if commitDecision == .restageFromArchive {
                 ringLog.notice("sleep: this drain may not stage its own slice, but \(self.adoptedRecordCount) adopted records are in the archive — re-staging from the union (#188)")
-                restageFromArchive()
-                stagedThisDrain = true
-                committedSleep = lastSleepPersistOutcome?.wroteRow ?? false
+                let restaged = restageFromArchive()
+                stagedThisDrain = restaged != nil
+                committedSleep = restaged?.wroteRow ?? false
             }
         }
         // TEMP DIAGNOSTIC (HR-not-recording investigation): how many of THIS drain's raw records
@@ -3747,15 +3747,19 @@ final class RingSession: NSObject {
     /// merge-protected (SleepSummaryMerge) so this can only GROW a fuller night, never shrink one, and it
     /// leaves `historySamples` alone (no new HealthKit samples to write). Run once per session (at
     /// connect) so retained-but-unstaged data surfaces without churning the periodic empty-poll path.
-    private func restageFromArchive() {
+    /// Returns what the re-staged night's write did, or nil when there was nothing to re-stage —
+    /// so a caller can never report a PREVIOUS drain's outcome as this one's (#204).
+    @discardableResult
+    private func restageFromArchive() -> SleepPersistOutcome? {
         let union = epochArchiveStore.load()
-        guard !union.isEmpty else { return }
+        guard !union.isEmpty else { return nil }
         let temps = wearTemperatureSamples()
         let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temps)
         sleepSegments = BulkSleep.sleepSegments(from: nightRecords, temperatures: temps)
         stagedSegments = overnightStagedSegments(from: nightRecords, archive: union)
         persistSleepAndSteps(nightRecords: nightRecords)
         ringLog.notice("sync: re-staged last night from archive union (\(union.count) epochs)")
+        return lastSleepPersistOutcome
     }
 
     /// Decode a completed OSA `0x48` burst into a SpO₂ night summary (#91). Fired ~5 s after the
