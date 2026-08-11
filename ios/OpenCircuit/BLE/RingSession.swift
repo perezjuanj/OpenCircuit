@@ -92,10 +92,12 @@ final class RingSession: NSObject {
     /// An unsubscribed notify char silently drops every inbound frame.
     private(set) var notifySubscribed = false
     /// True when the link is up + subscribed but the ring delivers only `0x81` status replies and
-    /// NO data frames (`0x10`/`0x82`/`0x15`/`0x47`/`0x4c`/`0x11`) — the signature of a ring that
-    /// hasn't been activated/bonded by the official app (it accepts writes but answers nothing, so
-    /// Measure/Sync would just time out). Cleared the instant a data frame arrives. We INFER this
-    /// (don't claim to KNOW it's unactivated), per the `reconnectStalled` precedent.
+    /// NO data frames (`0x10`/`0x82`/`0x15`/`0x47`/`0x4c`/`0x11`) — it accepts writes but answers
+    /// nothing, so Measure/Sync would just time out. Cleared the instant a data frame arrives.
+    /// This is NOT an "un-activated ring" signature: #106 confirmed a ring that had never been
+    /// signed into the official app streams on our SM3 auth alone, and the same tester saw this
+    /// flag set transiently and clear itself. We INFER a silent link (don't claim to KNOW why),
+    /// per the `reconnectStalled` precedent.
     private(set) var notStreaming = false
     /// Whether any non-`0x81` (data/activity) frame has arrived since connect. Drives `notStreaming`
     /// — the cold status reads always elicit `0x81`, so "frames arrived" alone can't tell us the
@@ -245,7 +247,7 @@ final class RingSession: NSObject {
     /// so steps/battery still recover even when a live read starts immediately after a sync.
     private var pendingDeviceStatusRefresh = false
     /// Fires once after the notify subscription is confirmed: if no DATA frame has arrived within
-    /// `firstFrameTimeout`, flips `notStreaming` (ring not activated/bonded). #54.
+    /// `firstFrameTimeout`, flips `notStreaming` (link up, ring silent). #54.
     private var streamWatchdogTask: Task<Void, Never>?
     /// Re-applies the user's persisted automatic-workout preference once per authenticated
     /// connection. The ring-side setting is not queryable, so a remembered local `true` must not
@@ -253,8 +255,8 @@ final class RingSession: NSObject {
     private var automaticWorkoutReassertTask: Task<Void, Never>?
     private var automaticWorkoutDetectionAppliedThisConnection = false
     /// Seconds after a confirmed subscription to wait for the ring's first DATA frame. The keepalive
-    /// starts writing status/fetch immediately on `ready`, so an activated ring answers well within
-    /// this; only an un-activated ring stays silent past it.
+    /// starts writing status/fetch immediately on `ready`, so a healthy ring answers well within
+    /// this; only a ring that is off-wrist, held by another app, or otherwise silent passes it.
     private static let firstFrameTimeout: TimeInterval = 10
 
     /// Cached nightly sleep window — skin-temp capture is gated to this span (see the
@@ -1067,9 +1069,9 @@ final class RingSession: NSObject {
     }
 
     /// After the notify subscription is confirmed, wait `firstFrameTimeout` for the ring's first
-    /// DATA frame. If none arrives (only the cold `0x81` status replies), the ring is almost
-    /// certainly not activated/bonded — surface `notStreaming` so the UI can say "open the official
-    /// app once to activate" instead of letting Measure/Sync silently time out (#54).
+    /// DATA frame. If none arrives (only the cold `0x81` status replies), surface `notStreaming` so
+    /// the UI can say what to check (worn? another app holding the ring?) instead of letting
+    /// Measure/Sync silently time out (#54).
     private func startStreamWatchdog() {
         streamWatchdogTask?.cancel()
         streamWatchdogTask = Task { [weak self] in
@@ -1077,7 +1079,7 @@ final class RingSession: NSObject {
             guard let self, !Task.isCancelled else { return }
             if self.notifySubscribed, !self.gotDataFrame {
                 self.notStreaming = true
-                ringLog.notice("activation: subscribed but no data frame in \(Self.firstFrameTimeout, privacy: .public)s — ring likely not activated/bonded (#54)")
+                ringLog.notice("stream: subscribed but no data frame in \(Self.firstFrameTimeout, privacy: .public)s — link up, ring silent (#54)")
             }
         }
     }
@@ -4521,7 +4523,7 @@ extension RingSession: CBPeripheralDelegate {
 
     /// Notify-subscription result (#54). `ready` only means the characteristic was DISCOVERED; this
     /// is the first point we know whether notifications will actually flow. On failure (e.g. the
-    /// data char needs an encrypted/bonded link the ring won't grant when un-activated) we surface
+    /// data char needs an encrypted link the ring hasn't granted yet) we surface
     /// `notStreaming` immediately instead of writing commands into the void; on success we arm the
     /// first-DATA-frame watchdog.
     nonisolated func peripheral(_ peripheral: CBPeripheral,

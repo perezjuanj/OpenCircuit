@@ -938,13 +938,14 @@ struct ContentView: View {
                     }
                 }
             }
-            // Link up + subscribed but the ring sends only status replies, no data (#54) — the
-            // un-activated/un-bonded signature. Until the activate step is reverse-engineered, the
-            // only fix is to open the official app once; say so instead of spinning forever.
-            if connected, session?.notStreaming == true { activationHint }
+            // Link up + subscribed but the ring sends only status replies, no data (#54). The
+            // official app is NOT the fix — a never-activated ring streams on our SM3 auth alone
+            // (#106, confirmed out-of-box on Gen 3 FR05.005) — so point at the real causes
+            // (off-wrist / another app holding the ring) instead of spinning forever.
+            if connected, session?.notStreaming == true { notStreamingHint }
             // Connected + streaming, but the ring is on the charger (#61, confirmed byte) or reads
             // off-wrist (#56, estimated) — surface it instead of silently backing the auto-measure
-            // off. notStreaming takes precedence (an un-activated ring's wear state is meaningless),
+            // off. notStreaming takes precedence (a silent ring's wear state is meaningless),
             // and we hide it during an active measurement so it can't contradict the "measuring" cue.
             if connected, session?.notStreaming != true, session?.monitoring != true,
                session?.charging == true || session?.appearsNotWorn == true {
@@ -1150,14 +1151,16 @@ struct ContentView: View {
         return AnyShapeStyle(.tertiary)
     }
 
-    /// Shown when `RingSession.notStreaming` — the ring is connected but not delivering data (not
-    /// yet activated/bonded by the official app). #54.
-    private var activationHint: some View {
+    /// Shown when `RingSession.notStreaming` — the ring is connected but not delivering data (#54).
+    /// The copy no longer tells users to "activate" in the official app: #106 confirmed a ring that
+    /// had never been signed into the official app streams on our SM3 auth alone, and the same
+    /// tester saw this banner appear transiently and clear on its own.
+    private var notStreamingHint: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Ring isn't streaming").font(.subheadline.weight(.medium))
-                Text("Connected, but the ring isn't sending data. Open the official RingConn app once to activate it, then fully close it (swipe it away) and return here — only one app can pull the ring at a time.")
+                Text("Connected, but the ring hasn't sent data yet. Check that it's on your finger and off the charger, and fully close the official RingConn app if it's running — only one app can pull the ring at a time. This often clears on the next reconnect.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -1204,7 +1207,7 @@ struct ContentView: View {
         return "Measuring SpO₂…"
     }
     /// Inline failure banner: shown when a user-initiated measure timed out without a lock.
-    /// Styled like `activationHint` (orange, inside the connection card) for visual consistency.
+    /// Styled like `notStreamingHint` (orange, inside the connection card) for visual consistency.
     /// Dismissed naturally when the user taps Measure again. (#55)
     private var measureFailedHint: some View {
         HStack(alignment: .top, spacing: 8) {

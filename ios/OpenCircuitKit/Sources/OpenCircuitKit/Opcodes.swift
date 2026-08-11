@@ -161,13 +161,13 @@ public enum Command {
         0xe3: [0x1b, 0xe9, 0x85], 0xe5: [0x52, 0x0b, 0xe1], 0xf9: [0x36, 0x09, 0xb2],
     ]   // 24/256 entries from captures (incl. 2026-06-16 login e5→52 0b e1). Full f() needs the APK.
 
-    /// 🔴 UNKNOWN — the one-time login/activation command (if any) the official app sends so the
-    /// ring starts streaming to a fresh client. NOT present in any steady-state capture; reverse-
-    /// engineer from a first-time-provisioning / login btsnoop (issue #54), then fill + wire at the
-    /// discovery handler. Current evidence (§0/§5.8) points to the LE-SC bond itself being the gate
-    /// (local LTK, no cloud key) — in which case there is no app-layer command to send, only the
-    /// CoreBluetooth auto-bond. Placeholder so the call site can land before the bytes are known:
-    // public static func activate(/* token from login */) -> [UInt8] { … }
+    /// 🟢 CLOSED (#106) — there is NO one-time login/activation command. The long-suspected
+    /// provisioning step never existed: a factory-fresh ring that had never been signed into the
+    /// official app (Gen 3, shipped on firmware FR05.005) streamed live HR and SpO₂ to
+    /// OpenCircuit out of the box. The only gate is the per-connection SM3 challenge (§5.8,
+    /// `RingAuth`) plus the LE-SC "Just Works" bond CoreBluetooth negotiates locally — no cloud
+    /// key, no app secret, no app-layer activate frame. The former `activate(token:)` placeholder
+    /// is intentionally removed.
 }
 
 /// BLE transport handles (🟢). The ring is driven through this pair, not discrete

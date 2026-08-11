@@ -23,7 +23,7 @@ Generated from an issue-triage sweep (2026-07-05). Companion to
 | **#94** all-day stress | 🟡 partial | E | online-vs-offline probe: is stress on-wire or cloud? |
 | **#95** daily Activity Score | 🟡 partial | B | 4-level intensity band ground truth (decode belongs to #93) |
 | **#96** ring write actions (iOS) | ✅ yes | F, H | same write opcodes as #88 (this is the iOS consumer) |
-| **#106** any-owner gate (fresh ring) | 🟡 fallback | — | only if OpenCircuit standalone test fails (see Notes) |
+| **#106** any-owner gate (fresh ring) | ✅ CLOSED | — | answered 2026-08-11 without a capture — no fresh-ring session needed (see Notes) |
 
 **Excluded / cannot fold into this session** — see Notes:
 - **#87** temp / waking-RR fetch — overnight-only (separate night capture).
@@ -177,9 +177,9 @@ separate in the log.
   battery ≥ 30%, else the app refuses (`osaStartFail`). Separate night session; watch
   `keyOSAStartMonitor` write + dense page `0x15`/`0x16`. **Do not attempt in this daytime
   session.**
-- **#106 fresh-ring test is a FALLBACK only** — needs a *factory-fresh, never-activated
-  ring* + a phone never paired to it. Primary path is the OpenCircuit standalone test;
-  only run the official-app first-time-onboarding capture if that standalone test fails.
+- **#106 fresh-ring test — DO NOT RUN, already answered.** A tester connected OpenCircuit to a
+  factory-fresh Gen 3 (`FR05.005`) *before ever installing the official app* and got live HR +
+  SpO₂ (2026-08-11). There is no first-time activation step; PROTOCOL.md §5.8 records it.
 - **#92 (OTA) is a documented non-goal — do NOT trigger a firmware update.** Bricking
   risk; excluded.
 - **Bond-stealing:** run the whole session on the phone that owns the ring's bond. Do not
