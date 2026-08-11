@@ -121,10 +121,15 @@ public enum ExportEngine {
         public let historySampleCount: Int
         public let rawRecordBlobBase64: String
         public let channels: [HistoryChannelTrace]
+        /// Which branch of the night-summary write ran (`SleepPersistOutcome.rawValue`), or nil when
+        /// this drain staged no night (#204). `sleepCommitted` alone cannot distinguish "merge
+        /// protection kept a fuller stored night" (healthy) from "nothing is stored" (the defect).
+        public let nightRowOutcome: String?
         public init(capturedAt: Date, ringID: String, trigger: String,
                     sleepCommitted: Bool, stagedSleepSegments: Int,
                     mergedRecordCount: Int, historySampleCount: Int,
-                    rawRecordBlobBase64: String, channels: [HistoryChannelTrace]) {
+                    rawRecordBlobBase64: String, channels: [HistoryChannelTrace],
+                    nightRowOutcome: String? = nil) {
             self.capturedAt = capturedAt
             self.ringID = ringID
             self.trigger = trigger
@@ -134,6 +139,36 @@ public enum ExportEngine {
             self.historySampleCount = historySampleCount
             self.rawRecordBlobBase64 = rawRecordBlobBase64
             self.channels = channels
+            self.nightRowOutcome = nightRowOutcome
+        }
+    }
+
+    /// The app's OWN rolling epoch archive — the record set staging actually runs on (#203).
+    ///
+    /// The per-drain `historySyncEvidence` blobs are a LOSSY view of it: they are a bounded ring
+    /// buffer, so once a drain's row ages out its epochs appear in no blob at all, and a replay from
+    /// the export alone then sees a data hole the app never had. This section carries the deduped
+    /// archive itself plus an explicit statement of what the blobs miss, so a reader never has to
+    /// assume the blobs are complete — they demonstrably were not on the export that motivated it.
+    public struct EpochArchiveRow: Equatable, Sendable {
+        public let ringID: String
+        /// `EpochArchive.encode` output, base64 — fixed 23-byte records concatenated, deduped by
+        /// epoch counter and ordered.
+        public let recordsBase64: String
+        public let recordCount: Int
+        public let firstEpoch: Date?
+        public let lastEpoch: Date?
+        /// How the evidence blobs compare against this archive.
+        public let coverage: ArchiveEvidenceCoverage.Report
+        public init(ringID: String, recordsBase64: String, recordCount: Int,
+                    firstEpoch: Date?, lastEpoch: Date?,
+                    coverage: ArchiveEvidenceCoverage.Report) {
+            self.ringID = ringID
+            self.recordsBase64 = recordsBase64
+            self.recordCount = recordCount
+            self.firstEpoch = firstEpoch
+            self.lastEpoch = lastEpoch
+            self.coverage = coverage
         }
     }
 
@@ -495,7 +530,10 @@ public enum ExportEngine {
 
     /// CSV for history-sync evidence. Channel traces are flattened to a compact summary string.
     public static func historySyncEvidenceCSV(_ rows: [HistorySyncEvidenceRow]) -> String {
-        var lines = ["capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64"]
+        // `nightRowOutcome` is APPENDED, never interleaved: every column a v2 consumer indexes
+        // keeps its position (`ExportEngine`'s header states that contract for sections; it holds
+        // for columns too, and `testHostileValuesRoundTripThroughTheCSV` is what enforces it).
+        var lines = ["capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64,nightRowOutcome"]
         for r in rows {
             let channelSummary = r.channels.map {
                 "\($0.label):\($0.outcome.rawValue):4c=\($0.page4CCount):47=\($0.page47Count):50=\($0.endMarkerCount):added=\($0.recordsAdded)"
@@ -509,7 +547,8 @@ public enum ExportEngine {
                 "\(r.mergedRecordCount)",
                 "\(r.historySampleCount)",
                 channelSummary,
-                r.rawRecordBlobBase64
+                r.rawRecordBlobBase64,
+                r.nightRowOutcome ?? ""
             ]))
         }
         return lines.joined(separator: "\n")
@@ -729,7 +768,8 @@ public enum ExportEngine {
                               historySyncEvidence: [HistorySyncEvidenceRow] = [],
                               now: Date = Date(),
                               metadata: ExportMetadata? = nil,
-                              sleepSessions: [SleepSessionRow] = []) -> String? {
+                              sleepSessions: [SleepSessionRow] = [],
+                              epochArchives: [EpochArchiveRow] = []) -> String? {
         var root: [String: Any] = [
             "schemaVersion": schemaVersion,
             "exportedAt": iso8601.string(from: now),
@@ -764,6 +804,7 @@ public enum ExportEngine {
                 "ringID": $0.ringID,
                 "trigger": $0.trigger,
                 "sleepCommitted": $0.sleepCommitted,
+                "nightRowOutcome": jsonOrNull($0.nightRowOutcome),
                 "stagedSleepSegments": $0.stagedSleepSegments,
                 "mergedRecordCount": $0.mergedRecordCount,
                 "historySampleCount": $0.historySampleCount,
@@ -858,7 +899,24 @@ public enum ExportEngine {
                 return obj
             }
         }
-        root["provenance"] = provenance(includesSleepSessions: !sleepSessions.isEmpty)
+        if !epochArchives.isEmpty {
+            root["epochArchive"] = epochArchives.map { a in [
+                "ringID": a.ringID,
+                "recordCount": a.recordCount,
+                "firstEpoch": jsonOrNull(a.firstEpoch.map { iso8601.string(from: $0) }),
+                "lastEpoch": jsonOrNull(a.lastEpoch.map { iso8601.string(from: $0) }),
+                "recordsBase64": a.recordsBase64,
+                "evidenceBlobCoverage": [
+                    "archiveRecordCount": a.coverage.archiveRecordCount,
+                    "evidenceRecordCount": a.coverage.evidenceRecordCount,
+                    "missingFromEvidenceCount": a.coverage.missingFromEvidence.count,
+                    "longestMissingRunSeconds": a.coverage.longestMissingRunSeconds,
+                    "isComplete": a.coverage.isComplete
+                ] as [String: Any]
+            ] as [String: Any] }
+        }
+        root["provenance"] = provenance(includesSleepSessions: !sleepSessions.isEmpty,
+                                        includesEpochArchive: !epochArchives.isEmpty)
         root["units"] = units
         root["notes"] = notes
 
@@ -878,7 +936,8 @@ public enum ExportEngine {
     ///   • diagnostic — troubleshooting exhaust, not health data
     /// `ExportSchemaV3Tests` enumerates the emitted top-level keys against this map, so a new
     /// section added without a classification fails the suite rather than shipping unlabelled.
-    private static func provenance(includesSleepSessions: Bool) -> [String: String] {
+    private static func provenance(includesSleepSessions: Bool,
+                                   includesEpochArchive: Bool = false) -> [String: String] {
         var map: [String: String] = [
             "samples": "measured",
             "stepSamples": "measured",
@@ -888,6 +947,12 @@ public enum ExportEngine {
             "naps": "derived",
             "historySyncEvidence": "diagnostic"
         ]
+        if includesEpochArchive {
+            // MEASURED: these are the ring's own bytes, deduped — nothing is estimated.
+            map["epochArchive"] = "measured"
+            // DIAGNOSTIC: a statement about the FILE, not about the wearer.
+            map["epochArchive.evidenceBlobCoverage"] = "diagnostic"
+        }
         if includesSleepSessions {
             map["sleepSessions"] = "derived"
             map["sleepSessions.summary"] = "derived"

@@ -309,8 +309,9 @@ enum ExportBuilder {
             .map { ExportEngine.DaytimeTemperatureRow(time: $0.time, celsius: $0.celsius) }
 
         // Recent sync-forensics whose capture time falls in the export window
-        let evidenceRows = ObservabilityStore().historySyncEvidence()
+        let evidence = ObservabilityStore().historySyncEvidence()
             .filter { $0.date >= from && $0.date < to }
+        let evidenceRows = evidence
             .map {
                 ExportEngine.HistorySyncEvidenceRow(
                     capturedAt: $0.date,
@@ -321,9 +322,30 @@ enum ExportBuilder {
                     mergedRecordCount: $0.mergedRecordCount,
                     historySampleCount: $0.historySampleCount,
                     rawRecordBlobBase64: $0.rawRecordBlob.base64EncodedString(),
-                    channels: $0.channels
+                    channels: $0.channels,
+                    nightRowOutcome: $0.nightRowOutcome
                 )
             }
+
+        // The app's OWN epoch archive, per ring, plus a statement of what the per-drain blobs
+        // above MISS of it (#203). The evidence list is a bounded ring buffer, so its blobs are a
+        // LOSSY view of the record set staging actually ran on — and a replay that assumes otherwise
+        // reads a phantom data hole as lost sleep. Ring-scoped exactly as `RingSession` scopes it,
+        // so a two-ring household exports two archives instead of one corrupted union.
+        let archiveRows: [ExportEngine.EpochArchiveRow] = Set(evidence.map(\.ringID)).sorted().compactMap { ringID in
+            let archive = EpochArchiveStore(namespace: ringID).load()
+            guard !archive.isEmpty else { return nil }
+            let blobbed = evidence.filter { $0.ringID == ringID }
+                .flatMap { EpochArchive.decode($0.rawRecordBlob) }
+            let dates = archive.map { $0.date() }.sorted()
+            return ExportEngine.EpochArchiveRow(
+                ringID: ringID,
+                recordsBase64: EpochArchive.encode(archive).base64EncodedString(),
+                recordCount: archive.count,
+                firstEpoch: dates.first,
+                lastEpoch: dates.last,
+                coverage: ArchiveEvidenceCoverage.report(archive: archive, evidence: blobbed))
+        }
 
         // ── v3 sections ───────────────────────────────────────────────────────────────────────
         let meta = metadata(rangeStart: from, rangeEnd: to, now: now)
@@ -376,7 +398,8 @@ enum ExportBuilder {
                                                  historySyncEvidence: evidenceRows,
                                                  now: now,
                                                  metadata: meta,
-                                                 sleepSessions: sessionRows) else {
+                                                 sleepSessions: sessionRows,
+                                                 epochArchives: archiveRows) else {
                 throw Failure.serializationFailed
             }
             content = json

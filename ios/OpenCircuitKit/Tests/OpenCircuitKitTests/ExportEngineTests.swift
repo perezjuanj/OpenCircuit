@@ -92,7 +92,9 @@ final class ExportEngineTests: XCTestCase {
     func testHistorySyncEvidenceCSVHeader() {
         XCTAssertEqual(
             ExportEngine.historySyncEvidenceCSV([]),
-            "capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64"
+            // `nightRowOutcome` (#204) is APPENDED — every pre-existing column keeps its index,
+            // which is the compatibility property this header lock exists to protect.
+            "capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64,nightRowOutcome"
         )
     }
 
@@ -224,10 +226,11 @@ final class ExportEngineTests: XCTestCase {
             capturedAt: t0, ringID: "ring-1", trigger: "manual",
             sleepCommitted: true, stagedSleepSegments: 4,
             mergedRecordCount: 8, historySampleCount: 10,
-            rawRecordBlobBase64: "AQID", channels: [trace])
+            rawRecordBlobBase64: "AQID", channels: [trace],
+            nightRowOutcome: SleepPersistOutcome.updated.rawValue)
         XCTAssertEqual(ExportEngine.historySyncEvidenceCSV([row]), """
-        capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64
-        2023-11-14T22:13:20.000Z,ring-1,manual,true,4,8,10,sleep:complete:4c=1:47=0:50=1:added=6,AQID
+        capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64,nightRowOutcome
+        2023-11-14T22:13:20.000Z,ring-1,manual,true,4,8,10,sleep:complete:4c=1:47=0:50=1:added=6,AQID,updated
         """)
     }
 
@@ -301,10 +304,11 @@ final class ExportEngineTests: XCTestCase {
                 rawRecordBlobBase64: "AQID", channels: [])
             let records = Self.parseCSV(ExportEngine.historySyncEvidenceCSV([row]))
             XCTAssertEqual(records.count, 2, "header + exactly one record for \(ringID)")
-            XCTAssertEqual(records[1].count, 9, "column count must survive \(ringID)")
+            XCTAssertEqual(records[1].count, 10, "column count must survive \(ringID)")
             XCTAssertEqual(records[1][1], ringID, "ringID must round-trip verbatim")
             XCTAssertEqual(records[1][2], trigger, "trigger must round-trip verbatim")
-            XCTAssertEqual(records[1][8], "AQID", "later columns must not shift")
+            XCTAssertEqual(records[1][8], "AQID",
+                           "later columns must not shift — `nightRowOutcome` is appended, not inserted")
         }
     }
 
