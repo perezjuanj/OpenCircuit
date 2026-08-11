@@ -67,10 +67,10 @@ written to **Apple Health** — nothing is sent to a server.
 
 - 🔗 **Standalone, no cloud key** — the ring's per-connection authentication is fully
   reverse-engineered (an SM3 challenge keyed only on the ring's *own* MAC), so OpenCircuit
-  connects and streams on its own, with **no RingConn account or app needed for everyday
-  use**. A ring you've already set up with the official app is bonded and works
-  immediately. *(One case is still being verified: a brand-new ring that has never been
-  activated in the official app on any phone — see issue #106.)*
+  connects and streams on its own, with **no RingConn account or app ever needed**.
+  Confirmed on a brand-new ring straight out of the box, before the official app had ever
+  been installed (Gen 3, firmware FR05.005 — [issue #106](https://github.com/perezjuanj/OpenCircuit/issues/106)),
+  as well as on rings already set up with the official app.
 - 💍 Works with **any RingConn Gen 2 ring**, and **multiple rings per phone**.
 - 🔄 Background sync, keepalive, and periodic auto-measure for continuous tracking.
 

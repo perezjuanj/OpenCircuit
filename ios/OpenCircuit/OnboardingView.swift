@@ -3,7 +3,8 @@ import SwiftUI
 /// First-run onboarding (#103). A short, dismissible, re-openable flow that orients a new
 /// (non-developer) user before they land on the dashboard:
 ///   1. what OpenCircuit does — local-first, writes to Apple Health, nothing leaves the device;
-///   2. the one-time prerequisite — activate the ring once in the official RingConn app;
+///   2. getting started — no official app or account needed (confirmed on a never-activated ring,
+///      #106); just close the official app if it's installed, since only one app can hold the ring;
 ///   3. permission priming — why Bluetooth + Apple Health are requested (the system prompts come
 ///      later, when the user first connects / authorizes Health — onboarding only explains them);
 ///   4. the not-affiliated / not-a-medical-device disclaimer.
@@ -26,7 +27,7 @@ struct OnboardingView: View {
         VStack(spacing: 0) {
             TabView(selection: $page) {
                 welcome.tag(0)
-                prerequisite.tag(1)
+                gettingStarted.tag(1)
                 permissions.tag(2)
                 disclaimer.tag(3)
             }
@@ -64,11 +65,12 @@ struct OnboardingView: View {
         }
     }
 
-    private var prerequisite: some View {
-        page(icon: "1.circle", tint: .indigo, title: "One-time setup") {
-            bullet("If your ring is new, set it up once in the official RingConn app to activate it — "
-                 + "then fully close that app (swipe it away). Only one app can talk to the ring at a "
-                 + "time. After that, OpenCircuit connects on its own.")
+    private var gettingStarted: some View {
+        page(icon: "1.circle", tint: .indigo, title: "Getting started") {
+            bullet("No RingConn account and no official app needed — OpenCircuit connects to your "
+                 + "ring on its own, even a brand-new ring straight out of the box.")
+            bullet("If the official RingConn app is installed, fully close it (swipe it away) before "
+                 + "using OpenCircuit — only one app can talk to the ring at a time.")
             bullet("Keep your phone nearby — especially overnight — so OpenCircuit can capture your "
                  + "full night of sleep and skin-temperature data.")
             bullet("Charge the ring as usual; OpenCircuit picks up where it left off.")

@@ -882,6 +882,12 @@ the `0x10`/`0x87` descriptor `[1]`, §5.4 🟢 — already decoded.)
 ### 5.8 Per-connection AUTH (the activation gate) 🟢 CRACKED — issue #54
 > ✅ **Standalone confirmed on-device 2026-06-16:** with the official app logged out, OpenCircuit
 > activated the ring and streamed on its own. No official app needed. (+ heartbeat + bonding below.)
+> ✅ **Never-activated ring confirmed 2026-08-11 🟢 (issue #106, now CLOSED):** an independent tester
+> ran OpenCircuit against a factory-fresh Gen 3 (shipped on `FR05.005`) **before the official app was
+> ever installed** — live HR and SpO₂ worked as expected. So there is **no first-time provisioning /
+> cloud-activation step at all**: the SM3 challenge below plus the local LE-SC bond are the whole
+> gate, for any owner of any ring. (They saw the `notStreaming` banner intermittently; it cleared on
+> its own. Installing the official app afterwards took firmware to `FR05.010`, still fine.)
 The `01 01 <…>` arg is a deterministic **challenge→response auth** — what "activates" the ring for
 streaming. Sequence every connect: host `01 00 00` → ring `81 00 <chal> <xor>`; host must answer
 `01 01 <r0> <r1> <r2> 00`. **🟢 ALGORITHM (RE'd 2026-06-16 from the official app's Dart AOT
