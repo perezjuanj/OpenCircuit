@@ -224,8 +224,18 @@ public enum HealthAlertEvaluator {
     /// accumulating one. A genuine desaturation — apnea is cyclic, and altitude/illness is
     /// sustained — produces many qualifying readings inside one window and is unaffected.
     ///
-    /// Returns the LOWEST reading of the qualifying run (the number worth showing the user), which
-    /// keeps the reported value identical to the old rule's on every night that still alerts.
+    /// Returns the WORST (lowest) reading across every qualifying run — which keeps the reported
+    /// value and time identical to the old rule's on every night that still alerts.
+    ///
+    /// ⚠️ THE OBVIOUS IMPLEMENTATION IS WRONG, AND IT IS WRONG IN THE UNSAFE DIRECTION. Returning as
+    /// soon as `minReadings` is satisfied reports the minimum of the first qualifying WINDOW — a
+    /// PREFIX of the run, not its nadir. Adversarial review measured both failure shapes:
+    ///   • [90 %@03:00, 90 %@03:05, 79 %@03:10, 82 %@03:15] reported "90 % at 03:00" where the old
+    ///     rule reported 79 % — understating the depth AND misplacing the time;
+    ///   • a shallow 90/90 pair at 01:00 followed by a genuine 78/76/74 run at 04:00 reported the
+    ///     01:00 pair and never named the 74 %.
+    /// The depth is the entire payload of the copy, and understating a desaturation is the unsafe
+    /// direction. So the sweep below classifies EVERY run first and only then takes the minimum.
     ///
     /// `minReadings <= 1` restores the pre-persistence behaviour exactly: the guard below short-
     /// circuits to the old "worst reading at/below threshold" over the whole series. That is the
@@ -239,26 +249,42 @@ public enum HealthAlertEvaluator {
         let low = readings.filter { $0.percent > 0 && $0.percent <= thresholdPercent }
             .sorted { $0.time < $1.time }
         guard !low.isEmpty else { return nil }
-        guard minReadings > 1 else { return low.min { $0.percent < $1.percent } }
+        guard minReadings > 1 else { return lowest(low) }
 
-        // Sweep runs of qualifying readings joined by <= maxGap, and take the FIRST run that packs
-        // `minReadings` of them into a `window`-long span. Scanning within the run (rather than
-        // requiring the whole run to fit the window) is what lets a long, genuinely sustained
-        // desaturation qualify on its first `minReadings` readings instead of being disqualified
-        // for lasting too long.
-        var runStart = 0
-        for i in low.indices {
-            if i > runStart, low[i].time.timeIntervalSince(low[i - 1].time) > maxGap {
-                runStart = i                       // gap too wide — a fresh run begins here
+        // Split into runs of readings joined by <= maxGap. The gap term is what stops two unrelated
+        // single-epoch artifacts far apart from pairing into a fake run.
+        var runs: [[SpO2Reading]] = []
+        var current: [SpO2Reading] = [low[0]]
+        for i in 1 ..< low.count {
+            if low[i].time.timeIntervalSince(low[i - 1].time) > maxGap {
+                runs.append(current)
+                current = []
             }
-            // Earliest reading of this run still within `window` of low[i].
-            var first = runStart
-            while low[i].time.timeIntervalSince(low[first].time) > window { first += 1 }
-            if i - first + 1 >= minReadings {
-                return low[first...i].min { $0.percent < $1.percent }
-            }
+            current.append(low[i])
         }
-        return nil
+        runs.append(current)
+
+        // A run QUALIFIES when `minReadings` of its readings fall inside one `window`-long span.
+        // Checking a sliding span inside the run (rather than requiring the whole run to fit the
+        // window) is what lets a long, genuinely sustained desaturation qualify instead of being
+        // disqualified for lasting too long.
+        func qualifies(_ run: [SpO2Reading]) -> Bool {
+            guard run.count >= minReadings else { return false }
+            var first = 0
+            for i in run.indices {
+                while run[i].time.timeIntervalSince(run[first].time) > window { first += 1 }
+                if i - first + 1 >= minReadings { return true }
+            }
+            return false
+        }
+
+        return lowest(runs.filter(qualifies).flatMap { $0 })
+    }
+
+    /// Lowest reading, ties broken by the EARLIEST time so the same series always words itself the
+    /// same way. nil for an empty series.
+    private static func lowest(_ readings: [SpO2Reading]) -> SpO2Reading? {
+        readings.min { a, b in a.percent == b.percent ? a.time < b.time : a.percent < b.percent }
     }
 
     /// The reading that COMPLETES a continuous run of HR ≥ threshold spanning ≥ `minDuration`,
@@ -460,13 +486,15 @@ public enum HeadacheSignsNotifications {
     /// Hard never-fire window, in minutes since local midnight, enforced INDEPENDENTLY of the user's
     /// quiet-hours toggle. 🔴 PROVISIONAL.
     ///
-    /// Quiet hours ship DISABLED (`HealthAlertDefaults` registers `quietEnabled: false`, and
-    /// `QuietHours.init` defaults `enabled: false`), so on a default install the shared DND gate
-    /// protects nothing overnight. Every other family in this file is an ACUTE reading the user
-    /// asked to hear about the moment it happens; this one is a summary of a night that is already
-    /// over. Holding it until morning costs nothing, while a 04:00 buzz costs sleep — which is one
-    /// of the very inputs being measured. A verdict computed before the window simply waits: the
-    /// day ledger is still fresh, so the next evaluate pass inside the window delivers it.
+    /// This window is deliberately INDEPENDENT of the quiet-hours setting, and stays that way now
+    /// that `HealthAlertDefaults` registers `quietEnabled: true` (22:00–07:00) — quiet hours are a
+    /// user PREFERENCE they may switch off, whereas this notification must never fire at 04:00 for
+    /// anyone. `QuietHours.init` still defaults `enabled: false`, so a caller constructing one
+    /// directly gets no protection either. Every other family in this file is a reading the user
+    /// asked to hear about; this one is a summary of a night that is already over. Holding it until
+    /// morning costs nothing, while a 04:00 buzz costs sleep — one of the very inputs being
+    /// measured. A verdict computed before the window simply waits: the day ledger is still fresh,
+    /// so the next evaluate pass inside the window delivers it.
     public static let earliestMinutes = 7 * 60
     public static let latestMinutes = 21 * 60
 

@@ -52,6 +52,49 @@ final class HealthAlertsTests: XCTestCase {
         XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 86)
     }
 
+    /// ⚠️ THE ABOVE TEST PASSES EVEN WHEN THE RULE IS WRONG, because its nadir sits inside the first
+    /// qualifying pair. These two do not. Both shapes were MEASURED against a returns-early
+    /// implementation by adversarial review (2026-08-12); each reported a shallow prefix value where
+    /// the pre-persistence rule reported the true nadir.
+
+    /// The desaturation DEEPENS after the run already qualifies. Reporting the qualifying prefix
+    /// would say 90 % at 03:00 — understating an event whose real nadir is 79 %, and misplacing it.
+    func testLowSpO2ReportsTheRunsNadirNotTheFirstQualifyingPair() {
+        let r = [spo2(90, 3, 0), spo2(90, 3, 5), spo2(79, 3, 10), spo2(82, 3, 15)]
+        let hit = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)
+        XCTAssertEqual(hit?.percent, 79)
+        XCTAssertEqual(hit?.time, at(3, 10), "the reported TIME must be the nadir's, not the prefix's")
+        // Identical to what the pre-persistence rule reported for this night.
+        XCTAssertEqual(hit?.percent,
+                       HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, minReadings: 1)?.percent)
+    }
+
+    /// A shallow qualifying pair EARLY must not mask a deeper qualifying run LATER.
+    func testLowSpO2PrefersTheDeepestQualifyingRunAcrossTheNight() {
+        let r = [spo2(90, 1, 0), spo2(90, 1, 5),
+                 spo2(78, 4, 0), spo2(76, 4, 5), spo2(74, 4, 10)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 74)
+    }
+
+    /// A deeper reading that is NOT part of any qualifying run must not be borrowed to dress up a
+    /// qualifying one — otherwise the gate would report artifact depths it just decided to ignore.
+    func testLowSpO2IgnoresDepthFromNonQualifyingRuns() {
+        let r = [spo2(70, 1, 0),                              // lone artifact, no run
+                 spo2(89, 4, 0), spo2(88, 4, 5)]              // the genuine qualifying pair
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 88)
+    }
+
+    /// The post-drain path hands the evaluator every just-drained reading TWICE (the store already
+    /// holds the batch while `session.historySamples` still does). A count-based rule must not be
+    /// satisfied by one artifact epoch counted twice — that reproduced the exact false alert the
+    /// gate exists to stop. De-duplication lives at the merge site; this pins the shape.
+    func testLowSpO2IsSatisfiedByOneEpochWhenTheSeriesIsDuplicated() {
+        let artifact = [spo2(89, 7, 4)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(artifact, thresholdPercent: 90))
+        XCTAssertNotNil(HealthAlertEvaluator.lowSpO2(artifact + artifact, thresholdPercent: 90),
+                        "a duplicated series DOES fool the count — hence the de-dupe at the merge")
+    }
+
     /// Two unrelated single-epoch artifacts far apart must not pair up into a fake run.
     func testLowSpO2DoesNotPairTwoDistantArtifacts() {
         let r = [spo2(89, 1, 0), spo2(97, 1, 30), spo2(88, 3, 0)]

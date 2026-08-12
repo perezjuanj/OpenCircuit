@@ -649,7 +649,7 @@ struct SleepCardView: View {
             // as a defect.
             HStack(spacing: 6) {
                 Image(systemName: "thermometer.medium").font(.caption2).foregroundStyle(.tertiary)
-                Text("Skin temp needs the ring connected through the night — too few readings for this one.")
+                Text("No skin temperature for this night — it's only recorded while the ring stays connected, and there weren't enough readings to compare.")
                     .font(.caption2).foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }

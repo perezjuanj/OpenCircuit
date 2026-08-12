@@ -93,6 +93,64 @@ final class ExerciseMinutesTests: XCTestCase {
         XCTAssertNil(ExerciseMinutes.restingBaseline(busy))
     }
 
+    /// A SPOT-READ-ONLY day must not produce a baseline. `RestingHR.lowestSustained` falls back to
+    /// the single lowest reading when no 5-min window held two readings, and the production
+    /// auto-measure cadence (600 s) is longer than that window — so without an explicit
+    /// sustained-window requirement one poor-contact 44 bpm read becomes the whole day's "resting
+    /// HR" and collapses the personalised threshold back toward the old absolute bar. Reproduced by
+    /// adversarial review (2026-08-12) on exactly this shape.
+    func testRestingBaselineRefusesASpotReadOnlyDay() {
+        var samples = (0 ..< 30).map {
+            HRSample(bpm: 68, start: t0.addingTimeInterval(Double($0) * 600))    // 10-min spacing
+        }
+        samples[7] = HRSample(bpm: 44, start: t0.addingTimeInterval(7 * 600))    // one bad read
+        XCTAssertEqual(samples.count, 30)
+        XCTAssertNil(ExerciseMinutes.restingBaseline(samples),
+                     "no 5-min window holds two readings — there is no sustained rest to measure")
+    }
+
+    /// …and the same day WITH a genuinely sustained quiet stretch does produce one, so the guard is
+    /// a discriminator rather than an off switch.
+    func testRestingBaselineAcceptsWhenASustainedWindowExists() {
+        var samples = (0 ..< 30).map {
+            HRSample(bpm: 68, start: t0.addingTimeInterval(Double($0) * 600))
+        }
+        // A dense quiet block: 6 readings 60 s apart at 55 bpm.
+        samples += (0 ..< 6).map {
+            HRSample(bpm: 55, start: t0.addingTimeInterval(3 * 3600 + Double($0) * 60))
+        }
+        XCTAssertEqual(ExerciseMinutes.restingBaseline(samples)!, 55, accuracy: 1e-9)
+    }
+
+    /// 🔴 KNOWN RESIDUAL, pinned deliberately so the boundary is visible rather than surprising.
+    ///
+    /// The derived threshold is always ≥ the %-of-max one for a realistic age, so the instant
+    /// `restingBaseline` becomes derivable the day's elevated minutes STEP DOWN. On a ring worn
+    /// overnight the guard is long satisfied before waking and nothing is affected; on a ring put on
+    /// this morning (charge day, day 1) the goal ring can run backwards inside the first
+    /// `minRestingBaselineSpan`. Eliminating it needs a baseline that outlives the day — see the
+    /// note on `minRestingBaselineSpan`. This test FAILING means someone fixed that; update it.
+    func testEstimateIsNonMonotonicAcrossTheBaselineBoundary() {
+        let ringOn = t0
+        // 1 h at rest, then a 40-min walk — span 1 h 40 m, under the 2 h guard.
+        var early: [HRSample] = (0 ..< 24).map {
+            HRSample(bpm: 62, start: ringOn.addingTimeInterval(Double($0) * 150))
+        }
+        early += (1 ... 16).map {
+            HRSample(bpm: 95, start: ringOn.addingTimeInterval(3600 + Double($0) * 150))
+        }
+        XCTAssertNil(ExerciseMinutes.restingBaseline(early), "under the span guard")
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: early, maxHR: 185), 40, accuracy: 1e-9)
+
+        // The same walk, once enough quiet time has accrued to read the resting pulse.
+        let late = early + (0 ..< 24).map {
+            HRSample(bpm: 62, start: ringOn.addingTimeInterval(2.5 * 3600 + Double($0) * 150))
+        }
+        XCTAssertEqual(ExerciseMinutes.restingBaseline(late)!, 62, accuracy: 1e-9)
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: late, maxHR: 185), 0, accuracy: 1e-9,
+                       "95 bpm is not 40% of the way from 62 to 185 — correct, but it is a STEP DOWN")
+    }
+
     // MARK: The reported symptom — the ring filling from ordinary morning activity
 
     /// A high-resting-HR wearer's morning: 6 h of night at 72 bpm, then 40 min of ordinary

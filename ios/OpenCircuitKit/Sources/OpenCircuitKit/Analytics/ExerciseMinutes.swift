@@ -42,13 +42,31 @@ public enum ExerciseMinutes {
     static let minRestingBaselineSamples = 12
     /// Minimum span the readings must cover before a derived resting baseline is trusted.
     ///
-    /// Both guards exist because `lowestSustained` answers "what is the quietest stretch IN THIS
+    /// These guards exist because `lowestSustained` answers "what is the quietest stretch IN THIS
     /// ARRAY", which is only a resting HR if the array actually contains a quiet stretch. Three
     /// readings taken during a workout produce a "resting HR" of 100 and a threshold of 134 — the
-    /// exact failure a unit fixture hit when this landed. Requiring several hours of readings makes
-    /// it overwhelmingly likely the window contains genuine rest; below it we use the %-of-max
-    /// model, which needs no such assumption.
-    static let minRestingBaselineSpan: TimeInterval = 4 * 3600
+    /// exact failure a unit fixture hit when this landed.
+    ///
+    /// ⚠️ 2 h, NOT the 4 h this first shipped with, and the reason is a real UX defect adversarial
+    /// review measured (2026-08-12). The derived threshold is always ≥ the %-of-max one for any
+    /// realistic age (new < old ⟺ rhr < maxHR/6, impossible with rhr floored at 35), so the moment
+    /// this guard flips the threshold JUMPS UP and the day's elevated minutes JUMP DOWN. Measured at
+    /// maxHR 185: a ring put on at 07:00, 1 h at 62 bpm then a 40-min walk at 95 bpm read 40 elevated
+    /// minutes (baseline nil, threshold 92) and then **0** once the span passed the guard (baseline
+    /// 62, threshold 111) — the goal ring visibly running backwards mid-morning.
+    ///
+    /// Halving the span halves that exposure without weakening the "did this array contain rest"
+    /// test, because that test is really carried by `plausibleRestingHR` and by the
+    /// sustained-window requirement below, not by elapsed time. On any ring worn overnight the
+    /// guard is satisfied long before waking and the day is unaffected either way.
+    ///
+    /// 🔴 KNOWN RESIDUAL, not fixed here: the jump still exists inside the first 2 h after a ring is
+    /// put on (charge-day mornings, day 1 of pairing). Eliminating it needs a baseline that outlives
+    /// the day — yesterday's stored resting HR carried in as a fallback — which is real plumbing
+    /// through every `Calories.dailyEstimate` call site and is the named follow-up.
+    /// `testEstimateIsNonMonotonicAcrossTheBaselineBoundary` pins the current behaviour so the
+    /// boundary is visible rather than surprising.
+    static let minRestingBaselineSpan: TimeInterval = 2 * 3600
 
     /// HR threshold for exercise, in bpm.
     ///
@@ -68,7 +86,8 @@ public enum ExerciseMinutes {
     ///
     /// Heart-rate reserve is the standard fix and the one the exercise-physiology literature
     /// defines intensity in: `threshold = RHR + fraction · (maxHR − RHR)` (Karvonen). At 40 % HRR
-    /// the same two people get 121 bpm and 99 bpm — each ~40 % of the way up their OWN range.
+    /// the same two people get 120 bpm and 101 bpm — each 40 % of the way up their OWN range.
+    /// (78 + 0.4·107 = 120.8 → 120 after truncation; 45 + 0.4·140 = 101.)
     ///
     /// Note this generally RAISES the threshold versus 50 % maxHR (ACSM puts 40–59 % HRR at
     /// 64–76 % maxHR, so the old constant sat below even the LIGHT band). Elevated-HR minutes and
@@ -99,18 +118,29 @@ public enum ExerciseMinutes {
     /// minutes now use the same qualifying heart-rate periods"). Same input samples ⇒ same
     /// baseline ⇒ same periods, with no call site able to get it wrong.
     ///
-    /// `RestingHR.lowestSustained` is the lowest rolling 5-min mean, which is Apple Health's own
-    /// resting-HR convention and requires ≥2 readings in the window, so a single low spot read
-    /// cannot depress the baseline (and thereby the threshold). nil — too few samples, or a value
-    /// outside `plausibleRestingHR` — degrades to the %-of-max model.
+    /// `RestingHR.lowestSustained` is the lowest rolling 5-min mean — Apple Health's own resting-HR
+    /// convention. nil — too few samples, too short a span, no genuinely sustained window, or a
+    /// value outside `plausibleRestingHR` — degrades to the %-of-max model.
+    ///
+    /// ⚠️ THE SUSTAINED-WINDOW CHECK IS NOT REDUNDANT. `lowestSustained` falls back to the single
+    /// lowest reading whenever NO 5-min window held two readings, and the production auto-measure
+    /// cadence is 600 s — longer than that window. So on a day whose HR is spot reads only (before
+    /// the morning bulk sync, or a night that never synced) every window holds one reading and the
+    /// "resting HR" becomes the day's single lowest read: one poor-contact 40 bpm sample would set
+    /// the bar for the whole day. Adversarial review reproduced it — 30 reads at 10-min spacing, all
+    /// 68 bpm except one 44, gave a baseline of 44.0 (2026-08-12). An earlier version of this comment
+    /// claimed `lowestSustained`'s ≥2-reading rule prevented exactly that; it does not, because of
+    /// the fallback. Asking for the guarantee explicitly is what makes the claim true.
     public static func restingBaseline(_ hrSamples: [HRSample]) -> Double? {
         let valid = hrSamples.filter { LiveHR.validBPM.contains($0.bpm) }
         guard valid.count >= minRestingBaselineSamples,
               let first = valid.map(\.start).min(), let last = valid.map(\.start).max(),
               last.timeIntervalSince(first) >= minRestingBaselineSpan,
-              let rhr = RestingHR.lowestSustained(hr: valid, window: RestingHR.sustainedWindow)
+              let derived = RestingHR.lowestSustainedDetailed(hr: valid,
+                                                              window: RestingHR.sustainedWindow),
+              derived.wasSustained
         else { return nil }
-        return plausibleRestingHR.contains(rhr) ? rhr : nil
+        return plausibleRestingHR.contains(derived.value) ? derived.value : nil
     }
 
     /// Estimate exercise minutes as the total merged duration of elevated-HR intervals,

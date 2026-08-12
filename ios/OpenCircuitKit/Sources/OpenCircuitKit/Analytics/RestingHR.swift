@@ -56,6 +56,33 @@ public enum RestingHR {
     /// Lowest rolling `window`-mean across the readings. Each window is anchored at a
     /// reading and must hold ≥2 readings to count as "sustained"; if no window qualifies
     /// (all readings isolated) we fall back to the single lowest reading. nil if empty.
+    /// As `lowestSustained`, but reports whether a GENUINELY SUSTAINED window (≥2 readings inside
+    /// `window`) actually produced the value, rather than the single-lowest-reading fallback.
+    ///
+    /// The distinction matters to any caller deriving a THRESHOLD from the result. The production
+    /// auto-measure cadence is 600 s — longer than the 5-min `sustainedWindow` — so on a day whose
+    /// HR set is spot reads only, EVERY window holds one reading, the fallback fires, and the
+    /// "resting HR" is literally the day's single lowest read. One poor-contact 40 bpm read then
+    /// sets the baseline (adversarial review, 2026-08-12). For the daily-value path that fallback is
+    /// still the right behaviour — a day with readings should produce a value — so it is unchanged;
+    /// callers that need the stronger guarantee ask for it here.
+    static func lowestSustainedDetailed(hr: [HRSample], window: TimeInterval)
+    -> (value: Double, wasSustained: Bool)? {
+        guard let value = lowestSustained(hr: hr, window: window) else { return nil }
+        return (value, hasSustainedWindow(hr: hr, window: window))
+    }
+
+    /// Whether any `window`-length span anchored at a reading holds ≥2 readings.
+    static func hasSustainedWindow(hr: [HRSample], window: TimeInterval) -> Bool {
+        let sorted = hr.sorted { $0.start < $1.start }
+        guard sorted.count >= 2 else { return false }
+        for i in 0 ..< (sorted.count - 1) where
+            sorted[i + 1].start.timeIntervalSince(sorted[i].start) < window {
+            return true
+        }
+        return false
+    }
+
     static func lowestSustained(hr: [HRSample], window: TimeInterval) -> Double? {
         guard !hr.isEmpty else { return nil }
         let sorted = hr.sorted { $0.start < $1.start }

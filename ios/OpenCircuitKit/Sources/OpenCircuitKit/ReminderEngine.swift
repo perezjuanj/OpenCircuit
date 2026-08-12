@@ -108,7 +108,14 @@ public struct WearReminder: Equatable, Sendable {
         // Positive proof the ring was worn recently outranks the absence of frames. A worn epoch
         // dated within `noDataInterval` of now means the ring was on the finger for the very
         // stretch the silence rule is about to complain about.
-        if let worn = lastWornEvidenceAt, now.timeIntervalSince(worn) < noDataInterval {
+        // `max(0, …)` because a worn timestamp NEWER than `now` (a ring whose clock has drifted
+        // ahead, or a device timezone change between the drain and this pass) yields a NEGATIVE
+        // age. Negative is trivially < the interval, so the untreated comparison happened to
+        // suppress — but only by accident, and a future-dated evidence stamp is no evidence at all.
+        // Clamping makes "newer than now" mean "as fresh as possible", which is the same verdict
+        // reached deliberately rather than by sign.
+        if let worn = lastWornEvidenceAt,
+           max(0, now.timeIntervalSince(worn)) < noDataInterval {
             return false
         }
         guard let last = lastRingDataAt else { return true }   // ever connected but no data

@@ -116,7 +116,11 @@ struct EditSleepView: View {
         let b = bounds
         let lo = cal.startOfDay(for: b.earliest)
         let dayAfterLatest = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: b.latest))
-        let hi = (dayAfterLatest ?? b.latest).addingTimeInterval(-60)
+        // …minus a minute so the edge reads as 23:59 rather than the next midnight. `max(_, b.latest)`
+        // matters when `b.latest` itself falls in a day's final minute: the initial @State values are
+        // clamped INTO `bounds`, so a range that stopped short of `b.latest` would silently drag the
+        // wake time backwards the moment the sheet opened.
+        let hi = max((dayAfterLatest ?? b.latest).addingTimeInterval(-60), b.latest)
         // `bounds` is monotone and always contains the clamped initial values, so lo ≤ hi holds;
         // the max() is a belt-and-braces guard because an inverted ClosedRange traps at runtime.
         return lo...max(lo, hi)

@@ -231,6 +231,24 @@ struct HealthNotificationCenter {
                 .map { SpO2Reading(percent: Int(($0.value * 100).rounded()), time: $0.start) }
         }
 
+        // ⚠️ THE TWO SOURCES OVERLAP, AND ANY COUNT-BASED RULE MUST NOT SEE THE OVERLAP.
+        //
+        // On the post-drain paths (`RingSession`'s wake-drain and ContentView's foreground sync)
+        // `commitDrainedRecords` has ALREADY persisted this batch before `evaluate` runs, while
+        // `session.historySamples` still holds it — it is only cleared at the start of the NEXT
+        // drain. So every just-drained reading appears TWICE, with identical time and value.
+        //
+        // That was harmless while every rule was a min/max over the series. It stopped being
+        // harmless the moment the low-SpO2 rule started COUNTING readings: a single artifact epoch,
+        // duplicated, satisfies `lowSpO2MinReadings = 2` with a zero gap inside a zero-length
+        // window — reproducing the exact false alert the persistence gate was written to stop, on
+        // the exact path that produced the tester's. Found by adversarial review, not by a test.
+        //
+        // De-duplicate on (device timestamp, value). Two genuine readings cannot share a device
+        // timestamp — the ring emits one epoch per 150 s slot — so this can only ever remove copies.
+        spo2 = Self.deduped(spo2, key: { ($0.time, $0.percent) })
+        hr = Self.deduped(hr, key: { ($0.start, $0.bpm) })
+
         // --- #144: activity gate for the HR rules ------------------------------------------------
         // Exercise HR routinely crosses 120 bpm, so the raw high-HR / elevated-while-inactive rules
         // would fire a false "high heart rate" alarm after every workout. Gate them on concurrent
@@ -341,6 +359,21 @@ struct HealthNotificationCenter {
             if let headacheRowDay { try? localStore.markRiskAlerted(day: headacheRowDay) }
         }
         for n in fire { await post(n, hit: hitByNotif[n], signals: headacheSignals) }
+    }
+
+    /// Stable-order de-duplication on a `(Date, Int)` identity — first occurrence wins, order is
+    /// otherwise preserved so the downstream rules see the same series they always did, minus the
+    /// copies. See the call site for why the overlap exists and why it is now load-bearing.
+    static func deduped<T>(_ items: [T], key: (T) -> (Date, Int)) -> [T] {
+        var seen = Set<String>()
+        var out: [T] = []
+        out.reserveCapacity(items.count)
+        for item in items {
+            let k = key(item)
+            // A composite string key avoids requiring Hashable conformance on the sample types.
+            if seen.insert("\(k.0.timeIntervalSince1970)|\(k.1)").inserted { out.append(item) }
+        }
+        return out
     }
 
     /// Whether `n` is one of the #85 skin-temp/fever notifications that de-dupe per night (see
@@ -641,6 +674,15 @@ struct HealthNotificationCenter {
     /// Post a "ring fully charged" notification, routed through the shared gate so it
     /// respects quiet hours and the anti-spam backoff. Called by ContentView when
     /// `BatteryTTE.justReachedFull` fires. (#86)
+    ///
+    /// ACCEPTED CONSEQUENCE of quiet hours now defaulting ON: this notification is EDGE-triggered
+    /// (`ContentView` sets `batteryWasFull = true` before calling, and `onChange` won't re-fire at a
+    /// steady 100 %), so a charge that completes inside the quiet window is DROPPED rather than
+    /// deferred. Judged acceptable and deliberately not worked around: the ring cannot be worn while
+    /// charging, the trigger already requires the app to be foregrounded and observing battery, and
+    /// the alternative — buzzing at 03:00 about a battery — is worse than reading it in the app the
+    /// next morning. Every OTHER family on this gate is re-derived on the next evaluate pass and so
+    /// is merely delayed to 07:00, not lost.
     func postChargingComplete(store localStore: LocalStore) async {
         let candidates: [HealthNotification] = [.chargingComplete]
         let quiet = HealthAlertDefaults.quietHours()
@@ -799,8 +841,14 @@ struct HealthNotificationCenter {
         guard let date else { return "" }
         let f = DateFormatter(); f.timeStyle = .short
         let clock = f.string(from: date)
-        if calendar.isDate(date, inSameDayAs: now) { return "at \(clock)" }
-        if calendar.isDateInYesterday(date) { return "yesterday at \(clock)" }
+        // Every branch is measured against `now`, never against the system clock. `isDateInYesterday`
+        // reads the host clock and so ignored the injected `now`, which made the copy untestable and
+        // left one of its own tests a time-bomb that would start failing the day after it was written
+        // (adversarial review, 2026-08-12). Day-difference arithmetic honours the parameter.
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date),
+                                           to: calendar.startOfDay(for: now)).day ?? 0
+        if days == 0 { return "at \(clock)" }
+        if days == 1 { return "yesterday at \(clock)" }
         let day = DateFormatter()
         day.setLocalizedDateFormatFromTemplate("EEE")
         return "on \(day.string(from: date)) at \(clock)"
@@ -810,9 +858,10 @@ struct HealthNotificationCenter {
     /// already ranked. Defaulted so every other call site (and `HealthAlertCopyTests`) is unchanged.
     static func copy(for n: HealthNotification, hit: HealthAlertHit?,
                      signals: [HeadacheSignals.Feature] = [],
-                     now: Date = Date()) -> (title: String, body: String) {
+                     now: Date = Date(),
+                     calendar: Calendar = .current) -> (title: String, body: String) {
         // Carries its own preposition — see `whenPhrase`. Never prefix it with " at ".
-        let at = whenPhrase(hit?.time, now: now)
+        let at = whenPhrase(hit?.time, now: now, calendar: calendar)
         switch n {
         case .highHR:
             let bpm = hit.map { Int($0.value) }
