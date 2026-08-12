@@ -1923,8 +1923,13 @@ final class RingSession: NSObject {
         let window = DateInterval(start: start, end: max(end, start))
 
         // Skin temp (#69): nightly mean from the persisted worn overnight readings.
-        let tempC = (try? store.samples(kind: .temperature, from: start, to: end))?.map(\.value)
-        let nightlyTemp = tempC.flatMap { SkinTempBaseline.nightlyMean($0) }
+        // Keeps the TIMESTAMPS rather than mapping straight to `.value`: the gate is about how much
+        // of the night's circadian curve was actually sampled, and a bare `[Double]` cannot express
+        // that (see `SkinTempBaseline.minNightlyCoverage`). Passing values alone silently degrades
+        // the gate to a count, which measurement showed is nearly a no-op.
+        let tempSamples = ((try? store.samples(kind: .temperature, from: start, to: end)) ?? [])
+            .map { TemperatureSample(time: $0.start, celsius: $0.value) }
+        let nightlyTemp = SkinTempBaseline.nightlyMean(samples: tempSamples, in: window)
         if let nightlyTemp { extras.skinTempC = nightlyTemp }
 
         // Rolling baseline from PRIOR nights (exclude tonight's day), for the composite temp factor.

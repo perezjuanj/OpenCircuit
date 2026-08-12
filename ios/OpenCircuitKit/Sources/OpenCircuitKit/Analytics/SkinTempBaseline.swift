@@ -70,15 +70,46 @@ public enum SkinTempBaseline {
     /// against a baseline built the same inconsistent way manufactures night-to-night swings out of
     /// nothing but connection luck. The un-gated mean published both with equal confidence.
     ///
-    /// Ten readings is the floor at which a night has sampled enough of the curve to be worth
-    /// comparing. Below it we return nil — which the callers already handle as "no usable
-    /// temperature this night" (`skinTempC > 0` guards throughout) — rather than publish a number
-    /// whose value depends mostly on when the link happened to survive.
+    /// A count floor alone, kept as a cheap first cut. ⚠️ IT IS NOT THE REAL GATE — see
+    /// `minNightlyCoverage`. 🟢 MEASURED on a tester's own well-connected night (decoded from the
+    /// 0x10/0x87 descriptor frames in their diagnostics export): **533 worn readings across a
+    /// 10 h window, 47–69 in every single hour** — about one per 68 s. So ten readings is roughly
+    /// ELEVEN MINUTES of connected time, and a count floor set anywhere sane rejects only nights
+    /// that barely connected at all. It does nothing about the case actually reported: a night
+    /// connected for two hours of eight passes a count floor easily while still having measured
+    /// only one corner of the curve.
     ///
     /// Finger-switching remains a real second-order effect (different tissue depth and perfusion),
     /// but it cannot be corrected for from the ring's data and it is not what makes a night with 3
     /// samples disagree with a night with 40.
     public static let minNightlySamples = 10
+
+    /// The REAL gate: the fraction of the night's hour-long buckets that must contain at least one
+    /// reading before the night's mean is comparable to another night's.
+    ///
+    /// Sleeping skin temperature follows a circadian curve — it rises after onset, peaks in the
+    /// small hours, falls before waking — so a mean is only comparable to another mean if the two
+    /// sampled the same SHAPE. Coverage measures that directly; a raw count cannot, because 100
+    /// readings from one connected hour and 100 spread over ten hours are the same number and
+    /// completely different measurements. Differencing an unevenly-sampled night against a baseline
+    /// built the same uneven way manufactures night-to-night swings out of connection luck, which is
+    /// exactly the "inconsistent readings" a tester reported (2026-08-12).
+    ///
+    /// 0.6 admits the well-connected night measured above (11 of 11 buckets = 1.00) with a wide
+    /// margin, and rejects the two-hours-of-eight case (0.25). It is a judgement about how much of a
+    /// curve is enough, not a fitted constant — labelled accordingly, and it errs toward showing
+    /// nothing rather than showing a number that means something different each night.
+    public static let minNightlyCoverage = 0.6
+
+    /// Fraction of `window`'s hour-long buckets holding ≥1 reading, in 0…1. Pure so the gate and any
+    /// diagnostic can report the same number.
+    public static func coverage(samples: [TemperatureSample], in window: DateInterval) -> Double {
+        let buckets = max(1, Int((window.duration / 3600).rounded(.up)))
+        let hit = Set(samples.filter { window.contains($0.time) }.map {
+            Int($0.time.timeIntervalSince(window.start) / 3600)
+        })
+        return Double(hit.count) / Double(buckets)
+    }
 
     /// Mean of skin-temperature readings inside a sleep window. Pass the night's persisted
     /// `.temperature` samples (already worn- and window-gated by RingSession). nil when there are
@@ -92,11 +123,18 @@ public enum SkinTempBaseline {
         return celsius.reduce(0, +) / Double(celsius.count)
     }
 
-    /// Convenience over `TemperatureSample`s, scoped to `[start, end]` (inclusive).
+    /// The night's mean, scoped to `[start, end]` (inclusive) and gated on COVERAGE as well as
+    /// count. THIS is the overload production should use — the array-only one above cannot see the
+    /// timestamps and therefore cannot tell a well-sampled night from a well-connected hour.
+    ///
+    /// `minCoverage: 0` is the kill-switch for the coverage half of the gate.
     public static func nightlyMean(samples: [TemperatureSample], in window: DateInterval,
-                                   minSamples: Int = minNightlySamples) -> Double? {
-        nightlyMean(samples.filter { window.contains($0.time) }.map(\.celsius),
-                    minSamples: minSamples)
+                                   minSamples: Int = minNightlySamples,
+                                   minCoverage: Double = minNightlyCoverage) -> Double? {
+        let inWindow = samples.filter { window.contains($0.time) }
+        guard minCoverage <= 0 || coverage(samples: inWindow, in: window) >= minCoverage
+        else { return nil }
+        return nightlyMean(inWindow.map(\.celsius), minSamples: minSamples)
     }
 
     /// Rolling baseline = mean of the most recent `windowNights` PRIOR nightly means. The
