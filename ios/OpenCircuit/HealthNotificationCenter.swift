@@ -188,7 +188,35 @@ struct HealthNotificationCenter {
     /// silence the older half of every drain — the legitimate background alerts we most need to
     /// deliver. De-dupe is NOT done here by sample age: the evaluator's per-notification `lastFired`
     /// filter is the sole guard that stops an already-alerted crossing from replaying on later syncs.
-    static let instantLookback: TimeInterval = 12 * 3600
+    ///
+    /// ⚠️ THIS IS A FLOOR, NOT THE WINDOW — see `instantLookback(quietHours:)`. Quiet hours DROP a
+    /// candidate outright rather than queue it, so a lookback that does not outlast the quiet window
+    /// turns "delayed until morning" into "lost forever".
+    static let baseInstantLookback: TimeInterval = 12 * 3600
+
+    /// The lookback actually used, widened by however long quiet hours suppress for.
+    ///
+    /// 🟢 MEASURED by adversarial review against the real Kit types (2026-08-12), on the exact
+    /// reading this feature's copy fix was written for. `NotificationGate.shouldFire` drops a
+    /// quiet-hours candidate unconditionally — there is no pending queue and no scheduled trigger —
+    /// and `evaluate` returns before `markFired`, so nothing is persisted. Delivery therefore
+    /// depends entirely on the reading STILL being inside this rolling device-timestamp window when
+    /// the window reopens.
+    ///
+    /// With a bare 12 h lookback and quiet hours 22:00–07:00 that fails: a crossing at 18:06 whose
+    /// link only delivers it at 06:00 is a live candidate at every pass inside quiet hours and has
+    /// aged out (07:00 − 12 h = 19:00 > 18:06) at the first pass outside them. It can never fire.
+    /// The class lost is everything older than `quietEnd − baseInstantLookback` — and quiet hours
+    /// ship ON, so it was a default-install regression, not an edge case.
+    ///
+    /// Adding the suppressed span is exactly sufficient, not a guess: the oldest reading that can
+    /// be a candidate when the window CLOSES is `quietStart − base`, and it must survive to
+    /// `quietEnd = quietStart + span`, so the window must reach back `base + span`. Nothing older
+    /// was ever eligible. The `lastFired` filter still does the de-duping, so widening cannot make
+    /// an already-alerted crossing replay.
+    static func instantLookback(quietHours: QuietHours) -> TimeInterval {
+        baseInstantLookback + quietHours.suppressedSpan
+    }
 
     /// Evaluate ALL health-alert conditions (#73 + #85) from the store (+ optional live session),
     /// then post a debounced notification for each survivor. Safe to call liberally — a no-op when
@@ -206,7 +234,10 @@ struct HealthNotificationCenter {
 
         // --- #73: high HR / low SpO2 / elevated-HR-while-inactive --------------------------------
         let thresholds = HealthAlertDefaults.thresholds()
-        let instantSince = now.addingTimeInterval(-Self.instantLookback)
+        // Read the quiet window HERE, not just at the gate below: it sets how far back a crossing
+        // suppressed overnight must still be visible for the morning pass to deliver it.
+        let quiet = HealthAlertDefaults.quietHours()
+        let instantSince = now.addingTimeInterval(-Self.instantLookback(quietHours: quiet))
         let lastFired = store.lastFired()
         // Fetch the whole recent window (stored + the just-synced in-memory batch) and let the pure
         // evaluator's per-notification `lastFired` filter do the de-dupe. HR is fetched over the SAME
@@ -326,7 +357,9 @@ struct HealthNotificationCenter {
         }
 
         // --- Route survivors through the ONE shared gate (quiet hours + backoff) ---------------
-        let quiet = HealthAlertDefaults.quietHours()
+        // `quiet` is the SAME value read at the top of this pass, where it also set the lookback.
+        // Re-reading it here would let a settings change mid-pass produce a window and a gate that
+        // disagree about the same night.
         let fire = gate.filter(candidates, now: now, lastFired: lastFired, quietHours: quiet)
         guard !fire.isEmpty else { return }
         // Reserve the survivors against the anti-spam backoff SYNCHRONOUSLY — there is no `await`

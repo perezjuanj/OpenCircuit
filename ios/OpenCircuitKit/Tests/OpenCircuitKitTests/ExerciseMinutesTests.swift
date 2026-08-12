@@ -25,8 +25,9 @@ final class ExerciseMinutesTests: XCTestCase {
     // MARK: Heart-rate-reserve threshold
 
     /// The reported defect, as arithmetic. At age 35 the old model gives 92 bpm to everyone. Under
-    /// HRR the person who rests at 78 gets 121 and the person who rests at 45 gets 101 — each 40 %
-    /// of the way up their OWN range, which is what "moderate intensity" means.
+    /// HRR the person who rests at 78 gets 120 and the person who rests at 45 gets 101 — each 40 %
+    /// of the way up their OWN range, which is what "moderate intensity" means. (78 + 0.4·107 =
+    /// 120.8, truncated to 120 by the Int conversion in `threshold`.)
     func testThresholdIsRelativeToRestingHR() {
         XCTAssertEqual(ExerciseMinutes.threshold(maxHR: 185, restingHR: 78), 78 + Int(0.4 * 107))
         XCTAssertEqual(ExerciseMinutes.threshold(maxHR: 185, restingHR: 45), 45 + Int(0.4 * 140))

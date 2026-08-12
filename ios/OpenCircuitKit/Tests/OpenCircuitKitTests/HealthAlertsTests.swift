@@ -125,6 +125,53 @@ final class HealthAlertsTests: XCTestCase {
         XCTAssertNil(HealthAlertEvaluator.lowSpO2([spo2(97, 1), spo2(96, 2)], thresholdPercent: 90))
     }
 
+    /// The recency cut must be applied AFTER the runs are built. Pre-filtering the series splits a
+    /// desaturation that straddles a previous fire: the surviving half drops below `minReadings` and
+    /// the whole event vanishes, where the pre-persistence rule still reported it.
+    func testLowSpO2DoesNotLoseARunStraddlingThePreviousFire() {
+        let run = [spo2(88, 3, 0), spo2(84, 3, 5), spo2(86, 3, 10)]
+        // We already alerted just after the first reading; only two of the three are "new".
+        let cut = at(3, 2)
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(run, thresholdPercent: 90, since: cut)?.percent,
+                       84, "the run survives and still reports its true nadir")
+
+        // The pathological shape: only ONE reading postdates the cut. Pre-filtering would leave a
+        // single reading, fail minReadings, and report nothing at all.
+        let straddle = [spo2(88, 3, 0), spo2(84, 3, 5)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(straddle, thresholdPercent: 90,
+                                                    since: at(3, 2))?.percent, 84)
+    }
+
+    /// …but a run that is entirely OLD must not re-alert.
+    func testLowSpO2DoesNotReAlertAFinishedRun() {
+        let run = [spo2(88, 3, 0), spo2(84, 3, 5)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(run, thresholdPercent: 90, since: at(4, 0)))
+    }
+
+    /// The kill-switch honours the cut too, so turning persistence off cannot resurrect old hits.
+    func testLowSpO2KillSwitchHonoursTheRecencyCut() {
+        let r = [spo2(80, 1, 0), spo2(88, 5, 0)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, minReadings: 1,
+                                                    since: at(3, 0))?.percent, 88)
+    }
+
+    // MARK: Quiet hours must delay, never destroy
+
+    /// A quiet-hours window DROPS candidates rather than queueing them, so anything deriving its
+    /// candidates from a rolling lookback must outlast the window or the suppression becomes
+    /// permanent. `suppressedSpan` is what the lookback is widened by.
+    func testQuietHoursSuppressedSpanIsTheWindowLength() {
+        XCTAssertEqual(QuietHours(enabled: true, startMinutes: 22 * 60,
+                                  endMinutes: 7 * 60).suppressedSpan, 9 * 3600, accuracy: 1e-9)
+        XCTAssertEqual(QuietHours(enabled: true, startMinutes: 1 * 60,
+                                  endMinutes: 6 * 60).suppressedSpan, 5 * 3600, accuracy: 1e-9)
+        XCTAssertEqual(QuietHours(enabled: false, startMinutes: 22 * 60,
+                                  endMinutes: 7 * 60).suppressedSpan, 0, accuracy: 1e-9)
+        XCTAssertEqual(QuietHours(enabled: true, startMinutes: 300,
+                                  endMinutes: 300).suppressedSpan, 0, accuracy: 1e-9,
+                       "a degenerate window suppresses nothing")
+    }
+
     /// The gate is wired into `evaluate`, not just callable in isolation.
     func testEvaluateAppliesThePersistenceGate() {
         let artifact = [spo2(97, 6, 54), spo2(89, 7, 4), spo2(96, 7, 14)]

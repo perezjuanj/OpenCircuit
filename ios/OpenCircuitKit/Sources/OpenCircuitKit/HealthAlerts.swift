@@ -71,6 +71,18 @@ public struct QuietHours: Equatable, Sendable {
         }
         return m >= startMinutes || m < endMinutes // wraps past midnight
     }
+
+    /// How long the window suppresses for, in seconds — 0 when disabled or degenerate. Wrap-aware.
+    ///
+    /// This is not decoration: a caller that derives its candidates from a rolling LOOKBACK must
+    /// widen that lookback by this span, or everything the window suppresses ages out of the
+    /// lookback before the window reopens and is lost rather than delayed. See
+    /// `HealthNotificationCenter.instantLookback` for the measured failure that motivated it.
+    public var suppressedSpan: TimeInterval {
+        guard enabled, startMinutes != endMinutes else { return 0 }
+        let minutes = ((endMinutes - startMinutes) % 1440 + 1440) % 1440
+        return TimeInterval(minutes * 60)
+    }
 }
 
 // MARK: - De-dupe / DND gate
@@ -200,7 +212,7 @@ public enum HealthAlertEvaluator {
         samples.filter { $0.bpm >= thresholdBpm }.max { $0.bpm < $1.bpm }
     }
 
-    /// The worst (lowest) reading of the first PERSISTENT low-SpO2 run, or nil. "Low blood oxygen
+    /// The worst (lowest) reading across every PERSISTENT low-SpO2 run, or nil. "Low blood oxygen
     /// detected at [time]" (pp.txt:48398).
     ///
     /// ══ WHY A SINGLE READING IS NOT ENOUGH ══
@@ -224,8 +236,13 @@ public enum HealthAlertEvaluator {
     /// accumulating one. A genuine desaturation — apnea is cyclic, and altitude/illness is
     /// sustained — produces many qualifying readings inside one window and is unaffected.
     ///
-    /// Returns the WORST (lowest) reading across every qualifying run — which keeps the reported
-    /// value and time identical to the old rule's on every night that still alerts.
+    /// Returns the WORST (lowest) reading across every qualifying run. That is identical to the old
+    /// rule's value and time whenever the night's deepest reading belongs to a qualifying run —
+    /// which is every night the gate was designed to keep. It deliberately DIFFERS when the deepest
+    /// reading is an isolated artifact the gate just decided to ignore: for
+    /// [70 %@01:00, 89 %@04:00, 88 %@04:05] the old rule said 70 % and this says 88 %, because
+    /// reporting a depth we have already classified as noise would undo the whole point.
+    /// (`testLowSpO2IgnoresDepthFromNonQualifyingRuns` pins exactly that case.)
     ///
     /// ⚠️ THE OBVIOUS IMPLEMENTATION IS WRONG, AND IT IS WRONG IN THE UNSAFE DIRECTION. Returning as
     /// soon as `minReadings` is satisfied reports the minimum of the first qualifying WINDOW — a
@@ -240,16 +257,26 @@ public enum HealthAlertEvaluator {
     /// `minReadings <= 1` restores the pre-persistence behaviour exactly: the guard below short-
     /// circuits to the old "worst reading at/below threshold" over the whole series. That is the
     /// kill-switch — `HealthAlertThresholds.lowSpO2MinReadings` is the one knob to turn.
+    ///
+    /// `since` is the recency cut (the last time this notification fired). It is applied HERE, after
+    /// the runs are built, rather than by the caller pre-filtering the series — because pre-filtering
+    /// SPLITS a run. A desaturation straddling a previous fire would lose its earlier readings, drop
+    /// below `minReadings`, and vanish entirely, where the pre-persistence rule still reported it.
+    /// Runs are therefore classified on the FULL series and a run survives if it carries at least one
+    /// reading strictly newer than `since` — so the depth reported is the real run's, and an
+    /// already-finished run cannot re-alert.
     public static func lowSpO2(_ readings: [SpO2Reading], thresholdPercent: Int,
                                minReadings: Int = 2,
                                window: TimeInterval = 30 * 60,
-                               maxGap: TimeInterval = 20 * 60) -> SpO2Reading? {
+                               maxGap: TimeInterval = 20 * 60,
+                               since: Date? = nil) -> SpO2Reading? {
         // `percent > 0` drops the "no reading" sentinel; the decoder's own 70…100 plausibility
         // guard (`BulkRecord.spo2Percent`) has already rejected impossible bytes upstream.
         let low = readings.filter { $0.percent > 0 && $0.percent <= thresholdPercent }
             .sorted { $0.time < $1.time }
         guard !low.isEmpty else { return nil }
-        guard minReadings > 1 else { return lowest(low) }
+        let cut = since ?? .distantPast
+        guard minReadings > 1 else { return lowest(low.filter { $0.time > cut }) }
 
         // Split into runs of readings joined by <= maxGap. The gap term is what stops two unrelated
         // single-epoch artifacts far apart from pairing into a fake run.
@@ -278,7 +305,12 @@ public enum HealthAlertEvaluator {
             return false
         }
 
-        return lowest(runs.filter(qualifies).flatMap { $0 })
+        // A run must both QUALIFY and carry something new since the last fire. Depth is then taken
+        // over the whole surviving run — including readings older than `cut` — because the number
+        // shown must be the desaturation's real nadir, not the nadir of whatever part of it happens
+        // to postdate the previous notification.
+        let live = runs.filter { qualifies($0) && $0.contains { $0.time > cut } }
+        return lowest(live.flatMap { $0 })
     }
 
     /// Lowest reading, ties broken by the EARLIEST time so the same series always words itself the
@@ -366,19 +398,24 @@ public enum HealthAlertEvaluator {
                                 lastFired: [HealthNotification: Date] = [:]) -> [HealthAlertHit] {
         var hits: [HealthAlertHit] = []
         let freshHR = hr.filter { $0.start > (lastFired[.highHR] ?? .distantPast) }
-        let freshSpO2 = spo2.filter { $0.time > (lastFired[.lowSpO2] ?? .distantPast) }
         let freshInactiveHR = inactiveHR.filter {
             $0.start > (lastFired[.elevatedHRInactive] ?? .distantPast)
         }
+        // NOTE the asymmetry, and do NOT "tidy" it into a third pre-filter. `highHR` is a per-reading
+        // max and `elevatedHRInactive` re-derives its own runs from whatever it is given, so trimming
+        // their inputs is safe. `lowSpO2` classifies RUNS, and trimming its input mid-run splits one —
+        // dropping a straddling desaturation below `minReadings` and losing it entirely. It therefore
+        // takes the cut as a parameter and applies it after the runs exist.
 
         if thresholds.highHREnabled, let s = highHR(freshHR, thresholdBpm: thresholds.highHRBpm) {
             hits.append(HealthAlertHit(notification: .highHR, value: Double(s.bpm), time: s.start))
         }
         if thresholds.lowSpO2Enabled,
-           let s = lowSpO2(freshSpO2, thresholdPercent: thresholds.lowSpO2Percent,
+           let s = lowSpO2(spo2, thresholdPercent: thresholds.lowSpO2Percent,
                            minReadings: thresholds.lowSpO2MinReadings,
                            window: thresholds.lowSpO2Window,
-                           maxGap: thresholds.lowSpO2MaxGap) {
+                           maxGap: thresholds.lowSpO2MaxGap,
+                           since: lastFired[.lowSpO2]) {
             hits.append(HealthAlertHit(notification: .lowSpO2, value: Double(s.percent), time: s.time))
         }
         if thresholds.elevatedHREnabled,
