@@ -141,15 +141,19 @@ final class ExerciseMinutesTests: XCTestCase {
             HRSample(bpm: 95, start: ringOn.addingTimeInterval(3600 + Double($0) * 150))
         }
         XCTAssertNil(ExerciseMinutes.restingBaseline(early), "under the span guard")
-        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: early, maxHR: 185), 40, accuracy: 1e-9)
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: early, maxHR: 185,
+                                                deriveRestingHR: true), 40, accuracy: 1e-9)
 
         // The same walk, once enough quiet time has accrued to read the resting pulse.
         let late = early + (0 ..< 24).map {
             HRSample(bpm: 62, start: ringOn.addingTimeInterval(2.5 * 3600 + Double($0) * 150))
         }
         XCTAssertEqual(ExerciseMinutes.restingBaseline(late)!, 62, accuracy: 1e-9)
-        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: late, maxHR: 185), 0, accuracy: 1e-9,
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: late, maxHR: 185, deriveRestingHR: true),
+                       0, accuracy: 1e-9,
                        "95 bpm is not 40% of the way from 62 to 185 — correct, but it is a STEP DOWN")
+        // With the shipped default there is no boundary and no step at all.
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: late, maxHR: 185), 40, accuracy: 1e-9)
     }
 
     // MARK: The reported symptom — the ring filling from ordinary morning activity
@@ -173,9 +177,17 @@ final class ExerciseMinutesTests: XCTestCase {
         XCTAssertEqual(old, 40, accuracy: 1e-9,
                        "the old absolute 92-bpm bar filled a 30-min goal from this alone")
 
-        let new = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 185, sleepWindow: window)
+        let new = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 185, sleepWindow: window,
+                                           deriveRestingHR: true)
         XCTAssertEqual(new, 0, accuracy: 1e-9,
                        "96 bpm is 22 bpm above a 72-bpm rest — not moderate exertion")
+
+        // ⚠️ AND THAT IS WHY THE MODEL IS SHIPPED OFF. Zero is the correct answer to "was this
+        // MODERATE INTENSITY", and the wrong answer to "how much Apple Exercise Time was this",
+        // which counts a brisk walk. With the shipped default the day still reads 40 minutes.
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: samples, maxHR: 185, sleepWindow: window),
+                       old, accuracy: 1e-9,
+                       "shipped default must reproduce the pre-HRR model exactly")
     }
 
     /// …and real exertion by the same wearer still counts, so the gate is not simply "off".

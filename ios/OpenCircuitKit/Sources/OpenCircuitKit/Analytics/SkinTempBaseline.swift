@@ -95,11 +95,38 @@ public enum SkinTempBaseline {
     /// built the same uneven way manufactures night-to-night swings out of connection luck, which is
     /// exactly the "inconsistent readings" a tester reported (2026-08-12).
     ///
-    /// 0.6 admits the well-connected night measured above (11 of 11 buckets = 1.00) with a wide
-    /// margin, and rejects the two-hours-of-eight case (0.25). It is a judgement about how much of a
-    /// curve is enough, not a fitted constant — labelled accordingly, and it errs toward showing
-    /// nothing rather than showing a number that means something different each night.
-    public static let minNightlyCoverage = 0.6
+    /// ⚠️ SHIPPED AT 0 — THE COVERAGE GATE IS OFF. The machinery and its tests stay; only the
+    /// default is neutered, so enabling it later is a one-line change plus the measurement below.
+    ///
+    /// 0.6 admits the well-connected night measured above (11 of 11 buckets = 1.00) and rejects the
+    /// two-hours-of-eight case (0.25) — but those are the ONLY two data points behind it, one real
+    /// and one hypothetical, and 0.6 sits in the unmeasured gap between them. Release review found
+    /// two reasons that is not good enough to ship:
+    ///
+    ///  1. CASCADE. Withholding the nightly mean sets `skinTempC = 0`, which every downstream
+    ///     consumer reads as "no temperature this night". Below `minBaselineNights` (3) surviving
+    ///     nights in the window there is no baseline at all — so no deviation is ever shown, the #85
+    ///     skin-temp/fever notification family goes permanently silent, and #183 loses its
+    ///     `skinTempDeviation` feature. The tester who motivated this already had 7 of 14 nights with
+    ///     no temperature; a gate tuned wrong could take her under the floor and turn a partially
+    ///     working feature into a dead one.
+    ///  2. THE DENOMINATOR IS THE WRONG WINDOW. Coverage is normalised over the STAGED in-bed span,
+    ///     but temperature is only ever persisted inside the RECORDING window (the habitual
+    ///     schedule, roughly median onset −1 h to median wake +1.5 h). A night whose bedtime is
+    ///     hours off the habit therefore scores low no matter how well the ring was connected —
+    ///     review pinned a perfectly-connected night at 0.55 — and, in the other direction, a
+    ///     truncated staged window shrinks numerator and denominator together and scores 1.00 while
+    ///     having measured one corner of the curve. Both are exactly the failure this gate exists to
+    ///     prevent.
+    ///
+    /// To enable: run `coverage` over ~14 real stored nights per tester to get the actual
+    /// distribution, pick the threshold from it, and normalise over the intersection of the staged
+    /// window and the recording window rather than the staged window alone.
+    public static let minNightlyCoverage = 0.0
+
+    /// The value to enable once the measurement above exists. Referenced by the tests so the
+    /// intended behaviour stays pinned while the default is neutral.
+    public static let candidateNightlyCoverage = 0.6
 
     /// Fraction of `window`'s hour-long buckets holding ≥1 reading, in 0…1. Pure so the gate and any
     /// diagnostic can report the same number.

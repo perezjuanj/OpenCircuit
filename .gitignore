@@ -28,3 +28,11 @@ Thumbs.db
 ios/build/
 ios/DerivedData/
 *.xcuserstate
+
+# Claude Code working directory. IGNORED WHOLESALE ON PURPOSE — this is a PUBLIC repo and
+# `.claude/testflight-triage/` holds real tester crash reports (`crash.ips.txt`) and triage
+# notes, i.e. exactly the personal data the capture rules keep out of git. It was previously
+# neither tracked nor ignored, so a single `git add -A` would have published it.
+# The skills under `.claude/skills/` are project knowledge and MAY be worth tracking — if so,
+# add them deliberately with `git add -f .claude/skills`, never by relaxing this rule.
+.claude/

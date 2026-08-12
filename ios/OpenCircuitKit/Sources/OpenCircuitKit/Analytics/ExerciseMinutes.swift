@@ -24,10 +24,58 @@ import Foundation
 
 public enum ExerciseMinutes {
 
-    /// Fraction of HEART-RATE RESERVE at which a reading counts as elevated. 0.40 is the ACSM
-    /// moderate-intensity floor (moderate = 40–59 % HRR), which is the same activity band Apple's
-    /// own "brisk walk or above" Exercise definition names.
+    /// ══ THE PERSONALISED THRESHOLD IS OFF. READ THIS BEFORE TURNING IT BACK ON. ══
+    ///
+    /// `false` ⇒ the %-of-max model, byte-identical to what shipped through build 41. This is the
+    /// ONE switch: `elevatedPieces`, `estimate` and `Calories` all resolve their baseline through
+    /// `effectiveRestingBaseline`, so nothing can be left half-converted.
+    ///
+    /// It is off because the personalised model as tuned here is WRONG IN THE OTHER DIRECTION, and
+    /// that was measured, not guessed. Release review built this Kit and ran realistic days at the
+    /// ring's 150 s epoch cadence: a 35-year-old walker with a 66.5 bpm resting pulse, walking at
+    /// 96–99 bpm, went from **95 elevated minutes to 0**, active calories 406 → 72, and an Activity
+    /// Score of 100 to 50 — on a completely unchanged day. The tester whose report motivated the
+    /// change went from 200 minutes to 0. And it is provably one-directional: `new < old` requires
+    /// `rhr < maxHR/6 ≈ 31 bpm`, which the 35 bpm plausibility floor excludes, so NO user anywhere
+    /// gains a single minute or calorie.
+    ///
+    /// The error was mine and it is worth naming precisely, because the arithmetic below is fine.
+    /// 0.40 HRR is the textbook ACSM floor for MODERATE INTENSITY — but this file estimates Apple
+    /// EXERCISE TIME, whose definition is "brisk walk or above", and a brisk walk does not reach
+    /// 40 % HRR. Equating the two is a taxonomy conflation; it made us stricter than the metric we
+    /// are approximating. I measured the fix on a high-resting-pulse day, saw 280 min → 12.5, and
+    /// read the collapse as success without asking whether 12.5 was the right answer for a day that
+    /// contained a real walk. It was not.
+    ///
+    /// The reported defect is still real — an absolute %-of-max bar over-credits a fast resting
+    /// pulse — and heart-rate reserve is still the right shape for the fix. What it needs before it
+    /// ships: a fraction re-fitted against days with KNOWN activity (review's sweep put the cliff
+    /// between 0.25 and 0.30 HRR — 0.25 → 60 min, 0.30 → 2 min, so ~0.25 is the candidate), a
+    /// resting baseline that outlives the day so the ring cannot run backwards mid-morning, and a
+    /// re-baselined `GoalDefaults.defaultActivityMinutes` (still 30, set against the old bar).
+    public static let personalisedThresholdEnabled = false
+
+    /// Fraction of HEART-RATE RESERVE at which a reading counts as elevated. Dormant while
+    /// `personalisedThresholdEnabled` is false. ⚠️ 0.40 is the ACSM MODERATE floor, which is NOT the
+    /// same band as Apple's "brisk walk or above" — see above. Re-fit before enabling.
     public static let hrReserveFraction = 0.40
+
+    /// The baseline every consumer must resolve through, so the kill-switch cannot be honoured in
+    /// one place and ignored in another.
+    ///
+    /// This exists because the first version of the switch DIDN'T work: `Calories.legacyDailyEstimate`
+    /// re-derived the baseline directly, so flipping `deriveRestingHR` produced a hybrid — old-model
+    /// minutes divided into new-model qualifying samples. Release review measured the wreckage
+    /// (40 min priced at 0.00 kcal where 161.66 was correct; 70 min at 574.69 where 410.09 was
+    /// correct, +40 %) and noted `swift test` could not see it, because both models are individually
+    /// self-consistent. A kill-switch that corrupts the thing it is meant to restore is worse than
+    /// no kill-switch.
+    public static func effectiveRestingBaseline(
+        _ hrSamples: [HRSample],
+        derive: Bool = personalisedThresholdEnabled
+    ) -> Double? {
+        derive ? restingBaseline(hrSamples) : nil
+    }
 
     /// Plausibility band for a derived resting HR. Outside it we do not trust the value and fall
     /// back to the %-of-max model rather than compute a threshold off a bad baseline.
@@ -173,7 +221,7 @@ public enum ExerciseMinutes {
         epochSeconds: TimeInterval = TimeInterval(BulkRecord.epochSeconds),
         pointSampleWidth: TimeInterval = 0,
         restingHR: Double? = nil,
-        deriveRestingHR: Bool = true
+        deriveRestingHR: Bool = personalisedThresholdEnabled
     ) -> Double {
         let seconds = elevatedPieces(hrSamples: hrSamples,
                                      maxHR: maxHR,
@@ -233,9 +281,9 @@ public enum ExerciseMinutes {
         epochSeconds: TimeInterval = TimeInterval(BulkRecord.epochSeconds),
         pointSampleWidth: TimeInterval = 0,
         restingHR: Double? = nil,
-        deriveRestingHR: Bool = true
+        deriveRestingHR: Bool = personalisedThresholdEnabled
     ) -> [ElevatedPiece] {
-        let effectiveRHR = restingHR ?? (deriveRestingHR ? restingBaseline(hrSamples) : nil)
+        let effectiveRHR = restingHR ?? effectiveRestingBaseline(hrSamples, derive: deriveRestingHR)
         let thresh = threshold(maxHR: maxHR, restingHR: effectiveRHR)
         let elevated = hrSamples
             .filter { s in

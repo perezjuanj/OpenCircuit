@@ -77,7 +77,8 @@ final class SkinTempBaselineTests: XCTestCase {
         }
         XCTAssertGreaterThan(samples.count, 500)
         XCTAssertEqual(SkinTempBaseline.coverage(samples: samples, in: w), 1.0, accuracy: 1e-9)
-        XCTAssertEqual(SkinTempBaseline.nightlyMean(samples: samples, in: w)!, 35.5, accuracy: 1e-9)
+        XCTAssertEqual(SkinTempBaseline.nightlyMean(samples: samples, in: w,
+                       minCoverage: SkinTempBaseline.candidateNightlyCoverage)!, 35.5, accuracy: 1e-9)
     }
 
     /// The REPORTED case, and the one a count floor cannot catch: the link held for two hours of
@@ -91,7 +92,11 @@ final class SkinTempBaselineTests: XCTestCase {
         XCTAssertGreaterThan(samples.count, SkinTempBaseline.minNightlySamples,
                              "the count floor alone would let this through")
         XCTAssertEqual(SkinTempBaseline.coverage(samples: samples, in: w), 0.2, accuracy: 1e-9)
-        XCTAssertNil(SkinTempBaseline.nightlyMean(samples: samples, in: w))
+        XCTAssertNil(SkinTempBaseline.nightlyMean(samples: samples, in: w,
+                     minCoverage: SkinTempBaseline.candidateNightlyCoverage))
+        // …and with the SHIPPED default (gate off) the same night is published — the deliberate
+        // ship-state, pinned so turning the gate on is a visible change rather than a silent one.
+        XCTAssertNotNil(SkinTempBaseline.nightlyMean(samples: samples, in: w))
     }
 
     /// A night with gaps but readings spread across most of it is still comparable.
@@ -102,7 +107,8 @@ final class SkinTempBaselineTests: XCTestCase {
             TemperatureSample(time: w.start.addingTimeInterval($0), celsius: 35.0)
         }
         XCTAssertEqual(SkinTempBaseline.coverage(samples: samples, in: w), 1.0, accuracy: 1e-9)
-        XCTAssertEqual(SkinTempBaseline.nightlyMean(samples: samples, in: w)!, 35.0, accuracy: 1e-9)
+        XCTAssertEqual(SkinTempBaseline.nightlyMean(samples: samples, in: w,
+                       minCoverage: SkinTempBaseline.candidateNightlyCoverage)!, 35.0, accuracy: 1e-9)
     }
 
     /// `minCoverage: 0` is the kill-switch for the coverage half.
