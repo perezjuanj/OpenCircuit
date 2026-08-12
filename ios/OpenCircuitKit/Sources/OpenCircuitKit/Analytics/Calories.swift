@@ -272,7 +272,12 @@ public enum Calories {
             sleepWindow: sleepWindow
         )
 
-        let threshold = ExerciseMinutes.threshold(maxHR: maxHR)
+        // MUST be the same threshold `elevatedPieces` just used inside `estimate` above — it is
+        // derived from these same samples, so re-deriving it here reproduces it exactly. Calling
+        // the bare `threshold(maxHR:)` would price a DIFFERENT qualifying set than the minutes it
+        // divides by, silently mixing two models in one kcal number.
+        let threshold = ExerciseMinutes.threshold(
+            maxHR: maxHR, restingHR: ExerciseMinutes.restingBaseline(hrSamples))
         let qualifyingBPM = hrSamples.compactMap { sample -> Int? in
             guard sample.bpm >= threshold,
                   sleepWindow.map({ !$0.contains(sample.start) }) ?? true else { return nil }

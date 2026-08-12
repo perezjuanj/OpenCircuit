@@ -705,10 +705,15 @@ final class RingSession: NSObject {
     /// Namespaced by the ring's identifier (#multi-ring) so two rings' epoch archives can't collide on
     /// the UInt32 epoch counter (which would corrupt overnight stitching).
     let epochArchiveStore: EpochArchiveStore
+    /// Whether CoreBluetooth currently holds the link. Read by the WEAR reminder, which must not
+    /// tell the user to "put your ring back on" while the ring is demonstrably connected — a quiet
+    /// notify pipe on a live link is our problem, not a ring the user took off.
+    var isLinkConnected: Bool { peripheral.state == .connected }
+
     /// `writeChar` can outlive an actual usable link during reconnect churn, so connection state
     /// is part of the write gate too.
     private var canWriteCommands: Bool {
-        peripheral.state == .connected && writeChar != nil
+        isLinkConnected && writeChar != nil
     }
 
     private let dataServiceUUID = CBUUID(string: OpenCircuitKit.Transport.dataServiceUUID)

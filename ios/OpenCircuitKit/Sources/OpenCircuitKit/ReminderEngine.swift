@@ -52,21 +52,65 @@ public struct SedentaryReminder: Equatable, Sendable {
 
 // MARK: - Wear reminder
 
-/// Fire if we have ever connected to the ring but ring data has gone silent for
-/// longer than `noDataInterval`. Opt-in (default off) — never fires before the first
-/// connection (`everConnected = false`).
+/// Fire when the ring appears to be OFF THE FINGER. Opt-in (default off) — never fires before the
+/// first connection (`everConnected = false`).
+///
+/// ══ SILENCE IS NOT EVIDENCE OF NOT-WEARING ══
+///
+/// 🟢 A tester reported "alerts that the ring is not detected even though I am wearing it… once or
+/// twice a day, and overnight" (2026-08-12). Their diagnostics bundle shows why: the sync activity
+/// log is dominated by `session replaced — no drain ran` and the epoch archive carries multi-hour
+/// holes — the BLE LINK drops routinely while the ring keeps recording perfectly well on the
+/// finger, and the backlog lands on the next successful drain. The old predicate ("no frame in
+/// 20 min") measured the health of OUR CONNECTION and reported it to the user as a fact about
+/// their ring. It is wrong for exactly the population it fires on hardest — the users whose link is
+/// flakiest — and the user can do nothing about it, which is the definition of a bad alert.
+///
+/// So silence is now only ONE necessary condition. Three suppressions carry the actual evidence:
+///
+///  1. `isConnected` — a live link with a quiet notify pipe means the ring is right there. Whatever
+///     is wrong, "put your ring back on" is the wrong instruction.
+///  2. `lastWornEvidenceAt` — the newest DEVICE timestamp we hold for an epoch the ring recorded
+///     while WORN (an epoch carrying a heart rate; the unworn template decodes no HR at all — see
+///     `BulkRecord.Layout.idle`). This arrives late by design, on the drain that heals the gap, and
+///     it is retro-active proof that the silent window was worn. Only silence NEWER than that proof
+///     can still be a genuine take-off.
+///  3. `inSleepWindow` — the tester got this at night. Nobody acts on a wear nag while asleep, and
+///     the overnight link is the least reliable of all; a nag here is pure cost.
+///
+/// The default interval is also an hour rather than 20 minutes: a background drain cadence measured
+/// in tens of minutes made 20 min indistinguishable from a normal quiet stretch.
 public struct WearReminder: Equatable, Sendable {
     /// Gap without ring data that triggers the reminder.
     public var noDataInterval: TimeInterval
 
-    public init(noDataInterval: TimeInterval = 20 * 60) {
+    public init(noDataInterval: TimeInterval = 60 * 60) {
         self.noDataInterval = noDataInterval
     }
 
-    /// True when data from the ring has been absent for ≥ `noDataInterval` and the ring
-    /// has been connected at least once in this session.
-    public func shouldFire(lastRingDataAt: Date?, now: Date, everConnected: Bool) -> Bool {
-        guard everConnected else { return false }
+    /// True when the ring looks genuinely un-worn: nothing has arrived for ≥ `noDataInterval`, we
+    /// are not currently connected, we are not inside the user's sleep window, and no drained epoch
+    /// proves the ring was on the finger during the silence.
+    ///
+    /// - Parameters:
+    ///   - lastRingDataAt: newest moment ANY frame arrived (wall-clock), or nil.
+    ///   - everConnected: a ring has been paired at least once. nil-safe gate, unchanged.
+    ///   - lastWornEvidenceAt: newest DEVICE timestamp of an epoch recorded while worn, or nil when
+    ///     we hold none. Deliberately compared against `now`, not against `lastRingDataAt`: it is
+    ///     proof about the RING'S OWN timeline, so it must age out on the same clock the silence does.
+    ///   - isConnected: a ring is connected right now.
+    ///   - inSleepWindow: `now` falls inside the user's configured sleep schedule.
+    public func shouldFire(lastRingDataAt: Date?, now: Date, everConnected: Bool,
+                           lastWornEvidenceAt: Date? = nil,
+                           isConnected: Bool = false,
+                           inSleepWindow: Bool = false) -> Bool {
+        guard everConnected, !isConnected, !inSleepWindow else { return false }
+        // Positive proof the ring was worn recently outranks the absence of frames. A worn epoch
+        // dated within `noDataInterval` of now means the ring was on the finger for the very
+        // stretch the silence rule is about to complain about.
+        if let worn = lastWornEvidenceAt, now.timeIntervalSince(worn) < noDataInterval {
+            return false
+        }
         guard let last = lastRingDataAt else { return true }   // ever connected but no data
         return now.timeIntervalSince(last) >= noDataInterval
     }

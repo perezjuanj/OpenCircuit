@@ -24,11 +24,93 @@ import Foundation
 
 public enum ExerciseMinutes {
 
-    /// HR threshold for exercise: ≥ 50% of max HR (brisk-walking equivalent).
+    /// Fraction of HEART-RATE RESERVE at which a reading counts as elevated. 0.40 is the ACSM
+    /// moderate-intensity floor (moderate = 40–59 % HRR), which is the same activity band Apple's
+    /// own "brisk walk or above" Exercise definition names.
+    public static let hrReserveFraction = 0.40
+
+    /// Plausibility band for a derived resting HR. Outside it we do not trust the value and fall
+    /// back to the %-of-max model rather than compute a threshold off a bad baseline.
+    ///
+    /// The 90 ceiling is deliberately below the physiological maximum for a resting pulse: a
+    /// derived value that high is far more likely to mean "this sample set never contained rest"
+    /// than "this person rests at 95". Falling back there errs toward the LOWER threshold, i.e.
+    /// toward crediting the user, which is the safe direction for a goal ring.
+    static let plausibleRestingHR: ClosedRange<Double> = 35 ... 90
+
+    /// Minimum readings before a derived resting baseline is trusted.
+    static let minRestingBaselineSamples = 12
+    /// Minimum span the readings must cover before a derived resting baseline is trusted.
+    ///
+    /// Both guards exist because `lowestSustained` answers "what is the quietest stretch IN THIS
+    /// ARRAY", which is only a resting HR if the array actually contains a quiet stretch. Three
+    /// readings taken during a workout produce a "resting HR" of 100 and a threshold of 134 — the
+    /// exact failure a unit fixture hit when this landed. Requiring several hours of readings makes
+    /// it overwhelmingly likely the window contains genuine rest; below it we use the %-of-max
+    /// model, which needs no such assumption.
+    static let minRestingBaselineSpan: TimeInterval = 4 * 3600
+
+    /// HR threshold for exercise, in bpm.
+    ///
+    /// ══ WHY THIS IS RELATIVE TO RESTING HR ══
+    ///
+    /// With `restingHR` nil this is the ORIGINAL model — 50 % of max HR — kept byte-identical as
+    /// the degrade path and the kill-switch.
+    ///
+    /// That model is wrong in a specific, reported way: it ignores where the person STARTS. A
+    /// tester wrote "Elevated HR… seems to fill up too easily… it was nearly complete right after I
+    /// woke up. I generally have a fast heart rate" (2026-08-12). She is describing the defect
+    /// exactly. At age 35 the old threshold is 92 bpm for everyone; for someone resting at 78 that
+    /// is 14 bpm above rest — reached by standing up and making coffee — while for someone resting
+    /// at 45 the same 92 bpm is real exertion. One absolute number cannot mean the same thing to
+    /// both, so the ring filled from ordinary morning ambulation for her and would under-credit an
+    /// endurance athlete on the same day.
+    ///
+    /// Heart-rate reserve is the standard fix and the one the exercise-physiology literature
+    /// defines intensity in: `threshold = RHR + fraction · (maxHR − RHR)` (Karvonen). At 40 % HRR
+    /// the same two people get 121 bpm and 99 bpm — each ~40 % of the way up their OWN range.
+    ///
+    /// Note this generally RAISES the threshold versus 50 % maxHR (ACSM puts 40–59 % HRR at
+    /// 64–76 % maxHR, so the old constant sat below even the LIGHT band). Elevated-HR minutes and
+    /// the active-calorie estimate that prices the same qualifying periods therefore both come
+    /// down. That is the intended direction: the old number over-credited.
+    ///
+    /// The `max(…, 60)` absolute floor is retained from the original model unchanged — no adult's
+    /// exercise threshold should land below 60 bpm regardless of what the inputs say.
+    ///
     /// NOTE: Full 4-level intensity (Vigorous/Moderate/Low/Inactive) follows the #93
     /// activity-record capture (PROTOCOL.md §5.3.1), not the current measurement record.
-    public static func threshold(maxHR: Int) -> Int {
-        return max(Int(Double(max(maxHR, 1)) * 0.5), 60)
+    public static func threshold(maxHR: Int, restingHR: Double? = nil) -> Int {
+        let mx = Double(max(maxHR, 1))
+        guard let rhr = restingHR, plausibleRestingHR.contains(rhr), rhr < mx else {
+            return max(Int(mx * 0.5), 60)
+        }
+        return max(Int(rhr + hrReserveFraction * (mx - rhr)), 60)
+    }
+
+    /// The resting-HR baseline to price a day's elevated time against, derived from the SAME HR
+    /// samples the estimate is computed over.
+    ///
+    /// Deriving it here rather than threading a parameter through every call site is deliberate and
+    /// load-bearing: `ExerciseMinutes.elevatedPieces` is the single owner of "which periods count",
+    /// and `Calories` prices exactly those periods. A caller that forgot to pass the baseline would
+    /// silently produce a different qualifying set for calories than for the minutes ring — the one
+    /// invariant `GoalsCardView`'s footnote promises the user ("Active calories and elevated-HR
+    /// minutes now use the same qualifying heart-rate periods"). Same input samples ⇒ same
+    /// baseline ⇒ same periods, with no call site able to get it wrong.
+    ///
+    /// `RestingHR.lowestSustained` is the lowest rolling 5-min mean, which is Apple Health's own
+    /// resting-HR convention and requires ≥2 readings in the window, so a single low spot read
+    /// cannot depress the baseline (and thereby the threshold). nil — too few samples, or a value
+    /// outside `plausibleRestingHR` — degrades to the %-of-max model.
+    public static func restingBaseline(_ hrSamples: [HRSample]) -> Double? {
+        let valid = hrSamples.filter { LiveHR.validBPM.contains($0.bpm) }
+        guard valid.count >= minRestingBaselineSamples,
+              let first = valid.map(\.start).min(), let last = valid.map(\.start).max(),
+              last.timeIntervalSince(first) >= minRestingBaselineSpan,
+              let rhr = RestingHR.lowestSustained(hr: valid, window: RestingHR.sustainedWindow)
+        else { return nil }
+        return plausibleRestingHR.contains(rhr) ? rhr : nil
     }
 
     /// Estimate exercise minutes as the total merged duration of elevated-HR intervals,
@@ -59,13 +141,17 @@ public enum ExerciseMinutes {
         maxHR: Int,
         sleepWindow: DateInterval? = nil,
         epochSeconds: TimeInterval = TimeInterval(BulkRecord.epochSeconds),
-        pointSampleWidth: TimeInterval = 0
+        pointSampleWidth: TimeInterval = 0,
+        restingHR: Double? = nil,
+        deriveRestingHR: Bool = true
     ) -> Double {
         let seconds = elevatedPieces(hrSamples: hrSamples,
                                      maxHR: maxHR,
                                      sleepWindow: sleepWindow,
                                      epochSeconds: epochSeconds,
-                                     pointSampleWidth: pointSampleWidth)
+                                     pointSampleWidth: pointSampleWidth,
+                                     restingHR: restingHR,
+                                     deriveRestingHR: deriveRestingHR)
             .reduce(0.0) { $0 + $1.seconds }
         return seconds / 60.0
     }
@@ -99,14 +185,28 @@ public enum ExerciseMinutes {
     /// Overlap rule: where two elevated samples cover the same instant, the EARLIER one keeps it
     /// (the later slice starts where the earlier ends). Total duration is therefore exactly the
     /// merged-union duration, and a live spot read landing inside a bulk epoch cannot add time.
+    ///
+    /// `restingHR` personalises the threshold (see `threshold(maxHR:restingHR:)`). Left nil — every
+    /// production call site — it is DERIVED from `hrSamples` via `restingBaseline`, so callers
+    /// cannot accidentally price calories against a different qualifying set than the minutes ring
+    /// uses. Pass a value explicitly only to override that derivation.
+    ///
+    /// `deriveRestingHR: false` is THE KILL-SWITCH: it restores the pre-HRR %-of-max model exactly,
+    /// everywhere at once. It exists as a parameter rather than a mutable global so it stays
+    /// Sendable and so the tests can pin both models side by side; flipping this default to `false`
+    /// is the one-line revert. Note nil-`restingHR` alone does NOT mean "old model" here — nil means
+    /// "derive it", which is why this flag is separate.
     public static func elevatedPieces(
         hrSamples: [HRSample],
         maxHR: Int,
         sleepWindow: DateInterval? = nil,
         epochSeconds: TimeInterval = TimeInterval(BulkRecord.epochSeconds),
-        pointSampleWidth: TimeInterval = 0
+        pointSampleWidth: TimeInterval = 0,
+        restingHR: Double? = nil,
+        deriveRestingHR: Bool = true
     ) -> [ElevatedPiece] {
-        let thresh = threshold(maxHR: maxHR)
+        let effectiveRHR = restingHR ?? (deriveRestingHR ? restingBaseline(hrSamples) : nil)
+        let thresh = threshold(maxHR: maxHR, restingHR: effectiveRHR)
         let elevated = hrSamples
             .filter { s in
                 s.bpm >= thresh

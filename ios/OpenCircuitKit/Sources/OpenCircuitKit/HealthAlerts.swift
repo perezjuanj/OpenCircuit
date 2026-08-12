@@ -121,6 +121,16 @@ public struct HealthAlertThresholds: Equatable, Sendable {
     public var highHRBpm: Int
     public var lowSpO2Enabled: Bool
     public var lowSpO2Percent: Int
+    /// How many readings at/below `lowSpO2Percent` must land inside `lowSpO2Window` before the
+    /// alert may fire. See `lowSpO2` for why a single reading is not enough. `1` restores the
+    /// pre-persistence behaviour byte-for-byte (the kill-switch).
+    public var lowSpO2MinReadings: Int
+    /// The span the qualifying readings must fall inside.
+    public var lowSpO2Window: TimeInterval
+    /// Largest allowed spacing between two CONSECUTIVE qualifying readings still counted as the
+    /// same desaturation. Wider than the ~5-min SpO2 duty cycle so one skipped slot doesn't break
+    /// a real run, narrower than the window so two unrelated dips can't pair up.
+    public var lowSpO2MaxGap: TimeInterval
     public var elevatedHREnabled: Bool
     public var elevatedHRBpm: Int
     public var elevatedSustained: TimeInterval
@@ -132,6 +142,9 @@ public struct HealthAlertThresholds: Equatable, Sendable {
                 highHRBpm: Int = 120,
                 lowSpO2Enabled: Bool = true,
                 lowSpO2Percent: Int = 90,
+                lowSpO2MinReadings: Int = 2,
+                lowSpO2Window: TimeInterval = 30 * 60,
+                lowSpO2MaxGap: TimeInterval = 20 * 60,
                 elevatedHREnabled: Bool = true,
                 elevatedHRBpm: Int = 100,
                 elevatedSustained: TimeInterval = 10 * 60,
@@ -140,6 +153,9 @@ public struct HealthAlertThresholds: Equatable, Sendable {
         self.highHRBpm = highHRBpm
         self.lowSpO2Enabled = lowSpO2Enabled
         self.lowSpO2Percent = lowSpO2Percent
+        self.lowSpO2MinReadings = lowSpO2MinReadings
+        self.lowSpO2Window = lowSpO2Window
+        self.lowSpO2MaxGap = lowSpO2MaxGap
         self.elevatedHREnabled = elevatedHREnabled
         self.elevatedHRBpm = elevatedHRBpm
         self.elevatedSustained = elevatedSustained
@@ -184,10 +200,65 @@ public enum HealthAlertEvaluator {
         samples.filter { $0.bpm >= thresholdBpm }.max { $0.bpm < $1.bpm }
     }
 
-    /// The worst (lowest) SpO2 reading at/below the threshold, or nil. "Low blood oxygen detected
-    /// at [time]" (pp.txt:48398).
-    public static func lowSpO2(_ readings: [SpO2Reading], thresholdPercent: Int) -> SpO2Reading? {
-        readings.filter { $0.percent > 0 && $0.percent <= thresholdPercent }.min { $0.percent < $1.percent }
+    /// The worst (lowest) reading of the first PERSISTENT low-SpO2 run, or nil. "Low blood oxygen
+    /// detected at [time]" (pp.txt:48398).
+    ///
+    /// ══ WHY A SINGLE READING IS NOT ENOUGH ══
+    ///
+    /// 🟢 MEASURED on a tester's own 2026-08-11 night, decoded from the `0x4c` bytes in their
+    /// diagnostics export: 141 SpO2 epochs across the night, of which EXACTLY ONE sat at/below the
+    /// default 90 % threshold — 89 % at 07:04 — and its four nearest SpO2 neighbours read
+    /// 97 / 96 / **89** / 95 / 96. One epoch, 8 points below its own immediate neighbourhood, is a
+    /// perfusion/motion artifact, not a desaturation; the ring's own high-fidelity path already
+    /// median-filters exactly this shape away before taking extremes (`OSASpO2.medianFilter`, "used
+    /// to reject single-window spikes"). The un-gated rule fired a full "Low blood oxygen detected"
+    /// alert on it, and did so most nights — which is what drove testers to report that the alert
+    /// "loses its importance because it doesn't seem accurate". An alert that is wrong most times it
+    /// fires trains people to ignore the time it is right, so the persistence gate is a SAFETY
+    /// change, not merely a UX one.
+    ///
+    /// THE RULE. Fire only when `minReadings` readings at/below the threshold fall inside one
+    /// `window`-long span AND no two CONSECUTIVE qualifying readings are more than `maxGap` apart.
+    /// The gap term is what stops two unrelated single-epoch artifacts 28 minutes apart from
+    /// pairing up into a fake "run"; the window term is what stops a slow all-night drift from
+    /// accumulating one. A genuine desaturation — apnea is cyclic, and altitude/illness is
+    /// sustained — produces many qualifying readings inside one window and is unaffected.
+    ///
+    /// Returns the LOWEST reading of the qualifying run (the number worth showing the user), which
+    /// keeps the reported value identical to the old rule's on every night that still alerts.
+    ///
+    /// `minReadings <= 1` restores the pre-persistence behaviour exactly: the guard below short-
+    /// circuits to the old "worst reading at/below threshold" over the whole series. That is the
+    /// kill-switch — `HealthAlertThresholds.lowSpO2MinReadings` is the one knob to turn.
+    public static func lowSpO2(_ readings: [SpO2Reading], thresholdPercent: Int,
+                               minReadings: Int = 2,
+                               window: TimeInterval = 30 * 60,
+                               maxGap: TimeInterval = 20 * 60) -> SpO2Reading? {
+        // `percent > 0` drops the "no reading" sentinel; the decoder's own 70…100 plausibility
+        // guard (`BulkRecord.spo2Percent`) has already rejected impossible bytes upstream.
+        let low = readings.filter { $0.percent > 0 && $0.percent <= thresholdPercent }
+            .sorted { $0.time < $1.time }
+        guard !low.isEmpty else { return nil }
+        guard minReadings > 1 else { return low.min { $0.percent < $1.percent } }
+
+        // Sweep runs of qualifying readings joined by <= maxGap, and take the FIRST run that packs
+        // `minReadings` of them into a `window`-long span. Scanning within the run (rather than
+        // requiring the whole run to fit the window) is what lets a long, genuinely sustained
+        // desaturation qualify on its first `minReadings` readings instead of being disqualified
+        // for lasting too long.
+        var runStart = 0
+        for i in low.indices {
+            if i > runStart, low[i].time.timeIntervalSince(low[i - 1].time) > maxGap {
+                runStart = i                       // gap too wide — a fresh run begins here
+            }
+            // Earliest reading of this run still within `window` of low[i].
+            var first = runStart
+            while low[i].time.timeIntervalSince(low[first].time) > window { first += 1 }
+            if i - first + 1 >= minReadings {
+                return low[first...i].min { $0.percent < $1.percent }
+            }
+        }
+        return nil
     }
 
     /// The reading that COMPLETES a continuous run of HR ≥ threshold spanning ≥ `minDuration`,
@@ -277,7 +348,11 @@ public enum HealthAlertEvaluator {
         if thresholds.highHREnabled, let s = highHR(freshHR, thresholdBpm: thresholds.highHRBpm) {
             hits.append(HealthAlertHit(notification: .highHR, value: Double(s.bpm), time: s.start))
         }
-        if thresholds.lowSpO2Enabled, let s = lowSpO2(freshSpO2, thresholdPercent: thresholds.lowSpO2Percent) {
+        if thresholds.lowSpO2Enabled,
+           let s = lowSpO2(freshSpO2, thresholdPercent: thresholds.lowSpO2Percent,
+                           minReadings: thresholds.lowSpO2MinReadings,
+                           window: thresholds.lowSpO2Window,
+                           maxGap: thresholds.lowSpO2MaxGap) {
             hits.append(HealthAlertHit(notification: .lowSpO2, value: Double(s.percent), time: s.time))
         }
         if thresholds.elevatedHREnabled,

@@ -828,13 +828,17 @@ struct ContentView: View {
         let wakeMinutes = d.integer(forKey: SleepScheduleDefaults.wakeMinutes)
         let sleepEnabled = d.bool(forKey: SleepScheduleDefaults.enabled)
         let s = session
+        // The wear reminder needs the store for its worn-evidence input (newest HR device
+        // timestamp). Built here on the main actor, like `evaluateHealthAlerts` does.
+        let store = LocalStore(modelContext)
         Task {
             await HealthNotificationCenter().evaluateReminders(
                 session: s,
                 sleepBedMinutes: bedMinutes,
                 sleepWakeMinutes: wakeMinutes,
                 sleepEnabled: sleepEnabled,
-                includeSedentary: includeSedentary)
+                includeSedentary: includeSedentary,
+                store: store)
         }
     }
 

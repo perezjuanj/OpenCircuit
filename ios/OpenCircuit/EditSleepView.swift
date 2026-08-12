@@ -86,26 +86,51 @@ struct EditSleepView: View {
             || !SleepEdit.isSamePickerMinute(times.sleepOnset, initialTimes.sleepOnset)
             || !SleepEdit.isSamePickerMinute(times.sleepWake, initialTimes.sleepWake)
     }
-    private var bedtimeRange: ClosedRange<Date> {
-        bounds.earliest...onset
-    }
-    private var onsetRange: ClosedRange<Date> {
-        bedtime...min(bounds.latest, wake.addingTimeInterval(-Self.minimumDuration))
-    }
-    private var wakeRange: ClosedRange<Date> {
-        max(bounds.earliest,
-            onset.addingTimeInterval(Self.minimumDuration))...bounds.latest
+    // ══ WHY THE PICKERS ARE BOUNDED BY WHOLE DAYS, NOT BY THE EXACT RULE ══
+    //
+    // 🟢 A tester with a night detected as in-bed 22:51 / asleep 23:47 / wake 08:57 reported that
+    // his real onset was 01:13 and that he "can't even edit my asleep time to that" (2026-08-12).
+    // `SleepEdit.validate` ALLOWS 01:13 — it is inside the bounds and after bedtime. The picker was
+    // the blocker.
+    //
+    // A SwiftUI `DatePicker(selection:in:)` clamps every intermediate value, and it exposes the
+    // date and the time as SEPARATE controls. With an exact range of 22:51 (Aug 11) … 08:27
+    // (Aug 12), moving a selection of "Aug 11 23:47" to "Aug 12 01:13" has no legal path:
+    //   • change the TIME first → "Aug 11 01:13", which is before 22:51 → clamped back;
+    //   • change the DATE first → "Aug 12 23:47", which is after 08:27 → clamped back.
+    // Every sub-day range that spans midnight is unreachable across the midnight boundary in
+    // exactly this way, which is the entire population of nights this editor exists for.
+    //
+    // So the pickers now offer the CONTAINING CALENDAR DAYS and the real rule is enforced where it
+    // was always meant to be: `invalid` prints the reason inline and `Save` stays disabled. That
+    // path already existed and was simply unreachable — `.startBeforeEarliest` / `.endAfterLatest`
+    // could never be produced by a picker that clamped them away first.
+    //
+    // The ORDERING rules (bedtime ≤ onset, wake ≥ onset + 30 min) move to validation for the same
+    // reason. They used to bound the pickers against each other, which reproduces the identical
+    // trap one level down: with bedtime at 22:51 on Aug 11, the onset picker's own lower bound was
+    // 22:51 Aug 11 — so onset still could not cross midnight even though `bounds` allowed it. Every
+    // anchor therefore shares ONE day-granular range, and `invalid` is the sole judge.
+    private var pickerRange: ClosedRange<Date> {
+        let cal = Calendar.current
+        let b = bounds
+        let lo = cal.startOfDay(for: b.earliest)
+        let dayAfterLatest = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: b.latest))
+        let hi = (dayAfterLatest ?? b.latest).addingTimeInterval(-60)
+        // `bounds` is monotone and always contains the clamped initial values, so lo ≤ hi holds;
+        // the max() is a belt-and-braces guard because an inverted ClosedRange traps at runtime.
+        return lo...max(lo, hi)
     }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    DatePicker("In bed", selection: $bedtime, in: bedtimeRange,
+                    DatePicker("In bed", selection: $bedtime, in: pickerRange,
                                displayedComponents: [.date, .hourAndMinute])
-                    DatePicker("Fell asleep", selection: $onset, in: onsetRange,
+                    DatePicker("Fell asleep", selection: $onset, in: pickerRange,
                                displayedComponents: [.date, .hourAndMinute])
-                    DatePicker("Woke up", selection: $wake, in: wakeRange,
+                    DatePicker("Woke up", selection: $wake, in: pickerRange,
                                displayedComponents: [.date, .hourAndMinute])
                 } header: {
                     Text("Editable Time Range")

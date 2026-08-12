@@ -53,17 +53,50 @@ public enum SkinTempBaseline {
         }
     }
 
+    /// Minimum readings before a night's mean is comparable to another night's.
+    ///
+    /// ══ WHY COVERAGE, NOT JUST NON-EMPTINESS ══
+    ///
+    /// 🟢 A tester reported skin-temperature readings that "seem inconsistent" and wondered whether
+    /// switching which finger she wears the ring on was the cause (2026-08-12). Her own diagnostics
+    /// bundle names a simpler first-order cause: skin temp rides the LIVE `0x10`/`0x87` descriptor,
+    /// NOT the drainable `0x4c` history (see this file's header), so a night only has temperature
+    /// for the stretches the ring stayed connected — and her log shows the link dropping repeatedly,
+    /// with only 7 of 14 nights carrying any temperature at all.
+    ///
+    /// Sleeping skin temperature is not flat: it rises after sleep onset, peaks in the small hours
+    /// and falls before waking. A mean over three samples near bedtime and a mean over forty spread
+    /// across the night are therefore measuring DIFFERENT PARTS OF A CURVE, and differencing them
+    /// against a baseline built the same inconsistent way manufactures night-to-night swings out of
+    /// nothing but connection luck. The un-gated mean published both with equal confidence.
+    ///
+    /// Ten readings is the floor at which a night has sampled enough of the curve to be worth
+    /// comparing. Below it we return nil — which the callers already handle as "no usable
+    /// temperature this night" (`skinTempC > 0` guards throughout) — rather than publish a number
+    /// whose value depends mostly on when the link happened to survive.
+    ///
+    /// Finger-switching remains a real second-order effect (different tissue depth and perfusion),
+    /// but it cannot be corrected for from the ring's data and it is not what makes a night with 3
+    /// samples disagree with a night with 40.
+    public static let minNightlySamples = 10
+
     /// Mean of skin-temperature readings inside a sleep window. Pass the night's persisted
-    /// `.temperature` samples (already worn- and window-gated by RingSession). nil when there
-    /// are no readings — a connection-free night has none until #87 lands.
-    public static func nightlyMean(_ celsius: [Double]) -> Double? {
-        guard !celsius.isEmpty else { return nil }
+    /// `.temperature` samples (already worn- and window-gated by RingSession). nil when there are
+    /// too few readings to represent the night — a connection-free night has none until #87 lands,
+    /// and a barely-connected one is no more comparable (see `minNightlySamples`).
+    ///
+    /// `minSamples` is the kill-switch: pass `1` for the old any-non-empty behaviour.
+    public static func nightlyMean(_ celsius: [Double],
+                                   minSamples: Int = minNightlySamples) -> Double? {
+        guard celsius.count >= max(1, minSamples) else { return nil }
         return celsius.reduce(0, +) / Double(celsius.count)
     }
 
     /// Convenience over `TemperatureSample`s, scoped to `[start, end]` (inclusive).
-    public static func nightlyMean(samples: [TemperatureSample], in window: DateInterval) -> Double? {
-        nightlyMean(samples.filter { window.contains($0.time) }.map(\.celsius))
+    public static func nightlyMean(samples: [TemperatureSample], in window: DateInterval,
+                                   minSamples: Int = minNightlySamples) -> Double? {
+        nightlyMean(samples.filter { window.contains($0.time) }.map(\.celsius),
+                    minSamples: minSamples)
     }
 
     /// Rolling baseline = mean of the most recent `windowNights` PRIOR nightly means. The

@@ -20,13 +20,79 @@ final class HealthAlertsTests: XCTestCase {
         XCTAssertNil(HealthAlertEvaluator.highHR([hr(80, 9), hr(100, 10)], thresholdBpm: 120))
     }
 
-    func testLowSpO2PicksWorstReading() {
+    /// `minReadings: 1` is the documented kill-switch, and it must reproduce the original
+    /// "worst reading at/below threshold over the whole series" rule exactly.
+    func testLowSpO2KillSwitchPicksWorstReading() {
         let r = [SpO2Reading(percent: 97, time: at(2)), SpO2Reading(percent: 88, time: at(3)),
                  SpO2Reading(percent: 91, time: at(4))]
-        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 88)
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, minReadings: 1)?.percent, 88)
         // Zero/invalid placeholders are ignored.
-        XCTAssertNil(HealthAlertEvaluator.lowSpO2([SpO2Reading(percent: 0, time: at(2))], thresholdPercent: 90))
-        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 80))
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2([SpO2Reading(percent: 0, time: at(2))],
+                                                  thresholdPercent: 90, minReadings: 1))
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 80, minReadings: 1))
+    }
+
+    // MARK: Low-SpO2 persistence gate
+
+    private func spo2(_ pct: Int, _ h: Int, _ m: Int = 0) -> SpO2Reading {
+        SpO2Reading(percent: pct, time: at(h, m))
+    }
+
+    /// The measured tester night, reduced to its shape: 141 SpO2 epochs, ONE at 89 %, neighbours
+    /// 97/96/95/96. That single artifact epoch must NOT raise an alert.
+    func testLowSpO2IgnoresAnIsolatedArtifactEpoch() {
+        let r = [spo2(97, 6, 54), spo2(96, 6, 59), spo2(89, 7, 4), spo2(95, 7, 9), spo2(96, 7, 14)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90))
+    }
+
+    /// A genuine desaturation — repeated low readings inside one window — still fires, and still
+    /// reports the WORST reading of the run so the number the user sees is unchanged.
+    func testLowSpO2FiresOnASustainedRunAndReportsTheWorst() {
+        let r = [spo2(97, 2), spo2(89, 3, 0), spo2(86, 3, 5), spo2(90, 3, 10), spo2(97, 4)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 86)
+    }
+
+    /// Two unrelated single-epoch artifacts far apart must not pair up into a fake run.
+    func testLowSpO2DoesNotPairTwoDistantArtifacts() {
+        let r = [spo2(89, 1, 0), spo2(97, 1, 30), spo2(88, 3, 0)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90),
+                     "2 h apart exceeds both the window and the max gap")
+    }
+
+    /// …and two lows inside the window but separated by more than `maxGap` are still rejected:
+    /// the gap term is what the window term alone cannot express.
+    func testLowSpO2RejectsAWideGapInsideTheWindow() {
+        let r = [spo2(89, 1, 0), spo2(88, 1, 25)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90,
+                                                  window: 30 * 60, maxGap: 20 * 60))
+        // Bring them within the gap and the same pair now qualifies.
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2([spo2(89, 1, 0), spo2(88, 1, 15)],
+                                                    thresholdPercent: 90)?.percent, 88)
+    }
+
+    /// A long, genuinely sustained desaturation must qualify on its first `minReadings` readings
+    /// rather than be disqualified for outlasting the window.
+    func testLowSpO2FiresOnARunLongerThanTheWindow() {
+        let r = (0 ..< 20).map { spo2(88, 1, $0 * 5) }   // 100 min of continuous lows
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 88)
+    }
+
+    func testLowSpO2EmptyAndAllHealthyAreNil() {
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2([], thresholdPercent: 90))
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2([spo2(97, 1), spo2(96, 2)], thresholdPercent: 90))
+    }
+
+    /// The gate is wired into `evaluate`, not just callable in isolation.
+    func testEvaluateAppliesThePersistenceGate() {
+        let artifact = [spo2(97, 6, 54), spo2(89, 7, 4), spo2(96, 7, 14)]
+        let hits = HealthAlertEvaluator.evaluate(hr: [], spo2: artifact, inactiveHR: [],
+                                                 thresholds: HealthAlertThresholds())
+        XCTAssertFalse(hits.contains { $0.notification == .lowSpO2 })
+
+        let real = [spo2(89, 3, 0), spo2(86, 3, 5)]
+        let fired = HealthAlertEvaluator.evaluate(hr: [], spo2: real, inactiveHR: [],
+                                                  thresholds: HealthAlertThresholds())
+        XCTAssertEqual(fired.first { $0.notification == .lowSpO2 }?.value, 86)
     }
 
     func testElevatedHRInactiveSustained() {
