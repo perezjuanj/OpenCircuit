@@ -411,7 +411,7 @@ struct UserProfileSettingsView: View {
                 Stepper(value: $weekendSleepMin, in: 240...600, step: 15) {
                     LabeledContent("Weekend sleep", value: formatGoalSleep(weekendSleepMin))
                 }
-                Text("Progress rings on the dashboard show today's goal vs. actual. Elevated-HR minutes are a basic threshold estimate, not detected workout duration; active calories use those same qualifying periods with steps as the fallback.")
+                Text("Progress rings on the dashboard show today's goal vs. actual. Elevated-HR minutes are an estimate, not detected workout duration: they count time at least 40% of the way from your resting heart rate up to your age-estimated maximum, so a naturally fast or slow resting pulse doesn't shift the ring. On a day with too little data to read your resting pulse, the bar falls back to half your age-estimated maximum. Active calories use those same qualifying periods with steps as the fallback.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

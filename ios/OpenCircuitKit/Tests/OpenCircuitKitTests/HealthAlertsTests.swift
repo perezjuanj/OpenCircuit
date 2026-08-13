@@ -20,13 +20,169 @@ final class HealthAlertsTests: XCTestCase {
         XCTAssertNil(HealthAlertEvaluator.highHR([hr(80, 9), hr(100, 10)], thresholdBpm: 120))
     }
 
-    func testLowSpO2PicksWorstReading() {
+    /// `minReadings: 1` is the documented kill-switch, and it must reproduce the original
+    /// "worst reading at/below threshold over the whole series" rule exactly.
+    func testLowSpO2KillSwitchPicksWorstReading() {
         let r = [SpO2Reading(percent: 97, time: at(2)), SpO2Reading(percent: 88, time: at(3)),
                  SpO2Reading(percent: 91, time: at(4))]
-        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 88)
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, minReadings: 1)?.percent, 88)
         // Zero/invalid placeholders are ignored.
-        XCTAssertNil(HealthAlertEvaluator.lowSpO2([SpO2Reading(percent: 0, time: at(2))], thresholdPercent: 90))
-        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 80))
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2([SpO2Reading(percent: 0, time: at(2))],
+                                                  thresholdPercent: 90, minReadings: 1))
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 80, minReadings: 1))
+    }
+
+    // MARK: Low-SpO2 persistence gate
+
+    private func spo2(_ pct: Int, _ h: Int, _ m: Int = 0) -> SpO2Reading {
+        SpO2Reading(percent: pct, time: at(h, m))
+    }
+
+    /// The measured tester night, reduced to its shape: 141 SpO2 epochs, ONE at 89 %, neighbours
+    /// 97/96/95/96. That single artifact epoch must NOT raise an alert.
+    func testLowSpO2IgnoresAnIsolatedArtifactEpoch() {
+        let r = [spo2(97, 6, 54), spo2(96, 6, 59), spo2(89, 7, 4), spo2(95, 7, 9), spo2(96, 7, 14)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90))
+    }
+
+    /// A genuine desaturation — repeated low readings inside one window — still fires, and still
+    /// reports the WORST reading of the run so the number the user sees is unchanged.
+    func testLowSpO2FiresOnASustainedRunAndReportsTheWorst() {
+        let r = [spo2(97, 2), spo2(89, 3, 0), spo2(86, 3, 5), spo2(90, 3, 10), spo2(97, 4)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 86)
+    }
+
+    /// ⚠️ THE ABOVE TEST PASSES EVEN WHEN THE RULE IS WRONG, because its nadir sits inside the first
+    /// qualifying pair. These two do not. Both shapes were MEASURED against a returns-early
+    /// implementation by adversarial review (2026-08-12); each reported a shallow prefix value where
+    /// the pre-persistence rule reported the true nadir.
+
+    /// The desaturation DEEPENS after the run already qualifies. Reporting the qualifying prefix
+    /// would say 90 % at 03:00 — understating an event whose real nadir is 79 %, and misplacing it.
+    func testLowSpO2ReportsTheRunsNadirNotTheFirstQualifyingPair() {
+        let r = [spo2(90, 3, 0), spo2(90, 3, 5), spo2(79, 3, 10), spo2(82, 3, 15)]
+        let hit = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)
+        XCTAssertEqual(hit?.percent, 79)
+        XCTAssertEqual(hit?.time, at(3, 10), "the reported TIME must be the nadir's, not the prefix's")
+        // Identical to what the pre-persistence rule reported for this night.
+        XCTAssertEqual(hit?.percent,
+                       HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, minReadings: 1)?.percent)
+    }
+
+    /// A shallow qualifying pair EARLY must not mask a deeper qualifying run LATER.
+    func testLowSpO2PrefersTheDeepestQualifyingRunAcrossTheNight() {
+        let r = [spo2(90, 1, 0), spo2(90, 1, 5),
+                 spo2(78, 4, 0), spo2(76, 4, 5), spo2(74, 4, 10)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 74)
+    }
+
+    /// A deeper reading that is NOT part of any qualifying run must not be borrowed to dress up a
+    /// qualifying one — otherwise the gate would report artifact depths it just decided to ignore.
+    func testLowSpO2IgnoresDepthFromNonQualifyingRuns() {
+        let r = [spo2(70, 1, 0),                              // lone artifact, no run
+                 spo2(89, 4, 0), spo2(88, 4, 5)]              // the genuine qualifying pair
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 88)
+    }
+
+    /// The post-drain path hands the evaluator every just-drained reading TWICE (the store already
+    /// holds the batch while `session.historySamples` still does). A count-based rule must not be
+    /// satisfied by one artifact epoch counted twice — that reproduced the exact false alert the
+    /// gate exists to stop. De-duplication lives at the merge site; this pins the shape.
+    func testLowSpO2IsSatisfiedByOneEpochWhenTheSeriesIsDuplicated() {
+        let artifact = [spo2(89, 7, 4)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(artifact, thresholdPercent: 90))
+        XCTAssertNotNil(HealthAlertEvaluator.lowSpO2(artifact + artifact, thresholdPercent: 90),
+                        "a duplicated series DOES fool the count — hence the de-dupe at the merge")
+    }
+
+    /// Two unrelated single-epoch artifacts far apart must not pair up into a fake run.
+    func testLowSpO2DoesNotPairTwoDistantArtifacts() {
+        let r = [spo2(89, 1, 0), spo2(97, 1, 30), spo2(88, 3, 0)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90),
+                     "2 h apart exceeds both the window and the max gap")
+    }
+
+    /// …and two lows inside the window but separated by more than `maxGap` are still rejected:
+    /// the gap term is what the window term alone cannot express.
+    func testLowSpO2RejectsAWideGapInsideTheWindow() {
+        let r = [spo2(89, 1, 0), spo2(88, 1, 25)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90,
+                                                  window: 30 * 60, maxGap: 20 * 60))
+        // Bring them within the gap and the same pair now qualifies.
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2([spo2(89, 1, 0), spo2(88, 1, 15)],
+                                                    thresholdPercent: 90)?.percent, 88)
+    }
+
+    /// A long, genuinely sustained desaturation must qualify on its first `minReadings` readings
+    /// rather than be disqualified for outlasting the window.
+    func testLowSpO2FiresOnARunLongerThanTheWindow() {
+        let r = (0 ..< 20).map { spo2(88, 1, $0 * 5) }   // 100 min of continuous lows
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)?.percent, 88)
+    }
+
+    func testLowSpO2EmptyAndAllHealthyAreNil() {
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2([], thresholdPercent: 90))
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2([spo2(97, 1), spo2(96, 2)], thresholdPercent: 90))
+    }
+
+    /// The recency cut must be applied AFTER the runs are built. Pre-filtering the series splits a
+    /// desaturation that straddles a previous fire: the surviving half drops below `minReadings` and
+    /// the whole event vanishes, where the pre-persistence rule still reported it.
+    func testLowSpO2DoesNotLoseARunStraddlingThePreviousFire() {
+        let run = [spo2(88, 3, 0), spo2(84, 3, 5), spo2(86, 3, 10)]
+        // We already alerted just after the first reading; only two of the three are "new".
+        let cut = at(3, 2)
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(run, thresholdPercent: 90, since: cut)?.percent,
+                       84, "the run survives and still reports its true nadir")
+
+        // The pathological shape: only ONE reading postdates the cut. Pre-filtering would leave a
+        // single reading, fail minReadings, and report nothing at all.
+        let straddle = [spo2(88, 3, 0), spo2(84, 3, 5)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(straddle, thresholdPercent: 90,
+                                                    since: at(3, 2))?.percent, 84)
+    }
+
+    /// …but a run that is entirely OLD must not re-alert.
+    func testLowSpO2DoesNotReAlertAFinishedRun() {
+        let run = [spo2(88, 3, 0), spo2(84, 3, 5)]
+        XCTAssertNil(HealthAlertEvaluator.lowSpO2(run, thresholdPercent: 90, since: at(4, 0)))
+    }
+
+    /// The kill-switch honours the cut too, so turning persistence off cannot resurrect old hits.
+    func testLowSpO2KillSwitchHonoursTheRecencyCut() {
+        let r = [spo2(80, 1, 0), spo2(88, 5, 0)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, minReadings: 1,
+                                                    since: at(3, 0))?.percent, 88)
+    }
+
+    // MARK: Quiet hours must delay, never destroy
+
+    /// A quiet-hours window DROPS candidates rather than queueing them, so anything deriving its
+    /// candidates from a rolling lookback must outlast the window or the suppression becomes
+    /// permanent. `suppressedSpan` is what the lookback is widened by.
+    func testQuietHoursSuppressedSpanIsTheWindowLength() {
+        XCTAssertEqual(QuietHours(enabled: true, startMinutes: 22 * 60,
+                                  endMinutes: 7 * 60).suppressedSpan, 9 * 3600, accuracy: 1e-9)
+        XCTAssertEqual(QuietHours(enabled: true, startMinutes: 1 * 60,
+                                  endMinutes: 6 * 60).suppressedSpan, 5 * 3600, accuracy: 1e-9)
+        XCTAssertEqual(QuietHours(enabled: false, startMinutes: 22 * 60,
+                                  endMinutes: 7 * 60).suppressedSpan, 0, accuracy: 1e-9)
+        XCTAssertEqual(QuietHours(enabled: true, startMinutes: 300,
+                                  endMinutes: 300).suppressedSpan, 0, accuracy: 1e-9,
+                       "a degenerate window suppresses nothing")
+    }
+
+    /// The gate is wired into `evaluate`, not just callable in isolation.
+    func testEvaluateAppliesThePersistenceGate() {
+        let artifact = [spo2(97, 6, 54), spo2(89, 7, 4), spo2(96, 7, 14)]
+        let hits = HealthAlertEvaluator.evaluate(hr: [], spo2: artifact, inactiveHR: [],
+                                                 thresholds: HealthAlertThresholds())
+        XCTAssertFalse(hits.contains { $0.notification == .lowSpO2 })
+
+        let real = [spo2(89, 3, 0), spo2(86, 3, 5)]
+        let fired = HealthAlertEvaluator.evaluate(hr: [], spo2: real, inactiveHR: [],
+                                                  thresholds: HealthAlertThresholds())
+        XCTAssertEqual(fired.first { $0.notification == .lowSpO2 }?.value, 86)
     }
 
     func testElevatedHRInactiveSustained() {

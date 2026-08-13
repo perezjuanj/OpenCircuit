@@ -10,9 +10,11 @@ final class SkinTempBaselineTests: XCTestCase {
         return SkinTempBaseline.NightlyTemp(night: day, celsius: c)
     }
 
+    /// The arithmetic, exercised with the coverage gate opened (`minSamples: 1`) so this test keeps
+    /// asserting what it always asserted: the mean itself. The gate has its own tests below.
     func testNightlyMean() {
-        XCTAssertNil(SkinTempBaseline.nightlyMean([]))
-        XCTAssertEqual(SkinTempBaseline.nightlyMean([30, 31, 32])!, 31, accuracy: 1e-9)
+        XCTAssertNil(SkinTempBaseline.nightlyMean([], minSamples: 1))
+        XCTAssertEqual(SkinTempBaseline.nightlyMean([30, 31, 32], minSamples: 1)!, 31, accuracy: 1e-9)
     }
 
     func testNightlyMeanWindowed() {
@@ -23,7 +25,99 @@ final class SkinTempBaselineTests: XCTestCase {
             TemperatureSample(time: base.addingTimeInterval(10_000), celsius: 99),  // outside window
         ]
         let window = DateInterval(start: base, end: base.addingTimeInterval(120))
-        XCTAssertEqual(SkinTempBaseline.nightlyMean(samples: samples, in: window)!, 31, accuracy: 1e-9)
+        XCTAssertEqual(SkinTempBaseline.nightlyMean(samples: samples, in: window, minSamples: 1)!,
+                       31, accuracy: 1e-9)
+    }
+
+    // MARK: Coverage gate — a barely-connected night is not comparable to a well-covered one
+
+    func testNightlyMeanRejectsAThinlyCoveredNight() {
+        // Three readings is what a night with one short connected stretch produces. Sleeping skin
+        // temp follows a circadian curve, so three samples from one corner of it are not a night.
+        XCTAssertNil(SkinTempBaseline.nightlyMean([30, 31, 32]),
+                     "below minNightlySamples → no nightly value at all")
+        XCTAssertNil(SkinTempBaseline.nightlyMean(
+            Array(repeating: 31.0, count: SkinTempBaseline.minNightlySamples - 1)))
+    }
+
+    func testNightlyMeanAcceptsAtTheCoverageFloor() {
+        let n = SkinTempBaseline.minNightlySamples
+        let values = Array(repeating: 31.0, count: n)
+        XCTAssertEqual(SkinTempBaseline.nightlyMean(values)!, 31, accuracy: 1e-9)
+    }
+
+    func testWindowedCoverageCountsOnlyInWindowSamples() {
+        // Enough samples overall, but only two land inside the sleep window → still nil. The gate
+        // must judge the night, not the array it was sliced from.
+        let base = Date()
+        let inWindow = (0 ..< 2).map {
+            TemperatureSample(time: base.addingTimeInterval(Double($0) * 60), celsius: 31)
+        }
+        let outside = (0 ..< 20).map {
+            TemperatureSample(time: base.addingTimeInterval(10_000 + Double($0) * 60), celsius: 31)
+        }
+        let window = DateInterval(start: base, end: base.addingTimeInterval(300))
+        XCTAssertNil(SkinTempBaseline.nightlyMean(samples: inWindow + outside, in: window))
+    }
+
+    // MARK: The gate that actually matters — coverage of the night's curve
+
+    private func night(hours: Double = 10) -> DateInterval {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        return DateInterval(start: start, duration: hours * 3600)
+    }
+
+    /// A well-connected night: the real cadence measured off a tester's descriptor frames is ~1
+    /// reading per 68 s, giving 47–69 per hour in every hour of a 10 h window. It must pass with a
+    /// wide margin — the gate exists to reject broken nights, not normal ones.
+    func testAWellConnectedNightPasses() {
+        let w = night()
+        let samples = stride(from: 0.0, to: w.duration, by: 68).map {
+            TemperatureSample(time: w.start.addingTimeInterval($0), celsius: 35.5)
+        }
+        XCTAssertGreaterThan(samples.count, 500)
+        XCTAssertEqual(SkinTempBaseline.coverage(samples: samples, in: w), 1.0, accuracy: 1e-9)
+        XCTAssertEqual(SkinTempBaseline.nightlyMean(samples: samples, in: w,
+                       minCoverage: SkinTempBaseline.candidateNightlyCoverage)!, 35.5, accuracy: 1e-9)
+    }
+
+    /// The REPORTED case, and the one a count floor cannot catch: the link held for two hours of
+    /// ten. Hundreds of readings — far past any sane count floor — but only one corner of the
+    /// circadian curve, so its mean is not comparable to a full night's.
+    func testAPartiallyConnectedNightIsRejectedDespiteManyReadings() {
+        let w = night()
+        let samples = stride(from: 0.0, to: 2 * 3600, by: 68).map {
+            TemperatureSample(time: w.start.addingTimeInterval($0), celsius: 34.0)
+        }
+        XCTAssertGreaterThan(samples.count, SkinTempBaseline.minNightlySamples,
+                             "the count floor alone would let this through")
+        XCTAssertEqual(SkinTempBaseline.coverage(samples: samples, in: w), 0.2, accuracy: 1e-9)
+        XCTAssertNil(SkinTempBaseline.nightlyMean(samples: samples, in: w,
+                     minCoverage: SkinTempBaseline.candidateNightlyCoverage))
+        // …and with the SHIPPED default (gate off) the same night is published — the deliberate
+        // ship-state, pinned so turning the gate on is a visible change rather than a silent one.
+        XCTAssertNotNil(SkinTempBaseline.nightlyMean(samples: samples, in: w))
+    }
+
+    /// A night with gaps but readings spread across most of it is still comparable.
+    func testASparseButWellSpreadNightPasses() {
+        let w = night()
+        // One reading every 20 min → 30 readings, every hour represented.
+        let samples = stride(from: 0.0, to: w.duration, by: 1200).map {
+            TemperatureSample(time: w.start.addingTimeInterval($0), celsius: 35.0)
+        }
+        XCTAssertEqual(SkinTempBaseline.coverage(samples: samples, in: w), 1.0, accuracy: 1e-9)
+        XCTAssertEqual(SkinTempBaseline.nightlyMean(samples: samples, in: w,
+                       minCoverage: SkinTempBaseline.candidateNightlyCoverage)!, 35.0, accuracy: 1e-9)
+    }
+
+    /// `minCoverage: 0` is the kill-switch for the coverage half.
+    func testCoverageKillSwitch() {
+        let w = night()
+        let samples = stride(from: 0.0, to: 2 * 3600, by: 68).map {
+            TemperatureSample(time: w.start.addingTimeInterval($0), celsius: 34.0)
+        }
+        XCTAssertNotNil(SkinTempBaseline.nightlyMean(samples: samples, in: w, minCoverage: 0))
     }
 
     func testBaselineNeedsMinimumHistory() {

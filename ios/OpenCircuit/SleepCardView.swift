@@ -639,6 +639,21 @@ struct SleepCardView: View {
                 tempChart()
             }
             .padding(.top, 2)
+        } else if latest != nil {
+            // A night was staged but carries no usable temperature. Say so, and say WHY — a tester
+            // who saw temperature appear on some nights and vanish on others reasonably assumed the
+            // readings were unreliable (or that switching fingers had broken something). Skin temp
+            // rides the LIVE 0x10/0x87 descriptor and is not in the drainable history, so a night
+            // the link kept dropping simply has too few samples to represent the night's curve
+            // (`SkinTempBaseline.minNightlySamples`). Showing nothing at all was the part that read
+            // as a defect.
+            HStack(spacing: 6) {
+                Image(systemName: "thermometer.medium").font(.caption2).foregroundStyle(.tertiary)
+                Text("No skin temperature for this night — it's only recorded while the ring stays connected, and there weren't enough readings to compare.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.top, 2)
         }
     }
 

@@ -12,6 +12,33 @@ final class SleepEditTests: XCTestCase {
         XCTAssertEqual(SleepEdit.editMargin, 3 * 3600, accuracy: 0.0001)
     }
 
+    /// The reported night, to the minute: in bed 22:51, ring-detected onset 23:47, wake 08:57 —
+    /// and a true onset of 01:13 that the tester could not enter. The RULE always permitted it (the
+    /// blocker was `EditSleepView`'s DatePicker range), and this pins that so a future tightening
+    /// of the rule cannot silently re-create the dead end.
+    func testAnOnsetPastMidnightIsPermittedByTheRule() {
+        let cal = Calendar(identifier: .gregorian)
+        func t(_ day: Int, _ h: Int, _ m: Int) -> Date {
+            cal.date(from: DateComponents(timeZone: TimeZone(identifier: "UTC"),
+                                          year: 2026, month: 8, day: day, hour: h, minute: m))!
+        }
+        let recordedOnset = t(11, 23, 47), recordedWake = t(12, 8, 57)
+        let times = SleepEdit.Times(inBedStart: t(11, 22, 51),
+                                    sleepOnset: t(12, 1, 13),      // the true onset
+                                    sleepWake: recordedWake)
+        XCTAssertNil(SleepEdit.validate(times, recordedOnset: recordedOnset,
+                                        recordedWake: recordedWake, minDuration: 30 * 60),
+                     "a 01:13 onset inside the detected in-bed window must be a legal edit")
+
+        // And the edit produces what the wearer asked for: pre-onset time is AWAKE, not sleep.
+        let base = [SleepSegment(start: recordedOnset, end: recordedWake, stage: .asleepCore)]
+        let out = SleepEdit.recompute(baseSegments: base, times: times)
+        let asleep = out.filter { $0.stage != .inBed && $0.stage != .awake }
+        XCTAssertEqual(asleep.map(\.start).min(), t(12, 1, 13))
+        XCTAssertTrue(out.contains { $0.stage == .awake && $0.start == t(11, 22, 51)
+            && $0.end == t(12, 1, 13) })
+    }
+
     func testBoundsAreOnsetMinus3hToWakePlus3h() {
         // Recorded: onset 0h, wake 8h.
         let b = SleepEdit.bounds(recordedOnset: at(0), recordedWake: at(8))

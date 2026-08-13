@@ -154,9 +154,10 @@ final class HealthAlertsHeadacheTests: XCTestCase {
 
     // MARK: - Delivery window + quiet hours
 
-    /// Quiet hours ship DISABLED, so the shared DND gate protects nothing overnight on a default
-    /// install. This alert therefore carries its own hard window: a summary of a night that is
-    /// already over has no business waking anyone at 04:00.
+    /// Quiet hours are a user PREFERENCE — they now ship enabled (22:00–07:00), but the user may
+    /// switch them off, and `QuietHours.init` still defaults `enabled: false` for anyone
+    /// constructing one directly. This alert therefore carries its OWN hard window regardless: a
+    /// summary of a night that is already over has no business waking anyone at 04:00.
     func testHardDeliveryWindowKeepsItOutOfTheNight() {
         XCTAssertEqual(candidates(now: at(20, 3)), [])
         XCTAssertEqual(candidates(now: at(20, 6, 59)), [])

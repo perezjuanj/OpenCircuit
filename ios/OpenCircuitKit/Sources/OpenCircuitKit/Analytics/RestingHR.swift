@@ -91,6 +91,35 @@ public enum RestingHR {
         return best
     }
 
+    /// As `lowestSustained`, but reports whether a GENUINELY SUSTAINED window (≥2 readings inside
+    /// `window`) actually produced the value, rather than the single-lowest-reading fallback above.
+    ///
+    /// The distinction matters to any caller deriving a THRESHOLD from the result. The production
+    /// auto-measure cadence is 600 s — longer than the 5-min `sustainedWindow` — so on a day whose
+    /// HR set is spot reads only, EVERY window holds one reading, the fallback fires, and the
+    /// "resting HR" is literally the day's single lowest read. One poor-contact 40 bpm read then
+    /// sets the baseline (adversarial review, 2026-08-12). For the daily-value path that fallback is
+    /// still the right behaviour — a day with readings should produce a value — so it is unchanged;
+    /// callers that need the stronger guarantee ask for it here.
+    static func lowestSustainedDetailed(hr: [HRSample], window: TimeInterval)
+    -> (value: Double, wasSustained: Bool)? {
+        guard let value = lowestSustained(hr: hr, window: window) else { return nil }
+        return (value, hasSustainedWindow(hr: hr, window: window))
+    }
+
+    /// Whether any two readings fall inside one `window`. Deliberately mirrors the `count >= 2`
+    /// test inside `lowestSustained`'s sweep — the two must agree about what "sustained" means, or
+    /// `lowestSustainedDetailed` would vouch for a value the fallback produced.
+    static func hasSustainedWindow(hr: [HRSample], window: TimeInterval) -> Bool {
+        let sorted = hr.sorted { $0.start < $1.start }
+        guard sorted.count >= 2 else { return false }
+        for i in 0 ..< (sorted.count - 1) where
+            sorted[i + 1].start.timeIntervalSince(sorted[i].start) < window {
+            return true
+        }
+        return false
+    }
+
     /// Per-calendar-day resting HR over a span of readings, oldest day first. HR is bucketed
     /// by the local day of each reading's start; `sleep` segments are matched to a day by
     /// temporal overlap (so an early-morning night lands on the day you woke). Days with no

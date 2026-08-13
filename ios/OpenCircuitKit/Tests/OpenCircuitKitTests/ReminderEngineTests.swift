@@ -85,6 +85,65 @@ final class ReminderEngineTests: XCTestCase {
         XCTAssertTrue(r.shouldFire(lastRingDataAt: nil, now: Date(), everConnected: true))
     }
 
+    // MARK: - WearReminder: silence is not evidence of not-wearing
+
+    /// The reported false positive. A tester's link drops for an hour while she is demonstrably
+    /// wearing the ring; the drain that follows carries worn epochs covering that hour. The
+    /// reminder must not have fired, and must not fire now.
+    func testWearDoesNotFireWhenDrainedEpochsProveTheRingWasWorn() {
+        let r = WearReminder(noDataInterval: 60 * 60)
+        let now = Date()
+        XCTAssertFalse(r.shouldFire(lastRingDataAt: now.addingTimeInterval(-90 * 60), now: now,
+                                    everConnected: true,
+                                    lastWornEvidenceAt: now.addingTimeInterval(-10 * 60)))
+    }
+
+    /// …but worn evidence that is itself older than the silence window proves nothing about now.
+    func testWearStillFiresWhenTheWornEvidenceIsAlsoStale() {
+        let r = WearReminder(noDataInterval: 60 * 60)
+        let now = Date()
+        XCTAssertTrue(r.shouldFire(lastRingDataAt: now.addingTimeInterval(-3 * 3600), now: now,
+                                   everConnected: true,
+                                   lastWornEvidenceAt: now.addingTimeInterval(-3 * 3600)))
+    }
+
+    /// "Put your ring back on" is the wrong instruction while the ring is connected.
+    func testWearDoesNotFireWhileConnected() {
+        let r = WearReminder(noDataInterval: 60 * 60)
+        let now = Date()
+        XCTAssertFalse(r.shouldFire(lastRingDataAt: now.addingTimeInterval(-3 * 3600), now: now,
+                                    everConnected: true, isConnected: true))
+        // …and the nil-data path is gated the same way, not just the interval path.
+        XCTAssertFalse(r.shouldFire(lastRingDataAt: nil, now: now,
+                                    everConnected: true, isConnected: true))
+    }
+
+    /// The tester also got this overnight. A wear nag inside the user's own sleep schedule is
+    /// never actionable.
+    func testWearDoesNotFireInsideTheSleepWindow() {
+        let r = WearReminder(noDataInterval: 60 * 60)
+        let now = Date()
+        XCTAssertFalse(r.shouldFire(lastRingDataAt: now.addingTimeInterval(-3 * 3600), now: now,
+                                    everConnected: true, inSleepWindow: true))
+        XCTAssertFalse(r.shouldFire(lastRingDataAt: nil, now: now,
+                                    everConnected: true, inSleepWindow: true))
+    }
+
+    /// A genuinely removed ring — silent, disconnected, awake hours, and the newest worn epoch is
+    /// older than the silence window — still fires. The suppressions must not disable the feature.
+    func testWearStillFiresForAGenuinelyRemovedRing() {
+        let r = WearReminder(noDataInterval: 60 * 60)
+        let now = Date()
+        XCTAssertTrue(r.shouldFire(lastRingDataAt: now.addingTimeInterval(-2 * 3600), now: now,
+                                   everConnected: true,
+                                   lastWornEvidenceAt: now.addingTimeInterval(-2 * 3600),
+                                   isConnected: false, inSleepWindow: false))
+    }
+
+    func testWearDefaultIntervalIsAnHour() {
+        XCTAssertEqual(WearReminder().noDataInterval, 60 * 60)
+    }
+
     // MARK: - BedtimeReminder (normal window, no midnight wrap)
 
     // Bed at 23:00 (1380 min), minutesBefore = 30 → window is [22:30, 23:00).

@@ -83,7 +83,14 @@ enum HealthAlertDefaults {
             elevatedHREnabled: true,
             elevatedHRBpm: defaultElevatedHRBpm,
             tempFeverEnabled: true,
-            quietEnabled: false,
+            // ON by default (22:00–07:00). Every family routed through this gate is either a
+            // summary of a night that is already over (skin temp, fever, the #183 verdict) or a
+            // reading that arrives on a background drain minutes-to-hours after the fact — none of
+            // them is a live emergency the phone could act on at 03:00, and OpenCircuit is not a
+            // medical device (see `disclaimer`). Shipping this OFF meant a single artifact SpO2
+            // epoch could wake the wearer, and the thing it woke them to measure was their sleep.
+            // A user who wants overnight alerts still turns it off in Settings.
+            quietEnabled: true,
             quietStartMinutes: defaultQuietStart,
             quietEndMinutes: defaultQuietEnd,
         ])
@@ -96,6 +103,9 @@ enum HealthAlertDefaults {
             highHRBpm: d.integer(forKey: highHRBpm),
             lowSpO2Enabled: d.bool(forKey: lowSpO2Enabled),
             lowSpO2Percent: d.integer(forKey: lowSpO2Percent),
+            // Persistence terms are intentionally NOT user-facing settings — they are the accuracy
+            // model, not a preference. `HealthAlertThresholds`' own defaults are the single source
+            // of truth for them (see `HealthAlertEvaluator.lowSpO2`).
             elevatedHREnabled: d.bool(forKey: elevatedHREnabled),
             elevatedHRBpm: d.integer(forKey: elevatedHRBpm))
     }
@@ -178,7 +188,35 @@ struct HealthNotificationCenter {
     /// silence the older half of every drain — the legitimate background alerts we most need to
     /// deliver. De-dupe is NOT done here by sample age: the evaluator's per-notification `lastFired`
     /// filter is the sole guard that stops an already-alerted crossing from replaying on later syncs.
-    static let instantLookback: TimeInterval = 12 * 3600
+    ///
+    /// ⚠️ THIS IS A FLOOR, NOT THE WINDOW — see `instantLookback(quietHours:)`. Quiet hours DROP a
+    /// candidate outright rather than queue it, so a lookback that does not outlast the quiet window
+    /// turns "delayed until morning" into "lost forever".
+    static let baseInstantLookback: TimeInterval = 12 * 3600
+
+    /// The lookback actually used, widened by however long quiet hours suppress for.
+    ///
+    /// 🟢 MEASURED by adversarial review against the real Kit types (2026-08-12), on the exact
+    /// reading this feature's copy fix was written for. `NotificationGate.shouldFire` drops a
+    /// quiet-hours candidate unconditionally — there is no pending queue and no scheduled trigger —
+    /// and `evaluate` returns before `markFired`, so nothing is persisted. Delivery therefore
+    /// depends entirely on the reading STILL being inside this rolling device-timestamp window when
+    /// the window reopens.
+    ///
+    /// With a bare 12 h lookback and quiet hours 22:00–07:00 that fails: a crossing at 18:06 whose
+    /// link only delivers it at 06:00 is a live candidate at every pass inside quiet hours and has
+    /// aged out (07:00 − 12 h = 19:00 > 18:06) at the first pass outside them. It can never fire.
+    /// The class lost is everything older than `quietEnd − baseInstantLookback` — and quiet hours
+    /// ship ON, so it was a default-install regression, not an edge case.
+    ///
+    /// Adding the suppressed span is exactly sufficient, not a guess: the oldest reading that can
+    /// be a candidate when the window CLOSES is `quietStart − base`, and it must survive to
+    /// `quietEnd = quietStart + span`, so the window must reach back `base + span`. Nothing older
+    /// was ever eligible. The `lastFired` filter still does the de-duping, so widening cannot make
+    /// an already-alerted crossing replay.
+    static func instantLookback(quietHours: QuietHours) -> TimeInterval {
+        baseInstantLookback + quietHours.suppressedSpan
+    }
 
     /// Evaluate ALL health-alert conditions (#73 + #85) from the store (+ optional live session),
     /// then post a debounced notification for each survivor. Safe to call liberally — a no-op when
@@ -196,7 +234,10 @@ struct HealthNotificationCenter {
 
         // --- #73: high HR / low SpO2 / elevated-HR-while-inactive --------------------------------
         let thresholds = HealthAlertDefaults.thresholds()
-        let instantSince = now.addingTimeInterval(-Self.instantLookback)
+        // Read the quiet window HERE, not just at the gate below: it sets how far back a crossing
+        // suppressed overnight must still be visible for the morning pass to deliver it.
+        let quiet = HealthAlertDefaults.quietHours()
+        let instantSince = now.addingTimeInterval(-Self.instantLookback(quietHours: quiet))
         let lastFired = store.lastFired()
         // Fetch the whole recent window (stored + the just-synced in-memory batch) and let the pure
         // evaluator's per-notification `lastFired` filter do the de-dupe. HR is fetched over the SAME
@@ -220,6 +261,24 @@ struct HealthNotificationCenter {
             }
                 .map { SpO2Reading(percent: Int(($0.value * 100).rounded()), time: $0.start) }
         }
+
+        // ⚠️ THE TWO SOURCES OVERLAP, AND ANY COUNT-BASED RULE MUST NOT SEE THE OVERLAP.
+        //
+        // On the post-drain paths (`RingSession`'s wake-drain and ContentView's foreground sync)
+        // `commitDrainedRecords` has ALREADY persisted this batch before `evaluate` runs, while
+        // `session.historySamples` still holds it — it is only cleared at the start of the NEXT
+        // drain. So every just-drained reading appears TWICE, with identical time and value.
+        //
+        // That was harmless while every rule was a min/max over the series. It stopped being
+        // harmless the moment the low-SpO2 rule started COUNTING readings: a single artifact epoch,
+        // duplicated, satisfies `lowSpO2MinReadings = 2` with a zero gap inside a zero-length
+        // window — reproducing the exact false alert the persistence gate was written to stop, on
+        // the exact path that produced the tester's. Found by adversarial review, not by a test.
+        //
+        // De-duplicate on (device timestamp, value). Two genuine readings cannot share a device
+        // timestamp — the ring emits one epoch per 150 s slot — so this can only ever remove copies.
+        spo2 = Self.deduped(spo2, key: { ($0.time, $0.percent) })
+        hr = Self.deduped(hr, key: { ($0.start, $0.bpm) })
 
         // --- #144: activity gate for the HR rules ------------------------------------------------
         // Exercise HR routinely crosses 120 bpm, so the raw high-HR / elevated-while-inactive rules
@@ -298,7 +357,9 @@ struct HealthNotificationCenter {
         }
 
         // --- Route survivors through the ONE shared gate (quiet hours + backoff) ---------------
-        let quiet = HealthAlertDefaults.quietHours()
+        // `quiet` is the SAME value read at the top of this pass, where it also set the lookback.
+        // Re-reading it here would let a settings change mid-pass produce a window and a gate that
+        // disagree about the same night.
         let fire = gate.filter(candidates, now: now, lastFired: lastFired, quietHours: quiet)
         guard !fire.isEmpty else { return }
         // Reserve the survivors against the anti-spam backoff SYNCHRONOUSLY — there is no `await`
@@ -331,6 +392,21 @@ struct HealthNotificationCenter {
             if let headacheRowDay { try? localStore.markRiskAlerted(day: headacheRowDay) }
         }
         for n in fire { await post(n, hit: hitByNotif[n], signals: headacheSignals) }
+    }
+
+    /// Stable-order de-duplication on a `(Date, Int)` identity — first occurrence wins, order is
+    /// otherwise preserved so the downstream rules see the same series they always did, minus the
+    /// copies. See the call site for why the overlap exists and why it is now load-bearing.
+    static func deduped<T>(_ items: [T], key: (T) -> (Date, Int)) -> [T] {
+        var seen = Set<String>()
+        var out: [T] = []
+        out.reserveCapacity(items.count)
+        for item in items {
+            let k = key(item)
+            // A composite string key avoids requiring Hashable conformance on the sample types.
+            if seen.insert("\(k.0.timeIntervalSince1970)|\(k.1)").inserted { out.append(item) }
+        }
+        return out
     }
 
     /// Whether `n` is one of the #85 skin-temp/fever notifications that de-dupe per night (see
@@ -530,9 +606,16 @@ struct HealthNotificationCenter {
     /// The caller passes `false` on the plain scene-active pass (wear + bedtime still evaluate there,
     /// since they don't need fresh step data) and `true` only after a sync completes, so the rule
     /// runs against fresh data.
+    ///
+    /// `store` (optional) supplies the WEAR reminder's worn-evidence input — the newest heart-rate
+    /// device timestamp, which only a worn epoch can produce. Left nil the wear rule still runs, it
+    /// just loses that suppression; every caller that has a store should pass it.
+    /// (Bound to `localStore` internally: the bare name `store` is this type's own
+    /// `HealthNotificationStore` de-dupe ledger, used further down — same convention as `evaluate`.)
     func evaluateReminders(session: RingSession?,
                            sleepBedMinutes: Int, sleepWakeMinutes: Int, sleepEnabled: Bool,
                            includeSedentary: Bool = true,
+                           store localStore: LocalStore? = nil,
                            now: Date = Date()) async {
         ReminderDefaults.register()
         let d = UserDefaults.standard
@@ -566,7 +649,27 @@ struct HealthNotificationCenter {
             let durableEpoch = d.double(forKey: ReminderDefaults.lastRingDataAt)
             let durable: Date? = durableEpoch > 0 ? Date(timeIntervalSince1970: durableEpoch) : nil
             let lastData = [durable, session?.lastFrameAt].compactMap { $0 }.max()
-            if r.shouldFire(lastRingDataAt: lastData, now: now, everConnected: hasSavedRing) {
+            // Positive worn-evidence: the newest heart-rate DEVICE timestamp we hold. HR decodes
+            // only from a worn epoch (the unworn template carries no HR at all — `BulkRecord`'s
+            // `.idle` layout), so this timestamp is the ring's own testimony that it was on the
+            // finger then. It arrives LATE, on the drain that heals a link gap, which is exactly
+            // the case the old silence-only rule got wrong. Read from the persisted cursor rather
+            // than a sample scan: it is a single small fetch on a path that runs on every
+            // scene-active pass.
+            let wornEvidence = (try? localStore?.loadCursor())??.last(.heartRate)
+            // A wear nag during the user's own sleep schedule is never actionable, and the
+            // overnight link is the least reliable of the day.
+            // `QuietHours` is reused purely as the shared "is `now` inside this minutes-since-
+            // midnight window" predicate (it handles the past-midnight wrap and treats
+            // start == end as unconfigured, the same convention `SleepWindow` uses). This is NOT
+            // the user's quiet-hours setting — that gate is applied separately below.
+            let inSleep = sleepEnabled && QuietHours(enabled: true,
+                                                     startMinutes: sleepBedMinutes,
+                                                     endMinutes: sleepWakeMinutes).contains(now)
+            if r.shouldFire(lastRingDataAt: lastData, now: now, everConnected: hasSavedRing,
+                            lastWornEvidenceAt: wornEvidence,
+                            isConnected: session?.isLinkConnected ?? false,
+                            inSleepWindow: inSleep) {
                 candidates.append(.wearReminder)
             }
         }
@@ -604,6 +707,15 @@ struct HealthNotificationCenter {
     /// Post a "ring fully charged" notification, routed through the shared gate so it
     /// respects quiet hours and the anti-spam backoff. Called by ContentView when
     /// `BatteryTTE.justReachedFull` fires. (#86)
+    ///
+    /// ACCEPTED CONSEQUENCE of quiet hours now defaulting ON: this notification is EDGE-triggered
+    /// (`ContentView` sets `batteryWasFull = true` before calling, and `onChange` won't re-fire at a
+    /// steady 100 %), so a charge that completes inside the quiet window is DROPPED rather than
+    /// deferred. Judged acceptable and deliberately not worked around: the ring cannot be worn while
+    /// charging, the trigger already requires the app to be foregrounded and observing battery, and
+    /// the alternative — buzzing at 03:00 about a battery — is worse than reading it in the app the
+    /// next morning. Every OTHER family on this gate is re-derived on the next evaluate pass and so
+    /// is merely delayed to 07:00, not lost.
     func postChargingComplete(store localStore: LocalStore) async {
         let candidates: [HealthNotification] = [.chargingComplete]
         let quiet = HealthAlertDefaults.quietHours()
@@ -735,30 +847,67 @@ struct HealthNotificationCenter {
         "Note: OpenCircuit is not a medical device. These reminders are based on ring sensor "
         + "data only and are not a diagnosis. If you feel unwell, consult a qualified medical professional."
 
-    private static func timeString(_ date: Date?) -> String {
+    /// When a reading was taken, worded so it can never be mistaken for "just now".
+    ///
+    /// 🟢 A tester reported: "This morning around 7:00 AM, I received a high heart rate notification
+    /// for an event that occurred more than 12 hours prior at 6:06 PM" (2026-08-12). The alert was
+    /// working as designed — all-day HR reaches the phone on background drains whose device
+    /// timestamps are routinely 30–60+ min old, and `instantLookback` is deliberately 12 h wide so a
+    /// crossing riding in on the older half of a drain still alerts once (see the NOTE on
+    /// `HealthAlerts.HealthAlertEvaluator`). Her ring's link had been dropping all evening, so the
+    /// 18:06 reading genuinely did not reach the phone until the morning drain.
+    ///
+    /// What was broken was the SENTENCE. `timeStyle = .short` alone renders "6:06 PM" with no date,
+    /// so a reading from the previous evening is indistinguishable from one taken minutes ago — the
+    /// notification asserted a stale measurement as a live event. Widening the lookback was the
+    /// right call and is NOT reverted here; the fix is to say when.
+    ///
+    /// Same-day readings keep the exact original wording ("6:06 PM"), so nothing changes for the
+    /// common case. A reading from a previous day gains its day ("yesterday at 6:06 PM",
+    /// "Mon at 6:06 PM") — which is also the honest answer to "why am I only hearing about this
+    /// now".
+    /// Returns the WHOLE trailing phrase including its preposition ("at 6:06 PM" / "yesterday at
+    /// 6:06 PM"), not a bare clock time, so no call site can assemble "at yesterday at 6:06 PM".
+    /// Empty string when there is no reading to cite.
+    static func whenPhrase(_ date: Date?, now: Date = Date(),
+                           calendar: Calendar = .current) -> String {
         guard let date else { return "" }
         let f = DateFormatter(); f.timeStyle = .short
-        return f.string(from: date)
+        let clock = f.string(from: date)
+        // Every branch is measured against `now`, never against the system clock. `isDateInYesterday`
+        // reads the host clock and so ignored the injected `now`, which made the copy untestable and
+        // left one of its own tests a time-bomb that would start failing the day after it was written
+        // (adversarial review, 2026-08-12). Day-difference arithmetic honours the parameter.
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date),
+                                           to: calendar.startOfDay(for: now)).day ?? 0
+        if days == 0 { return "at \(clock)" }
+        if days == 1 { return "yesterday at \(clock)" }
+        let day = DateFormatter()
+        day.setLocalizedDateFormatFromTemplate("EEE")
+        return "on \(day.string(from: date)) at \(clock)"
     }
 
     /// `signals` is used only by `.headacheSigns` — the ring-derived features that drifted furthest,
     /// already ranked. Defaulted so every other call site (and `HealthAlertCopyTests`) is unchanged.
     static func copy(for n: HealthNotification, hit: HealthAlertHit?,
-                     signals: [HeadacheSignals.Feature] = []) -> (title: String, body: String) {
-        let at = timeString(hit?.time)
+                     signals: [HeadacheSignals.Feature] = [],
+                     now: Date = Date(),
+                     calendar: Calendar = .current) -> (title: String, body: String) {
+        // Carries its own preposition — see `whenPhrase`. Never prefix it with " at ".
+        let at = whenPhrase(hit?.time, now: now, calendar: calendar)
         switch n {
         case .highHR:
             let bpm = hit.map { Int($0.value) }
             return ("High heart rate",
                     "High heart rate detected"
                     + (bpm.map { " (\($0) bpm)" } ?? "")
-                    + (at.isEmpty ? "" : " at \(at)") + ".")
+                    + (at.isEmpty ? "" : " \(at)") + ".")
         case .lowSpO2:
             let pct = hit.map { Int($0.value) }
             return ("Low blood oxygen",
                     "Low blood oxygen detected"
                     + (pct.map { " (\($0)%)" } ?? "")
-                    + (at.isEmpty ? "" : " at \(at)") + " (estimate).")
+                    + (at.isEmpty ? "" : " \(at)") + " (estimate).")
         case .elevatedHRInactive:
             // Cite the user's CONFIGURED threshold, not the completing sample's bpm. `hit.value` here is
             // the reading that finished the 10-min run (HealthAlerts elevatedHRInactive), NOT the peak

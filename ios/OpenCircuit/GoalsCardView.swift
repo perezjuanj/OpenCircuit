@@ -207,7 +207,7 @@ struct GoalsCardView: View {
                          goal: formatDuration(sleepGoalMin),
                          color: .purple)
             }
-            Text("\u{B9} Activity Score is an on-device estimate — the weighted attainment of your step, active-calorie & elevated-HR goals, not the RingConn app's number. Active calories and elevated-HR minutes now use the same qualifying heart-rate periods; steps remain the calorie fallback. Elevated HR is not detected workout duration. Full accuracy follows the ring activity-payload decode.")
+            Text("\u{B9} Activity Score is an on-device estimate — the weighted attainment of your step, active-calorie & elevated-HR goals, not the RingConn app's number. Elevated HR counts time spent at least 40% of the way from your resting heart rate up to your age-estimated maximum, so the bar moves with your resting pulse instead of being the same number for everyone; on a day with too little data to read your resting pulse it falls back to half your age-estimated maximum. Active calories and elevated-HR minutes use those same qualifying periods; steps remain the calorie fallback. Elevated HR is not detected workout duration. Full accuracy follows the ring activity-payload decode.")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

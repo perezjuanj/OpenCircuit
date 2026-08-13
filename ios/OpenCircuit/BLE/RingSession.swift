@@ -705,10 +705,15 @@ final class RingSession: NSObject {
     /// Namespaced by the ring's identifier (#multi-ring) so two rings' epoch archives can't collide on
     /// the UInt32 epoch counter (which would corrupt overnight stitching).
     let epochArchiveStore: EpochArchiveStore
+    /// Whether CoreBluetooth currently holds the link. Read by the WEAR reminder, which must not
+    /// tell the user to "put your ring back on" while the ring is demonstrably connected — a quiet
+    /// notify pipe on a live link is our problem, not a ring the user took off.
+    var isLinkConnected: Bool { peripheral.state == .connected }
+
     /// `writeChar` can outlive an actual usable link during reconnect churn, so connection state
     /// is part of the write gate too.
     private var canWriteCommands: Bool {
-        peripheral.state == .connected && writeChar != nil
+        isLinkConnected && writeChar != nil
     }
 
     private let dataServiceUUID = CBUUID(string: OpenCircuitKit.Transport.dataServiceUUID)
@@ -1918,8 +1923,13 @@ final class RingSession: NSObject {
         let window = DateInterval(start: start, end: max(end, start))
 
         // Skin temp (#69): nightly mean from the persisted worn overnight readings.
-        let tempC = (try? store.samples(kind: .temperature, from: start, to: end))?.map(\.value)
-        let nightlyTemp = tempC.flatMap { SkinTempBaseline.nightlyMean($0) }
+        // Keeps the TIMESTAMPS rather than mapping straight to `.value`: the gate is about how much
+        // of the night's circadian curve was actually sampled, and a bare `[Double]` cannot express
+        // that (see `SkinTempBaseline.minNightlyCoverage`). Passing values alone silently degrades
+        // the gate to a count, which measurement showed is nearly a no-op.
+        let tempSamples = ((try? store.samples(kind: .temperature, from: start, to: end)) ?? [])
+            .map { TemperatureSample(time: $0.start, celsius: $0.value) }
+        let nightlyTemp = SkinTempBaseline.nightlyMean(samples: tempSamples, in: window)
         if let nightlyTemp { extras.skinTempC = nightlyTemp }
 
         // Rolling baseline from PRIOR nights (exclude tonight's day), for the composite temp factor.
