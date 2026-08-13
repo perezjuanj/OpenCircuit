@@ -611,7 +611,7 @@ Severity mapping (verified against the installed SDK, `HKCategoryValues.h:206-21
 
 **Timing.** The verdict is gated on `inBedEnd + 180 min`. Overnight the drain is deliberately suppressed (`HistoryDrainCadence.shouldDrain`), so nothing evaluates between bedtime and the morning drain — correct, and it means a headache alert can never wake someone at 03:00. After wake, drains land every ~6–10 min while worn and connected, so the verdict reaches the user within minutes of the settle margin.
 
-**Quiet hours are OFF by default** (verified: `HealthAlertDefaults` registers `quietEnabled: false`; `QuietHours.init(enabled: false)`). All three proposals leaned on quiet hours as overnight protection and none noticed. So `.headacheSigns` gets a **hard never-fire window independent of the user's toggle**: `headacheEarliestMinutes = 7*60`, `headacheLatestMinutes = 21*60` 🔴 PROVISIONAL, enforced in the pure layer.
+**Quiet hours cannot be relied on as overnight protection.** (As of build 42 `HealthAlertDefaults` registers `quietEnabled: true`, 22:00–07:00 — but that is a user PREFERENCE they may switch off, and `QuietHours.init(enabled: false)` still defaults off for any caller constructing one directly. Through build 41 it was registered `false`, so there was no overnight protection at all.) All three proposals leaned on quiet hours as overnight protection and none noticed. So `.headacheSigns` gets a **hard never-fire window independent of the user's toggle**: `headacheEarliestMinutes = 7*60`, `headacheLatestMinutes = 21*60` 🔴 PROVISIONAL, enforced in the pure layer.
 
 ---
 
