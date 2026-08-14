@@ -611,6 +611,29 @@ struct LocalStore {
             sortBy: [SortDescriptor(\.start, order: .forward)])
     }
 
+    /// Newest sample of `kind` strictly BEFORE `before`, or nil. One row, index-ordered — this is
+    /// the bedtime-provenance probe (#198) and runs on the sleep card's render path, so it must
+    /// never become a scan.
+    func latestSample(kind: MetricKind, before: Date) throws -> QuantitySample? {
+        let kindRaw = kind.rawValue
+        var descriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == kindRaw && $0.start < before },
+            sortBy: [SortDescriptor(\.start, order: .reverse)])
+        descriptor.fetchLimit = 1
+        return try context.fetch(descriptor).first?.sample
+    }
+
+    /// Oldest retained sample of `kind`, or nil when none is stored. Tells "the ring recorded
+    /// nothing" from "retention no longer reaches back that far" (#198). One row.
+    func earliestSample(kind: MetricKind) throws -> QuantitySample? {
+        let kindRaw = kind.rawValue
+        var descriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == kindRaw },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
+        descriptor.fetchLimit = 1
+        return try context.fetch(descriptor).first?.sample
+    }
+
     nonisolated static func recentSleepSummariesDescriptor(limit: Int) -> FetchDescriptor<StoredSleepSummary> {
         var descriptor = FetchDescriptor<StoredSleepSummary>(
             sortBy: [SortDescriptor(\.night, order: .reverse)])
