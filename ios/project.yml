@@ -62,7 +62,17 @@ targets:
     info:
       path: OpenCircuit/Info.plist
       properties:
-        UILaunchScreen: {}
+        # Splash: the system launch screen, so the brand mark is on screen for the REAL launch work
+        # (container open + any migration) and costs the user no added time — as opposed to an
+        # in-app splash on a timer, which would be a deliberate delay in the same release that
+        # removes ~25 k rows of main-thread work from the launch path.
+        # `LaunchBackground` is pinned to `systemGroupedBackground`'s own values (#F2F2F7 light,
+        # black dark) — the same Theme.pageBackground the first real frame paints — so the handoff
+        # from splash to UI doesn't flash a different colour.
+        UILaunchScreen:
+          UIImageName: LaunchLogo
+          UIImageRespectsSafeAreaInsets: true
+          UIColorName: LaunchBackground
         # User-facing app name (home screen, Settings). Independent of PRODUCT_NAME / bundle id,
         # which stay "OpenCircuit"/com.standardsoftwaresolutions.opencircuit internally (#100 rebrand).
         CFBundleDisplayName: OpenCircuit

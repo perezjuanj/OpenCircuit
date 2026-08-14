@@ -346,24 +346,6 @@ struct ContentView: View {
             // Pull-to-refresh mirrors the "Sync from ring" button (same guards). See `forceSync`.
             .refreshable { await forceSync() }
             .navigationTitle("Today")
-            // Brand mark, centered above the large title. `.principal` is what puts it THERE:
-            // with a large-title stack the bar region sits above the title, so the mark reads as
-            // an app header rather than as another card. Today only — the other tabs keep their
-            // plain large titles, and the tab bar already names the section.
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Image("AppLogo")
-                        .resizable()
-                        .scaledToFit()
-                        // 36pt, not the 28 first tried: below ~32 the mark's ring collapses into
-                        // an indistinct blob at a glance (checked on a 3x simulator). 36 is the
-                        // most the bar region gives before the large title starts to crowd it.
-                        .frame(height: 36)
-                        // The mark alone carries no text, so VoiceOver needs the name; it is
-                        // decorative next to the "Today" title, hence a label and not a header.
-                        .accessibilityLabel("OpenCircuit")
-                }
-            }
             .navigationDestination(for: Route.self) { route in destination(for: route) }
         }
     }
@@ -493,12 +475,45 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                     debugCard
+                    brandFooter
                 }
                 .padding()
             }
             .background(Theme.pageBackground)
             .navigationTitle("Profile")
         }
+    }
+
+    /// Brand mark + version, closing out the Profile tab.
+    ///
+    /// This is where an app's own logo conventionally lives — the settings/about surface — rather
+    /// than on the main screen, where it costs the user real estate and tells them nothing they
+    /// don't already know. Pairing it with the version string also makes the one thing people
+    /// actually come looking for ("what build am I on?") easy to find and quote in a bug report.
+    private var brandFooter: some View {
+        VStack(spacing: 8) {
+            Image("AppLogo")
+                .resizable()
+                .scaledToFit()
+                .frame(height: 56)
+                // Decorative: the wordmark directly below already names the app, so announcing the
+                // image too would make VoiceOver read "OpenCircuit" twice in a row.
+                .accessibilityHidden(true)
+            Text("OpenCircuit").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            Text(Self.versionString).font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 8)
+        .padding(.bottom, 24)
+    }
+
+    /// "Version 1.0 (43)" from the bundle — never hardcoded, so it can't drift from the build that
+    /// is actually running (project.yml is the single source of truth for both numbers).
+    private static var versionString: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "—"
+        let build = info?["CFBundleVersion"] as? String ?? "—"
+        return "Version \(short) (\(build))"
     }
 
     // MARK: - Tab helpers
