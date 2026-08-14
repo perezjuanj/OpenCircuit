@@ -346,6 +346,24 @@ struct ContentView: View {
             // Pull-to-refresh mirrors the "Sync from ring" button (same guards). See `forceSync`.
             .refreshable { await forceSync() }
             .navigationTitle("Today")
+            // Brand mark, centered above the large title. `.principal` is what puts it THERE:
+            // with a large-title stack the bar region sits above the title, so the mark reads as
+            // an app header rather than as another card. Today only — the other tabs keep their
+            // plain large titles, and the tab bar already names the section.
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Image("AppLogo")
+                        .resizable()
+                        .scaledToFit()
+                        // 36pt, not the 28 first tried: below ~32 the mark's ring collapses into
+                        // an indistinct blob at a glance (checked on a 3x simulator). 36 is the
+                        // most the bar region gives before the large title starts to crowd it.
+                        .frame(height: 36)
+                        // The mark alone carries no text, so VoiceOver needs the name; it is
+                        // decorative next to the "Today" title, hence a label and not a header.
+                        .accessibilityLabel("OpenCircuit")
+                }
+            }
             .navigationDestination(for: Route.self) { route in destination(for: route) }
         }
     }
