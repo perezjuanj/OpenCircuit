@@ -1,8 +1,10 @@
 # Build 43 — new app icon, a launch screen, and a much faster first open
 
+**With thanks to u/Icy-Faithlessness-12, who designed the new logo for us.**
+
 ## What you'll notice
 
-**A new app icon.** The mark was designed for us and replaces the old flat one. It's a layered icon,
+**A new app icon.** The mark was designed for us by u/Icy-Faithlessness-12 and replaces the old flat one. It's a layered icon,
 so it adapts properly to light, dark, and tinted home screens on iOS 26. The same mark now appears
 on the launch screen and at the bottom of the Profile tab, next to the version number — which is the
 number to quote if you report a bug.
