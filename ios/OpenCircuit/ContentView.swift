@@ -70,6 +70,8 @@ struct ContentView: View {
     /// so the same metric can never disagree between tabs. Reloaded on launch, foreground return,
     /// and after a sync finishes. See `loadTrends()`.
     @State private var trends = TrendsData()
+    /// When `trends` was last (re)loaded — the debounce input for `TrendsRefreshPolicy`.
+    @State private var trendsLoadedAt: Date?
     /// Rolling buffer of recent live readings feeding the liveline live chart during an on-demand
     /// measurement (HR or SpO₂). Accumulated from `session.liveHR`/`liveSpO2` onChange, reset when
     /// monitoring stops. Display units: bpm for HR, whole-percent for SpO₂.
@@ -136,9 +138,16 @@ struct ContentView: View {
         }
         .tint(Theme.accent)
             // Shared trends cache: load once, then refresh on foreground return and after each sync.
-            .task { await loadTrends() }
-            .onChange(of: scenePhase) { _, phase in if phase == .active { Task { await loadTrends() } } }
-            .onChange(of: session?.syncing) { _, syncing in if syncing == false { Task { await loadTrends() } } }
+            // Every hook goes through `TrendsRefreshPolicy` — at a cold launch `.task` and
+            // `scenePhase == .active` both fire within a frame or two of each other, and one load
+            // reads ~25 k rows (🟢 measured). A finished sync is never debounced; see the policy.
+            .task { await loadTrends(.appeared) }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { Task { await loadTrends(.foregrounded) } }
+            }
+            .onChange(of: session?.syncing) { _, syncing in
+                if syncing == false { Task { await loadTrends(.syncFinished) } }
+            }
             // Feed / reset the liveline live-vitals buffer as on-demand readings arrive.
             .onChange(of: session?.liveHR) { _, hr in
                 if session?.monitoring == true, session?.liveMode == .hr, let hr { appendLive(Double(hr)) }
@@ -466,6 +475,7 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                     debugCard
+                    brandFooter
                 }
                 .padding()
             }
@@ -474,12 +484,52 @@ struct ContentView: View {
         }
     }
 
+    /// Brand mark + version, closing out the Profile tab.
+    ///
+    /// This is where an app's own logo conventionally lives — the settings/about surface — rather
+    /// than on the main screen, where it costs the user real estate and tells them nothing they
+    /// don't already know. Pairing it with the version string also makes the one thing people
+    /// actually come looking for ("what build am I on?") easy to find and quote in a bug report.
+    private var brandFooter: some View {
+        VStack(spacing: 8) {
+            Image("AppLogo")
+                .resizable()
+                .scaledToFit()
+                .frame(height: 56)
+                // Decorative: the wordmark directly below already names the app, so announcing the
+                // image too would make VoiceOver read "OpenCircuit" twice in a row.
+                .accessibilityHidden(true)
+            Text("OpenCircuit").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            Text(Self.versionString).font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 8)
+        .padding(.bottom, 24)
+    }
+
+    /// "Version 1.0 (43)" from the bundle — never hardcoded, so it can't drift from the build that
+    /// is actually running (project.yml is the single source of truth for both numbers).
+    private static var versionString: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "—"
+        let build = info?["CFBundleVersion"] as? String ?? "—"
+        return "Version \(short) (\(build))"
+    }
+
     // MARK: - Tab helpers
 
-    /// Reload the shared two-week trends cache — fetch on main, heavy per-day compute off-main.
+    /// Reload the shared two-week trends cache. Both the fetch and the per-day compute run off the
+    /// main actor (see `TrendsData.loadAsync`); `TrendsRefreshPolicy` decides whether this
+    /// particular trigger has earned the work at all.
     @MainActor
-    private func loadTrends() async {
-        trends = await TrendsData.loadAsync(store: LocalStore(modelContext), tempUnitRaw: tempUnitRaw)
+    private func loadTrends(_ reason: TrendsRefreshPolicy.Reason) async {
+        guard TrendsRefreshPolicy.shouldReload(reason: reason, lastLoadedAt: trendsLoadedAt) else { return }
+        // Stamped BEFORE the await, not after: two triggers can arrive in the same run-loop turn
+        // (cold launch fires `.appeared` and `.foregrounded` a frame apart), and stamping on
+        // completion would let the second one pass this guard while the first is still in flight —
+        // which is the exact double-load being fixed.
+        trendsLoadedAt = Date()
+        trends = await TrendsData.loadAsync(container: modelContext.container, tempUnitRaw: tempUnitRaw)
     }
 
     /// Append one live reading (already in display units) to the liveline buffer, stamped now.

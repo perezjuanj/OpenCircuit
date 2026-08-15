@@ -117,7 +117,7 @@ struct TrendsView: View {
 
     @MainActor
     private func loadData() async {
-        data = await TrendsData.loadAsync(store: LocalStore(modelContext), tempUnitRaw: tempUnitRaw)
+        data = await TrendsData.loadAsync(container: modelContext.container, tempUnitRaw: tempUnitRaw)
         loading = false
     }
 }

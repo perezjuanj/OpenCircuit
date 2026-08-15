@@ -578,6 +578,76 @@ struct LocalStore {
 
     init(_ context: ModelContext) { self.context = context }
 
+    // MARK: Shared fetch descriptors
+    //
+    // `nonisolated` so the SAME descriptor can be run on the main-actor `context` (the instance
+    // methods below) and on a background `ModelContext` (`TrendsSnapshotReader`, which pulls ~25 k
+    // rows and must never do it on the main thread). They live here, and the instance methods are
+    // thin wrappers over them, so the two callers can never drift into fetching different sets —
+    // a background reader with its own hand-copied predicate is exactly how a "why does Trends
+    // disagree with the card" bug gets born.
+
+    nonisolated static func samplesDescriptor(kind: MetricKind, from start: Date,
+                                              to end: Date) -> FetchDescriptor<StoredSample> {
+        let kindRaw = kind.rawValue
+        return FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == kindRaw && $0.start >= start && $0.start < end },
+            sortBy: [SortDescriptor(\.start, order: .forward)]
+        )
+    }
+
+    nonisolated static func daytimeTemperaturesDescriptor(from start: Date,
+                                                          to end: Date) -> FetchDescriptor<StoredDaytimeTemp> {
+        FetchDescriptor<StoredDaytimeTemp>(
+            predicate: #Predicate { $0.time >= start && $0.time < end },
+            sortBy: [SortDescriptor(\.time)]
+        )
+    }
+
+    nonisolated static func stepSamplesDescriptor(from: Date,
+                                                  to: Date) -> FetchDescriptor<StoredStepSample> {
+        FetchDescriptor<StoredStepSample>(
+            predicate: #Predicate { $0.start >= from && $0.start < to },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
+    }
+
+    /// Newest sample of `kind` strictly BEFORE `before`, or nil. One row, index-ordered — this is
+    /// the bedtime-provenance probe (#198) and runs on the sleep card's render path, so it must
+    /// never become a scan.
+    func latestSample(kind: MetricKind, before: Date) throws -> QuantitySample? {
+        let kindRaw = kind.rawValue
+        var descriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == kindRaw && $0.start < before },
+            sortBy: [SortDescriptor(\.start, order: .reverse)])
+        descriptor.fetchLimit = 1
+        return try context.fetch(descriptor).first?.sample
+    }
+
+    /// Oldest retained sample of `kind`, or nil when none is stored. Tells "the ring recorded
+    /// nothing" from "retention no longer reaches back that far" (#198). One row.
+    func earliestSample(kind: MetricKind) throws -> QuantitySample? {
+        let kindRaw = kind.rawValue
+        var descriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == kindRaw },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
+        descriptor.fetchLimit = 1
+        return try context.fetch(descriptor).first?.sample
+    }
+
+    nonisolated static func recentSleepSummariesDescriptor(limit: Int) -> FetchDescriptor<StoredSleepSummary> {
+        var descriptor = FetchDescriptor<StoredSleepSummary>(
+            sortBy: [SortDescriptor(\.night, order: .reverse)])
+        descriptor.fetchLimit = limit
+        return descriptor
+    }
+
+    nonisolated static func recentDailiesDescriptor(limit: Int) -> FetchDescriptor<StoredDaily> {
+        var descriptor = FetchDescriptor<StoredDaily>(
+            sortBy: [SortDescriptor(\.day, order: .reverse)])
+        descriptor.fetchLimit = limit
+        return descriptor
+    }
+
     struct IngestPreview: Equatable {
         var inputCount = 0
         var plausibleCount = 0
@@ -780,11 +850,7 @@ struct LocalStore {
 
     /// Daytime skin-temp readings in `[start, end)`, oldest first.
     func daytimeTemperatures(from start: Date, to end: Date) throws -> [StoredDaytimeTemp] {
-        let descriptor = FetchDescriptor<StoredDaytimeTemp>(
-            predicate: #Predicate { $0.time >= start && $0.time < end },
-            sortBy: [SortDescriptor(\.time)]
-        )
-        return try context.fetch(descriptor)
+        try context.fetch(Self.daytimeTemperaturesDescriptor(from: start, to: end))
     }
 
     /// One-time cleanup: delete physiologically-impossible heart-rate samples — those outside
@@ -882,12 +948,7 @@ struct LocalStore {
     /// dashboard to average overnight skin-temperature samples (which only exist while the
     /// ring was connected) over a night window.
     func samples(kind: MetricKind, from start: Date, to end: Date) throws -> [QuantitySample] {
-        let kindRaw = kind.rawValue
-        let descriptor = FetchDescriptor<StoredSample>(
-            predicate: #Predicate { $0.kindRaw == kindRaw && $0.start >= start && $0.start < end },
-            sortBy: [SortDescriptor(\.start, order: .forward)]
-        )
-        return try context.fetch(descriptor).compactMap(\.sample)
+        try context.fetch(Self.samplesDescriptor(kind: kind, from: start, to: end)).compactMap(\.sample)
     }
 
     /// Stored samples of one kind newer than `since`, oldest→newest. Bounded by the predicate so
@@ -1488,10 +1549,7 @@ struct LocalStore {
     /// Trailing sleep summaries (latest first), for the rolling skin-temp baseline (#69) and
     /// any short-window trend. Bounded so it never scans the whole table.
     func recentSleepSummaries(limit: Int = 40) throws -> [StoredSleepSummary] {
-        var descriptor = FetchDescriptor<StoredSleepSummary>(
-            sortBy: [SortDescriptor(\.night, order: .reverse)])
-        descriptor.fetchLimit = limit
-        return try context.fetch(descriptor)
+        try context.fetch(Self.recentSleepSummariesDescriptor(limit: limit))
     }
 
     /// Sleep summaries whose `night` bucket falls within `[from, to)`, oldest first.
@@ -2174,10 +2232,7 @@ struct LocalStore {
     /// Step snapshots in `[from, to)`, oldest first — the timestamped step history for the
     /// Trends/day-detail intraday views (#steps-history); `StoredDaily` only has the day total.
     func stepSamples(from: Date, to: Date) throws -> [StoredStepSample] {
-        let descriptor = FetchDescriptor<StoredStepSample>(
-            predicate: #Predicate { $0.start >= from && $0.start < to },
-            sortBy: [SortDescriptor(\.start, order: .forward)])
-        return try context.fetch(descriptor)
+        try context.fetch(Self.stepSamplesDescriptor(from: from, to: to))
     }
 
     /// Most recent stored daily rollup (latest day), or nil.
@@ -2191,10 +2246,7 @@ struct LocalStore {
     /// Trailing daily rollups (latest first), bounded by `limit`. Used by TrendsView (#74) to
     /// build 7-day rolling aggregates for steps. Bounded so it never scans the whole table.
     func recentDailies(limit: Int = 14) throws -> [StoredDaily] {
-        var descriptor = FetchDescriptor<StoredDaily>(
-            sortBy: [SortDescriptor(\.day, order: .reverse)])
-        descriptor.fetchLimit = limit
-        return try context.fetch(descriptor)
+        try context.fetch(Self.recentDailiesDescriptor(limit: limit))
     }
 
     /// Daily step rollups whose `day` bucket falls within `[from, to)`, oldest first.

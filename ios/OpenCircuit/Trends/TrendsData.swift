@@ -57,45 +57,77 @@ struct TrendsData {
         var tempUnitRaw: String
     }
 
-    /// Load the last two weeks of trends: fetch on the main actor, then compute the heavy per-day
-    /// rollup off-main. Recent-readings rows (cheap, and they build SwiftUI Colors) stay on main.
-    @MainActor
-    static func loadAsync(store: LocalStore, tempUnitRaw: String) async -> TrendsData {
-        let inputs = fetchInputs(store: store, tempUnitRaw: tempUnitRaw)
+    /// Load the last two weeks of trends. BOTH the fetch and the per-day rollup run off the main
+    /// actor; only the cheap recent-readings rows (which build SwiftUI `Color`s) stay on main.
+    ///
+    /// 🟢 MEASURED 2026-08-14 on a real device (39,434 `StoredSample` rows): one call fetches
+    /// **24,959 rows** over the 14-day window — daytime temps 8,988, HR 6,472, RR 3,648, HRV 2,530,
+    /// SpO₂ 1,908, step deltas 1,413. That fetch used to run `@MainActor`, and `ContentView` drives
+    /// it from three places (first `.task`, `scenePhase == .active`, and `syncing → false`), so a
+    /// first open that also syncs paid ~75 k row materializations ON THE MAIN THREAD. That is the
+    /// "app is extremely slow when you first open it and it syncs" report.
+    ///
+    /// `ModelContainer` is `Sendable`; the background `ModelContext` is created, used and destroyed
+    /// entirely inside the detached task, and nothing but the `Sendable` `Inputs` snapshot crosses
+    /// back — the same pattern `RollupBackup.exportBeforeWipe` already uses off the main context.
+    /// The profile is read on the caller's actor (a handful of UserDefaults keys) and passed in, so
+    /// the detached task touches nothing main-actor-isolated.
+    ///
+    /// One deliberate semantic change: a second context sees only what has been SAVED, not the main
+    /// context's in-flight edits. That is correct for every caller here — `LocalStore.ingest`,
+    /// `saveSleepSummary` and `applySleepEdit` all `context.save()` before returning, and the
+    /// `.syncFinished` trigger fires after the commit — so nothing this reads can be stranded in an
+    /// unsaved main-context change. A future caller that reloads trends mid-transaction would be
+    /// the exception, and should save first rather than reach back onto the main actor.
+    static func loadAsync(container: ModelContainer, tempUnitRaw: String) async -> TrendsData {
+        let profile = await MainActor.run { HealthKitWriter.storedUserProfile() }
+        let inputs = await Task.detached {
+            fetchInputs(container: container, profile: profile, tempUnitRaw: tempUnitRaw)
+        }.value
         let points = await Task.detached { computePoints(inputs) }.value
-        let recentRows = buildRecentMetricRows(inputs)
+        let recentRows = await buildRecentMetricRows(inputs)
         return TrendsData(points: points, recentRows: recentRows)
     }
 
-    /// Main-actor fetch + extraction into the Sendable `Inputs` snapshot.
-    @MainActor
-    private static func fetchInputs(store: LocalStore, tempUnitRaw: String) -> Inputs {
+    /// Off-main fetch + extraction into the `Sendable` `Inputs` snapshot.
+    ///
+    /// Every descriptor comes from `LocalStore`'s `nonisolated static` builders — deliberately NOT
+    /// hand-copied here — so this background read and the main-actor `LocalStore` methods can never
+    /// diverge into fetching different row sets.
+    nonisolated private static func fetchInputs(container: ModelContainer,
+                                                profile: UserProfile,
+                                                tempUnitRaw: String) -> Inputs {
+        let context = ModelContext(container)
         let cal = Calendar.current
         let now = Date()
         let lookbackStart = cal.date(byAdding: .day, value: -lookbackDays, to: now) ?? now
 
         var summaryByNight: [Date: SleepRow] = [:]
-        for s in (try? store.recentSleepSummaries(limit: lookbackDays)) ?? [] {
+        for s in (try? context.fetch(LocalStore.recentSleepSummariesDescriptor(limit: lookbackDays))) ?? [] {
             summaryByNight[cal.startOfDay(for: s.night)] = SleepRow(
                 night: s.night, asleepMin: s.asleepMin, sleepScore: s.sleepScore,
                 stressScore: s.stressScore, skinTempC: s.skinTempC,
                 inBedStart: s.inBedStart, inBedEnd: s.inBedEnd)
         }
         var stepsByDay: [Date: Int] = [:]
-        for d in (try? store.recentDailies(limit: lookbackDays)) ?? [] {
+        for d in (try? context.fetch(LocalStore.recentDailiesDescriptor(limit: lookbackDays))) ?? [] {
             stepsByDay[cal.startOfDay(for: d.day)] = d.steps
         }
-        let hr   = (try? store.samples(kind: .heartRate,       from: lookbackStart, to: now)) ?? []
-        let hrv  = (try? store.samples(kind: .hrvSDNN,         from: lookbackStart, to: now)) ?? []
-        let spo2 = (try? store.samples(kind: .spo2,            from: lookbackStart, to: now)) ?? []
-        let rr   = (try? store.samples(kind: .respiratoryRate, from: lookbackStart, to: now)) ?? []
-        let temps = ((try? store.daytimeTemperatures(from: lookbackStart, to: now)) ?? [])
+        func samples(_ kind: MetricKind) -> [QuantitySample] {
+            ((try? context.fetch(LocalStore.samplesDescriptor(kind: kind, from: lookbackStart, to: now))) ?? [])
+                .compactMap(\.sample)
+        }
+        let temps = ((try? context.fetch(
+            LocalStore.daytimeTemperaturesDescriptor(from: lookbackStart, to: now))) ?? [])
             .map { TempRow(time: $0.time, celsius: $0.celsius) }
-        let stepDeltas = ((try? store.stepSamples(from: lookbackStart, to: now)) ?? [])
+        let stepDeltas = ((try? context.fetch(
+            LocalStore.stepSamplesDescriptor(from: lookbackStart, to: now))) ?? [])
             .map { StepRow(start: $0.start, end: $0.end, delta: $0.delta) }
         return Inputs(summaryByNight: summaryByNight, stepsByDay: stepsByDay,
-                      hr: hr, hrv: hrv, spo2: spo2, rr: rr, temps: temps, stepDeltas: stepDeltas,
-                      profile: HealthKitWriter.storedUserProfile(), tempUnitRaw: tempUnitRaw)
+                      hr: samples(.heartRate), hrv: samples(.hrvSDNN),
+                      spo2: samples(.spo2), rr: samples(.respiratoryRate),
+                      temps: temps, stepDeltas: stepDeltas,
+                      profile: profile, tempUnitRaw: tempUnitRaw)
     }
 
     /// Pure, off-main per-day rollup — the heavy loop (Calories.dailyEstimate × up to 14 days).

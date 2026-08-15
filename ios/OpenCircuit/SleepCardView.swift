@@ -35,6 +35,9 @@ struct SleepCardView: View {
     @Query private var storedSleep: [StoredSleepSummary]
     /// Today's auto-detected naps (#76), latest first.
     @Query private var todayNaps: [StoredNap]
+    /// Whether this night's leading edge was observed or is just where recording resumed (#198).
+    /// Held as @State and refreshed in `.task(id:)` — never read from the store inside `body`.
+    @State private var bedtimeProvenance: BedtimeProvenance.Verdict = .unknown
     /// Freshly staged segments from the just-finished sync (empty when none / after disconnect).
     /// Preferred over the store so a completed sync updates the card immediately.
     var liveSegments: [SleepSegment]
@@ -352,6 +355,10 @@ struct SleepCardView: View {
         .padding()
         .background(RoundedRectangle(cornerRadius: Theme.cardCornerRadius)
             .fill(Color(.secondarySystemGroupedBackground)))
+        // Bedtime provenance (#198). Recomputed off the render path — two fetchLimit-1 reads, but
+        // `body` runs on every @Query invalidation and a store read there is how #14's black-screen
+        // launch happened. Keyed on the edge itself, so it re-runs only when the night changes.
+        .task(id: night?.inBedStart) { await refreshBedtimeProvenance() }
         .sheet(item: $editTarget) { target in
             EditSleepView(
                 night: target.night,
@@ -423,6 +430,7 @@ struct SleepCardView: View {
         Text(footer(night).joined(separator: " · "))
             .font(.caption2).foregroundStyle(.tertiary)
         captureHint(night)
+        bedtimeProvenanceHint(night)
         confidenceHint(night)
     }
 
@@ -477,6 +485,75 @@ struct SleepCardView: View {
             hintRow(systemImage: "bolt.badge.clock", tint: .orange,
                     "Synced only from \(onset.formatted(date: .omitted, time: .shortened)) — the rest of the night didn’t transfer off the ring. Make sure the official RingConn app isn’t connected (only one app can pull the ring), then open OpenCircuit in the morning to sync the full night.")
         }
+    }
+
+    // MARK: Bedtime provenance (#198)
+
+    /// Recompute whether this night's leading edge was WITNESSED or is just where recording resumed.
+    ///
+    /// Derived, never persisted — deliberately. The issue proposed a stored provenance flag, which
+    /// means a SwiftData migration, and the sibling branch `fix/sleep-wake-evidence-persistence` is
+    /// on HOLD for exactly that reason: every migration is a launch-crash surface whose recovery path
+    /// (`wipeAndRecoverForeground`) deletes un-resyncable raw history, and its migration tests pass
+    /// on the simulator only. The same answer is already computable from rows on disk, so this ships
+    /// the user-visible half of #198 at zero schema risk. The cost is that a night older than sample
+    /// retention degrades to `.unknown` — which the classifier reports honestly rather than
+    /// mistaking for "witnessed".
+    @MainActor
+    private func refreshBedtimeProvenance() async {
+        guard let start = night?.inBedStart else {
+            bedtimeProvenance = .unknown
+            return
+        }
+        let store = LocalStore(modelContext)
+        // HEART RATE specifically: it is band-guarded to 30…220 bpm, so a charging or pocketed ring
+        // yields none. A skin-temp or step row would NOT work — those keep arriving from a docked
+        // ring, and the #198 night is precisely a charge cycle, so they would call it "witnessed".
+        let last = try? store.latestSample(kind: .heartRate, before: start)
+        let earliest = try? store.earliestSample(kind: .heartRate)
+        bedtimeProvenance = BedtimeProvenance.classify(
+            inBedStart: start,
+            lastMeasurementBefore: last?.start,
+            earliestRetainedMeasurement: earliest?.start)
+    }
+
+    /// Say plainly when the printed bedtime is where DATA starts rather than where the user settled.
+    ///
+    /// Suppressed when `captureHint` already fired: a truncated night is the same class of statement
+    /// ("synced only from X") and two stacked caveats about the same edge read as nagging.
+    ///
+    /// ⚠️ The copy names no CAUSE. Charging, taking the ring off and a BLE dropout are
+    /// indistinguishable from the persisted stream, and there are n = 0 bedtime labels in the corpus
+    /// — so it reports the observation (nothing was recorded before this) and points at the one
+    /// thing the user can actually do about it: correct it with Edit (#176), which is also the
+    /// supervised label this whole area lacks.
+    @ViewBuilder
+    private func bedtimeProvenanceHint(_ night: Night) -> some View {
+        if let start = night.inBedStart, !isLikelyTruncated(night),
+           BedtimeProvenance.needsQualification(bedtimeProvenance) {
+            switch bedtimeProvenance {
+            case .resumedAfterGap(let gap):
+                hintRow(systemImage: "bed.double", tint: .secondary,
+                        "\(Self.clock(start)) is when the ring started recording again, not when you settled — it recorded nothing for \(Self.approximateDuration(gap)) before that. If you were already in bed, tap Edit to correct it.")
+            case .noPriorMeasurement:
+                hintRow(systemImage: "bed.double", tint: .secondary,
+                        "\(Self.clock(start)) is where this night's recording begins — there's nothing before it, so we can't tell whether you were already in bed. Tap Edit if it's wrong.")
+            case .witnessed, .unknown:
+                // `.unknown` stays SILENT: we could not judge, and a caveat we can't support is its
+                // own kind of dishonesty. It simply doesn't earn the unqualified claim either — the
+                // card just prints the time without asserting it was observed.
+                EmptyView()
+            }
+        }
+    }
+
+    /// A gap rendered at the precision the measurement supports — whole minutes under an hour, then
+    /// hours and minutes. Never seconds: the underlying edge is a 150 s epoch boundary.
+    private static func approximateDuration(_ seconds: TimeInterval) -> String {
+        let minutes = max(Int((seconds / 60).rounded()), 1)
+        if minutes < 60 { return "\(minutes) minute\(minutes == 1 ? "" : "s")" }
+        let (h, m) = (minutes / 60, minutes % 60)
+        return m == 0 ? "\(h) hour\(h == 1 ? "" : "s")" : "\(h)h \(m)m"
     }
 
     /// One Sleep-card caption row: a small tinted SF Symbol + secondary caption text. Shared by the

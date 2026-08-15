@@ -14,7 +14,7 @@ options:
 settings:
   base:
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "42"
+    CURRENT_PROJECT_VERSION: "43"
 
 packages:
   OpenCircuitKit:
@@ -32,6 +32,21 @@ targets:
     platform: iOS
     sources:
       - path: OpenCircuit
+        # AppIcon.icon is an Icon Composer BUNDLE (a directory of icon.json + layer SVGs). Excluded
+        # from the recursive scan and re-added below as a single `type: file` reference, or XcodeGen
+        # walks into it and adds the two layer SVGs as loose unknown-type resources — the bundle
+        # itself then never reaches actool and the icon silently falls back to the placeholder.
+        excludes:
+          - "AppIcon.icon"
+          # Design source art (icon mark + the 2026-06 candidate explorations). Referenced by
+          # nothing in code — every file here was being copied into the .app as a dead resource.
+          # Kept in the repo as the editable source of the shipped icon, out of the bundle.
+          - "branding"
+      # The Icon Composer icon (Xcode 26 / iOS 26 liquid glass). `type: file` keeps the .icon
+      # bundle ONE file reference. actool compiles it and derives the legacy flat icons for
+      # pre-iOS-26 (deployment target is 17.0), so this replaces the old 1024px AppIcon.appiconset.
+      - path: OpenCircuit/AppIcon.icon
+        type: file
       # Shared/ holds WorkoutActivityAttributes — the ActivityKit contract compiled into BOTH the
       # app (starts/updates the Live Activity) and the WorkoutWidget extension (renders it).
       - path: Shared
@@ -47,7 +62,17 @@ targets:
     info:
       path: OpenCircuit/Info.plist
       properties:
-        UILaunchScreen: {}
+        # Splash: the system launch screen, so the brand mark is on screen for the REAL launch work
+        # (container open + any migration) and costs the user no added time — as opposed to an
+        # in-app splash on a timer, which would be a deliberate delay in the same release that
+        # removes ~25 k rows of main-thread work from the launch path.
+        # `LaunchBackground` is pinned to `systemGroupedBackground`'s own values (#F2F2F7 light,
+        # black dark) — the same Theme.pageBackground the first real frame paints — so the handoff
+        # from splash to UI doesn't flash a different colour.
+        UILaunchScreen:
+          UIImageName: LaunchLogo
+          UIImageRespectsSafeAreaInsets: true
+          UIColorName: LaunchBackground
         # User-facing app name (home screen, Settings). Independent of PRODUCT_NAME / bundle id,
         # which stay "OpenCircuit"/com.standardsoftwaresolutions.opencircuit internally (#100 rebrand).
         CFBundleDisplayName: OpenCircuit
@@ -118,8 +143,9 @@ targets:
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
-        # App icon lives in OpenCircuit/Assets.xcassets/AppIcon.appiconset (single 1024px icon,
-        # iOS 17 single-size format). Set explicitly so CLI/device builds assign it after xcodegen.
+        # App icon is OpenCircuit/AppIcon.icon (Icon Composer). Set explicitly so CLI/device builds
+        # assign it after xcodegen. The name must match the .icon file's basename; there must be
+        # NO AppIcon.appiconset left in Assets.xcassets or actool errors on the duplicate name.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # On-device signing. Set here so CLI device builds work after `xcodegen generate`
         # (which would otherwise drop the team and fail signing). Team 765RD9BJ8C =
