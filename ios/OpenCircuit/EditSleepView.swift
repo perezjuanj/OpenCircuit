@@ -202,6 +202,8 @@ struct EditSleepView: View {
         case .startBeforeEarliest: return "Bedtime can’t be earlier than \(clock(bounds.earliest))."
         case .endAfterLatest:      return "Wake time can’t be later than \(clock(bounds.latest))."
         case .tooShort:            return "That window is too short for a night."
+        case .tooLong(let maxMinutes):
+            return "Time in bed can’t be longer than \(maxMinutes / 60)h \(maxMinutes % 60)m."
         }
     }
 
