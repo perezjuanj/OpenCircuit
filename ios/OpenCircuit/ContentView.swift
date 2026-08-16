@@ -858,20 +858,14 @@ struct ContentView: View {
             Task { healthPromptExhausted = (await health.authorizationPromptAvailable()) == false }
         }
         let battery = session?.batteryPercent
-        // Is the ring still WRITING history, or only still TALKING? Both inputs are already on
-        // hand: the `.heartRate` cursor is the newest `0x4c` epoch we hold (HR decodes from nothing
-        // else), and `lastRingDataAt` is the durable "a frame arrived" stamp. The pair is the whole
-        // detector — see `EpochRecordingHealth`.
-        let newestEpochAt = (try? LocalStore(modelContext).loadCursor())?.last(.heartRate)
-        let ringDataEpoch = UserDefaults.standard.double(forKey: ReminderDefaults.lastRingDataAt)
-        let lastRingDataAt = [ringDataEpoch > 0 ? Date(timeIntervalSince1970: ringDataEpoch) : nil,
-                              session?.lastFrameAt].compactMap { $0 }.max()
-        let recording = EpochRecordingHealth.classify(newestEpochAt: newestEpochAt,
-                                                      newestDescriptorAt: lastRingDataAt)
-        Task {
-            await LocalAlertCenter().evaluate(batteryPercent: battery, healthAuthorized: authorized,
-                                              recording: recording)
-        }
+        // ⚠️ THE `notRecording` DETECTOR IS DELIBERATELY NOT WIRED HERE — see `EpochRecordingHealth`.
+        // Adversarial review proved the inputs available at this call site cannot support it: the
+        // `.heartRate` cursor is WORN-evidence (an unworn epoch decodes no HR at all) and the
+        // overnight-quiet gate suppresses drains for 8-10 h by design while the keepalive keeps the
+        // ring "answering" — so it would have fired on a healthy ring every morning, and whenever the
+        // ring sat off-finger beside the phone. It needs DRAIN OUTCOMES, not sample cursors.
+        // `evaluate` defaults `recording:` to `.recording`, so omitting it keeps the alert inert.
+        Task { await LocalAlertCenter().evaluate(batteryPercent: battery, healthAuthorized: authorized) }
         evaluateHealthAlerts()
         // Pre-sync pass: wear + bedtime only. The sedentary rule is deferred to the post-sync
         // handler so it never fires on a stale `lastActivityAt` right after activity (#145).

@@ -71,9 +71,9 @@ final class EpochRecordingHealthTests: XCTestCase {
                                                      newestDescriptorAt: nil, now: now), .unknown)
     }
 
-    /// The threshold must clear a legitimately sparse drain cadence — notably the overnight quiet
-    /// window, during which no drain runs at all by design.
-    func testAnUndrainedOvernightGapDoesNotWarn() {
+    /// A short undrained gap is silent. ⚠️ This does NOT establish that the threshold clears the
+    /// overnight-quiet window — it does not; see `testKNOWNDEFECT_normalNightReadsAsStalledOnWaking`.
+    func testAShortUndrainedGapDoesNotWarn() {
         XCTAssertEqual(EpochRecordingHealth.classify(newestEpochAt: ago(2.5 * 3600),
                                                      newestDescriptorAt: ago(30), now: now),
                        .recording)
@@ -95,6 +95,33 @@ final class EpochRecordingHealthTests: XCTestCase {
     func testStalledHoursIsNilWhenRecording() {
         XCTAssertNil(EpochRecordingHealth.stalledHours(.recording, now: now))
         XCTAssertNil(EpochRecordingHealth.stalledHours(.unknown, now: now))
+    }
+
+    // MARK: ⚠️ THE TWO PROVEN FALSE-ALARM MODES — why this detector is NOT wired
+    //
+    // These pin the CURRENT, WRONG behaviour on purpose. Each asserts `.stalled` on a state where
+    // nothing is wrong, which is exactly why `ContentView` does not feed this into the alert. When
+    // the rebuild lands (classify from DRAIN OUTCOMES — see the file header), both must flip to a
+    // silent verdict, and these tests failing is the signal that it worked.
+
+    /// MODE 1 — ring off the finger, in range, beside the phone. The keepalive keeps the descriptor
+    /// seconds-fresh; an unworn epoch decodes no heart rate, so the `.heartRate` cursor cannot
+    /// advance. Nothing is broken. The rule fires anyway.
+    func testKNOWNDEFECT_unwornRingBesideThePhoneReadsAsStalled() {
+        let s = EpochRecordingHealth.classify(newestEpochAt: ago(5 * 3600),   // taken off 5 h ago
+                                              newestDescriptorAt: ago(30),    // keepalive, seconds old
+                                              now: now)
+        XCTAssertTrue(s.isStalled, "DEFECT pinned: an unworn ring in range must NOT read as stalled")
+    }
+
+    /// MODE 2 — an ordinary night. Automatic drains are suppressed inside the overnight-quiet
+    /// window by design (8-10 h), while the in-window keepalive keeps the ring answering. The first
+    /// foreground on waking runs before the wake drain lands.
+    func testKNOWNDEFECT_normalNightReadsAsStalledOnWaking() {
+        let s = EpochRecordingHealth.classify(newestEpochAt: ago(8 * 3600),   // last pre-bed drain
+                                              newestDescriptorAt: ago(30),    // keepalive all night
+                                              now: now)
+        XCTAssertTrue(s.isStalled, "DEFECT pinned: a healthy night must NOT read as stalled")
     }
 
     /// Never reads "0 hours" — the copy has to be sensible the moment it fires.
