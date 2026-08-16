@@ -958,7 +958,8 @@ public enum BulkSleep {
 
     public static func latestNightRecords(from records: [BulkRecord],
                                           temperatures: [TemperatureSample] = [],
-                                          epoch: Int = Command.syncEpoch) -> [BulkRecord] {
+                                          epoch: Int = Command.syncEpoch,
+                                          morningContinuationGap: TimeInterval = morningContinuationMaxGap) -> [BulkRecord] {
         // Motion detection needs a time-ordered timeline; sort defensively so the helper is correct
         // for any caller, not only the pre-sorted EpochArchive union.
         let records = records.sorted { $0.counter < $1.counter }
@@ -1018,11 +1019,55 @@ public enum BulkSleep {
         // gate discards the whole night → no summary persisted (🟢 reproduced 2026-06-30). A real night —
         // even a long lie-in — fits inside maxNightSpan, so legitimate multi-drain stitching is untouched.
         clusterStart = max(clusterStart, anchor.end.addingTimeInterval(-maxNightSpan))
+        // MORNING-CONTINUATION ABSORB. A brief arousal near the natural end of the wake window can
+        // split one night into "the night" + a separate later sleep block: the later block's midpoint
+        // falls past 09:00, `isOvernightBlock` rejects it as a night, and it drains away as a "nap" —
+        // the user's real wake time with it. 🟢 Device case 2026-08-16 (Gen 2 Air): asleep
+        // 03:44→10:30 with a ~1-min detector split at 09:04 became a 03:44→09:03 night plus an
+        // 86-min 09:04→10:30 "nap"; the sleep card (which excludes naps) reported 4 h for a 6¾ h
+        // night. Chain FORWARD over later sleep blocks the same way the backward pass chains earlier
+        // ones, but under much stricter rules — each one keeps a real failure out:
+        //   * the gap must be ≤ `morningContinuationMaxGap` (30 min — the same slop this function
+        //     already grants as `margin`; the device split was ~1 min). Deliberately a small fraction
+        //     of `maxIntraNightGap` (6 h): a genuine late-morning or afternoon nap keeps its hours-
+        //     wide gap and stays a nap.
+        //   * the extended envelope must still satisfy `isOvernightBlock`, or absorbing the tail
+        //     would get the WHOLE night rejected by the downstream overnight gate — losing a real
+        //     night to recover its tail is the anchor-eviction failure shape all over again.
+        //   * the extension never exceeds `maxNightSpan` from the cluster start, and never moves
+        //     `anchor` or the head-clip floor above — both stay keyed to the pass-1/2 anchor, so
+        //     every guarantee argued for them is untouched.
+        // Candidates are sleep periods ≥ `NapDetection.minNapDuration` (15 min — the APK's own
+        // auto-nap floor: "naps … longer than 15 minutes", pp.txt:47434), NOT `minSleepDuration`: a bout can be
+        // too short to START a night yet a perfectly real continuation of one (🟢 the device case
+        // had a 32-min 08:40–09:13 bout after the arousal). Anything under the nap floor is noise.
+        // Blocks are DISJOINT in time (detector output), so a plain forward scan terminates; the
+        // first block that fails a rule ends the chain (any later block starts even further from
+        // `clusterEnd`).
+        let continuations = periods.filter {
+            $0.activity == .sleep && $0.duration >= NapDetection.minNapDuration
+        }
+        var clusterEnd = anchor.end
+        if morningContinuationGap > 0 {
+            for p in continuations.sorted(by: { $0.start < $1.start }) where p.start >= anchor.end {
+                guard p.start.timeIntervalSince(clusterEnd) <= morningContinuationGap,
+                      p.end.timeIntervalSince(clusterStart) <= maxNightSpan,
+                      SleepWindow.isOvernightBlock(start: clusterStart, end: p.end) else { break }
+                clusterEnd = max(clusterEnd, p.end)
+            }
+        }
         let margin: TimeInterval = 30 * 60   // don't clip onset/wake at detection granularity
         let lo = clusterStart.addingTimeInterval(-margin)
-        let hi = anchor.end.addingTimeInterval(margin)
+        let hi = clusterEnd.addingTimeInterval(margin)
         return records.filter { let t = $0.date(epoch: epoch); return t >= lo && t <= hi }
     }
+
+    /// Longest arousal the morning-continuation absorb in `latestNightRecords` bridges between the
+    /// anchor night's end and a later same-morning sleep block. Small ON PURPOSE — the backward
+    /// pass's `maxIntraNightGap` (6 h) would swallow genuine daytime naps if applied forward.
+    /// Passing `morningContinuationGap: 0` (or any non-positive value) disables the absorb and is
+    /// byte-identical to the pre-fix scoping (kill switch, pinned by test).
+    public static let morningContinuationMaxGap: TimeInterval = 30 * 60
 
     /// Light/Deep/REM/Awake staging of the detected sleep block. Thin wrapper over
     /// `SleepStaging.classify` (kept for source compatibility with existing callers).
