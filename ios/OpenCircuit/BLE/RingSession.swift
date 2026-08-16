@@ -254,6 +254,10 @@ final class RingSession: NSObject {
     /// be treated as proof that firmware is still armed after a reboot/reconnect.
     private var automaticWorkoutReassertTask: Task<Void, Never>?
     private var automaticWorkoutDetectionAppliedThisConnection = false
+    /// Per-connection latch for `clearStrandedSportModeIfNeeded` — a stranded ring is cleared once
+    /// per link, never repeatedly, and never after a workout has claimed the connection.
+    private var strandedSportClearedThisConnection = false
+    private var strandedSportClearTask: Task<Void, Never>?
     /// Seconds after a confirmed subscription to wait for the ring's first DATA frame. The keepalive
     /// starts writing status/fetch immediately on `ready`, so a healthy ring answers well within
     /// this; only a ring that is off-wrist, held by another app, or otherwise silent passes it.
@@ -888,6 +892,7 @@ final class RingSession: NSObject {
         postSyncStatusTask?.cancel(); postSyncStatusTask = nil
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
         automaticWorkoutReassertTask?.cancel(); automaticWorkoutReassertTask = nil
+        strandedSportClearTask?.cancel(); strandedSportClearTask = nil
         syncTask?.cancel(); syncTask = nil
         // The in-drain bank debounce is cancelled AFTER `flushDrainedToArchive()` above has already
         // banked the same records, so nothing is dropped by cancelling it — this only stops a
@@ -2233,6 +2238,12 @@ final class RingSession: NSObject {
     /// records HR; `workoutHRActive` (not `sportSessionActive`) is what keeps `collectHRSnapshot`
     /// recording across that switch.
     func beginSportSession(typeByte: UInt8) {
+        // A workout now owns the ring: kill any pending stranded-sport clear before it can fire.
+        // The task re-checks these flags each tick, but cancelling here closes the window between
+        // its check and its write — the only way `clearStrandedSportModeIfNeeded` could ever cut a
+        // real workout short.
+        strandedSportClearTask?.cancel(); strandedSportClearTask = nil
+        strandedSportClearedThisConnection = true
         sportSessionActive = true
         workoutHRActive = true   // records HR for the whole workout (0x4e stream OR live-poll fallback)
         // Take the shared "a workout owns the ring" hold so the SAME contention gates that already
@@ -2674,6 +2685,71 @@ final class RingSession: NSObject {
                     self.automaticWorkoutDetectionAppliedThisConnection = true
                     ringLog.notice("automatic workout detection: RE-ASSERTED after reconnect (05 23 01 00)")
                     print("[OC] automatic workout detection RE-ASSERTED after reconnect")
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+    }
+
+    /// Once per connection, tell a ring that nobody is working out to LEAVE SPORT MODE.
+    ///
+    /// ══ THE WORST DATA-LOSS MODE FOUND SO FAR, AND IT IS SILENT ══
+    ///
+    /// 🟢 PROVEN END-TO-END on the maintainer's own ring, 2026-08-16 (Gen 2, FR02.018, build 43).
+    /// The app crashed MID-WORKOUT at 08-15 14:46 (mid-workout crashes are a known perf/watchdog
+    /// issue). `SportStop` (`06 00 00`) is written by exactly one site — `endSportSession()` — which
+    /// requires the APP to hold a live workout; after a crash it relaunches holding none and never
+    /// calls it. The ring therefore stayed in sport mode for **19 h 56 m** and recorded **ZERO `0x4c`
+    /// epochs** for the entire time: no HR, no SpO2, no HRV, no RR, and NO SLEEP. A whole night was
+    /// not mis-staged, it was never written — nothing can recover it. Sending `06 00 00` by hand
+    /// restored recording within one epoch (14:46:23 → 10:42:47).
+    ///
+    /// What made it invisible: **skin temperature stayed current the whole time**, because it rides
+    /// the live `0x10/0x87` descriptor rather than the `0x4c` history. Battery, temperature and the
+    /// connection all read perfectly normal while the ring recorded nothing.
+    ///
+    /// ⚠️ THIS MUST NOT BE GATED ON `workout.inProgress`. That durable flag is already reconciled by
+    /// ContentView's crash-orphan cleanup, so on the proven incident it read **false** for 19 h while
+    /// the ring was still stranded. Gating on it would have fixed nothing. The ring's mode cannot be
+    /// queried, so the only safe move is to assert the state we want whenever we know no workout is
+    /// running — which is exactly the reasoning `reassertAutomaticWorkoutDetectionIfNeeded` uses for
+    /// `05 23`, and this mirrors it deliberately.
+    ///
+    /// ⚠️ `05 23 00 00` IS NOT A SUBSTITUTE. That disarms the recognizer; it does not end a session.
+    /// The user tried it first and it changed nothing. Nor does a live-HR read: that sends `06 01`,
+    /// and the ring rejects a direct `06 03`→`06 01` switch (see `fallBackToLivePoll`).
+    ///
+    /// SAFETY. `06 00 00` on an already-idle ring is a no-op — the same command the enter path and
+    /// the calibration path already send unconditionally. The guards below are the reassert task's,
+    /// plus the three that say a workout is genuinely live (`workoutHolding` / `sportSessionActive` /
+    /// `workoutHRActive`); with any of those set this never fires, so a real workout — including one
+    /// that started before this connection — is never cut short.
+    private func clearStrandedSportModeIfNeeded() {
+        guard !strandedSportClearedThisConnection,
+              strandedSportClearTask == nil else { return }
+        strandedSportClearTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.strandedSportClearTask = nil }
+            while !Task.isCancelled {
+                // A workout starting at any point cancels this permanently for the connection: the
+                // ring is then in sport mode BY REQUEST and must be left alone.
+                if self.workoutHolding || self.sportSessionActive || self.workoutHRActive {
+                    self.strandedSportClearedThisConnection = true
+                    return
+                }
+                if self.ready,
+                   self.notifySubscribed,
+                   self.gotDataFrame,
+                   self.syncTask == nil,
+                   !self.syncing,
+                   !self.monitoring,
+                   !self.livePreparing,
+                   !self.calibrationCapturing {
+                    self.write(Command.sportStop)
+                    self.strandedSportClearedThisConnection = true
+                    ringLog.notice("sport mode: cleared on connect (06 00 00) — no workout is active")
+                    print("[OC] sport mode cleared on connect (06 00 00)")
                     return
                 }
                 try? await Task.sleep(for: .milliseconds(500))
@@ -4080,6 +4156,7 @@ extension RingSession: CBPeripheralDelegate {
                 self.startKeepalive()      // continuous descriptor polling (temp/steps/battery)
                 self.startAutoMeasure()    // periodic HR/SpO₂ reads so those refresh on their own
                 self.reassertAutomaticWorkoutDetectionIfNeeded()
+                self.clearStrandedSportModeIfNeeded()
             }
         }
     }
@@ -4604,6 +4681,7 @@ extension RingSession: CBPeripheralDelegate {
             if characteristic.isNotifying {
                 self.startStreamWatchdog()
                 self.reassertAutomaticWorkoutDetectionIfNeeded()
+                self.clearStrandedSportModeIfNeeded()
             }
         }
     }

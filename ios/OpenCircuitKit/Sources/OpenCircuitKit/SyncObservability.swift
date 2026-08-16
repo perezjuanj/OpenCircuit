@@ -12,6 +12,13 @@ public enum SyncAlert: String, CaseIterable, Codable, Sendable {
     case notSynced       // no successful ring sync in > staleSyncThreshold
     case lowBattery      // ring battery at/under lowBatteryThreshold
     case healthAuthLost  // Health share access was granted before and is now off
+    /// The ring is connected and answering, but has written no `0x4c` epoch history for hours —
+    /// so heart rate, SpO2, HRV, respiratory rate and SLEEP are all being lost right now.
+    /// APPENDED AT THE END, never inserted: `alertsToFire` returns survivors in `allCases`
+    /// declaration order and the `String` rawValue keys the persisted `obs.alertLastFired` ledger.
+    /// 🟢 Added after a proven incident where this state ran 19 h 56 m and cost a whole night with
+    /// no warning of any kind — see `EpochRecordingHealth` for why it is invisible without this.
+    case notRecording
 }
 
 /// Thresholds + debounce for the silent-failure alerts. Pure value type: the app feeds it the
@@ -40,11 +47,16 @@ public struct SyncAlertPolicy: Sendable, Equatable {
     ///   check rather than firing a false low-battery alert.
     /// - `healthAuthLost` only fires when Health was authorized before (`healthEverAuthorized`)
     ///   and is now off — so a user who simply never opted into Health isn't told it "broke".
+    /// - `notRecording` is decided by `EpochRecordingHealth` and passed in already classified, so
+    ///   this policy stays a pure threshold/debounce layer and the "is the ring writing history"
+    ///   judgement lives in one place. Defaulted to `.recording` so every existing caller is
+    ///   unchanged and can never accidentally raise it.
     public func activeConditions(now: Date,
                                  lastSuccessfulSync: Date?,
                                  batteryPercent: Int?,
                                  healthAuthorized: Bool,
-                                 healthEverAuthorized: Bool) -> Set<SyncAlert> {
+                                 healthEverAuthorized: Bool,
+                                 recording: EpochRecordingHealth.Status = .recording) -> Set<SyncAlert> {
         var conditions: Set<SyncAlert> = []
         if let last = lastSuccessfulSync, now.timeIntervalSince(last) > staleSyncThreshold {
             conditions.insert(.notSynced)
@@ -54,6 +66,9 @@ public struct SyncAlertPolicy: Sendable, Equatable {
         }
         if healthEverAuthorized && !healthAuthorized {
             conditions.insert(.healthAuthLost)
+        }
+        if recording.isStalled {
+            conditions.insert(.notRecording)
         }
         return conditions
     }
@@ -65,12 +80,14 @@ public struct SyncAlertPolicy: Sendable, Equatable {
                              batteryPercent: Int?,
                              healthAuthorized: Bool,
                              healthEverAuthorized: Bool,
-                             lastFired: [SyncAlert: Date]) -> [SyncAlert] {
+                             lastFired: [SyncAlert: Date],
+                             recording: EpochRecordingHealth.Status = .recording) -> [SyncAlert] {
         let active = activeConditions(now: now,
                                       lastSuccessfulSync: lastSuccessfulSync,
                                       batteryPercent: batteryPercent,
                                       healthAuthorized: healthAuthorized,
-                                      healthEverAuthorized: healthEverAuthorized)
+                                      healthEverAuthorized: healthEverAuthorized,
+                                      recording: recording)
         return SyncAlert.allCases.filter { alert in
             guard active.contains(alert) else { return false }
             if let fired = lastFired[alert], now.timeIntervalSince(fired) < renotifyInterval {

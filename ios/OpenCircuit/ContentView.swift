@@ -858,7 +858,20 @@ struct ContentView: View {
             Task { healthPromptExhausted = (await health.authorizationPromptAvailable()) == false }
         }
         let battery = session?.batteryPercent
-        Task { await LocalAlertCenter().evaluate(batteryPercent: battery, healthAuthorized: authorized) }
+        // Is the ring still WRITING history, or only still TALKING? Both inputs are already on
+        // hand: the `.heartRate` cursor is the newest `0x4c` epoch we hold (HR decodes from nothing
+        // else), and `lastRingDataAt` is the durable "a frame arrived" stamp. The pair is the whole
+        // detector — see `EpochRecordingHealth`.
+        let newestEpochAt = (try? LocalStore(modelContext).loadCursor())?.last(.heartRate)
+        let ringDataEpoch = UserDefaults.standard.double(forKey: ReminderDefaults.lastRingDataAt)
+        let lastRingDataAt = [ringDataEpoch > 0 ? Date(timeIntervalSince1970: ringDataEpoch) : nil,
+                              session?.lastFrameAt].compactMap { $0 }.max()
+        let recording = EpochRecordingHealth.classify(newestEpochAt: newestEpochAt,
+                                                      newestDescriptorAt: lastRingDataAt)
+        Task {
+            await LocalAlertCenter().evaluate(batteryPercent: battery, healthAuthorized: authorized,
+                                              recording: recording)
+        }
         evaluateHealthAlerts()
         // Pre-sync pass: wear + bedtime only. The sedentary rule is deferred to the post-sync
         // handler so it never fires on a stale `lastActivityAt` right after activity (#145).
