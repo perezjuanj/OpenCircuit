@@ -217,14 +217,19 @@ struct LocalAlertCenter {
     /// Evaluate the current state and post a debounced notification for each firing condition.
     /// No-op when nothing's wrong. `batteryPercent == nil` (e.g. the background session is already
     /// torn down) simply skips the low-battery check rather than firing falsely.
-    func evaluate(now: Date = Date(), batteryPercent: Int?, healthAuthorized: Bool) async {
+    /// `recording` is the already-classified verdict from `EpochRecordingHealth` (the caller owns
+    /// the two timestamps it needs). Defaulted to `.recording` so a caller that cannot supply them
+    /// behaves exactly as before and can never raise a false alarm.
+    func evaluate(now: Date = Date(), batteryPercent: Int?, healthAuthorized: Bool,
+                  recording: EpochRecordingHealth.Status = .recording) async {
         let fire = policy.alertsToFire(
             now: now,
             lastSuccessfulSync: store.lastSuccessfulSync,
             batteryPercent: batteryPercent,
             healthAuthorized: healthAuthorized,
             healthEverAuthorized: store.healthEverAuthorized,
-            lastFired: store.alertLastFired())
+            lastFired: store.alertLastFired(),
+            recording: recording)
         guard !fire.isEmpty, await ensureAuthorized() else { return }
         for alert in fire { await post(alert) }
         store.markAlertsFired(fire, at: now)
@@ -256,6 +261,13 @@ struct LocalAlertCenter {
         case .healthAuthLost:
             content.title = "Apple Health access off"
             content.body = "OpenCircuit can no longer write to Apple Health. Re-enable it in Settings ▸ Health ▸ Data Access & Devices."
+        case .notRecording:
+            // Names the SYMPTOM the wearer can verify (nothing new for hours) and the ONE action
+            // that clears the proven cause, without asserting a cause we cannot confirm from here —
+            // the ring's mode is not queryable. Deliberately concrete about what is being lost:
+            // "not recording" is abstract, "heart rate and sleep" is not.
+            content.title = "Ring isn't recording"
+            content.body = "Your ring is connected but hasn't stored any heart rate or sleep data for several hours. Start a workout and stop it again — that usually clears it."
         }
         // One pending request per condition (stable id) — re-posting just refreshes it.
         let request = UNNotificationRequest(identifier: "obs.alert.\(alert.rawValue)",
