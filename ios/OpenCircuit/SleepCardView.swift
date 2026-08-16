@@ -374,10 +374,14 @@ struct SleepCardView: View {
     }
 
     private func makeEditTarget(_ row: StoredSleepSummary) -> EditTarget {
-        let onset = row.sleepEditRecordedOnset > Date.distantPast
-            ? row.sleepEditRecordedOnset : row.sleepEditRecordedInBedStart
-        let wake = row.sleepEditRecordedWake > onset
-            ? row.sleepEditRecordedWake : row.sleepEditRecordedInBedEnd
+        // Clamp anchors come from the WIDENED-recorded view (frozen recorded window ∪ any fuller
+        // stagings a keptManualEdit drain recorded), so re-editing a night whose archive grew can
+        // reach the newly held data. Must match `RingSession.applySleepEdit`'s validator anchors.
+        let clamp = row.sleepEditClampWindow
+        let onset = clamp.sleepOnset > Date.distantPast
+            ? clamp.sleepOnset : clamp.inBedStart
+        let wake = clamp.sleepWake > onset
+            ? clamp.sleepWake : clamp.inBedEnd
         return EditTarget(night: row.night,
                           inBedStart: row.sleepEditCurrentInBedStart,
                           sleepOnset: row.sleepEditCurrentOnset,

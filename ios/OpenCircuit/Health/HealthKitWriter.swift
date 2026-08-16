@@ -1684,6 +1684,35 @@ final class HealthKitWriter {
             recordedStart: recordedStart, recordedEnd: recordedEnd,
             napWindows: napWindows, keeping: newUUIDs)
 
+        // 2b. Sweep auto-naps the EDITED window absorbed. Nothing else can: `mirrorSettledNight`
+        //     leaves edited nights entirely alone, and the transition cleanup above deletes only
+        //     inside the FROZEN recorded span while excluding nap windows — so a nap the user's
+        //     corrective edit turned into night sleep would stay double-counted in totals and in
+        //     Health forever (🟢 2026-08-16 tester: an 86-min 09:04–10:30 auto-nap inside her
+        //     corrected wake; review find). HEALTH FIRST, row second: the row is the only record
+        //     those samples exist, so it is deleted only once its samples are gone (`healthWritten`
+        //     false ⇒ nothing in Health, delete directly). A Health-delete failure keeps the row —
+        //     the next edit of this night retries the sweep.
+        //     A nap only PARTLY inside the edited window is swept WHOLE (same semantics as the
+        //     unedited path's prune): the user's asserted window wins over the detector's tail.
+        let absorbed = local.autoNaps(overlapping: times.inBedStart, to: times.sleepWake)
+        var sweptNaps: [StoredNap] = []
+        for nap in absorbed {
+            let lo = min(nap.start, nap.effectiveStart)
+            let hi = max(nap.end, nap.effectiveEnd)
+            if nap.healthWritten, hi > lo {
+                // Exclude MANUAL naps' windows: a user-asserted nap inside the swept span must keep
+                // its samples (its row survives, so orphaning would be silent double-bookkeeping).
+                let manualWindows = local.healthWrittenNapWindows(overlapping: lo, to: hi,
+                                                                  manualOnly: true)
+                do { try await deleteNightSleep(from: lo, to: hi, napWindows: manualWindows,
+                                                keeping: newUUIDs) }
+                catch { continue }
+            }
+            sweptNaps.append(nap)
+        }
+        local.deleteNaps(sweptNaps, reason: "absorbed-by-edit", night: night)
+
         // 3. Track (fresh write + any prior we couldn't delete), and pin the watermarks so the periodic
         //    flush neither re-adds the trimmed recorded tail nor re-appends the leading extension.
         local.setSleepEditHealthUUIDs(newUUIDs + survivingPrior, night: night)

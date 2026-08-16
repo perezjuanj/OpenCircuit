@@ -1766,13 +1766,17 @@ final class RingSession: NSObject {
         guard let store = localStore else { return nil }
         guard let row = try? store.sleepSummary(night: night) else { return nil }
 
-        // Always validate against immutable RECORDED anchors, never the last edited values. This is
+        // Always validate against RING-DERIVED anchors, never the last edited values. This is
         // both a server-side guard (the UI cannot smuggle out-of-range Times) and what prevents
-        // re-editing from walking the ±3 h limits farther outward on every Save.
-        let recordedOnset = row.sleepEditRecordedOnset > .distantPast
-            ? row.sleepEditRecordedOnset : row.sleepEditRecordedInBedStart
-        let recordedWake = row.sleepEditRecordedWake > recordedOnset
-            ? row.sleepEditRecordedWake : row.sleepEditRecordedInBedEnd
+        // re-editing from walking the ±3 h limits farther outward on every Save. The anchors are
+        // the WIDENED-recorded view (frozen recorded ∪ fuller keptManualEdit stagings): still
+        // ring-derived — a user edit never feeds it — so the no-walking property holds, and it
+        // matches the sheet's own anchors (`SleepCardView.makeEditTarget`).
+        let clamp = row.sleepEditClampWindow
+        let recordedOnset = clamp.sleepOnset > .distantPast
+            ? clamp.sleepOnset : clamp.inBedStart
+        let recordedWake = clamp.sleepWake > recordedOnset
+            ? clamp.sleepWake : clamp.inBedEnd
         // Widen the bounds by the epochs we actually HOLD for this night (#188 fallout): a badly
         // truncated night is otherwise uncorrectable, because ±3 h around a wrong detection cannot
         // reach the real bedtime. Computed HERE from the same pure helper the picker uses, so the
