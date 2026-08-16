@@ -55,8 +55,17 @@ enum DiagnosticsReport {
             s.append("  (none stored)")
         } else {
             for n in nights {
-                s.append("  \(t(n.inBedStart)) → \(t(n.inBedEnd))  asleep \(n.asleepMin)m"
-                         + " (D\(n.deepMin)/R\(n.remMin)/L\(n.lightMin)/A\(n.awakeMin))  score \(n.sleepScore)")
+                // An edited night's minutes describe the USER's window (`sleepEditCurrent*`), not
+                // the recorded columns — printing the recorded window beside edited minutes reads
+                // as an impossible night (asleep > span) and cost a real triage hours (2026-08-16).
+                // Show the window the minutes belong to, and the recorded one for reference.
+                let start = n.isManuallyEdited ? n.sleepEditCurrentInBedStart : n.inBedStart
+                let end = n.isManuallyEdited ? n.sleepEditCurrentInBedEnd : n.inBedEnd
+                let editedSuffix = n.isManuallyEdited
+                    ? "  [edited; recorded \(t(n.inBedStart)) → \(t(n.inBedEnd))]" : ""
+                s.append("  \(t(start)) → \(t(end))  asleep \(n.asleepMin)m"
+                         + " (D\(n.deepMin)/R\(n.remMin)/L\(n.lightMin)/A\(n.awakeMin))  score \(n.sleepScore)"
+                         + editedSuffix)
             }
         }
         s.append("")
