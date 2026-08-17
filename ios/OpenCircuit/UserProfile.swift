@@ -537,7 +537,9 @@ struct UserProfileSettingsView: View {
                         LabeledContent("Warn before bed", value: "\(bedtimeMinutesBefore) min")
                     }
                 }
-                Text("Reminder quiet hours and backoff use the same settings as health alerts above.")
+                Text("Reminders pause while the ring is on the charger or off your finger — it "
+                     + "counts no steps there, so that time isn't treated as sitting still. "
+                     + "Quiet hours and backoff use the same settings as health alerts above.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

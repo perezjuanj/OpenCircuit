@@ -37,6 +37,18 @@ enum ReminderDefaults {
     /// so it tracks actual "ring data went silent" rather than transient BLE-connection state.
     static let lastRingDataAt = "reminder.lastRingDataAt"
 
+    /// UserDefaults key written by RingSession on every descriptor that shows the ring OFF THE
+    /// FINGER — docked (🟢 `[2] == 0x04`) or reading colder than `wornMinTemperatureC` (🟡
+    /// `DeviceStatus.isWorn`). The SEDENTARY rule reads it: the ring counts no steps while it is
+    /// off the finger, so that stretch is unmeasured, not inactive, and must not be nagged about.
+    /// Durable for the same reason as `lastRingDataAt` — a charge routinely outlives the session.
+    static let lastOffFingerAt = "reminder.lastOffFingerAt"
+
+    /// UserDefaults key mirroring the charging byte of the LAST descriptor seen (🟢 `[2] == 0x04`),
+    /// so it pairs with `lastRingDataAt` to answer "where was the ring when we last heard from it".
+    /// The WEAR rule reads it: a docked ring was detected, so "Ring not detected" would be false.
+    static let lastKnownOnCharger = "reminder.lastKnownOnCharger"
+
     static func register(_ d: UserDefaults = .standard) {
         d.register(defaults: [
             sedentaryEnabled:    true,
@@ -621,6 +633,15 @@ struct HealthNotificationCenter {
         let d = UserDefaults.standard
         var candidates: [HealthNotification] = []
 
+        // Newest moment ANY frame arrived, shared by the sedentary and wear rules. The DURABLE
+        // stamp (survives cold launch / session teardown) taken together with the live session's
+        // in-memory value, newest wins — see the wear branch below for why the durable one alone
+        // is not enough and vice versa.
+        let durableFrameEpoch = d.double(forKey: ReminderDefaults.lastRingDataAt)
+        let durableFrameAt: Date? = durableFrameEpoch > 0
+            ? Date(timeIntervalSince1970: durableFrameEpoch) : nil
+        let lastRingDataAt = [durableFrameAt, session?.lastFrameAt].compactMap { $0 }.max()
+
         // Sedentary / move reminder — only when `includeSedentary` (post-sync), so it never fires on
         // a stale pre-sync `lastActivityAt` reading (#145).
         if includeSedentary, d.bool(forKey: ReminderDefaults.sedentaryEnabled) {
@@ -629,7 +650,19 @@ struct HealthNotificationCenter {
             let lastActivityEpoch = d.double(forKey: ReminderDefaults.lastActivityAt)
             let lastActivityAt: Date? = lastActivityEpoch > 0
                 ? Date(timeIntervalSince1970: lastActivityEpoch) : nil
-            if r.shouldFire(lastActivityAt: lastActivityAt, now: now) {
+            // The ring counts steps only while it is ON A FINGER, so a charge/off-wrist stretch is
+            // unmeasured time, not sedentary time (#84 charger false positive). `charging` is the
+            // live 🟢 byte; the durable stamp covers the stretch that just ended — including the
+            // minutes right after the user puts the ring back on, where `lastActivityAt` is still
+            // carrying the whole charge as "inactivity"; and `lastRingDataAt` covers the charge that
+            // happened with the link down, which leaves neither of the other two anything to see.
+            let offFingerEpoch = d.double(forKey: ReminderDefaults.lastOffFingerAt)
+            let lastOffFingerAt: Date? = offFingerEpoch > 0
+                ? Date(timeIntervalSince1970: offFingerEpoch) : nil
+            if r.shouldFire(lastActivityAt: lastActivityAt, now: now,
+                            isOnCharger: session?.charging ?? false,
+                            lastOffFingerAt: lastOffFingerAt,
+                            lastRingDataAt: lastRingDataAt) {
                 candidates.append(.sedentaryReminder)
             }
         }
@@ -642,13 +675,10 @@ struct HealthNotificationCenter {
             // this before RingScanner has migrated). (#multi-ring)
             let hasSavedRing = (d.stringArray(forKey: "com.opencircuit.ring.peripheralIDs")?.isEmpty == false)
                 || d.string(forKey: "com.opencircuit.ring.peripheralID") != nil
-            // Use the DURABLE last-frame timestamp (survives cold launch / session teardown), not
-            // the ephemeral session value — otherwise the reminder fires "Put your ring back on"
-            // on every cold foreground while the ring is actually worn and merely reconnecting.
-            // Take the most recent of the durable and (if present) live session timestamps.
-            let durableEpoch = d.double(forKey: ReminderDefaults.lastRingDataAt)
-            let durable: Date? = durableEpoch > 0 ? Date(timeIntervalSince1970: durableEpoch) : nil
-            let lastData = [durable, session?.lastFrameAt].compactMap { $0 }.max()
+            // The silence input is `lastRingDataAt`, hoisted above: the DURABLE last-frame stamp
+            // (it survives cold launch / session teardown) folded with the ephemeral session value,
+            // newest wins. The durable half is what stops "Put your ring back on" firing on every
+            // cold foreground while the ring is actually worn and merely reconnecting.
             // Positive worn-evidence: the newest heart-rate DEVICE timestamp we hold. HR decodes
             // only from a worn epoch (the unworn template carries no HR at all — `BulkRecord`'s
             // `.idle` layout), so this timestamp is the ring's own testimony that it was on the
@@ -666,10 +696,21 @@ struct HealthNotificationCenter {
             let inSleep = sleepEnabled && QuietHours(enabled: true,
                                                      startMinutes: sleepBedMinutes,
                                                      endMinutes: sleepWakeMinutes).contains(now)
-            if r.shouldFire(lastRingDataAt: lastData, now: now, everConnected: hasSavedRing,
+            // Where the ring was when we last heard from it. A docked ring was DETECTED, so the
+            // "Ring not detected" copy would be a false statement — and the instruction it gives
+            // ("put it back on") asks the user to interrupt a charge they started on purpose.
+            // OR, not a preference order: control only reaches here when the link is DOWN (the
+            // `isConnected` suppression above), and `session.charging` is reset per connection —
+            // so a session object that outlived its link reads a meaningless `false`. The durable
+            // mirror is the one that actually knows. Staleness is not a concern: the pure rule
+            // ages the whole suppression out against `lastRingDataAt` via `chargerGrace`.
+            let onCharger = (session?.charging ?? false)
+                || d.bool(forKey: ReminderDefaults.lastKnownOnCharger)
+            if r.shouldFire(lastRingDataAt: lastRingDataAt, now: now, everConnected: hasSavedRing,
                             lastWornEvidenceAt: wornEvidence,
                             isConnected: session?.isLinkConnected ?? false,
-                            inSleepWindow: inSleep) {
+                            inSleepWindow: inSleep,
+                            lastKnownOnCharger: onCharger) {
                 candidates.append(.wearReminder)
             }
         }

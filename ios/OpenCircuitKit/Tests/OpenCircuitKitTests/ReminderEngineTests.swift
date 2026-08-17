@@ -60,6 +60,82 @@ final class ReminderEngineTests: XCTestCase {
         XCTAssertFalse(r.shouldFire(lastActivityAt: fresh, now: now1000, calendar: cal))
     }
 
+    // MARK: - SedentaryReminder: a ring on the charger is not a user sitting still
+
+    /// The reported false positive. The ring has been on the charger for the last hour, so no step
+    /// delta has arrived and `lastActivityAt` is an hour stale — which is exactly what genuine
+    /// inactivity looks like. The live charging byte says otherwise.
+    func testSedentaryDoesNotFireWhileOnTheCharger() {
+        let r = SedentaryReminder(interval: 50 * 60, activeStartMinutes: 8 * 60, activeEndMinutes: 21 * 60)
+        let last = now1000.addingTimeInterval(-(60 * 60))
+        XCTAssertFalse(r.shouldFire(lastActivityAt: last, now: now1000,
+                                    isOnCharger: true, calendar: cal))
+    }
+
+    /// The same stretch seen after the fact — the ring is back on the finger (or merely
+    /// disconnected, so no live byte), but the last thing we OBSERVED was it off the finger, five
+    /// minutes ago. The unmeasured stretch must not be charged to the user as stillness.
+    func testSedentaryDoesNotFireWhenTheRingWasOffTheFingerInsideTheWindow() {
+        let r = SedentaryReminder(interval: 50 * 60, activeStartMinutes: 8 * 60, activeEndMinutes: 21 * 60)
+        let last = now1000.addingTimeInterval(-(60 * 60))
+        XCTAssertFalse(r.shouldFire(lastActivityAt: last, now: now1000,
+                                    lastOffFingerAt: now1000.addingTimeInterval(-(5 * 60)),
+                                    calendar: cal))
+    }
+
+    /// …and the suppression expires: once the ring has been back on the finger for a full interval,
+    /// the stillness has actually been measured and the nudge is earned again. This is the test that
+    /// keeps the fix from silently disabling the whole reminder for anyone who ever charges.
+    func testSedentaryFiresOnceTheRingHasBeenBackOnTheFingerForAFullInterval() {
+        let r = SedentaryReminder(interval: 50 * 60, activeStartMinutes: 8 * 60, activeEndMinutes: 21 * 60)
+        let last = now1000.addingTimeInterval(-(3 * 3600))
+        XCTAssertTrue(r.shouldFire(lastActivityAt: last, now: now1000,
+                                   lastOffFingerAt: now1000.addingTimeInterval(-(51 * 60)),
+                                   calendar: cal))
+    }
+
+    /// A future-dated off-finger stamp (ring clock drift / a timezone change between the frame and
+    /// this pass) is "as fresh as possible", not "infinitely old" — clamped, so it suppresses.
+    func testSedentaryClampsAFutureDatedOffFingerStamp() {
+        let r = SedentaryReminder(interval: 50 * 60, activeStartMinutes: 8 * 60, activeEndMinutes: 21 * 60)
+        let last = now1000.addingTimeInterval(-(3 * 3600))
+        XCTAssertFalse(r.shouldFire(lastActivityAt: last, now: now1000,
+                                    lastOffFingerAt: now1000.addingTimeInterval(30 * 60),
+                                    calendar: cal))
+    }
+
+    /// The charge that happens with the LINK DOWN: no descriptor arrives to stamp either of the
+    /// signals above, and the first frame after the reconnect is warm and current — but we heard
+    /// nothing at all across the window, so we measured no stillness to complain about.
+    func testSedentaryDoesNotFireWhenTheRingWasSilentForTheWholeWindow() {
+        let r = SedentaryReminder(interval: 50 * 60, activeStartMinutes: 8 * 60, activeEndMinutes: 21 * 60)
+        let last = now1000.addingTimeInterval(-(2 * 3600))
+        XCTAssertFalse(r.shouldFire(lastActivityAt: last, now: now1000,
+                                    lastRingDataAt: now1000.addingTimeInterval(-(2 * 3600)),
+                                    calendar: cal))
+    }
+
+    /// A ring that IS reporting — frames landing right up to now — and still no steps is the case
+    /// the reminder is for. The silence suppression must not extend to it.
+    func testSedentaryFiresWhenFramesAreArrivingButNoStepsAre() {
+        let r = SedentaryReminder(interval: 50 * 60, activeStartMinutes: 8 * 60, activeEndMinutes: 21 * 60)
+        let last = now1000.addingTimeInterval(-(51 * 60))
+        XCTAssertTrue(r.shouldFire(lastActivityAt: last, now: now1000,
+                                   lastRingDataAt: now1000.addingTimeInterval(-60),
+                                   calendar: cal))
+    }
+
+    /// The new inputs are suppressions only — omitted (an old build's persisted state, or a session
+    /// that has seen no descriptor yet), the rule behaves exactly as it did before. In particular a
+    /// nil `lastRingDataAt` is "no information", not "silent forever".
+    func testSedentaryUnchangedWhenNoWearEvidenceIsAvailable() {
+        let r = SedentaryReminder(interval: 50 * 60, activeStartMinutes: 8 * 60, activeEndMinutes: 21 * 60)
+        let last = now1000.addingTimeInterval(-(51 * 60))
+        XCTAssertTrue(r.shouldFire(lastActivityAt: last, now: now1000,
+                                   isOnCharger: false, lastOffFingerAt: nil,
+                                   lastRingDataAt: nil, calendar: cal))
+    }
+
     // MARK: - WearReminder
 
     func testWearFiresAfterInterval() {
@@ -142,6 +218,48 @@ final class ReminderEngineTests: XCTestCase {
 
     func testWearDefaultIntervalIsAnHour() {
         XCTAssertEqual(WearReminder().noDataInterval, 60 * 60)
+    }
+
+    // MARK: - WearReminder: a docked ring was detected, not lost
+
+    /// The charger false positive: the link has been down for 90 min, but the last frame we hold
+    /// said the ring was on the charger. "Ring not detected · put your ring back on" is both untrue
+    /// and un-actionable — the user is charging on purpose.
+    func testWearDoesNotFireWhenTheLastFrameSaidOnTheCharger() {
+        let r = WearReminder(noDataInterval: 60 * 60, chargerGrace: 4 * 3600)
+        let now = Date()
+        XCTAssertFalse(r.shouldFire(lastRingDataAt: now.addingTimeInterval(-90 * 60), now: now,
+                                    everConnected: true, lastKnownOnCharger: true))
+    }
+
+    /// The suppression is bounded, not absolute: a ring that came off the charger straight into a
+    /// drawer stops being "probably still charging" once the charge could long since have finished.
+    func testWearFiresOnceTheChargerEvidenceAgesPastTheGrace() {
+        let r = WearReminder(noDataInterval: 60 * 60, chargerGrace: 4 * 3600)
+        let now = Date()
+        XCTAssertTrue(r.shouldFire(lastRingDataAt: now.addingTimeInterval(-5 * 3600), now: now,
+                                   everConnected: true, lastKnownOnCharger: true))
+    }
+
+    /// A ring whose last frame showed it WORN and then went silent is the genuine case the rule
+    /// exists for — the charger suppression must not swallow it.
+    func testWearStillFiresWhenTheLastFrameDidNotSayCharger() {
+        let r = WearReminder(noDataInterval: 60 * 60, chargerGrace: 4 * 3600)
+        let now = Date()
+        XCTAssertTrue(r.shouldFire(lastRingDataAt: now.addingTimeInterval(-90 * 60), now: now,
+                                   everConnected: true, lastKnownOnCharger: false))
+    }
+
+    /// With no frame ever recorded there is no timestamp to age the charger evidence against, so
+    /// the flag cannot suppress: "ever paired, never heard from" stays a fire.
+    func testWearFiresWithNilDataEvenIfTheChargerFlagIsSet() {
+        let r = WearReminder(noDataInterval: 60 * 60, chargerGrace: 4 * 3600)
+        XCTAssertTrue(r.shouldFire(lastRingDataAt: nil, now: Date(),
+                                   everConnected: true, lastKnownOnCharger: true))
+    }
+
+    func testWearDefaultChargerGraceIsFourHours() {
+        XCTAssertEqual(WearReminder().chargerGrace, 4 * 3600)
     }
 
     // MARK: - BedtimeReminder (normal window, no midnight wrap)

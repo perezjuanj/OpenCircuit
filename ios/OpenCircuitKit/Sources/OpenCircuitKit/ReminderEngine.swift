@@ -24,6 +24,37 @@ public enum ReminderKind: String, CaseIterable, Sendable {
 /// inside the daily active window. "Activity" = a nonzero step delta from the ring;
 /// `lastActivityAt` is nil until the first step arrives so the rule stays silent on a
 /// fresh session / day the ring isn't worn (never a false positive).
+///
+/// ══ A RING ON THE CHARGER CANNOT COUNT STEPS ══
+///
+/// 🟢 Reported false positive: "Move reminder — you've been inactive for a while" arriving while the
+/// ring sat on the charger. The mechanism is the same fallacy `WearReminder` below was rewritten to
+/// avoid, one layer over: `lastActivityAt` only advances when a nonzero step delta arrives from the
+/// ring, so ANY stretch the ring is off the finger — charging, in the case, on a desk — reads as a
+/// stretch of zero steps. A ~50-minute charge is therefore indistinguishable from 50 minutes of
+/// sitting still, and the nag lands on a user who may have been walking the whole time. Absence of
+/// measurement is not evidence of inactivity.
+///
+/// So the rule now needs the ring to have been ON THE FINGER for the whole window it is about to
+/// complain about. Three suppressions carry that:
+///
+///  1. `isOnCharger` — the live 🟢 `[2] == 0x04` descriptor byte (`DeviceStatus.isOnCharger`). Instant
+///     and definitive: whatever the step field says, the ring is docked and measuring nothing.
+///  2. `lastOffFingerAt` — the newest moment we OBSERVED the ring off the finger (docked, or a cold
+///     skin temperature under `ActivityPeriod.wornMinTemperatureC` — `DeviceStatus.isWorn`). Only
+///     silence entirely NEWER than that observation is measured inactivity, so the clock effectively
+///     restarts when the ring goes back on: after a charge the user gets a full `interval` of real,
+///     measured stillness before the first nudge, instead of inheriting the charge as "inactivity".
+///  3. `lastRingDataAt` — the charge that happens while the LINK IS DOWN leaves no descriptor to
+///     stamp (1) or (2) with, and the ring's step field carries no history to recover it from: the
+///     first frame after the reconnect is warm and current, while `lastActivityAt` still dates from
+///     before the charge. A window we heard nothing at all across is unobserved for the same reason
+///     a charge is, so a ring that has been silent for the whole `interval` earns no nudge either.
+///     Note this is NOT the wear rule's discredited "silence ⇒ not worn" inference: silence here
+///     only ever WITHHOLDS a claim, never makes one.
+///
+/// All three are suppressions — they never CAUSE a fire, so a ring that reports none of them (an old
+/// build's persisted state, a session that has seen no descriptor yet) behaves exactly as before.
 public struct SedentaryReminder: Equatable, Sendable {
     /// Inactivity threshold before firing.
     public var interval: TimeInterval
@@ -39,11 +70,37 @@ public struct SedentaryReminder: Equatable, Sendable {
         self.activeEndMinutes = activeEndMinutes
     }
 
-    /// True when inactive for ≥ `interval` AND inside the active window.
+    /// True when inactive for ≥ `interval`, inside the active window, and the ring was on the
+    /// finger for that whole stretch (so the stillness was actually MEASURED).
+    ///
+    /// - Parameters:
+    ///   - lastActivityAt: newest moment a nonzero step delta arrived, or nil before the first one.
+    ///   - isOnCharger: the ring reports itself docked right now (🟢 descriptor `[2] == 0x04`).
+    ///   - lastOffFingerAt: newest moment we observed the ring off the finger — docked, or reading
+    ///     colder than `ActivityPeriod.wornMinTemperatureC`. Aged against `now`, like the wear rule's
+    ///     worn-evidence stamp, with the same `max(0, …)` clamp so a stamp dated ahead of `now` (ring
+    ///     clock drift, a timezone change between the frame and this pass) reads as "just now"
+    ///     deliberately rather than sliding through on a negative interval.
+    ///   - lastRingDataAt: newest moment any frame arrived. `nil` means "no information" and does NOT
+    ///     suppress — every path that writes `lastActivityAt` writes this one too, so in practice a
+    ///     nil here alongside a non-nil activity stamp only occurs on legacy persisted state, where
+    ///     the pre-existing behaviour is the safer answer.
     public func shouldFire(lastActivityAt: Date?, now: Date,
+                           isOnCharger: Bool = false,
+                           lastOffFingerAt: Date? = nil,
+                           lastRingDataAt: Date? = nil,
                            calendar: Calendar = .current) -> Bool {
+        guard !isOnCharger else { return false }
         guard let last = lastActivityAt else { return false }
         guard now.timeIntervalSince(last) >= interval else { return false }
+        if let off = lastOffFingerAt,
+           max(0, now.timeIntervalSince(off)) < interval {
+            return false
+        }
+        if let heard = lastRingDataAt,
+           max(0, now.timeIntervalSince(heard)) >= interval {
+            return false
+        }
         let c = calendar.dateComponents([.hour, .minute], from: now)
         let m = (c.hour ?? 0) * 60 + (c.minute ?? 0)
         return m >= activeStartMinutes && m < activeEndMinutes
@@ -80,12 +137,26 @@ public struct SedentaryReminder: Equatable, Sendable {
 ///
 /// The default interval is also an hour rather than 20 minutes: a background drain cadence measured
 /// in tens of minutes made 20 min indistinguishable from a normal quiet stretch.
+///
+/// A fourth suppression covers the charger (same report as `SedentaryReminder` above): if the newest
+/// descriptor we hold said 🟢 ON THE CHARGER, we did not fail to detect the ring — we detected it,
+/// and it is docked. "Ring not detected · Put your ring back on" is then simply a false statement,
+/// aimed at a user who is deliberately charging and would have to interrupt the charge to comply.
+/// It is bounded by `chargerGrace` rather than absolute, so a ring that is dropped in a drawer
+/// straight off the charger still earns the nag once the charge could plausibly have finished.
 public struct WearReminder: Equatable, Sendable {
     /// Gap without ring data that triggers the reminder.
     public var noDataInterval: TimeInterval
 
-    public init(noDataInterval: TimeInterval = 60 * 60) {
+    /// How long a last-seen-on-charger reading keeps suppressing the reminder. 4 h is deliberately
+    /// well past a full RingConn Gen-2 charge (~1.5 h from empty) so an ordinary top-up is covered
+    /// end to end, while a ring parked off the finger all afternoon still gets nagged about.
+    public var chargerGrace: TimeInterval
+
+    public init(noDataInterval: TimeInterval = 60 * 60,
+                chargerGrace: TimeInterval = 4 * 3600) {
         self.noDataInterval = noDataInterval
+        self.chargerGrace = chargerGrace
     }
 
     /// True when the ring looks genuinely un-worn: nothing has arrived for ≥ `noDataInterval`, we
@@ -100,11 +171,23 @@ public struct WearReminder: Equatable, Sendable {
     ///     proof about the RING'S OWN timeline, so it must age out on the same clock the silence does.
     ///   - isConnected: a ring is connected right now.
     ///   - inSleepWindow: `now` falls inside the user's configured sleep schedule.
+    ///   - lastKnownOnCharger: the NEWEST descriptor we hold reported the ring docked (🟢
+    ///     `[2] == 0x04`). It describes the ring as of `lastRingDataAt` — that pairing is what makes
+    ///     it ageable — so pass the state carried by the last frame, not "was ever on the charger".
     public func shouldFire(lastRingDataAt: Date?, now: Date, everConnected: Bool,
                            lastWornEvidenceAt: Date? = nil,
                            isConnected: Bool = false,
-                           inSleepWindow: Bool = false) -> Bool {
+                           inSleepWindow: Bool = false,
+                           lastKnownOnCharger: Bool = false) -> Bool {
         guard everConnected, !isConnected, !inSleepWindow else { return false }
+        // We know where the ring is: on the charger, as of the last frame. Not "not detected".
+        // Aged on the same clock as the silence (and clamped for the same drift reason), so the
+        // suppression expires with `chargerGrace` instead of persisting for a ring that left the
+        // charger during a link outage and never came back.
+        if lastKnownOnCharger, let last = lastRingDataAt,
+           max(0, now.timeIntervalSince(last)) < chargerGrace {
+            return false
+        }
         // Positive proof the ring was worn recently outranks the absence of frames. A worn epoch
         // dated within `noDataInterval` of now means the ring was on the finger for the very
         // stretch the silence rule is about to complain about.
