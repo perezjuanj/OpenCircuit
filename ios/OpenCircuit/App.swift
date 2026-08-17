@@ -166,8 +166,73 @@ struct OpenCircuitApp: App {
     /// Adds `StoredSleepSummary.hypnogramData` — the night's staged segments, so a session export can
     /// say WHEN a stage happened and not only how many minutes of it there were. One defaulted column
     /// on an existing model: lightweight migration, not a custom stage (cf. #21).
+    ///
+    /// V5 IS FROZEN. It shipped in build 35 (`v1.0-b35`, 2026-08-02) through build 43, so its shape
+    /// is the shape on real phones. `StoredSleepSummary` is pinned to a NESTED snapshot of exactly
+    /// that shape — the same discipline as V4 above, learned the hard way TWICE now:
+    ///
+    /// ⚠️ 🟢 THE BUILD-44 WIPE (2026-08-16): build 44 added the four `widenedRecorded*` columns to
+    /// the LIVE type while V5 still pointed at it — so a store written by build 43 matched NO
+    /// version in the plan ("Cannot use staged migration with an unknown model version"), routed to
+    /// `wipeAndRecoverForeground`, and every raw StoredSample/StoredCursor/StoredStepSample/
+    /// StoredDaytimeTemp row was deleted on upgrade — the maintainer's own Trends history among
+    /// them. The defaulted-column rule (#21) is NECESSARY but NOT SUFFICIENT once a migration plan
+    /// exists: a new column ALWAYS also needs a new `VersionedSchema` whose predecessor pins the
+    /// previous live shape. Build 44 was expired on TestFlight the same day.
     enum SchemaV5: VersionedSchema {
         static var versionIdentifier = Schema.Version(5, 0, 0)
+        static var models: [any PersistentModel.Type] {
+            // `StoredSleepSummary` here resolves to the nested snapshot below — deliberately.
+            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
+             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
+             StoredHeadacheEntry.self, StoredHeadacheRisk.self]
+        }
+
+        /// `StoredSleepSummary` EXACTLY as builds 35–43 wrote it — V4's shape + `hypnogramData`,
+        /// WITHOUT the `widenedRecorded*` columns. Same rules as V4's snapshot: nothing reads or
+        /// writes through it, keep it byte-for-byte, and do NOT add to it — a new column belongs on
+        /// the live type plus a new schema version.
+        @Model final class StoredSleepSummary {
+            @Attribute(.unique) var night: Date = Date.distantPast
+            var asleepMin: Int = 0
+            var deepMin: Int = 0
+            var lightMin: Int = 0
+            var remMin: Int = 0
+            var awakeMin: Int = 0
+            var efficiency: Double = 0
+            var inBedStart: Date = Date.distantPast
+            var inBedEnd: Date = Date.distantPast
+            var sleepOnset: Date = Date.distantPast
+            var sleepWake: Date = Date.distantPast
+            var updatedAt: Date = Date.distantPast
+            var skinTempC: Double = 0
+            var sleepScore: Int = 0
+            var stressScore: Int = 0
+            var feelScore: Int = 0
+            var hrDeep: Int = 0
+            var hrLight: Int = 0
+            var hrRem: Int = 0
+            var hrAwake: Int = 0
+            var movementLevels: [Int] = []
+            var hypnogramData: Data = Data()
+            var osaAvgSpO2: Double = 0
+            var osaMinSpO2: Double = 0
+            var osaTimeBelow90Sec: Double = 0
+            var osaODI: Double = 0
+            var osaValidWindows: Int = 0
+            var editedInBedStart: Date = Date.distantPast
+            var editedInBedEnd: Date = Date.distantPast
+            var isManuallyEdited: Bool = false
+            init() {}
+        }
+    }
+
+    /// Adds the four `StoredSleepSummary.widenedRecorded*` columns (the kept-edit clamp overlay —
+    /// see the live type). Four defaulted Date columns on an existing model: lightweight migration.
+    /// V5 (pinned) and V6 (live) differ by exactly those four columns, which is what makes the two
+    /// checksums distinct and the stage legal.
+    enum SchemaV6: VersionedSchema {
+        static var versionIdentifier = Schema.Version(6, 0, 0)
         static var models: [any PersistentModel.Type] {
             [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
              StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
@@ -177,13 +242,15 @@ struct OpenCircuitApp: App {
 
     enum MigrationPlan: SchemaMigrationPlan {
         static var schemas: [any VersionedSchema.Type] {
-            [SchemaV1.self, SchemaV2.self, SchemaV3.self, SchemaV4.self, SchemaV5.self]
+            [SchemaV1.self, SchemaV2.self, SchemaV3.self, SchemaV4.self, SchemaV5.self,
+             SchemaV6.self]
         }
         static var stages: [MigrationStage] {
             [.lightweight(fromVersion: SchemaV1.self, toVersion: SchemaV2.self),
              .lightweight(fromVersion: SchemaV2.self, toVersion: SchemaV3.self),
              .lightweight(fromVersion: SchemaV3.self, toVersion: SchemaV4.self),
-             .lightweight(fromVersion: SchemaV4.self, toVersion: SchemaV5.self)]
+             .lightweight(fromVersion: SchemaV4.self, toVersion: SchemaV5.self),
+             .lightweight(fromVersion: SchemaV5.self, toVersion: SchemaV6.self)]
         }
     }
 
