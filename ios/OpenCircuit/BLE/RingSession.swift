@@ -1766,13 +1766,17 @@ final class RingSession: NSObject {
         guard let store = localStore else { return nil }
         guard let row = try? store.sleepSummary(night: night) else { return nil }
 
-        // Always validate against immutable RECORDED anchors, never the last edited values. This is
+        // Always validate against RING-DERIVED anchors, never the last edited values. This is
         // both a server-side guard (the UI cannot smuggle out-of-range Times) and what prevents
-        // re-editing from walking the ±3 h limits farther outward on every Save.
-        let recordedOnset = row.sleepEditRecordedOnset > .distantPast
-            ? row.sleepEditRecordedOnset : row.sleepEditRecordedInBedStart
-        let recordedWake = row.sleepEditRecordedWake > recordedOnset
-            ? row.sleepEditRecordedWake : row.sleepEditRecordedInBedEnd
+        // re-editing from walking the ±3 h limits farther outward on every Save. The anchors are
+        // the WIDENED-recorded view (frozen recorded ∪ fuller keptManualEdit stagings): still
+        // ring-derived — a user edit never feeds it — so the no-walking property holds, and it
+        // matches the sheet's own anchors (`SleepCardView.makeEditTarget`).
+        let clamp = row.sleepEditClampWindow
+        let recordedOnset = clamp.sleepOnset > .distantPast
+            ? clamp.sleepOnset : clamp.inBedStart
+        let recordedWake = clamp.sleepWake > recordedOnset
+            ? clamp.sleepWake : clamp.inBedEnd
         // Widen the bounds by the epochs we actually HOLD for this night (#188 fallout): a badly
         // truncated night is otherwise uncorrectable, because ±3 h around a wrong detection cannot
         // reach the real bedtime. Computed HERE from the same pure helper the picker uses, so the
@@ -4376,6 +4380,28 @@ extension RingSession: CBPeripheralDelegate {
             // superseding the rising-% inference while connected. Also decode ring voltage (#89).
             if let onCharger {
                 if onCharger != self.charging { self.charging = onCharger }
+            }
+            // OFF-FINGER evidence for the reminders (#84). A ring that isn't on a finger counts no
+            // steps and locks no reading, so a charge reads to the sedentary rule as a stretch of
+            // perfect stillness and to the wear rule as a vanished ring — the two false positives
+            // testers actually see ("Move reminder" / "Ring not detected" while it sits on the
+            // charger). Stamp what we OBSERVED so those rules can tell unmeasured from measured:
+            //   • docked          — 🟢 the decoded charging byte, definitive.
+            //   • cold skin temp  — 🟡 `DeviceStatus.isWorn`, the same wear proxy the sleep gate
+            //     (#41) and the auto-measure backoff (#56) already run on. It catches the ring
+            //     parked on a desk or in the case, which the charging byte alone does not.
+            // Durable (UserDefaults, not session state): a charge outlives the session, and the
+            // reminders are evaluated on a scene-active pass that may follow a cold launch.
+            // Written only while off-finger, so a worn ring pays nothing.
+            let offFinger = (onCharger == true) || (DeviceStatus.isWorn(bytes) == false)
+            if offFinger {
+                UserDefaults.standard.set(Date().timeIntervalSince1970,
+                                          forKey: ReminderDefaults.lastOffFingerAt)
+            }
+            // Mirror the charger verdict itself, paired with `lastRingDataAt` above, so the wear
+            // rule can ask "where was the ring when we last heard from it" after the link drops.
+            if let onCharger {
+                UserDefaults.standard.set(onCharger, forKey: ReminderDefaults.lastKnownOnCharger)
             }
             if let mv = batteryMV {
                 if mv != self.batteryVoltageMV { self.batteryVoltageMV = mv }

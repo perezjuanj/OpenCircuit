@@ -78,7 +78,7 @@ public enum SleepEdit {
             latest = max(latest, coverage.upperBound)
         }
         // ⚠️ BOTH CAPS ARE ANCHORED ON THE *FLOOR*, NEVER ON THE COVERAGE-WIDENED EDGE. Do not
-        // "simplify" either line to use `latest`/`earliest` after widening.
+        // "simplify" either line to use `latest`/`earliest` after widening — in EITHER direction.
         //
         // The first draft capped the early edge with `latest.addingTimeInterval(-maxNightSpan)`,
         // where `latest` had already been widened to `coverage.upperBound`. On a worn ring the
@@ -89,16 +89,27 @@ public enum SleepEdit {
         // by 19:00 `earliest` was back to 04:30 — bit-identical to the bug the user reported. The fix
         // silently expired a few hours after wake.
         //
-        // Anchoring on the floor makes both edges time-invariant, which also makes `bounds` MONOTONE
-        // in coverage: growing the archive can only ever widen, never contract. That monotonicity is
+        // The second draft then capped the late edge with `earliest.addingTimeInterval(maxNightSpan)`
+        // — the WIDENED-AND-CAPPED `earliest`, which is the same mistake mirrored. 🟢 Device case
+        // 2026-08-16: recorded 03:44→06:04, previous-EVENING coverage dragged `earliest` down to its
+        // cap (`floorLatest` − 14 h = Sat 19:04), so the late cap collapsed to 19:04 + 14 h = 09:04 —
+        // exactly `floorLatest` — and the tester's real ~10:15 wake was refused even though the
+        // archive HELD epochs through 10:51. The 14 h budget was spent on eight useless evening
+        // hours and denied on the side the user actually needed.
+        //
+        // So each cap anchors on the OPPOSITE FLOOR edge: an edge may reach at most `maxNightSpan`
+        // beyond the recorded night's far margin, independent of how far coverage widened the other
+        // side. Floor-anchoring keeps both edges time-invariant, and keeps `bounds` MONOTONE in
+        // coverage: growing the archive can only ever widen, never contract. That monotonicity is
         // load-bearing for two more failures review found — a drain landing while the sheet is open
         // could otherwise make Save reject a time the picker had offered, and re-opening an edited
         // night could clamp the user's own stored edit inward.
+        //
+        // The caps alone no longer bound the PAIRED window to one night (the two edges can be up to
+        // 28 h − floorSpan apart); "one plausible night" is enforced where it belongs, on the
+        // proposed window itself — `validate`'s `.tooLong` duration rule.
         earliest = min(floorEarliest, max(earliest, floorLatest.addingTimeInterval(-maxNightSpan)))
-        // Now cap the LATE edge too — the first draft never did, so the "one plausible night" claim
-        // was not actually enforced and a sheet opened in the evening would accept "I slept until
-        // 19:00" (`recompute` credits a user extension as core sleep).
-        latest = max(floorLatest, min(latest, earliest.addingTimeInterval(maxNightSpan)))
+        latest = max(floorLatest, min(latest, floorEarliest.addingTimeInterval(maxNightSpan)))
         // A night the user has ALREADY edited must always remain fully selectable. Deliberately
         // outside the caps above.
         if let existing = existingEdit {
@@ -111,6 +122,63 @@ public enum SleepEdit {
     /// Clamp a proposed edge into the editable bounds (for a live-dragging picker).
     public static func clamp(_ date: Date, to bounds: Bounds) -> Date {
         min(max(date, bounds.earliest), bounds.latest)
+    }
+
+    /// A night row's RECORDED (ring-derived) window — the four columns the edit sheet anchors on.
+    /// `.distantPast` edges mean "unknown" (legacy rows / no asleep block), matching the store.
+    public struct RecordedWindow: Equatable, Sendable {
+        public var inBedStart: Date
+        public var inBedEnd: Date
+        public var sleepOnset: Date
+        public var sleepWake: Date
+        public init(inBedStart: Date, inBedEnd: Date, sleepOnset: Date, sleepWake: Date) {
+            self.inBedStart = inBedStart
+            self.inBedEnd = inBedEnd
+            self.sleepOnset = sleepOnset
+            self.sleepWake = sleepWake
+        }
+        var inBedKnown: Bool { inBedStart > .distantPast && inBedEnd > inBedStart }
+        var sleepKnown: Bool { sleepOnset > .distantPast && sleepWake > sleepOnset }
+    }
+
+    /// Outward-only widening of a MANUALLY-EDITED night's recorded anchors from a later, fuller
+    /// staging of the same night.
+    ///
+    /// A manual edit freezes the row (`keptManualEdit`): the user's window/durations are
+    /// authoritative and later re-syncs must not overwrite them. But freezing the RECORDED anchors
+    /// with the minutes was its own defect — 🟢 device case 2026-08-16: the anchors froze at a
+    /// truncated early staging (wake 06:04) while the archive grew through the real ~10:15 wake, so
+    /// the ±3 h edit clamp (anchored on the recorded wake) pinned the sheet at 09:04 forever and
+    /// the tester could never correct the night, edit after edit, morning after morning.
+    ///
+    /// The recorded anchors describe WHAT THE RING RECORDED, not what the user asserted — updating
+    /// them from a fuller staging contradicts nothing the user edited. Widening is OUTWARD-ONLY
+    /// (min start / max end), so the editable floor derived from them is monotone: re-opening the
+    /// sheet can only ever offer MORE, never invalidate a previously offered time.
+    ///
+    /// Returns nil when there is nothing to do: the incoming staging has no known window, or
+    /// widening changes nothing. The caller persists only on non-nil.
+    public static func widenRecorded(stored: RecordedWindow,
+                                     incoming: RecordedWindow) -> RecordedWindow? {
+        guard incoming.inBedKnown else { return nil }
+        var out = stored
+        if stored.inBedKnown {
+            out.inBedStart = min(stored.inBedStart, incoming.inBedStart)
+            out.inBedEnd = max(stored.inBedEnd, incoming.inBedEnd)
+        } else {
+            out.inBedStart = incoming.inBedStart
+            out.inBedEnd = incoming.inBedEnd
+        }
+        if incoming.sleepKnown {
+            if stored.sleepKnown {
+                out.sleepOnset = min(stored.sleepOnset, incoming.sleepOnset)
+                out.sleepWake = max(stored.sleepWake, incoming.sleepWake)
+            } else {
+                out.sleepOnset = incoming.sleepOnset
+                out.sleepWake = incoming.sleepWake
+            }
+        }
+        return out == stored ? nil : out
     }
 
     /// The editor displays only date/hour/minute. Compare at that same granularity so changing a
@@ -164,6 +232,21 @@ public enum SleepEdit {
         case startBeforeEarliest    // pushed bedtime > 3 h before recorded onset
         case endAfterLatest         // pushed wake > 3 h after recorded wake
         case tooShort(minMinutes: Int)
+        case tooLong(maxMinutes: Int) // in-bed window longer than one plausible night
+    }
+
+    /// The longest in-bed window `validate` accepts — the "one plausible night" rule, enforced on
+    /// the PROPOSED window itself rather than by capping the bounds' edges against each other
+    /// (capping the edges is what produced the 2026-08-16 seesaw — see `bounds`). Never below the
+    /// FLOOR span, so a genuinely long recorded night plus its ±3 h parity margins always remains
+    /// fully selectable, and never below an already-saved edit — the same "the user's own saved
+    /// times stay valid" guarantee `bounds` makes for its edges.
+    public static func maxWindowDuration(recordedOnset: Date, recordedWake: Date,
+                                         existingEdit: ClosedRange<Date>? = nil,
+                                         maxNightSpan: TimeInterval = defaultMaxNightSpan) -> TimeInterval {
+        let floorSpan = recordedWake.timeIntervalSince(recordedOnset) + 2 * editMargin
+        let existingSpan = existingEdit.map { $0.upperBound.timeIntervalSince($0.lowerBound) } ?? 0
+        return max(maxNightSpan, max(floorSpan, existingSpan))
     }
 
     /// Validate the three independent editor anchors. The minimum applies to the asserted sleep
@@ -178,6 +261,13 @@ public enum SleepEdit {
         if times.sleepWake <= times.sleepOnset { return .wakeNotAfterOnset }
         if times.inBedStart < b.earliest { return .startBeforeEarliest }
         if times.sleepWake > b.latest { return .endAfterLatest }
+        // "One plausible night" — the bounds' edges no longer pairwise-cap each other (see
+        // `bounds`), so the window's own duration carries the rule.
+        let maxDuration = maxWindowDuration(recordedOnset: recordedOnset, recordedWake: recordedWake,
+                                            existingEdit: existingEdit)
+        if times.inBedDuration > maxDuration {
+            return .tooLong(maxMinutes: Int(maxDuration / 60))
+        }
         if times.asleepWindowDuration < minDuration {
             return .tooShort(minMinutes: Int(minDuration / 60))
         }

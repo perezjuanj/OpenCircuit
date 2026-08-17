@@ -162,6 +162,21 @@ final class StoredSleepSummary {
     /// turn a recorded night into a manual edit, and so lightweight migration has an explicit flag.
     var isManuallyEdited: Bool = false
 
+    // MARK: Widened-recorded overlay for the EDIT CLAMP only. An edited night's re-syncs hit
+    // `keptManualEdit` and are discarded, but the ±3 h edit clamp anchors on the RECORDED window —
+    // freezing it with the minutes trapped a tester in a wrong wake she could never correct
+    // (🟢 2026-08-16, see `SleepEdit.widenRecorded`). Fuller stagings widen THESE columns
+    // (outward-only), and only `sleepEditClamp*` reads them. The original `inBedStart…sleepWake`
+    // columns stay FROZEN on an edited row on purpose: `pendingSleepEditHealthWrites` /
+    // `markSleepEditHealthCovered` / the edited-night reconcile treat them as "what the ordinary
+    // flush wrote to Health", and a keptManualEdit drain writes NOTHING to Health — widening those
+    // would overstate Health coverage and silently drop a user's extension append (review find).
+    // DEFAULTED for SwiftData lightweight migration (cf. #21); `distantPast` = never widened.
+    var widenedRecordedInBedStart: Date = Date.distantPast
+    var widenedRecordedInBedEnd: Date = Date.distantPast
+    var widenedRecordedOnset: Date = Date.distantPast
+    var widenedRecordedWake: Date = Date.distantPast
+
     init(
         night: Date,
         asleepMin: Int = 0,
@@ -232,6 +247,20 @@ final class StoredSleepSummary {
     }
     var sleepEditRecordedWake: Date {
         sleepWake
+    }
+
+    /// The recorded window AS THE EDIT CLAMP should see it: the frozen recorded columns, widened
+    /// outward by any fuller stagings a `keptManualEdit` drain recorded into the overlay columns.
+    /// ONLY the edit sheet/validator anchors on this — Health bookkeeping keeps reading the frozen
+    /// `sleepEditRecorded*` values (see the overlay columns' comment).
+    var sleepEditClampWindow: SleepEdit.RecordedWindow {
+        let recorded = SleepEdit.RecordedWindow(
+            inBedStart: inBedStart, inBedEnd: inBedEnd,
+            sleepOnset: sleepOnset, sleepWake: sleepWake)
+        let widened = SleepEdit.RecordedWindow(
+            inBedStart: widenedRecordedInBedStart, inBedEnd: widenedRecordedInBedEnd,
+            sleepOnset: widenedRecordedOnset, sleepWake: widenedRecordedWake)
+        return SleepEdit.widenRecorded(stored: recorded, incoming: widened) ?? recorded
     }
 
     var sleepEditCurrentInBedStart: Date {
@@ -1114,10 +1143,12 @@ struct LocalStore {
     /// and does NOT re-mirror, so the actual Health sample may sit at the original `start…end` even
     /// after the displayed window moved to `editedStart…editedEnd`. Excluding both covers wherever the
     /// sample actually is.
-    func healthWrittenNapWindows(overlapping start: Date, to end: Date) -> [DateInterval] {
+    func healthWrittenNapWindows(overlapping start: Date, to end: Date,
+                                 manualOnly: Bool = false) -> [DateInterval] {
         let naps = (try? context.fetch(FetchDescriptor<StoredNap>())) ?? []
         return naps.compactMap { nap in
             guard nap.healthWritten else { return nil }
+            if manualOnly, !nap.isManuallyAdded, !nap.isManuallyEdited { return nil }
             let lo = min(nap.start, nap.effectiveStart)
             let hi = max(nap.end, nap.effectiveEnd)
             guard hi > lo, lo < end, hi > start else { return nil }
@@ -1419,10 +1450,32 @@ struct LocalStore {
             // staging, so the edit stays reversible by re-editing. Reaching here means the incoming
             // staging genuinely overlaps the edited night, which is the case this guard is FOR.
             if existing.isManuallyEdited {
+                // …but the ±3 h edit clamp anchors on the RECORDED window, and freezing that with
+                // the minutes trapped a tester in a wrong wake she could never correct
+                // (🟢 2026-08-16 — see `SleepEdit.widenRecorded`). Record this fuller staging into
+                // the WIDENED-RECORDED overlay columns (outward-only) so the clamp can grow.
+                // Deliberately NOT the frozen `inBedStart…sleepWake` columns — Health bookkeeping
+                // reads those as "what the ordinary flush wrote", and this drain wrote nothing
+                // (see the overlay columns' comment). Minutes/hypnogram stay the user's.
+                var widenedDetail = ""
+                if let w = SleepEdit.widenRecorded(
+                    stored: existing.sleepEditClampWindow,
+                    incoming: .init(inBedStart: inBedStart, inBedEnd: inBedEnd,
+                                    sleepOnset: sleepOnset, sleepWake: sleepWake)) {
+                    existing.widenedRecordedInBedStart = w.inBedStart
+                    existing.widenedRecordedInBedEnd = w.inBedEnd
+                    existing.widenedRecordedOnset = w.sleepOnset
+                    existing.widenedRecordedWake = w.sleepWake
+                    existing.updatedAt = Date()
+                    widenedDetail = " clampWidened=[\(Self.stamp(w.inBedStart))..\(Self.stamp(w.inBedEnd))]"
+                }
+                // Breadcrumb BEFORE the save so a save throw can't lose the kept=MANUAL-EDIT trace.
                 ObservabilityStore().recordMetricEvent(
                     source: "sleep-drop",
                     detail: "night=\(Self.stamp(dayStart)) kept=MANUAL-EDIT "
-                        + "incoming=[\(Self.stamp(inBedStart))..\(Self.stamp(inBedEnd))] asleep=\(m.asleep)")
+                        + "incoming=[\(Self.stamp(inBedStart))..\(Self.stamp(inBedEnd))] asleep=\(m.asleep)"
+                        + widenedDetail)
+                if !widenedDetail.isEmpty { try context.save() }
                 return .keptManualEdit
             }
             // Non-destructive upsert. A night can be drained in MORE THAN ONE piece (e.g. a
@@ -1499,7 +1552,65 @@ struct LocalStore {
             context.insert(row)
         }
         try context.save()
+        // The night just grew (or appeared) over this span — any AUTO-detected nap inside it is now
+        // the same sleep counted twice (🟢 2026-08-16: a split night's 09:04–10:30 tail was stored
+        // as an 86-min nap; once scoping re-absorbs the tail, night + nap overlap). Manual naps are
+        // the user's word and stay. Deleting the row is also what heals Apple Health: the mirrors'
+        // nap-safe delete exclusions come from `healthWrittenNapWindows` (Health-written STORED
+        // naps), so once the row is gone the next `mirrorSettledNight` union-delete sweeps the nap's
+        // samples out of the span the fresh night write covers.
+        pruneAutoNaps(overlapping: inBedStart, inBedEnd, night: dayStart)
         return existingRow == nil ? .inserted : .updated
+    }
+
+    /// Auto-detected (non-manual) naps whose effective window overlaps `[start, end]`. The
+    /// edited-night reconcile uses this to find naps the USER's edited window absorbed — those must
+    /// be swept from Apple Health BEFORE their rows are deleted (the row is the only record the
+    /// samples exist), so the row deletion is the CALLER's second step, not part of this read.
+    func autoNaps(overlapping start: Date, to end: Date) -> [StoredNap] {
+        guard end > start else { return [] }
+        let naps = (try? context.fetch(FetchDescriptor<StoredNap>())) ?? []
+        return naps.filter { nap in
+            guard !nap.isManuallyAdded, !nap.isManuallyEdited else { return false }
+            let lo = min(nap.start, nap.effectiveStart)
+            let hi = max(nap.end, nap.effectiveEnd)
+            return hi > lo && lo < end && hi > start
+        }
+    }
+
+    /// Delete specific nap rows (after their Health samples were handled). Best-effort save; a
+    /// failure leaves the rows for the next sweep.
+    func deleteNaps(_ rows: [StoredNap], reason: String, night: Date? = nil) {
+        guard !rows.isEmpty else { return }
+        for row in rows { context.delete(row) }
+        do { try context.save() } catch { context.rollback(); return }
+        let nightDetail = night.map { " night=\(Self.stamp($0))" } ?? ""
+        ObservabilityStore().recordMetricEvent(source: "nap-prune",
+                                               detail: "removed=\(rows.count) reason=\(reason)" + nightDetail)
+    }
+
+    /// Delete auto-detected (non-manual) naps whose effective window overlaps `[start, end]` — a
+    /// stored night now covers that sleep. Best-effort: a fetch/save failure leaves the naps for the
+    /// next night write to prune. The pruned naps' Health samples are swept by the NEXT
+    /// `mirrorSettledNight` of this just-written night (its union-delete stops excluding windows
+    /// `healthWrittenNapWindows` no longer reports); the night was written one line above this call,
+    /// so that mirror is on the very next flush — the orphan window is one flush cycle, not open-ended.
+    private func pruneAutoNaps(overlapping start: Date, _ end: Date, night: Date) {
+        guard end > start else { return }
+        let naps = (try? context.fetch(FetchDescriptor<StoredNap>())) ?? []
+        var removed = 0
+        for nap in naps where !nap.isManuallyAdded && !nap.isManuallyEdited {
+            let lo = min(nap.start, nap.effectiveStart)
+            let hi = max(nap.end, nap.effectiveEnd)
+            guard hi > lo, lo < end, hi > start else { continue }
+            context.delete(nap)
+            removed += 1
+        }
+        guard removed > 0 else { return }
+        do { try context.save() } catch { context.rollback(); return }
+        ObservabilityStore().recordMetricEvent(
+            source: "nap-prune",
+            detail: "night=\(Self.stamp(night)) removed=\(removed) span=[\(Self.stamp(start))..\(Self.stamp(end))]")
     }
 
     private func applyExtras(_ extras: SleepNightExtras, to row: StoredSleepSummary) {
@@ -2064,6 +2175,12 @@ struct LocalStore {
     /// nap already mirrored to Health isn't re-written.
     func saveNap(start: Date, end: Date, asleepMin: Int, isLongNap: Bool,
                  segments: [SleepSegment] = []) throws {
+        // Persistence-layer backstop mirroring the manual path's: a nap overlapping a STORED night
+        // is that night's sleep counted twice. `NapDetection` only excludes the slice-local
+        // `mainSleep`, so a partial drain slice holding just a post-arousal morning bout (too short
+        // to be a night on its own) would otherwise re-save a "nap" the archive-union staging
+        // absorbs into the night (🟢 2026-08-16 device case; review find).
+        if overlapsStoredNight(start, end) { return }
         let descriptor = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == start })
         if let existing = try? context.fetch(descriptor).first {
             // A manually edited/added nap is authoritative — auto re-detection must not overwrite it.
@@ -2090,7 +2207,7 @@ struct LocalStore {
         guard end > start else { return false }
         // Persistence-layer backstop for the night-overlap rule (the sheet's guard can be nil-fed):
         // a manual nap must not sit inside the recorded night, or it double-counts + duplicates Health.
-        if overlapsLatestNight(start, end) { return false }
+        if overlapsStoredNight(start, end) { return false }
         let dup = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == start })
         if (try? context.fetch(dup).first) != nil { return false }
         let row = StoredNap(start: start, end: end,
@@ -2117,7 +2234,7 @@ struct LocalStore {
     @discardableResult
     func editNap(originalStart: Date, newStart: Date, newEnd: Date) throws -> Bool {
         guard newEnd > newStart else { return false }
-        if overlapsLatestNight(newStart, newEnd) { return false }
+        if overlapsStoredNight(newStart, newEnd) { return false }
         let descriptor = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == originalStart })
         guard let row = try? context.fetch(descriptor).first else { return false }
         row.editedStart = newStart          // keep `start` (the dedup key) stable — overlay the edit
@@ -2134,13 +2251,25 @@ struct LocalStore {
         return true
     }
 
-    /// True when [start,end] overlaps the latest stored night's in-bed window — the persistence-layer
-    /// guard that keeps a manual nap from double-counting / duplicating the night in Apple Health.
-    private func overlapsLatestNight(_ start: Date, _ end: Date) -> Bool {
-        var d = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
-        d.fetchLimit = 1
-        guard let n = try? context.fetch(d).first, n.inBedEnd > n.inBedStart else { return false }
-        return start < n.inBedEnd && end > n.inBedStart
+    /// True when [start,end] overlaps a stored night's effective window — the persistence-layer
+    /// guard that keeps a nap (manual or auto) from double-counting / duplicating a night in Apple
+    /// Health. Checks the RECORDED in-bed window and, for an edited night, the user's edited window
+    /// too (either overlap double-counts on screen). Nearby nights only — a nap and its night are
+    /// within a calendar day of each other by construction.
+    private func overlapsStoredNight(_ start: Date, _ end: Date) -> Bool {
+        guard end > start else { return false }
+        let lo = Calendar.current.date(byAdding: .day, value: -2, to: start) ?? start
+        let hi = Calendar.current.date(byAdding: .day, value: 2, to: end) ?? end
+        let d = FetchDescriptor<StoredSleepSummary>(
+            predicate: #Predicate { $0.night >= lo && $0.night <= hi })
+        let rows = (try? context.fetch(d)) ?? []
+        return rows.contains { row in
+            if row.inBedEnd > row.inBedStart,
+               start < row.inBedEnd && end > row.inBedStart { return true }
+            if row.isManuallyEdited, row.editedInBedEnd > row.editedInBedStart,
+               start < row.editedInBedEnd && end > row.editedInBedStart { return true }
+            return false
+        }
     }
 
     /// Naps that started on `day` (start-of-day bucket), latest first.
