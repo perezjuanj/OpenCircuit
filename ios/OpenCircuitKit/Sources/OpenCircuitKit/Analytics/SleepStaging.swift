@@ -395,6 +395,16 @@ public enum SleepStaging {
         /// therefore a synthetic unworn block over REAL night bytes, not a corpus night. See #194.
         public var stagedWearGate: Bool
 
+        /// Share of epochs in the rolling window that must read ALL-ZERO activity magnitudes for an
+        /// epoch to be allowed to stage as asleep — the STAGED half of the desk-activity gate (#204).
+        /// The coarse half runs in `ActivityPeriod.applyDeskActivityOverride` and fixes the in-bed
+        /// ENVELOPE; this one marks any desk epoch that survives INSIDE the envelope as awake, so the
+        /// two layers cannot disagree about the same evening (the #194 failure shape).
+        /// **0 DISABLES it** — byte-identical to pre-#204 staging. Defaults to the detector's own
+        /// constant so one number moves both layers. See `ActivityPeriod.deskWakeZeroShareThreshold`
+        /// for the measurements and the 🟡 two-night caveat.
+        public var deskWakeZeroShareThreshold: Double
+
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
                     remHRPercentile: Double = 0.86,
@@ -429,7 +439,8 @@ public enum SleepStaging {
                     preOnsetBedtimeMaxGapEpochs: Int = 5,
                     cadenceWakeQuietEpochs: Int = 20,
                     cadenceWakeMaxQuietEpochs: Int = 240,
-                    stagedWearGate: Bool = true) {
+                    stagedWearGate: Bool = true,
+                    deskWakeZeroShareThreshold: Double = ActivityPeriod.deskWakeZeroShareThreshold) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -465,6 +476,7 @@ public enum SleepStaging {
             self.cadenceWakeQuietEpochs = cadenceWakeQuietEpochs
             self.cadenceWakeMaxQuietEpochs = cadenceWakeMaxQuietEpochs
             self.stagedWearGate = stagedWearGate
+            self.deskWakeZeroShareThreshold = deskWakeZeroShareThreshold
         }
 
         public static let `default` = Tuning()
@@ -677,6 +689,18 @@ public enum SleepStaging {
         // is not a physiological channel — it is the ring's own SpO2 duty cycle, read by
         // `markCadenceWakeOffset` alone (#190).
         var rowLayouts: [BulkRecord.Layout] = []
+        // Parallel to `rows`: the DESK-ACTIVITY verdict (#204). Computed over the WHOLE in-block run
+        // before the row loop, because the rolling share needs neighbours that the loop may skip
+        // (a leading epoch with no HR yet). Idle epochs report quiet-by-template rather than by
+        // measurement, so they are excluded from the evidence exactly as `activityQuietTimeline` does.
+        var rowDeskAwake: [Bool] = []
+        let deskAwakeAll: [Bool] = {
+            let quiet = inBlock.map {
+                ActivityQuietSample(time: $0.date(epoch: epoch),
+                                    quiet: $0.layout == .idle ? true : $0.activityMagnitudesAreZero)
+            }
+            return ActivityPeriod.deskActivityAwake(quiet, threshold: tuning.deskWakeZeroShareThreshold)
+        }()
         // Per-epoch motion energy is measured ABOVE a LOCAL idle floor (same rolling estimate as
         // detection). Gen 2 idles at ~1, Gen 3 at ~15–16 and DRIFTS across the night with posture
         // (16→24→39, 🟢 FR05.008 capture 2026-06-23). The old `$1 == 1 ? 0 : …` hard-coded Gen 2's
@@ -700,6 +724,7 @@ public enum SleepStaging {
             let motion = max(0, Int(rawMotion[idx] - floor[idx]))
             rows.append((r.date(epoch: epoch), hr, lastHRV, motion, lastSpo2, lastRR, r.hrvRMSSD != nil))
             rowLayouts.append(r.layout)
+            rowDeskAwake.append(deskAwakeAll[idx])
         }
         guard rows.count >= 2 else { return [] }
 
@@ -755,7 +780,11 @@ public enum SleepStaging {
         // the rescued pre-wake morning back off via `sleepSpan`. Scoping it to the tail is what keeps a
         // genuine mid-night WASO (an interior awakening with sustained sleep AFTER it) from being absorbed
         // as sleep — only the morning is rescued, not every restless mid-night.
-        let motionAwakeStrict = rows.map { $0.motion > tuning.awakeMotion }
+        // MOTION-awake now has TWO sources, both movement evidence: the primary `[10:15]` channel
+        // above its local idle floor, OR the ring's own activity magnitudes saying this stretch was
+        // not still (#204). The second is what sees desk work, which the first cannot express — see
+        // `ActivityPeriod.deskWakeZeroShareThreshold`. Inert when the threshold is 0.
+        let motionAwakeStrict = rows.indices.map { rows[$0].motion > tuning.awakeMotion || rowDeskAwake[$0] }
         // Tail boundary from the STRICT (un-softened) span: the epoch just after the end of the last
         // sustained asleep run. `motionAwakeVitalsHalfWindow <= 0` disables the rescue entirely (tail =
         // end of night → no epoch is softened → byte-identical to the pre-rescue staging).

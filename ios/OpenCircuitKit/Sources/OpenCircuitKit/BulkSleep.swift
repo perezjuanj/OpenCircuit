@@ -791,6 +791,22 @@ public enum BulkSleep {
         records.compactMap { $0.hrvRMSSD != nil ? $0.date(epoch: epoch) : nil }
     }
 
+    /// Per-epoch verdicts from the ring's OWN activity magnitudes (`[15:23)`, 🟢 #195) for the
+    /// DESK-ACTIVITY GATE (`ActivityPeriod.applyDeskActivityOverride`, #204) — the awake-but-still
+    /// signal the primary `[10:15]` channel cannot express. Built from the SAME records as the
+    /// motion/HR/sleep-vitals timelines, so no extra channel is threaded.
+    ///
+    /// Idle (unworn) epochs are EXCLUDED rather than reported quiet: their activity block is zero by
+    /// template, not by measurement, so counting them would let a charging stretch vouch for the
+    /// stillness of the epochs around it.
+    public static func activityQuietTimeline(from records: [BulkRecord],
+                                             epoch: Int = Command.syncEpoch) -> [ActivityQuietSample] {
+        records.compactMap { r in
+            r.layout == .idle ? nil
+                : ActivityQuietSample(time: r.date(epoch: epoch), quiet: r.activityMagnitudesAreZero)
+        }
+    }
+
     /// Restrict `records` to those whose epoch falls within `hint`, or return them
     /// unchanged when no hint is given. Extension point for the sleep-schedule abstraction:
     /// the app can pass the user's bedtime→wake window (see ios/OpenCircuit/SleepSchedule)
@@ -814,7 +830,8 @@ public enum BulkSleep {
         let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
                                                       temperatureSamples: temperatures,
                                                       heartRateSamples: heartRateTimeline(from: scoped, epoch: epoch),
-                                                      sleepVitalTimes: sleepVitalTimeline(from: scoped, epoch: epoch))
+                                                      sleepVitalTimes: sleepVitalTimeline(from: scoped, epoch: epoch),
+                                                      activityQuiet: activityQuietTimeline(from: scoped, epoch: epoch))
         // Clustered span (brief awakenings bridged), not just the first/longest fragment — see
         // mainSleepBlock. A drifting Gen-3 floor or a real mid-sleep stir otherwise splits the night.
         return ActivityPeriod.mainSleepBlock(periods)
@@ -850,7 +867,8 @@ public enum BulkSleep {
         let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
                                                       temperatureSamples: temperatures,
                                                       heartRateSamples: heartRateTimeline(from: scoped, epoch: epoch),
-                                                      sleepVitalTimes: sleepVitalTimeline(from: scoped, epoch: epoch))
+                                                      sleepVitalTimes: sleepVitalTimeline(from: scoped, epoch: epoch),
+                                                      activityQuiet: activityQuietTimeline(from: scoped, epoch: epoch))
         // Main in-bed block = the clustered sleep span (brief awakenings bridged via maxSleepPause),
         // not just the longest single fragment — so a drift-fragmented Gen-3 night isn't truncated.
         guard let block = ActivityPeriod.mainSleepBlock(periods) else { return [] }
@@ -966,7 +984,8 @@ public enum BulkSleep {
         let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: records, epoch: epoch),
                                                       temperatureSamples: temperatures,
                                                       heartRateSamples: heartRateTimeline(from: records, epoch: epoch),
-                                                      sleepVitalTimes: sleepVitalTimeline(from: records, epoch: epoch))
+                                                      sleepVitalTimes: sleepVitalTimeline(from: records, epoch: epoch),
+                                                      activityQuiet: activityQuietTimeline(from: records, epoch: epoch))
         let sleepBlocks = periods.filter {
             $0.activity == .sleep && $0.duration > ActivityPeriod.minSleepDuration
         }

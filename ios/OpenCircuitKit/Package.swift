@@ -23,5 +23,9 @@ let package = Package(
         // CLT-friendly verifier: `swift run RingKitVerify` works without Xcode,
         // asserting the same real-capture fixtures. Stopgap until Xcode is present.
         .executableTarget(name: "RingKitVerify", dependencies: ["OpenCircuitKit"]),
+        // Field-triage tool: replays a wearer's exported 0x4c records through the shipping
+        // sleep pipeline and prints the decision trace. Read-only; changes no behaviour.
+        // `swift run SleepReplay <export.json>` — see Sources/SleepReplay/main.swift.
+        .executableTarget(name: "SleepReplay", dependencies: ["OpenCircuitKit"]),
     ]
 )

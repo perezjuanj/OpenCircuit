@@ -58,6 +58,22 @@ public struct HeartRateSample: Sendable, Equatable {
     }
 }
 
+/// One epoch's verdict from the ring's OWN activity magnitudes — `BulkRecord.activityMagnitudes`,
+/// the five 12-bit nibble-packed values in `[15:23)` (🟢 layout MEASURED, PROTOCOL.md §5.3 / #195).
+/// `quiet == true` means all five read zero: the ring itself saying nothing moved this epoch.
+///
+/// This is the ONLY thing the desk-activity gate reads — a BINARY predicate with an absolute floor,
+/// never a magnitude, a rank or a quantile. That distinction is the whole safety argument: see
+/// `deskWakeZeroShareThreshold`.
+public struct ActivityQuietSample: Sendable, Equatable {
+    public let time: Date
+    public let quiet: Bool
+    public init(time: Date, quiet: Bool) {
+        self.time = time
+        self.quiet = quiet
+    }
+}
+
 public enum Activity: Equatable, Sendable { case sleep, active }
 
 public struct ActivityPeriod: Equatable, Sendable {
@@ -109,6 +125,134 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// Minimum HR readings (globally, and inside a block) before the gate will act, so a single
     /// stray reading can neither set a bogus floor nor flip a block.
     static let minHRSamplesForGate = 3
+
+    // MARK: - Desk-activity wake gate (#204)
+    //
+    // THE HOLE THIS FILLS. The HR gate above catches an awake-but-still block by its HEART; nothing
+    // catches one by its MOVEMENT, because the primary `[10:15]` motion channel does not register
+    // desk work. 🟢 MEASURED on two ground-truthed evenings from one wearer (FR02.018, Gen 2,
+    // Australia/Melbourne) in which the wearer was sitting at a computer:
+    //
+    //   period                                  n    epochs > motion baseline
+    //   Aug-16 evening, at a computer          152    19
+    //   Aug-17 evening, at a computer           61     0
+    //   Aug-17/18 REAL SLEEP                   157     0
+    //
+    // The primary channel reads the SAME value at a keyboard as it does in deep sleep, so the
+    // detector cannot break the run, `mainSleepBlock` welds evening to night, and the HR gate —
+    // which judges a whole period on its MEDIAN — cannot trim a head. On this wearer's 2026-08-17
+    // night that produced ONE unbroken 14 h 03 m "sleep" block, 17:49:54 → 07:53:12.
+    //
+    // WHAT THE RING DID RECORD. `activityMagnitudes` (`[15:23)`) is non-zero throughout both
+    // computer sessions and zero through most of real sleep. Share of epochs reading ALL-ZERO:
+    //
+    //   Aug-15 evening (before a correctly-staged night)      9 %
+    //   Aug-15/16 REAL SLEEP                                 79 %
+    //   Aug-16 daytime                                       10 %
+    //   Aug-16 evening, at a computer  [ground truth]         2 %
+    //   Aug-17 evening, up and about                          0 %
+    //   Aug-17 evening, dozing         [ground truth]        14 %
+    //   Aug-17 evening, at a computer  [ground truth]         0 %
+    //   Aug-17/18 REAL SLEEP                                 72 %
+    //
+    // Real sleep 72–79 %, every awake state 0–14 %, on two independent nights. The gate sits in
+    // that gap.
+    //
+    // ⚠️ WHY THIS IS NOT THE MEASURED TRAP `motionSource` WARNS ABOUT. That warning is about
+    // mapping the tail to a MAGNITUDE through a rank (a p80 quantile with no absolute floor), which
+    // moved 15 of 18 corpus nights by −100…+45 min and moved the SAME night in opposite directions
+    // in two bundles. This gate never computes a magnitude. It reads one binary predicate —
+    // `activityMagnitudesAreZero`, whose absolute floor is the number zero — and thresholds its
+    // SHARE over a rolling window. A record set cannot move where zero is.
+    //
+    // ⚠️ It also deliberately relaxes the "consumers may use it only through `BulkSleep.motionSource`"
+    // constraint on `motionIntensityTail`. That constraint exists to stop the two motion channels
+    // being MIXED into one magnitude scale; this gate keeps them separate — the primary channel
+    // still decides stillness, and this only ever VETOES a stillness verdict the ring's own activity
+    // record contradicts.
+    //
+    // ONE-DIRECTIONAL, like the wear and HR gates: it can only ever turn sleep into active.
+
+    /// Share of epochs in the rolling window that must read ALL-ZERO activity magnitudes for the
+    /// window to be allowed to count as sleep. Below this share the epoch is forced ACTIVE.
+    ///
+    /// **0 DISABLES THE GATE ENTIRELY** — the kill switch every other pass in this file carries.
+    /// At 0 the override is skipped outright and detection is byte-identical to pre-#204.
+    ///
+    /// 🟡 FIT ON TWO NIGHTS, ONE WEARER. 0.35 sits between the highest awake reading measured
+    /// (0.14, the Aug-17 doze) and the lowest sleep reading measured (0.72). That is a wide gap,
+    /// but it is two nights — this is a starting point to be re-fit against accumulated
+    /// `SleepEditLabel` corrections, NOT a settled value. The dozing figure is the one to watch:
+    /// evening dozing is genuinely intermediate, and a threshold this high will trim a doze back
+    /// to its stillest core.
+    public static let deskWakeZeroShareThreshold: Double = 0.35
+
+    /// Rolling window (in epochs) the share is measured over, centred on the epoch being judged.
+    /// 18 × 150 s = 45 min. Long enough that normal sleep stirring cannot drag a window under the
+    /// threshold (real-sleep windows measured 0.67–1.00 across both nights), short enough to place
+    /// the evening→sleep transition within ~15 min of the wearer's reported time.
+    static let deskWakeWindowEpochs = 18
+
+    /// Nominal epoch cadence, kept local so this detector stays device-agnostic (openwhoop port);
+    /// the RingConn 0x4c step is 150 s (`BulkRecord.epochSeconds`). Mirrors `rescueEpochStep`.
+    static let deskEpochStep: TimeInterval = 150
+
+    /// Per-epoch AWAKE verdicts from the ring's own activity record: `true` where the centred
+    /// window's all-zero share falls BELOW `threshold`. `epochs` must be time-sorted.
+    static func deskActivityAwake(_ epochs: [ActivityQuietSample],
+                                  threshold: Double = deskWakeZeroShareThreshold,
+                                  windowEpochs: Int = deskWakeWindowEpochs) -> [Bool] {
+        let n = epochs.count
+        guard n > 0, windowEpochs > 0, threshold > 0 else {
+            return [Bool](repeating: false, count: n)
+        }
+        // Prefix sums so the rolling share is O(n) rather than O(n·w).
+        var prefix = [Int](repeating: 0, count: n + 1)
+        for i in 0 ..< n { prefix[i + 1] = prefix[i] + (epochs[i].quiet ? 1 : 0) }
+        let half = windowEpochs / 2
+        return (0 ..< n).map { i in
+            let lo = max(0, i - half), hi = min(n, i + half + 1)
+            return Double(prefix[hi] - prefix[lo]) / Double(hi - lo) < threshold
+        }
+    }
+
+    /// Force `magnitudes` to the ACTIVE sentinel on every motion sample whose epoch the desk gate
+    /// judged awake. Runs AFTER `motionAboveLocalFloor` on purpose: the rolling idle floor is
+    /// computed from the unmodified channel, so the override cannot feed back into it.
+    ///
+    /// No-op — byte-identical to pre-#204 — when the threshold is 0, when no activity timeline is
+    /// supplied, or when no epoch is judged awake.
+    static func applyDeskActivityOverride(_ magnitudes: inout [Float], times: [Date],
+                                          activityQuiet: [ActivityQuietSample],
+                                          threshold: Double = deskWakeZeroShareThreshold,
+                                          windowEpochs: Int = deskWakeWindowEpochs) {
+        guard threshold > 0, !activityQuiet.isEmpty, magnitudes.count == times.count else { return }
+        let epochs = activityQuiet.sorted { $0.time < $1.time }
+        let awake = deskActivityAwake(epochs, threshold: threshold, windowEpochs: windowEpochs)
+        guard awake.contains(true) else { return }
+        let starts = epochs.map(\.time)
+        for i in magnitudes.indices {
+            // The motion timeline is a 5× sub-sample expansion of each epoch, so match a sample to
+            // the last epoch that STARTS at or before it and lies within one epoch step. Matching by
+            // time RANGE (not equality) keeps this correct for any sub-sample layout, and leaves a
+            // sample that falls in a data hole unmatched rather than mis-attributed.
+            guard let e = epochIndex(for: times[i], starts: starts), awake[e] else { continue }
+            magnitudes[i] = .greatestFiniteMagnitude
+        }
+    }
+
+    /// Index of the last epoch starting at or before `t`, or nil when `t` sits more than one epoch
+    /// step past it (a data hole, or before the first epoch).
+    static func epochIndex(for t: Date, starts: [Date]) -> Int? {
+        var lo = 0, hi = starts.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if starts[mid] <= t { lo = mid + 1 } else { hi = mid }
+        }
+        let i = lo - 1
+        guard i >= 0, t.timeIntervalSince(starts[i]) < deskEpochStep else { return nil }
+        return i
+    }
 
     /// Sleep-vitals rescue (the SYMMETRIC counterpart to the HR gate). The motion detector is blind
     /// to a still-but-AWAKE period (→ HR gate). It is EQUALLY blind the other way: a MOVING-but-ASLEEP
@@ -218,12 +362,21 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// of the worn samples) so whatever the device idles at maps to ~0, then apply the same
     /// threshold. A constant-floor timeline (every existing test, an idle ring) maps to all-zero
     /// → still, exactly as before — so this is a no-op for Gen 2 while fixing Gen 3.
-    public static func detectFromMotion(_ history: [MotionSample]) -> [ActivityPeriod] {
+    /// `activityQuiet:` (optional) threads the ring's OWN per-epoch activity record through the
+    /// DESK-ACTIVITY GATE — the fix for an awake-but-still stretch the primary channel cannot see
+    /// (see the `deskWakeZeroShareThreshold` block). Empty (the default) leaves detection
+    /// byte-identical to pre-#204.
+    public static func detectFromMotion(_ history: [MotionSample],
+                                        activityQuiet: [ActivityQuietSample] = [],
+                                        threshold: Double = deskWakeZeroShareThreshold) -> [ActivityPeriod] {
         guard history.count >= 2 else { return [] }
         // The rolling floor and `detect` both assume a time-ordered timeline; sort defensively so an
         // unsorted caller (e.g. the nap path feeds the concatenated 0x00+0x03 channels) is correct.
         let history = history.sorted { $0.time < $1.time }
-        let relative = motionAboveLocalFloor(history)
+        var relative = motionAboveLocalFloor(history)
+        // One-directional: only ever raises a magnitude to the ACTIVE sentinel, never lowers one.
+        applyDeskActivityOverride(&relative, times: history.map(\.time), activityQuiet: activityQuiet,
+                                  threshold: threshold)
         return detect(times: history.map(\.time), deltas: relative,
                       stillThreshold: motionStillThreshold,
                       maxGap: gravityMaxGap - motionGapSubSampleCorrection,
@@ -320,7 +473,7 @@ public struct ActivityPeriod: Equatable, Sendable {
         return out
     }
 
-    /// Sleep/Active detection (motion) with two post-filters that only ever REMOVE sleep, never add it:
+    /// Sleep/Active detection (motion) with three post-filters that only ever REMOVE sleep, never add it:
     ///   • WEAR GATE (#41): a `.sleep` block whose median skin temperature reads off-wrist / on the
     ///     charger is reclassified `.active`, so a perfectly still ring on the nightstand can't
     ///     masquerade as a night. A block with no temperature coverage is left as detected — absence
@@ -328,15 +481,22 @@ public struct ActivityPeriod: Equatable, Sendable {
     ///   • HR GATE: a still block whose median HR runs well above the night's resting floor (an
     ///     awake-but-still period — sitting out late, a long sedentary evening) is reclassified
     ///     `.active`. The ring is WORN here, so the wear gate can't catch it; HR is the discriminator.
+    ///   • DESK-ACTIVITY GATE (#204, `activityQuiet:`): epochs the ring's OWN activity magnitudes say
+    ///     were not still are forced `.active` BEFORE segmentation, so the run SPLITS there. Unlike
+    ///     the two gates above — which judge a whole period on its median and so cannot trim a HEAD —
+    ///     this one acts per epoch, which is what a sedentary evening welded onto the night needs.
+    ///     Empty timeline (the default) or threshold 0 ⇒ inert.
     /// `temperatureSamples` / `heartRateSamples` may be unordered and sparse; only readings inside a
     /// block are considered, and an empty set makes that gate a no-op.
     public static func detectFromMotion(_ history: [MotionSample],
                                         temperatureSamples: [TemperatureSample],
                                         heartRateSamples: [HeartRateSample] = [],
                                         sleepVitalTimes: [Date] = [],
+                                        activityQuiet: [ActivityQuietSample] = [],
+                                        threshold: Double = deskWakeZeroShareThreshold,
                                         wornMinC: Double = wornMinTemperatureC,
                                         awakeHRMargin: Int = awakeHRMarginBPM) -> [ActivityPeriod] {
-        let base = detectFromMotion(history)
+        let base = detectFromMotion(history, activityQuiet: activityQuiet, threshold: threshold)
         let wearGated = wearGate(base, temperatureSamples, wornMinC: wornMinC)
         let hrGated = heartRateGate(wearGated, heartRateSamples, marginBPM: awakeHRMargin)
         return sleepVitalsRescue(hrGated, heartRateSamples, sleepVitalTimes, marginBPM: awakeHRMargin)
@@ -345,7 +505,7 @@ public struct ActivityPeriod: Equatable, Sendable {
     /// The night's resting-floor HR estimate: `sleepHRFloorPercentile` over the DISTINCT HR levels
     /// seen tonight (deduped so a long high-HR stretch can't drag the floor up by sheer count — see
     /// `heartRateGate`). `nil` when there aren't enough readings to judge.
-    static func sleepHRFloor(_ hr: [HeartRateSample]) -> Int? {
+    public static func sleepHRFloor(_ hr: [HeartRateSample]) -> Int? {
         guard hr.count >= minHRSamplesForGate else { return nil }
         let levels = Array(Set(hr.map(\.bpm))).sorted()
         guard !levels.isEmpty else { return nil }
