@@ -78,14 +78,44 @@ public struct CursorSpan: Codable, Equatable, Sendable {
         self.end = end
     }
 
-    /// Degenerate single-cursor span, used to migrate the v1 head-cursor sets.
+    /// Degenerate single-cursor span.
     public init(point: UInt32) {
         self.start = point
         self.end = point
     }
 
+    /// Migrate a v1 head-cursor bookkeeping entry. A v1 cursor is the bout head AS OF the moment it
+    /// was recorded, and the retention prune only ever moves a head FORWARD — so the bout the
+    /// cursor belonged to lies within `retention` AFTER it, never before. A degenerate point span
+    /// provably fails here: on the field device every recorded head was a past prune cutoff, so by
+    /// the next rebuild the surviving span started strictly after it (review 2026-08-17, MAJOR).
+    /// Widening forward by the retention window restores the overlap; the over-suppression risk is
+    /// bounded to bouts starting within 48 h after an already-reviewed head, and stale spans are
+    /// pruned away once they can no longer overlap anything (`prunedToRelevant`).
+    public static func migratedFromLegacyCursor(
+        _ cursor: UInt32,
+        retention: TimeInterval = AutomaticWorkoutInbox.retention
+    ) -> CursorSpan {
+        CursorSpan(start: cursor, end: cursor &+ UInt32(max(retention, 0)))
+    }
+
     public func overlaps(_ other: CursorSpan) -> Bool {
         start <= other.end && other.start <= end
+    }
+}
+
+public extension [CursorSpan] {
+    /// Drop spans that can no longer matter: `AutomaticWorkoutInbox.rebuild` only retains samples
+    /// whose end lies within `retention` of `now`, so a span ending before that horizon can never
+    /// overlap a future candidate. Bounds the otherwise append-only notified/resolved bookkeeping
+    /// and caps how long a widened legacy span can over-suppress.
+    func prunedToRelevant(
+        now: Date,
+        retention: TimeInterval = AutomaticWorkoutInbox.retention
+    ) -> [CursorSpan] {
+        let horizon = now.addingTimeInterval(-Swift.max(retention, 0))
+            .timeIntervalSince1970 - TimeInterval(Command.syncEpoch)
+        return filter { TimeInterval($0.end) >= horizon }
     }
 }
 
@@ -240,10 +270,11 @@ public enum AutomaticWorkoutInbox {
 /// two field failure modes — a bout re-announced because its head cursor moved, and a days-old bout
 /// announced as if it just happened — stay replay-testable without UserNotifications.
 public enum AutomaticWorkoutAnnouncement {
-    /// A push is only useful shortly after the bout ENDS; past this age the two-day review inbox is
-    /// the surface, not a notification. Also the safety net for spans migrated from the v1
-    /// head-cursor sets, whose degenerate spans cannot retro-cover a pruned head.
-    public static let maxAge: TimeInterval = 12 * 3600
+    /// A push is only useful in the day after the bout ENDS; past this age the two-day review
+    /// inbox is the surface, not a notification. 24 h (not 12) so a once-a-morning syncer still
+    /// gets the push for yesterday morning's workout — the span-overlap dedup, not this age cut,
+    /// is what prevents repeats (review 2026-08-17).
+    public static let maxAge: TimeInterval = 24 * 3600
 
     public static func shouldAnnounce(
         _ candidate: AutomaticWorkoutDetector.Candidate,

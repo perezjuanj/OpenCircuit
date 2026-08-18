@@ -2765,10 +2765,11 @@ final class RingSession: NSObject {
         }
     }
 
-    /// Load v2 span bookkeeping, migrating a v1 head-cursor set to degenerate one-point spans on
-    /// first run. A migrated point can no longer match a bout whose head the prune already moved
-    /// past it — `AutomaticWorkoutAnnouncement.maxAge` is the safety net for that window. The v1
-    /// key is removed so a later v1 write can never resurrect over v2 state.
+    /// Load v2 span bookkeeping, migrating a v1 head-cursor set on first run via the
+    /// retention-widened `CursorSpan.migratedFromLegacyCursor` (a degenerate point provably misses
+    /// a bout whose head the prune already moved past it). The v1 key is deliberately LEFT IN
+    /// PLACE: the v2-first read below already makes a later v1 write inert, and removing it would
+    /// hand a downgraded build an empty set and a full re-notify of the whole inbox.
     private func loadAutomaticWorkoutSpans(key: String, legacyKey: String) -> [CursorSpan] {
         let defaults = UserDefaults.standard
         if let data = defaults.data(forKey: key),
@@ -2777,16 +2778,18 @@ final class RingSession: NSObject {
         }
         guard let data = defaults.data(forKey: legacyKey),
               let saved = try? JSONDecoder().decode(Set<UInt32>.self, from: data) else { return [] }
-        let migrated = saved.sorted().map { CursorSpan(point: $0) }
+        let migrated = saved.sorted().map { CursorSpan.migratedFromLegacyCursor($0) }
         if let encoded = try? JSONEncoder().encode(migrated) {
             defaults.set(encoded, forKey: key)
         }
-        defaults.removeObject(forKey: legacyKey)
         return migrated
     }
 
+    /// Persist minus the spans that can no longer overlap any future candidate — keeps the
+    /// otherwise append-only bookkeeping bounded and caps a widened legacy span's reach.
     private func persistAutomaticWorkoutSpans(_ spans: [CursorSpan], key: String) {
-        if let data = try? JSONEncoder().encode(spans) {
+        let relevant = spans.prunedToRelevant(now: Date())
+        if let data = try? JSONEncoder().encode(relevant) {
             UserDefaults.standard.set(data, forKey: key)
         }
     }

@@ -194,12 +194,61 @@ final class AutomaticWorkoutDetectionTests: XCTestCase {
         // but the surviving tail still overlaps the dismissed span → no zombie candidate.
         let later = Date(timeIntervalSince1970:
             TimeInterval(Command.syncEpoch) + TimeInterval(firstCursor + retention + 600))
+        // Control: absent the resolved filter the pruned tail DOES still form a candidate, so the
+        // suppression assertions below cannot pass vacuously (e.g. if minimumDuration changes).
+        let control = AutomaticWorkoutInbox.rebuild(
+            existing: initial.samples, incoming: [], resolvedSpans: [], now: later)
+        XCTAssertFalse(control.samples.isEmpty)              // tail survives the prune…
+        XCTAssertNotEqual(control.samples.first?.cursor, firstCursor) // …with a MOVED head…
+        XCTAssertEqual(control.candidates.count, 1)          // …and would resurrect unsuppressed
+
         let rebuilt = AutomaticWorkoutInbox.rebuild(
             existing: initial.samples, incoming: [],
             resolvedSpans: [dismissedSpan], now: later)
-        XCTAssertFalse(rebuilt.samples.isEmpty)              // tail survives the prune…
-        XCTAssertNotEqual(rebuilt.samples.first?.cursor, firstCursor) // …with a MOVED head…
-        XCTAssertTrue(rebuilt.candidates.isEmpty)            // …and stays dismissed anyway
+        XCTAssertTrue(rebuilt.candidates.isEmpty)            // full span keeps it dismissed
+    }
+
+    /// v1→v2 migration replay of the field failure: every v1 cursor on the affected device was a
+    /// PAST prune cutoff, i.e. strictly BEFORE the bout span surviving the next rebuild. A
+    /// degenerate point span misses that bout entirely; the retention-widened migration must not.
+    func testLegacyCursorMigrationStillSuppressesAfterHeadPrune() throws {
+        let retention = UInt32(AutomaticWorkoutInbox.retention)
+        let firstCursor: UInt32 = 2_000_000
+        let bout = (0 ..< 120).map {
+            sample(cursor: firstCursor + UInt32($0 * 10), bpm: 75, steps: 1)
+        }
+        // The v1 build recorded the head as it stood back then — the original first cursor.
+        let legacyHeadCursor = firstCursor
+
+        // Rebuild once the cutoff has eaten past that recorded head.
+        let later = Date(timeIntervalSince1970:
+            TimeInterval(Command.syncEpoch) + TimeInterval(firstCursor + retention + 600))
+        let survivingSpan = try XCTUnwrap(AutomaticWorkoutInbox.rebuild(
+            existing: bout, incoming: [], resolvedSpans: [], now: later).candidates.first).cursorSpan
+
+        // The degenerate point provably fails (the review's MAJOR)…
+        XCTAssertFalse(CursorSpan(point: legacyHeadCursor).overlaps(survivingSpan))
+        // …the widened migration covers it…
+        let migrated = CursorSpan.migratedFromLegacyCursor(legacyHeadCursor)
+        XCTAssertTrue(migrated.overlaps(survivingSpan))
+        // …and end-to-end the bout stays dismissed through the inbox and the announcement gate.
+        XCTAssertTrue(AutomaticWorkoutInbox.rebuild(
+            existing: bout, incoming: [], resolvedSpans: [migrated], now: later).candidates.isEmpty)
+        let candidate = AutomaticWorkoutInbox.rebuild(
+            existing: bout, incoming: [], resolvedSpans: [], now: later).candidates[0]
+        XCTAssertFalse(AutomaticWorkoutAnnouncement.shouldAnnounce(
+            candidate, announcedSpans: [migrated], now: candidate.end.addingTimeInterval(60)))
+    }
+
+    func testSpanPruneDropsOnlyDeadSpans() {
+        let nowCursor: UInt32 = 3_000_000
+        let now = Date(timeIntervalSince1970:
+            TimeInterval(Command.syncEpoch) + TimeInterval(nowCursor))
+        let retention = UInt32(AutomaticWorkoutInbox.retention)
+        let dead = CursorSpan(start: nowCursor - retention - 1_000, end: nowCursor - retention - 1)
+        let live = CursorSpan(start: nowCursor - retention - 1_000, end: nowCursor - retention + 1)
+        let fresh = CursorSpan(start: nowCursor - 600, end: nowCursor - 100)
+        XCTAssertEqual([dead, live, fresh].prunedToRelevant(now: now), [live, fresh])
     }
 
     func testAnnouncementGateSuppressesMovedHeadsStaleBoutsAndPassesFreshOnes() {
