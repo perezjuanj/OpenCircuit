@@ -64,6 +64,61 @@ public enum HistoricalSportFrame {
     }
 }
 
+/// Inclusive range of ring cursors covered by a bout. This — not the first-sample cursor — is the
+/// durable identity of a detected workout: the first cursor MOVES whenever the two-day retention
+/// prune eats the bout's head or pages arrive out of order across drains, and keying notified/
+/// dismissed state to it let one stuck 19.7 h bout re-notify 10× and survive 4 dismissals
+/// (device-proven 2026-08-17). Overlap, not equality, is the "same bout" test.
+public struct CursorSpan: Codable, Equatable, Sendable {
+    public let start: UInt32
+    public let end: UInt32
+
+    public init(start: UInt32, end: UInt32) {
+        self.start = start
+        self.end = end
+    }
+
+    /// Degenerate single-cursor span.
+    public init(point: UInt32) {
+        self.start = point
+        self.end = point
+    }
+
+    /// Migrate a v1 head-cursor bookkeeping entry. A v1 cursor is the bout head AS OF the moment it
+    /// was recorded, and the retention prune only ever moves a head FORWARD — so the bout the
+    /// cursor belonged to lies within `retention` AFTER it, never before. A degenerate point span
+    /// provably fails here: on the field device every recorded head was a past prune cutoff, so by
+    /// the next rebuild the surviving span started strictly after it (review 2026-08-17, MAJOR).
+    /// Widening forward by the retention window restores the overlap; the over-suppression risk is
+    /// bounded to bouts starting within 48 h after an already-reviewed head, and stale spans are
+    /// pruned away once they can no longer overlap anything (`prunedToRelevant`).
+    public static func migratedFromLegacyCursor(
+        _ cursor: UInt32,
+        retention: TimeInterval = AutomaticWorkoutInbox.retention
+    ) -> CursorSpan {
+        CursorSpan(start: cursor, end: cursor &+ UInt32(max(retention, 0)))
+    }
+
+    public func overlaps(_ other: CursorSpan) -> Bool {
+        start <= other.end && other.start <= end
+    }
+}
+
+public extension [CursorSpan] {
+    /// Drop spans that can no longer matter: `AutomaticWorkoutInbox.rebuild` only retains samples
+    /// whose end lies within `retention` of `now`, so a span ending before that horizon can never
+    /// overlap a future candidate. Bounds the otherwise append-only notified/resolved bookkeeping
+    /// and caps how long a widened legacy span can over-suppress.
+    func prunedToRelevant(
+        now: Date,
+        retention: TimeInterval = AutomaticWorkoutInbox.retention
+    ) -> [CursorSpan] {
+        let horizon = now.addingTimeInterval(-Swift.max(retention, 0))
+            .timeIntervalSince1970 - TimeInterval(Command.syncEpoch)
+        return filter { TimeInterval($0.end) >= horizon }
+    }
+}
+
 /// Reconstructs retroactive potential-workout periods from historical sport samples.
 public enum AutomaticWorkoutDetector {
     public enum SuggestedKind: String, Equatable, Sendable {
@@ -80,6 +135,13 @@ public enum AutomaticWorkoutDetector {
         /// Stable across retransmitted and later pages because it is the first ring cursor in the
         /// bout, not an app-generated UUID or the still-growing end cursor.
         public var id: UInt32 { samples.first?.cursor ?? 0 }
+
+        /// The bout's durable identity for notified/dismissed bookkeeping. `id` (the first cursor)
+        /// is only stable for SwiftUI list diffing within one rebuild; across rebuilds the prune
+        /// and page arrival move it — see `CursorSpan`.
+        public var cursorSpan: CursorSpan {
+            CursorSpan(start: samples.first?.cursor ?? 0, end: samples.last?.cursor ?? 0)
+        }
 
         public var duration: TimeInterval { end.timeIntervalSince(start) }
         public var steps: Int { samples.reduce(0) { $0 + $1.steps } }
@@ -173,11 +235,15 @@ public enum AutomaticWorkoutInbox {
     public static let retention: TimeInterval = 2 * 24 * 60 * 60
 
     /// Merge page retransmissions, prune expired records, reconstruct bouts, and suppress any bout
-    /// whose stable first cursor was already saved/dismissed. Prefer a duplicate with valid HR.
+    /// that overlaps a span the user already saved/dismissed. Prefer a duplicate with valid HR.
+    ///
+    /// Suppression is span-OVERLAP, not first-cursor equality: the retention prune below runs with
+    /// `now` on every rebuild, so a long bout's first cursor advances as the cutoff crosses it, and
+    /// an equality key resurrects the dismissed bout with a fresh head on every merge.
     public static func rebuild(
         existing: [HistoricalSportFrame.Sample],
         incoming: [HistoricalSportFrame.Sample],
-        resolvedStartCursors: Set<UInt32>,
+        resolvedSpans: [CursorSpan],
         now: Date = Date(),
         retention: TimeInterval = retention
     ) -> State {
@@ -193,10 +259,32 @@ public enum AutomaticWorkoutInbox {
             .sorted { $0.cursor < $1.cursor }
         let candidates = AutomaticWorkoutDetector.detect(samples: retained)
             .filter { candidate in
-                guard let startCursor = candidate.samples.first?.cursor else { return false }
-                return !resolvedStartCursors.contains(startCursor)
+                let span = candidate.cursorSpan
+                return !resolvedSpans.contains { $0.overlaps(span) }
             }
         return State(samples: retained, candidates: candidates)
+    }
+}
+
+/// Pure gate for the one-time "Possible workout detected" push. Kept out of `RingSession` so the
+/// two field failure modes — a bout re-announced because its head cursor moved, and a days-old bout
+/// announced as if it just happened — stay replay-testable without UserNotifications.
+public enum AutomaticWorkoutAnnouncement {
+    /// A push is only useful in the day after the bout ENDS; past this age the two-day review
+    /// inbox is the surface, not a notification. 24 h (not 12) so a once-a-morning syncer still
+    /// gets the push for yesterday morning's workout — the span-overlap dedup, not this age cut,
+    /// is what prevents repeats (review 2026-08-17).
+    public static let maxAge: TimeInterval = 24 * 3600
+
+    public static func shouldAnnounce(
+        _ candidate: AutomaticWorkoutDetector.Candidate,
+        announcedSpans: [CursorSpan],
+        now: Date,
+        maxAge: TimeInterval = maxAge
+    ) -> Bool {
+        guard now.timeIntervalSince(candidate.end) <= maxAge else { return false }
+        let span = candidate.cursorSpan
+        return !announcedSpans.contains { $0.overlaps(span) }
     }
 }
 

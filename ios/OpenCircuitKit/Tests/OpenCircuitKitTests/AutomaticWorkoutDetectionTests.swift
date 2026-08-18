@@ -149,26 +149,144 @@ final class AutomaticWorkoutDetectionTests: XCTestCase {
         let initial = AutomaticWorkoutInbox.rebuild(
             existing: [expired, invalidDuplicate],
             incoming: bout,
-            resolvedStartCursors: [],
+            resolvedSpans: [],
             now: now
         )
         XCTAssertEqual(initial.samples.count, 60)
         XCTAssertEqual(initial.samples.first?.heartRate, 90) // valid retransmission wins
         XCTAssertEqual(initial.candidates.map(\.id), [firstCursor])
 
-        // Later pages extend the same bout. Its first cursor—and therefore durable review key—does
-        // not change, so it remains gone after a reconnect instead of appearing as a duplicate.
+        // Later pages extend the same bout. The extended span still overlaps the resolved span, so
+        // it remains gone after a reconnect instead of appearing as a duplicate.
+        let resolvedSpan = try XCTUnwrap(initial.candidates.first).cursorSpan
         let extensionSamples = (60 ..< 66).map {
             sample(cursor: firstCursor + UInt32($0 * 10), bpm: 95, steps: 13)
         }
         let restored = AutomaticWorkoutInbox.rebuild(
             existing: initial.samples,
             incoming: extensionSamples,
-            resolvedStartCursors: [firstCursor],
+            resolvedSpans: [resolvedSpan],
             now: now
         )
         XCTAssertEqual(restored.samples.count, 66)
         XCTAssertTrue(restored.candidates.isEmpty)
+    }
+
+    /// Field failure 2026-08-17: a 19.7 h stuck bout was dismissed 4× and notified 10× because the
+    /// 48 h retention prune moved its FIRST cursor on every rebuild, and both the resolved filter
+    /// and the notify dedup keyed on that cursor. A dismissed bout must stay dismissed after the
+    /// prune eats its head.
+    func testPrunedHeadDoesNotResurrectResolvedBout() throws {
+        let retention = UInt32(AutomaticWorkoutInbox.retention)
+        let firstCursor: UInt32 = 1_000_000
+        let bout = (0 ..< 120).map {
+            sample(cursor: firstCursor + UInt32($0 * 10), bpm: 75, steps: 1)
+        }
+        let dismissedAt = Date(timeIntervalSince1970:
+            TimeInterval(Command.syncEpoch) + TimeInterval(firstCursor + 2_000))
+
+        let initial = AutomaticWorkoutInbox.rebuild(
+            existing: [], incoming: bout, resolvedSpans: [], now: dismissedAt)
+        let dismissedSpan = try XCTUnwrap(initial.candidates.first).cursorSpan
+        XCTAssertEqual(dismissedSpan.start, firstCursor)
+
+        // Two days later the prune cutoff sits INSIDE the bout: its head cursor has moved forward,
+        // but the surviving tail still overlaps the dismissed span → no zombie candidate.
+        let later = Date(timeIntervalSince1970:
+            TimeInterval(Command.syncEpoch) + TimeInterval(firstCursor + retention + 600))
+        // Control: absent the resolved filter the pruned tail DOES still form a candidate, so the
+        // suppression assertions below cannot pass vacuously (e.g. if minimumDuration changes).
+        let control = AutomaticWorkoutInbox.rebuild(
+            existing: initial.samples, incoming: [], resolvedSpans: [], now: later)
+        XCTAssertFalse(control.samples.isEmpty)              // tail survives the prune…
+        XCTAssertNotEqual(control.samples.first?.cursor, firstCursor) // …with a MOVED head…
+        XCTAssertEqual(control.candidates.count, 1)          // …and would resurrect unsuppressed
+
+        let rebuilt = AutomaticWorkoutInbox.rebuild(
+            existing: initial.samples, incoming: [],
+            resolvedSpans: [dismissedSpan], now: later)
+        XCTAssertTrue(rebuilt.candidates.isEmpty)            // full span keeps it dismissed
+    }
+
+    /// v1→v2 migration replay of the field failure: every v1 cursor on the affected device was a
+    /// PAST prune cutoff, i.e. strictly BEFORE the bout span surviving the next rebuild. A
+    /// degenerate point span misses that bout entirely; the retention-widened migration must not.
+    func testLegacyCursorMigrationStillSuppressesAfterHeadPrune() throws {
+        let retention = UInt32(AutomaticWorkoutInbox.retention)
+        let firstCursor: UInt32 = 2_000_000
+        let bout = (0 ..< 120).map {
+            sample(cursor: firstCursor + UInt32($0 * 10), bpm: 75, steps: 1)
+        }
+        // The v1 build recorded the head as it stood back then — the original first cursor.
+        let legacyHeadCursor = firstCursor
+
+        // Rebuild once the cutoff has eaten past that recorded head.
+        let later = Date(timeIntervalSince1970:
+            TimeInterval(Command.syncEpoch) + TimeInterval(firstCursor + retention + 600))
+        let survivingSpan = try XCTUnwrap(AutomaticWorkoutInbox.rebuild(
+            existing: bout, incoming: [], resolvedSpans: [], now: later).candidates.first).cursorSpan
+
+        // The degenerate point provably fails (the review's MAJOR)…
+        XCTAssertFalse(CursorSpan(point: legacyHeadCursor).overlaps(survivingSpan))
+        // …the widened migration covers it…
+        let migrated = CursorSpan.migratedFromLegacyCursor(legacyHeadCursor)
+        XCTAssertTrue(migrated.overlaps(survivingSpan))
+        // …and end-to-end the bout stays dismissed through the inbox and the announcement gate.
+        XCTAssertTrue(AutomaticWorkoutInbox.rebuild(
+            existing: bout, incoming: [], resolvedSpans: [migrated], now: later).candidates.isEmpty)
+        let candidate = AutomaticWorkoutInbox.rebuild(
+            existing: bout, incoming: [], resolvedSpans: [], now: later).candidates[0]
+        XCTAssertFalse(AutomaticWorkoutAnnouncement.shouldAnnounce(
+            candidate, announcedSpans: [migrated], now: candidate.end.addingTimeInterval(60)))
+    }
+
+    func testSpanPruneDropsOnlyDeadSpans() {
+        let nowCursor: UInt32 = 3_000_000
+        let now = Date(timeIntervalSince1970:
+            TimeInterval(Command.syncEpoch) + TimeInterval(nowCursor))
+        let retention = UInt32(AutomaticWorkoutInbox.retention)
+        let dead = CursorSpan(start: nowCursor - retention - 1_000, end: nowCursor - retention - 1)
+        let live = CursorSpan(start: nowCursor - retention - 1_000, end: nowCursor - retention + 1)
+        let fresh = CursorSpan(start: nowCursor - 600, end: nowCursor - 100)
+        XCTAssertEqual([dead, live, fresh].prunedToRelevant(now: now), [live, fresh])
+    }
+
+    func testAnnouncementGateSuppressesMovedHeadsStaleBoutsAndPassesFreshOnes() {
+        let firstCursor: UInt32 = 500_000
+        let bout = (0 ..< 90).map {
+            sample(cursor: firstCursor + UInt32($0 * 10), bpm: 80, steps: 5)
+        }
+        let candidate = AutomaticWorkoutDetector.detect(samples: bout)[0]
+        let justEnded = candidate.end.addingTimeInterval(60)
+
+        // Fresh, never announced → announce once.
+        XCTAssertTrue(AutomaticWorkoutAnnouncement.shouldAnnounce(
+            candidate, announcedSpans: [], now: justEnded))
+
+        // Same bout with a pruned head (drop the first 30 samples): overlaps the announced span,
+        // so it is NOT a new workout.
+        let announced = candidate.cursorSpan
+        let pruned = AutomaticWorkoutDetector.detect(samples: Array(bout.dropFirst(30)))[0]
+        XCTAssertNotEqual(pruned.cursorSpan.start, announced.start)
+        XCTAssertFalse(AutomaticWorkoutAnnouncement.shouldAnnounce(
+            pruned, announcedSpans: [announced], now: justEnded))
+
+        // A v1-migrated degenerate point span inside the bout also suppresses it.
+        XCTAssertFalse(AutomaticWorkoutAnnouncement.shouldAnnounce(
+            pruned, announcedSpans: [CursorSpan(point: firstCursor + 600)], now: justEnded))
+
+        // A bout that ENDED longer than maxAge ago never rates a push, announced or not.
+        let stale = candidate.end.addingTimeInterval(AutomaticWorkoutAnnouncement.maxAge + 1)
+        XCTAssertFalse(AutomaticWorkoutAnnouncement.shouldAnnounce(
+            candidate, announcedSpans: [], now: stale))
+
+        // A disjoint later bout is genuinely new.
+        let secondStart = firstCursor + 10_000
+        let second = AutomaticWorkoutDetector.detect(samples: (0 ..< 90).map {
+            sample(cursor: secondStart + UInt32($0 * 10), bpm: 110, steps: 20)
+        })[0]
+        XCTAssertTrue(AutomaticWorkoutAnnouncement.shouldAnnounce(
+            second, announcedSpans: [announced], now: second.end.addingTimeInterval(60)))
     }
 
     private func sample(cursor: UInt32, bpm: Int, steps: Int) -> HistoricalSportFrame.Sample {

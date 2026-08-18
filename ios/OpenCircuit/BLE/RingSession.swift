@@ -328,17 +328,25 @@ final class RingSession: NSObject {
     private var automaticWorkoutSamplesKey: String {
         "workout.automaticDetection.samples.v1.\(peripheral.identifier.uuidString)"
     }
-    /// Start cursors of candidates the user already saved or dismissed. The first cursor remains
-    /// stable if later pages extend a bout; using the end cursor could resurrect that same workout.
-    private var resolvedAutomaticWorkoutCursors: Set<UInt32> = []
-    private var resolvedAutomaticWorkoutCursorsKey: String {
+    /// Cursor spans of candidates the user already saved or dismissed. Spans, not first cursors:
+    /// the v1 head-cursor key resurrected a dismissed bout every time the 48 h retention prune (or
+    /// out-of-order page arrival) moved its head — one stuck 19.7 h bout survived 4 dismissals and
+    /// notified 10× (device-proven 2026-08-17). Overlap with a resolved span means "same bout".
+    private var resolvedAutomaticWorkoutSpans: [CursorSpan] = []
+    private var resolvedAutomaticWorkoutSpansKey: String {
+        "workout.automaticDetection.resolved.v2.\(peripheral.identifier.uuidString)"
+    }
+    private var legacyResolvedAutomaticWorkoutCursorsKey: String {
         "workout.automaticDetection.resolved.v1.\(peripheral.identifier.uuidString)"
     }
-    /// Candidate starts whose one-time notification attempt was delivered or declined. Separate
-    /// from resolution: an unreviewed workout stays in the inbox, but reconnects must not nag.
-    private var notifiedAutomaticWorkoutCursors: Set<UInt32> = []
-    private var pendingAutomaticWorkoutNotificationCursors: Set<UInt32> = []
-    private var notifiedAutomaticWorkoutCursorsKey: String {
+    /// Spans whose one-time notification attempt was delivered or declined. Separate from
+    /// resolution: an unreviewed workout stays in the inbox, but reconnects must not nag.
+    private var notifiedAutomaticWorkoutSpans: [CursorSpan] = []
+    private var pendingAutomaticWorkoutNotificationSpans: [CursorSpan] = []
+    private var notifiedAutomaticWorkoutSpansKey: String {
+        "workout.automaticDetection.notified.v2.\(peripheral.identifier.uuidString)"
+    }
+    private var legacyNotifiedAutomaticWorkoutCursorsKey: String {
         "workout.automaticDetection.notified.v1.\(peripheral.identifier.uuidString)"
     }
     /// Pages received by the channel currently being drained. Unlike `bulkRecords.count`, this also
@@ -821,14 +829,10 @@ final class RingSession: NSObject {
             self.historyCapture = saved
         }
         automaticWorkoutDetectionEnabled = UserDefaults.standard.bool(forKey: automaticWorkoutDetectionKey)
-        if let data = UserDefaults.standard.data(forKey: resolvedAutomaticWorkoutCursorsKey),
-           let saved = try? JSONDecoder().decode(Set<UInt32>.self, from: data) {
-            resolvedAutomaticWorkoutCursors = saved
-        }
-        if let data = UserDefaults.standard.data(forKey: notifiedAutomaticWorkoutCursorsKey),
-           let saved = try? JSONDecoder().decode(Set<UInt32>.self, from: data) {
-            notifiedAutomaticWorkoutCursors = saved
-        }
+        resolvedAutomaticWorkoutSpans = loadAutomaticWorkoutSpans(
+            key: resolvedAutomaticWorkoutSpansKey, legacyKey: legacyResolvedAutomaticWorkoutCursorsKey)
+        notifiedAutomaticWorkoutSpans = loadAutomaticWorkoutSpans(
+            key: notifiedAutomaticWorkoutSpansKey, legacyKey: legacyNotifiedAutomaticWorkoutCursorsKey)
         if let data = UserDefaults.standard.data(forKey: automaticWorkoutSamplesKey),
            let saved = try? JSONDecoder().decode([HistoricalSportFrame.Sample].self, from: data) {
             mergeHistoricalSportSamples(saved)
@@ -2761,13 +2765,42 @@ final class RingSession: NSObject {
         }
     }
 
+    /// Load v2 span bookkeeping, migrating a v1 head-cursor set on first run via the
+    /// retention-widened `CursorSpan.migratedFromLegacyCursor` (a degenerate point provably misses
+    /// a bout whose head the prune already moved past it). The v1 key is deliberately LEFT IN
+    /// PLACE: the v2-first read below already makes a later v1 write inert, and removing it would
+    /// hand a downgraded build an empty set and a full re-notify of the whole inbox.
+    private func loadAutomaticWorkoutSpans(key: String, legacyKey: String) -> [CursorSpan] {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: key),
+           let saved = try? JSONDecoder().decode([CursorSpan].self, from: data) {
+            return saved
+        }
+        guard let data = defaults.data(forKey: legacyKey),
+              let saved = try? JSONDecoder().decode(Set<UInt32>.self, from: data) else { return [] }
+        let migrated = saved.sorted().map { CursorSpan.migratedFromLegacyCursor($0) }
+        if let encoded = try? JSONEncoder().encode(migrated) {
+            defaults.set(encoded, forKey: key)
+        }
+        return migrated
+    }
+
+    /// Persist minus the spans that can no longer overlap any future candidate — keeps the
+    /// otherwise append-only bookkeeping bounded and caps a widened legacy span's reach.
+    private func persistAutomaticWorkoutSpans(_ spans: [CursorSpan], key: String) {
+        let relevant = spans.prunedToRelevant(now: Date())
+        if let data = try? JSONEncoder().encode(relevant) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
     /// Merge retransmitted sport pages, retain the official app's two-day review window, rebuild
     /// retroactive candidates, and persist across reconnects. Prefer the duplicate that has valid HR.
     private func mergeHistoricalSportSamples(_ incoming: [HistoricalSportFrame.Sample]) {
         let rebuilt = AutomaticWorkoutInbox.rebuild(
             existing: historicalSportSamples,
             incoming: incoming,
-            resolvedStartCursors: resolvedAutomaticWorkoutCursors
+            resolvedSpans: resolvedAutomaticWorkoutSpans
         )
         historicalSportSamples = rebuilt.samples
         automaticWorkoutCandidates = rebuilt.candidates
@@ -2775,29 +2808,31 @@ final class RingSession: NSObject {
             UserDefaults.standard.set(data, forKey: automaticWorkoutSamplesKey)
         }
 
+        // Announce via the pure Kit gate: span-overlap dedup (a bout whose head moved is NOT a new
+        // bout) + the max-age cut (a bout that ended half a day ago belongs in the inbox, not on
+        // the lock screen — and its time-only copy would read as today).
         let unannounced = automaticWorkoutCandidates.filter {
-            guard let startCursor = $0.samples.first?.cursor else { return false }
-            return !notifiedAutomaticWorkoutCursors.contains(startCursor)
-                && !pendingAutomaticWorkoutNotificationCursors.contains(startCursor)
+            AutomaticWorkoutAnnouncement.shouldAnnounce(
+                $0,
+                announcedSpans: notifiedAutomaticWorkoutSpans + pendingAutomaticWorkoutNotificationSpans,
+                now: Date()
+            )
         }
         if !unannounced.isEmpty {
             // Claim in memory before creating the task: several pages can rebuild the same candidate
             // faster than authorization returns. Persist after successful enqueue or an explicit
             // authorization decision; only a transient enqueue error remains retryable.
-            pendingAutomaticWorkoutNotificationCursors.formUnion(
-                unannounced.compactMap { $0.samples.first?.cursor }
-            )
+            pendingAutomaticWorkoutNotificationSpans.append(contentsOf: unannounced.map(\.cursorSpan))
             Task { [weak self] in
                 guard let self else { return }
                 for candidate in unannounced {
-                    guard let cursor = candidate.samples.first?.cursor else { continue }
+                    let span = candidate.cursorSpan
                     let handled = await self.postAutomaticWorkoutNotification(candidate)
-                    self.pendingAutomaticWorkoutNotificationCursors.remove(cursor)
+                    self.pendingAutomaticWorkoutNotificationSpans.removeAll { $0 == span }
                     if handled {
-                        self.notifiedAutomaticWorkoutCursors.insert(cursor)
-                        if let data = try? JSONEncoder().encode(self.notifiedAutomaticWorkoutCursors) {
-                            UserDefaults.standard.set(data, forKey: self.notifiedAutomaticWorkoutCursorsKey)
-                        }
+                        self.notifiedAutomaticWorkoutSpans.append(span)
+                        self.persistAutomaticWorkoutSpans(self.notifiedAutomaticWorkoutSpans,
+                                                          key: self.notifiedAutomaticWorkoutSpansKey)
                     }
                 }
             }
@@ -2823,7 +2858,16 @@ final class RingSession: NSObject {
         }
 
         let minutes = max(Int(candidate.duration / 60), 1)
-        let time = candidate.start.formatted(date: .omitted, time: .shortened)
+        // "about 1093 minutes" for a multi-hour bout is unreadable; switch to h/min at 90 min.
+        let durationText = minutes >= 90
+            ? "\(minutes / 60)h \(minutes % 60)m"
+            : "\(minutes) minutes"
+        // Time-only copy made a Saturday bout read as "today" (its pruned start was exactly
+        // now − 48 h, so it always looked one minute old). Include the date when it isn't today,
+        // matching the Workouts inbox subtitle.
+        let time = Calendar.current.isDateInToday(candidate.start)
+            ? candidate.start.formatted(date: .omitted, time: .shortened)
+            : candidate.start.formatted(date: .abbreviated, time: .shortened)
         let kind: String
         switch candidate.suggestedKind {
         case .walking: kind = "walk"
@@ -2832,7 +2876,7 @@ final class RingSession: NSObject {
         }
         let content = UNMutableNotificationContent()
         content.title = "Possible \(kind) detected"
-        content.body = "Your ring detected about \(minutes) minutes starting at \(time). Open Workouts to review it."
+        content.body = "Your ring detected about \(durationText) starting at \(time). Open Workouts to review it."
         content.sound = .default
         let cursor = candidate.samples.first?.cursor ?? 0
         let identifier = "workout.detected.\(peripheral.identifier.uuidString).\(cursor)"
@@ -2848,14 +2892,15 @@ final class RingSession: NSObject {
 
     /// Permanently remove a reviewed candidate from the two-day inbox. Saving and dismissing share
     /// this path: both mean the user has made a decision, and neither should reappear after a page
-    /// retransmission or reconnect.
+    /// retransmission, a reconnect, or a retention prune that moves the bout's head cursor —
+    /// hence span-overlap, not first-cursor equality.
     func resolveAutomaticWorkoutCandidate(_ candidate: AutomaticWorkoutDetector.Candidate) {
-        guard let startCursor = candidate.samples.first?.cursor else { return }
-        resolvedAutomaticWorkoutCursors.insert(startCursor)
-        automaticWorkoutCandidates.removeAll { $0.samples.first?.cursor == startCursor }
-        if let data = try? JSONEncoder().encode(resolvedAutomaticWorkoutCursors) {
-            UserDefaults.standard.set(data, forKey: resolvedAutomaticWorkoutCursorsKey)
-        }
+        guard !candidate.samples.isEmpty else { return }
+        let span = candidate.cursorSpan
+        resolvedAutomaticWorkoutSpans.append(span)
+        automaticWorkoutCandidates.removeAll { $0.cursorSpan.overlaps(span) }
+        persistAutomaticWorkoutSpans(resolvedAutomaticWorkoutSpans,
+                                     key: resolvedAutomaticWorkoutSpansKey)
     }
 
     /// Per-mode user-measure budget (seconds): HR needs longer stillness to converge than SpO₂.
