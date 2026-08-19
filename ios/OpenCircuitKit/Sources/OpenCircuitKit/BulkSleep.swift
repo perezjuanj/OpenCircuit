@@ -1014,6 +1014,12 @@ public enum BulkSleep {
         // stitch above exists for a night torn apart by a MISSING drain, and a gap full of observed
         // non-sleep epochs is not that — it is measured awake time. Default 0 disables the whole
         // check and this loop is then byte-identical to the pre-guard code (pinned by test).
+        // ⚠️ A declined bridge `continue`s rather than breaking the chain, so a STILL EARLIER block
+        // sitting behind an unobserved hole could in principle leapfrog it and pull the declined
+        // block's records back into the slice. UNTESTED: no night in the corpus has more than two
+        // night blocks (`SleepAbsorbProbeTests` prints `nightBlocks` per night, max observed 2), so
+        // the case is unrepresented. `break` is the arguably cleaner semantics; it is not adopted
+        // here because nothing available can measure the difference.
         var clusterStart = anchor.start
         let times = observedGapCoverageCut > 0 ? records.map { $0.date(epoch: epoch) } : []
         for p in nights.sorted(by: { $0.start > $1.start }) where p.end <= anchor.end {
