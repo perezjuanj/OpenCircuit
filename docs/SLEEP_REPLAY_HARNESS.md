@@ -6,15 +6,26 @@ shipped app runs**, printing the detected window, the stage minutes, and the sig
 whatever reference the night carries.
 
 - Lives in the Kit **test target** → `swift test`, CLI-only, no Xcode project, no HealthKit, no SwiftData.
-- Reads **nothing** from the repo and writes **nothing** to it. Corpora live outside the tree because
-  they are real tester health data (`CLAUDE.md`: never commit a capture).
-- With no environment variable set, every entry point **skips with a printed reason**, so `swift test`
-  stays green on a machine that holds no health data.
+- Reads **nothing** from the repo and writes **nothing** to it — except `CorpusGateLoudnessTests`,
+  which audits this target's own sources. Corpora live outside the tree because they are real tester
+  health data (`CLAUDE.md`: never commit a capture).
+- With no environment variable set, every entry point **skips LOUDLY**: `SleepReplay.requireCorpus`
+  throws `XCTSkip`, so the run is reported as `skipped`, never as `passed`. `swift test` still stays
+  green on a machine that holds no health data.
+
+> ⚠️ **A run with the variable unset proves nothing.** Until 2026-08-19 these entry points opened with
+> `guard let dir = … else { print("unset — skipping"); return }`. XCTest scores that early return as a
+> **pass**, so the fidelity *proof* printed
+> `Test Case '…SleepReplayFidelityTests…' passed (0.001 seconds) / Executed 1 test, with 0 failures`
+> having asserted **nothing** — on every machine without a corpus. All four entry points did this, not
+> just the fidelity one. Read the run summary for `1 test skipped`; if you see `passed`, the corpus
+> was actually opened.
 
 | File | What |
 |---|---|
-| `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/SleepReplay.swift` | loader, the pipeline transcription, the report formatter. **Read its header block first** — it is the production-parity contract. |
+| `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/SleepReplay.swift` | loader, the pipeline transcription, the report formatter, and `requireCorpus` — the one legal way to open a corpus. **Read its header block first** — it is the production-parity contract. |
 | `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/SleepReplayTests.swift` | the three command-line entry points |
+| `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/CorpusGateLoudnessTests.swift` | the gate on the gate: asserts an unset variable skips rather than passes, and source-audits this test target so no new entry point can reintroduce the silent-pass pattern. Needs no corpus. |
 
 ---
 

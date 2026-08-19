@@ -13,8 +13,11 @@
 //   cd ios/OpenCircuitKit && \
 //     OC_SLEEP_FIDELITY_CORPUS=<fidelity-dir> swift test --filter SleepReplayInputSensitivityTests
 //
-// With neither variable set every test SKIPS with a printed reason, so `swift test` stays green on
-// a machine that holds no tester health data. Nothing here reads or writes the repo.
+// With neither variable set every test SKIPS **LOUDLY** — `SleepReplay.requireCorpus` throws
+// `XCTSkip`, so XCTest reports "skipped", never "passed". That distinction is the whole point: these
+// entry points used to `return` early, which XCTest scores as a PASS, so the fidelity *proof* printed
+// a green tick having asserted nothing on every machine without a corpus. `swift test` still stays
+// green on a machine that holds no tester health data. Nothing here reads or writes the repo.
 
 import XCTest
 @testable import OpenCircuitKit
@@ -24,10 +27,8 @@ import XCTest
 final class SleepReplayMeasureTests: XCTestCase {
 
     func testMeasureCorpus() throws {
-        guard let dir = SleepReplay.dir("OC_SLEEP_CORPUS") else {
-            print("[replay] OC_SLEEP_CORPUS unset — skipping. Point it at a corpus directory.")
-            return
-        }
+        let dir = try SleepReplay.requireCorpus(
+            "OC_SLEEP_CORPUS", purpose: "the corpus measurement table (SleepReplayMeasureTests)")
         let nights = try SleepReplay.loadManifest(at: dir)
         var results: [ReplayResult] = []
         var failures: [String] = []
@@ -87,10 +88,12 @@ final class SleepReplayFidelityTests: XCTestCase {
     /// The stored window is compared at the manifest row's own precision: a diagnostics `.txt`
     /// prints HH:mm, so a 60 s row can only ever be asserted to the minute.
     func testReproducesStoredWindowAndMinutes() throws {
-        guard let dir = SleepReplay.dir("OC_SLEEP_FIDELITY_CORPUS") else {
-            print("[replay] OC_SLEEP_FIDELITY_CORPUS unset — skipping the fidelity proof.")
-            return
-        }
+        let dir = try SleepReplay.requireCorpus(
+            "OC_SLEEP_FIDELITY_CORPUS",
+            purpose: "the production-parity FIDELITY PROOF (SleepReplayFidelityTests)",
+            consequence: "This is the single check that says the harness reproduces what the app "
+                       + "actually stored; unrun, every measurement taken with the harness is "
+                       + "unbacked.")
         let nights = try SleepReplay.loadManifest(at: dir)
         var asserted = 0
         print("\n=== SLEEP REPLAY FIDELITY — \(dir.path)\n")
@@ -193,10 +196,9 @@ final class SleepReplayFidelityTests: XCTestCase {
 final class SleepReplayInputSensitivityTests: XCTestCase {
 
     func testTemperatureAndBaselineSensitivity() throws {
-        guard let dir = SleepReplay.dir("OC_SLEEP_FIDELITY_CORPUS") else {
-            print("[replay] OC_SLEEP_FIDELITY_CORPUS unset — skipping the sensitivity sweep.")
-            return
-        }
+        let dir = try SleepReplay.requireCorpus(
+            "OC_SLEEP_FIDELITY_CORPUS",
+            purpose: "the input-sensitivity sweep (SleepReplayInputSensitivityTests)")
         let nights = try SleepReplay.loadManifest(at: dir)
         print("\n=== INPUT SENSITIVITY — the two inputs a .b64 file cannot carry\n")
 

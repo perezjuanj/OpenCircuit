@@ -27,10 +27,11 @@ import XCTest
 final class SleepBaselineTests: XCTestCase {
 
     func testEmitBaselineTSV() throws {
-        guard let dir = SleepReplay.dir("OC_SLEEP_BASELINE_CORPUS") else {
-            print("[baseline] OC_SLEEP_BASELINE_CORPUS unset — skipping. Point it at a corpus directory.")
-            return
-        }
+        let dir = try SleepReplay.requireCorpus(
+            "OC_SLEEP_BASELINE_CORPUS",
+            purpose: "the scoreboard emitter (SleepBaselineTests)",
+            consequence: "No baseline.tsv was written, so any sha256 you were about to quote as a "
+                       + "byte-identity proof would be from a stale file.")
         let outPath = ProcessInfo.processInfo.environment["OC_SLEEP_BASELINE_OUT"]
             ?? dir.appendingPathComponent("baseline.tsv").path
 
