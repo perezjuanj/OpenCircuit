@@ -959,7 +959,8 @@ public enum BulkSleep {
     public static func latestNightRecords(from records: [BulkRecord],
                                           temperatures: [TemperatureSample] = [],
                                           epoch: Int = Command.syncEpoch,
-                                          morningContinuationGap: TimeInterval = morningContinuationMaxGap) -> [BulkRecord] {
+                                          morningContinuationGap: TimeInterval = morningContinuationMaxGap,
+                                          observedGapCoverageCut: Double = observedGapAbsorbCoverageCut) -> [BulkRecord] {
         // Motion detection needs a time-ordered timeline; sort defensively so the helper is correct
         // for any caller, not only the pre-sorted EpochArchive union.
         let records = records.sorted { $0.counter < $1.counter }
@@ -1007,9 +1008,22 @@ public enum BulkSleep {
         // code kept only `anchor`, discarding every earlier fragment (a single 35-min data gap already
         // threw away ~5 h of a real 10 h night). The whole clustered span (gaps included) is returned;
         // `SleepStaging`/`sleepSegments` then stitch the fragments inside it.
+        //
+        // OBSERVED-GAP GUARD (`observedGapCoverageCut`, DEFAULT OFF — see the constant's doc). When
+        // enabled, a bridge is DECLINED if the gap it spans is densely covered by real records: the
+        // stitch above exists for a night torn apart by a MISSING drain, and a gap full of observed
+        // non-sleep epochs is not that — it is measured awake time. Default 0 disables the whole
+        // check and this loop is then byte-identical to the pre-guard code (pinned by test).
         var clusterStart = anchor.start
+        let times = observedGapCoverageCut > 0 ? records.map { $0.date(epoch: epoch) } : []
         for p in nights.sorted(by: { $0.start > $1.start }) where p.end <= anchor.end {
-            if clusterStart.timeIntervalSince(p.end) <= maxIntraNightGap {
+            let gap = clusterStart.timeIntervalSince(p.end)
+            if gap <= maxIntraNightGap {
+                if observedGapCoverageCut > 0, gap > onsetContiguityGap {
+                    let observed = times.filter { $0 > p.end && $0 < clusterStart }.count
+                    let expected = gap / Double(BulkRecord.epochSeconds)
+                    if expected > 0, Double(observed) / expected >= observedGapCoverageCut { continue }
+                }
                 clusterStart = min(clusterStart, p.start)
             }
         }
@@ -1068,6 +1082,42 @@ public enum BulkSleep {
     /// Passing `morningContinuationGap: 0` (or any non-positive value) disables the absorb and is
     /// byte-identical to the pre-fix scoping (kill switch, pinned by test).
     public static let morningContinuationMaxGap: TimeInterval = 30 * 60
+
+    /// OBSERVED-GAP GUARD on the BACKWARD cluster chain in `latestNightRecords` — **DEFAULT 0 =
+    /// DISABLED, and 0 is byte-identical to the pre-guard code** (`ObservedGapAbsorbTests`).
+    ///
+    /// WHAT IT WOULD DO. The backward chain absorbs an earlier sleep block into the night whenever
+    /// the gap between them is ≤ `maxIntraNightGap` (6 h). It exists for a night torn across several
+    /// drains, where the fragments are separated by an **unobserved hole** — records that were never
+    /// recorded, or were lost (`:1005-1009`, and #193/`e216f7c` for the hole-fence side of it). When
+    /// this cut is > 0, a bridge is declined if the bridged gap is **densely covered by real
+    /// records**, i.e. `observedRecords / (gap / 150 s) >= cut`: those epochs exist, the detector
+    /// looked at them and did not call them sleep, so the gap is measured awake time, not a hole.
+    ///
+    /// 🟢 MEASURED, and the measurement is the reason this ships at 0. Over the 27-record-carrying
+    /// nights of the 2026-08-19 corpus the backward chain considers 25 bridges and only **4** move
+    /// `clusterStart`. Two of the four span a ~30 s detector split (0 records, coverage 0.000) and
+    /// are below `onsetContiguityGap`, so no cut touches them. The other two are BOTH dense:
+    ///   * R3 2026-08-19 — 43.0 min gap, 17 records / 17.2 expected, coverage **0.988**. This is the
+    ///     still-but-awake 20:24→21:35 evening block being welded onto a night that really began at
+    ///     22:18; suppressing it is the point of the guard.
+    ///   * R3 2026-08-12 — 39.2 min gap, 14 records / 15.7 expected, coverage **0.894**. Same shape,
+    ///     NO user label, so the corpus cannot adjudicate it. 🟡 The ring's own SpO2/HRV duty cycle
+    ///     can, weakly, and it agrees with the guard: the dropped 22:51→00:38 block sits at duty
+    ///     0.310 with HR median 66, hourly 0.208 / 0.208 / 0.292 through 21h–23h, while the block the
+    ///     guard keeps runs at exactly 0.500 with HR median 54 from 01h — the awake→asleep step this
+    ///     project already documents at 🟡 (`spo2-duty-cycle-marks-onset`). Corroboration, not proof.
+    /// ⚠️ NO corpus night stitches across an EMPTY hole, so the case the chain exists for is
+    /// UNREPRESENTED here and this guard's safety for it is argued, not measured. And 0.894 vs 0.988
+    /// is ~1.5 records — any cut that separates those two nights is a hand-tune, not a discriminator.
+    /// ⚠️ THE KNOWN FALSE POSITIVE, asserted in `testEnabledCutAlsoDropsARealMidNightBout`: a wearer
+    /// who genuinely sleeps, gets up and moves for 30–60 min with the ring recording, then sleeps
+    /// again, produces the SAME densely-observed gap. The guard drops their first bout. Nothing in
+    /// this corpus separates that case from Juan's, which is the whole reason the default is 0.
+    ///
+    /// Gaps at or below `onsetContiguityGap` (450 s) are never judged: at that scale a gap is
+    /// detector granularity, not a hole and not an awakening, and both corpus cases prove it.
+    public static let observedGapAbsorbCoverageCut: Double = 0
 
     /// Light/Deep/REM/Awake staging of the detected sleep block. Thin wrapper over
     /// `SleepStaging.classify` (kept for source compatibility with existing callers).

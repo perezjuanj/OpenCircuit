@@ -220,3 +220,44 @@ Two further cross-checks, both measured:
 5. **Builds ≤ 43 are not master.** `a29400f` (build 44) changed `BulkSleep.latestNightRecords`; it can
    only move the cluster **end** later. Everything from `7f4e664` on is byte-identical to master
    across `SleepStaging.swift`, `SleepDetection.swift`, `BulkSleep.swift`, `SleepWindow.swift`.
+
+---
+
+## 7. A/B'ing a candidate: `observedGapAbsorbCoverageCut` (candidate 1)
+
+The harness can score a staging candidate against master **in one process, on the same bytes, with
+nothing else different**. The first knob wired this way is the observed-gap guard on the backward
+cluster chain (`BulkSleep.observedGapAbsorbCoverageCut`, default `0` = master).
+
+```sh
+cd ios/OpenCircuitKit
+# BEFORE — omit the variable; the TSV is byte-identical to the master baseline
+OC_SLEEP_BASELINE_CORPUS=<corpus> OC_SLEEP_BASELINE_OUT=/tmp/before.tsv \
+  swift test --filter SleepBaselineTests
+# AFTER — any cut in (0, 1]
+OC_SLEEP_BASELINE_CORPUS=<corpus> OC_SLEEP_ABSORB_CUT=0.5 OC_SLEEP_BASELINE_OUT=/tmp/after.tsv \
+  swift test --filter SleepBaselineTests
+# and, before changing anything, see WHAT the chain actually bridges on every night:
+OC_SLEEP_CORPUS=<corpus> swift test --filter SleepAbsorbProbeTests
+```
+
+**Measured result on the 2026-08-19 corpus (73 rows, 27 replayable, 21 staged).** Every cut in
+`[0.1, 0.9]` changes exactly the same nights; `1.0` changes nothing.
+
+| cut | nights changed | median \|in-bed edge err\| on labelled nights | mean |
+|---|---|---|---|
+| default `0` | 0 — TSV sha256 identical to the master baseline | 89.5 | 96.2 |
+| 0.1 / 0.5 | 2 (`R3_2026-08-19`, `R3_2026-08-12`) | 35.0 | 84.8 |
+| 0.9 / 0.95 | 1 (`R3_2026-08-19` only) | 35.0 | 84.8 |
+| 1.0 | 0 | 89.5 | 96.2 |
+
+- `R3_2026-08-19` (labelled): in-bed start `20:24:34 → 22:18:36`, error vs the wearer's own corrected
+  22:24 goes **−119 → −5 min**. In-bed end unchanged (+10). Asleep 713 → 648 (his true ~395 is a
+  separate, unfixed problem — the signal ceiling, not this scoping bug). Efficiency 0.928 → 0.990.
+- `R3_2026-08-12` (**no label**): in-bed start `22:51:56 → 01:17:50`, +145 min. Unadjudicable from
+  the corpus; see the constant's doc for the 🟡 duty-cycle corroboration.
+- The other 19 staged nights, and all 5 fidelity nights except Juan's, are **bit-for-bit unchanged**.
+
+> The median moves 89.5 → 35.0 because **one** edge moves from 119 to 5 in a 10-value list — at n=10
+> the median is a step function. The honest effect size is the **mean**, −11.4 min, i.e. 114 min of
+> error removed across 10 edges. Quote both.

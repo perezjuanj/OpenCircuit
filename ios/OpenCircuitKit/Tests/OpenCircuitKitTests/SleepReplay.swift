@@ -391,10 +391,14 @@ enum SleepReplay {
     }
 
     /// Stage one night exactly as `RingSession` does. See the parity block at the top of this file.
+    /// `observedGapCoverageCut` is the candidate-1 kill switch (`BulkSleep.observedGapAbsorbCoverageCut`,
+    /// default 0 = master). Threaded here so a candidate can be A/B'd against master in one process,
+    /// on the same bytes, with nothing else different.
     static func stage(records: [BulkRecord],
                       temperatures: [TemperatureSample] = [],
                       deepHRBaseline: Double? = nil,
-                      tuning: SleepStaging.Tuning = .default)
+                      tuning: SleepStaging.Tuning = .default,
+                      observedGapCoverageCut: Double = BulkSleep.observedGapAbsorbCoverageCut)
         -> (segments: [SleepSegment], union: [BulkRecord], nightRecords: [BulkRecord]) {
 
         // RingSession :3619 — epochArchiveStore.merge() IS EpochArchive.merge(existing:incoming:).
@@ -403,7 +407,8 @@ enum SleepReplay {
         let union = EpochArchive.merge(existing: [], incoming: records)
 
         // RingSession :3620
-        let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temperatures)
+        let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temperatures,
+                                                        observedGapCoverageCut: observedGapCoverageCut)
 
         // RingSession :1580-1582
         let baseline = deepHRBaseline.map { SleepStaging.PersonalBaseline(deepSleepHR: $0) }
@@ -435,7 +440,9 @@ enum SleepReplay {
                         in dir: URL,
                         temperaturesOverride: [TemperatureSample]? = nil,
                         deepHRBaselineOverride: Double?? = nil,
-                        tuning: SleepStaging.Tuning = .default) throws -> ReplayResult {
+                        tuning: SleepStaging.Tuning = .default,
+                        observedGapCoverageCut: Double = BulkSleep.observedGapAbsorbCoverageCut)
+        throws -> ReplayResult {
         let records = try loadRecords(night, in: dir)
         let temps = temperaturesOverride
             ?? night.temperatures.map { TemperatureSample(time: $0.t, celsius: $0.c) }
@@ -444,7 +451,8 @@ enum SleepReplay {
 
         return try withTimeZone(night.timeZone, at: anchor) {
             let staged = stage(records: records, temperatures: temps,
-                               deepHRBaseline: baseline, tuning: tuning)
+                               deepHRBaseline: baseline, tuning: tuning,
+                               observedGapCoverageCut: observedGapCoverageCut)
             let segs = staged.segments
             let summary = SleepStaging.summary(segs)              // RingSession :1876
             let sleep = SleepStaging.sleepWindow(segs)            // RingSession :1892

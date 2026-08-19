@@ -33,6 +33,11 @@ final class SleepBaselineTests: XCTestCase {
         }
         let outPath = ProcessInfo.processInfo.environment["OC_SLEEP_BASELINE_OUT"]
             ?? dir.appendingPathComponent("baseline.tsv").path
+        // CANDIDATE A/B. `OC_SLEEP_ABSORB_CUT` sets `BulkSleep.observedGapAbsorbCoverageCut` for this
+        // run so the SAME scoreboard scores the candidate. UNSET = the shipped default = master, and
+        // the emitted TSV is then byte-identical (proven: sha256 of the master-generated baseline).
+        let absorbCut = (ProcessInfo.processInfo.environment["OC_SLEEP_ABSORB_CUT"]).flatMap(Double.init)
+            ?? BulkSleep.observedGapAbsorbCoverageCut
 
         // --- raw manifest, for the census columns SleepReplay's model does not carry
         let manifestURL = dir.appendingPathComponent("manifest.json")
@@ -112,7 +117,7 @@ final class SleepBaselineTests: XCTestCase {
             if n.recordsFile.isEmpty {
                 status = "summaryOnly"; summaryOnly += 1
             } else {
-                do { r = try SleepReplay.measure(n, in: dir); replayed += 1 }
+                do { r = try SleepReplay.measure(n, in: dir, observedGapCoverageCut: absorbCut); replayed += 1 }
                 catch { status = "loadFailed"; failed += 1; failures.append("\(n.id): \(error)") }
             }
 
@@ -172,7 +177,9 @@ final class SleepBaselineTests: XCTestCase {
         }
 
         try (lines.joined(separator: "\n") + "\n").write(toFile: outPath, atomically: true, encoding: .utf8)
-        print("\n=== SLEEP BASELINE — master staging, corpus \(dir.path)")
+        print("\n=== SLEEP BASELINE — observedGapAbsorbCoverageCut = \(absorbCut)"
+              + (absorbCut == BulkSleep.observedGapAbsorbCoverageCut ? " (shipped default)" : " (CANDIDATE)")
+              + ", corpus \(dir.path)")
         print("=== \(nights.count) manifest rows: \(replayed) replayed, \(summaryOnly) summary-only, "
               + "\(failed) load failures")
         print("=== wrote \(lines.count - 1) rows x \(columns.count) columns -> \(outPath)")
