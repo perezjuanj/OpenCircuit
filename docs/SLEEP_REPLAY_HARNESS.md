@@ -45,13 +45,35 @@ OC_SLEEP_FIDELITY_CORPUS=/path/to/fidelity-corpus \
 # (c) INPUT SENSITIVITY — how much do the inputs a .b64 cannot carry actually matter?
 OC_SLEEP_FIDELITY_CORPUS=/path/to/fidelity-corpus \
   swift test --filter SleepReplayInputSensitivityTests 2>&1 | sed -n '/INPUT SENSITIVITY/,$p'
-```
 
-```sh
-# (d) BASELINE SCOREBOARD — every corpus night, one TSV, and the pinned golden hash
+# (d) COVERAGE — score `SleepConfidence.assess` (acquisition flags) on every staged night
+OC_SLEEP_COVERAGE_CORPUS=/path/to/corpus \
+  swift test --filter SleepCoverageMeasureTests 2>&1 | sed -n '/SLEEP COVERAGE/,$p'
+
+# (e) BASELINE SCOREBOARD — every corpus night, one TSV, and the pinned golden hash
 OC_SLEEP_BASELINE_CORPUS=/path/to/corpus \
   swift test --filter SleepBaselineTests 2>&1 | sed -n '/SLEEP BASELINE/,$p'
 ```
+
+Entry point (d) answers a different question from the others: not "where did staging put the edges"
+but "**did the recording cover the night at all**". It replays staging exactly as (a) does, then
+builds a `SleepConfidence.Coverage` for each night and prints the before/after scoreboard — which
+nights flag, with which reason, the labelled TP/FP cross-tab, the shipped card's own hint counts
+re-run rather than assumed, and a `materialGapSeconds` sweep. It is the only entry point that
+asserts on a *production* type's behaviour rather than on staging, and it is `XCTSkip`-gated, so an
+unset variable reports `skipped`.
+
+> ⚠️ **`UNDET` and `XFILE` in its tables are properties of the corpus, not the device.** A corpus
+> night is a noon-to-noon slice of ONE capture artifact; the device archive is continuous. Two rules
+> follow, and they cut in opposite directions:
+> - **`UNDET`** — past a 12 h horizon the harness withholds the "next record" and the classifier
+>   answers `.unknown`. Firing rates printed here are therefore **lower bounds**.
+> - **`XFILE`** — a neighbouring record that lives in a *different* `.b64` is discarded, not scored.
+>   Asking the ring-wide union "did the stream resume?" answers yes whenever the owner happened to
+>   export a second file later, which measures the export schedule and not the ring. That produced
+>   one measured false positive (`R3_2026-08-04`, back edge, "resumed" 243.2 min later — the first
+>   record of `R3_2026-08-05.b64`). Evidence must be bracketed inside one artifact; the withheld
+>   cases are printed so you can see what was thrown away.
 
 ### The pinned golden
 
