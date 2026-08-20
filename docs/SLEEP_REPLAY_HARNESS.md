@@ -25,7 +25,7 @@ whatever reference the night carries.
 |---|---|
 | `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/SleepReplay.swift` | loader, the pipeline transcription, the report formatter, and `requireCorpus` — the one legal way to open a corpus. **Read its header block first** — it is the production-parity contract. |
 | `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/SleepReplayTests.swift` | the three command-line entry points |
-| `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/CorpusGateLoudnessTests.swift` | the gate on the gate: asserts an unset variable skips rather than passes, and source-audits this test target so no new entry point can reintroduce the silent-pass pattern. Needs no corpus. |
+| `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/CorpusGateLoudnessTests.swift` | the gate on the gate: asserts an unset variable skips rather than passes, and source-audits this test target. A **tripwire, not a proof** — read its header for what it does and does not catch. Needs no corpus. |
 
 ---
 
@@ -46,6 +46,30 @@ OC_SLEEP_FIDELITY_CORPUS=/path/to/fidelity-corpus \
 OC_SLEEP_FIDELITY_CORPUS=/path/to/fidelity-corpus \
   swift test --filter SleepReplayInputSensitivityTests 2>&1 | sed -n '/INPUT SENSITIVITY/,$p'
 ```
+
+```sh
+# (d) BASELINE SCOREBOARD — every corpus night, one TSV, and the pinned golden hash
+OC_SLEEP_BASELINE_CORPUS=/path/to/corpus \
+  swift test --filter SleepBaselineTests 2>&1 | sed -n '/SLEEP BASELINE/,$p'
+```
+
+### The pinned golden
+
+Every honesty/staging change in this area ships with the claim *"no staged sleep number moved."* The
+number that backs it is pinned in tracked source — `SleepBaselineGolden` in
+`SleepBaselineTests.swift` — and repeated here so `git grep <hash>` answers *which corpus produced
+this?* rather than nothing at all:
+
+| what | sha256 |
+|---|---|
+| corpus `manifest.json` (identity of the corpus) | `63a07be8f28714b2c31a410c950dfb9c6f69b899097dccbc5f92f18b41061c0e` |
+| `baseline.tsv` emitted from it on master `f042639` (74 lines: header + 73 rows) | `ef5dc087a16f0461d14d656d2e3461cc479cceb85ef5d30f5e4dd741eaa13e8f` |
+
+The emitter asserts the baseline hash **only** when the manifest it just read matches the first row —
+against any other corpus it prints both hashes and asserts nothing, because there is nothing to
+compare against. A mismatch on the pinned corpus is a hard failure: re-pin deliberately and say what
+moved, never quote "hash unchanged" past it. `CorpusGateLoudnessTests` keeps this table and the Swift
+constants in agreement.
 
 Table columns: `inBedStart · inBedEnd · onset · wake · inBed/aslp/awk/deep/rem/light` (whole minutes
 from `SleepStaging.Summary.minutes`) · `eff` · `dStart`/`dEnd` (detected in-bed edge **minus** the
