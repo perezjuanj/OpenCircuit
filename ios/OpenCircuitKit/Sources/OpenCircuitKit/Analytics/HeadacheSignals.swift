@@ -343,8 +343,18 @@ public enum HeadacheSignals {
                                          noiseFloor: feature.noiseFloor)), nil)
         }
 
+        // ⚠️ THE QUALITY MULTIPLIER IS COMPUTED BEFORE THE EFFICIENCY FEATURE, NOT AFTER.
+        //
+        // It used to be declared below and applied only to fragmentation and duration —
+        // `sleepEfficiencyDrop` was left at full weight even though, at 0.18, it is the LARGEST of
+        // the three sleep weights and the one an unmeasured hole corrupts most: efficiency is a
+        // ratio, so a four-hour gap moves it far harder than it moves a minute count. On
+        // `R2_2026-08-18` the shipped efficiency was 0.918 against an honest 0.822 over covered
+        // ground, and that 10-point swing fed this feature at full strength.
+        let sleepQuality = input.sleepLikelyTruncated ? tuning.truncatedSleepQuality : 1.0
+
         let (effZ, effReason) = seriesZ(input.sleepEfficiencyPct, .sleepEfficiencyDrop)
-        add(.sleepEfficiencyDrop, z: effZ, reason: effReason)
+        add(.sleepEfficiencyDrop, z: effZ, reason: effReason, quality: sleepQuality)
 
         let (hrvZ, hrvReason) = seriesZ(input.hrvSDNN, .hrvDeviation)
         add(.hrvDeviation, z: hrvZ, reason: hrvReason)
@@ -352,9 +362,8 @@ public enum HeadacheSignals {
         let (rhrZ, rhrReason) = seriesZ(input.restingHR, .restingHRDeviation)
         add(.restingHRDeviation, z: rhrZ, reason: rhrReason)
 
-        // Sleep duration + fragmentation carry the truncation quality multiplier: a night cut short
-        // by the ring's buffer looks identical to a genuinely short, broken one.
-        let sleepQuality = input.sleepLikelyTruncated ? tuning.truncatedSleepQuality : 1.0
+        // Sleep duration + fragmentation carry the same multiplier: a night cut short by the ring's
+        // buffer looks identical to a genuinely short, broken one.
         let (fragZ, fragReason) = seriesZ(input.sleepFragmentationMin, .sleepFragmentation)
         add(.sleepFragmentation, z: fragZ, reason: fragReason, quality: sleepQuality)
 

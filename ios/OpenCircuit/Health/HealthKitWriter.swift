@@ -490,12 +490,50 @@ final class HealthKitWriter {
                 SleepSegment(start: nap.effectiveStart, end: nap.effectiveEnd, stage: .asleepCore),
             ]
             do {
-                try await write(sleep: segs)
+                // WRITE FIRST, THEN CLEAN — the same ordering `reconcileEditedNightSleep` uses, so a
+                // HealthKit failure can never leave Health emptier than before. `editNap` re-arms
+                // `healthWritten` when a shrink or a move leaves a previously-mirrored span
+                // uncovered; without this, that stale sleep stayed in Apple Health permanently
+                // because `pendingNaps()` never offered the row again.
+                let uuids = try await writeReturningSleepUUIDs(segs)
+                if let stale = store.staleNapHealthSpan(start: nap.start) {
+                    await deleteStaleNapSleep(stale, keeping: uuids,
+                                              current: nap.effectiveStart ..< nap.effectiveEnd)
+                }
                 try store.markNapWritten(start: nap.start)
                 written += 1
             } catch { pendingFlushFailures.insert(.sleep); break }   // surface + stop; naps retry next flush
         }
         return written
+    }
+
+    /// Delete this app's sleep samples across a nap's previously-mirrored span, EXCLUDING the
+    /// samples just written and anything inside the nap's current window. Own-samples-only, so a
+    /// night's sleep or another app's data is never touched. Best-effort: a failure leaves a
+    /// transient duplicate the next edit cleans up, which is strictly better than deleting
+    /// optimistically and losing the record.
+    private func deleteStaleNapSleep(_ stale: DateInterval, keeping newUUIDs: [String],
+                                     current: Range<Date>) async {
+        // Own-samples-only comes from `deleteObjects` itself — HealthKit refuses to delete another
+        // source's data — exactly as `deleteNightSleep` (:1938) relies on. Deliberately NOT adding an
+        // `HKSource.default()` predicate: it is redundant there and an unproven variation here, and a
+        // source predicate that matched nothing would make this delete silently do nothing.
+        let type = HKCategoryType(.sleepAnalysis)
+        var subs: [NSPredicate] = [
+            HKQuery.predicateForSamples(withStart: stale.start, end: stale.end, options: []),
+        ]
+        let keep = Set(newUUIDs.compactMap { UUID(uuidString: $0) })
+        if !keep.isEmpty {
+            subs.append(NSCompoundPredicate(
+                notPredicateWithSubpredicate: HKQuery.predicateForObjects(with: keep)))
+        }
+        if current.upperBound > current.lowerBound {
+            subs.append(NSCompoundPredicate(notPredicateWithSubpredicate:
+                HKQuery.predicateForSamples(withStart: current.lowerBound, end: current.upperBound,
+                                            options: [.strictStartDate, .strictEndDate])))
+        }
+        _ = try? await store.deleteObjects(of: type,
+                                           predicate: NSCompoundPredicate(andPredicateWithSubpredicates: subs))
     }
 
     /// Write pending user-logged period flow entries to Apple Health, returning the count
@@ -1581,10 +1619,27 @@ final class HealthKitWriter {
         return pendingMin
     }
 
+    // ⚠️ THE ONLY TWO FUNCTIONS IN THIS APP THAT CREATE A SLEEP `HKCategorySample`.
+    //
+    // Verified by grep 2026-08-20: every other `HKCategoryType(.sleepAnalysis)` in the app is a
+    // READ, a DELETE predicate, or the authorization set. Five call sites reach Health with sleep —
+    // `flushToHealth`'s edit backfill (:335), `flushNaps` (:493), `reconcileEditedNightSleepLocked`
+    // (:1674), `mirrorSettledNight` (:1836), and the deferred-reconcile drain (:354) — and every one
+    // of them funnels through one of these two. So the coverage filter belongs HERE and nowhere
+    // else: a filter applied at four of five call sites is a false sense of safety, and the audit
+    // found exactly that shape of bug elsewhere in this feature.
+    //
+    // `healthPublishable` keeps the WHOLE `.inBed` layer (a user claim we have no reason to doubt)
+    // and drops any other segment whose ground holds no epoch records. See `SleepProvenance`.
+    // Segments with no provenance information — which is everything the staging path emits — are
+    // `.measured` and pass through untouched, so an unedited night's Health write is unchanged.
+
     /// Write a night as contiguous sleepAnalysis category samples (mapping notes).
     func write(sleep segments: [SleepSegment]) async throws {
         let type = HKCategoryType(.sleepAnalysis)
-        let samples = segments.map { seg in
+        let publishable = segments.healthPublishable
+        Self.logUnmeasuredRetraction(segments, publishable, site: "write(sleep:)")
+        let samples = publishable.map { seg in
             HKCategorySample(type: type, value: Self.sleepValue(seg.stage).rawValue,
                              start: seg.start, end: seg.end)
         }
@@ -1597,13 +1652,30 @@ final class HealthKitWriter {
     @discardableResult
     func writeReturningSleepUUIDs(_ segments: [SleepSegment]) async throws -> [String] {
         let type = HKCategoryType(.sleepAnalysis)
-        let samples = segments.map { seg in
+        let publishable = segments.healthPublishable
+        Self.logUnmeasuredRetraction(segments, publishable, site: "writeReturningSleepUUIDs")
+        let samples = publishable.map { seg in
             HKCategorySample(type: type, value: Self.sleepValue(seg.stage).rawValue,
                              start: seg.start, end: seg.end)
         }
         guard !samples.isEmpty else { return [] }
         try await store.save(samples)
         return samples.map { $0.uuid.uuidString }
+    }
+
+    /// Breadcrumb what the coverage filter removed, so the effect is auditable on a real phone
+    /// instead of inferred. Silent when nothing was removed — which is every unedited night.
+    private static func logUnmeasuredRetraction(_ all: [SleepSegment],
+                                                _ publishable: [SleepSegment],
+                                                site: String) {
+        let droppedAsleepMin = all.unmeasuredAsleepSeconds / 60
+        guard droppedAsleepMin > 0 else { return }
+        let mins = String(format: "%.1f", droppedAsleepMin)
+        let dropped = all.count - publishable.count
+        ringLog.info("""
+            [OC] sleep-health: withheld \(mins, privacy: .public) asserted asleep-min from \
+            \(site, privacy: .public) (\(dropped, privacy: .public) of \(all.count, privacy: .public) segments)
+            """)
     }
 
     /// Reconcile Apple Health so a manually-edited night matches the EDITED window. This is the piece

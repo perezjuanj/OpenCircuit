@@ -441,12 +441,25 @@ final class HeadacheSignalsTests: XCTestCase {
 
     // MARK: Quality multipliers
 
-    /// A ring-buffer-truncated night looks exactly like a genuinely short, broken one, so the two
-    /// features most prone to that false positive are halved — and NOTHING else moves.
+    /// A ring-buffer-truncated night looks exactly like a genuinely short, broken one, so the THREE
+    /// sleep features are halved — and NOTHING else moves.
+    ///
+    /// ⚠️ DELIBERATE CHANGE, 2026-08-20 — `.sleepEfficiencyDrop` was ADDED to `halved`. This
+    /// assertion previously read "`sleepEfficiencyDrop` must be untouched by the truncation flag",
+    /// and it was wrong in the one direction that matters: efficiency is the LARGEST sleep weight
+    /// (0.18 against 0.10 and 0.10) and, being a RATIO, is the feature an unmeasured hole distorts
+    /// MOST — a four-hour gap moves it far harder than it moves a minute count. Measured on
+    /// `R2_2026-08-18`: the shipped efficiency was 0.918 against an honest 0.822 over covered
+    /// ground, and that 10-point swing was fed to this feature at full weight while the two
+    /// smaller, less-affected features were protected.
+    ///
+    /// The rest of the test is UNCHANGED and still load-bearing: every non-sleep feature must stay
+    /// untouched, and the multiplier must move the WEIGHT of the evidence, never the measurement.
     func testTruncatedNightHalvesSleepWeight() throws {
         let normal = try XCTUnwrap(assessment(HeadacheSignals.assess(input())))
         let cut = try XCTUnwrap(assessment(HeadacheSignals.assess(input(truncated: true))))
-        let halved: Set<Feature> = [.sleepDurationDeviation, .sleepFragmentation]
+        let halved: Set<Feature> = [.sleepDurationDeviation, .sleepFragmentation,
+                                    .sleepEfficiencyDrop]
 
         for feature in Feature.allCases {
             let before = try XCTUnwrap(contribution(normal, feature))

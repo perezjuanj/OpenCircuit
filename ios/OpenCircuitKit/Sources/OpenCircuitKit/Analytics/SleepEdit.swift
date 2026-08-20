@@ -311,8 +311,13 @@ public enum SleepEdit {
     /// segments fall past the sleep write-watermark, so Health GAINS the added sleep and nothing is
     /// ever deleted. (A trim shrinks the in-app view only; already-written Health samples are left
     /// untouched — non-destructive by design.)
+    /// - Parameter coverage: which instants the ring actually recorded. **`nil` is the kill switch**
+    ///   — it reproduces the pre-provenance behaviour byte-for-byte, every emitted segment carrying
+    ///   the default `.measured`. Non-nil splits every FILL span against the coverage so invented
+    ///   time is tagged `.asserted` and can be excluded from derived numbers and from Health.
     public static func recompute(baseSegments: [SleepSegment], window: Window,
-                                 fillStage: SleepStage = .asleepCore) -> [SleepSegment] {
+                                 fillStage: SleepStage = .asleepCore,
+                                 coverage: MeasuredCoverage? = nil) -> [SleepSegment] {
         let start = window.inBedStart, end = window.inBedEnd
         guard end > start else { return [] }
 
@@ -320,7 +325,8 @@ public enum SleepEdit {
         let sortedBase = baseSegments.sorted { $0.start < $1.start }
         let clipped: [SleepSegment] = sortedBase.compactMap { seg in
             let s = max(seg.start, start), e = min(seg.end, end)
-            return e > s ? SleepSegment(start: s, end: e, stage: seg.stage) : nil
+            return e > s ? SleepSegment(start: s, end: e, stage: seg.stage,
+                                        provenance: seg.provenance) : nil
         }
 
         // With no recording at all, the user's whole window is synthetic asleep time. With a
@@ -330,7 +336,7 @@ public enum SleepEdit {
         // never to the first/last clipped segment.
         guard let recordedStart = sortedBase.map(\.start).min(),
               let recordedEnd = sortedBase.map(\.end).max() else {
-            return [SleepSegment(start: start, end: end, stage: fillStage)]
+            return fill(start ..< end, stage: fillStage, coverage: coverage)
         }
 
         let hasInBedLayer = sortedBase.contains { $0.stage == .inBed }
@@ -340,16 +346,41 @@ public enum SleepEdit {
             // Match the classifier's two-layer representation: the extension is both in bed and
             // asleep. For synthetic stage-only input, keep it stage-only so Summary's fallback
             // remains valid instead of introducing a partial in-bed layer.
-            if hasInBedLayer { out.append(SleepSegment(start: start, end: leadingEnd, stage: .inBed)) }
-            out.append(SleepSegment(start: start, end: leadingEnd, stage: fillStage))
+            if hasInBedLayer {
+                out.append(contentsOf: fill(start ..< leadingEnd, stage: .inBed, coverage: coverage))
+            }
+            out.append(contentsOf: fill(start ..< leadingEnd, stage: fillStage, coverage: coverage))
         }
         out.append(contentsOf: clipped)
         let trailingStart = max(start, recordedEnd)
         if trailingStart < end {
-            if hasInBedLayer { out.append(SleepSegment(start: trailingStart, end: end, stage: .inBed)) }
-            out.append(SleepSegment(start: trailingStart, end: end, stage: fillStage))
+            if hasInBedLayer {
+                out.append(contentsOf: fill(trailingStart ..< end, stage: .inBed, coverage: coverage))
+            }
+            out.append(contentsOf: fill(trailingStart ..< end, stage: fillStage, coverage: coverage))
         }
         return out
+    }
+
+    /// Emit a USER-ASSERTED span as one or more segments, split at the coverage boundaries.
+    ///
+    /// This is the single choke point through which every invented minute in this file passes —
+    /// `recompute`'s leading fill, trailing fill, empty-base fill, and the bedtime-to-onset `.awake`
+    /// paint. Centralising it is deliberate: the audit found five separate fill sites and a fix
+    /// applied to only some of them is a false sense of safety.
+    ///
+    /// `coverage == nil` returns exactly one `.measured` segment — bit-for-bit what the pre-
+    /// provenance code emitted, which is what makes the kill switch a true no-op.
+    private static func fill(_ range: Range<Date>, stage: SleepStage,
+                             coverage: MeasuredCoverage?) -> [SleepSegment] {
+        guard range.upperBound > range.lowerBound else { return [] }
+        guard let coverage else {
+            return [SleepSegment(start: range.lowerBound, end: range.upperBound, stage: stage)]
+        }
+        return coverage.partition(range).map { piece in
+            SleepSegment(start: piece.range.lowerBound, end: piece.range.upperBound, stage: stage,
+                         provenance: piece.measured ? .assertedOverMeasured : .asserted)
+        }
     }
 
     /// Recompute using independent bedtime, sleep-onset, and wake anchors.
@@ -358,8 +389,30 @@ public enum SleepEdit {
     /// `.awake`; recorded stages inside the original sleep window are preserved; only a user-added
     /// extension of the *sleep* window is synthetic core sleep. Thus moving bedtime earlier no
     /// longer inflates time asleep or produces 100% efficiency.
+    /// - Parameter coverage: which instants the ring actually recorded. **`nil` is the kill switch**
+    ///   and reproduces master byte-for-byte (proved by regenerating the corpus baseline TSV and
+    ///   matching its sha256).
+    ///
+    /// 🟢 WHAT COVERAGE FIXES, MEASURED. On the tester night `R2_2026-08-18` this function emitted
+    /// `{asleepCore, 02:37:02 → 06:43:00}` — 246 minutes — over a raw hole `02:35:02 → 06:38:57`
+    /// holding 2 of ~98 expected epochs. The card read 403 min asleep at 0.918 efficiency on a night
+    /// whose own coverage is 0.377, and the block reached Apple Health 1:1 as `.asleepCore`. With
+    /// coverage supplied, the same call still emits the same 246 minutes — the user asserted them and
+    /// clause 1 says an assertion wins for display — but ~243 of them now carry `.asserted`, which
+    /// keeps them out of every stage minute, out of efficiency, out of the score, and out of Health.
+    ///
+    /// ⚠️ THE SIBLING DEFECT IS DELIBERATELY NOT "FIXED" HERE. `preservedStart` still discards
+    /// recorded stages before the asserted onset, and the `.awake` paint below is still
+    /// unconditional. Vetoing either would make the onset picker a no-op against OVER-detected sleep
+    /// (`SleepEditTests.swift:19-40` is a real tester whose ring called onset 86 min early), and on
+    /// `R2_2026-08-17` it would leave 14 SECONDS of preserved sleep — a card reading 0 min asleep
+    /// across an 8 h 11 m in-bed window, which is a worse number than the bug. The answer is
+    /// provenance plus reversibility: the paint is TAGGED (`.assertedOverMeasured` where the ring
+    /// recorded), and the ring's own hypnogram is persisted separately so the disagreement is
+    /// visible and undoable rather than silently resolved by deletion.
     public static func recompute(baseSegments: [SleepSegment], times: Times,
-                                 fillStage: SleepStage = .asleepCore) -> [SleepSegment] {
+                                 fillStage: SleepStage = .asleepCore,
+                                 coverage: MeasuredCoverage? = nil) -> [SleepSegment] {
         guard times.sleepWake > times.sleepOnset,
               times.sleepOnset >= times.inBedStart else { return [] }
 
@@ -373,31 +426,42 @@ public enum SleepEdit {
             let preservedStart = max(times.sleepOnset, recordedSleep.onset)
             let preservedEnd = min(times.sleepWake, recordedSleep.wake)
 
+            // LEADING fill — the mirror of the trailing one below, and just as capable of inventing
+            // sleep over a front-edge hole.
             if times.sleepOnset < min(times.sleepWake, recordedSleep.onset) {
-                stages.append(SleepSegment(start: times.sleepOnset,
-                                           end: min(times.sleepWake, recordedSleep.onset),
-                                           stage: fillStage))
+                stages.append(contentsOf: fill(times.sleepOnset ..< min(times.sleepWake, recordedSleep.onset),
+                                               stage: fillStage, coverage: coverage))
             }
             if preservedEnd > preservedStart {
+                // The ring's own stages, kept verbatim — including their provenance, which is
+                // `.measured` for anything staging produced.
                 stages.append(contentsOf: stageBase.compactMap { segment in
                     let start = max(segment.start, preservedStart)
                     let end = min(segment.end, preservedEnd)
                     return end > start
-                        ? SleepSegment(start: start, end: end, stage: segment.stage) : nil
+                        ? SleepSegment(start: start, end: end, stage: segment.stage,
+                                       provenance: segment.provenance) : nil
                 })
             }
+            // TRAILING fill — the 246-minute block on R2_2026-08-18.
             if max(times.sleepOnset, recordedSleep.wake) < times.sleepWake {
-                stages.append(SleepSegment(start: max(times.sleepOnset, recordedSleep.wake),
-                                           end: times.sleepWake, stage: fillStage))
+                stages.append(contentsOf: fill(max(times.sleepOnset, recordedSleep.wake) ..< times.sleepWake,
+                                               stage: fillStage, coverage: coverage))
             }
         } else {
-            stages.append(SleepSegment(start: times.sleepOnset, end: times.sleepWake,
-                                       stage: fillStage))
+            // No staged base at all — 100 % of this night's "sleep" is the user's assertion.
+            stages.append(contentsOf: fill(times.sleepOnset ..< times.sleepWake,
+                                           stage: fillStage, coverage: coverage))
         }
 
-        var result = [SleepSegment(start: times.inBedStart, end: times.inBedEnd, stage: .inBed)]
+        // The in-bed envelope is entirely a user claim, and we honour it (clause 1: in-bed is a
+        // statement about where the body was, and we hold no competing measurement). Splitting it by
+        // coverage is what lets a consumer compute efficiency over COVERED ground without re-deriving
+        // anything: covered in-bed is just the non-`.asserted` part of this layer.
+        var result = fill(times.inBedStart ..< times.inBedEnd, stage: .inBed, coverage: coverage)
         if times.inBedStart < times.sleepOnset {
-            result.append(SleepSegment(start: times.inBedStart, end: times.sleepOnset, stage: .awake))
+            result.append(contentsOf: fill(times.inBedStart ..< times.sleepOnset,
+                                           stage: .awake, coverage: coverage))
         }
         result.append(contentsOf: stages)
         return result

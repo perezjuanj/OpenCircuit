@@ -863,12 +863,49 @@ public enum ExportEngine {
                 // empty array for both would have made a night staged before the hypnogram column
                 // existed read identically to a night we staged and found no stages in.
                 if !session.hypnogram.isEmpty {
-                    obj["hypnogram"] = emittableHypnogram(session).map { seg in [
-                        "start": offsetISO8601(seg.start),
-                        "end": offsetISO8601(seg.end),
-                        "stage": seg.stage.rawValue,
-                        "durationSec": seg.duration
-                    ] as [String: Any] }
+                    // `provenance` is emitted ONLY when it is not `.measured`, so a fully-measured
+                    // night's JSON is unchanged from every earlier schema-3 export and no consumer
+                    // has to learn a new key to keep working.
+                    //
+                    // 🟢 WHY IT IS HERE AT ALL: before this key existed, NO EXPORT SURFACE COULD SAY
+                    // WHICH MINUTES WERE MEASURED. Coverage was reported only as a night AGGREGATE,
+                    // so a consumer reading an edited night's timeline could not distinguish a
+                    // 246-minute `asleepCore` block invented over a 2 %-covered hole from a real
+                    // one — they serialised identically. This is the per-segment answer.
+                    obj["hypnogram"] = emittableHypnogram(session).map { seg -> [String: Any] in
+                        var row: [String: Any] = [
+                            "start": offsetISO8601(seg.start),
+                            "end": offsetISO8601(seg.end),
+                            "stage": seg.stage.rawValue,
+                            "durationSec": seg.duration
+                        ]
+                        if seg.provenance != .measured {
+                            row["provenance"] = seg.provenance.rawValue
+                        }
+                        return row
+                    }
+                    // The night-level roll-up of the same fact, so a reader does not have to sum the
+                    // timeline to learn whether the headline is a measurement or a claim.
+                    let breakdown = SleepProvenanceBreakdown(segments: session.hypnogram)
+                    if breakdown.hasAssertedTime {
+                        var summary: [String: Any] = [
+                            "measuredAsleepSec": breakdown.measuredAsleep,
+                            "assertedAsleepSec": breakdown.assertedAsleep,
+                            "measuredAwakeSec": breakdown.measuredAwake,
+                            "assertedAwakeSec": breakdown.assertedAwake,
+                            "coveredInBedSec": breakdown.coveredInBed,
+                            "coverageFraction": breakdown.coverageFraction,
+                            "longestUnmeasuredGapSec": breakdown.longestUnmeasuredGap,
+                            "scorable": breakdown.isScorable
+                        ]
+                        // OMITTED when withheld — never 0, and never a JSON null. 0 is a real
+                        // efficiency, and at `LocalStore.swift:235` it is a live sentinel that
+                        // reconstructs in-bed from the wrong quantities. Absence is the only honest
+                        // encoding of "we do not have enough covered ground to say", and it matches
+                        // the omit-the-key convention `osa` and `coverage` already use here.
+                        if let eff = breakdown.efficiency { summary["measuredEfficiency"] = eff }
+                        obj["provenanceSummary"] = summary
+                    }
                 }
                 // Omitted, not zero-filled: a night with no drained assessment and a night with
                 // a genuinely quiet one must not read the same.
