@@ -207,6 +207,62 @@ final class ExportBuilderTests: XCTestCase {
 
         // The stage minutes of the pruned night are untouched — only the coverage claim is dropped.
         XCTAssertEqual(rows[0][7], "480", "the old night still exports its summary")
+
+        // …and the SAME hazard on the trailing edge, which has no retention horizon of its own.
+        // `earliestSample(after:)` for the pruned night returns the recent night's first HR row —
+        // 28 days later — and an unguarded classifier would export that as a 28-day silence, i.e.
+        // local housekeeping dressed as a hole in the night. It must read `unknown` with no gap.
+        // (bedtimeVerdict, bedtimeGapSeconds, wakeVerdict, wakeGapSeconds, confidenceReasons)
+        XCTAssertEqual(rows[0][27], "unknown",
+                       "retention no longer reaches this night's end — we cannot judge it")
+        XCTAssertEqual(rows[0][28], "", "…so there is no gap to report, and 0 would be a claim")
+        XCTAssertFalse(rows[0][29].contains("noRecording"),
+                       "no ACQUISITION caveat may come out of an unjudgeable night: \(rows[0][29])")
+        // The DURATION verdict is unaffected, and must be: it reads the night's own two totals,
+        // which retention does not touch. (This fixture's old night is 8 h at high efficiency, so
+        // `durationLikelyHigh` is the correct — and only — thing left to say about it.)
+        XCTAssertEqual(rows[0][29], "durationLikelyHigh")
+    }
+
+    /// The wake-edge caveat, end to end through the real store: a night, then FOUR HOURS with no
+    /// heart-rate row, then the stream resumes. This is the `R2_2026-08-18` shape — the case every
+    /// other coverage surface in the file is blind to, because `coverageFraction` counts only rows
+    /// INSIDE a window that the records themselves defined.
+    func testANightWhoseRecordingStoppedAtTheWakeExportsTheGapAndTheReason() throws {
+        let store = try makeStore()
+        let now = at(24)
+
+        try save(night(from: 0, to: 6), to: store)
+        // Continuous HR through the night (so the LEADING edge is witnessed and cannot be the thing
+        // that fires), then nothing for 4 h, then the stream comes back.
+        var hr = stride(from: -3_600.0, to: 6 * 3600, by: 150).map { offset -> QuantitySample in
+            let t = at(0).addingTimeInterval(offset)
+            return QuantitySample(kind: .heartRate, start: t, end: t, value: 58)
+        }
+        hr += stride(from: 10 * 3600.0, to: 12 * 3600.0, by: 150).map { offset -> QuantitySample in
+            let t = at(0).addingTimeInterval(offset)
+            return QuantitySample(kind: .heartRate, start: t, end: t, value: 70)
+        }
+        _ = try store.ingest(hr)
+
+        guard case .file(let payload) = try ExportBuilder.build(
+            store: store, mode: .dateRange(start: at(-24), end: now),
+            format: .csv, now: now) else { return XCTFail("expected a file") }
+        let row = try XCTUnwrap(sessionRows(payload.content).first)
+
+        XCTAssertEqual(row[25], "witnessed", "the stream ran into the bedtime we print")
+        XCTAssertEqual(row[27], "stoppedThenResumed")
+        XCTAssertEqual(row[28], String(format: "%.1f", 4 * 3600.0),
+                       "the gap is 06:00 → 10:00 — measured, not inferred")
+        XCTAssertEqual(row[29], "noRecordingAfterWake",
+                       "and the file carries the caveat the card showed")
+
+        // The claim the whole feature rests on: coverage still calls this window complete.
+        XCTAssertNotEqual(row[21], "", "coverage is reportable for this night")
+        let fraction = try XCTUnwrap(Double(row[21]))
+        XCTAssertGreaterThan(fraction, 0.95,
+                             "coverageFraction sees a perfect night — which is exactly why the "
+                             + "edge verdict had to be added: the hole starts AT the wake")
     }
 
     // MARK: - 4. The DEFAULT format carries the honesty apparatus

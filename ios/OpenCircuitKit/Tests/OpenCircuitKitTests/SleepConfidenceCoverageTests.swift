@@ -182,6 +182,61 @@ final class SleepConfidenceCoverageTests: XCTestCase {
 
     // MARK: - Summary overload
 
+    // MARK: - Retention (found integrating the sleep card)
+
+    /// A night older than `LocalStore.sampleRetentionDays` keeps its summary row and loses every raw
+    /// sample around it. `earliestSample(after:)` then returns the OLDEST SURVIVING ROW — the
+    /// retention boundary, days later — and an unguarded classifier reads that as a resume, telling
+    /// the wearer "nothing was recorded between 02:37 and <three weeks later>". That is local
+    /// housekeeping reported as a hole in the night.
+    ///
+    /// The tell: the oldest row we still hold is NEWER than the night's trailing edge.
+    func testAnAgedOutNightDoesNotReportRetentionPruningAsAHole() {
+        let pruned = SleepConfidence.Coverage(
+            inBedStart: start,
+            inBedEnd: end,
+            // Everything before the night was pruned too, which is why the FRONT edge is already
+            // safe: BedtimeProvenance answers .unknown with no predecessor and no deep retention.
+            lastMeasurementBeforeStart: nil,
+            // …but the oldest surviving row sits 21 days AFTER this night ended.
+            firstMeasurementAfterEnd: end.addingTimeInterval(21 * 86_400),
+            earliestRetainedMeasurement: end.addingTimeInterval(21 * 86_400))
+        let a = SleepConfidence.assess(asleep: mins(249), inBed: mins(253), coverage: pruned)
+        XCTAssertEqual(a.wake, .unknown,
+                       "retention no longer reaches this night's end — we cannot judge, so we "
+                       + "must not claim a 21-day silence")
+        XCTAssertEqual(a.bedtime, .unknown)
+        XCTAssertTrue(a.reasons.isEmpty, "an unjudgeable night must say nothing: \(a.reasons)")
+        // No reasons ⇒ nothing to render and nothing to export. The card's own rendering of this is
+        // asserted on the parked coverage-card branch; here the reason list IS the surface, because
+        // it is what `sleepSessions[].edgeProvenance.reasons` and the diagnostics line carry.
+        XCTAssertEqual(a.reasons.map(SleepConfidence.exportName), [])
+    }
+
+    /// The guard must not swallow the real case: when retention DOES reach past the edge, the same
+    /// gap is evidence and must still be reported. (Identical inputs to the test above except that
+    /// the store also holds rows from before the night.)
+    func testTheGuardOnlyFiresWhenRetentionStopsShortOfTheEdge() {
+        let a = SleepConfidence.assess(asleep: mins(249), inBed: mins(253),
+                                       coverage: coverage(before: 150, after: 21 * 86_400))
+        XCTAssertEqual(a.wake, .stoppedThenResumed(21 * 86_400))
+        XCTAssertTrue(a.hasAcquisitionReason)
+    }
+
+    /// A nil `earliestRetainedMeasurement` means the caller supplied no retention information, not
+    /// "retention stops here" — and the corpus harness withholds it on `R2_2026-08-17`, one of the
+    /// two 246-minute nights this whole change exists for. The guard must not silence it.
+    func testMissingRetentionInformationDoesNotSilenceTheWakeVerdict() {
+        let a = SleepConfidence.assess(
+            asleep: mins(102), inBed: mins(102),
+            coverage: SleepConfidence.Coverage(inBedStart: start, inBedEnd: end,
+                                               lastMeasurementBeforeStart: nil,
+                                               firstMeasurementAfterEnd: end.addingTimeInterval(14_616),
+                                               earliestRetainedMeasurement: nil))
+        XCTAssertEqual(a.wake, .stoppedThenResumed(14_616))
+        XCTAssertEqual(a.reasons, [.noRecordingAfterWake(from: end, silentFor: 14_616)])
+    }
+
     func testSummaryOverloadMatchesThePrimitive() {
         let s = SleepStaging.Summary(inBed: mins(253), awake: mins(4),
                                      light: mins(160), deep: mins(40), rem: mins(49))

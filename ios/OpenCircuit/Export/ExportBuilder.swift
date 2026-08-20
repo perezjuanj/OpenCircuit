@@ -489,6 +489,38 @@ enum ExportBuilder {
             coverage = ExportCoverage.assess(sampleTimes: hr.map(\.start), from: start, to: end)
         }
 
+        // Edge provenance — what sits just OUTSIDE each edge, which is the half `coverage` above
+        // cannot see: its window is defined by the records inside it, so a night whose recording
+        // stopped dead at the wake reports a coverage fraction of ~1.0.
+        //
+        // Measured over the RECORDED (detector) window, NOT the edit-aware one the row's
+        // `inBedStart`/`inBedEnd` carry. Three reasons, in order of weight: an edit changes what the
+        // app shows, never what was recorded, so the detector edge is the only one whose provenance
+        // is a fact about the data; the recorded columns are populated on EVERY night (they are the
+        // raw `inBedStart`/`inBedEnd`), so the column is comparable across edited and unedited
+        // nights; and a corrected wake time that lands INSIDE the hole would otherwise measure its
+        // own gap and shrink the very evidence the correction is proof of. `edgeProvenance.window*`
+        // states which window was used so no consumer has to infer it.
+        //
+        // Three `fetchLimit = 1` reads per night, the same probes the sleep card runs — and, as
+        // there, HEART RATE specifically: it is band-guarded to 30…220 bpm, so a charging or
+        // pocketed ring yields none, while a skin-temp row keeps arriving from a docked ring and
+        // would report a dead night as "still recording".
+        var edgeProvenance: ExportEngine.SleepEdgeProvenanceRow?
+        let recordedStart = realDate(row.sleepEditRecordedInBedStart)
+        let recordedEnd = realDate(row.sleepEditRecordedInBedEnd)
+        if let s = recordedStart, let e = recordedEnd, e > s {
+            let assessment = SleepConfidence.assess(
+                asleep: row.asSummary.totalAsleep, inBed: row.asSummary.inBed,
+                coverage: SleepConfidence.Coverage(
+                    inBedStart: s, inBedEnd: e,
+                    lastMeasurementBeforeStart: (try? store.latestSample(kind: .heartRate, before: s))?.start,
+                    firstMeasurementAfterEnd: (try? store.earliestSample(kind: .heartRate, after: e))?.start,
+                    earliestRetainedMeasurement: (try? store.earliestSample(kind: .heartRate))?.start))
+            edgeProvenance = ExportEngine.SleepEdgeProvenanceRow(
+                windowStart: s, windowEnd: e, assessment: assessment)
+        }
+
         return ExportEngine.SleepSessionRow(
             sessionID: ExportEngine.sessionID(night: row.night),
             night: row.night,
@@ -515,7 +547,8 @@ enum ExportBuilder {
             hypnogram: SleepHypnogramCodec.decode(row.hypnogramData),
             summary: summary,
             osa: osa,
-            coverage: coverage)
+            coverage: coverage,
+            edgeProvenance: edgeProvenance)
     }
 
     /// `.distantPast` is the store's "not recorded" sentinel for every sleep clock column; it must
