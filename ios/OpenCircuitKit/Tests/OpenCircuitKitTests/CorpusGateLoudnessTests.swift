@@ -272,9 +272,10 @@ final class CorpusGateLoudnessTests: XCTestCase {
     /// one-line edit here rather than an unnoticed addition.
     func testEveryKnownCorpusEntryPointIsGatedExactly() throws {
         let expected: [String: Int] = [
-            "CorpusGateLoudnessTests.swift": 5,  // this file's own five behaviour tests
-            "SleepReplayTests.swift": 3,         // measure, fidelity, input-sensitivity
-            "SleepBaselineTests.swift": 1,       // scoreboard emitter
+            "CorpusGateLoudnessTests.swift": 5,   // this file's own five behaviour tests
+            "SleepReplayTests.swift": 3,          // measure, fidelity, input-sensitivity
+            "SleepBaselineTests.swift": 1,        // scoreboard emitter
+            "SleepCoverageMeasureTests.swift": 1, // acquisition-coverage scoreboard
         ]
         let gateCall = "SleepReplay" + ".requireCorpus("
         var found: [String: Int] = [:]

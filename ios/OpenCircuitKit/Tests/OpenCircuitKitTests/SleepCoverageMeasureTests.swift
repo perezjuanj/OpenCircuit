@@ -63,10 +63,11 @@ final class SleepCoverageMeasureTests: XCTestCase {
     }
 
     func testMeasureCoverageAcrossCorpus() throws {
-        guard let dir = SleepReplay.dir("OC_SLEEP_COVERAGE_CORPUS") else {
-            throw XCTSkip("OC_SLEEP_COVERAGE_CORPUS unset — point it at a corpus directory. "
-                          + "This is a SKIP, not a pass: nothing was measured.")
-        }
+        let dir = try SleepReplay.requireCorpus(
+            "OC_SLEEP_COVERAGE_CORPUS",
+            purpose: "the acquisition-coverage scoreboard (SleepCoverageMeasureTests)",
+            consequence: "The firing rates, the labelled TP/FP cross-tab and the threshold sweep "
+                       + "were all NOT produced, so none of them may be quoted from this run.")
         let manifestURL = dir.appendingPathComponent("manifest.json")
         let raw = try JSONSerialization.jsonObject(with: try Data(contentsOf: manifestURL))
         guard let root = raw as? [String: Any], let rawRows = root["nights"] as? [[String: Any]] else {
