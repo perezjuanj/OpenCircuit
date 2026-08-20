@@ -37,6 +37,24 @@ Usage:
 
 Faithful to: ios/OpenCircuitKit/Sources/OpenCircuitKit/Analytics/SleepStaging.swift,
              .../Analytics/SleepDetection.swift, .../BulkSleep.swift (read 2026-06-21).
+
+!! STALE AS OF 2026-08-19 — DO NOT PROMOTE A FITTED Tuning FROM THIS PORT !!
+    The step-3 Python re-implementation above was written against the Swift as read
+    2026-06-21. Measured 2026-08-19, those three files have since changed by
+    +2311 / -78 lines (#190 SpO2 wake locator, #193 data-hole guard, #194 wear gate,
+    #197 absolute intensity seam, #202 leading-wake erosion):
+
+        git diff --stat 'HEAD@{2026-06-22}' HEAD -- \
+          ios/OpenCircuitKit/Sources/OpenCircuitKit/Analytics/SleepStaging.swift \
+          ios/OpenCircuitKit/Sources/OpenCircuitKit/Analytics/SleepDetection.swift \
+          ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift
+
+    Fitting this port optimises a model we do NOT ship, and the resulting Tuning will not
+    transfer. Fit against the SWIFT replay harness instead (no port => no drift). Re-run
+    the churn command before any fit campaign; non-zero means this warning still applies.
+    The ground-truth LOADING and per-epoch ALIGNMENT here (steps 1, 2, 5) remain correct
+    and reusable — it is only the staging re-implementation that has rotted.
+    See docs/RUNBOOK_SLEEP_GROUNDTRUTH.md "READ BEFORE YOUR FIRST CAPTURE".
 """
 from __future__ import annotations
 

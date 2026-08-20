@@ -13,6 +13,57 @@ this doc).
 > labels is the app↔cloud traffic. Their thresholds are unreadable from the stripped
 > `libxgVipSecurity.so`, so SUPERVISED FITTING against these captured labels is the path.
 
+---
+
+## ⚠️ READ BEFORE YOUR FIRST CAPTURE (added 2026-08-19)
+
+Three corrections. Each one can waste a whole capture night.
+
+### 1. 🟢 Do NOT fit `ringconn_sleep_fit.py`'s Python port as-is — it is stale
+The fitter's step 3 re-implements our staging in Python, faithful to the Swift **as read
+2026-06-21**. Measured 2026-08-19, those three files have changed by **+2311 / −78 lines**
+since:
+```
+git diff --stat 'HEAD@{2026-06-22}' HEAD -- \
+  ios/OpenCircuitKit/Sources/OpenCircuitKit/Analytics/SleepStaging.swift \
+  ios/OpenCircuitKit/Sources/OpenCircuitKit/Analytics/SleepDetection.swift \
+  ios/OpenCircuitKit/Sources/OpenCircuitKit/BulkSleep.swift
+```
+That covers #190 (SpO2 wake locator), #193 (data-hole guard), #194 (wear gate), #197
+(absolute intensity seam) and #202 (leading-wake erosion). **A `Tuning(...)` fitted to the
+port optimises a model we do not ship.** Fit against the Swift replay harness instead, so
+there is no port and therefore no drift. Re-check this churn number before every fit
+campaign; if it is non-zero, the port is untrustworthy again.
+
+### 2. 🟡 Capture ORDER matters — OpenCircuit first, then the RingConn app
+Step 5 below tells you to sync the ring from the RingConn app. That **drains ring history**,
+and the ring has a **single resume pointer**. Whether OpenCircuit can still read the same
+night afterwards is UNRESOLVED: `ack-implies-retain` says an ack permanently advances the
+pointer, while `sync-cursor-and-app-behavior` says the official app drives an incremental
+cursor with `0x50` resume. Those predict opposite outcomes, so do not assume.
+
+Sidestep it — same morning, in this order:
+1. Open **OpenCircuit**, let the night finish syncing.
+2. **Settings ▸ Data ▸ Export (JSON)** — this carries the night's raw 23-byte records in
+   `epochArchive` (≈30 h retention, so it must be the same morning).
+3. Start `mitmweb --listen-port 8080` and point the phone's Wi-Fi proxy at the laptop.
+4. **Only now** open the RingConn app → pull-to-refresh → Sleep detail for that night.
+
+If the RingConn app shows an **empty** night at step 4, the pointer is destructive and this
+whole approach needs rework — **record that result, it answers an open protocol question.**
+If it shows the night, both sides are aligned on the same 150 s grid.
+
+### 3. 🟢 You do NOT need a parallel desktop BLE capture for the features CSV
+The "Aligning timestamps" section below sends you to `extract_last_night.py <decoded.txt>`,
+which needs a separate overnight BLE capture. Unnecessary: the app export's
+`epochArchive[].recordsBase64` holds the **identical 23-byte records** (ts =
+`int(raw[0:4], big) + 1577793600`). Derive the features CSV from the export.
+
+### Scope
+This labels **one ring** — whichever ring wore the night. It does nothing for a night lost
+to a data hole (see the Gen 2 Air ~4 h nightly holes, 2026-08-19): no ground truth recovers
+bytes we never received.
+
 ## What we're capturing
 
 A response body from `api.ringconn.com` containing:
