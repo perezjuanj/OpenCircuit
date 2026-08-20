@@ -3,6 +3,62 @@
 **Status:** MANDATORY before any build carrying `SchemaV7` (the sleep provenance/reversibility
 columns) goes to TestFlight. Not optional, not replaceable by the simulator suite.
 
+## Gate A — the shipped-store migration suite, run as its OWN named gate
+
+**Run this before anything else in this runbook, and again before any release that touches a
+`@Model` type, `FrozenSchemas.swift`, a `SchemaVn`, or the `MigrationPlan`.** It is the automated
+half of the protection; §2 below is the manual half. Neither replaces the other.
+
+```bash
+cd ios && xcodegen generate
+xcodebuild test -project OpenCircuit.xcodeproj -scheme OpenCircuit \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+  -only-testing:OpenCircuitTests/ShippedStoreMigrationTests \
+  CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/migration-gate.log | tail -5
+```
+
+**PASS requires BOTH numbers, and the first one is the whole point:**
+
+```bash
+# how many tests the suite HAS
+grep -c '^    func test' OpenCircuitTests/ShippedStoreMigrationTests.swift
+# how many actually EXECUTED
+grep -c "ShippedStoreMigrationTests .*' passed" /tmp/migration-gate.log
+grep -c "ShippedStoreMigrationTests .*' failed" /tmp/migration-gate.log   # must be 0
+```
+
+The two counts must be **equal**, and the failure count must be **0**. Measured on
+2026-08-20: **11 and 11, 0 failed, 0 crashed, 0 restarts, `xcodebuild` exit 0.** If the executed
+count is lower than the declared count, the gate did **not** pass — some of it did not run.
+
+### Why it is a separate invocation and not "the app-target suite is green"
+
+**Because a whole-target run has already skipped this entire suite once, silently.** Measured, in a
+full `xcodebuild test` of the app target on the branch that introduced the suite: the eight tests
+compiled into the bundle and **zero of them started**. The sequence in that log is
+
+```
+Test Case '-[…SchemaMigrationTests testTheMigratedRowCanCarryAHypnogram]' started.
+Restarting after unexpected exit, crash, or test timeout; summary will include totals from previous launches.
+Test Suite 'SchemaMigrationTests' started …          ← resumed at the NEXT test in the crashed class
+Test Suite 'SleepEditStoreTests' started …           ← and then jumped straight past
+                                                       ShippedStoreMigrationTests
+```
+
+`SchemaMigrationTests` sorts immediately before `ShippedStoreMigrationTests`. One of its tests hit
+the documented container-lifetime crash (the landmine in `CaptureToStoreEndToEndTests`,
+`HealthWatermarkTests`, `SyncCursorPlausibilityTests` and sometimes `SchemaMigrationTests` — present
+on master, unrelated to any migration change). The test host died, `xcodebuild` relaunched, and the
+resumed launch dropped the whole next class. The summary still reported totals "from previous
+launches", so the run looked entirely normal.
+
+That crash is **intermittent**. A separate full-target run of this branch, on this host, executed
+all 8 and reported 170 passed / 0 failed / 16 crashed. Same command, same suite, opposite coverage
+— and nothing in either summary says which happened. So a green whole-target run is not evidence
+this suite ran; it is evidence that it either ran or was skipped. `-only-testing` removes the
+neighbours from the run, and the count check above removes the ambiguity. **Do not substitute a
+full-target run for Gate A, and do not accept a Gate A result without the two counts.**
+
 ## 0. Why this runbook exists, and why the shortcuts don't work
 
 Twice now a column was added to a live `@Model` type while a historical `VersionedSchema` still

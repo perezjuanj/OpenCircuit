@@ -66,12 +66,29 @@ struct OpenCircuitApp: App {
     /// stops being identifiable. `ShippedStoreMigrationTests.testNoHistoricalSchemaVersionNamesALiveType`
     /// fails if one ever does again.
     ///
-    /// V1's summary + nap pins are `SchemaV4.StoredSleepSummary` / `FrozenModels.StoredNap` — the
-    /// b22–b33 shapes, which is the NEWEST shape V1 ever described. Stated plainly: **no store can
-    /// match V1, V2 or V3 any more, whatever they are pinned to.** MEASURED across the tags — while
-    /// these three named live types their checksums moved at b17, b21, b22, b38 and b45, so a
-    /// b1–b33 store stopped being identifiable long before today. These pins are a tripwire and
-    /// hygiene, not a recovery path; the versions that recover a real phone are V4, V5 and V6.
+    /// ⚠️ CORRECTED, AND THE CORRECTION IS LOAD-BEARING. This note used to say "no store can match
+    /// V1, V2 or V3 any more, whatever they are pinned to". **That is false for V3**, measured by
+    /// re-scanning every `v1.0-b*` tag and by opening a store written in the b22–b33 shape through
+    /// the real plan (`ShippedStoreMigrationTests.testABuild33StoreOpensAndKeepsEveryRow`). What the
+    /// scan actually shows:
+    ///
+    ///   * **V1 — inert.** Six entities. The six-entity builds are b1–b17, and there the summary is
+    ///     19 props (b1–b12) or 21 (b13–b20) and `StoredNap` is 6 props. V1 pins the b22 summary
+    ///     (29) and the b22 nap (11), a combination no six-entity build ever wrote.
+    ///   * **V2 — inert.** Seven entities. `StoredDaytimeTemp` and `StoredStepSample` both first
+    ///     shipped at b18, so the entity count goes straight from 6 to 8: no build ever wrote a
+    ///     seven-entity store at all.
+    ///   * **V3 — NOT inert. It is exactly the shape builds 22 through 33 shipped**: eight entities,
+    ///     `StoredSleepSummary` at 29 props, `StoredNap` at 11. Those builds are ~3 weeks old, so a
+    ///     phone can still be sitting on one. Pinning V1…V3 to frozen snapshots did not merely add a
+    ///     tripwire, it handed b22–b33 stores back a matching version — they open and keep every
+    ///     row instead of being wiped.
+    ///
+    /// So do NOT "tidy" V3 back to naming live types on the argument that nothing can match it. That
+    /// edit would wipe every phone still on b22–b33. The claim is now enforced rather than asserted:
+    /// `testEachFrozenVersionStillDescribesTheShippedShape` compares `SchemaV3` against a shipped
+    /// shape transcribed independently in the test target, and the open test above exercises it
+    /// through `makeContainerOrThrow`.
     enum SchemaV1: VersionedSchema {
         static var versionIdentifier = Schema.Version(1, 0, 0)
         static var models: [any PersistentModel.Type] {
@@ -99,6 +116,10 @@ struct OpenCircuitApp: App {
     /// Adds `StoredStepSample` (timestamped step DELTAS — #steps-history) alongside the existing
     /// `StoredDaily` running total, so a step reading's actual observation window survives
     /// instead of being folded away. Purely additive — lightweight migration.
+    ///
+    /// ⚠️ V3 IS REACHABLE — unlike V1 and V2 it describes a shape that really shipped (builds 22
+    /// through 33). See the correction above the `SchemaV1` declaration before changing anything
+    /// here.
     enum SchemaV3: VersionedSchema {
         static var versionIdentifier = Schema.Version(3, 0, 0)
         static var models: [any PersistentModel.Type] {
@@ -811,7 +832,23 @@ struct RollupBackup: Codable {
     /// Read the rollup tables from the (un-openable-as-current) store using a schema LIMITED to
     /// just those tables — so a schema change to the sample/cursor tables can't block reading
     /// them — and write a JSON snapshot. Returns the snapshot (nil if even this best-effort read
-    /// fails). The file persists so a crash mid-wipe can't lose the rollups.
+    /// fails).
+    ///
+    /// ⚠️ TWO GAPS HERE, both pre-existing and both deliberately left alone by the M1 fix — they are
+    /// reported so the next person does not re-derive them from a comment that was wrong:
+    ///
+    ///  1. **The JSON file is WRITE-ONLY.** This comment used to end "the file persists so a crash
+    ///     mid-wipe can't lose the rollups". It cannot do that: `rollup-backup.json` is written
+    ///     here and deleted in `restore(into:)`, and **nothing in the app ever reads it back** —
+    ///     grep the target. Only the in-memory return value is used. A crash between
+    ///     `removeStoreFiles` and `restore` therefore loses the rollups anyway, with the file
+    ///     sitting on disk unread. Making it real means reading it at launch when it exists.
+    ///  2. **`StoredDaytimeTemp` is not backed up** — it is absent from the limited schema below,
+    ///     so the Trends intraday skin-temperature series is destroyed permanently by a wipe. Skin
+    ///     temp is LIVE-only (the `0x10`/`0x87` descriptor); the ring holds no history of it and
+    ///     can never re-send it, and it is deliberately not mirrored into Apple Health, so there is
+    ///     no second copy anywhere. Adding it here is a behaviour change to the wipe path and was
+    ///     out of scope for a comment-and-tests fix; it is the single biggest remaining hole.
     static func exportBeforeWipe(config: ModelConfiguration) -> RollupBackup? {
         let schema = Schema([StoredSleepSummary.self, StoredDaily.self,
                              StoredPeriodEntry.self, StoredNap.self,

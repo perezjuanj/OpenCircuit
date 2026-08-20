@@ -36,9 +36,20 @@ import SwiftData
 ///
 ///   | entity | shipped shape history |
 ///   |---|---|
-///   | `StoredSample`, `StoredCursor`, `StoredDaily`, `StoredStepSample`, `StoredDaytimeTemp`, `StoredPeriodEntry`, `StoredHeadacheEntry`, `StoredHeadacheRisk` | unchanged b34 → b45 (the whole span any live store can come from) |
+///   | `StoredSample`, `StoredCursor`, `StoredDaily`, `StoredPeriodEntry` | unchanged b1 → b45 |
+///   | `StoredStepSample`, `StoredDaytimeTemp` | first shipped b18 (together), unchanged b18 → b45 |
+///   | `StoredHeadacheEntry`, `StoredHeadacheRisk` | first shipped b34, unchanged b34 → b45 |
 ///   | `StoredNap` | 6 props b1–b21; **11 props b22 → b45, unchanged**; SchemaV7 adds 3 |
-///   | `StoredSleepSummary` | 19 props b1–b16 · 21 b17–b20 · 26 b21 · **29 b22–b37 (V4)** · **30 b38–b43 (V5)** · **34 b45 (V6)** · 40 on V7 |
+///   | `StoredSleepSummary` | 19 props b1–b12 · 21 b13–b20 · 26 b21 · **29 b22–b37 (V4, and V3)** · **30 b38–b43 (V5)** · **34 b45 (V6)** · 40 on V7 |
+///
+/// The ENTITY COUNT is itself part of the shape: 6 entities b1–b17, 8 b18–b33, 10 b34–b45. That is
+/// why `SchemaV3` (8 entities, 29-prop summary, 11-prop nap) describes builds 22–33 exactly and
+/// **is reachable** — see the correction above `OpenCircuitApp.SchemaV1`, and do not restate the
+/// retired claim that V1/V2/V3 are all inert.
+///
+/// (One boundary in this table was re-measured and corrected: the summary's 19→21 step is at b13
+/// — `sleepOnset` + `sleepWake` — not b17. It moves nothing, since those are six-entity builds no
+/// version describes, but the table is the audit record, so it says what the tags say.)
 ///
 /// Note `hypnogramData` first shipped in **b38**. `SchemaV5`'s note used to say build 35; that was
 /// wrong and has been corrected in place — the column is absent at the b35, b36 and b37 tags.
@@ -54,7 +65,7 @@ import SwiftData
 ///    previous shape if a later version will change it again.
 enum FrozenModels {
 
-    // MARK: Entities unchanged across every build a live store can have come from (b34 → b45)
+    // MARK: Entities that never changed shape after they first shipped (spans in the table above)
 
     /// `StoredSample` as shipped b34 → b45. The un-resyncable raw epoch rows — the table the wipe
     /// path destroys, and the reason all of this matters.

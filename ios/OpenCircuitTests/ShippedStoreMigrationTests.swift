@@ -108,7 +108,29 @@ final class ShippedStoreMigrationTests: XCTestCase {
                        "the user's own nap edit must survive the migration", file: file, line: line)
     }
 
-    // MARK: - The three shapes that can be on a phone today
+    // MARK: - The shapes that can be on a phone today
+
+    /// Builds 22–33 — the EIGHT-entity era, before `StoredHeadacheEntry` / `StoredHeadacheRisk`
+    /// arrived at b34. Same 29-column summary and 11-column nap as b34; the entity set is the
+    /// difference.
+    ///
+    /// This is the arm that refutes the old "V1, V2 and V3 are inert, no store can match them"
+    /// note. Re-measured across every `v1.0-b*` tag: the entity count goes 6 (b1–b17) → 8 (b18–b33)
+    /// → 10 (b34–b45), `StoredNap` goes 6 → 11 props at b22, and `StoredSleepSummary` sits at 29
+    /// props for b22–b37 — so `SchemaV3`, once pinned, describes b22–b33 EXACTLY. Those builds are
+    /// weeks old, not archaeology. Opened here through the real plan, so the claim is enforced.
+    func testABuild33StoreOpensAndKeepsEveryRow() throws {
+        try writeShippedStore(ShippedModels.b33) { context in
+            let row = ShippedB34.StoredSleepSummary()
+            row.night = self.night
+            row.asleepMin = 388
+            context.insert(row)
+        }
+        let container = try openExactlyAsTheAppDoes()
+        try assertRawHistorySurvived(container)
+        let summaries = try ModelContext(container).fetch(FetchDescriptor<StoredSleepSummary>())
+        XCTAssertEqual(summaries.first?.asleepMin, 388)
+    }
 
     /// Builds 34–37. `StoredSleepSummary` at 29 columns, `StoredNap` at 11.
     func testABuild34StoreOpensAndKeepsEveryRow() throws {
@@ -161,31 +183,39 @@ final class ShippedStoreMigrationTests: XCTestCase {
 
     // MARK: - Making the blindness impossible to repeat
 
-    /// THE STRUCTURAL GUARD. A `VersionedSchema` older than the current one must not name a LIVE
-    /// `@Model` type: a live type is not a shape, it is a moving target, and the next column added
-    /// to it silently re-breaks every store the version was supposed to identify.
+    /// THE STRUCTURAL GUARD, as a function so the same rule can be aimed at a synthetic plan.
+    ///
+    /// "Live" is **DERIVED from the plan's own current (last) version**, never from a list of type
+    /// names written out by hand. That distinction is the fix for a real hole: the hand-written
+    /// version named the ten entities that existed the day it was written, so an ELEVENTH `@Model`
+    /// added later would be absent from it and a historical version naming that eleventh type would
+    /// pass the guard in silence — "the entity nobody was watching", one entity further along, which
+    /// is exactly the failure mode this whole file exists to close.
+    private static func historicalVersionsNamingLiveTypes(
+        _ plan: [any VersionedSchema.Type]
+    ) -> [(version: Schema.Version, names: [String])] {
+        guard let current = plan.last else { return [] }
+        let live = Set(current.models.map { ObjectIdentifier($0) })
+        return plan.dropLast().compactMap { version in
+            let names = version.models
+                .filter { live.contains(ObjectIdentifier($0)) }
+                .map { String(describing: $0) }
+            return names.isEmpty ? nil : (version.versionIdentifier, names)
+        }
+    }
+
+    /// A `VersionedSchema` older than the current one must not name a LIVE `@Model` type: a live
+    /// type is not a shape, it is a moving target, and the next column added to it silently
+    /// re-breaks every store the version was supposed to identify.
     func testNoHistoricalSchemaVersionNamesALiveType() {
-        let live: [ObjectIdentifier: String] = [
-            ObjectIdentifier(StoredSample.self): "StoredSample",
-            ObjectIdentifier(StoredCursor.self): "StoredCursor",
-            ObjectIdentifier(StoredSleepSummary.self): "StoredSleepSummary",
-            ObjectIdentifier(StoredDaily.self): "StoredDaily",
-            ObjectIdentifier(StoredNap.self): "StoredNap",
-            ObjectIdentifier(StoredPeriodEntry.self): "StoredPeriodEntry",
-            ObjectIdentifier(StoredDaytimeTemp.self): "StoredDaytimeTemp",
-            ObjectIdentifier(StoredStepSample.self): "StoredStepSample",
-            ObjectIdentifier(StoredHeadacheEntry.self): "StoredHeadacheEntry",
-            ObjectIdentifier(StoredHeadacheRisk.self): "StoredHeadacheRisk",
-        ]
         let all = OpenCircuitApp.MigrationPlan.schemas
         guard let current = all.last else { return XCTFail("empty migration plan") }
         XCTAssertEqual(current.versionIdentifier, OpenCircuitApp.SchemaV7.versionIdentifier,
                        "the CURRENT version is the only one allowed to name live types")
-        for version in all.dropLast() {
-            let offenders = version.models.compactMap { live[ObjectIdentifier($0)] }
-            XCTAssertTrue(offenders.isEmpty, """
-                Schema version \(version.versionIdentifier) names the LIVE type(s) \
-                \(offenders.joined(separator: ", ")). A historical version must pin a FROZEN \
+        for offender in Self.historicalVersionsNamingLiveTypes(all) {
+            XCTFail("""
+                Schema version \(offender.version) names the LIVE type(s) \
+                \(offender.names.joined(separator: ", ")). A historical version must pin a FROZEN \
                 snapshot (see FrozenModels) — otherwise the next column added to that live type \
                 changes this version's checksum, the store on the phone matches nothing, and \
                 makeContainer wipes every raw history row. That is the build-44 wipe.
@@ -193,10 +223,44 @@ final class ShippedStoreMigrationTests: XCTestCase {
         }
     }
 
+    /// The derivation above is sound only if the container the app ACTUALLY builds lists exactly the
+    /// current version's models — otherwise a new live type could be reachable at runtime while
+    /// sitting outside the derived set. `makeSchemaAndConfig`'s own comment claimed this suite
+    /// asserted it; until this test, nothing did.
+    func testTheLiveContainerListsExactlyTheCurrentVersionsModels() throws {
+        let container = try OpenCircuitApp.makeContainerOrThrow(storeURL: storeURL)
+        XCTAssertEqual(container.schema, Schema(OpenCircuitApp.SchemaV7.models), """
+            The container schema and the CURRENT VersionedSchema have drifted apart. Everything \
+            above derives "which types are live" from SchemaV7.models; a type the app can reach \
+            but SchemaV7 does not name would be invisible to that derivation.
+            """)
+    }
+
+    /// PROOF THAT THE GUARD IS DERIVED, NOT HAND-MAINTAINED — the eleventh type.
+    ///
+    /// `EleventhTypePlan` is a two-version plan whose current version introduces a type that appears
+    /// in no list anywhere in this file, and whose historical version names that same live type.
+    /// A guard built from a hand-written roster of the ten known entities returns nothing here; the
+    /// derived rule names it. This is the regression test for the roster, not for the app plan.
+    func testTheGuardCatchesAnEleventhTypeNoHandWrittenListCouldKnow() {
+        let offenders = Self.historicalVersionsNamingLiveTypes(
+            [EleventhTypePlan.Historical.self, EleventhTypePlan.Current.self])
+        XCTAssertEqual(offenders.map(\.names), [["StoredEleventhEntity"]], """
+            The rule must flag a live type it was never told about by name. If this is empty the \
+            guard has been re-narrowed to a fixed list of entities and stopped generalising.
+            """)
+    }
+
     /// Shape tripwire: each frozen version must still describe the shape that SHIPPED. Compared
     /// against this file's independently transcribed snapshots, so a typo in `FrozenModels` — or a
     /// column quietly appended to a frozen snapshot — is caught before it reaches a phone.
     func testEachFrozenVersionStillDescribesTheShippedShape() {
+        XCTAssertEqual(Schema(OpenCircuitApp.SchemaV3.models), Schema(ShippedModels.b33), """
+            SchemaV3 must describe the store builds 22–33 wrote. This one is NOT a formality: the \
+            note above SchemaV1 used to call V1/V2/V3 inert, and for V3 that is false — pinning it \
+            handed b22–b33 phones a version that matches, so they migrate instead of being wiped. \
+            Anyone who "corrects" that note and re-points V3 at the live types trips this.
+            """)
         XCTAssertEqual(Schema(OpenCircuitApp.SchemaV4.models), Schema(ShippedModels.b34),
                        "SchemaV4 must describe the store builds 34–37 wrote")
         XCTAssertEqual(Schema(OpenCircuitApp.SchemaV5.models), Schema(ShippedModels.b43),
@@ -584,13 +648,48 @@ private enum ShippedB34 {
 }
 
 private enum ShippedModels {
-    private static var common: [any PersistentModel.Type] {
+    /// The seven non-summary entities present from b18 (when `StoredDaytimeTemp` and
+    /// `StoredStepSample` arrived together) through b45. `StoredNap` is the b22–b45 shape.
+    private static var commonB18: [any PersistentModel.Type] {
         [ShippedB45.StoredSample.self, ShippedB45.StoredCursor.self, ShippedB45.StoredDaily.self,
          ShippedB45.StoredNap.self, ShippedB45.StoredPeriodEntry.self,
-         ShippedB45.StoredDaytimeTemp.self, ShippedB45.StoredStepSample.self,
-         ShippedB45.StoredHeadacheEntry.self, ShippedB45.StoredHeadacheRisk.self]
+         ShippedB45.StoredDaytimeTemp.self, ShippedB45.StoredStepSample.self]
     }
+    /// b34 added the two headache entities.
+    private static var common: [any PersistentModel.Type] {
+        commonB18 + [ShippedB45.StoredHeadacheEntry.self, ShippedB45.StoredHeadacheRisk.self]
+    }
+    static var b33: [any PersistentModel.Type] { commonB18 + [ShippedB34.StoredSleepSummary.self] }
     static var b34: [any PersistentModel.Type] { common + [ShippedB34.StoredSleepSummary.self] }
     static var b43: [any PersistentModel.Type] { common + [ShippedB43.StoredSleepSummary.self] }
     static var b45: [any PersistentModel.Type] { common + [ShippedB45.StoredSleepSummary.self] }
+}
+
+// MARK: - The eleventh type
+//
+// A `@Model` that is deliberately NOT one of the app's ten entities, and a two-version plan that
+// misuses it exactly the way a future maintainer would: the current version introduces it, and the
+// historical version — which pins its other entity properly — still names the live one. It stands
+// for the entity that gets added AFTER a guard is written, which no roster of today's entities can
+// contain.
+private enum EleventhTypePlan {
+    @Model final class StoredEleventhEntity {
+        var day: Date = Date.distantPast
+        var value: Double = 0
+        init() {}
+    }
+    /// Its summary is pinned to a frozen snapshot (the correct discipline); the eleventh entity is
+    /// left naming the live type (the mistake under test), so it is the ONLY offender expected.
+    enum Historical: VersionedSchema {
+        static var versionIdentifier = Schema.Version(1, 0, 0)
+        static var models: [any PersistentModel.Type] {
+            [ShippedB34.StoredSleepSummary.self, StoredEleventhEntity.self]
+        }
+    }
+    enum Current: VersionedSchema {
+        static var versionIdentifier = Schema.Version(2, 0, 0)
+        static var models: [any PersistentModel.Type] {
+            [ShippedB43.StoredSleepSummary.self, StoredEleventhEntity.self]
+        }
+    }
 }
