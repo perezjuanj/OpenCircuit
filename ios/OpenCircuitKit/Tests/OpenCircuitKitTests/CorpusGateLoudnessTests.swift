@@ -24,8 +24,9 @@
 //   1. BEHAVIOUR — `SleepReplay.requireCorpus` throws `XCTSkip` when unset (XCTest then reports
 //      "skipped", which is not a pass) and FAILS when the variable is set to a bad path.
 //   2. SOURCE AUDIT — no test in this target may name a corpus environment variable except through
-//      that gate, no helper may hand one back as an `Optional` (that Optional is the hole), and the
-//      known entry points must keep EXACTLY the gate count they are pinned at.
+//      that gate, no helper may hand one back as an `Optional` (that Optional is the hole), the
+//      known entry points must keep EXACTLY the gate count they are pinned at, and the whole set of
+//      `OC_…` variable names the target reads is declared in one place.
 //   3. PINNED GOLDEN — the corpus fingerprint and the baseline sha256 the campaign quotes live in
 //      tracked source and tracked docs, so "the scoreboard did not move" is a checkable claim rather
 //      than a number in a chat log.
@@ -35,10 +36,18 @@
 // back"; that was an overclaim, and an adversarial review broke the audit three ways in one sitting:
 // a comment supplying the missing unit of a `>=` count; a fresh `-> URL?` helper added to the one
 // file the audit excluded; and the two-line `let env = …environment` / `env[<corpus name>]` form,
-// which the single-line needle could not see. All three are closed below and each is re-broken on
-// demand by scratchpad/gatebreak/break.py. What remains open, and is accepted:
-//   • a variable name assembled at run time ("OC_SLEEP" + "_X" + "_CORPUS") is invisible to a text
-//     audit;
+// which the single-line needle could not see. A LAND review then found a fourth, and it is the
+// worst kind because it needs NO INTENT: the needle was `OC_SLEEP…_CORPUS`, so a gated test whose
+// variable was simply named something else — `OC_COVERAGE_CORPUS`, `OC_CORPUS` — reinstated the
+// original silent pass with every audit test green. The needle is now `OC_[A-Z0-9_]*CORPUS`, and
+// the whole `OC_`-prefixed NAME SET the target reads is pinned besides (see
+// `testEveryOCEnvironmentVariableTheTargetReadsIsDeclared`), so inventing any new `OC_…` variable —
+// corpus-shaped or not — is a deliberate one-line edit here rather than a silent widening.
+// All of them are closed below and each is re-broken on demand by scratchpad/fix4/break.py.
+// What remains open, and is accepted:
+//   • a variable name assembled at run time ("OC_" + "X" + "CORPUS") is invisible to a text audit;
+//   • a corpus variable named outside the house `OC_…` convention entirely (`SLEEP_CORPUS_DIR`)
+//     escapes both the needle and the pinned set — which is a deliberate deviation, not a slip;
 //   • a `func` signature deliberately split so `-> URL?` and `private` never share a declaration
 //     window would slip the shape rule;
 //   • anything that bypasses the test target entirely.
@@ -162,16 +171,22 @@ final class CorpusGateLoudnessTests: XCTestCase {
     /// subscript into a captured environment dictionary, a name stashed in a `let` — is a route back
     /// to the silent pass.
     ///
-    /// Two evasions the first version allowed, both closed here:
+    /// Three evasions earlier versions allowed, all closed here:
     ///   • the needle was the literal `environment` + `[`, so the idiomatic two-line form
     ///     `let env = ProcessInfo.processInfo.environment` then `env[<corpus name>]` walked past;
-    ///   • matching was per line, so any statement split across lines walked past.
-    /// The check now runs over the file FLATTENED (comments removed, lines joined), so line breaks
-    /// buy nothing, and it bans the corpus name itself rather than one spelling of one reader.
+    ///   • matching was per line, so any statement split across lines walked past;
+    ///   • the NAME needle was `OC_SLEEP…_CORPUS`, which is narrower than the thing being banned.
+    ///     A gated test that calls its variable `OC_COVERAGE_CORPUS` or `OC_CORPUS` — no intent
+    ///     required, just a different feature name — was invisible to it, and could open its corpus
+    ///     through a raw Optional lookup with all of this file's tests green. Measured: the break
+    ///     harness reproduces exactly that against the old needle. The needle is now
+    ///     `OC_[A-Z0-9_]*CORPUS`, i.e. any `OC_`-prefixed name ending in CORPUS.
+    /// The check runs over the file FLATTENED (comments removed, lines joined), so line breaks buy
+    /// nothing, and it bans the corpus name itself rather than one spelling of one reader.
     func testACorpusVariableIsOnlyEverNamedInsideTheLoudGate() throws {
         // Assembled from pieces so this file contains no text that its own rules would match.
         let rawLookup = "SleepReplay" + ".dir("
-        let corpusToken = "OC_SLEEP" + "[A-Z0-9_]*" + "_CORPUS"
+        let corpusToken = "OC_" + "[A-Z0-9_]*" + "CORPUS"
         let corpusLiteral = try NSRegularExpression(pattern: "\"" + corpusToken + "\"")
         let gatedLiteral = try NSRegularExpression(pattern: "requireCorpus\\(\\s*\"" + corpusToken + "\"")
 
@@ -294,6 +309,62 @@ final class CorpusGateLoudnessTests: XCTestCase {
                            "\(file) has \(found[file].map(String.init) ?? "0") corpus gate(s) in "
                            + "executable code, pinned at \(count).")
         }
+    }
+
+    /// THE NO-INTENT GUARD. The rule above bans a corpus NAME outside the gate; this one pins the
+    /// whole `OC_`-prefixed name SET the target reads, so a variable that is corpus-shaped in
+    /// PURPOSE but not in SPELLING cannot appear silently either.
+    ///
+    /// Why it exists: the previous needle was `OC_SLEEP…_CORPUS`. A gated test whose variable was
+    /// named for its own feature rather than for sleep — `OC_COVERAGE_CORPUS` — slipped it with no
+    /// intent whatsoever and reinstated the original `guard let … else { return }` silent pass. The
+    /// needle is widened (to `OC_[A-Z0-9_]*CORPUS`), and this pin covers the remaining shape: a new
+    /// `OC_…` variable that does not end in CORPUS but still gates a measurement. Adding one is
+    /// then a deliberate one-line edit HERE, next to the reason it matters, which is the point.
+    ///
+    /// This is a NAME pin only. It does not say how a variable is read — that is the rule above.
+    /// And note the shared-prefix assembly below: writing the names out in full would make THIS
+    /// file trip the corpus rule, and the same technique is the first item on the accepted-open
+    /// list — a text audit cannot see a name that is built at run time, including its own.
+    func testEveryOCEnvironmentVariableTheTargetReadsIsDeclared() throws {
+        // Every `OC_…` string literal the test target contains, and what it is for. A corpus name
+        // must ALSO satisfy the gate rule above; the two are independent checks on purpose.
+        let oc = "OC_" + "SLEEP"
+        let declared: Set<String> = [
+            oc + "_CORPUS",           // SleepReplayMeasureTests — the corpus scoreboard
+            oc + "_FIDELITY_CORPUS",  // SleepReplayFidelityTests + InputSensitivityTests
+            oc + "_COVERAGE_CORPUS",  // SleepCoverageMeasureTests — acquisition coverage
+            oc + "_BASELINE_CORPUS",  // SleepBaselineTests — the pinned-golden emitter
+            oc + "_BASELINE_OUT",     // …and where that emitter writes its TSV. NOT a corpus: an
+                                      // output path, legitimately Optional, read raw.
+            oc + "_GATE_SELFTEST",    // this file's own injected variable; never a real corpus
+        ]
+        // Assembled from pieces, like the needle above, so this file's own source cannot match.
+        let ocLiteral = try NSRegularExpression(pattern: "\"" + "OC_" + "[A-Z0-9_]+" + "\"")
+
+        var found: Set<String> = []
+        for src in try auditSources() {
+            let flat = src.flat as NSString
+            ocLiteral.enumerateMatches(in: src.flat,
+                                       range: NSRange(location: 0, length: flat.length)) { m, _, _ in
+                guard let m else { return }
+                found.insert(flat.substring(with: m.range).replacingOccurrences(of: "\"", with: ""))
+            }
+        }
+        XCTAssertFalse(found.isEmpty,
+                       "the scan found no OC_ environment names at all — the harness reads at least "
+                       + "four. FIX THE AUDIT rather than letting this pass vacuously.")
+        XCTAssertEqual(found.subtracting(declared), [],
+                       "undeclared OC_ environment variable(s) in the test target: "
+                       + "\(found.subtracting(declared).sorted()). If this gates a MEASUREMENT it "
+                       + "must be opened through `SleepReplay.requireCorpus`, which skips loudly "
+                       + "instead of returning nil — an unset variable read any other way ends in "
+                       + "an early `return`, which XCTest reports as PASSED. Declare it here with a "
+                       + "note saying which it is.")
+        XCTAssertEqual(declared.subtracting(found), [],
+                       "declared but no longer present: \(declared.subtracting(found).sorted()). If "
+                       + "an entry point was deleted, delete its line here too — a stale allowance "
+                       + "is a hole waiting for someone to reuse the name.")
     }
 
     /// The fidelity proof's own tripwire. `asserted` counts the fields the manifest declared as

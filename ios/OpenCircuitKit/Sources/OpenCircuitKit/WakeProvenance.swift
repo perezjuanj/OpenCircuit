@@ -98,10 +98,39 @@ public enum WakeProvenance: Equatable, Sendable {
     ///     same reason `BedtimeProvenance` does: HR is band-guarded to 30…220 bpm, so a charging or
     ///     pocketed ring produces none, while a skin-temp row keeps arriving from a docked ring and
     ///     would call a charge cycle "witnessed".
+    ///   - earliestRetainedMeasurement: timestamp of the OLDEST measurement still on disk, used to
+    ///     tell "the ring stopped recording" from "retention no longer reaches this night". nil when
+    ///     the caller has no retention information (on device that means an empty store, in which
+    ///     case there is no successor either), and the raw verdict then stands — deliberate: the
+    ///     corpus harness withholds the field on nights whose leading edge is undeterminable, and
+    ///     `R2_2026-08-17`, one of the two 246-minute nights this whole classifier exists for, is
+    ///     one of them. This parameter has NO DEFAULT on purpose; see the retention note below.
     /// - Returns: `.unknown` when there is no later measurement — the honest answer, because the
     ///   store having nothing after the edge is exactly as consistent with "you synced at wake" as
     ///   with "the ring stopped". This branch has ZERO labelled validation (6 of 21 corpus nights
     ///   land there and the corpus cannot adjudicate one of them), so it must stay SILENT in the UI.
+    ///
+    /// ⚠️ THE RETENTION GUARD, AND WHY IT LIVES HERE RATHER THAN IN THE CALLER. `StoredSample` rows
+    /// are pruned at `LocalStore.sampleRetentionDays` (30) on every launch while
+    /// `StoredSleepSummary` is kept long-term, so a night older than that keeps its row and loses
+    /// every raw sample around it. The two edges then behave completely differently:
+    ///
+    ///   • FRONT: `latestSample(before:)` returns nil (everything earlier was pruned) and
+    ///     `BedtimeProvenance` answers `.unknown`, because retention cannot reach back far enough.
+    ///     Silent, correct, and it gets that for free from the `earliestRetainedMeasurement` it
+    ///     already takes.
+    ///   • BACK: `earliestSample(after:)` happily returns the OLDEST SURVIVING ROW — the retention
+    ///     boundary, days later. Read as a resume, that makes the card say "nothing was recorded
+    ///     between 07:12 and <three weeks later>": routine local housekeeping reported as a hole in
+    ///     the night.
+    ///
+    /// This guard used to sit in `SleepConfidence.assess`, which meant the OBVIOUS API — this
+    /// function — was the unsafe one, and any second caller would have had to remember to reapply
+    /// it. It is now here, mirroring the leading edge, and the parameter is required so the mistake
+    /// cannot be made by omission. The test is the data itself rather than a copy of the retention
+    /// constant: if the oldest row we still hold is NEWER than the night's trailing edge, then
+    /// everything at and after that edge has been pruned, so the "next" measurement is a boundary,
+    /// not evidence, and `.unknown` — which ships silent — is the honest answer.
     ///
     /// ⚠️ THE INPUT IS OUR ARCHIVE, WHICH LAGS THE RING. Records exist on the ring before any drain
     /// hands them over, so a morning where the app has only reached 02:37 looks identical to a ring
@@ -120,7 +149,12 @@ public enum WakeProvenance: Equatable, Sendable {
     /// (`BedtimeProvenanceTests.testNoPriorMeasurementWithDeepRetentionIsEvidence` only reaches it by
     /// passing a `nil` predecessor alongside a 7-day-old "earliest"). Mirroring a dead branch would
     /// mean shipping copy that can never render.
-    public static func classify(inBedEnd: Date, firstMeasurementAfter: Date?) -> Verdict {
+    public static func classify(inBedEnd: Date,
+                                firstMeasurementAfter: Date?,
+                                earliestRetainedMeasurement: Date?) -> Verdict {
+        // Retention no longer reaches this night's end ⇒ whatever comes "after" it is the pruning
+        // boundary, not the ring resuming. See the note above.
+        if let earliest = earliestRetainedMeasurement, earliest > inBedEnd { return .unknown }
         guard let next = firstMeasurementAfter else { return .unknown }
         // A measurement at or before the edge is not "after" it; treat a caller that passes one as
         // giving no usable evidence rather than silently computing a negative gap. (Mirrors

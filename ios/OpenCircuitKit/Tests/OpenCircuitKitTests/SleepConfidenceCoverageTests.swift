@@ -167,6 +167,48 @@ final class SleepConfidenceCoverageTests: XCTestCase {
         XCTAssertEqual(a.reasons.count, 2)
     }
 
+    // MARK: - The threshold travels WITH the verdict
+
+    /// A bundle must never misstate the cut behind its own reasons. The threshold used to be a
+    /// separate defaulted argument on the export row, so a sweep could assess at one value and
+    /// export another beside those reasons with nothing able to notice.
+    func testTheAssessmentCarriesTheCutItsReasonsWereProducedAt() {
+        for cut in [0.0, 900.0, WakeProvenance.materialGapSeconds, TimeInterval.infinity] {
+            let a = SleepConfidence.assess(asleep: mins(249), inBed: mins(253),
+                                           coverage: coverage(before: 150, after: 14_515),
+                                           materialGapSeconds: cut)
+            XCTAssertEqual(a.materialGapSeconds, cut, "cut \(cut)")
+        }
+        XCTAssertEqual(SleepConfidence.assess(asleep: mins(249), inBed: mins(253),
+                                              coverage: coverage(before: 150, after: 14_515))
+                           .materialGapSeconds,
+                       WakeProvenance.materialGapSeconds,
+                       "the default must be the constant, not a second copy of the number")
+    }
+
+    /// …including on the no-coverage path, which returns early. That branch produced the legacy
+    /// verdict and would otherwise have had to invent a threshold for a row it never measured.
+    func testTheCutIsCarriedEvenWithNoCoverageAtAll() {
+        XCTAssertEqual(SleepConfidence.assess(asleep: mins(572), inBed: mins(579),
+                                              coverage: nil, materialGapSeconds: 42)
+                           .materialGapSeconds, 42)
+    }
+
+    /// And it reaches the file: the export row reads the cut off the assessment rather than
+    /// defaulting, so a swept run cannot label its reasons with the shipped default.
+    func testTheExportRowTakesTheCutFromTheAssessmentNotADefault() {
+        let a = SleepConfidence.assess(asleep: mins(249), inBed: mins(253),
+                                       coverage: coverage(before: 150, after: 14_515),
+                                       materialGapSeconds: 900)
+        let row = ExportEngine.SleepEdgeProvenanceRow(windowStart: start, windowEnd: end,
+                                                      assessment: a)
+        XCTAssertEqual(row.materialGapSeconds, 900)
+        XCTAssertNotEqual(row.materialGapSeconds, WakeProvenance.materialGapSeconds,
+                          "fixture must differ from the default or this cannot fail")
+        XCTAssertEqual(row.reasons, ["noRecordingAfterWake"],
+                       "…and the reasons it labels really were produced at that cut")
+    }
+
     func testUnknownEdgesNeverFlagAtAnyThreshold() {
         // 6 of 21 corpus nights have nothing after the in-bed end at all. "The ring stopped" and
         // "you synced at wake" are the same picture, so this branch ships silent — even at 0.
@@ -183,6 +225,12 @@ final class SleepConfidenceCoverageTests: XCTestCase {
     // MARK: - Summary overload
 
     // MARK: - Retention (found integrating the sleep card)
+    //
+    // The guard itself now lives in `WakeProvenance.classify`, mirroring the leading edge, and is
+    // asserted there directly (`WakeProvenanceTests`, "Retention"). It moved because leaving it
+    // here made the OBVIOUS API — the public classifier — the unsafe one: any second caller had to
+    // remember to reapply it. These three tests stay, unchanged in expectation, as the end-to-end
+    // check that `assess` still routes both edges through the guarded path.
 
     /// A night older than `LocalStore.sampleRetentionDays` keeps its summary row and loses every raw
     /// sample around it. `earliestSample(after:)` then returns the OLDEST SURVIVING ROW — the

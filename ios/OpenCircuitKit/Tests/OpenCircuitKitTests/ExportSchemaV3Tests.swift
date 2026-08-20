@@ -446,7 +446,10 @@ final class ExportSchemaV3Tests: XCTestCase {
         XCTAssertEqual(row[27], "stoppedThenResumed")
         XCTAssertEqual(row[28], String(format: "%.1f", 4 * 3600.0))
         XCTAssertEqual(row[29], "noRecordingAfterWake",
-                       "the reason list is what the card actually showed")
+                       "the reason list is what the CLASSIFIER concluded — not what any screen "
+                       + "showed. No coverage caveat ships in this build (the card is parked), so a "
+                       + "failure here means the export lost the classifier's own output, never "
+                       + "that the UI disagreed with it.")
     }
 
     func testEdgeProvenanceJSONOmitsTheGapKeyRatherThanWritingZero() {

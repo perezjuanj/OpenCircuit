@@ -373,18 +373,23 @@ public enum ExportEngine {
 
         /// Build the row from an assessment measured over `[windowStart, windowEnd]`.
         ///
-        /// Takes the assessment rather than re-deriving the verdicts so the export cannot disagree
-        /// with the card: both read the same `SleepConfidence.Assessment`.
+        /// Takes the assessment rather than re-deriving the verdicts, so anything that renders the
+        /// same `SleepConfidence.Assessment` and this file cannot drift apart.
+        ///
+        /// The threshold comes off the assessment for the same reason. It used to be a defaulted
+        /// argument here, which meant a caller sweeping the cut — the one purpose the parameter has
+        /// — could assess at 0 and export `3600` beside those reasons, misstating the cut behind its
+        /// own evidence with nothing able to notice. `materialGapSeconds` is now a fact about the
+        /// verdict, not about the call site.
         public init(windowStart: Date, windowEnd: Date,
-                    assessment: SleepConfidence.Assessment,
-                    materialGapSeconds: TimeInterval = WakeProvenance.materialGapSeconds) {
+                    assessment: SleepConfidence.Assessment) {
             self.init(windowStart: windowStart, windowEnd: windowEnd,
                       bedtimeVerdict: SleepConfidence.exportName(assessment.bedtime),
                       bedtimeGapSeconds: SleepConfidence.gapSeconds(assessment.bedtime),
                       wakeVerdict: SleepConfidence.exportName(assessment.wake),
                       wakeGapSeconds: SleepConfidence.gapSeconds(assessment.wake),
                       reasons: assessment.reasons.map(SleepConfidence.exportName),
-                      materialGapSeconds: materialGapSeconds)
+                      materialGapSeconds: assessment.materialGapSeconds)
         }
     }
 
@@ -744,8 +749,10 @@ public enum ExportEngine {
                 edge?.bedtimeGapSeconds.map { String(format: "%.1f", $0) } ?? "",
                 edge?.wakeVerdict ?? "",
                 edge?.wakeGapSeconds.map { String(format: "%.1f", $0) } ?? "",
-                // Space-separated so the field needs no CSV quoting and stays greppable; empty
-                // means the card said nothing, which is a real and common answer.
+                // Space-separated so the field needs no CSV quoting and stays greppable. Empty means
+                // the CLASSIFIER found nothing to say — a real and common answer (12 of 21 corpus
+                // nights) — and says nothing about any screen: no coverage caveat ships in this
+                // build. See the ⚠️ on `SleepEdgeProvenanceRow`.
                 edge?.reasons.joined(separator: " ") ?? ""
             ]))
         }

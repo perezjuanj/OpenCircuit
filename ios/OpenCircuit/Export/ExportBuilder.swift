@@ -506,17 +506,37 @@ enum ExportBuilder {
         // there, HEART RATE specifically: it is band-guarded to 30…220 bpm, so a charging or
         // pocketed ring yields none, while a skin-temp row keeps arriving from a docked ring and
         // would report a dead night as "still recording".
+        //
+        // …but only for nights whose raw rows can still EXIST, gated on the very same
+        // `retentionHorizon` the coverage block above uses. Two reasons, and the second is the one
+        // that made this a defect rather than a tidy-up:
+        //
+        //   1. CORRECTNESS, already handled but stated once here: past the horizon every probe can
+        //      answer is the pruning boundary, so `SleepConfidence`'s own retention guard collapses
+        //      the pair to `.unknown` anyway. Passing `coverage: nil` produces the IDENTICAL row —
+        //      bedtime `unknown`, wake `unknown`, no gaps, and the duration verdict (which reads the
+        //      night's two totals and is untouched by retention) still exported. Asserted by
+        //      `ExportBuilderTests.testCoverageIsOmittedOnceTheRawSamplesHaveBeenPrunedAway`.
+        //   2. COST. `ExportBuilder` is `@MainActor` and the build is synchronous, `maxExportDays`
+        //      is 365, and `sampleRetentionDays` is 30 — so a full export probed up to 365 × 3 =
+        //      1095 nights' worth of indexed fetches on the main thread, of which 335 × 3 = 1005
+        //      could only ever return "unknown". That is the same unbounded-main-actor shape §5 of
+        //      the tests exists to bound, in an app that has already shipped an 0x8BADF00D
+        //      scene-update watchdog kill. This leaves at most 30 × 3 = 90.
         var edgeProvenance: ExportEngine.SleepEdgeProvenanceRow?
         let recordedStart = realDate(row.sleepEditRecordedInBedStart)
         let recordedEnd = realDate(row.sleepEditRecordedInBedEnd)
         if let s = recordedStart, let e = recordedEnd, e > s {
-            let assessment = SleepConfidence.assess(
-                asleep: row.asSummary.totalAsleep, inBed: row.asSummary.inBed,
-                coverage: SleepConfidence.Coverage(
+            let edgeCoverage: SleepConfidence.Coverage? = s >= retentionHorizon
+                ? SleepConfidence.Coverage(
                     inBedStart: s, inBedEnd: e,
                     lastMeasurementBeforeStart: (try? store.latestSample(kind: .heartRate, before: s))?.start,
                     firstMeasurementAfterEnd: (try? store.earliestSample(kind: .heartRate, after: e))?.start,
-                    earliestRetainedMeasurement: (try? store.earliestSample(kind: .heartRate))?.start))
+                    earliestRetainedMeasurement: (try? store.earliestSample(kind: .heartRate))?.start)
+                : nil
+            let assessment = SleepConfidence.assess(
+                asleep: row.asSummary.totalAsleep, inBed: row.asSummary.inBed,
+                coverage: edgeCoverage)
             edgeProvenance = ExportEngine.SleepEdgeProvenanceRow(
                 windowStart: s, windowEnd: e, assessment: assessment)
         }

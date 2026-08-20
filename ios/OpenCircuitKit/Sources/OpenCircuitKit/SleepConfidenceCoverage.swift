@@ -149,6 +149,17 @@ extension SleepConfidence {
         /// Trailing-edge provenance for these inputs (`WakeProvenance.classify`).
         public let wake: WakeProvenance.Verdict
 
+        /// The gap threshold `reasons` was produced under, carried on the verdict itself.
+        ///
+        /// Not decoration: the threshold is an UNFITTED round number behind a kill switch (read
+        /// `WakeProvenance.materialGapSeconds`), so a diagnostics bundle is only interpretable if it
+        /// states the cut its reasons were measured at. It used to be a separate defaulted argument
+        /// to `ExportEngine.SleepEdgeProvenanceRow.init(windowStart:windowEnd:assessment:)`, which
+        /// meant a caller sweeping the cut — the exact thing the parameter exists for — could
+        /// assess at one value and export the default beside those reasons, with nothing anywhere
+        /// able to detect the disagreement. Carrying it here makes that unrepresentable.
+        public let materialGapSeconds: TimeInterval
+
         /// Whether anything at all should be said about this night.
         public var flags: Bool { !reasons.isEmpty }
 
@@ -192,14 +203,21 @@ extension SleepConfidence {
         guard let c = coverage else {
             return Assessment(level: level,
                               reasons: level == .durationLikelyHigh ? [.durationLikelyHigh] : [],
-                              bedtime: .unknown, wake: .unknown)
+                              bedtime: .unknown, wake: .unknown,
+                              materialGapSeconds: materialGapSeconds)
         }
 
+        // Both edges take the same three inputs and both apply the retention guard themselves — see
+        // `WakeProvenance.classify`, which used to leave that guard to this function and so made the
+        // obvious API the unsafe one.
         let bedtime = BedtimeProvenance.classify(
             inBedStart: c.inBedStart,
             lastMeasurementBefore: c.lastMeasurementBeforeStart,
             earliestRetainedMeasurement: c.earliestRetainedMeasurement)
-        let wake = wakeVerdict(c)
+        let wake = WakeProvenance.classify(
+            inBedEnd: c.inBedEnd,
+            firstMeasurementAfter: c.firstMeasurementAfterEnd,
+            earliestRetainedMeasurement: c.earliestRetainedMeasurement)
 
         var reasons: [Reason] = []
 
@@ -214,40 +232,8 @@ extension SleepConfidence {
             reasons.append(.durationLikelyHigh)
         }
 
-        return Assessment(level: level, reasons: reasons, bedtime: bedtime, wake: wake)
-    }
-
-    /// `WakeProvenance.classify`, plus the RETENTION guard the leading edge gets for free and the
-    /// trailing edge does not.
-    ///
-    /// ⚠️ THE BUG THIS EXISTS TO PREVENT, found integrating the card. `StoredSample` rows are pruned
-    /// at `LocalStore.sampleRetentionDays` (30) on every launch, while `StoredSleepSummary` is kept
-    /// long-term — so a night older than that keeps its row and loses every raw sample around it.
-    /// The two edges then behave completely differently:
-    ///
-    ///   • FRONT: `latestSample(before:)` returns nil (everything earlier was pruned), and
-    ///     `BedtimeProvenance` answers `.unknown` because retention cannot reach back far enough.
-    ///     Silent, correct.
-    ///   • BACK: `earliestSample(after:)` happily returns the OLDEST SURVIVING ROW — the retention
-    ///     boundary, days later. Unguarded, `classify` reads that as a resume and the card says
-    ///     "nothing was recorded between 07:12 and <three weeks later>", reporting routine local
-    ///     housekeeping as a hole in the night. `ExportBuilder` already suppresses `ExportCoverage`
-    ///     for exactly this reason (its `retentionHorizon`); nothing did the same here.
-    ///
-    /// The guard is the data itself rather than a copy of the retention constant: if the oldest row
-    /// we still hold is NEWER than the night's trailing edge, then everything at and after that edge
-    /// has been pruned, so the "next" measurement is a boundary, not evidence. `.unknown` — which
-    /// ships silent — is the honest answer.
-    ///
-    /// A nil `earliestRetainedMeasurement` means the caller supplied no retention information (on
-    /// device it means an empty store, in which case there is no successor either), so the guard
-    /// does not apply and the raw verdict stands. Deliberate: the corpus harness withholds that
-    /// field on nights whose leading edge is undeterminable, and `R2_2026-08-17` — one of the two
-    /// 246-minute nights this whole change exists for — is one of them.
-    private static func wakeVerdict(_ c: Coverage) -> WakeProvenance.Verdict {
-        if let earliest = c.earliestRetainedMeasurement, earliest > c.inBedEnd { return .unknown }
-        return WakeProvenance.classify(inBedEnd: c.inBedEnd,
-                                       firstMeasurementAfter: c.firstMeasurementAfterEnd)
+        return Assessment(level: level, reasons: reasons, bedtime: bedtime, wake: wake,
+                          materialGapSeconds: materialGapSeconds)
     }
 
     /// Convenience overload for a staged-night `Summary`.

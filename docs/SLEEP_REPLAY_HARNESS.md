@@ -27,6 +27,14 @@ whatever reference the night carries.
 | `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/SleepReplayTests.swift` | the three command-line entry points |
 | `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/CorpusGateLoudnessTests.swift` | the gate on the gate: asserts an unset variable skips rather than passes, and source-audits this test target. A **tripwire, not a proof** — read its header for what it does and does not catch. Needs no corpus. |
 
+> **Adding an entry point?** Name its variable `OC_…CORPUS` and open it through
+> `SleepReplay.requireCorpus`. Two audit rules enforce that: any `OC_[A-Z0-9_]*CORPUS` literal
+> outside the gate fails, and the whole set of `OC_…` names this target reads is pinned in
+> `CorpusGateLoudnessTests`, so a new one is a deliberate one-line declaration. Both exist because a
+> variable read any other way ends in `guard let … else { return }`, which XCTest reports as
+> **passed** — the original defect, and one a differently-named variable silently reinstated until
+> the needle was widened from `OC_SLEEP…_CORPUS` on 2026-08-20.
+
 ---
 
 ## 1. Run it

@@ -208,10 +208,19 @@ final class ExportBuilderTests: XCTestCase {
         // The stage minutes of the pruned night are untouched — only the coverage claim is dropped.
         XCTAssertEqual(rows[0][7], "480", "the old night still exports its summary")
 
-        // …and the SAME hazard on the trailing edge, which has no retention horizon of its own.
-        // `earliestSample(after:)` for the pruned night returns the recent night's first HR row —
-        // 28 days later — and an unguarded classifier would export that as a 28-day silence, i.e.
-        // local housekeeping dressed as a hole in the night. It must read `unknown` with no gap.
+        // …and the SAME hazard on the trailing edge. `earliestSample(after:)` for the pruned night
+        // returns the recent night's first HR row — 28 days later — and an unguarded classifier
+        // would export that as a 28-day silence, i.e. local housekeeping dressed as a hole in the
+        // night. It must read `unknown` with no gap.
+        //
+        // TWO mechanisms now produce that, and this row is past BOTH: `sessionRow` short-circuits
+        // the three edge probes for a night older than `retentionHorizon` (passing no coverage at
+        // all — 0 fetches instead of 3), and `WakeProvenance.classify` guards on retention anyway
+        // for the nights that do get probed. They agree by construction: `assess(coverage: nil)`
+        // and a fully-pruned probe both yield unknown/unknown with the duration verdict intact.
+        // The guard itself is asserted independently and without the short-circuit in the Kit
+        // suite (`WakeProvenanceTests` "Retention", `SleepConfidenceCoverageTests` "Retention"), so
+        // this assertion is the END-TO-END check, not the only cover for either mechanism.
         // (bedtimeVerdict, bedtimeGapSeconds, wakeVerdict, wakeGapSeconds, confidenceReasons)
         XCTAssertEqual(rows[0][27], "unknown",
                        "retention no longer reaches this night's end — we cannot judge it")
@@ -255,7 +264,10 @@ final class ExportBuilderTests: XCTestCase {
         XCTAssertEqual(row[28], String(format: "%.1f", 4 * 3600.0),
                        "the gap is 06:00 → 10:00 — measured, not inferred")
         XCTAssertEqual(row[29], "noRecordingAfterWake",
-                       "and the file carries the caveat the card showed")
+                       "…and the file carries the reason the CLASSIFIER produced. Not a record of "
+                       + "anything the wearer saw: no coverage caveat ships in this build, the card "
+                       + "is deliberately parked, and this column is instrumentation collected "
+                       + "ahead of it.")
 
         // The claim the whole feature rests on: coverage still calls this window complete.
         XCTAssertNotEqual(row[21], "", "coverage is reportable for this night")
@@ -263,6 +275,64 @@ final class ExportBuilderTests: XCTestCase {
         XCTAssertGreaterThan(fraction, 0.95,
                              "coverageFraction sees a perfect night — which is exactly why the "
                              + "edge verdict had to be added: the hole starts AT the wake")
+    }
+
+    /// THE RETENTION SHORT-CIRCUIT, isolated from the classifier's own retention guard.
+    ///
+    /// Both nights below have their HR rows still present — nothing prunes an in-memory store — so
+    /// `earliestSample(kind:)` reaches back before BOTH of them and `WakeProvenance`'s guard cannot
+    /// fire for either. The only thing that can separate them is `sessionRow`'s horizon test. It
+    /// must:
+    ///   • probe the night inside the horizon and report its measured 4 h gap, and
+    ///   • not probe the night outside it at all, reporting `unknown` with no gap — the same
+    ///     "we do not vouch past retention" policy the coverage columns next door already apply,
+    ///     and the reason a full 365-day export no longer runs up to 1005 main-actor fetches that
+    ///     could only ever answer "unknown".
+    /// The duration verdict is retention-independent and must survive on both.
+    func testEdgeProbesAreSkippedPastTheRetentionHorizonAndKeptInsideIt() throws {
+        let store = try makeStore()
+        let now = at(0)
+        let day = 24.0
+        let horizon = -Double(LocalStore.sampleRetentionDays) * day
+
+        // Two identically shaped nights straddling the horizon: 6 h in bed, then 4 h of silence,
+        // then the stream resumes.
+        for startHour in [horizon - 2 * day, horizon + 2 * day] {
+            try save(night(from: startHour, to: startHour + 6), to: store)
+            var hr = stride(from: -3_600.0, to: 6 * 3600, by: 150).map { offset -> QuantitySample in
+                let t = at(startHour).addingTimeInterval(offset)
+                return QuantitySample(kind: .heartRate, start: t, end: t, value: 58)
+            }
+            hr += stride(from: 10 * 3600.0, to: 12 * 3600.0, by: 150).map { offset -> QuantitySample in
+                let t = at(startHour).addingTimeInterval(offset)
+                return QuantitySample(kind: .heartRate, start: t, end: t, value: 70)
+            }
+            _ = try store.ingest(hr)
+        }
+
+        guard case .file(let payload) = try ExportBuilder.build(
+            store: store, mode: .dateRange(start: at(horizon - 4 * day), end: now),
+            format: .csv, now: now) else { return XCTFail("expected a file") }
+        let rows = sessionRows(payload.content)
+        XCTAssertEqual(rows.count, 2, "both nights are in the file; only the PROBE differs")
+
+        // rows[0] is the older night — outside the horizon.
+        XCTAssertEqual(rows[0][27], "unknown",
+                       "a night past the retention horizon must not be probed; its edge verdict is "
+                       + "the honest 'we cannot vouch', not a measurement of rows we only still "
+                       + "hold because this store never prunes")
+        XCTAssertEqual(rows[0][28], "", "…and no gap, because none was measured")
+
+        // rows[1] is inside the horizon and must still be measured — without this the
+        // short-circuit could be "skip everything" and every test above would stay green.
+        XCTAssertEqual(rows[1][27], "stoppedThenResumed")
+        XCTAssertEqual(rows[1][28], String(format: "%.1f", 4 * 3600.0))
+        XCTAssertEqual(rows[1][29], "noRecordingAfterWake")
+
+        // The duration verdict reads the night's own two totals and is untouched by retention, so
+        // the skipped night keeps whatever the legacy classifier says about it — the skip removes
+        // an ACQUISITION claim, never the night.
+        XCTAssertEqual(rows[0][7], "360", "the skipped night still exports its summary")
     }
 
     // MARK: - 4. The DEFAULT format carries the honesty apparatus
