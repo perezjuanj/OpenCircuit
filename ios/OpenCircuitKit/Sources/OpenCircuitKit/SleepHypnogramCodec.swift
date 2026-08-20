@@ -11,7 +11,8 @@
 //     [[startEpochSeconds, endEpochSeconds, stageCode], …]
 //     [[startEpochSeconds, endEpochSeconds, stageCode, provenanceCode], …]
 // with stageCode 0=inBed 1=awake 2=asleepCore 3=asleepDeep 4=asleepREM
-// and provenanceCode 1=asserted 2=assertedOverMeasured (0 = measured, and it is OMITTED).
+// and provenanceCode 1=asserted 2=assertedOverMeasured 3=assertedCoverageUnknown
+// (0 = measured, and it is OMITTED).
 //
 // ⚠️ THE FOURTH ELEMENT IS WRITTEN ONLY WHEN PROVENANCE IS NOT `.measured`. An all-measured night —
 // which is every unedited night — therefore encodes to the IDENTICAL bytes it did before provenance
@@ -48,11 +49,17 @@ public enum SleepHypnogramCodec {
     ]
 
     /// Wire code for provenance. `.measured` is 0 and is never written — see the header.
+    ///
+    /// ⚠️ CODE 3 (`.assertedCoverageUnknown`) MUST DEGRADE UPWARD, and it does: a build that predates
+    /// it maps the unknown code to `.measured` via the `?? .measured` below, i.e. it counts and
+    /// publishes the span. That is the same thing this build does with it, and the same thing every
+    /// build did before provenance existed — so a downgrade cannot turn "we cannot tell" into
+    /// "nothing was recorded" and silently retract a user's sleep.
     private static let codeForProvenance: [SleepProvenance: Int] = [
-        .measured: 0, .asserted: 1, .assertedOverMeasured: 2
+        .measured: 0, .asserted: 1, .assertedOverMeasured: 2, .assertedCoverageUnknown: 3
     ]
     private static let provenanceForCode: [Int: SleepProvenance] = [
-        0: .measured, 1: .asserted, 2: .assertedOverMeasured
+        0: .measured, 1: .asserted, 2: .assertedOverMeasured, 3: .assertedCoverageUnknown
     ]
 
     /// Encode segments to the stored form. Segments that `decode` would refuse (reversed or

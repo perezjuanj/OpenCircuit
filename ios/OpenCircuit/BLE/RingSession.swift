@@ -1833,6 +1833,13 @@ final class RingSession: NSObject {
         // the app's own best case, so a caveat can never be an artifact of the scoping above. Pass
         // `nil` here to restore master byte-for-byte.
         //
+        // ⚠️ THE ARCHIVE IS A ~30-HOUR ROLLING WINDOW, AND `recompute` KNOWS IT. It runs this through
+        // `MeasuredCoverage.trusted(for:)`, which refuses to judge a window the archive holds no
+        // record for at all and treats ground older than the oldest surviving record as UNKNOWN
+        // rather than empty. Without that, editing a fully-recorded night two days later published
+        // 0.0 asleep minutes to Apple Health in place of 403.0 — retention read as absence. Handing
+        // the raw set to a coverage test is therefore not a neutral act; only the guarded read is.
+        //
         // 🟢 What it buys, measured on the tester night this exists for (R2_2026-08-18): the same
         // 403-minute headline is still displayed — the user asserted it and an assertion wins for
         // display — but 241.4 of those minutes are now tagged `.asserted` over a 4 h hole holding

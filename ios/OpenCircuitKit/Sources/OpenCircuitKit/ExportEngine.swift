@@ -667,13 +667,28 @@ public enum ExportEngine {
     }
 
     /// CSV for the per-epoch hypnogram: one row PER SEGMENT across all sessions, keyed back to
-    /// its session. Header: `sessionID,start,end,stage,durationSec`. Sessions with no recorded
-    /// hypnogram contribute no rows (absence, not a zero-length night).
+    /// its session. Header: `sessionID,start,end,stage,durationSec,provenance`. Sessions with no
+    /// recorded hypnogram contribute no rows (absence, not a zero-length night).
     ///
     /// The rows are a PARTITION: they never overlap, so `durationSec` may be summed per session.
     /// See `emittableHypnogram` for the envelope that is deliberately not emitted.
+    ///
+    /// 🟢 WHY `provenance` IS HERE, AND WHY LAST. CSV is the DEFAULT format on the export screen and
+    /// is the file most people actually hand to a clinician (see the schema-v3 block below, which
+    /// says so in those words) — and until this column existed, a 246-minute `asleepCore` block
+    /// invented over ground holding 2 of ~98 expected epochs serialised here BYTE-IDENTICALLY to
+    /// 246 minutes of recorded sleep. The JSON export had carried the distinction since provenance
+    /// shipped; the clinician's copy had not. Appended at the END so every existing positional
+    /// consumer keeps working.
+    ///
+    /// THE VOCABULARY IS THE JSON'S, EXACTLY: `SleepProvenance.rawValue`, i.e. `measured`,
+    /// `asserted`, `assertedOverMeasured`, `assertedCoverageUnknown`. Rendered from the same enum the
+    /// JSON renders, so the two cannot drift. One deliberate difference: JSON OMITS the key for
+    /// `.measured` (absence means measured, and that keeps an unedited night's JSON unchanged),
+    /// while CSV always prints it — a blank cell in a column of stage labels reads as "missing data",
+    /// which is the opposite of what it would mean.
     public static func hypnogramCSV(_ rows: [SleepSessionRow]) -> String {
-        var lines = ["sessionID,start,end,stage,durationSec"]
+        var lines = ["sessionID,start,end,stage,durationSec,provenance"]
         for r in rows {
             for seg in emittableHypnogram(r) {
                 lines.append(csvLine([
@@ -681,7 +696,8 @@ public enum ExportEngine {
                     offsetISO8601(seg.start),
                     offsetISO8601(seg.end),
                     seg.stage.rawValue,
-                    plainNumber(seg.duration)
+                    plainNumber(seg.duration),
+                    seg.provenance.rawValue
                 ]))
             }
         }
@@ -1077,6 +1093,15 @@ public enum ExportEngine {
             "distinction is explicit: hypnogramSegments is EMPTY (and the JSON hypnogram key is " +
             "absent) when no timeline was recorded, and 0 only when one was recorded and contained " +
             "no stage blocks.",
+        "hypnogramProvenance":
+            "Every hypnogram segment carries a provenance: measured = the ring recorded epochs " +
+            "across this span; asserted = the wearer edited their sleep window over ground holding " +
+            "NO ring data, so this block is their claim and not a measurement; " +
+            "assertedOverMeasured = the wearer's label sits on ground the ring did record, and the " +
+            "two disagree (the ring's own reading is kept separately); assertedCoverageUnknown = " +
+            "the wearer's claim over ground this app no longer retains records for, so neither " +
+            "reading is available. Only 'measured' is a device observation. In CSV the column is " +
+            "always present; in JSON the key is omitted when the value is 'measured'.",
         "exportRange":
             "meta.rangeStart and meta.rangeEnd are the window this file ACTUALLY covers, which can " +
             "be narrower than the one that was requested: the app caps how much it assembles in a " +

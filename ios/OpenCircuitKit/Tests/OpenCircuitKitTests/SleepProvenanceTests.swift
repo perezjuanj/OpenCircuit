@@ -50,7 +50,133 @@ final class MeasuredCoverageTests: XCTestCase {
     func testEmptyCoverageMakesEverythingUnmeasured() {
         XCTAssertEqual(MeasuredCoverage.empty.measuredDuration(in: at(0) ..< at(1000)), 0)
         XCTAssertEqual(MeasuredCoverage.empty.partition(at(0) ..< at(1000)).count, 1)
-        XCTAssertEqual(MeasuredCoverage.empty.partition(at(0) ..< at(1000)).first?.measured, false)
+        XCTAssertEqual(MeasuredCoverage.empty.partition(at(0) ..< at(1000)).first?.ground, .unmeasured)
+    }
+}
+
+// MARK: - The retention guard (M2)
+//
+// RETENTION MUST NEVER READ AS ABSENCE. Coverage comes from a rolling ~30 h archive; a night older
+// than that holds no records for a reason that has nothing to do with the ring. Measured on the
+// branch these tests were added to: an un-guarded read of a fully-recorded night edited two days
+// later published 0.0 asleep minutes to Apple Health where the shipped build published 403.0.
+
+final class MeasuredCoverageTrustTests: XCTestCase {
+
+    private let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+    private func at(_ m: Double) -> Date { t0.addingTimeInterval(m * 60) }
+
+    func testAWindowHoldingNoRecordAtAllIsUNKNOWNRatherThanEmpty() {
+        // The retention case in one line: every record we still hold is from AFTER the night.
+        let night = at(0) ..< at(480)
+        let archive = MeasuredCoverage(recordDates: [at(3000), at(3150)], epochSeconds: 150)
+        XCTAssertEqual(archive.fraction(of: night), 0, "the raw read really does say zero coverage")
+        XCTAssertNil(archive.trusted(for: night),
+                     "…and zero coverage over a window we hold nothing for is UNKNOWN, not empty")
+    }
+
+    func testOneRecordInsideTheWindowIsEnoughToTrustIt() {
+        let night = at(0) ..< at(480)
+        let archive = MeasuredCoverage(recordDates: [at(-600), at(200)], epochSeconds: 150)
+        let trusted = try? XCTUnwrap(archive.trusted(for: night))
+        XCTAssertEqual(trusted?.intervals, archive.intervals, "trusting must not change the ground")
+        XCTAssertEqual(trusted?.provenFrom, at(-600))
+    }
+
+    func testGroundOlderThanOurOldestRecordIsUnknownAndTheRestIsStillProven() throws {
+        // One record at minute 100, covering one 150 s epoch. A window opening at minute -60 reaches
+        // back past everything we hold.
+        let archive = MeasuredCoverage(recordDates: [at(100)], epochSeconds: 150)
+        let night = at(-60) ..< at(480)
+        let trusted = try XCTUnwrap(archive.trusted(for: night))
+        let parts = trusted.partition(night)
+        XCTAssertEqual(parts.map(\.ground), [.unknown, .measured, .unmeasured],
+                       "before the oldest record = unknown; after it, silence is evidence")
+        XCTAssertEqual(parts[0].range, at(-60) ..< at(100))
+        XCTAssertEqual(parts[2].range, at(102.5) ..< at(480))
+    }
+
+    func testAGapStraddlingTheHorizonIsSplitAtIt() throws {
+        // Two record islands; the window opens inside the earlier one's past.
+        let archive = MeasuredCoverage(intervals: [at(0) ..< at(60), at(200) ..< at(260)])
+        let trusted = try XCTUnwrap(archive.trusted(for: at(-100) ..< at(300)))
+        let parts = trusted.partition(at(-100) ..< at(300))
+        XCTAssertEqual(parts.map(\.ground), [.unknown, .measured, .unmeasured, .measured, .unmeasured])
+        XCTAssertEqual(parts[0].range, at(-100) ..< at(0), "split exactly at the oldest record")
+    }
+
+    func testTrustIsRefusedForAReversedOrEmptyWindow() {
+        let archive = MeasuredCoverage(recordDates: [at(0)], epochSeconds: 150)
+        XCTAssertNil(archive.trusted(for: at(10) ..< at(10)))
+        XCTAssertNil(MeasuredCoverage.empty.trusted(for: at(0) ..< at(100)))
+    }
+}
+
+final class SleepEditRetentionGuardTests: XCTestCase {
+
+    private let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+    private func at(_ m: Double) -> Date { t0.addingTimeInterval(m * 60) }
+
+    /// A fully-recorded night: base staging across the whole window, and the user nudges wake by
+    /// 10 minutes. This is the M2 scenario — the only variable is how old the archive is.
+    private var base: [SleepSegment] {
+        [SleepSegment(start: at(0), end: at(480), stage: .inBed),
+         SleepSegment(start: at(0), end: at(480), stage: .asleepCore)]
+    }
+    private var times: SleepEdit.Times {
+        SleepEdit.Times(inBedStart: at(0), sleepOnset: at(0), sleepWake: at(490))
+    }
+
+    func testAnArchiveThatRolledPastTheNightCannotShrinkIt() {
+        // Two days later: the archive holds only recent records, none from this night.
+        let rolled = MeasuredCoverage(recordDates: [at(4000), at(4150)], epochSeconds: 150)
+        let out = SleepEdit.recompute(baseSegments: base, times: times, coverage: rolled)
+        let master = SleepEdit.recompute(baseSegments: base, times: times, coverage: nil)
+
+        XCTAssertEqual(out, master, "a night the archive cannot speak about must behave as master")
+        XCTAssertFalse(out.containsAssertedTime)
+        XCTAssertEqual(SleepStaging.totalAsleep(out.healthPublishable),
+                       SleepStaging.totalAsleep(master.healthPublishable),
+                       "…and Apple Health must receive exactly what it received before")
+        XCTAssertTrue(out.withheldSpans.isEmpty, "nothing withheld ⇒ nothing can be deleted")
+    }
+
+    func testTheSameNightSTILLSHRINKSWhileTheArchiveHoldsIt() {
+        // The guard must not be a blanket off-switch: with the records still in hand, the 10-minute
+        // extension past the last record is invented and is tagged as such.
+        let held = MeasuredCoverage(intervals: [at(0) ..< at(480)])
+        let out = SleepEdit.recompute(baseSegments: base, times: times, coverage: held)
+        XCTAssertTrue(out.containsAssertedTime)
+        XCTAssertEqual(SleepProvenanceBreakdown(segments: out).assertedAsleep, 600, accuracy: 1,
+                       "the 10 minutes past the last record are the user's claim")
+    }
+
+    func testAHalfRetainedNightPublishesTheUnREACHABLEHalfAndWithholdsTheProvenHole() {
+        // RETENTION CUT THIS NIGHT IN TWO, and it cut the staging with it — both come from the same
+        // archive, so the surviving base covers only the retained half (240→480). The user's window
+        // still runs 0→490.
+        //
+        //   0   → 240  we hold no records AND cannot reach back that far  → UNKNOWN → published
+        //   240 → 480  records, staged                                    → measured
+        //   480 → 490  past our newest record, and we hold everything after it → proven hole
+        let retainedBase = [SleepSegment(start: at(240), end: at(480), stage: .inBed),
+                            SleepSegment(start: at(240), end: at(480), stage: .asleepCore)]
+        let half = MeasuredCoverage(intervals: [at(240) ..< at(480)])
+        let out = SleepEdit.recompute(baseSegments: retainedBase, times: times, coverage: half)
+        let b = SleepProvenanceBreakdown(segments: out)
+
+        XCTAssertEqual(b.unknownAsleep, 240 * 60, accuracy: 1,
+                       "the pre-archive half is UNKNOWN, not a hole")
+        XCTAssertEqual(b.assertedAsleep, 600, accuracy: 1, "only the tail is proven unmeasured")
+        XCTAssertEqual(b.measuredAsleep, 240 * 60, accuracy: 1)
+        XCTAssertEqual(b.displayedAsleep, 490 * 60, accuracy: 1, "the card total is untouched")
+        XCTAssertEqual(b.unknownInBed, 240 * 60, accuracy: 1)
+
+        // Health keeps the unknown half — that is the whole point of the third bucket. Only the
+        // 10 proven minutes are withheld, and only they can gate a delete.
+        let published = out.healthPublishable
+        XCTAssertEqual(SleepStaging.totalAsleep(published), 480 * 60, accuracy: 1)
+        XCTAssertEqual(out.withheldSpans.map(\.duration), [600])
     }
 }
 

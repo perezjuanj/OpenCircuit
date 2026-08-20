@@ -7,10 +7,17 @@
 // display and a user who dragged their window to 06:43 must not be told they slept until 02:37.
 // Everything a third party could mistake for a measurement is computed here instead.
 //
-// WHAT COUNTS AS MEASURED. `.measured` and `.assertedOverMeasured` both do. The second is a user
-// LABEL sitting on real recorded ground — the label wins for display and the ground is real, so the
-// span belongs in both numerator and denominator. Only `.asserted` — a claim over nothing — is
-// excluded. Getting this backwards would delete the user's corrections from their own statistics.
+// WHAT COUNTS AS MEASURED. `.measured` and `.assertedOverMeasured` both do (`hasMeasurement`). The
+// second is a user LABEL sitting on real recorded ground — the label wins for display and the ground
+// is real, so the span belongs in both numerator and denominator. Getting this backwards would
+// delete the user's corrections from their own statistics.
+//
+// THREE BUCKETS, NOT TWO, AND THE THIRD IS LOAD-BEARING. `.asserted` is a claim over ground we can
+// PROVE holds no records, and it is the only thing excluded from a derived number. Ground our
+// retained records cannot reach is `.assertedCoverageUnknown` and lands in its own `unknown*`
+// bucket: counted in the display total, published to Health, never quoted as either measurement or
+// hole. Collapsing it into `asserted` is precisely how retention got read as absence (measured: 403
+// asleep-minutes to 0.0 in Apple Health — see `MeasuredCoverage.trusted(for:)`).
 //
 // 🟢 WORKED EXAMPLE, re-derived from raw bytes 2026-08-20 (`R2_2026-08-18`, Gen 2 Air, Europe/Paris):
 //   in-bed window 23:24 → 06:43 (439 min), of which 195.1 min is covered ground (fraction 0.444)
@@ -73,12 +80,19 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
     public let coveredInBed: TimeInterval
     /// Asleep (core + deep + REM) over covered ground.
     public let measuredAsleep: TimeInterval
-    /// Asleep the user asserted over ground holding no records at all.
+    /// Asleep the user asserted over ground we can PROVE holds no records.
     public let assertedAsleep: TimeInterval
+    /// Asleep the user asserted over ground our retained records cannot speak about at all — neither
+    /// measured nor provably empty. Counted in the display total and published to Health, exactly as
+    /// before provenance existed; kept in its own bucket so it is never quoted as either of the
+    /// other two.
+    public let unknownAsleep: TimeInterval
     /// Awake over covered ground.
     public let measuredAwake: TimeInterval
-    /// Awake the user asserted over ground holding no records at all.
+    /// Awake the user asserted over ground we can PROVE holds no records.
     public let assertedAwake: TimeInterval
+    /// Awake over ground our retained records cannot speak about. See `unknownAsleep`.
+    public let unknownAwake: TimeInterval
     /// Per-stage seconds over covered ground only. Unmeasured time has no defensible stage.
     public let measuredLight: TimeInterval
     public let measuredDeep: TimeInterval
@@ -92,15 +106,27 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
 
     /// Share of the in-bed window the ring recorded across, 0…1. 1 on any night with no asserted
     /// time — which is every unedited night.
+    ///
+    /// ⚠️ UNKNOWN GROUND IS NOT IN THE NUMERATOR. A night whose window reaches back past our oldest
+    /// retained record reports a LOW fraction for a reason that is partly about our retention and
+    /// only partly about the ring — read `unknownAsleep`/`unknownInBed` before quoting this as a
+    /// statement about the device.
     public var coverageFraction: Double {
         totalInBed > 0 ? coveredInBed / totalInBed : 0
     }
 
-    /// The headline the CARD shows: measured plus asserted. Clause 1 — an assertion wins for display.
-    public var displayedAsleep: TimeInterval { measuredAsleep + assertedAsleep }
-    public var displayedAwake: TimeInterval { measuredAwake + assertedAwake }
+    /// In-bed time our retained records cannot speak about — the part of `totalInBed` that is
+    /// neither `coveredInBed` nor a proven hole.
+    public let unknownInBed: TimeInterval
 
-    /// True when any of this night's displayed sleep is a claim over nothing.
+    /// The headline the CARD shows: everything, however we came by it. Clause 1 — an assertion wins
+    /// for display.
+    public var displayedAsleep: TimeInterval { measuredAsleep + assertedAsleep + unknownAsleep }
+    public var displayedAwake: TimeInterval { measuredAwake + assertedAwake + unknownAwake }
+
+    /// True when any of this night's displayed sleep is a claim over ground we can prove holds no
+    /// records. Deliberately NOT true for unknown ground: that is the pre-provenance situation, and
+    /// flagging it would caveat every night older than the archive.
     public var hasAssertedTime: Bool { assertedAsleep > 0 || assertedAwake > 0 }
 
     /// Sleep efficiency over COVERED GROUND ONLY — `nil` when there is not enough covered in-bed
@@ -127,12 +153,23 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
         return coverageFraction >= tuning.minCoverageForScore
     }
 
+    /// In-bed time we can PROVE holds no records — `totalInBed` less the covered part AND less the
+    /// part our retained records cannot speak about. This is the only quantity entitled to be
+    /// described in words as "holds no ring data".
+    public var provenUnmeasuredInBed: TimeInterval {
+        max(0, totalInBed - coveredInBed - unknownInBed)
+    }
+
     /// A one-line reason a number was withheld, for the export and the diagnostics bundle. `nil`
     /// when nothing is withheld.
+    ///
+    /// ⚠️ IT COUNTS ONLY PROVEN GROUND. Using `totalInBed - coveredInBed` here would fold in the
+    /// unknown bucket and state as fact that the ring recorded nothing across minutes we simply no
+    /// longer hold records for — 🟢 143 of the 389 minutes this sentence used to claim on
+    /// `R2_2026-08-17` were exactly that.
     public var withheldReason: String? {
         guard tuning.withholdingEnabled, hasAssertedTime else { return nil }
-        let unmeasured = max(0, totalInBed - coveredInBed)
-        let mins = Int((unmeasured / 60).rounded())
+        let mins = Int((provenUnmeasuredInBed / 60).rounded())
         return "\(mins) min of this night's \(Int((totalInBed / 60).rounded())) min in-bed window "
             + "holds no ring data"
     }
@@ -154,24 +191,30 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
         if inBedLayer.isEmpty {
             let staged = sum { $0.stage != .inBed }
             totalInBed = staged
-            coveredInBed = sum { $0.stage != .inBed && !$0.provenance.isUnmeasured }
+            coveredInBed = sum { $0.stage != .inBed && $0.provenance.hasMeasurement }
+            unknownInBed = sum { $0.stage != .inBed && $0.provenance.isCoverageUnknown }
         } else {
             totalInBed = sum { $0.stage == .inBed }
-            coveredInBed = sum { $0.stage == .inBed && !$0.provenance.isUnmeasured }
+            coveredInBed = sum { $0.stage == .inBed && $0.provenance.hasMeasurement }
+            unknownInBed = sum { $0.stage == .inBed && $0.provenance.isCoverageUnknown }
         }
 
-        measuredAsleep = sum { asleepStages.contains($0.stage) && !$0.provenance.isUnmeasured }
-        assertedAsleep = sum { asleepStages.contains($0.stage) && $0.provenance.isUnmeasured }
-        measuredAwake = sum { $0.stage == .awake && !$0.provenance.isUnmeasured }
-        assertedAwake = sum { $0.stage == .awake && $0.provenance.isUnmeasured }
-        measuredLight = sum { $0.stage == .asleepCore && !$0.provenance.isUnmeasured }
-        measuredDeep = sum { $0.stage == .asleepDeep && !$0.provenance.isUnmeasured }
-        measuredREM = sum { $0.stage == .asleepREM && !$0.provenance.isUnmeasured }
+        measuredAsleep = sum { asleepStages.contains($0.stage) && $0.provenance.hasMeasurement }
+        assertedAsleep = sum { asleepStages.contains($0.stage) && $0.provenance.isProvenUnmeasured }
+        unknownAsleep = sum { asleepStages.contains($0.stage) && $0.provenance.isCoverageUnknown }
+        measuredAwake = sum { $0.stage == .awake && $0.provenance.hasMeasurement }
+        assertedAwake = sum { $0.stage == .awake && $0.provenance.isProvenUnmeasured }
+        unknownAwake = sum { $0.stage == .awake && $0.provenance.isCoverageUnknown }
+        measuredLight = sum { $0.stage == .asleepCore && $0.provenance.hasMeasurement }
+        measuredDeep = sum { $0.stage == .asleepDeep && $0.provenance.hasMeasurement }
+        measuredREM = sum { $0.stage == .asleepREM && $0.provenance.hasMeasurement }
 
-        // Longest unmeasured run: merge the asserted spans (the in-bed layer and the stage layer
-        // overlap, so a naive max over segments would report the shorter of two views of one hole).
+        // Longest PROVEN unmeasured run: merge the asserted spans (the in-bed layer and the stage
+        // layer overlap, so a naive max over segments would report the shorter of two views of one
+        // hole). Unknown ground is excluded on purpose — a gap we cannot vouch for must not be
+        // reported as "the ring recorded nothing for N hours".
         let assertedSpans = segments
-            .filter { $0.provenance.isUnmeasured && $0.end > $0.start }
+            .filter { $0.provenance.isProvenUnmeasured && $0.end > $0.start }
             .map { $0.start ..< $0.end }
         longestUnmeasuredGap = MeasuredCoverage(intervals: assertedSpans).intervals
             .map { $0.upperBound.timeIntervalSince($0.lowerBound) }
@@ -198,7 +241,7 @@ public extension Array where Element == SleepSegment {
     /// ⚠️ NOT the Apple Health filter. This drops the unmeasured part of the `.inBed` layer too,
     /// which is right for a denominator ("covered in-bed") and wrong for Health, where the in-bed
     /// span is a user claim we have no reason to doubt. Use `healthPublishable` there.
-    var measuredOnly: [SleepSegment] { filter { !$0.provenance.isUnmeasured } }
+    var measuredOnly: [SleepSegment] { filter { $0.provenance.hasMeasurement } }
 
     /// What may be written to Apple Health.
     ///
@@ -213,17 +256,35 @@ public extension Array where Element == SleepSegment {
     /// Sleep UI included — sums `asleepCore + asleepDeep + asleepREM + asleepUnspecified`, so it
     /// would land in third-party totals identically to `.asleepCore`. It looks like a compromise and
     /// functions as the status quo.
+    ///
+    /// ⚠️ `.assertedCoverageUnknown` PUBLISHES. Only a PROVEN hole is withheld. Ground our retained
+    /// records cannot reach is written exactly as the pre-provenance build wrote it — see
+    /// `MeasuredCoverage.trusted(for:)` for the 403-minutes-to-zero measurement that rule exists for.
     var healthPublishable: [SleepSegment] {
-        filter { $0.stage == .inBed || !$0.provenance.isUnmeasured }
+        filter { $0.stage == .inBed || !$0.provenance.isProvenUnmeasured }
     }
 
-    /// True when any segment is a claim over ground holding no records.
-    var containsAssertedTime: Bool { contains { $0.provenance.isUnmeasured } }
+    /// True when any segment is a claim over ground we can PROVE holds no records.
+    var containsAssertedTime: Bool { contains { $0.provenance.isProvenUnmeasured } }
 
     /// Asleep seconds that would reach Health today but must not — the retraction quantity.
     var unmeasuredAsleepSeconds: TimeInterval {
         let asleep: Set<SleepStage> = [.asleepCore, .asleepDeep, .asleepREM]
-        return filter { asleep.contains($0.stage) && $0.provenance.isUnmeasured }
+        return filter { asleep.contains($0.stage) && $0.provenance.isProvenUnmeasured }
             .reduce(0) { $0 + Swift.max(0, $1.duration) }
+    }
+
+    /// The spans this app is DECLINING to publish — the exact ground a coverage-driven shrink
+    /// removes from a Health write. Merged, so overlapping stage/in-bed views of one hole count once.
+    ///
+    /// ⚠️ ITS ONE PRODUCTION CONSUMER IS A DELETE PREDICATE, AND THAT IS THE POINT. Withholding a
+    /// span from our own write is reversible — the next sync can add it. Deleting Apple Health
+    /// samples across the same span is not, and it would take with it whatever an earlier, better-
+    /// informed run of this app had already written there. See `deletePriorEditedNightSleep`.
+    var withheldSpans: [DateInterval] {
+        let spans = filter { $0.provenance.isProvenUnmeasured && $0.end > $0.start }
+            .map { $0.start ..< $0.end }
+        return MeasuredCoverage(intervals: spans).intervals
+            .map { DateInterval(start: $0.lowerBound, end: $0.upperBound) }
     }
 }

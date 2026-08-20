@@ -334,8 +334,13 @@ final class HealthKitWriter {
                     // them (otherwise an extension written here would survive the trim).
                     let uuids = try await writeReturningSleepUUIDs(edit.segments)
                     store.appendSleepEditHealthUUIDs(uuids, night: edit.night)
-                    try store.markSleepEditHealthWritten(night: edit.night, segments: edit.segments)
-                    result.sleepSegments += edit.segments.count
+                    // Watermark from what Health actually received, never from what was proposed —
+                    // see the note in `reconcileEditedNightSleepLocked` step 3. This is the path
+                    // where it bites hardest: a leading extension withheld by the coverage filter and
+                    // watermarked anyway is never offered again, so it could never be backfilled.
+                    let published = edit.segments.healthPublishable
+                    try store.markSleepEditHealthWritten(night: edit.night, segments: published)
+                    result.sleepSegments += published.count
                     writtenKinds.insert(.sleep)
                 } catch {
                     pendingFlushFailures.insert(.sleep)
@@ -1750,11 +1755,21 @@ final class HealthKitWriter {
         //    cleanup — always EXCLUDING the fresh write AND every Health-written nap window (so a nap
         //    the night later grew over is never deleted). Returns prior UUIDs we could NOT confirm
         //    deleted, so we keep tracking them for a retry instead of forgetting them.
+        //
+        //    ⚠️ AND EXCLUDING EVERY SPAN THE COVERAGE FILTER WITHHELD. A coverage-driven shrink must
+        //    never drive a Health DELETE. Withholding a span from our own write is reversible — the
+        //    next sync can add it back. Deleting across that span is not, and what it removes is
+        //    whatever an earlier, better-informed run wrote there, when the epoch archive still held
+        //    the records this run no longer does. Retention already fooled this code once (measured:
+        //    403.0 asleep-min in Apple Health replaced by 0.0 on a fully-recorded night edited two
+        //    days late); `MeasuredCoverage.trusted(for:)` is the primary guard and this is the
+        //    backstop that keeps the failure non-destructive even if that guard is ever wrong.
         let napWindows = local.healthWrittenNapWindows(overlapping: recordedStart, to: recordedEnd)
         let survivingPrior = await deletePriorEditedNightSleep(
             priorUUIDs: local.sleepEditHealthUUIDs(night: night),
             recordedStart: recordedStart, recordedEnd: recordedEnd,
-            napWindows: napWindows, keeping: newUUIDs)
+            napWindows: napWindows, keeping: newUUIDs,
+            withheld: editedSegments.withheldSpans)
 
         // 2b. Sweep auto-naps the EDITED window absorbed. Nothing else can: `mirrorSettledNight`
         //     leaves edited nights entirely alone, and the transition cleanup above deletes only
@@ -1787,11 +1802,20 @@ final class HealthKitWriter {
 
         // 3. Track (fresh write + any prior we couldn't delete), and pin the watermarks so the periodic
         //    flush neither re-adds the trimmed recorded tail nor re-appends the leading extension.
+        //
+        //    ⚠️ THE WATERMARKS COME FROM WHAT WAS ACTUALLY WRITTEN, NOT FROM WHAT WAS PROPOSED. The
+        //    write above is `editedSegments.healthPublishable`; pinning the edges from the unfiltered
+        //    set would declare a leading extension "already in Health" that the coverage filter had
+        //    just withheld, and `pendingSleepEditHealthWrites` would then never offer it again — so
+        //    the sleep could not be added later even once the records arrived to justify it. A
+        //    watermark is a claim about Apple Health, and it must only ever be made about samples
+        //    Apple Health received.
         local.setSleepEditHealthUUIDs(newUUIDs + survivingPrior, night: night)
-        let editedEnd = editedSegments.map(\.end).max() ?? recordedEnd
+        let published = editedSegments.healthPublishable
+        let editedEnd = published.map(\.end).max() ?? recordedEnd
         try? local.forceSleepCursorAtLeast(max(recordedEnd, editedEnd))
-        try? local.markSleepEditHealthWritten(night: night, segments: editedSegments)
-        try? local.markSleepEditHealthCovered(by: editedSegments)
+        try? local.markSleepEditHealthWritten(night: night, segments: published)
+        try? local.markSleepEditHealthCovered(by: published)
         return true   // applied to Health; caller clears the pending marker (conditionally, on drain)
     }
 
@@ -1803,7 +1827,8 @@ final class HealthKitWriter {
     /// confirmed deleted, so the caller keeps tracking them.
     private func deletePriorEditedNightSleep(priorUUIDs: [String], recordedStart: Date,
                                              recordedEnd: Date, napWindows: [DateInterval],
-                                             keeping newUUIDs: [String]) async -> [String] {
+                                             keeping newUUIDs: [String],
+                                             withheld: [DateInterval] = []) async -> [String] {
         let type = HKCategoryType(.sleepAnalysis)
         let keep = Set(newUUIDs.compactMap { UUID(uuidString: $0) })
 
@@ -1834,6 +1859,13 @@ final class HealthKitWriter {
         for window in napWindows {
             subs.append(NSCompoundPredicate(notPredicateWithSubpredicate:
                 HKQuery.predicateForSamples(withStart: window.start, end: window.end, options: [])))
+        }
+        // The coverage filter's withheld ground, protected in the same way a nap window is. This is
+        // the one clause that makes "we decline to publish X" incapable of ALSO meaning "and delete
+        // whatever is already there across X" — see the call site.
+        for span in withheld where span.duration > 0 {
+            subs.append(NSCompoundPredicate(notPredicateWithSubpredicate:
+                HKQuery.predicateForSamples(withStart: span.start, end: span.end, options: [])))
         }
         let pred = subs.count == 1 ? subs[0] : NSCompoundPredicate(andPredicateWithSubpredicates: subs)
         _ = try? await store.deleteObjects(of: type, predicate: pred)
@@ -1897,6 +1929,14 @@ final class HealthKitWriter {
         if store.authorizationStatus(for: HKCategoryType(.sleepAnalysis)) == .sharingDenied {
             return .failed
         }
+
+        // A COVERAGE-DRIVEN SHRINK MUST NEVER DRIVE THIS PATH'S DELETE. Step 2 below deletes across a
+        // SPAN, with no withheld-ground protection, because nothing that reaches here should ever
+        // carry withheld ground: `SleepStaging.classify` emits only `.measured`, and an edited night
+        // returned at the guard above. If that ever stops being true, this path would write a filtered
+        // night and then delete the span it declined to fill — the exact irreversible shape of M2. Bail
+        // instead; the edit reconcile, which IS protected, owns any night with asserted time.
+        if segments.containsAssertedTime { return .unchanged }
 
         let signature = Self.sleepSignature(segments)
         let last = local.mirroredNight(night: night)

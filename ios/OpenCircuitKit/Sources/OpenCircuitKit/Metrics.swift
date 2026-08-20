@@ -96,27 +96,50 @@ public enum SleepStage: String, Codable, CaseIterable, Sendable {
 /// was 246 minutes over ground holding 2 of ~98 expected epochs (2.0 % covered), and it was counted
 /// in full: 403 min asleep, 0.918 efficiency, score 71, and 1:1 into Apple Health as real sleep.
 ///
-/// The governing rule, in three clauses:
+/// The governing rule, in four clauses:
 ///   1. AN ASSERTION ALWAYS WINS FOR DISPLAY — it is the user's record and they were there.
 ///   2. A MEASUREMENT IS NEVER DESTROYED — the ring-derived hypnogram is persisted separately.
-///   3. ASSERTED-**UNMEASURED** TIME NEVER ENTERS A DERIVED NUMBER — not a stage minute, not
+///   3. ASSERTED-**PROVEN-UNMEASURED** TIME NEVER ENTERS A DERIVED NUMBER — not a stage minute, not
 ///      efficiency, not the sleep score, not a headache feature, and never Apple Health as sleep.
+///   4. AND WE MUST BE ABLE TO PROVE IT. "We hold no records here" is only evidence of absence when
+///      our record set could have held them. Where it could not — the ground predates what we still
+///      retain — the honest answer is `.assertedCoverageUnknown`, which behaves EXACTLY as this app
+///      behaved before provenance existed: counted, displayed, published.
 ///
 /// Note clause 3 excludes `.asserted` only. `.assertedOverMeasured` is a user label sitting on top
 /// of real recorded ground: the label wins (clause 1) and the ground is real, so it participates in
-/// derived numbers normally. That distinction is the whole reason there are three cases and not two.
+/// derived numbers normally.
 public enum SleepProvenance: String, Codable, CaseIterable, Sendable {
     /// The ring recorded epochs across this span and this is what they said.
     case measured
-    /// The user asserted this span and the ring recorded NOTHING here. Honoured for display and
-    /// for in-bed; excluded from every derived statistic; never written to Health as sleep.
+    /// The user asserted this span and the ring recorded NOTHING here, AND our record set reaches
+    /// back far enough to prove it. Honoured for display and for in-bed; excluded from every derived
+    /// statistic; never written to Health as sleep.
     case asserted
     /// The user asserted this span and the ring DID record here — the two disagree. The user's
     /// label is displayed and counted; the ring's reading survives in the recorded hypnogram.
     case assertedOverMeasured
+    /// The user asserted this span and WE CANNOT SAY whether the ring recorded across it, because
+    /// the span lies outside the reach of the records we still hold (see `MeasuredCoverage.trusted`).
+    ///
+    /// ⚠️ THIS IS "WE DO NOT KNOW", NOT "NOTHING WAS RECORDED", AND THE DIFFERENCE IS THE WHOLE
+    /// POINT. 🟢 Measured on the branch this case was added to fix: editing a fully-recorded night
+    /// two days later, after the 30-hour epoch archive had rolled past it, published **0.0** asleep
+    /// minutes to Apple Health where the shipped build published 403.0 — and deleted the previously
+    /// written samples on the way. Retention had been read as absence. This case behaves in every
+    /// respect like the pre-provenance build (counted, displayed, published, never a delete driver),
+    /// so an unprovable claim can only ever cost us a caveat, never a user's data.
+    case assertedCoverageUnknown
 
-    /// True when no measurement underlies this span — the only case clause 3 excludes.
-    public var isUnmeasured: Bool { self == .asserted }
+    /// True when no measurement underlies this span AND we can prove it — the only case clause 3
+    /// excludes. Named `isProvenUnmeasured`, not `isUnmeasured`, precisely so a reader cannot mistake
+    /// `.assertedCoverageUnknown` for it.
+    public var isProvenUnmeasured: Bool { self == .asserted }
+    /// True when real recorded ground underlies this span, whoever chose the label. This is the
+    /// predicate a DERIVED STATISTIC's covered ground is built from.
+    public var hasMeasurement: Bool { self == .measured || self == .assertedOverMeasured }
+    /// True when we hold no records here but cannot prove none were ever recorded.
+    public var isCoverageUnknown: Bool { self == .assertedCoverageUnknown }
     /// True when the user, not the ring, chose this label.
     public var isAsserted: Bool { self != .measured }
 }

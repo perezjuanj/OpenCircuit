@@ -315,11 +315,16 @@ public enum SleepEdit {
     ///   — it reproduces the pre-provenance behaviour byte-for-byte, every emitted segment carrying
     ///   the default `.measured`. Non-nil splits every FILL span against the coverage so invented
     ///   time is tagged `.asserted` and can be excluded from derived numbers and from Health.
+    ///   It is passed through `MeasuredCoverage.trusted(for:)` FIRST — a record set that cannot
+    ///   speak about this window collapses to the same `nil` the kill switch passes.
     public static func recompute(baseSegments: [SleepSegment], window: Window,
                                  fillStage: SleepStage = .asleepCore,
-                                 coverage: MeasuredCoverage? = nil) -> [SleepSegment] {
+                                 coverage rawCoverage: MeasuredCoverage? = nil) -> [SleepSegment] {
         let start = window.inBedStart, end = window.inBedEnd
         guard end > start else { return [] }
+        // THE RETENTION GUARD, APPLIED ONCE FOR THE WHOLE NIGHT. Not per fill span: a per-span test
+        // would answer a different question for the leading and trailing fills of one window.
+        let coverage = rawCoverage?.trusted(for: start ..< end)
 
         // Clip each base segment to the window; drop any that fall entirely outside.
         let sortedBase = baseSegments.sorted { $0.start < $1.start }
@@ -370,7 +375,13 @@ public enum SleepEdit {
     /// applied to only some of them is a false sense of safety.
     ///
     /// `coverage == nil` returns exactly one `.measured` segment — bit-for-bit what the pre-
-    /// provenance code emitted, which is what makes the kill switch a true no-op.
+    /// provenance code emitted, which is what makes the kill switch a true no-op. It is also what an
+    /// UNTRUSTWORTHY record set collapses to (`MeasuredCoverage.trusted(for:)` returns nil), so
+    /// "we were told not to test" and "we cannot honestly test" take the same safe path.
+    ///
+    /// ⚠️ THE CALLER MUST HAVE APPLIED `trusted(for:)` ALREADY. Passing a raw coverage here works —
+    /// its `provenFrom` is `.distantPast`, so nothing comes back `.unknown` — and that is exactly the
+    /// unguarded behaviour whose measured cost was 403 asleep-minutes becoming 0.0 in Apple Health.
     private static func fill(_ range: Range<Date>, stage: SleepStage,
                              coverage: MeasuredCoverage?) -> [SleepSegment] {
         guard range.upperBound > range.lowerBound else { return [] }
@@ -379,7 +390,17 @@ public enum SleepEdit {
         }
         return coverage.partition(range).map { piece in
             SleepSegment(start: piece.range.lowerBound, end: piece.range.upperBound, stage: stage,
-                         provenance: piece.measured ? .assertedOverMeasured : .asserted)
+                         provenance: SleepEdit.provenance(for: piece.ground))
+        }
+    }
+
+    /// The one place ground becomes a label. `.unknown` is `.assertedCoverageUnknown`, NOT
+    /// `.asserted`: the difference is a Health write surviving or being withheld.
+    public static func provenance(for ground: MeasuredCoverage.Ground) -> SleepProvenance {
+        switch ground {
+        case .measured:   .assertedOverMeasured
+        case .unmeasured: .asserted
+        case .unknown:    .assertedCoverageUnknown
         }
     }
 
@@ -412,9 +433,16 @@ public enum SleepEdit {
     /// visible and undoable rather than silently resolved by deletion.
     public static func recompute(baseSegments: [SleepSegment], times: Times,
                                  fillStage: SleepStage = .asleepCore,
-                                 coverage: MeasuredCoverage? = nil) -> [SleepSegment] {
+                                 coverage rawCoverage: MeasuredCoverage? = nil) -> [SleepSegment] {
         guard times.sleepWake > times.sleepOnset,
               times.sleepOnset >= times.inBedStart else { return [] }
+
+        // THE RETENTION GUARD, once, against the WHOLE in-bed window — the widest thing this call
+        // will label. `nil` back means our record set cannot speak about this night at all, and every
+        // fill below then behaves exactly as it did before provenance existed. 🟢 The case it is for:
+        // a night edited two days after it happened, once the ~30 h epoch archive has rolled past it,
+        // where the unguarded read published 0.0 asleep minutes to Health in place of 403.0.
+        let coverage = rawCoverage?.trusted(for: times.inBedStart ..< times.inBedEnd)
 
         let stageBase = baseSegments
             .filter { $0.stage != .inBed }

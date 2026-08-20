@@ -180,6 +180,67 @@ final class SleepEditStoreTests: XCTestCase {
                        "re-edit must append only the newly exposed bedtime slice")
     }
 
+    // MARK: A WATERMARK IS A CLAIM ABOUT APPLE HEALTH
+    //
+    // The edit paths write `segments.healthPublishable`, which drops any span the coverage filter
+    // could prove holds no ring data. The watermarks must therefore be pinned from the PUBLISHED set
+    // and never from the proposed one: `pendingSleepEditHealthWrites` only ever offers ground BEFORE
+    // the leading watermarks, so a watermark pinned over a withheld span retires that span forever —
+    // the sleep could not be added later even once records arrived to justify it.
+
+    func testAWithheldLeadingExtensionIsNotWatermarkedAndStaysOffered() throws {
+        let store = try makeStore()
+        try seed(store)
+        try store.markSleepWritten([.init(start: at(0), end: at(8), stage: .asleepCore)])
+
+        let times = SleepEdit.Times(inBedStart: at(-1), sleepOnset: at(-1), sleepWake: at(9))
+        XCTAssertTrue(try store.applySleepEdit(
+            night: at(0), times: times,
+            summary: SleepStaging.Summary(inBed: 10 * 3600, awake: 0,
+                                          light: 10 * 3600, deep: 0, rem: 0)))
+
+        let proposed = try XCTUnwrap(store.pendingSleepEditHealthWrites().first).segments
+        XCTAssertTrue(proposed.contains { $0.stage == .asleepCore && $0.start == at(-1) })
+
+        // The coverage filter proves the leading hour holds no records: that `asleepCore` block is
+        // withheld from the write, while the in-bed claim over the same hour is still published.
+        let withheldLeading = proposed.map { seg in
+            seg.stage == .asleepCore && seg.start == at(-1) ? seg.withProvenance(.asserted) : seg
+        }
+        let published = withheldLeading.healthPublishable
+        XCTAssertFalse(published.contains { $0.stage == .asleepCore && $0.start == at(-1) },
+                       "precondition: the leading asleep block was NOT written to Health")
+
+        try store.markSleepEditHealthWritten(night: at(0), segments: published)
+
+        let after = try store.pendingSleepEditHealthWrites().first
+        XCTAssertNotNil(after, "the withheld leading sleep must still be offered")
+        XCTAssertTrue(after?.segments.contains { $0.stage == .asleepCore && $0.start == at(-1) } ?? false,
+                      "watermarking from the unfiltered set would retire it permanently")
+        XCTAssertFalse(after?.segments.contains { $0.stage == .inBed && $0.start == at(-1) } ?? true,
+                       "the in-bed hour WAS written, so it must not be offered again")
+    }
+
+    func testWatermarkingTheUNFILTEREDSetIsWhatRetiresIt() throws {
+        // The control for the test above — this is the defect, reproduced deliberately, so the
+        // assertion above cannot pass for an unrelated reason.
+        let store = try makeStore()
+        try seed(store)
+        try store.markSleepWritten([.init(start: at(0), end: at(8), stage: .asleepCore)])
+        let times = SleepEdit.Times(inBedStart: at(-1), sleepOnset: at(-1), sleepWake: at(9))
+        XCTAssertTrue(try store.applySleepEdit(
+            night: at(0), times: times,
+            summary: SleepStaging.Summary(inBed: 10 * 3600, awake: 0,
+                                          light: 10 * 3600, deep: 0, rem: 0)))
+        let proposed = try XCTUnwrap(store.pendingSleepEditHealthWrites().first).segments
+
+        try store.markSleepEditHealthWritten(night: at(0), segments: proposed)
+
+        let after = try store.pendingSleepEditHealthWrites().first
+        XCTAssertFalse(after?.segments.contains { $0.stage == .asleepCore && $0.start == at(-1) } ?? false,
+                       "pinned from the proposal, the leading sleep is never offered again")
+    }
+
     func testNormalFullNightWriteCoversLeadingEditWithoutSecondAppend() throws {
         let store = try makeStore()
         try seed(store)

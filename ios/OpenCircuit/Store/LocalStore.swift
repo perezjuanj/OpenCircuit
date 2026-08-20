@@ -573,9 +573,30 @@ struct PendingSleepReconcile: Codable, Equatable {
 }
 
 enum PendingSleepReconcileStore {
-    private static let key = "sleep.edit.pending-reconcile.v1"
+    /// ⚠️ THE VERSION SUFFIX IS LOAD-BEARING — BUMP IT WHENEVER `SleepSegment`'S ENCODING GAINS A
+    /// MEANING AN OLDER BUILD DID NOT WRITE.
+    ///
+    /// A queued item holds `[SleepSegment]`, and `SleepSegment.init(from:)` decodes a missing
+    /// `provenance` key as `.measured` — which is right for a segment an older build STAGED, and
+    /// exactly wrong for the invented fill an older build's EDIT produced. Left on `v1`, the first
+    /// launch after upgrade would drain a queue written before coverage existed, read every invented
+    /// minute in it as measured, and write the whole thing to Apple Health once — the one outcome
+    /// this entire change exists to prevent, executed by the fix itself.
+    ///
+    /// The cost of the bump is that a reconcile queued by the old build never drains: the user's TRIM
+    /// does not reach Health until they touch that night again. That is a stale wider night in
+    /// Health, which is the pre-existing behaviour of every build before the reconcile queue existed
+    /// — non-destructive, and strictly better than one confident invented write.
+    private static let key = "sleep.edit.pending-reconcile.v2"
+    /// The queue this build refuses to read. Dropped once, on first access, so it cannot sit in
+    /// UserDefaults forever — and dropping it is safe for the reason above: it can only ever cause
+    /// Health to keep MORE sleep than the user asked for, never less.
+    private static let abandonedKey = "sleep.edit.pending-reconcile.v1"
 
     static func all() -> [PendingSleepReconcile] {
+        if UserDefaults.standard.object(forKey: abandonedKey) != nil {
+            UserDefaults.standard.removeObject(forKey: abandonedKey)
+        }
         guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
         return (try? JSONDecoder().decode([PendingSleepReconcile].self, from: data)) ?? []
     }
@@ -2370,12 +2391,15 @@ struct LocalStore {
             // found it precisely because closing one of several paths is a false sense of safety.
             //
             // It recovers the coverage decision already persisted on the row's hypnogram rather than
-            // making a second, possibly different one. `fromStoredHypnogram` returns nil when the
-            // hypnogram carries no asserted span — which means EITHER fully covered OR written
-            // before provenance existed, and those must not be conflated — so a legacy row keeps its
-            // previous behaviour untouched and is instead marked at the row level by the migration.
-            let coverage = MeasuredCoverage.fromStoredHypnogram(
-                SleepHypnogramCodec.decode(row.hypnogramData))
+            // making a second, possibly different one. `fromProvenanceLabels` returns nil when the
+            // hypnogram carries no proven-unmeasured span — which means EITHER fully covered OR
+            // written before provenance existed, and those must not be conflated — so a legacy row
+            // keeps its previous behaviour untouched and is instead marked at the row level by the
+            // migration. `trusted(for:)` then applies the same retention guard the primary path uses,
+            // so neither construction can call a night empty that the other calls recorded.
+            let coverage = MeasuredCoverage
+                .fromProvenanceLabels(SleepHypnogramCodec.decode(row.hypnogramData))?
+                .trusted(for: row.editedInBedStart ..< row.editedInBedEnd)
             func fill(_ range: Range<Date>, _ stage: SleepStage) -> [SleepSegment] {
                 guard range.upperBound > range.lowerBound else { return [] }
                 guard let coverage else {
@@ -2383,7 +2407,7 @@ struct LocalStore {
                 }
                 return coverage.partition(range).map {
                     SleepSegment(start: $0.range.lowerBound, end: $0.range.upperBound, stage: stage,
-                                 provenance: $0.measured ? .assertedOverMeasured : .asserted)
+                                 provenance: SleepEdit.provenance(for: $0.ground))
                 }
             }
 

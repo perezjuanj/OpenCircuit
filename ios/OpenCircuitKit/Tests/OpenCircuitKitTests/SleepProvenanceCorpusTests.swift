@@ -17,12 +17,19 @@
 // reading available to the app: every minute this reports as asserted is asserted under the app's
 // own best case, so no number here can be an artifact of a narrow window.
 //
-// ⚠️ TWO CORPUS ROWS ARE MEASURED BUT MUST NOT BE COUNTED — `R1_2026-08-14` and `R1_2026-08-15`
-// replay as fully invented, but their `.b64` holds NO records inside the app's own recorded in-bed
-// window (`recordCoverageOfRecordedInBed == 0.0`) while the app's OWN export reported coverage 1.00
-// and 0.974. The corpus input is provably not what the phone staged from, so those minutes are an
-// artifact of the corpus, not evidence about those nights. The test prints them under DISCOUNTED and
-// keeps them out of every total.
+// 🟢 THE TWO UNCOUNTABLE ROWS ARE NOW HANDLED BY THE PRODUCTION GUARD, NOT BY A LIST OF NIGHT IDS.
+// `R1_2026-08-14` and `R1_2026-08-15` used to replay as fully invented (470.6 + 414.0 asserted
+// asleep-minutes) because their `.b64` holds NO records inside the app's own recorded in-bed window
+// while the app's OWN export reported coverage 1.00 and 0.974 — the corpus input provably is not
+// what the phone staged from. They were kept out of the totals by a hard-coded `discounted` set,
+// which is a measurement that knows the answer in advance.
+//
+// `MeasuredCoverage.trusted(for:)` now refuses to judge a window holding not one record, so both
+// come back at 0.0 asserted with no list involved. That is the same rule that stops a night edited
+// after the ~30 h archive rolled past it from reading as "the ring recorded nothing" — the corpus
+// artifact and the retention defect are one bug, and one guard closes both. This test asserts it,
+// so deleting the guard turns these rows red instead of quietly re-inflating the headline by 884.6
+// minutes.
 
 import XCTest
 @testable import OpenCircuitKit
@@ -43,8 +50,10 @@ final class SleepProvenanceCorpusTests: XCTestCase {
         var appCoverageFraction: Double?
     }
 
-    /// Rows whose corpus BYTES provably are not what the phone staged from. Measured, never counted.
-    private static let discounted: Set<String> = ["R1_2026-08-14", "R1_2026-08-15"]
+    /// Rows whose corpus BYTES provably are not what the phone staged from — kept ONLY to assert
+    /// that the production guard reclaims them without being told which nights they are. They are
+    /// not excluded from anything; nothing in the totals below reads this set.
+    private static let bytesDisagreeWithThePhone: Set<String> = ["R1_2026-08-14", "R1_2026-08-15"]
 
     func testMeasureProvenanceAcrossTheCorpus() throws {
         guard let dir = SleepReplay.dir("OC_SLEEP_PROVENANCE_CORPUS")
@@ -86,15 +95,21 @@ final class SleepProvenanceCorpusTests: XCTestCase {
         var withBytes = 0, staged = 0, replayableEdits = 0
         var nightsChanged = 0
         var totalAssertedAsleepMin = 0.0, totalAssertedAwakeMin = 0.0
-        var discountedAssertedAsleepMin = 0.0
-        var ordinaryPathAssertedAsleepMin = 0.0
-        var lines: [String] = []
+        var totalUnknownAsleepMin = 0.0, totalUnknownAwakeMin = 0.0
+        var untrustedNights: [String] = []
+        // ⚠️ RENAMED (S4). This was `ordinaryPathAssertedAsleepMin`, printed as "the ordinary staging
+        // path's asserted minutes", and it is 0.0 BY CONSTRUCTION: `SleepStaging.classify` emits only
+        // `.measured` labels, so summing its `.asserted` ones can only ever return zero. It measures
+        // LABELS, not RECORDS, and it says nothing whatever about interior holes in ordinary staging
+        // — which is the question a reader of the old name would think it had answered. The name now
+        // says what it counts.
+        var ordinaryPathLabelledAssertedAsleepMin = 0.0
 
-        let header = String(format: "%-16@ %7@ %8@ %9@ %9@ %8@ %8@ %8@",
+        let header = String(format: "%-16@ %7@ %8@ %9@ %9@ %8@ %8@ %8@ %8@",
                             "night" as NSString, "cover" as NSString, "displayed" as NSString,
-                            "measured" as NSString, "asserted" as NSString,
+                            "measured" as NSString, "asserted" as NSString, "unknown" as NSString,
                             "effOFF" as NSString, "effON" as NSString, "score" as NSString)
-        lines.append(header)
+        var lines: [String] = [header]
 
         for row in rows where !row.recordsFile.isEmpty {
             withBytes += 1
@@ -118,7 +133,7 @@ final class SleepProvenanceCorpusTests: XCTestCase {
                 //     assumed — and so a future change to staging cannot quietly start asserting.
                 if !base.isEmpty {
                     let ordinary = SleepProvenanceBreakdown(segments: base)
-                    ordinaryPathAssertedAsleepMin += ordinary.assertedAsleep / 60
+                    ordinaryPathLabelledAssertedAsleepMin += ordinary.assertedAsleep / 60
                 }
 
                 // --- EDIT PATH
@@ -150,31 +165,41 @@ final class SleepProvenanceCorpusTests: XCTestCase {
                 let bOn = SleepProvenanceBreakdown(segments: on)
                 let assertedAsleepMin = bOn.assertedAsleep / 60
                 let assertedAwakeMin = bOn.assertedAwake / 60
+                totalUnknownAsleepMin += bOn.unknownAsleep / 60
+                totalUnknownAwakeMin += bOn.unknownAwake / 60
+
+                // THE GUARD, OBSERVED RATHER THAN ASSUMED: a window holding no record at all comes
+                // back untrusted, and `recompute` then reproduces master exactly.
+                if coverage.trusted(for: times.inBedStart ..< times.inBedEnd) == nil {
+                    untrustedNights.append(row.id)
+                    XCTAssertEqual(on, off,
+                                   "\(row.id): coverage we cannot trust must behave as master")
+                    XCTAssertFalse(bOn.hasAssertedTime,
+                                   "\(row.id): an untrustworthy read must assert nothing")
+                }
 
                 if bOn.hasAssertedTime {
                     nightsChanged += 1
-                    if Self.discounted.contains(row.id) {
-                        discountedAssertedAsleepMin += assertedAsleepMin
-                    } else {
-                        totalAssertedAsleepMin += assertedAsleepMin
-                        totalAssertedAwakeMin += assertedAwakeMin
-                    }
+                    totalAssertedAsleepMin += assertedAsleepMin
+                    totalAssertedAwakeMin += assertedAwakeMin
                 }
 
                 func eff(_ b: SleepProvenanceBreakdown) -> String {
                     b.efficiency.map { String(format: "%.4f", $0) } ?? "withheld"
                 }
                 lines.append(String(
-                    format: "%-16@ %6.3f %8.1f %9.1f %9.1f %8@ %8@ %8@%@",
+                    format: "%-16@ %6.3f %8.1f %9.1f %9.1f %8.1f %8@ %8@ %8@%@",
                     row.id as NSString,
                     bOn.coverageFraction,
                     bOn.displayedAsleep / 60,
                     bOn.measuredAsleep / 60,
                     assertedAsleepMin,
+                    bOn.unknownAsleep / 60,
                     eff(bOff) as NSString,
                     eff(bOn) as NSString,
                     (bOn.isScorable ? "keep" : "withheld") as NSString,
-                    (Self.discounted.contains(row.id) ? "   DISCOUNTED" : "") as NSString))
+                    (Self.bytesDisagreeWithThePhone.contains(row.id)
+                        ? "   bytes≠phone" : "") as NSString))
             }
         }
 
@@ -188,18 +213,36 @@ final class SleepProvenanceCorpusTests: XCTestCase {
 
         --- what changes
         nights carrying ANY asserted time ......... \(nightsChanged) of \(withBytes)
-        ordinary (unedited) staging path, asserted  \(String(format: "%.1f", ordinaryPathAssertedAsleepMin)) asleep-min TOTAL
-        EDIT path asserted ASLEEP (counted) ....... \(String(format: "%.1f", totalAssertedAsleepMin)) min \
+        ordinary staging path, LABELLED asserted .. \(String(format: "%.1f", ordinaryPathLabelledAssertedAsleepMin)) asleep-min TOTAL
+          ⚠️ LABELS, NOT RECORDS. `SleepStaging.classify` emits only `.measured`, so this figure is
+             0.0 by construction and is NOT a measurement of interior holes in ordinary staging.
+
+        EDIT path asserted ASLEEP (proven holes) .. \(String(format: "%.1f", totalAssertedAsleepMin)) min \
         = \(String(format: "%.2f", totalAssertedAsleepMin / 60)) h
-        EDIT path asserted AWAKE  (counted) ....... \(String(format: "%.1f", totalAssertedAwakeMin)) min
-        DISCOUNTED (corpus input != what staged) .. \(String(format: "%.1f", discountedAssertedAsleepMin)) min — NOT counted
+        EDIT path asserted AWAKE  (proven holes) .. \(String(format: "%.1f", totalAssertedAwakeMin)) min
+        EDIT path UNKNOWN asleep (unprovable) ..... \(String(format: "%.1f", totalUnknownAsleepMin)) min — published, as before
+        EDIT path UNKNOWN awake  (unprovable) ..... \(String(format: "%.1f", totalUnknownAwakeMin)) min — the ground our
+          records cannot reach back to. Before the guard these minutes were counted as proven holes.
+
+        --- the retention guard
+        nights whose record set could not be trusted at all: \(untrustedNights.isEmpty ? "none" : untrustedNights.joined(separator: ", "))
+        Each behaves exactly as master (asserted 0.0, nothing withheld, nothing deleted). No list of
+        night ids is involved — `MeasuredCoverage.trusted(for:)` refuses a window holding no record.
 
         --- Apple Health
         every asserted-asleep minute above is on the write path today (HealthKitWriter :1585/:1598
-        map EVERY segment 1:1 with no coverage filter). `[SleepSegment].measuredOnly` removes exactly
-        \(String(format: "%.1f", totalAssertedAsleepMin)) asleep-minutes from it and keeps the .inBed claim.
+        map EVERY segment 1:1 with no coverage filter). `[SleepSegment].healthPublishable` removes
+        exactly \(String(format: "%.1f", totalAssertedAsleepMin)) asleep-minutes from it and keeps the .inBed claim.
         """)
 
         XCTAssertGreaterThan(withBytes, 0, "nothing was replayed at all")
+
+        // THE GUARD IS LOAD-BEARING, AND THESE TWO ROWS ARE THE PROOF. Both replay as 100 % invented
+        // from bytes the phone demonstrably did not stage from; before the guard they contributed
+        // 884.6 asserted asleep-minutes and were suppressed by a hard-coded set of night ids.
+        for id in Self.bytesDisagreeWithThePhone where rows.contains(where: { $0.id == id }) {
+            XCTAssertTrue(untrustedNights.contains(id),
+                          "\(id) must be reclaimed by the guard, not by a list")
+        }
     }
 }
