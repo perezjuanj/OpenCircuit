@@ -83,7 +83,9 @@ final class WakeProvenanceTests: XCTestCase {
     }
 
     func testMaterialCutSitsInTheEmptyIntervalTheCorpusMeasured() {
-        // Sorted corpus gaps after the in-bed end (minutes): … 2.5, 7.5, 33.0, 241.9, 243.2, 243.6.
+        // Sorted corpus gaps after the in-bed end (minutes): … 2.5, 7.5, 33.0, 241.9, 243.6.
+        // (243.2 appeared in this list until 2026-08-20 and was never a measured gap —
+        // `R3_2026-08-04`'s next record is in a different capture artifact. Withheld now.)
         // The cut must separate the small cluster from the ~4 h cluster. Every value in
         // (33.0, 241.9] does that identically — this asserts the PROPERTY, not the number, so a
         // future retune inside the empty interval stays green and one outside it does not.

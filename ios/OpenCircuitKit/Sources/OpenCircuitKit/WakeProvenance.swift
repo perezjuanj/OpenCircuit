@@ -11,9 +11,14 @@
 //     error 8 min). A flag on a night we get right is worse than no flag.
 //   • what DOES discriminate is whether the stream RESUMES afterwards. Partitioning the same 21
 //     nights on what follows the in-bed end: 10 have a record within 300 s (the wake was a decision
-//     the stager made while data kept arriving), 5 stop and resume after 7.5 / 33.0 / 241.9 / 243.2 /
-//     243.6 min (a PROVABLE data edge), and 6 have nothing within 12 h (unprovable — "the ring
-//     stopped" and "you synced at wake" are the same picture).
+//     the stager made while data kept arriving), 4 stop and resume after 7.5 / 33.0 / 241.9 /
+//     243.6 min (a PROVABLE data edge), and 7 have nothing usable within 12 h (unprovable — "the
+//     ring stopped" and "you synced at wake" are the same picture).
+//     ⚠️ THAT PARTITION WAS 10 / 5 / 6 UNTIL 2026-08-20, and the fifth "resume" was not one:
+//     `R3_2026-08-04`'s next record sits 243.2 min later in a DIFFERENT capture artifact
+//     (`R3_2026-08-05.b64`), so it measured the owner's export schedule, not the ring. Corpus
+//     evidence now has to be bracketed inside ONE artifact; see the header of
+//     `SleepCoverageMeasureTests`, which prints this partition rather than asking you to trust it.
 //   • both 246-minute errors in the corpus (`R2_2026-08-17`, `R2_2026-08-18`) are in that middle
 //     group, and both are invisible to everything already shipped: their ~4 h hole begins exactly AT
 //     the in-bed end (02:39:14 / 02:37:02), so it is never INSIDE the window that an internal-hole or
@@ -62,9 +67,15 @@ public enum WakeProvenance: Equatable, Sendable {
     /// How long the stream must be absent before the gap is worth telling the USER about.
     ///
     /// ⚠️ THIS NUMBER IS NOT FITTED, AND THE COMMENT SAYING SO IS PART OF THE NUMBER. On the corpus
-    /// the sorted gaps after the in-bed end are, in minutes:
+    /// the sorted gaps after the in-bed end are, in minutes (n = 14; printed as TABLE 0 by
+    /// `SleepCoverageMeasureTests`, re-copy from there rather than editing by hand):
     ///
-    ///     0.1 · 1.0 · 1.0 · 1.0 · 1.0 · 1.5 · 1.5 · 2.0 · 2.5 · 2.5 · 7.5 · 33.0 · 241.9 · 243.2 · 243.6
+    ///     0.1 · 1.0 · 1.0 · 1.0 · 1.0 · 1.5 · 1.5 · 2.0 · 2.5 · 2.5 · 7.5 · 33.0 · 241.9 · 243.6
+    ///
+    /// (A 15th value, 243.2, was listed here until 2026-08-20 and was never a measured gap:
+    /// `R3_2026-08-04`'s next record is in another capture artifact. It is withheld now, and its
+    /// removal changes nothing else — the firing set stays 5 / 21 because that night still fires
+    /// legitimately on its FRONT edge.)
     ///
     /// The distribution is BIMODAL with an EMPTY interval from 33.0 to 241.9 min, so EVERY cut in
     /// (33.0, 241.9] scores identically on the evidence we have. 60 min was chosen for a ~1.8×
