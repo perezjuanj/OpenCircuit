@@ -652,6 +652,24 @@ struct LocalStore {
         return try context.fetch(descriptor).first?.sample
     }
 
+    /// Oldest sample of `kind` strictly AFTER `after`, or nil. The trailing-edge mirror of
+    /// `latestSample(kind:before:)` and the WAKE-provenance probe (`WakeProvenance.classify`,
+    /// `SleepConfidence.Coverage.firstMeasurementAfterEnd`): it answers "did the ring keep recording
+    /// past the wake we printed, or is that wake just where the data stopped?".
+    ///
+    /// Same shape as its mirror — one row, index-ordered, `fetchLimit = 1` — because it runs on the
+    /// same sleep-card render path and must never become a scan. Pass `.heartRate`: HR is
+    /// band-guarded to 30…220 bpm, so a charging or pocketed ring produces none, while a skin-temp
+    /// row keeps arriving from a docked ring and would report a dead night as "still recording".
+    func earliestSample(kind: MetricKind, after: Date) throws -> QuantitySample? {
+        let kindRaw = kind.rawValue
+        var descriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == kindRaw && $0.start > after },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
+        descriptor.fetchLimit = 1
+        return try context.fetch(descriptor).first?.sample
+    }
+
     /// Oldest retained sample of `kind`, or nil when none is stored. Tells "the ring recorded
     /// nothing" from "retention no longer reaches back that far" (#198). One row.
     func earliestSample(kind: MetricKind) throws -> QuantitySample? {
