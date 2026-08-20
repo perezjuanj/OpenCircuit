@@ -48,8 +48,25 @@ enum DiagnosticsReport {
         s.append(EpochArchiveDiagnostics.report(session.archivedEpochs, timeZone: timeZone))
         s.append("")
 
-        // 2) Nightly sleep summaries (the symptom).
+        // 2) Nightly sleep summaries (the symptom) + the EDGE PROVENANCE behind each one.
+        //
+        // The `edges:` line is the part obtainable no other way. A truncated night looks perfectly
+        // healthy in the summary above it — `R2_2026-08-17` reads 102 min in bed at efficiency
+        // 1.0000, which is indistinguishable from a short good night — and the epoch-gap report in
+        // section 1 is ring-wide, so it cannot say which hole belongs to which night's EDGE. This
+        // line says whether the stream ran into the printed bedtime and continued past the printed
+        // wake, so a bundle answers "was the night the tester complained about actually RECORDED?"
+        // without a device pull.
+        //
+        // ⚠️ `reasons=` is the classifier's list, NOT a record of anything the tester saw. No
+        // coverage caveat is shown in this build — the card is deliberately parked — so this line
+        // is instrumentation collected AHEAD of the UI, which is the whole point: it is what will
+        // let the eventual "does the caveat fire on nights people correct?" question be answered
+        // from real phones instead of from 21 corpus nights.
         s.append("# Stored sleep summaries (latest first)")
+        s.append("  edges: measured at the RECORDED window with heart-rate rows;"
+                 + " material gap \(Int(WakeProvenance.materialGapSeconds / 60))m,"
+                 + " continuous tolerance \(Int(WakeProvenance.continuousToleranceSeconds))s")
         let nights = (try? store?.recentSleepSummaries(limit: 6)) ?? []
         if nights.isEmpty {
             s.append("  (none stored)")
@@ -66,6 +83,7 @@ enum DiagnosticsReport {
                 s.append("  \(t(start)) → \(t(end))  asleep \(n.asleepMin)m"
                          + " (D\(n.deepMin)/R\(n.remMin)/L\(n.lightMin)/A\(n.awakeMin))  score \(n.sleepScore)"
                          + editedSuffix)
+                s.append("      edges: \(edgeLine(n, store: store))")
             }
         }
         s.append("")
@@ -156,6 +174,46 @@ enum DiagnosticsReport {
         }
 
         return s.joined(separator: "\n")
+    }
+
+    /// One night's acquisition verdict, as a single greppable line:
+    /// `bed=resumedAfterGap(241m) wake=stoppedThenResumed(244m) reasons=noRecordingAfterWake`.
+    ///
+    /// Measured over the RECORDED window (`inBedStart`/`inBedEnd`), matching the data export's
+    /// `sleepSessions[].edgeProvenance` — an edit changes what the app shows, not what was recorded,
+    /// and a corrected wake landing inside a hole would otherwise shrink the evidence for the
+    /// correction. On an unedited night that IS the window printed on the line above.
+    ///
+    /// `reasons=` is what `SleepConfidence.assess` CONCLUDED, not what any screen showed: nothing
+    /// in this build renders a coverage caveat. `(none)` is a real and common answer — 12 of 21
+    /// corpus nights.
+    ///
+    /// Three `fetchLimit = 1` reads per night, six nights: 18 indexed single-row fetches for the
+    /// whole section. Never a scan, so this cannot become the reason a big archive times out the
+    /// export. Every read is `try?`, like every other read in this file: a bundle must not be lost
+    /// because one night could not be probed.
+    private static func edgeLine(_ n: StoredSleepSummary, store: LocalStore?) -> String {
+        guard let store, n.inBedEnd > n.inBedStart, n.inBedStart > .distantPast else {
+            return "(no recorded window to measure)"
+        }
+        let start = n.inBedStart, end = n.inBedEnd
+        let assessment = SleepConfidence.assess(
+            asleep: n.asSummary.totalAsleep, inBed: n.asSummary.inBed,
+            coverage: SleepConfidence.Coverage(
+                inBedStart: start, inBedEnd: end,
+                lastMeasurementBeforeStart: (try? store.latestSample(kind: .heartRate, before: start))?.start,
+                firstMeasurementAfterEnd: (try? store.earliestSample(kind: .heartRate, after: end))?.start,
+                earliestRetainedMeasurement: (try? store.earliestSample(kind: .heartRate))?.start))
+        func gap(_ seconds: TimeInterval?) -> String {
+            guard let seconds else { return "" }
+            return "(\(Int((seconds / 60).rounded()))m)"
+        }
+        let reasons = assessment.reasons.map(SleepConfidence.exportName)
+        return "bed=\(SleepConfidence.exportName(assessment.bedtime))"
+            + gap(SleepConfidence.gapSeconds(assessment.bedtime))
+            + "  wake=\(SleepConfidence.exportName(assessment.wake))"
+            + gap(SleepConfidence.gapSeconds(assessment.wake))
+            + "  reasons=" + (reasons.isEmpty ? "(none)" : reasons.joined(separator: ","))
     }
 
     /// Trailing window for the headache section. Two weeks is long enough to expose a channel that
