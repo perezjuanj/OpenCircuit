@@ -179,7 +179,14 @@ public struct SleepSegment: Equatable, Codable, Sendable {
         start = try c.decode(Date.self, forKey: .start)
         end = try c.decode(Date.self, forKey: .end)
         stage = try c.decode(SleepStage.self, forKey: .stage)
-        provenance = try c.decodeIfPresent(SleepProvenance.self, forKey: .provenance) ?? .measured
+        // Decoded as a STRING, not as the enum. `decodeIfPresent(SleepProvenance.self)` THROWS on a
+        // raw value it does not know, and one throw here fails the whole array — which for
+        // `EpochArchiveStore.loadPendingSleepSegments` (`?? []`) means silently dropping a drain's
+        // pending segments. A label we cannot read must cost the label, never the sleep, so an
+        // unrecognised value degrades to `.measured`: counted and published, i.e. what every build
+        // did before provenance existed.
+        let raw = try c.decodeIfPresent(String.self, forKey: .provenance)
+        provenance = raw.flatMap(SleepProvenance.init(rawValue:)) ?? .measured
     }
 
     // Encode `provenance` only when it is not the default, so a fully-measured night's JSON is

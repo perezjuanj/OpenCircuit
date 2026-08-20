@@ -50,11 +50,14 @@ public enum SleepHypnogramCodec {
 
     /// Wire code for provenance. `.measured` is 0 and is never written — see the header.
     ///
-    /// ⚠️ CODE 3 (`.assertedCoverageUnknown`) MUST DEGRADE UPWARD, and it does: a build that predates
-    /// it maps the unknown code to `.measured` via the `?? .measured` below, i.e. it counts and
-    /// publishes the span. That is the same thing this build does with it, and the same thing every
-    /// build did before provenance existed — so a downgrade cannot turn "we cannot tell" into
-    /// "nothing was recorded" and silently retract a user's sleep.
+    /// ⚠️ WHAT A DOWNGRADE DOES WITH CODE 3 (`.assertedCoverageUnknown`), stated precisely rather
+    /// than optimistically. A build that shipped WITH provenance but without this case reads the
+    /// 4-element row and maps the unrecognised code to `.measured` via the `?? .measured` below: it
+    /// counts and publishes the span, which is what this build does too. A build that predates
+    /// provenance entirely drops any 4-element row (its guard is `count == 3`), so the span vanishes
+    /// from its TIMELINE while the row's stored MINUTES still include it. Both are display-side; in
+    /// neither direction can "we cannot tell" become "nothing was recorded" and retract a user's
+    /// sleep, which is the property that has to hold.
     private static let codeForProvenance: [SleepProvenance: Int] = [
         .measured: 0, .asserted: 1, .assertedOverMeasured: 2, .assertedCoverageUnknown: 3
     ]

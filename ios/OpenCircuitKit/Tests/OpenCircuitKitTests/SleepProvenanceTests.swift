@@ -403,3 +403,34 @@ final class SleepSegmentCodableProvenanceTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode([SleepSegment].self, from: data), [seg])
     }
 }
+
+
+// MARK: - Decoding a label we do not recognise
+
+final class SleepSegmentProvenanceDecodeTests: XCTestCase {
+
+    /// A future (or corrupt) provenance string must cost the LABEL, never the SLEEP.
+    /// `decodeIfPresent(SleepProvenance.self)` would throw, and one throw fails the whole array —
+    /// which at `EpochArchiveStore.loadPendingSleepSegments`'s `?? []` silently drops a drain's
+    /// pending segments.
+    func testAnUnrecognisedProvenanceDegradesToMeasuredInsteadOfFailingTheArray() throws {
+        let json = """
+        [{"start": 700000000, "end": 700003600, "stage": "asleepCore", "provenance": "fromTheFuture"},
+         {"start": 700003600, "end": 700007200, "stage": "asleepDeep"}]
+        """
+        let segs = try JSONDecoder().decode([SleepSegment].self, from: Data(json.utf8))
+        XCTAssertEqual(segs.count, 2, "one unreadable label must not drop two hours of sleep")
+        XCTAssertEqual(segs.map(\.provenance), [.measured, .measured])
+    }
+
+    func testEveryKnownProvenanceStillRoundTrips() throws {
+        let t = Date(timeIntervalSince1970: 700_000_000)
+        for p in SleepProvenance.allCases {
+            let seg = SleepSegment(start: t, end: t.addingTimeInterval(600), stage: .awake,
+                                   provenance: p)
+            let back = try JSONDecoder().decode(SleepSegment.self,
+                                                from: try JSONEncoder().encode(seg))
+            XCTAssertEqual(back, seg, "\(p.rawValue) did not survive a round trip")
+        }
+    }
+}

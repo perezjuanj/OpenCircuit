@@ -904,12 +904,19 @@ public enum ExportEngine {
                     // timeline to learn whether the headline is a measurement or a claim.
                     let breakdown = SleepProvenanceBreakdown(segments: session.hypnogram)
                     if breakdown.hasAssertedTime {
+                        // The three buckets are all emitted so the arithmetic CLOSES: displayed
+                        // asleep = measured + asserted + unknown. Omitting the unknown bucket would
+                        // leave a reader with minutes that belong to no category and no way to tell
+                        // a proven hole from ground this app no longer retains records for.
                         var summary: [String: Any] = [
                             "measuredAsleepSec": breakdown.measuredAsleep,
                             "assertedAsleepSec": breakdown.assertedAsleep,
+                            "coverageUnknownAsleepSec": breakdown.unknownAsleep,
                             "measuredAwakeSec": breakdown.measuredAwake,
                             "assertedAwakeSec": breakdown.assertedAwake,
+                            "coverageUnknownAwakeSec": breakdown.unknownAwake,
                             "coveredInBedSec": breakdown.coveredInBed,
+                            "coverageUnknownInBedSec": breakdown.unknownInBed,
                             "coverageFraction": breakdown.coverageFraction,
                             "longestUnmeasuredGapSec": breakdown.longestUnmeasuredGap,
                             "scorable": breakdown.isScorable
