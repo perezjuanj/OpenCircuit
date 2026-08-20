@@ -13,12 +13,13 @@ import XCTest
 /// exist and the detector looked at them and did not call them sleep. That is measured awake time,
 /// not the missing-drain hole the chain was written for (`BulkSleep.swift:1005-1009`).
 ///
-/// ⚠️ THE DEFAULT IS 0.65 = ON. See the constant's doc comment for why that value (a measured
-/// reachability bound, not a fit to the labelled score) and for the standing cost: on the 2026-08-19
-/// corpus the guard changes exactly two nights, and the second one (R3 2026-08-12, coverage 0.894)
-/// carries no recoverable in-bed ground truth, so the corpus cannot say whether the guard helps it
-/// or truncates a genuinely fragmented night. `= 0` is the one-constant revert and is pinned
-/// byte-identical below.
+/// ⚠️ THE DEFAULT IS 0.95 = ON. See the constant's doc comment for why that value (a completeness
+/// threshold read off the measured gap geometry, not a fit to the labelled score). On the
+/// 2026-08-19 corpus it changes exactly ONE night — this one — and leaves 20 of 21 staged nights
+/// bit-for-bit identical. A lower cut (anything ≤ 0.894) additionally moves `R3_2026-08-12`, whose
+/// bridged gap is genuinely missing an epoch and which carries no recoverable in-bed ground truth,
+/// so the corpus cannot say whether that would help it or truncate a fragmented night.
+/// `= 0` is the one-constant revert and is pinned byte-identical below.
 final class ObservedGapAbsorbTests: XCTestCase {
 
     private let base = Date(timeIntervalSince1970: 1_780_000_000)   // ~2026, after syncEpoch
@@ -94,17 +95,40 @@ final class ObservedGapAbsorbTests: XCTestCase {
                              "at the shipped default the evening block must be declined")
     }
 
-    /// The shipped default must sit at or below the coverage a FULLY OBSERVED gap can actually
-    /// produce, or the guard is unreachable for short gaps for a purely arithmetic reason
-    /// (`ObservedGapCeilingProbeTests` measures the curve; the floor case is the binding one).
-    func testShippedDefaultIsReachableAtTheShortestJudgeableGap() {
-        let n = BulkSleep.onsetContiguityGap / Double(BulkRecord.epochSeconds)   // epochs in the floor gap
-        let ceilingAtFloor = (n - 1) / n
-        XCTAssertLessThanOrEqual(BulkSleep.observedGapAbsorbCoverageCut, ceilingAtFloor,
-                                 "cut \(BulkSleep.observedGapAbsorbCoverageCut) exceeds the "
-                                 + "\(ceilingAtFloor) a fully observed gap reads at the "
-                                 + "\(BulkSleep.onsetContiguityGap / 60) min floor — the guard would "
-                                 + "be testing gap LENGTH, not observation")
+    /// The shipped default must be REACHABLE at every gap length the guard is allowed to judge.
+    ///
+    /// ⚠️ This test previously asserted `cut <= (n-1)/n` at the shortest judgeable gap, on the model
+    /// that a fully observed gap tops out at `(n-1)/n`. That model assumes both gap endpoints sit on
+    /// the 150 s record grid. They do not — the endpoints are `ActivityPeriod` block boundaries — and
+    /// with off-grid endpoints a full gap reaches `⌈L⌉/L`, which EXCEEDS 1.0 at non-integer `L`.
+    /// The corpus proves it: `R3_2026-08-19`'s 43-min bridge reads 0.988 where the old model said
+    /// 0.930 was the maximum. See `ObservedGapCeilingProbeTests` for the measured band.
+    ///
+    /// The honest statement is therefore weaker and is what is asserted here: every cut ≤ 1.0 is
+    /// reachable. At gaps under ~60 min a fully observed gap can also read BELOW 0.95 in an unlucky
+    /// alignment, in which case the guard declines to fire — a false negative that reproduces
+    /// master's behaviour, which is the safe direction.
+    func testShippedDefaultIsReachableAtEveryJudgeableGapLength() {
+        let cadence = Double(BulkRecord.epochSeconds)
+        let cut = BulkSleep.observedGapAbsorbCoverageCut
+        XCTAssertLessThanOrEqual(cut, 1.0, "a cut above 1.0 would need a super-complete gap")
+
+        for gapMinutes in [7.5, 10.0, 20.0, 30.0, 43.0, 60.0, 360.0] {
+            let gap = gapMinutes * 60.0
+            guard gap > BulkSleep.onsetContiguityGap else { continue }
+            var maxInterior = 0
+            for step in 0..<Int(cadence) {
+                var count = 0
+                var t = Double(step)
+                while t < gap { if t > 0 { count += 1 }; t += cadence }
+                maxInterior = max(maxInterior, count)
+            }
+            let achievable = Double(maxInterior) / (gap / cadence)
+            XCTAssertGreaterThanOrEqual(achievable, cut,
+                                        "cut \(cut) is unreachable at a \(gapMinutes) min gap "
+                                        + "(max achievable \(achievable)) — the guard would be inert "
+                                        + "there for an arithmetic reason, not a physical one")
+        }
     }
 
     /// A negative cut is also OFF (the `> 0` guard), so a mis-set flag degrades to master rather

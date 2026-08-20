@@ -14,7 +14,7 @@
 //   3. durationLikelyHigh    — SleepConfidence.classify(...) == .durationLikelyHigh   [view :458]
 //
 // Measured inputs are the `SleepBaselineTests` scoreboard rows for R3_2026-08-19 at cut 0 and at the
-// shipped 0.65.
+// shipped 0.95.
 
 import XCTest
 @testable import OpenCircuitKit

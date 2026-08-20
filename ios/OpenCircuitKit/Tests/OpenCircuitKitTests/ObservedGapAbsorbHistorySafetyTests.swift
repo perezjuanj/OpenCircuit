@@ -1,6 +1,6 @@
 // DOES ENABLING THE OBSERVED-GAP GUARD REWRITE ALREADY-STORED NIGHTS?
 //
-// The guard (`BulkSleep.observedGapAbsorbCoverageCut`, now 0.65 = ON) moves a night's in-bed START
+// The guard (`BulkSleep.observedGapAbsorbCoverageCut`, now 0.95 = ON) moves a night's in-bed START
 // later by ~2 h on the nights it fires. Every stored night is upserted through
 // `LocalStore.saveSleepSummary`, so the release either heals history retroactively or leaves it
 // alone — and which one it is changes the release decision. This pins the answer.

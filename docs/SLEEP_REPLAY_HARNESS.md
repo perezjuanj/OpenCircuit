@@ -223,11 +223,11 @@ Two further cross-checks, both measured:
 
 ---
 
-## 7. A/B'ing a candidate: `observedGapAbsorbCoverageCut` (candidate 1 — **now ON at 0.65**)
+## 7. A/B'ing a candidate: `observedGapAbsorbCoverageCut` (candidate 1 — **now ON at 0.95**)
 
 The harness can score a staging candidate against master **in one process, on the same bytes, with
 nothing else different**. The first knob wired this way is the observed-gap guard on the backward
-cluster chain (`BulkSleep.observedGapAbsorbCoverageCut`). **It now ships ENABLED at `0.65`; `0` is
+cluster chain (`BulkSleep.observedGapAbsorbCoverageCut`). **It now ships ENABLED at `0.95`; `0` is
 the one-constant revert and is byte-identical to the pre-guard code.**
 
 ```sh
@@ -241,7 +241,7 @@ OC_SLEEP_BASELINE_CORPUS=<corpus> OC_SLEEP_ABSORB_CUT=0 OC_SLEEP_BASELINE_OUT=/t
 # and, to see WHAT the chain actually bridges on every night (this probe models the UNGUARDED
 # chain deliberately — that is how the bridge coverages below were measured):
 OC_SLEEP_CORPUS=<corpus> swift test --filter SleepAbsorbProbeTests
-# the coverage-CEILING curve that the 0.65 choice rests on (no corpus needed):
+# the coverage GEOMETRY the 0.95 choice rests on (no corpus needed):
 swift test --filter ObservedGapCeilingProbeTests
 ```
 
@@ -253,26 +253,46 @@ argued from semantics, not fitted.
 | cut | nights changed | median \|in-bed edge err\| on labelled nights | mean |
 |---|---|---|---|
 | `0` (off) | 0 — TSV sha256 `ef5dc087…a13e8f` | 89.5 | 96.2 |
-| **0.65 (shipped)** | **2** (`R3_2026-08-19`, `R3_2026-08-12`) | **35.0** | **84.8** |
-| 0.9 / 0.95 | 1 (`R3_2026-08-19` only) | 35.0 | 84.8 |
-| 1.0 | 0 | 89.5 | 96.2 |
+| 0.05 – 0.890 | 2 (`R3_2026-08-19`, `R3_2026-08-12`) | 35.0 | 84.8 |
+| **0.95 (shipped)** | **1** (`R3_2026-08-19` only) | **35.0** | **84.8** |
+| 0.990 + | 0 | 89.5 | 96.2 |
 
-**Why 0.65 and not 0.9.** The ratio counts records STRICTLY INSIDE the gap but divides by
-`gap / 150 s`, which includes the two records bounding it — so a **fully observed** gap cannot read
-1.0. Measured ceiling (`ObservedGapCeilingProbeTests`): **0.667** at the 7.5-min floor, 0.917 at
-30 min, 0.958 at 60 min. A cut above that curve is unreachable for shorter gaps, making the guard a
-test of gap LENGTH and 150 s grid alignment rather than of observation. 0.65 is the highest value
-reachable at every gap length the guard may judge. Corroborating the point: the corpus's two dense
-bridges read 0.894 (39.2 min) and 0.988 (43.0 min), and the 0.894 one is **at its own arithmetic
-ceiling of 0.893** — both gaps are completely observed, so any cut separating them separates gap
-length, not data quality.
+**Why 0.95.** The cut is a COMPLETENESS threshold, and the two corpus bridges differ in
+completeness — measured from the bytes, not modelled:
+
+| bridge | gap | L = gap/150 s | interior records | inter-record deltas | coverage | a FULL gap of this length reads |
+|---|---|---|---|---|---|---|
+| `R3_2026-08-19` | 2580 s (43.0 min) | 17.200 | 17 | **all exactly 150 s** | **0.988** | 0.988 – 1.047 → **complete** |
+| `R3_2026-08-12` | 2350 s (39.2 min) | 15.667 | 14 | incl. **215 s and 275 s** | **0.894** | 0.957 – 1.021 → **an epoch is missing** |
+
+0.95 fires on the complete gap and declines the holed one. That is the single discrimination the
+guard is asked to make: a gap missing epochs is a *hole*, which is precisely what the backward chain
+exists to stitch.
+
+> ⚠️ **A superseded argument, recorded so it is not re-derived.** An earlier revision justified 0.65
+> as "the highest reachable value", on the model that a fully observed gap tops out at
+> `(⌊L⌋−1)/L` — 0.667 at the 7.5-min floor, 0.930 at 43 min. That model assumes both gap endpoints
+> sit on the 150 s record grid. They do not: the endpoints are `ActivityPeriod` block boundaries. With
+> off-grid endpoints a full gap reaches `⌈L⌉/L`, which **exceeds 1.0** at non-integer `L` (1.047 at
+> L=17.2, 1.250 at L=3.2) — and the corpus proves it, since the real 43-min bridge reads 0.988 above
+> the model's own 0.930 "ceiling". There is **no reachability bound**: every cut ≤ 1.0 is reachable
+> at every gap length, so reachability cannot choose the value. The same correction retires the claim
+> that "both bridges are completely observed" — they are not, as the delta column above shows.
+>
+> The measured cost of going lower: at 0.65 the guard fires on a gap only two thirds recovered, and a
+> drain hole partially refilled with epochs that read NON-sleep (the motion-blind Gen 2 Air case) is
+> TRUNCATED once recovery reaches ~67 %. That is the #193 failure class the chain exists to prevent.
 
 - `R3_2026-08-19` (labelled): in-bed start `20:24:34 → 22:18:36`, error vs the wearer's own corrected
   22:24 goes **−119 → −5 min**. In-bed end unchanged (+10). Asleep 713 → 648 (his true ~395 is a
   separate, unfixed problem — the signal ceiling, not this scoping bug). Efficiency 0.928 → 0.990.
-- `R3_2026-08-12` (**no label**): in-bed start `22:51:56 → 01:17:50`, +145 min. Unadjudicable from
-  the corpus; see the constant's doc for the 🟡 duty-cycle corroboration.
-- The other 19 staged nights, and all 5 fidelity nights except Juan's, are **bit-for-bit unchanged**.
+- `R3_2026-08-12` (**no label**): **NOT changed at the shipped 0.95** — its bridged gap is missing an
+  epoch (0.894, below its own fully-observed floor of 0.957). At any cut ≤ 0.894 it moves its in-bed
+  start `22:51:56 → 01:17:50` (+145 min) with no label to adjudicate it, and its deep sleep collapses
+  60 → 15 min. That is the main reason the cut is high.
+- The other 20 staged nights, and all 5 fidelity nights except Juan's, are **bit-for-bit unchanged** —
+  including `R1_2026-08-02`, the corpus's only `.intensityTail` night (#197's regression guard). Every
+  other corpus night stages through `.primary`; `motionIntensityActiveCut` is untouched by this diff.
 
 > The median moves 89.5 → 35.0 because **one** edge moves from 119 to 5 in a 10-value list — at n=10
 > the median is a step function. The honest effect size is the **mean**, −11.4 min, i.e. 114 min of
@@ -291,11 +311,33 @@ length, not data quality.
   silent**: efficiency crossing 0.95 trips `SleepConfidence.durationLikelyHigh` and
   `SleepCardView.confidenceHint` renders "Very still night — duration may read a little high…"
   (pinned by `ObservedGapAbsorbDisclosureTests`; the night said nothing before the change).
-- **`R3_2026-08-12` awake error 57 → 131 min worse**, and it carries **no in-bed label** at all, so
-  the corpus cannot adjudicate its ±145 min start move.
-- Only **one labelled night** moves, against `SleepEditLabel.minimumNightsToFit = 10`.
-- The known false positive is now live: a real sleep → get-up-and-move → sleep-again night has the
-  same densely-observed gap and loses its first bout (`testEnabledCutAlsoDropsARealMidNightBout`).
+- **Staging is re-fitted inside the smaller window — this is not a pure prefix trim.** On
+  `R3_2026-08-19` deep goes 125 → 95 min while REM goes 180 → **185** min, i.e. REM RISES inside a
+  strictly smaller window, because the percentile-based stage thresholds see a different
+  distribution once the evening is removed. Report stage minutes, not only the in-bed edge.
+- **The sleep-score badge goes UP**, 87 → 99 on `R3_2026-08-19` (both "excellent"). A night the wearer
+  knows was rough now badges higher. The badge is far more prominent than the efficiency footnote.
+- **The card stops reporting a sleep latency** on this night: in-bed start and onset land 30 s apart,
+  under the 60 s floor in `SleepCardView.sleepWindowText`, so the "17m to fall asleep" clause
+  disappears. Do not describe the change as bedtime DETECTION — it is the removal of a wrong bedtime.
+- Only **one labelled night** moves, against `SleepEditLabel.minimumNightsToFit = 10`, and it is a
+  single ring (R3, Gen 2). Gen 3 and Gen 2 Air contribute **zero** moving nights, so the guard is
+  unmeasured on those generations.
+- The known false positive is now live: a real sleep → get-up-and-move → sleep-again night has a
+  COMPLETELY observed gap and loses its first bout (`testEnabledCutAlsoDropsARealMidNightBout`).
+  **Raising the cut does not mitigate this** — that gap reads ≈1.0 by construction and fires at every
+  cut. It is inherent to enabling the guard at all. `NapDetection.swift:70` rejects any candidate
+  whose midpoint is overnight, so the dropped bout is **not re-filed as a nap** — those minutes leave
+  the daily total outright.
+- **A declined bridge `continue`s rather than `break`s.** Measured on a synthetic 3-block night: a
+  third block behind an unobserved hole leapfrogs the declined bridge and the guard goes inert
+  (ON == OFF). Not a regression versus master — the guard is monotone, it can only move in-bed start
+  LATER — but the fix silently does nothing on multi-block nights. Max `nightBlocks` in the corpus
+  is 2, so this is unrepresented in real data.
+- **Nothing has validated the guard against a device.** Every fidelity fixture predates it, so
+  `SleepReplayFidelityTests` and `SleepAbsorbProbeTests.testProbeAgreesWithProduction` are both
+  pinned at cut 0 and prove only that the harness matches the PRE-GUARD path. Closing this needs one
+  morning Diagnostics bundle, raw frames ON, from a build with the guard enabled.
 
 ### 7b. It does NOT rewrite stored history
 
