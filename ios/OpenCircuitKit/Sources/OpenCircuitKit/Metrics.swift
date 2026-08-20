@@ -179,14 +179,28 @@ public struct SleepSegment: Equatable, Codable, Sendable {
         start = try c.decode(Date.self, forKey: .start)
         end = try c.decode(Date.self, forKey: .end)
         stage = try c.decode(SleepStage.self, forKey: .stage)
-        // Decoded as a STRING, not as the enum. `decodeIfPresent(SleepProvenance.self)` THROWS on a
-        // raw value it does not know, and one throw here fails the whole array — which for
+        // Decoded LENIENTLY, and never as the enum. `decodeIfPresent(SleepProvenance.self)` THROWS on
+        // a raw value it does not know, and one throw here fails the whole array — which for
         // `EpochArchiveStore.loadPendingSleepSegments` (`?? []`) means silently dropping a drain's
-        // pending segments. A label we cannot read must cost the label, never the sleep, so an
-        // unrecognised value degrades to `.measured`: counted and published, i.e. what every build
-        // did before provenance existed.
-        let raw = try c.decodeIfPresent(String.self, forKey: .provenance)
-        provenance = raw.flatMap(SleepProvenance.init(rawValue:)) ?? .measured
+        // pending segments. A label we cannot read must cost the LABEL, never the SLEEP; the lenient
+        // reads below extend that to a value of the wrong TYPE, so no future encoding of this one key
+        // can cost a night either.
+        //
+        // ⚠️ AN UNREADABLE LABEL IS NOT `.measured`. `encode(to:)` below OMITS the key for
+        // `.measured`, so a value that is PRESENT was written to mean something OTHER than measured —
+        // `.measured` is the one reading its writer has ruled out, and it is the reading that says a
+        // sensor saw this span, which is how invented sleep reaches Apple Health. The honest degrade
+        // is `.assertedCoverageUnknown`: counted, displayed and PUBLISHED exactly as before provenance
+        // existed (so the sleep is still never lost) but never quoted as a measurement, never a
+        // denominator, and never a delete driver.
+        let carriesALabel = c.contains(.provenance) && (try? c.decodeNil(forKey: .provenance)) == false
+        if carriesALabel {
+            provenance = (try? c.decode(String.self, forKey: .provenance))
+                .flatMap(SleepProvenance.init(rawValue:)) ?? .assertedCoverageUnknown
+        } else {
+            // No label: written by a build that predates provenance, or a `.measured` segment.
+            provenance = .measured
+        }
     }
 
     // Encode `provenance` only when it is not the default, so a fully-measured night's JSON is

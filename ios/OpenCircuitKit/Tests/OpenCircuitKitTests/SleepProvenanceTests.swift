@@ -112,6 +112,70 @@ final class MeasuredCoverageTrustTests: XCTestCase {
     }
 }
 
+// MARK: - The SECOND Health construction reads LABELS, and must not be re-guarded
+//
+// `LocalStore.pendingSleepEditHealthWrites` builds Health segments straight from the user's anchors
+// and holds no records, so it recovers the decision from the stored labels. Running THAT through
+// `MeasuredCoverage.trusted(for:)` substitutes "the first non-hole LABEL" for "our oldest RECORD",
+// and the substitution always favours publishing: any hole at the START of a night sits before the
+// first non-hole label, so it comes back `.unknown` instead of the `.unmeasured` the records proved.
+// 🟢 Measured through the real path in `SleepEditStoreTests`: a proven-empty hour reached Apple
+// Health as `.asleepCore`. `ProvenanceLabelCoverage` has no `trusted(for:)` — the call no longer
+// compiles.
+
+final class ProvenanceLabelCoverageTests: XCTestCase {
+
+    private let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+    private func at(_ m: Double) -> Date { t0.addingTimeInterval(m * 60) }
+
+    /// A stored hypnogram whose FIRST label is a proven hole, exactly as the primary path writes it
+    /// when the wearer drags bedtime back into ground the records prove empty.
+    private var labels: [SleepSegment] {
+        [SleepSegment(start: at(0), end: at(60), stage: .inBed, provenance: .asserted),
+         SleepSegment(start: at(0), end: at(60), stage: .asleepCore, provenance: .asserted),
+         SleepSegment(start: at(60), end: at(480), stage: .inBed),
+         SleepSegment(start: at(60), end: at(480), stage: .asleepCore)]
+    }
+
+    func testALeadingPROVENHoleIsStillAHoleAndItsFillIsWithheld() throws {
+        let cov = try XCTUnwrap(MeasuredCoverage.fromProvenanceLabels(labels))
+        let parts = cov.partition(at(0) ..< at(480))
+        XCTAssertEqual(parts.map(\.ground), [.unmeasured, .measured],
+                       "the labels proved this hour empty; recovering them must not soften it")
+
+        // What `pendingSleepEditHealthWrites` does with those pieces, verbatim.
+        let filled = parts.map {
+            SleepSegment(start: $0.range.lowerBound, end: $0.range.upperBound, stage: .asleepCore,
+                         provenance: SleepEdit.provenance(for: $0.ground))
+        }
+        XCTAssertEqual(SleepStaging.totalAsleep(filled.healthPublishable), 420 * 60, accuracy: 1,
+                       "the 60-minute proven hole must not reach Health as sleep")
+    }
+
+    func testGroundLabelledCoverageUNKNOWNCountsAsCoveredAndPublishes() throws {
+        // The retention case, already decided by the records-based call: `.assertedCoverageUnknown`
+        // is "we cannot say", which publishes. Recovering it must not turn it into a hole.
+        let withUnknown = [
+            SleepSegment(start: at(0), end: at(60), stage: .asleepCore,
+                         provenance: .assertedCoverageUnknown),
+            SleepSegment(start: at(60), end: at(120), stage: .asleepCore, provenance: .asserted),
+            SleepSegment(start: at(120), end: at(480), stage: .asleepCore),
+        ]
+        let cov = try XCTUnwrap(MeasuredCoverage.fromProvenanceLabels(withUnknown))
+        XCTAssertEqual(cov.partition(at(0) ..< at(480)).map(\.ground),
+                       [.measured, .unmeasured, .measured])
+    }
+
+    func testAHypnogramWithNoPROVENHoleReturnsNilSoTheCallerKeepsItsOldBehaviour() {
+        let allMeasured = [SleepSegment(start: at(0), end: at(480), stage: .asleepCore)]
+        XCTAssertNil(MeasuredCoverage.fromProvenanceLabels(allMeasured),
+                     "fully covered and pre-provenance are indistinguishable — do not guess")
+        let unknownOnly = [SleepSegment(start: at(0), end: at(480), stage: .asleepCore,
+                                        provenance: .assertedCoverageUnknown)]
+        XCTAssertNil(MeasuredCoverage.fromProvenanceLabels(unknownOnly))
+    }
+}
+
 final class SleepEditRetentionGuardTests: XCTestCase {
 
     private let t0 = Date(timeIntervalSince1970: 1_700_000_000)
@@ -413,14 +477,35 @@ final class SleepSegmentProvenanceDecodeTests: XCTestCase {
     /// `decodeIfPresent(SleepProvenance.self)` would throw, and one throw fails the whole array —
     /// which at `EpochArchiveStore.loadPendingSleepSegments`'s `?? []` silently drops a drain's
     /// pending segments.
-    func testAnUnrecognisedProvenanceDegradesToMeasuredInsteadOfFailingTheArray() throws {
+    ///
+    /// ⚠️ AND IT MUST NOT DEGRADE TO `.measured`. `encode(to:)` omits the key for `.measured`, so a
+    /// PRESENT value was written to mean something else — reading it as "a sensor saw this span" is
+    /// the one reading its writer ruled out, and it is how invented sleep reaches Apple Health.
+    func testAnUnrecognisedProvenanceDegradesToCoverageUnknownInsteadOfFailingTheArray() throws {
         let json = """
         [{"start": 700000000, "end": 700003600, "stage": "asleepCore", "provenance": "fromTheFuture"},
          {"start": 700003600, "end": 700007200, "stage": "asleepDeep"}]
         """
         let segs = try JSONDecoder().decode([SleepSegment].self, from: Data(json.utf8))
         XCTAssertEqual(segs.count, 2, "one unreadable label must not drop two hours of sleep")
-        XCTAssertEqual(segs.map(\.provenance), [.measured, .measured])
+        XCTAssertEqual(segs.map(\.provenance), [.assertedCoverageUnknown, .measured],
+                       "present-but-unreadable is 'we cannot say'; absent is measured")
+        // Still published — the degrade costs a caveat, never the user's sleep.
+        XCTAssertEqual(SleepStaging.totalAsleep(segs.healthPublishable), 7200, accuracy: 1)
+        // …but never counted as a measurement.
+        XCTAssertEqual(SleepProvenanceBreakdown(segments: segs).measuredAsleep, 3600, accuracy: 1)
+    }
+
+    /// A provenance value of the wrong TYPE must not fail the array either — `decodeIfPresent`
+    /// throws on a type mismatch, and that throw would cost the whole drain's pending segments.
+    func testAProvenanceOfTheWrongTypeCostsOnlyTheLabel() throws {
+        let json = """
+        [{"start": 700000000, "end": 700003600, "stage": "asleepCore", "provenance": 3},
+         {"start": 700003600, "end": 700007200, "stage": "asleepDeep"}]
+        """
+        let segs = try JSONDecoder().decode([SleepSegment].self, from: Data(json.utf8))
+        XCTAssertEqual(segs.count, 2, "a malformed label must not drop two hours of sleep")
+        XCTAssertEqual(segs.map(\.provenance), [.assertedCoverageUnknown, .measured])
     }
 
     func testEveryKnownProvenanceStillRoundTrips() throws {

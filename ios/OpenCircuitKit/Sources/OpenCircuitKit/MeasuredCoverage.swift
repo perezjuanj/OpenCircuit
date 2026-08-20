@@ -83,21 +83,30 @@ public struct MeasuredCoverage: Equatable, Sendable {
     /// it holds no records of its own. Reusing the persisted decision keeps the two constructions
     /// from disagreeing about the same night.
     ///
-    /// The recovered set carries `provenFrom = .distantPast`: the labels were written by a call that
-    /// had already applied `trusted(for:)`, so any span it could not vouch for is labelled
-    /// `.assertedCoverageUnknown` and is treated here as covered ground — the conservative reading,
+    /// ⚠️ AND IT RETURNS A DIFFERENT TYPE ON PURPOSE — `ProvenanceLabelCoverage`, which HAS NO
+    /// `trusted(for:)`. The retention guard's horizon is "the first instant our oldest RECORD
+    /// covers"; hand it labels and that resolves to "wherever the first non-hole LABEL sits", which
+    /// by construction sits AFTER any hole at the START of a night. 🟢 Measured: a leading hour the
+    /// primary path had PROVEN empty came back `.unknown`, was tagged `.assertedCoverageUnknown`,
+    /// and was PUBLISHED to Apple Health — invented sleep, through the second path, produced by the
+    /// guard meant to prevent it. Returning a type with no guard on it makes that call not merely
+    /// unwise but uncompilable.
+    ///
+    /// No guard is needed here anyway: the labels were written by a call that HAD applied
+    /// `trusted(for:)` against real records, so any span it could not vouch for is already labelled
+    /// `.assertedCoverageUnknown` and is treated below as covered ground — the conservative reading,
     /// which publishes rather than withholds.
     ///
     /// Returns `nil` when the hypnogram carries NO proven-unmeasured span at all. That is
     /// deliberately ambiguous — it means either "fully covered" or "written before provenance
     /// existed" — and the two must not be conflated, so the caller keeps its previous behaviour
     /// instead of guessing.
-    public static func fromProvenanceLabels(_ segments: [SleepSegment]) -> MeasuredCoverage? {
+    public static func fromProvenanceLabels(_ segments: [SleepSegment]) -> ProvenanceLabelCoverage? {
         guard segments.contains(where: { $0.provenance.isProvenUnmeasured }) else { return nil }
         let covered = segments
             .filter { !$0.provenance.isProvenUnmeasured && $0.end > $0.start }
             .map { $0.start ..< $0.end }
-        return MeasuredCoverage(intervals: covered)
+        return ProvenanceLabelCoverage(covered: covered)
     }
 
     // MARK: - The retention guard
@@ -256,5 +265,38 @@ public struct MeasuredCoverage: Equatable, Sendable {
             }
         }
         return out
+    }
+}
+
+/// A coverage decision RECOVERED FROM STORED PROVENANCE LABELS — deliberately NOT a
+/// `MeasuredCoverage`, because it is not built from records and must never be treated as if it were.
+///
+/// ⚠️ IT HAS NO `trusted(for:)`, AND THAT IS THE ENTIRE REASON THIS TYPE EXISTS. The retention guard
+/// answers "is our RECORD SET entitled to call this ground empty?" by taking the first instant our
+/// oldest record covers as the proof horizon. Applied to labels, "our oldest record" silently becomes
+/// "the first non-hole LABEL" — which by construction sits AFTER any hole at the START of a night, so
+/// every leading hole the records had PROVEN empty is re-read as `.unknown` and published. 🟢 That
+/// exact substitution was committed on this branch (never released) and put a proven-empty hour back
+/// into Apple Health as sleep through `LocalStore.pendingSleepEditHealthWrites`. Not passing the
+/// wrong value was not enough; the wrong value can no longer be expressed.
+///
+/// A guard would be redundant regardless: these labels were written by a call that HAD applied
+/// `MeasuredCoverage.trusted(for:)` to real record timestamps, so ground it could not vouch for is
+/// already `.assertedCoverageUnknown` and counts as covered here.
+public struct ProvenanceLabelCoverage: Sendable {
+
+    private let coverage: MeasuredCoverage
+
+    fileprivate init(covered: [Range<Date>]) {
+        // `provenFrom` stays `.distantPast`: a label-derived set has no proof horizon to establish,
+        // and `partition` then reports every gap as `.unmeasured` — i.e. it repeats the verdict the
+        // records-based call already reached, which is the only verdict this type is entitled to.
+        coverage = MeasuredCoverage(intervals: covered)
+    }
+
+    /// Cut `range` into ascending, contiguous pieces tagged with what the LABELS say about them.
+    /// Never `.unknown` — see the note on the initializer.
+    public func partition(_ range: Range<Date>) -> [(range: Range<Date>, ground: MeasuredCoverage.Ground)] {
+        coverage.partition(range)
     }
 }

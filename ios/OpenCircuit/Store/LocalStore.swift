@@ -2395,11 +2395,16 @@ struct LocalStore {
             // hypnogram carries no proven-unmeasured span — which means EITHER fully covered OR
             // written before provenance existed, and those must not be conflated — so a legacy row
             // keeps its previous behaviour untouched and is instead marked at the row level by the
-            // migration. `trusted(for:)` then applies the same retention guard the primary path uses,
-            // so neither construction can call a night empty that the other calls recorded.
+            // migration.
+            //
+            // ⚠️ AND IT IS NOT RE-GUARDED HERE. The retention guard belongs to the RECORDS-based
+            // call that wrote these labels; re-running `MeasuredCoverage.trusted(for:)` over the
+            // labels resolved its "oldest record" horizon to "the first non-hole LABEL" and handed
+            // every leading PROVEN hole back as `.unknown`, i.e. publishable — 🟢 measured at 60 min
+            // of invented sleep reaching Health in `SleepEditStoreTests`. `ProvenanceLabelCoverage`
+            // has no `trusted(for:)` at all, so that call cannot be written again.
             let coverage = MeasuredCoverage
-                .fromProvenanceLabels(SleepHypnogramCodec.decode(row.hypnogramData))?
-                .trusted(for: row.editedInBedStart ..< row.editedInBedEnd)
+                .fromProvenanceLabels(SleepHypnogramCodec.decode(row.hypnogramData))
             func fill(_ range: Range<Date>, _ stage: SleepStage) -> [SleepSegment] {
                 guard range.upperBound > range.lowerBound else { return [] }
                 guard let coverage else {
