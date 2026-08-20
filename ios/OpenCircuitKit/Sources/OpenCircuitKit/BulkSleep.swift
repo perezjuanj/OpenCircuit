@@ -1009,8 +1009,9 @@ public enum BulkSleep {
         // threw away ~5 h of a real 10 h night). The whole clustered span (gaps included) is returned;
         // `SleepStaging`/`sleepSegments` then stitch the fragments inside it.
         //
-        // OBSERVED-GAP GUARD (`observedGapCoverageCut`, DEFAULT OFF — see the constant's doc). When
-        // enabled, a bridge is DECLINED if the gap it spans is densely covered by real records: the
+        // OBSERVED-GAP GUARD (`observedGapCoverageCut`, DEFAULT 0.65 = ON — see the constant's doc
+        // for why that value and what it costs). A bridge is DECLINED if the gap it spans is
+        // densely covered by real records: the
         // stitch above exists for a night torn apart by a MISSING drain, and a gap full of observed
         // non-sleep epochs is not that — it is measured awake time. Default 0 disables the whole
         // check and this loop is then byte-identical to the pre-guard code (pinned by test).
@@ -1089,41 +1090,54 @@ public enum BulkSleep {
     /// byte-identical to the pre-fix scoping (kill switch, pinned by test).
     public static let morningContinuationMaxGap: TimeInterval = 30 * 60
 
-    /// OBSERVED-GAP GUARD on the BACKWARD cluster chain in `latestNightRecords` — **DEFAULT 0 =
-    /// DISABLED, and 0 is byte-identical to the pre-guard code** (`ObservedGapAbsorbTests`).
+    /// OBSERVED-GAP GUARD on the BACKWARD cluster chain in `latestNightRecords` — **DEFAULT 0.65 =
+    /// ENABLED. Setting it to 0 disables the whole check and is byte-identical to the pre-guard
+    /// code** (`ObservedGapAbsorbTests`; scoreboard sha256 `ef5dc087…a13e8f` at 0).
     ///
-    /// WHAT IT WOULD DO. The backward chain absorbs an earlier sleep block into the night whenever
-    /// the gap between them is ≤ `maxIntraNightGap` (6 h). It exists for a night torn across several
+    /// WHAT IT DOES. The backward chain absorbs an earlier sleep block into the night whenever the
+    /// gap between them is ≤ `maxIntraNightGap` (6 h). It exists for a night torn across several
     /// drains, where the fragments are separated by an **unobserved hole** — records that were never
     /// recorded, or were lost (`:1005-1009`, and #193/`e216f7c` for the hole-fence side of it). When
     /// this cut is > 0, a bridge is declined if the bridged gap is **densely covered by real
     /// records**, i.e. `observedRecords / (gap / 150 s) >= cut`: those epochs exist, the detector
     /// looked at them and did not call them sleep, so the gap is measured awake time, not a hole.
     ///
-    /// 🟢 MEASURED, and the measurement is the reason this ships at 0. Over the 27-record-carrying
-    /// nights of the 2026-08-19 corpus the backward chain considers 25 bridges and only **4** move
-    /// `clusterStart`. Two of the four span a ~30 s detector split (0 records, coverage 0.000) and
-    /// are below `onsetContiguityGap`, so no cut touches them. The other two are BOTH dense:
-    ///   * R3 2026-08-19 — 43.0 min gap, 17 records / 17.2 expected, coverage **0.988**. This is the
-    ///     still-but-awake 20:24→21:35 evening block being welded onto a night that really began at
-    ///     22:18; suppressing it is the point of the guard.
-    ///   * R3 2026-08-12 — 39.2 min gap, 14 records / 15.7 expected, coverage **0.894**. Same shape,
-    ///     NO user label, so the corpus cannot adjudicate it. 🟡 The ring's own SpO2/HRV duty cycle
-    ///     can, weakly, and it agrees with the guard: the dropped 22:51→00:38 block sits at duty
-    ///     0.310 with HR median 66, hourly 0.208 / 0.208 / 0.292 through 21h–23h, while the block the
-    ///     guard keeps runs at exactly 0.500 with HR median 54 from 01h — the awake→asleep step this
-    ///     project already documents at 🟡 (`spo2-duty-cycle-marks-onset`). Corroboration, not proof.
+    /// WHY 0.65 — a reachability bound, not a fit. **Higher is the conservative direction**: a higher
+    /// cut demands more observation before suppressing, so the guard fires less often and defers more
+    /// readily to the multi-drain stitch the chain exists for. But the cut cannot be pushed near 1.0,
+    /// because this ratio **cannot reach 1.0 for a fully observed gap**: `observed` counts records
+    /// STRICTLY INSIDE the gap while `expected` counts the two records that bound it, so a gap with
+    /// every epoch present reads ≈ (n−1)/n for n = gap/150 s. 🟢 MEASURED by
+    /// `ObservedGapCeilingProbeTests`: a perfectly covered gap reads **0.667** at the 7.5-min floor,
+    /// 0.917 at 30 min, 0.958 at 60 min. A cut above that curve is silently unreachable for shorter
+    /// gaps — the guard would then be testing HOW LONG the gap is and how its boundaries happen to
+    /// align with the 150 s grid, not whether the epochs exist. 0.65 is the highest value that stays
+    /// reachable at every gap length the guard is permitted to judge, so firing remains a function of
+    /// observation alone. Duration is filtered deliberately and separately by `onsetContiguityGap`
+    /// below, rather than accidentally by an unreachable ratio.
+    ///
+    /// 🟢 MEASURED on the 2026-08-19 corpus (27 record-carrying nights, 21 staged). The backward
+    /// chain considers 25 bridges; only **4** move `clusterStart`, at coverages
+    /// {0.000, 0.000, 0.894, 0.988}. The two 0.000 bridges span a ~30 s detector split and sit below
+    /// `onsetContiguityGap`, so no cut touches them. The other two are both fully observed and both
+    /// are declined at this cut. **2 nights change; 19 of 21 staged nights are bit-for-bit
+    /// identical**, including the `.intensityTail` regression guard.
+    /// ⚠️ Every cut in (0, 0.894] produces exactly this corpus result, and every cut in
+    /// (0.894, 0.988] moves only one of the two nights, with an IDENTICAL labelled scoreboard either
+    /// way — the labelled data cannot choose the value, which is why the argument above is semantic.
     /// ⚠️ NO corpus night stitches across an EMPTY hole, so the case the chain exists for is
-    /// UNREPRESENTED here and this guard's safety for it is argued, not measured. And 0.894 vs 0.988
-    /// is ~1.5 records — any cut that separates those two nights is a hand-tune, not a discriminator.
+    /// UNREPRESENTED here and this guard's safety for it is argued, not measured. (A *partially*
+    /// recovered hole was tested and never reaches the bridge: sparse recovered still-epochs merge
+    /// the block first.)
     /// ⚠️ THE KNOWN FALSE POSITIVE, asserted in `testEnabledCutAlsoDropsARealMidNightBout`: a wearer
     /// who genuinely sleeps, gets up and moves for 30–60 min with the ring recording, then sleeps
-    /// again, produces the SAME densely-observed gap. The guard drops their first bout. Nothing in
-    /// this corpus separates that case from Juan's, which is the whole reason the default is 0.
+    /// again, produces the SAME densely-observed gap, and the guard drops their first bout. Nothing
+    /// in this corpus separates that case from a still-but-awake evening. This is the standing cost
+    /// of the guard; `= 0` is the one-constant revert.
     ///
     /// Gaps at or below `onsetContiguityGap` (450 s) are never judged: at that scale a gap is
     /// detector granularity, not a hole and not an awakening, and both corpus cases prove it.
-    public static let observedGapAbsorbCoverageCut: Double = 0
+    public static let observedGapAbsorbCoverageCut: Double = 0.65
 
     /// Light/Deep/REM/Awake staging of the detected sleep block. Thin wrapper over
     /// `SleepStaging.classify` (kept for source compatibility with existing callers).

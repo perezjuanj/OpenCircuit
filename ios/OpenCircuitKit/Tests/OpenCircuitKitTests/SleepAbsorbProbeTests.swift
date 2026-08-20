@@ -155,6 +155,13 @@ final class SleepAbsorbProbeTests: XCTestCase {
     }
 
     /// The probe must reproduce production's own night scoping, or its evidence is worthless.
+    ///
+    /// Compared against production AT CUT 0. `walk` deliberately transcribes the UNGUARDED backward
+    /// chain — that is the whole point of the probe: it enumerates every bridge the chain *considers*
+    /// and the coverage of each, which is the evidence the cut is chosen from. Comparing it against
+    /// the guarded default would compare two different algorithms and the anti-drift guarantee would
+    /// mean nothing. (Measured: at the shipped default this disagrees on exactly the 2 nights the
+    /// guard moves, R3_2026-08-12 and R3_2026-08-19 — i.e. the intended behaviour change.)
     func testProbeAgreesWithProduction() throws {
         guard let dir = SleepReplay.dir("OC_SLEEP_CORPUS") else {
             print("SKIP — set OC_SLEEP_CORPUS")
@@ -166,7 +173,8 @@ final class SleepAbsorbProbeTests: XCTestCase {
             let union = EpochArchive.merge(existing: [], incoming: recs)
             let temps = n.temperatures.map { TemperatureSample(time: $0.t, celsius: $0.c) }
             try SleepReplay.withTimeZone(n.timeZone, at: recs.first?.date() ?? Date()) {
-                let prod = BulkSleep.latestNightRecords(from: union, temperatures: temps)
+                let prod = BulkSleep.latestNightRecords(from: union, temperatures: temps,
+                                                        observedGapCoverageCut: 0)
                 guard let w = Self.walk(union, temperatures: temps) else {
                     // No night: production returns the records unchanged.
                     XCTAssertEqual(prod.count, union.count, "\(n.id): no-night case must pass through")

@@ -82,7 +82,24 @@ final class SleepReplayMeasureTests: XCTestCase {
 /// Only fields the manifest explicitly lists in `stored.fidelity` are asserted. A row whose input
 /// provably differs from what staging saw (a later archive snapshot, a hole the app did not have)
 /// declares an EMPTY list and is reported, never asserted — see each row's `inputCaveat`.
+///
+/// ⚠️ REPLAYED AT `observedGapAbsorbCoverageCut = 0`, DELIBERATELY, AND THAT IS A REAL LIMITATION.
+/// Every `stored.*` value in the manifest was persisted by a build that PREDATES the observed-gap
+/// guard (build ≤ 45). This test asks one question only — "does the harness transcribe the
+/// production path?" — so it must run the same code the fixtures came out of; scoring it against the
+/// current default would only re-measure the guard, which `SleepBaselineTests` already does, and
+/// would silently redefine the parity proof every time a staging default moves.
+/// MEASURED, so nobody has to guess what that hides: at the shipped default this test fails 4
+/// assertions on `juan-2026-08-19` (inBedStart 22:18:36 vs stored 20:24, Δ 115 min, plus the three
+/// `edit.*` stage minutes) and passes on the other four nights. Those failures ARE the intended
+/// behaviour change, not a harness defect.
+/// ⚠️ CONSEQUENCE: a green run here does NOT say the guard reproduces production. Nothing does yet —
+/// closing that needs one Diagnostics bundle from a device running a build with the guard ON.
 final class SleepReplayFidelityTests: XCTestCase {
+
+    /// The cut the stored fixtures were produced at. Not `BulkSleep.observedGapAbsorbCoverageCut` —
+    /// see the class comment. Bump this only alongside re-captured fixtures.
+    static let fixtureProvenanceCut: Double = 0
 
     /// The stored window is compared at the manifest row's own precision: a diagnostics `.txt`
     /// prints HH:mm, so a 60 s row can only ever be asserted to the minute.
@@ -93,10 +110,18 @@ final class SleepReplayFidelityTests: XCTestCase {
         }
         let nights = try SleepReplay.loadManifest(at: dir)
         var asserted = 0
-        print("\n=== SLEEP REPLAY FIDELITY — \(dir.path)\n")
+        print("\n=== SLEEP REPLAY FIDELITY — \(dir.path)")
+        print("=== replayed at observedGapAbsorbCoverageCut = \(Self.fixtureProvenanceCut) "
+              + "(the fixtures' provenance; shipped default is "
+              + "\(BulkSleep.observedGapAbsorbCoverageCut))")
+        if Self.fixtureProvenanceCut != BulkSleep.observedGapAbsorbCoverageCut {
+            print("=== ⚠️  this proves the HARNESS matches the PRE-GUARD production path. It says "
+                  + "NOTHING about whether the shipped default matches a device.\n")
+        }
 
         for n in nights {
-            let r = try SleepReplay.measure(n, in: dir)
+            let r = try SleepReplay.measure(n, in: dir,
+                                            observedGapCoverageCut: Self.fixtureProvenanceCut)
             let tz = n.timeZone
             let tol = Double(n.stored.windowPrecisionSec)
             print("--- \(n.id)   build \(n.appBuild ?? "?")  \(n.ring ?? "")  "

@@ -223,33 +223,49 @@ Two further cross-checks, both measured:
 
 ---
 
-## 7. A/B'ing a candidate: `observedGapAbsorbCoverageCut` (candidate 1)
+## 7. A/B'ing a candidate: `observedGapAbsorbCoverageCut` (candidate 1 — **now ON at 0.65**)
 
 The harness can score a staging candidate against master **in one process, on the same bytes, with
 nothing else different**. The first knob wired this way is the observed-gap guard on the backward
-cluster chain (`BulkSleep.observedGapAbsorbCoverageCut`, default `0` = master).
+cluster chain (`BulkSleep.observedGapAbsorbCoverageCut`). **It now ships ENABLED at `0.65`; `0` is
+the one-constant revert and is byte-identical to the pre-guard code.**
 
 ```sh
 cd ios/OpenCircuitKit
-# BEFORE — omit the variable; the TSV is byte-identical to the master baseline
-OC_SLEEP_BASELINE_CORPUS=<corpus> OC_SLEEP_BASELINE_OUT=/tmp/before.tsv \
+# SHIPPED DEFAULT — omit the variable
+OC_SLEEP_BASELINE_CORPUS=<corpus> OC_SLEEP_BASELINE_OUT=/tmp/after.tsv \
   swift test --filter SleepBaselineTests
-# AFTER — any cut in (0, 1]
-OC_SLEEP_BASELINE_CORPUS=<corpus> OC_SLEEP_ABSORB_CUT=0.5 OC_SLEEP_BASELINE_OUT=/tmp/after.tsv \
+# MASTER / OFF — the TSV is byte-identical to the pre-guard baseline (sha256 ef5dc087…a13e8f)
+OC_SLEEP_BASELINE_CORPUS=<corpus> OC_SLEEP_ABSORB_CUT=0 OC_SLEEP_BASELINE_OUT=/tmp/before.tsv \
   swift test --filter SleepBaselineTests
-# and, before changing anything, see WHAT the chain actually bridges on every night:
+# and, to see WHAT the chain actually bridges on every night (this probe models the UNGUARDED
+# chain deliberately — that is how the bridge coverages below were measured):
 OC_SLEEP_CORPUS=<corpus> swift test --filter SleepAbsorbProbeTests
+# the coverage-CEILING curve that the 0.65 choice rests on (no corpus needed):
+swift test --filter ObservedGapCeilingProbeTests
 ```
 
 **Measured result on the 2026-08-19 corpus (73 rows, 27 replayable, 21 staged).** Every cut in
-`[0.1, 0.9]` changes exactly the same nights; `1.0` changes nothing.
+`(0, 0.894]` changes exactly the same two nights; `(0.894, 0.988]` changes one; `> 0.988` changes
+nothing. The labelled scoreboard is IDENTICAL across the whole range — which is why the value is
+argued from semantics, not fitted.
 
 | cut | nights changed | median \|in-bed edge err\| on labelled nights | mean |
 |---|---|---|---|
-| default `0` | 0 — TSV sha256 identical to the master baseline | 89.5 | 96.2 |
-| 0.1 / 0.5 | 2 (`R3_2026-08-19`, `R3_2026-08-12`) | 35.0 | 84.8 |
+| `0` (off) | 0 — TSV sha256 `ef5dc087…a13e8f` | 89.5 | 96.2 |
+| **0.65 (shipped)** | **2** (`R3_2026-08-19`, `R3_2026-08-12`) | **35.0** | **84.8** |
 | 0.9 / 0.95 | 1 (`R3_2026-08-19` only) | 35.0 | 84.8 |
 | 1.0 | 0 | 89.5 | 96.2 |
+
+**Why 0.65 and not 0.9.** The ratio counts records STRICTLY INSIDE the gap but divides by
+`gap / 150 s`, which includes the two records bounding it — so a **fully observed** gap cannot read
+1.0. Measured ceiling (`ObservedGapCeilingProbeTests`): **0.667** at the 7.5-min floor, 0.917 at
+30 min, 0.958 at 60 min. A cut above that curve is unreachable for shorter gaps, making the guard a
+test of gap LENGTH and 150 s grid alignment rather than of observation. 0.65 is the highest value
+reachable at every gap length the guard may judge. Corroborating the point: the corpus's two dense
+bridges read 0.894 (39.2 min) and 0.988 (43.0 min), and the 0.894 one is **at its own arithmetic
+ceiling of 0.893** — both gaps are completely observed, so any cut separating them separates gap
+length, not data quality.
 
 - `R3_2026-08-19` (labelled): in-bed start `20:24:34 → 22:18:36`, error vs the wearer's own corrected
   22:24 goes **−119 → −5 min**. In-bed end unchanged (+10). Asleep 713 → 648 (his true ~395 is a
@@ -261,3 +277,35 @@ OC_SLEEP_CORPUS=<corpus> swift test --filter SleepAbsorbProbeTests
 > The median moves 89.5 → 35.0 because **one** edge moves from 119 to 5 in a 10-value list — at n=10
 > the median is a step function. The honest effect size is the **mean**, −11.4 min, i.e. 114 min of
 > error removed across 10 edges. Quote both.
+>
+> ⚠️ That n=10 is the **in-bed edges only**. Over all four labelled error columns (n=16, adding 3
+> onset + 3 wake labels, none of which move) the mean is **103.7 → 96.6**. State which denominator
+> you are quoting.
+
+### 7a. What it COSTS — report these alongside the wins
+
+- **`R3_2026-08-19` awake-in-bed error 195 → 244 min worse**, efficiency error 0.320 → 0.382 worse
+  (0.928 → **0.990** against the wearer's own reference 0.608). This is the documented
+  `inbed-equals-asleep` signal ceiling being EXPOSED by a correct bedtime, not created by the guard —
+  the same night's *asleep* error simultaneously improves, 324 → 259 min. It is **disclosed, not
+  silent**: efficiency crossing 0.95 trips `SleepConfidence.durationLikelyHigh` and
+  `SleepCardView.confidenceHint` renders "Very still night — duration may read a little high…"
+  (pinned by `ObservedGapAbsorbDisclosureTests`; the night said nothing before the change).
+- **`R3_2026-08-12` awake error 57 → 131 min worse**, and it carries **no in-bed label** at all, so
+  the corpus cannot adjudicate its ±145 min start move.
+- Only **one labelled night** moves, against `SleepEditLabel.minimumNightsToFit = 10`.
+- The known false positive is now live: a real sleep → get-up-and-move → sleep-again night has the
+  same densely-observed gap and loses its first bout (`testEnabledCutAlsoDropsARealMidNightBout`).
+
+### 7b. It does NOT rewrite stored history
+
+Verified in source and pinned by `ObservedGapAbsorbHistorySafetyTests`:
+`SleepNightKey` anchors on **`inBedEnd`**, which this guard never moves, so a re-drain lands on the
+SAME row — no duplicate night, even when the corrected start crosses midnight. That row is then kept:
+`LocalStore.swift:1498-1500` sets `sameCoverage` only when BOTH edges are within one 150 s epoch (the
+start moves 114–145 min, so it is false), and `SleepSummaryMerge.shouldReplace` therefore judges on
+time asleep, which the guard only ever reduces → `.keptFullerStoredNight`. A manually-edited row
+returns `.keptManualEdit` even earlier, and `SleepEdit.widenRecorded` is outward-only so a narrower
+incoming start cannot shrink the clamp. **The fix improves nights staged from now on; existing
+history is untouched.** The load-bearing precondition — that the guard only ever reduces asleep — is
+asserted, because if it ever added sleep those rows WOULD be overwritten.
