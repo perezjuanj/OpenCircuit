@@ -121,6 +121,18 @@ final class HealthKitWriter {
             && store.authorizationStatus(for: HKQuantityType(.heartRate)) == .sharingAuthorized
     }
 
+    /// True when SLEEP specifically is being written to Apple Health right now.
+    ///
+    /// Deliberately NOT `isShareAuthorized`, which probes HEART RATE as a representative type: the
+    /// partial-grant case (#132) is real — heart rate on, sleep off in Settings ▸ Health ▸ Data
+    /// Access — and in that state the app writes no sleep at all. The Sleep card's edited-night
+    /// notice tells the wearer what Apple Health holds for that night, so it must key on the type it
+    /// is talking about, not on a proxy.
+    var isSleepShareAuthorized: Bool {
+        Self.isAvailable
+            && store.authorizationStatus(for: HKCategoryType(.sleepAnalysis)) == .sharingAuthorized
+    }
+
     /// The shareable, AUTHORIZABLE types the user has explicitly DENIED (turned off in the iOS
     /// permission sheet or later in Settings ▸ Health ▸ Data Access). SHARE status is reportable
     /// per-type (unlike READ status), so this is a trustworthy signal. `allTypes` already excludes

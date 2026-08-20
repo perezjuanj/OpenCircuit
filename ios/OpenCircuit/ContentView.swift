@@ -21,6 +21,13 @@ struct ContentView: View {
     /// of a blanket "Auto-syncing" that silently drops the denied metrics. Recomputed alongside
     /// `healthAuthorized` (launch / foreground / post-authorize / post-flush).
     @State private var healthShareState: HealthKitWriter.ShareState = .unauthorized
+    /// Whether SLEEP specifically is reaching Apple Health (`.sleepAnalysis` share granted). Keyed on
+    /// the sleep type rather than the heart-rate proxy `healthAuthorized` uses, because the Sleep
+    /// card's edited-night notice makes a claim about what Health holds FOR SLEEP and must not make
+    /// it on a partial grant (#132). Refreshed in `refreshHealthShareState`, i.e. at every point
+    /// `healthAuthorized` is refreshed (launch / foreground / post-authorize / post-flush). Starts
+    /// `false`: absent evidence, the sentence is dropped rather than guessed.
+    @State private var mirrorsSleepToHealth = false
     /// Persisted per-metric Health write failures (#135) — a metric whose `save` actually threw
     /// (e.g. a category toggled off in Settings ▸ Health). Surfaced as an amber "hasn't synced" line.
     @State private var healthWriteFailures: [MetricKind] = []
@@ -1343,6 +1350,7 @@ struct ContentView: View {
     /// reflects a just-finished sync instantly via the live staged segments. (See SleepCardView.)
     private var sleepCard: some View {
         SleepCardView(liveSegments: session?.stagedSegments ?? [], lastSyncAt: lastSyncAt,
+                      mirrorsSleepToHealth: mirrorsSleepToHealth,
                       sleepPersistOutcome: session?.lastSleepPersistOutcome,
                       onEditSleep: { night, times, uiCoverage in
                           await session?.applySleepEdit(night: night, times: times,
@@ -1783,6 +1791,7 @@ struct ContentView: View {
     private func refreshHealthShareState() {
         healthShareState = health.shareState
         healthWriteFailures = HealthKitWriter.healthWriteFailures().keys.sorted { $0.rawValue < $1.rawValue }
+        mirrorsSleepToHealth = health.isSleepShareAuthorized
     }
 
     // MARK: Device Info (#79)
