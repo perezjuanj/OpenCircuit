@@ -46,8 +46,29 @@ import XCTest
 enum SleepBaselineGolden {
     /// sha256 of `manifest.json` for the corpus the baseline below was measured on.
     static let corpusManifestSHA256 = "63a07be8f28714b2c31a410c950dfb9c6f69b899097dccbc5f92f18b41061c0e"
-    /// sha256 of the `baseline.tsv` this emitter produces from that corpus on master `f042639`.
-    static let baselineSHA256 = "ef5dc087a16f0461d14d656d2e3461cc479cceb85ef5d30f5e4dd741eaa13e8f"
+    /// sha256 of the `baseline.tsv` this emitter produces from that corpus AT THE SHIPPED DEFAULT.
+    ///
+    /// ⚠️ 2026-08-22: this was `ef5dc087…a13e8f` and that was a real hash of the wrong thing. It is
+    /// the scoreboard with `BulkSleep.observedGapAbsorbCoverageCut` **at 0 — the kill switch OFF**,
+    /// which is what master `f042639` (build 45) did before the evening-absorb guard merged in
+    /// `f790c19` (build 46). Pinned as the default, the golden failed on every correct run and
+    /// passed only with the shipped behaviour disabled — a gate that is green exactly when the
+    /// feature is off.
+    ///
+    /// Both values re-derived on 2026-08-22 against the same pinned corpus, on master `f790c19`:
+    ///     OC_SLEEP_BASELINE_CORPUS=… swift test --filter SleepBaselineTests        → b1df0547…9bf148
+    ///     OC_SLEEP_ABSORB_CUT=0 OC_SLEEP_BASELINE_CORPUS=… …                       → ef5dc087…a13e8f
+    /// and the honesty stack reproduces `b1df0547` byte-for-byte, 73 rows × 57 columns, which is the
+    /// evidence for "no staged sleep number moved".
+    ///
+    /// Keep BOTH written down. `docs/SLEEP_REPLAY_HARNESS.md` and `BulkSleep.swift`'s comment quote
+    /// `ef5dc087` and are CORRECT — they are talking about the guard being off. Do not "fix" them.
+    static let baselineSHA256 = "b1df05475ae15b243c35b8c25c6bd76888e596248f569160c3dba33bbb9bf148"
+
+    /// The same scoreboard with the evening-absorb guard OFF (`OC_SLEEP_ABSORB_CUT=0`). Recorded so
+    /// the two can never be mistaken for each other again.
+    static let baselineSHA256AbsorbGuardOff =
+        "ef5dc087a16f0461d14d656d2e3461cc479cceb85ef5d30f5e4dd741eaa13e8f"
 
     static func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()

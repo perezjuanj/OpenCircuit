@@ -93,7 +93,13 @@ this?* rather than nothing at all:
 | what | sha256 |
 |---|---|
 | corpus `manifest.json` (identity of the corpus) | `63a07be8f28714b2c31a410c950dfb9c6f69b899097dccbc5f92f18b41061c0e` |
-| `baseline.tsv` emitted from it on master `f042639` (74 lines: header + 73 rows) | `ef5dc087a16f0461d14d656d2e3461cc479cceb85ef5d30f5e4dd741eaa13e8f` |
+| `baseline.tsv` at the **shipped default** — master `f790c19`, build 46 (74 lines: header + 73 rows) | `b1df05475ae15b243c35b8c25c6bd76888e596248f569160c3dba33bbb9bf148` |
+| the same, with the evening-absorb guard **OFF** (`OC_SLEEP_ABSORB_CUT=0`, ≡ master `f042639`) | `ef5dc087a16f0461d14d656d2e3461cc479cceb85ef5d30f5e4dd741eaa13e8f` |
+
+⚠️ **These two are not interchangeable and the pin got it wrong once.** `SleepBaselineGolden`
+originally pinned `ef5dc087` as the default; that is the guard-OFF scoreboard, so the golden failed
+on every correct run and passed only with build 46's behaviour disabled. Both were re-derived on
+2026-08-22 against this corpus. When you quote a scoreboard hash, say which cut produced it.
 
 The emitter asserts the baseline hash **only** when the manifest it just read matches the first row —
 against any other corpus it prints both hashes and asserts nothing, because there is nothing to
