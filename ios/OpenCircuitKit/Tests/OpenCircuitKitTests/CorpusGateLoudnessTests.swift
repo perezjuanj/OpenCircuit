@@ -189,6 +189,12 @@ final class CorpusGateLoudnessTests: XCTestCase {
         let corpusToken = "OC_" + "[A-Z0-9_]*" + "CORPUS"
         let corpusLiteral = try NSRegularExpression(pattern: "\"" + corpusToken + "\"")
         let gatedLiteral = try NSRegularExpression(pattern: "requireCorpus\\(\\s*\"" + corpusToken + "\"")
+        // The `anyOf:` overload consumes its names from an ARRAY literal, so they are not "the first
+        // argument" textually even though the call skips just as loudly. Cover the whole bracketed
+        // list: names inside it are as gated as a first-argument name, and nothing else is. Kept
+        // deliberately narrow — `[^\]]*` cannot span past the closing bracket, so a name sitting
+        // after the call still trips the rule.
+        let gatedAnyOfList = try NSRegularExpression(pattern: "requireCorpus\\(\\s*anyOf:\\s*\\[[^\\]]*\\]")
 
         var violations: [String] = []
         let sources = try auditSources()
@@ -206,6 +212,9 @@ final class CorpusGateLoudnessTests: XCTestCase {
             let whole = NSRange(location: 0, length: flat.length)
             var gated: [NSRange] = []
             gatedLiteral.enumerateMatches(in: src.flat, range: whole) { m, _, _ in
+                if let m { gated.append(m.range) }
+            }
+            gatedAnyOfList.enumerateMatches(in: src.flat, range: whole) { m, _, _ in
                 if let m { gated.append(m.range) }
             }
             corpusLiteral.enumerateMatches(in: src.flat, range: whole) { m, _, _ in
@@ -294,6 +303,7 @@ final class CorpusGateLoudnessTests: XCTestCase {
             "SleepAbsorbProbeTests.swift": 2,     // backward-absorb probe + its anti-drift check
             "SleepProvenanceCorpusTests.swift": 1, // asserted-vs-measured blast radius
             "SleepProvenanceFixtureProbe.swift": 1, // fixture-geometry scaffold
+            "SleepEditedNightNoticeCorpusTests.swift": 1, // how often the card's notice appears
         ]
         let gateCall = "SleepReplay" + ".requireCorpus("
         var found: [String: Int] = [:]
@@ -339,9 +349,15 @@ final class CorpusGateLoudnessTests: XCTestCase {
             oc + "_COVERAGE_CORPUS",  // SleepCoverageMeasureTests — acquisition coverage
             oc + "_BASELINE_CORPUS",  // SleepBaselineTests — the pinned-golden emitter
             oc + "_PROVENANCE_CORPUS", // SleepProvenanceCorpusTests + its fixture scaffold
+            oc + "_NOTICE_CORPUS",     // SleepEditedNightNoticeCorpusTests
             oc + "_BASELINE_OUT",     // …and where that emitter writes its TSV. NOT a corpus: an
                                       // output path, legitimately Optional, read raw.
             oc + "_GATE_SELFTEST",    // this file's own injected variable; never a real corpus
+            oc + "_PROBE_OUT",        // SleepAbsorbProbeTests' output path. NOT a corpus, same shape
+                                      // as _BASELINE_OUT: an output path, legitimately Optional.
+            oc + "_ABSORB_CUT",       // SleepAbsorbProbeTests' CANDIDATE cut override. NOT a corpus:
+                                      // unset means "measure the shipped default", which is a real
+                                      // measurement, not a skipped one.
         ]
         // Assembled from pieces, like the needle above, so this file's own source cannot match.
         let ocLiteral = try NSRegularExpression(pattern: "\"" + "OC_" + "[A-Z0-9_]+" + "\"")

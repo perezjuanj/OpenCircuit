@@ -35,11 +35,10 @@ final class SleepEditedNightNoticeCorpusTests: XCTestCase {
     private static let discounted: Set<String> = ["R1_2026-08-14", "R1_2026-08-15"]
 
     func testMeasureHowManyCorpusNightsShowTheEditedNightLine() throws {
-        guard let dir = SleepReplay.dir("OC_SLEEP_NOTICE_CORPUS")
-                ?? SleepReplay.dir("OC_SLEEP_PROVENANCE_CORPUS")
-                ?? SleepReplay.dir("OC_SLEEP_BASELINE_CORPUS") else {
-            throw XCTSkip("OC_SLEEP_NOTICE_CORPUS unset — point it at a corpus directory.")
-        }
+        let dir = try SleepReplay.requireCorpus(
+            anyOf: ["OC_SLEEP_NOTICE_CORPUS", "OC_SLEEP_PROVENANCE_CORPUS", "OC_SLEEP_BASELINE_CORPUS"],
+            purpose: "the count of corpus nights that would show the edited-night notice",
+            consequence: "How often the new card line appears was NOT measured on this run.")
 
         let raw = try JSONSerialization.jsonObject(with:
             try Data(contentsOf: dir.appendingPathComponent("manifest.json")))
