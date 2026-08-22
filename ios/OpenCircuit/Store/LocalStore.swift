@@ -1696,6 +1696,41 @@ struct LocalStore {
                 // it), and the caller's single `sleep-persist` event already carries the name. A
                 // second event here would triple the metric log's fill rate and evict the rarer
                 // breadcrumbs (`sleep-rekey`, `sleep-drop`, `archive-repair`) that testers need.
+                //
+                // …but the clamp anchors must still grow. This is the SAME defect the
+                // `keptManualEdit` branch above was fixed for on 2026-08-16, sitting unfixed in the
+                // sibling branch nobody checked: discarding the fuller staging's MINUTES is
+                // correct, freezing the RECORDED WINDOW the edit clamp anchors on is not.
+                //
+                // 🟢 2026-08-22, measured on a Gen 2 Air tester's night. Her second drain, 13
+                // minutes after the first, carried the last 10 minutes of the night
+                // (02:21:51..02:31:51). Re-staging with them yields 108 asleep-min against the
+                // stored 112 — that tail genuinely reads awake — so `shouldReplace` correctly
+                // refused. The row then kept `inBedEnd = 02:08:51` even though the app holds epochs
+                // through 02:33:51, and her edit clamp is anchored on that frozen edge.
+                //
+                // Outward-only, so it can only ever widen what an edit may reach. It writes the
+                // OVERLAY columns for the same reason the branch above does: the frozen
+                // `inBedStart…sleepWake` columns are Health's "what the ordinary flush wrote"
+                // bookkeeping, and this drain wrote nothing. The event fires ONLY when a widen
+                // actually happened — rare — so the fill-rate reasoning above still holds.
+                if let w = SleepEdit.widenRecorded(
+                    stored: existing.sleepEditClampWindow,
+                    incoming: .init(inBedStart: inBedStart, inBedEnd: inBedEnd,
+                                    sleepOnset: sleepOnset, sleepWake: sleepWake)) {
+                    existing.widenedRecordedInBedStart = w.inBedStart
+                    existing.widenedRecordedInBedEnd = w.inBedEnd
+                    existing.widenedRecordedOnset = w.sleepOnset
+                    existing.widenedRecordedWake = w.sleepWake
+                    existing.updatedAt = Date()
+                    ObservabilityStore().recordMetricEvent(
+                        source: "sleep-drop",
+                        detail: "night=\(Self.stamp(dayStart)) kept=FULLER "
+                            + "incoming=[\(Self.stamp(inBedStart))..\(Self.stamp(inBedEnd))] "
+                            + "asleep=\(m.asleep) "
+                            + "clampWidened=[\(Self.stamp(w.inBedStart))..\(Self.stamp(w.inBedEnd))]")
+                    try context.save()
+                }
                 return .keptFullerStoredNight
             }
             // Only NOW — every early return above is behind us, so this reaches `context.save()`.
