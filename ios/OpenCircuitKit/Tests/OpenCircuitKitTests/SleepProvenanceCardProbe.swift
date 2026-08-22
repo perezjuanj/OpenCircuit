@@ -13,12 +13,14 @@ final class SleepProvenanceCardProbe: XCTestCase {
 
     private func d(_ e: Int) -> Date { Date(timeIntervalSince1970: TimeInterval(e)) }
 
-    /// - Returns: `(shippedAsleepMin, retractedAsleepMin)` — the before-card total this must
-    ///   reproduce, and the asleep-minutes removed from the Apple Health write.
+    /// - Returns: `(shippedAsleepMin, retractedAsleepMin, cardNotice)` — the before-card total this
+    ///   must reproduce, the asleep-minutes removed from the Apple Health write, and the exact Sleep
+    ///   card line that accounts for the difference between the two.
     @discardableResult
     private func report(_ name: String, base: [SleepSegment], times: SleepEdit.Times,
                         coverage: MeasuredCoverage) -> (shippedAsleepMin: Int,
-                                                        retractedAsleepMin: Double) {
+                                                        retractedAsleepMin: Double,
+                                                        cardNotice: String?) {
         let off = SleepEdit.recompute(baseSegments: base, times: times, coverage: nil)
         let on = SleepEdit.recompute(baseSegments: base, times: times, coverage: coverage)
         let sOff = SleepStaging.summary(off), mOff = sOff.minutes
@@ -35,6 +37,12 @@ final class SleepProvenanceCardProbe: XCTestCase {
         let inBedOff = off.filter { $0.stage == .inBed }.reduce(0.0) { $0 + $1.duration } / 60
         let inBedOn = on.healthPublishable.filter { $0.stage == .inBed }
             .reduce(0.0) { $0 + $1.duration } / 60
+        // The Sleep-card line the wearer reads under the footer — the copy half of this change,
+        // rendered from the very same breakdown the Health filter is driven by. `true` here is the
+        // sleep-share-authorized case, i.e. what the tester actually sees.
+        let notice = SleepEditedNightNotice.line(measuredAsleep: b.measuredAsleep,
+                                                 assertedAsleep: b.assertedAsleep,
+                                                 mirrorsSleepToHealth: true)
 
         print("""
 
@@ -57,13 +65,16 @@ final class SleepProvenanceCardProbe: XCTestCase {
           -> Health asleep \(String(format: "%.1f", healthOn)) min · inBed \(String(format: "%.1f", inBedOn)) min
           RETRACTED  \(String(format: "%.1f", healthOff - healthOn)) asleep-min no longer written
           reason     \(b.withheldReason ?? "—")
+          CARD LINE  \(notice ?? "— (silent)")
         """)
 
         // The card the user sees must not change — clause 1.
         XCTAssertEqual(SleepStaging.summary(on).minutes.asleep, mOff.asleep, name)
         // …and the in-bed claim must survive to Health in full.
         XCTAssertEqual(inBedOn, inBedOff, accuracy: 0.01, "\(name): the in-bed claim was dropped")
-        return (mOff.asleep, healthOff - healthOn)
+        // The retraction may not ship without the line that accounts for it.
+        XCTAssertNotNil(notice, "\(name): Health drops asleep-minutes with nothing on the card saying so")
+        return (mOff.asleep, healthOff - healthOn, notice)
     }
 
     func testBothTesterNightsReproduceTheShippedCardAndRetractTheInventedSleep() {
@@ -129,5 +140,16 @@ final class SleepProvenanceCardProbe: XCTestCase {
         XCTAssertEqual(n0817.retractedAsleepMin, 243.1, accuracy: 0.2)
         XCTAssertEqual(n0818.retractedAsleepMin + n0817.retractedAsleepMin, 484.5, accuracy: 0.4,
                        "484.5 invented asleep-minutes stop reaching Apple Health across the two nights")
+
+        // …and pin the exact card line for each, verbatim. This is the sentence that keeps the
+        // Health subtraction from shipping unaccounted for; a silent reword is a regression.
+        XCTAssertEqual(n0818.cardNotice,
+                       "We kept the times you set. The ring recorded 2h 42m of the sleep above; for "
+                       + "the other 4h 1m we have your account, not a measurement. Only the measured "
+                       + "part reaches Apple Health, so your sleep there reads shorter.")
+        XCTAssertEqual(n0817.cardNotice,
+                       "We kept the times you set. The ring recorded 3 minutes of the sleep above; "
+                       + "for the other 4h 3m we have your account, not a measurement. Only the "
+                       + "measured part reaches Apple Health, so your sleep there reads shorter.")
     }
 }

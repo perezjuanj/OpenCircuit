@@ -59,6 +59,15 @@ struct SleepCardView: View {
     /// missing-night banner is suppressed in favour of a soft "not synced yet" note. nil ⇒ never
     /// synced. Uses the SYNC time, not a sample timestamp (device timestamps can be 60+ min stale).
     var lastSyncAt: Date?
+    /// Whether this app is actually mirroring SLEEP to Apple Health right now — i.e. the wearer
+    /// granted the sleep-analysis share type and has not since turned it off.
+    ///
+    /// Injected, never inferred, and deliberately defaulting to `false`. It gates one sentence of the
+    /// edited-night notice: the sentence that tells the user what Apple Health holds. Saying "only
+    /// measured sleep is written to Apple Health" to someone whose sleep permission is off would be
+    /// an unearned claim about a surface we are not writing to — the exact failure mode this whole
+    /// change removes — so absent evidence the sentence is dropped rather than reworded.
+    var mirrorsSleepToHealth: Bool = false
     /// What the last drain's attempt to STORE the night actually did (#204). nil = no drain has
     /// tried this session. When it reports a silent loss AND the night on screen has no stored row,
     /// the card says so instead of quietly presenting live staging that will not survive relaunch
@@ -78,12 +87,14 @@ struct SleepCardView: View {
     private static let historyNights = 35
 
     init(liveSegments: [SleepSegment] = [], lastSyncAt: Date? = nil,
+         mirrorsSleepToHealth: Bool = false,
          sleepPersistOutcome: SleepPersistOutcome? = nil,
          onEditSleep: ((Date, SleepEdit.Times, ClosedRange<Date>?) async -> Int?)? = nil,
          sleepEditDataCoverage: ((Date, Date) -> ClosedRange<Date>?)? = nil,
          onNap: ((Date?, NapEdit.Window) async -> Bool)? = nil) {
         self.liveSegments = liveSegments
         self.lastSyncAt = lastSyncAt
+        self.mirrorsSleepToHealth = mirrorsSleepToHealth
         self.sleepPersistOutcome = sleepPersistOutcome
         self.onEditSleep = onEditSleep
         self.sleepEditDataCoverage = sleepEditDataCoverage
@@ -433,9 +444,78 @@ struct SleepCardView: View {
         // Footer: sleep window · efficiency · est. caveat.
         Text(footer(night).joined(separator: " · "))
             .font(.caption2).foregroundStyle(.tertiary)
+        hints(night)
+    }
+
+    /// The caption rows under the footer, as ONE ViewBuilder child — `content` is already at the
+    /// 10-child limit — and, more importantly, as the ONE place their precedence is stated.
+    ///
+    /// AT MOST TWO ROWS EVER RENDER, which is exactly the ceiling before this line existed:
+    /// `captureHint` and `bedtimeProvenanceHint` are already mutually exclusive (the latter tests
+    /// `!isLikelyTruncated`), as are `captureHint` and `confidenceHint`, so the pre-existing maximum
+    /// was {bedtime, confidence}. `editedNightNotice` displaces BOTH of those, so the new maximum is
+    /// {capture, edited}. Three stacked caveats about one night is its own defect.
+    ///
+    /// WHY IT DISPLACES THEM, rather than sitting alongside:
+    ///
+    /// - `bedtimeProvenanceHint` ends "tap Edit to correct it" / "Tap Edit if it's wrong". On a night
+    ///   the wearer has ALREADY edited that is not a caveat, it is the app failing to notice they did
+    ///   the thing it is asking for. The new line makes the same underlying statement — the ring
+    ///   recorded nothing across part of this window — and credits the correction instead.
+    /// - `confidenceHint` says "very still night — duration may read a little high", attributing a
+    ///   high efficiency to a sensor ceiling. On an asserted night `summary.efficiency` is inflated
+    ///   by the FILL, not by stillness (it is `asleep / inBed` on the display basis, which is why
+    ///   `SleepProvenanceBreakdown.efficiency` refuses to publish a ratio over uncovered ground). So
+    ///   that attribution is not merely redundant here, it is wrong, and naming the real cause is
+    ///   strictly more honest.
+    ///
+    /// `captureHint` is deliberately NOT displaced: it is the only actionable row of the four ("the
+    /// rest of the night didn't transfer off the ring — make sure the official app isn't connected"),
+    /// it names a different problem, and its buffer-limited signature is near-disjoint from an edited
+    /// night anyway — neither tester night can reach it (both in-bed spans, 439 min and 491 min, are
+    /// far past `SleepCaptureCoverage.ringBufferSeconds + bufferSlack`, so it returns `.full`).
+    @ViewBuilder
+    private func hints(_ night: Night) -> some View {
+        let editedNotice = editedNightNoticeText(night)
         captureHint(night)
-        bedtimeProvenanceHint(night)
-        confidenceHint(night)
+        if let editedNotice {
+            hintRow(systemImage: "pencil", tint: .secondary, editedNotice)
+        } else {
+            bedtimeProvenanceHint(night)
+            confidenceHint(night)
+        }
+    }
+
+    // MARK: Edited night with asserted-unmeasured sleep
+
+    /// Account for the difference between this card's total and Apple Health, on a night where both
+    /// halves of the statement are CERTAIN.
+    ///
+    /// This is the copy half of the provenance change, and the release depends on the two shipping
+    /// together: the Health write now drops asleep segments over ground holding no records, so on the
+    /// tester's 08-18 night the card reads 403 min while Health holds 162. Shipping the subtraction
+    /// with nothing on screen accounting for it was the land review's one blocking objection.
+    ///
+    /// ⚠️ IT CARRIES NO DETECTION RISK, and that is why it can ship while the coverage-caveat card
+    /// stays parked. That card fires on a SUSPECTED data gap whose false-positive rate is unknown.
+    /// This one fires on `isManuallyEdited` — set by the wearer's own Save — AND on
+    /// `sleepBasis == .assertedTagged` with a positive `assertedAsleepSeconds`, both written by
+    /// `applySleepEdit` from `SleepProvenanceBreakdown` over the actual record set. Neither is an
+    /// inference, so neither can be a false positive.
+    ///
+    /// Reads only the row already on screen (`latest`, from the existing `@Query`) — no store fetch,
+    /// no async, nothing that could put a read back on the render path (#14).
+    private func editedNightNoticeText(_ night: Night) -> String? {
+        // Same identity guard as `editableSleepSummary`: only the persisted row that IS the night on
+        // screen may speak for it. `night.isManuallyEdited` can only be true on the stored branch.
+        guard night.isManuallyEdited, let row = latest, row.night == night.nightKey else { return nil }
+        // `.assertedTagged` is written ONLY by an edit whose breakdown carried asserted time. A
+        // legacy row is `.unknown` — its split is genuinely not known, and a night we cannot describe
+        // must stay silent rather than be described anyway.
+        guard SleepBasis(stored: row.sleepBasis) == .assertedTagged else { return nil }
+        return SleepEditedNightNotice.line(measuredAsleep: row.measuredAsleepSeconds,
+                                           assertedAsleep: row.assertedAsleepSeconds,
+                                           mirrorsSleepToHealth: mirrorsSleepToHealth)
     }
 
     /// Honest caveat when last night read implausibly high efficiency (near-zero detected wake over a
@@ -553,22 +633,30 @@ struct SleepCardView: View {
 
     /// A gap rendered at the precision the measurement supports — whole minutes under an hour, then
     /// hours and minutes. Never seconds: the underlying edge is a 150 s epoch boundary.
+    ///
+    /// Delegates to the kit so this row and the edited-night notice beside it cannot drift into two
+    /// different renderings of the same span.
     private static func approximateDuration(_ seconds: TimeInterval) -> String {
-        let minutes = max(Int((seconds / 60).rounded()), 1)
-        if minutes < 60 { return "\(minutes) minute\(minutes == 1 ? "" : "s")" }
-        let (h, m) = (minutes / 60, minutes % 60)
-        return m == 0 ? "\(h) hour\(h == 1 ? "" : "s")" : "\(h)h \(m)m"
+        SleepEditedNightNotice.duration(seconds)
     }
 
     /// One Sleep-card caption row: a small tinted SF Symbol + secondary caption text. Shared by the
-    /// capture and confidence hints so their layout (spacing / font / padding) can't drift apart.
+    /// capture, bedtime, confidence and edited-night hints so their layout (spacing / font / padding)
+    /// can't drift apart.
+    ///
+    /// The glyph is decorative — every one of these rows says in words what its symbol hints at — so
+    /// it is hidden from VoiceOver and the row is combined into a single element. Without this the
+    /// wearer hears the symbol's own name ("pencil", "bed double") announced ahead of the sentence,
+    /// and the row is swiped through in two stops instead of one.
     @ViewBuilder
     private func hintRow(systemImage: String, tint: Color, _ text: String) -> some View {
         HStack(alignment: .top, spacing: 6) {
             Image(systemName: systemImage).font(.caption2).foregroundStyle(tint)
+                .accessibilityHidden(true)
             Text(text).font(.caption2).foregroundStyle(.secondary)
         }
         .padding(.top, 2)
+        .accessibilityElement(children: .combine)
     }
 
     /// The Wave-1 sleep-detail rows in one group: per-stage HR, overnight stress, skin-temp
