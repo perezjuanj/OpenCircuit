@@ -1825,7 +1825,29 @@ final class RingSession: NSObject {
         let nightRecords = BulkSleep.latestNightRecords(from: scopedArchive,
                                                         temperatures: wearTemperatureSamples())
         let base = overnightStagedSegments(from: nightRecords, archive: scopedArchive)
-        let segments = SleepEdit.recompute(baseSegments: base, times: times)
+
+        // WHICH MINUTES THE RING ACTUALLY RECORDED — the input `recompute` never had.
+        //
+        // Built from the WHOLE archive, not `scopedArchive` and not `nightRecords`. That is the most
+        // generous reading available to us: every minute this marks unmeasured is unmeasured under
+        // the app's own best case, so a caveat can never be an artifact of the scoping above. Pass
+        // `nil` here to restore master byte-for-byte.
+        //
+        // ⚠️ THE ARCHIVE IS A ~30-HOUR ROLLING WINDOW, AND `recompute` KNOWS IT. It runs this through
+        // `MeasuredCoverage.trusted(for:)`, which refuses to judge a window the archive holds no
+        // record for at all and treats ground older than the oldest surviving record as UNKNOWN
+        // rather than empty. Without that, editing a fully-recorded night two days later published
+        // 0.0 asleep minutes to Apple Health in place of 403.0 — retention read as absence. Handing
+        // the raw set to a coverage test is therefore not a neutral act; only the guarded read is.
+        //
+        // 🟢 What it buys, measured on the tester night this exists for (R2_2026-08-18): the same
+        // 403-minute headline is still displayed — the user asserted it and an assertion wins for
+        // display — but 241.4 of those minutes are now tagged `.asserted` over a 4 h hole holding
+        // 2 of ~98 expected epochs, so they stay out of the stage minutes, out of efficiency, out
+        // of the score, and out of Apple Health.
+        let coverageOfRecord = MeasuredCoverage(records: epochArchiveStore.load())
+        let segments = SleepEdit.recompute(baseSegments: base, times: times,
+                                           coverage: coverageOfRecord)
         guard !segments.isEmpty else { return nil }
         let summary = SleepStaging.summary(segments)
         // The recomputed segments go in with the recomputed minutes so the stored timeline always

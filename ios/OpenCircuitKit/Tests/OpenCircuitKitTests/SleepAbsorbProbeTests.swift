@@ -93,10 +93,10 @@ final class SleepAbsorbProbeTests: XCTestCase {
     }
 
     func testProbeBackwardAbsorbAcrossCorpus() throws {
-        guard let dir = SleepReplay.dir("OC_SLEEP_CORPUS") else {
-            print("SKIP SleepAbsorbProbeTests — set OC_SLEEP_CORPUS to a corpus directory")
-            return
-        }
+        let dir = try SleepReplay.requireCorpus(
+            "OC_SLEEP_CORPUS",
+            purpose: "the backward-cluster-chain probe that the shipped absorb cut was chosen from",
+            consequence: "The evidence behind `BulkSleep.observedGapAbsorbCoverageCut` was NOT reproduced.")
         let nights = try SleepReplay.loadManifest(at: dir)
         var lines: [String] = []
         lines.append("=== BACKWARD-CLUSTER-CHAIN PROBE ===")
@@ -163,10 +163,10 @@ final class SleepAbsorbProbeTests: XCTestCase {
     /// mean nothing. (Measured: at the shipped default this disagrees on exactly the 2 nights the
     /// guard moves, R3_2026-08-12 and R3_2026-08-19 — i.e. the intended behaviour change.)
     func testProbeAgreesWithProduction() throws {
-        guard let dir = SleepReplay.dir("OC_SLEEP_CORPUS") else {
-            print("SKIP — set OC_SLEEP_CORPUS")
-            return
-        }
+        let dir = try SleepReplay.requireCorpus(
+            "OC_SLEEP_CORPUS",
+            purpose: "the anti-drift check that the probe still walks what production walks",
+            consequence: "A silently drifted probe would make every number it prints meaningless.")
         var checked = 0
         for n in try SleepReplay.loadManifest(at: dir) where !n.recordsFile.isEmpty {
             let recs = try SleepReplay.loadRecords(n, in: dir)

@@ -6,15 +6,34 @@ shipped app runs**, printing the detected window, the stage minutes, and the sig
 whatever reference the night carries.
 
 - Lives in the Kit **test target** → `swift test`, CLI-only, no Xcode project, no HealthKit, no SwiftData.
-- Reads **nothing** from the repo and writes **nothing** to it. Corpora live outside the tree because
-  they are real tester health data (`CLAUDE.md`: never commit a capture).
-- With no environment variable set, every entry point **skips with a printed reason**, so `swift test`
-  stays green on a machine that holds no health data.
+- Reads **nothing** from the repo and writes **nothing** to it — except `CorpusGateLoudnessTests`,
+  which audits this target's own sources. Corpora live outside the tree because they are real tester
+  health data (`CLAUDE.md`: never commit a capture).
+- With no environment variable set, every entry point **skips LOUDLY**: `SleepReplay.requireCorpus`
+  throws `XCTSkip`, so the run is reported as `skipped`, never as `passed`. `swift test` still stays
+  green on a machine that holds no health data.
+
+> ⚠️ **A run with the variable unset proves nothing.** Until 2026-08-19 these entry points opened with
+> `guard let dir = … else { print("unset — skipping"); return }`. XCTest scores that early return as a
+> **pass**, so the fidelity *proof* printed
+> `Test Case '…SleepReplayFidelityTests…' passed (0.001 seconds) / Executed 1 test, with 0 failures`
+> having asserted **nothing** — on every machine without a corpus. All four entry points did this, not
+> just the fidelity one. Read the run summary for `1 test skipped`; if you see `passed`, the corpus
+> was actually opened.
 
 | File | What |
 |---|---|
-| `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/SleepReplay.swift` | loader, the pipeline transcription, the report formatter. **Read its header block first** — it is the production-parity contract. |
+| `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/SleepReplay.swift` | loader, the pipeline transcription, the report formatter, and `requireCorpus` — the one legal way to open a corpus. **Read its header block first** — it is the production-parity contract. |
 | `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/SleepReplayTests.swift` | the three command-line entry points |
+| `ios/OpenCircuitKit/Tests/OpenCircuitKitTests/CorpusGateLoudnessTests.swift` | the gate on the gate: asserts an unset variable skips rather than passes, and source-audits this test target. A **tripwire, not a proof** — read its header for what it does and does not catch. Needs no corpus. |
+
+> **Adding an entry point?** Name its variable `OC_…CORPUS` and open it through
+> `SleepReplay.requireCorpus`. Two audit rules enforce that: any `OC_[A-Z0-9_]*CORPUS` literal
+> outside the gate fails, and the whole set of `OC_…` names this target reads is pinned in
+> `CorpusGateLoudnessTests`, so a new one is a deliberate one-line declaration. Both exist because a
+> variable read any other way ends in `guard let … else { return }`, which XCTest reports as
+> **passed** — the original defect, and one a differently-named variable silently reinstated until
+> the needle was widened from `OC_SLEEP…_CORPUS` on 2026-08-20.
 
 ---
 
@@ -34,7 +53,59 @@ OC_SLEEP_FIDELITY_CORPUS=/path/to/fidelity-corpus \
 # (c) INPUT SENSITIVITY — how much do the inputs a .b64 cannot carry actually matter?
 OC_SLEEP_FIDELITY_CORPUS=/path/to/fidelity-corpus \
   swift test --filter SleepReplayInputSensitivityTests 2>&1 | sed -n '/INPUT SENSITIVITY/,$p'
+
+# (d) COVERAGE — score `SleepConfidence.assess` (acquisition flags) on every staged night
+OC_SLEEP_COVERAGE_CORPUS=/path/to/corpus \
+  swift test --filter SleepCoverageMeasureTests 2>&1 | sed -n '/SLEEP COVERAGE/,$p'
+
+# (e) BASELINE SCOREBOARD — every corpus night, one TSV, and the pinned golden hash
+OC_SLEEP_BASELINE_CORPUS=/path/to/corpus \
+  swift test --filter SleepBaselineTests 2>&1 | sed -n '/SLEEP BASELINE/,$p'
 ```
+
+Entry point (d) answers a different question from the others: not "where did staging put the edges"
+but "**did the recording cover the night at all**". It replays staging exactly as (a) does, then
+builds a `SleepConfidence.Coverage` for each night and prints the before/after scoreboard — which
+nights flag, with which reason, the labelled TP/FP cross-tab, the shipped card's own hint counts
+re-run rather than assumed, and a `materialGapSeconds` sweep. It is the only entry point that
+asserts on a *production* type's behaviour rather than on staging, and it is `XCTSkip`-gated, so an
+unset variable reports `skipped`.
+
+> ⚠️ **`UNDET` and `XFILE` in its tables are properties of the corpus, not the device.** A corpus
+> night is a noon-to-noon slice of ONE capture artifact; the device archive is continuous. Two rules
+> follow, and they cut in opposite directions:
+> - **`UNDET`** — past a 12 h horizon the harness withholds the "next record" and the classifier
+>   answers `.unknown`. Firing rates printed here are therefore **lower bounds**.
+> - **`XFILE`** — a neighbouring record that lives in a *different* `.b64` is discarded, not scored.
+>   Asking the ring-wide union "did the stream resume?" answers yes whenever the owner happened to
+>   export a second file later, which measures the export schedule and not the ring. That produced
+>   one measured false positive (`R3_2026-08-04`, back edge, "resumed" 243.2 min later — the first
+>   record of `R3_2026-08-05.b64`). Evidence must be bracketed inside one artifact; the withheld
+>   cases are printed so you can see what was thrown away.
+
+### The pinned golden
+
+Every honesty/staging change in this area ships with the claim *"no staged sleep number moved."* The
+number that backs it is pinned in tracked source — `SleepBaselineGolden` in
+`SleepBaselineTests.swift` — and repeated here so `git grep <hash>` answers *which corpus produced
+this?* rather than nothing at all:
+
+| what | sha256 |
+|---|---|
+| corpus `manifest.json` (identity of the corpus) | `63a07be8f28714b2c31a410c950dfb9c6f69b899097dccbc5f92f18b41061c0e` |
+| `baseline.tsv` at the **shipped default** — master `f790c19`, build 46 (74 lines: header + 73 rows) | `b1df05475ae15b243c35b8c25c6bd76888e596248f569160c3dba33bbb9bf148` |
+| the same, with the evening-absorb guard **OFF** (`OC_SLEEP_ABSORB_CUT=0`, ≡ master `f042639`) | `ef5dc087a16f0461d14d656d2e3461cc479cceb85ef5d30f5e4dd741eaa13e8f` |
+
+⚠️ **These two are not interchangeable and the pin got it wrong once.** `SleepBaselineGolden`
+originally pinned `ef5dc087` as the default; that is the guard-OFF scoreboard, so the golden failed
+on every correct run and passed only with build 46's behaviour disabled. Both were re-derived on
+2026-08-22 against this corpus. When you quote a scoreboard hash, say which cut produced it.
+
+The emitter asserts the baseline hash **only** when the manifest it just read matches the first row —
+against any other corpus it prints both hashes and asserts nothing, because there is nothing to
+compare against. A mismatch on the pinned corpus is a hard failure: re-pin deliberately and say what
+moved, never quote "hash unchanged" past it. `CorpusGateLoudnessTests` keeps this table and the Swift
+constants in agreement.
 
 Table columns: `inBedStart · inBedEnd · onset · wake · inBed/aslp/awk/deep/rem/light` (whole minutes
 from `SleepStaging.Summary.minutes`) · `eff` · `dStart`/`dEnd` (detected in-bed edge **minus** the

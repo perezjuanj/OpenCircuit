@@ -91,13 +91,30 @@ final class ExportSchemaV3Tests: XCTestCase {
     private func session(hypnogram: [SleepSegment] = [],
                          osa: ExportEngine.OSARow? = nil,
                          coverage: ExportCoverage.Assessment? = nil,
+                         edgeProvenance: ExportEngine.SleepEdgeProvenanceRow? = nil,
                          night nightDate: Date? = nil) -> ExportEngine.SleepSessionRow {
         let n = nightDate ?? night
         return ExportEngine.SleepSessionRow(
             sessionID: ExportEngine.sessionID(night: n), night: n,
             inBedStart: t0, inBedEnd: t1, sleepOnset: t0.addingTimeInterval(600),
             sleepWake: t1, isManuallyEdited: false,
-            hypnogram: hypnogram, summary: sleepRow, osa: osa, coverage: coverage)
+            hypnogram: hypnogram, summary: sleepRow, osa: osa, coverage: coverage,
+            edgeProvenance: edgeProvenance)
+    }
+
+    /// A night whose recording STOPPED at the wake and resumed 4 h later, built through the same
+    /// `SleepConfidence.assess` the app calls — the `R2_2026-08-18` shape, and the case every other
+    /// coverage surface in the file is blind to.
+    private var stoppedAtWakeEdge: ExportEngine.SleepEdgeProvenanceRow {
+        let assessment = SleepConfidence.assess(
+            asleep: 5 * 3600, inBed: 6 * 3600,
+            coverage: SleepConfidence.Coverage(
+                inBedStart: t0, inBedEnd: t1,
+                lastMeasurementBeforeStart: t0.addingTimeInterval(-100),
+                firstMeasurementAfterEnd: t1.addingTimeInterval(4 * 3600),
+                earliestRetainedMeasurement: t0.addingTimeInterval(-7 * 86_400)))
+        return ExportEngine.SleepEdgeProvenanceRow(windowStart: t0, windowEnd: t1,
+                                                   assessment: assessment)
     }
 
     private func parsed(_ json: String?) -> [String: Any] {
@@ -323,7 +340,7 @@ final class ExportSchemaV3Tests: XCTestCase {
 
     func testSleepSessionsCSVHeaderIsExactAndEmptyIsHeaderOnly() {
         let csv = ExportEngine.sleepSessionsCSV([])
-        XCTAssertEqual(csv, "sessionID,night,inBedStart,inBedEnd,sleepOnset,sleepWake,isManuallyEdited,asleepMin,deepMin,lightMin,remMin,awakeMin,efficiency,sleepScore,stressScore,hypnogramSegments,osaAvgSpO2,osaMinSpO2,osaTimeBelow90Sec,osaODI,osaValidWindows,coverageFraction,expectedSamples,observedSamples,longestGapSeconds")
+        XCTAssertEqual(csv, "sessionID,night,inBedStart,inBedEnd,sleepOnset,sleepWake,isManuallyEdited,asleepMin,deepMin,lightMin,remMin,awakeMin,efficiency,sleepScore,stressScore,hypnogramSegments,osaAvgSpO2,osaMinSpO2,osaTimeBelow90Sec,osaODI,osaValidWindows,coverageFraction,expectedSamples,observedSamples,longestGapSeconds,bedtimeVerdict,bedtimeGapSeconds,wakeVerdict,wakeGapSeconds,confidenceReasons")
         XCTAssertFalse(csv.contains("\n"), "empty input is header-only")
     }
 
@@ -332,8 +349,8 @@ final class ExportSchemaV3Tests: XCTestCase {
         let records = ExportEngineTests.parseCSV(csv)
         XCTAssertEqual(records.count, 2)
         let row = records[1]
-        XCTAssertEqual(row.count, 25)
-        for index in 16 ... 24 {
+        XCTAssertEqual(row.count, 30)
+        for index in 16 ... 29 {
             XCTAssertEqual(row[index], "",
                            "column \(index) must be EMPTY when absent — 0 is a real reading")
         }
@@ -415,6 +432,74 @@ final class ExportSchemaV3Tests: XCTestCase {
         XCTAssertNil((obj["sleepSessions"] as? [[String: Any]])?.first?["osa"])
     }
 
+    // MARK: - edgeProvenance: the half `coverage` structurally cannot see
+    //
+    // `coverageFraction` counts records INSIDE the detected window, and the detected window is
+    // defined by those records — it measures 0.976–1.049 on all 21 corpus nights, including the two
+    // understated by 246 min. What discriminates is what sits just OUTSIDE each edge.
+
+    func testEdgeProvenanceCSVCarriesBothVerdictsAndOnlyTheMeasuredGaps() {
+        let row = ExportEngineTests.parseCSV(
+            ExportEngine.sleepSessionsCSV([session(edgeProvenance: stoppedAtWakeEdge)]))[1]
+        XCTAssertEqual(row[25], "witnessed", "a record 100 s before the edge is continuous")
+        XCTAssertEqual(row[26], "", "a witnessed edge measured NO silence — empty, never 0")
+        XCTAssertEqual(row[27], "stoppedThenResumed")
+        XCTAssertEqual(row[28], String(format: "%.1f", 4 * 3600.0))
+        XCTAssertEqual(row[29], "noRecordingAfterWake",
+                       "the reason list is what the CLASSIFIER concluded — not what any screen "
+                       + "showed. No coverage caveat ships in this build (the card is parked), so a "
+                       + "failure here means the export lost the classifier's own output, never "
+                       + "that the UI disagreed with it.")
+    }
+
+    func testEdgeProvenanceJSONOmitsTheGapKeyRatherThanWritingZero() {
+        let obj = parsed(ExportEngine.toJSON(
+            samples: [], sleep: [], daily: [], now: t0,
+            sleepSessions: [session(edgeProvenance: stoppedAtWakeEdge)]))
+        guard let edge = (obj["sleepSessions"] as? [[String: Any]])?
+                .first?["edgeProvenance"] as? [String: Any] else {
+            return XCTFail("edgeProvenance block missing")
+        }
+        XCTAssertEqual(edge["bedtimeVerdict"] as? String, "witnessed")
+        XCTAssertNil(edge["bedtimeGapSeconds"],
+                     "0 would turn 'the stream never stopped' and 'we could not look' into the "
+                     + "same value — the exact absence-is-not-zero rule osa/coverage follow")
+        XCTAssertEqual(edge["wakeVerdict"] as? String, "stoppedThenResumed")
+        XCTAssertEqual(edge["wakeGapSeconds"] as? Double, 4 * 3600)
+        XCTAssertEqual(edge["reasons"] as? [String], ["noRecordingAfterWake"])
+        XCTAssertEqual(edge["materialGapSeconds"] as? Double, WakeProvenance.materialGapSeconds)
+    }
+
+    func testEdgeProvenanceKeyIsAbsentWhenTheNightHasNoneAndTheCSVFieldsAreEmpty() {
+        let obj = parsed(ExportEngine.toJSON(samples: [], sleep: [], daily: [], now: t0,
+                                             sleepSessions: [session()]))
+        XCTAssertNil((obj["sleepSessions"] as? [[String: Any]])?.first?["edgeProvenance"],
+                     "no measurable window ⇒ omit the key, the convention osa/coverage use")
+        let row = ExportEngineTests.parseCSV(ExportEngine.sleepSessionsCSV([session()]))[1]
+        for index in 25 ... 29 {
+            XCTAssertEqual(row[index], "", "edge column \(index) must be empty when unmeasured")
+        }
+    }
+
+    /// The claim the whole feature rests on: a night whose stream stops dead at the wake reports
+    /// PERFECT coverage, so the two blocks must both be present and must not be conflated.
+    func testAFullyCoveredWindowStillCarriesAStoppedWakeVerdict() {
+        let coverage = ExportCoverage.assess(
+            sampleTimes: stride(from: 0.0, to: t1.timeIntervalSince(t0), by: 150)
+                .map { t0.addingTimeInterval($0) },
+            from: t0, to: t1)
+        XCTAssertGreaterThan(coverage.coverageFraction, 0.95,
+                             "fixture must be a night the coverage fraction calls complete")
+        let obj = parsed(ExportEngine.toJSON(
+            samples: [], sleep: [], daily: [], now: t0,
+            sleepSessions: [session(coverage: coverage, edgeProvenance: stoppedAtWakeEdge)]))
+        let s = (obj["sleepSessions"] as? [[String: Any]])?.first
+        XCTAssertNotNil(s?["coverage"], "coverage still reports the window as covered")
+        XCTAssertEqual(((s?["edgeProvenance"] as? [String: Any])?["wakeVerdict"]) as? String,
+                       "stoppedThenResumed",
+                       "…while edgeProvenance reports the 4 h hole that begins AT the wake")
+    }
+
     func testSleepSessionsCSVOrderingIsDeterministic() {
         let earlier = night
         let later = night.addingTimeInterval(86_400)
@@ -425,9 +510,56 @@ final class ExportSchemaV3Tests: XCTestCase {
                        "rows are emitted in the order given, never reordered")
     }
 
+    /// ⚠️ THE HEADER IS A CONTRACT AND `provenance` IS PART OF IT (M3). CSV is the DEFAULT export
+    /// format and the file people hand to a clinician; without this column an `asleepCore` block the
+    /// wearer asserted over ground holding no ring data is byte-identical to one the ring recorded.
+    /// The column is APPENDED, so every positional consumer of the first five keeps working.
     func testHypnogramCSVHeaderAndEmptyInput() {
         XCTAssertEqual(ExportEngine.hypnogramCSV([]),
-                       "sessionID,start,end,stage,durationSec")
+                       "sessionID,start,end,stage,durationSec,provenance")
+    }
+
+    /// The vocabulary must be the JSON's, character for character — one enum renders both, and a
+    /// consumer joining the two views must not have to translate.
+    func testHypnogramCSVProvenanceVocabularyMatchesTheJSONExactly() {
+        let mixed = [
+            SleepSegment(start: t0, end: t0.addingTimeInterval(150), stage: .asleepCore),
+            SleepSegment(start: t0.addingTimeInterval(150), end: t0.addingTimeInterval(300),
+                         stage: .asleepCore, provenance: .asserted),
+            SleepSegment(start: t0.addingTimeInterval(300), end: t0.addingTimeInterval(450),
+                         stage: .asleepCore, provenance: .assertedOverMeasured),
+            SleepSegment(start: t0.addingTimeInterval(450), end: t0.addingTimeInterval(600),
+                         stage: .asleepCore, provenance: .assertedCoverageUnknown),
+        ]
+        let rows = ExportEngineTests.parseCSV(
+            ExportEngine.hypnogramCSV([session(hypnogram: mixed)])).dropFirst()
+        XCTAssertEqual(rows.map { $0[5] },
+                       ["measured", "asserted", "assertedOverMeasured", "assertedCoverageUnknown"])
+
+        // …and every one of those strings is a `SleepProvenance` raw value, which is what the JSON
+        // emits. If a case is ever renamed, both views move together and this still holds.
+        let vocabulary = Set(SleepProvenance.allCases.map(\.rawValue))
+        XCTAssertTrue(rows.allSatisfy { vocabulary.contains($0[5]) })
+
+        let obj = parsed(ExportEngine.toJSON(samples: [], sleep: [], daily: [], now: t0,
+                                             sleepSessions: [session(hypnogram: mixed)]))
+        let json = (obj["sleepSessions"] as? [[String: Any]])?.first?["hypnogram"]
+            as? [[String: Any]]
+        // JSON omits the key for `.measured` (absence means measured, so an unedited night's export
+        // is unchanged); CSV always prints it. Every key the JSON DOES emit must match the CSV cell.
+        XCTAssertEqual(json?.map { $0["provenance"] as? String ?? "measured" },
+                       rows.map { $0[5] })
+    }
+
+    /// The invented block must not be able to hide in the clinician's copy. This is the M3 defect
+    /// stated as a test: identical spans and stages, different provenance, DIFFERENT bytes.
+    func testAnInventedBlockIsNoLongerByteIdenticalToAMeasuredOne() {
+        let span = [SleepSegment(start: t0, end: t0.addingTimeInterval(14_758), stage: .asleepCore)]
+        let invented = [SleepSegment(start: t0, end: t0.addingTimeInterval(14_758),
+                                     stage: .asleepCore, provenance: .asserted)]
+        XCTAssertNotEqual(ExportEngine.hypnogramCSV([session(hypnogram: span)]),
+                          ExportEngine.hypnogramCSV([session(hypnogram: invented)]),
+                          "246 invented minutes serialised exactly like 246 recorded ones")
     }
 
     func testHypnogramCSVEmitsOneRowPerSegmentAcrossSessions() {
@@ -449,7 +581,7 @@ final class ExportSchemaV3Tests: XCTestCase {
 
     func testSessionWithNoHypnogramEmitsNoHypnogramRows() {
         XCTAssertEqual(ExportEngine.hypnogramCSV([session()]),
-                       "sessionID,start,end,stage,durationSec")
+                       "sessionID,start,end,stage,durationSec,provenance")
     }
 
     // MARK: - The emitted hypnogram is a PARTITION, not a partition plus an umbrella
@@ -512,7 +644,7 @@ final class ExportSchemaV3Tests: XCTestCase {
     func testEnvelopeOnlyNightEmitsNoRowsRatherThanAnAllNightBar() {
         let envelopeOnly = [SleepSegment(start: t0, end: t1, stage: .inBed)]
         XCTAssertEqual(ExportEngine.hypnogramCSV([session(hypnogram: envelopeOnly)]),
-                       "sessionID,start,end,stage,durationSec")
+                       "sessionID,start,end,stage,durationSec,provenance")
     }
 
     // MARK: - sleepSessions JSON
@@ -700,7 +832,7 @@ final class ExportSchemaV3Tests: XCTestCase {
             daytimeTemperatures: [ExportEngine.DaytimeTemperatureRow(time: t0, celsius: 34.2)],
             historySyncEvidence: [evidenceRow], now: t0,
             metadata: metadata,
-            sleepSessions: [session(hypnogram: hypnogram)]))
+            sleepSessions: [session(hypnogram: hypnogram, edgeProvenance: stoppedAtWakeEdge)]))
 
         guard let provenance = obj["provenance"] as? [String: String] else {
             return XCTFail("provenance block missing")
@@ -731,6 +863,9 @@ final class ExportSchemaV3Tests: XCTestCase {
         XCTAssertEqual(provenance["sleepSessions.summary"], "derived")
         XCTAssertEqual(provenance["sleepSessions.osa"], "derived")
         XCTAssertEqual(provenance["sleepSessions.coverage"], "measured")
+        // DERIVED: the gaps inside it are measured, but the verdicts and the reason list are a
+        // classifier's output at a chosen threshold — a policy decision, not an observation.
+        XCTAssertEqual(provenance["sleepSessions.edgeProvenance"], "derived")
     }
 
     func testProvenanceOmitsSleepSessionSubKeysWhenNoSessionsAreEmitted() {
@@ -850,7 +985,8 @@ final class ExportSchemaV3Tests: XCTestCase {
             naps: [ExportEngine.NapRow(start: t0, end: t1, asleepMin: 30, isLongNap: false)],
             daytimeTemperatures: [ExportEngine.DaytimeTemperatureRow(time: t0, celsius: 34.2)],
             historySyncEvidence: [evidenceRow], now: t0, metadata: metadata,
-            sleepSessions: [session(hypnogram: stagedNight, osa: osa, coverage: coverage)]))
+            sleepSessions: [session(hypnogram: stagedNight, osa: osa, coverage: coverage,
+                                    edgeProvenance: stoppedAtWakeEdge)]))
 
         guard let units = obj["units"] as? [String: String] else {
             return XCTFail("units block missing")

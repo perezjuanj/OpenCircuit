@@ -291,6 +291,9 @@ public enum ExportEngine {
         public let summary: SleepRow
         public let osa: OSARow?
         public let coverage: ExportCoverage.Assessment?
+        /// What the record stream says about the two EDGES of this night (`SleepConfidence.assess`).
+        /// nil when the night has no clock times to measure against.
+        public let edgeProvenance: SleepEdgeProvenanceRow?
         public init(sessionID: String, night: Date,
                     inBedStart: Date? = nil, inBedEnd: Date? = nil,
                     sleepOnset: Date? = nil, sleepWake: Date? = nil,
@@ -300,7 +303,8 @@ public enum ExportEngine {
                     hypnogram: [SleepSegment] = [],
                     summary: SleepRow,
                     osa: OSARow? = nil,
-                    coverage: ExportCoverage.Assessment? = nil) {
+                    coverage: ExportCoverage.Assessment? = nil,
+                    edgeProvenance: SleepEdgeProvenanceRow? = nil) {
             self.sessionID = sessionID; self.night = night
             self.inBedStart = inBedStart; self.inBedEnd = inBedEnd
             self.sleepOnset = sleepOnset; self.sleepWake = sleepWake
@@ -309,6 +313,83 @@ public enum ExportEngine {
             self.recordedOnset = recordedOnset; self.recordedWake = recordedWake
             self.hypnogram = hypnogram; self.summary = summary
             self.osa = osa; self.coverage = coverage
+            self.edgeProvenance = edgeProvenance
+        }
+    }
+
+    /// The acquisition verdict on ONE night's two edges, in a form a tester bundle can carry.
+    ///
+    /// This is how we find out whether the coverage caveat HELPED. `coverage` next door answers
+    /// "how much of the detected window do we hold?" and measures 0.976–1.049 on 21 of 21 corpus
+    /// nights — vacuous by construction, because the detected window is DEFINED by the records. The
+    /// question that discriminates is what sits just OUTSIDE each edge, which is what this row
+    /// carries: on both 246-minute corpus errors the ~4 h hole begins exactly AT the in-bed end
+    /// (02:39:14 / 02:37:02), so it is never inside any window a coverage fraction can see.
+    ///
+    /// `reasons` is the payload that makes a future analysis possible: with the night's
+    /// `recorded*`/edited columns beside it, a bundle answers *would the caveat have fired on the
+    /// nights the wearer went on to correct?* — the question 21 corpus nights cannot answer.
+    ///
+    /// ⚠️ IT IS THE CLASSIFIER'S REASON LIST, NOT "WHAT THE CARD SHOWED". No user-visible caveat
+    /// ships yet: the card change these verdicts were written for is deliberately parked (its
+    /// "never fires on a night we get right" claim is an absence of measurement, not a measurement).
+    /// Even once a card renders them it will apply its OWN render guards — the shipped duration
+    /// hint is suppressed on a non-contiguous or front-truncated night — so this list is an
+    /// UPPER BOUND on what a wearer saw, and describing it as verbatim card copy would be wrong in
+    /// both directions. Instrumentation first, on purpose.
+    ///
+    /// ⚠️ MEASURED AT THE RECORDED (DETECTOR) EDGES, NOT THE EDITED ONES — see the note under the
+    /// `edgeProvenance` key in `notes`.
+    public struct SleepEdgeProvenanceRow: Equatable, Sendable {
+        /// The window the verdicts below were measured against.
+        public let windowStart: Date
+        public let windowEnd: Date
+        /// `witnessed` · `resumedAfterGap` · `noPriorMeasurement` · `unknown`.
+        public let bedtimeVerdict: String
+        /// Seconds of silence before `windowStart`, or nil when the verdict carries none.
+        /// ABSENT rather than 0: `witnessed` means the stream ran right into the edge and `unknown`
+        /// means we could not look, and writing 0 for the second would claim the first.
+        public let bedtimeGapSeconds: TimeInterval?
+        /// `witnessed` · `stoppedThenResumed` · `unknown`.
+        public let wakeVerdict: String
+        /// Seconds of silence after `windowEnd`, or nil. Same absence-is-not-zero rule.
+        public let wakeGapSeconds: TimeInterval?
+        /// `SleepConfidence.exportName` of every reason the classifier produced, in its order.
+        /// `[]` means it found nothing to say about this night — the common case.
+        public let reasons: [String]
+        /// The gap threshold in force when these reasons were produced, so a bundle collected under
+        /// a different cut is still interpretable. Not fitted — see `WakeProvenance.materialGapSeconds`.
+        public let materialGapSeconds: TimeInterval
+
+        public init(windowStart: Date, windowEnd: Date,
+                    bedtimeVerdict: String, bedtimeGapSeconds: TimeInterval?,
+                    wakeVerdict: String, wakeGapSeconds: TimeInterval?,
+                    reasons: [String], materialGapSeconds: TimeInterval) {
+            self.windowStart = windowStart; self.windowEnd = windowEnd
+            self.bedtimeVerdict = bedtimeVerdict; self.bedtimeGapSeconds = bedtimeGapSeconds
+            self.wakeVerdict = wakeVerdict; self.wakeGapSeconds = wakeGapSeconds
+            self.reasons = reasons; self.materialGapSeconds = materialGapSeconds
+        }
+
+        /// Build the row from an assessment measured over `[windowStart, windowEnd]`.
+        ///
+        /// Takes the assessment rather than re-deriving the verdicts, so anything that renders the
+        /// same `SleepConfidence.Assessment` and this file cannot drift apart.
+        ///
+        /// The threshold comes off the assessment for the same reason. It used to be a defaulted
+        /// argument here, which meant a caller sweeping the cut — the one purpose the parameter has
+        /// — could assess at 0 and export `3600` beside those reasons, misstating the cut behind its
+        /// own evidence with nothing able to notice. `materialGapSeconds` is now a fact about the
+        /// verdict, not about the call site.
+        public init(windowStart: Date, windowEnd: Date,
+                    assessment: SleepConfidence.Assessment) {
+            self.init(windowStart: windowStart, windowEnd: windowEnd,
+                      bedtimeVerdict: SleepConfidence.exportName(assessment.bedtime),
+                      bedtimeGapSeconds: SleepConfidence.gapSeconds(assessment.bedtime),
+                      wakeVerdict: SleepConfidence.exportName(assessment.wake),
+                      wakeGapSeconds: SleepConfidence.gapSeconds(assessment.wake),
+                      reasons: assessment.reasons.map(SleepConfidence.exportName),
+                      materialGapSeconds: assessment.materialGapSeconds)
         }
     }
 
@@ -635,10 +716,11 @@ public enum ExportEngine {
     /// measurement. Decimal places are display precision only — they carry no physiological meaning
     /// and mirror `sleepCSV`'s existing `%.4f` efficiency / `%.2f` choices.
     public static func sleepSessionsCSV(_ rows: [SleepSessionRow]) -> String {
-        var lines = ["sessionID,night,inBedStart,inBedEnd,sleepOnset,sleepWake,isManuallyEdited,asleepMin,deepMin,lightMin,remMin,awakeMin,efficiency,sleepScore,stressScore,hypnogramSegments,osaAvgSpO2,osaMinSpO2,osaTimeBelow90Sec,osaODI,osaValidWindows,coverageFraction,expectedSamples,observedSamples,longestGapSeconds"]
+        var lines = ["sessionID,night,inBedStart,inBedEnd,sleepOnset,sleepWake,isManuallyEdited,asleepMin,deepMin,lightMin,remMin,awakeMin,efficiency,sleepScore,stressScore,hypnogramSegments,osaAvgSpO2,osaMinSpO2,osaTimeBelow90Sec,osaODI,osaValidWindows,coverageFraction,expectedSamples,observedSamples,longestGapSeconds,bedtimeVerdict,bedtimeGapSeconds,wakeVerdict,wakeGapSeconds,confidenceReasons"]
         for r in rows {
             let osa = emittableOSA(r)
             let cov = r.coverage
+            let edge = r.edgeProvenance
             lines.append(csvLine([
                 r.sessionID,
                 dateOnly.string(from: r.night),
@@ -660,20 +742,46 @@ public enum ExportEngine {
                 cov.map { String(format: "%.4f", $0.coverageFraction) } ?? "",
                 cov.map { "\($0.expectedSamples)" } ?? "",
                 cov.map { "\($0.observedSamples)" } ?? "",
-                cov.map { String(format: "%.1f", $0.longestGapSeconds) } ?? ""
+                cov.map { String(format: "%.1f", $0.longestGapSeconds) } ?? "",
+                // A `witnessed`/`unknown` edge has NO gap; the field stays empty rather than
+                // printing 0, which would read as a measured zero-second silence.
+                edge?.bedtimeVerdict ?? "",
+                edge?.bedtimeGapSeconds.map { String(format: "%.1f", $0) } ?? "",
+                edge?.wakeVerdict ?? "",
+                edge?.wakeGapSeconds.map { String(format: "%.1f", $0) } ?? "",
+                // Space-separated so the field needs no CSV quoting and stays greppable. Empty means
+                // the CLASSIFIER found nothing to say — a real and common answer (12 of 21 corpus
+                // nights) — and says nothing about any screen: no coverage caveat ships in this
+                // build. See the ⚠️ on `SleepEdgeProvenanceRow`.
+                edge?.reasons.joined(separator: " ") ?? ""
             ]))
         }
         return lines.joined(separator: "\n")
     }
 
     /// CSV for the per-epoch hypnogram: one row PER SEGMENT across all sessions, keyed back to
-    /// its session. Header: `sessionID,start,end,stage,durationSec`. Sessions with no recorded
-    /// hypnogram contribute no rows (absence, not a zero-length night).
+    /// its session. Header: `sessionID,start,end,stage,durationSec,provenance`. Sessions with no
+    /// recorded hypnogram contribute no rows (absence, not a zero-length night).
     ///
     /// The rows are a PARTITION: they never overlap, so `durationSec` may be summed per session.
     /// See `emittableHypnogram` for the envelope that is deliberately not emitted.
+    ///
+    /// 🟢 WHY `provenance` IS HERE, AND WHY LAST. CSV is the DEFAULT format on the export screen and
+    /// is the file most people actually hand to a clinician (see the schema-v3 block below, which
+    /// says so in those words) — and until this column existed, a 246-minute `asleepCore` block
+    /// invented over ground holding 2 of ~98 expected epochs serialised here BYTE-IDENTICALLY to
+    /// 246 minutes of recorded sleep. The JSON export had carried the distinction since provenance
+    /// shipped; the clinician's copy had not. Appended at the END so every existing positional
+    /// consumer keeps working.
+    ///
+    /// THE VOCABULARY IS THE JSON'S, EXACTLY: `SleepProvenance.rawValue`, i.e. `measured`,
+    /// `asserted`, `assertedOverMeasured`, `assertedCoverageUnknown`. Rendered from the same enum the
+    /// JSON renders, so the two cannot drift. One deliberate difference: JSON OMITS the key for
+    /// `.measured` (absence means measured, and that keeps an unedited night's JSON unchanged),
+    /// while CSV always prints it — a blank cell in a column of stage labels reads as "missing data",
+    /// which is the opposite of what it would mean.
     public static func hypnogramCSV(_ rows: [SleepSessionRow]) -> String {
-        var lines = ["sessionID,start,end,stage,durationSec"]
+        var lines = ["sessionID,start,end,stage,durationSec,provenance"]
         for r in rows {
             for seg in emittableHypnogram(r) {
                 lines.append(csvLine([
@@ -681,7 +789,8 @@ public enum ExportEngine {
                     offsetISO8601(seg.start),
                     offsetISO8601(seg.end),
                     seg.stage.rawValue,
-                    plainNumber(seg.duration)
+                    plainNumber(seg.duration),
+                    seg.provenance.rawValue
                 ]))
             }
         }
@@ -863,12 +972,56 @@ public enum ExportEngine {
                 // empty array for both would have made a night staged before the hypnogram column
                 // existed read identically to a night we staged and found no stages in.
                 if !session.hypnogram.isEmpty {
-                    obj["hypnogram"] = emittableHypnogram(session).map { seg in [
-                        "start": offsetISO8601(seg.start),
-                        "end": offsetISO8601(seg.end),
-                        "stage": seg.stage.rawValue,
-                        "durationSec": seg.duration
-                    ] as [String: Any] }
+                    // `provenance` is emitted ONLY when it is not `.measured`, so a fully-measured
+                    // night's JSON is unchanged from every earlier schema-3 export and no consumer
+                    // has to learn a new key to keep working.
+                    //
+                    // 🟢 WHY IT IS HERE AT ALL: before this key existed, NO EXPORT SURFACE COULD SAY
+                    // WHICH MINUTES WERE MEASURED. Coverage was reported only as a night AGGREGATE,
+                    // so a consumer reading an edited night's timeline could not distinguish a
+                    // 246-minute `asleepCore` block invented over a 2 %-covered hole from a real
+                    // one — they serialised identically. This is the per-segment answer.
+                    obj["hypnogram"] = emittableHypnogram(session).map { seg -> [String: Any] in
+                        var row: [String: Any] = [
+                            "start": offsetISO8601(seg.start),
+                            "end": offsetISO8601(seg.end),
+                            "stage": seg.stage.rawValue,
+                            "durationSec": seg.duration
+                        ]
+                        if seg.provenance != .measured {
+                            row["provenance"] = seg.provenance.rawValue
+                        }
+                        return row
+                    }
+                    // The night-level roll-up of the same fact, so a reader does not have to sum the
+                    // timeline to learn whether the headline is a measurement or a claim.
+                    let breakdown = SleepProvenanceBreakdown(segments: session.hypnogram)
+                    if breakdown.hasAssertedTime {
+                        // The three buckets are all emitted so the arithmetic CLOSES: displayed
+                        // asleep = measured + asserted + unknown. Omitting the unknown bucket would
+                        // leave a reader with minutes that belong to no category and no way to tell
+                        // a proven hole from ground this app no longer retains records for.
+                        var summary: [String: Any] = [
+                            "measuredAsleepSec": breakdown.measuredAsleep,
+                            "assertedAsleepSec": breakdown.assertedAsleep,
+                            "coverageUnknownAsleepSec": breakdown.unknownAsleep,
+                            "measuredAwakeSec": breakdown.measuredAwake,
+                            "assertedAwakeSec": breakdown.assertedAwake,
+                            "coverageUnknownAwakeSec": breakdown.unknownAwake,
+                            "coveredInBedSec": breakdown.coveredInBed,
+                            "coverageUnknownInBedSec": breakdown.unknownInBed,
+                            "coverageFraction": breakdown.coverageFraction,
+                            "longestUnmeasuredGapSec": breakdown.longestUnmeasuredGap,
+                            "scorable": breakdown.isScorable
+                        ]
+                        // OMITTED when withheld — never 0, and never a JSON null. 0 is a real
+                        // efficiency, and at `LocalStore.swift:235` it is a live sentinel that
+                        // reconstructs in-bed from the wrong quantities. Absence is the only honest
+                        // encoding of "we do not have enough covered ground to say", and it matches
+                        // the omit-the-key convention `osa` and `coverage` already use here.
+                        if let eff = breakdown.efficiency { summary["measuredEfficiency"] = eff }
+                        obj["provenanceSummary"] = summary
+                    }
                 }
                 // Omitted, not zero-filled: a night with no drained assessment and a night with
                 // a genuinely quiet one must not read the same.
@@ -895,6 +1048,24 @@ public enum ExportEngine {
                             "seconds": gap.seconds
                         ] as [String: Any] }
                     ] as [String: Any]
+                }
+                // Omitted, never zero-filled, for the same reason as `osa`/`coverage`: a night with
+                // no clock times to measure is not a night whose edges we watched.
+                if let edge = session.edgeProvenance {
+                    var block: [String: Any] = [
+                        "windowStart": offsetISO8601(edge.windowStart),
+                        "windowEnd": offsetISO8601(edge.windowEnd),
+                        "bedtimeVerdict": edge.bedtimeVerdict,
+                        "wakeVerdict": edge.wakeVerdict,
+                        "reasons": edge.reasons,
+                        "materialGapSeconds": edge.materialGapSeconds
+                    ]
+                    // Present ONLY on a verdict that measured a silence. `witnessed` has none and
+                    // `unknown` could not look — a 0 here would turn "we don't know" into "we
+                    // watched, and the stream never stopped".
+                    if let g = edge.bedtimeGapSeconds { block["bedtimeGapSeconds"] = g }
+                    if let g = edge.wakeGapSeconds { block["wakeGapSeconds"] = g }
+                    obj["edgeProvenance"] = block
                 }
                 return obj
             }
@@ -962,6 +1133,12 @@ public enum ExportEngine {
             map["sleepSessions.hypnogram"] = "derived"
             // MEASURED: coverage counts rows we actually hold, it estimates nothing.
             map["sleepSessions.coverage"] = "measured"
+            // DERIVED, not measured. The two GAPS in it are measured (distances between stored
+            // timestamps), but `bedtimeVerdict`/`wakeVerdict`/`reasons` are the output of a
+            // classifier with a chosen threshold — and the reasons are literally the sentences the
+            // app decided to show. Labelling that "measured" would dress a policy decision as an
+            // observation, which is the one thing this block exists to prevent.
+            map["sleepSessions.edgeProvenance"] = "derived"
         }
         return map
     }
@@ -1013,6 +1190,11 @@ public enum ExportEngine {
         }
         map["coverageFraction"] = "fraction"
         map["longestGapSeconds"] = "s"
+        // `sleepSessions[].edgeProvenance` — the CSV column names and the JSON keys are the same
+        // strings here, so there is nothing to keep in sync.
+        map["bedtimeGapSeconds"] = "s"
+        map["wakeGapSeconds"] = "s"
+        map["materialGapSeconds"] = "s"
         map["durationSec"] = "s"
         map["seconds"] = "s"
         map["timeZoneOffsetSeconds"] = "s"
@@ -1040,6 +1222,15 @@ public enum ExportEngine {
             "distinction is explicit: hypnogramSegments is EMPTY (and the JSON hypnogram key is " +
             "absent) when no timeline was recorded, and 0 only when one was recorded and contained " +
             "no stage blocks.",
+        "hypnogramProvenance":
+            "Every hypnogram segment carries a provenance: measured = the ring recorded epochs " +
+            "across this span; asserted = the wearer edited their sleep window over ground holding " +
+            "NO ring data, so this block is their claim and not a measurement; " +
+            "assertedOverMeasured = the wearer's label sits on ground the ring did record, and the " +
+            "two disagree (the ring's own reading is kept separately); assertedCoverageUnknown = " +
+            "the wearer's claim over ground this app no longer retains records for, so neither " +
+            "reading is available. Only 'measured' is a device observation. In CSV the column is " +
+            "always present; in JSON the key is omitted when the value is 'measured'.",
         "exportRange":
             "meta.rangeStart and meta.rangeEnd are the window this file ACTUALLY covers, which can " +
             "be narrower than the one that was requested: the app caps how much it assembles in a " +
@@ -1068,6 +1259,24 @@ public enum ExportEngine {
             "epochs were lost — the export cannot tell those apart. The coverage fields are left " +
             "EMPTY for a night older than the app's raw-sample retention window: those epochs " +
             "were deleted by local housekeeping, so a number there would report routine " +
-            "housekeeping as missing data."
+            "housekeeping as missing data.",
+        "edgeProvenance":
+            "edgeProvenance says whether the record stream ran INTO the printed bedtime and " +
+            "CONTINUED past the printed wake — the question coverageFraction structurally cannot " +
+            "answer, because the detected window is defined by the records inside it (it measures " +
+            "0.976-1.049 on all 21 nights of the development corpus, including two understated by " +
+            "246 minutes, whose ~4 h hole starts exactly AT the in-bed end). The gaps are " +
+            "measured; the verdicts and reasons are a classifier's output at " +
+            "materialGapSeconds, a threshold the evidence does not pin down (gap sizes are " +
+            "bimodal with an empty interval from 33 to 242 minutes, so every cut in there scores " +
+            "identically). A gap BOUNDS the error in the reported duration, it does NOT estimate " +
+            "it. 'unknown' means there was no measurement on that side at all — which is equally " +
+            "consistent with the ring having stopped and with the app not having drained that far " +
+            "yet, so it carries no claim. Measured against the RECORDED (detector) window, which " +
+            "on an edited night is NOT the window inBedStart/inBedEnd report: the edit changes " +
+            "what the app shows, not what was recorded. reasons[] is the classifier's own list, " +
+            "NOT a record of what the app displayed: no coverage caveat is shown to the wearer in " +
+            "this build, and any future card would apply its own render guards on top, so treat " +
+            "reasons[] as an upper bound on what anyone actually saw."
     ] }
 }

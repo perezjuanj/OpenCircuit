@@ -177,6 +177,58 @@ final class StoredSleepSummary {
     var widenedRecordedOnset: Date = Date.distantPast
     var widenedRecordedWake: Date = Date.distantPast
 
+    // MARK: Reversibility + provenance (measured-vs-asserted). DEFAULTED for SwiftData lightweight
+    // migration (cf. #21) AND pinned behind SchemaV7 (cf. the build-44 wipe — a defaulted column is
+    // necessary but NOT sufficient once a migration plan exists).
+
+    /// THE RING-DERIVED HYPNOGRAM, written ONLY by the staging path and NEVER by the edit path.
+    ///
+    /// ⚠️ THE SINGLE MOST IMPORTANT COLUMN IN THIS BLOCK. `hypnogramData` is one column that
+    /// `applySleepEdit` overwrites in place (`:1768`), so before this existed the moment a user
+    /// edited a night the recording was gone forever, with no backup anywhere. 🟢 Device-proven on
+    /// `R2_2026-08-17`: 102.5 minutes of 97.6 %-covered, stage-resolved sleep — 30 min of it deep —
+    /// became unrecoverable the instant she corrected her wake time, and the card then displayed
+    /// every one of those minutes as awake with no way back.
+    ///
+    /// Empty = no recording captured (a legacy row, or a night staged before this column existed).
+    /// An empty value must NEVER be presented as "the ring recorded nothing".
+    var recordedHypnogramData: Data = Data()
+
+    /// Measured-versus-asserted split for this night, in SECONDS, so no consumer re-derives them and
+    /// the export is auditable. `-1` = NOT COMPUTED, which is deliberately distinct from 0: a night
+    /// with genuinely zero asserted time is a real and common answer, and conflating the two is how
+    /// `efficiency == 0` became a silent sentinel at `:235`.
+    var measuredAsleepSeconds: Double = -1
+    var assertedAsleepSeconds: Double = -1
+    /// Share of the in-bed window the ring recorded across, 0…1. `-1` = not computed.
+    var coverageFraction: Double = -1
+    /// Longest single unmeasured run inside the in-bed window, seconds. `-1` = not computed.
+    var longestGapSeconds: Double = -1
+
+    /// Sleep efficiency over COVERED GROUND ONLY — the honest ratio. `-1` = withheld or not
+    /// computed; render it as "—", never as 0 and never as a number.
+    ///
+    /// ⚠️ THIS IS A SEPARATE COLUMN FOR ONE SPECIFIC REASON, AND IT MUST STAY ONE. `efficiency`
+    /// above is load-bearing in an identity: `asSummary` (`:275`) recovers the in-bed span as
+    /// `asleep / efficiency`, where `asleep` is the DISPLAY-basis stage total. Writing the
+    /// measured-only ratio into `efficiency` therefore mixes bases and silently corrupts in-bed for
+    /// every downstream reader — on `R2_2026-08-18` it would reconstruct 490 min of in-bed for a
+    /// 439-minute night. `efficiency` stays display-basis; the honest number lives here.
+    var measuredEfficiency: Double = -1
+
+    /// WHICH BASIS THIS ROW'S MINUTES WERE COMPUTED ON. Empty = unknown (every row written before
+    /// this column existed).
+    ///
+    /// Why a version stamp and not a boolean: `HeadacheEngine.swift:368` never recomputes a frozen
+    /// day, so priors already on testers' phones hold asserted-INCLUSIVE `asleepMin` (403) and
+    /// `efficiency` (0.918). Switching today's rows to a measured-only basis without a stamp would
+    /// make `sleepDurationDeviation` compare a measured-only today against asserted-inclusive priors
+    /// and produce a spurious z for one whole baseline window — a wave of false headache flags at
+    /// exactly the moment we ship an honesty fix. With the stamp the builder can refuse to mix bases,
+    /// and the transition surfaces as `.buildingBaseline(daysRemaining:)`, an existing honest verdict
+    /// with existing UI (`HeadacheSignals.swift:433`).
+    var sleepBasis: String = ""
+
     init(
         night: Date,
         asleepMin: Int = 0,
@@ -319,6 +371,86 @@ private func canMoveNightScopedDefault(from oldKey: String, to newKey: String) -
     UserDefaults.standard.object(forKey: newKey) == nil
 }
 
+/// Which basis a `StoredSleepSummary`'s minutes were computed on. Persisted as a raw string on the
+/// row so the value survives an enum rename, and so an unrecognised future value degrades to
+/// `.unknown` rather than being silently read as one of the known bases.
+enum SleepBasis: String {
+    /// Written before this column existed, or by an edit whose recording is already destroyed. The
+    /// row's split is NOT known and must never be presented as if it were.
+    case unknown = ""
+    /// Every segment is measured — which is every unedited, staged night.
+    case measuredOnly
+    /// The row carries user-asserted time, correctly tagged, with the split in the sibling columns.
+    case assertedTagged
+
+    init(stored: String) { self = SleepBasis(rawValue: stored) ?? .unknown }
+}
+
+/// THE UNDO STACK FOR SLEEP EDITS — every step, not merely the original state.
+///
+/// A user's stored health history is theirs, and changing it is destructive and hard to reverse, so
+/// each edit pushes the window it replaced. Night-keyed UserDefaults, following exactly the
+/// `SleepEditOnsetOverlay` pattern below (including the rename hook the one-shot night-key migration
+/// needs — an overlay without one is stranded when a row is re-keyed, which for the Health-sample
+/// overlay once meant deleting another night's samples).
+///
+/// Bounded at `maxDepth` so a user who nudges a picker fifty times cannot grow UserDefaults without
+/// limit; the OLDEST entry is dropped, never the original, because the original is the one a
+/// "restore what the ring recorded" affordance needs.
+enum SleepEditPriorTimesOverlay {
+    struct Snapshot: Codable, Equatable {
+        var inBedStart: Date
+        var sleepOnset: Date
+        var sleepWake: Date
+    }
+
+    static let maxDepth = 20
+
+    private static func key(_ night: Date) -> String {
+        let day = Calendar.current.startOfDay(for: night).timeIntervalSince1970
+        return "sleep.edit.priorTimes.\(day)"
+    }
+
+    static func stack(night: Date) -> [Snapshot] {
+        guard let data = UserDefaults.standard.data(forKey: key(night)),
+              let out = try? JSONDecoder().decode([Snapshot].self, from: data) else { return [] }
+        return out
+    }
+
+    /// Record the window being replaced. A no-op when the incoming snapshot has no usable window
+    /// (a legacy row with `.distantPast` edges has nothing to restore TO, and pushing it would put a
+    /// meaningless entry at the bottom of the stack where the original belongs).
+    static func push(_ snapshot: Snapshot, night: Date) {
+        guard snapshot.sleepWake > snapshot.inBedStart,
+              snapshot.inBedStart > .distantPast else { return }
+        var out = stack(night: night)
+        guard out.last != snapshot else { return }        // an unchanged Save must not grow the stack
+        out.append(snapshot)
+        // Drop from the FRONT+1 so entry 0 — the ring's own window — always survives.
+        if out.count > maxDepth { out.removeSubrange(1 ..< (out.count - maxDepth + 1)) }
+        guard let data = try? JSONEncoder().encode(out) else { return }
+        UserDefaults.standard.set(data, forKey: key(night))
+    }
+
+    /// Pop the most recent snapshot, for an "undo this edit" affordance.
+    static func pop(night: Date) -> Snapshot? {
+        var out = stack(night: night)
+        guard let last = out.popLast() else { return nil }
+        if let data = try? JSONEncoder().encode(out) {
+            UserDefaults.standard.set(data, forKey: key(night))
+        }
+        return last
+    }
+
+    /// One-shot night-key migration hook — see `moveNightScopedDefault`.
+    static func rename(from oldNight: Date, to newNight: Date) {
+        moveNightScopedDefault(from: key(oldNight), to: key(newNight))
+    }
+    static func canRename(from oldNight: Date, to newNight: Date) -> Bool {
+        canMoveNightScopedDefault(from: key(oldNight), to: key(newNight))
+    }
+}
+
 /// One extra edited clock value is needed beyond the existing two-edge SwiftData overlay. Keeping
 /// it in UserDefaults avoids changing the production SwiftData schema (and therefore avoids a
 /// destructive migration on phones with an existing sleep database). Wake remains editedInBedEnd.
@@ -441,9 +573,30 @@ struct PendingSleepReconcile: Codable, Equatable {
 }
 
 enum PendingSleepReconcileStore {
-    private static let key = "sleep.edit.pending-reconcile.v1"
+    /// ⚠️ THE VERSION SUFFIX IS LOAD-BEARING — BUMP IT WHENEVER `SleepSegment`'S ENCODING GAINS A
+    /// MEANING AN OLDER BUILD DID NOT WRITE.
+    ///
+    /// A queued item holds `[SleepSegment]`, and `SleepSegment.init(from:)` decodes a missing
+    /// `provenance` key as `.measured` — which is right for a segment an older build STAGED, and
+    /// exactly wrong for the invented fill an older build's EDIT produced. Left on `v1`, the first
+    /// launch after upgrade would drain a queue written before coverage existed, read every invented
+    /// minute in it as measured, and write the whole thing to Apple Health once — the one outcome
+    /// this entire change exists to prevent, executed by the fix itself.
+    ///
+    /// The cost of the bump is that a reconcile queued by the old build never drains: the user's TRIM
+    /// does not reach Health until they touch that night again. That is a stale wider night in
+    /// Health, which is the pre-existing behaviour of every build before the reconcile queue existed
+    /// — non-destructive, and strictly better than one confident invented write.
+    private static let key = "sleep.edit.pending-reconcile.v2"
+    /// The queue this build refuses to read. Dropped once, on first access, so it cannot sit in
+    /// UserDefaults forever — and dropping it is safe for the reason above: it can only ever cause
+    /// Health to keep MORE sleep than the user asked for, never less.
+    private static let abandonedKey = "sleep.edit.pending-reconcile.v1"
 
     static func all() -> [PendingSleepReconcile] {
+        if UserDefaults.standard.object(forKey: abandonedKey) != nil {
+            UserDefaults.standard.removeObject(forKey: abandonedKey)
+        }
         guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
         return (try? JSONDecoder().decode([PendingSleepReconcile].self, from: data)) ?? []
     }
@@ -560,6 +713,20 @@ final class StoredNap {
     var editedStart: Date? = nil
     var editedEnd: Date? = nil
 
+    /// The AUTO-DETECTED staged hypnogram, kept so an edit is reversible. `editNap` used to replace
+    /// `napSegmentsData` with a whole-window `inBed + asleepCore` pair, destroying the ring's real
+    /// per-nap staging with no backup — the nap-scale twin of the night-scale defect
+    /// `recordedHypnogramData` exists for. nil = the nap was always coarse, or predates this column.
+    var recordedNapSegmentsData: Data? = nil
+
+    /// The window last MIRRORED to Apple Health. `healthWritten` is a bare bool, so when a user
+    /// SHRANK an already-mirrored nap the wider sleep stayed in Health permanently — there is no nap
+    /// analogue of `reconcileEditedNightSleep`, and `pendingNaps()` only offers rows with
+    /// `healthWritten == false`. Recording the written span lets `flushNaps` clean the stale
+    /// remainder. `distantPast` = never written.
+    var healthWrittenStart: Date = Date.distantPast
+    var healthWrittenEnd: Date = Date.distantPast
+
     init(start: Date, end: Date, asleepMin: Int = 0, isLongNap: Bool = false,
          healthWritten: Bool = false, updatedAt: Date = Date()) {
         self.start = start
@@ -648,6 +815,24 @@ struct LocalStore {
         var descriptor = FetchDescriptor<StoredSample>(
             predicate: #Predicate { $0.kindRaw == kindRaw && $0.start < before },
             sortBy: [SortDescriptor(\.start, order: .reverse)])
+        descriptor.fetchLimit = 1
+        return try context.fetch(descriptor).first?.sample
+    }
+
+    /// Oldest sample of `kind` strictly AFTER `after`, or nil. The trailing-edge mirror of
+    /// `latestSample(kind:before:)` and the WAKE-provenance probe (`WakeProvenance.classify`,
+    /// `SleepConfidence.Coverage.firstMeasurementAfterEnd`): it answers "did the ring keep recording
+    /// past the wake we printed, or is that wake just where the data stopped?".
+    ///
+    /// Same shape as its mirror — one row, index-ordered, `fetchLimit = 1` — because it runs on the
+    /// same sleep-card render path and must never become a scan. Pass `.heartRate`: HR is
+    /// band-guarded to 30…220 bpm, so a charging or pocketed ring produces none, while a skin-temp
+    /// row keeps arriving from a docked ring and would report a dead night as "still recording".
+    func earliestSample(kind: MetricKind, after: Date) throws -> QuantitySample? {
+        let kindRaw = kind.rawValue
+        var descriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == kindRaw && $0.start > after },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
         descriptor.fetchLimit = 1
         return try context.fetch(descriptor).first?.sample
     }
@@ -1511,6 +1696,41 @@ struct LocalStore {
                 // it), and the caller's single `sleep-persist` event already carries the name. A
                 // second event here would triple the metric log's fill rate and evict the rarer
                 // breadcrumbs (`sleep-rekey`, `sleep-drop`, `archive-repair`) that testers need.
+                //
+                // …but the clamp anchors must still grow. This is the SAME defect the
+                // `keptManualEdit` branch above was fixed for on 2026-08-16, sitting unfixed in the
+                // sibling branch nobody checked: discarding the fuller staging's MINUTES is
+                // correct, freezing the RECORDED WINDOW the edit clamp anchors on is not.
+                //
+                // 🟢 2026-08-22, measured on a Gen 2 Air tester's night. Her second drain, 13
+                // minutes after the first, carried the last 10 minutes of the night
+                // (02:21:51..02:31:51). Re-staging with them yields 108 asleep-min against the
+                // stored 112 — that tail genuinely reads awake — so `shouldReplace` correctly
+                // refused. The row then kept `inBedEnd = 02:08:51` even though the app holds epochs
+                // through 02:33:51, and her edit clamp is anchored on that frozen edge.
+                //
+                // Outward-only, so it can only ever widen what an edit may reach. It writes the
+                // OVERLAY columns for the same reason the branch above does: the frozen
+                // `inBedStart…sleepWake` columns are Health's "what the ordinary flush wrote"
+                // bookkeeping, and this drain wrote nothing. The event fires ONLY when a widen
+                // actually happened — rare — so the fill-rate reasoning above still holds.
+                if let w = SleepEdit.widenRecorded(
+                    stored: existing.sleepEditClampWindow,
+                    incoming: .init(inBedStart: inBedStart, inBedEnd: inBedEnd,
+                                    sleepOnset: sleepOnset, sleepWake: sleepWake)) {
+                    existing.widenedRecordedInBedStart = w.inBedStart
+                    existing.widenedRecordedInBedEnd = w.inBedEnd
+                    existing.widenedRecordedOnset = w.sleepOnset
+                    existing.widenedRecordedWake = w.sleepWake
+                    existing.updatedAt = Date()
+                    ObservabilityStore().recordMetricEvent(
+                        source: "sleep-drop",
+                        detail: "night=\(Self.stamp(dayStart)) kept=FULLER "
+                            + "incoming=[\(Self.stamp(inBedStart))..\(Self.stamp(inBedEnd))] "
+                            + "asleep=\(m.asleep) "
+                            + "clampWidened=[\(Self.stamp(w.inBedStart))..\(Self.stamp(w.inBedEnd))]")
+                    try context.save()
+                }
                 return .keptFullerStoredNight
             }
             // Only NOW — every early return above is behind us, so this reaches `context.save()`.
@@ -1629,6 +1849,85 @@ struct LocalStore {
         // row whose timeline and whose minutes came from two different captures — a divergence no
         // consumer could detect. Empty in ⇒ empty stored ("not recorded"), which is honest.
         row.hypnogramData = SleepHypnogramCodec.encode(extras.hypnogram)
+        // THE RING'S OWN READING, kept where an edit cannot reach it. `applySleepEdit` overwrites
+        // `hypnogramData` in place, so before this line existed a single edit destroyed the
+        // recording permanently (🟢 R2_2026-08-17: 102.5 min of 97.6 %-covered sleep, 30 min of it
+        // deep). This is the ONLY writer of the column — the edit path must never touch it.
+        row.recordedHypnogramData = row.hypnogramData
+        // A staged row is all-measured by construction, so state the split rather than leaving the
+        // columns at their "not computed" sentinel. `SleepStaging.classify` emits only `.measured`
+        // segments; the audit measured the ordinary path at 22.4 asserted asleep-minutes across all
+        // 21 staged corpus nights, so there is nothing here to withhold.
+        let staged = SleepProvenanceBreakdown(segments: extras.hypnogram)
+        row.measuredAsleepSeconds = staged.measuredAsleep
+        row.assertedAsleepSeconds = staged.assertedAsleep
+        row.coverageFraction = extras.hypnogram.isEmpty ? -1 : staged.coverageFraction
+        row.longestGapSeconds = extras.hypnogram.isEmpty ? -1 : staged.longestUnmeasuredGap
+        row.measuredEfficiency = extras.hypnogram.isEmpty ? -1 : (staged.efficiency ?? -1)
+        row.sleepBasis = extras.hypnogram.isEmpty ? "" : SleepBasis.measuredOnly.rawValue
+    }
+
+    /// ONE-SHOT BACKFILL for the reversibility columns. Runs after the container opens, never inside
+    /// the migration, so a failure here cannot take the store down (the build-44 wipe is what that
+    /// rule is for).
+    ///
+    /// ⚠️ HONEST ABOUT WHAT IT CANNOT RECOVER. `recordedHypnogramData` is filled from `hypnogramData`
+    /// ONLY where `isManuallyEdited == false`, because those rows are still pure recordings. For a
+    /// row that was ALREADY EDITED the recording is ALREADY DESTROYED — `applySleepEdit` overwrote
+    /// the single column, and nothing anywhere holds the ring's version. Those rows are stamped
+    /// `unknown` and left empty. We must never present an edit's output as "what the ring recorded".
+    ///
+    /// Idempotent: a row that already has a recorded hypnogram or a basis stamp is skipped, so
+    /// running it on every launch is free and re-running it can never overwrite a real value.
+    /// Returns the number of rows it changed, for the diagnostics bundle.
+    @discardableResult
+    func backfillSleepProvenance() -> Int {
+        let rows = (try? context.fetch(FetchDescriptor<StoredSleepSummary>())) ?? []
+        var changed = 0
+        for row in rows {
+            guard SleepBasis(stored: row.sleepBasis) == .unknown else { continue }
+            // AN ALREADY-EDITED LEGACY ROW IS LEFT EXACTLY AS IT IS, deliberately. Its
+            // `hypnogramData` is edit OUTPUT — `applySleepEdit` overwrote the single column before
+            // `recordedHypnogramData` existed — so copying it into the recorded slot would fabricate
+            // a "recording" that never happened, and computing a split from it would report the
+            // invented minutes as measured. It keeps the `.unknown` stamp, which is the true answer:
+            // this row cannot say what it measured, and nothing may claim otherwise on its behalf.
+            if row.isManuallyEdited { continue }
+            guard !row.hypnogramData.isEmpty else { continue }
+            if row.recordedHypnogramData.isEmpty { row.recordedHypnogramData = row.hypnogramData }
+            let segs = SleepHypnogramCodec.decode(row.hypnogramData)
+            let b = SleepProvenanceBreakdown(segments: segs)
+            row.measuredAsleepSeconds = b.measuredAsleep
+            row.assertedAsleepSeconds = b.assertedAsleep
+            row.coverageFraction = b.coverageFraction
+            row.longestGapSeconds = b.longestUnmeasuredGap
+            row.measuredEfficiency = b.efficiency ?? -1
+            row.sleepBasis = SleepBasis.measuredOnly.rawValue
+            changed += 1
+        }
+        if changed > 0 { try? context.save() }
+        return changed
+    }
+
+    /// Nights whose Apple Health record still holds sleep this app invented over unmeasured ground —
+    /// the RETRACTION list.
+    ///
+    /// Invented blocks already written to testers' phones are recoverable because edited nights are
+    /// UUID-tracked (`writeReturningSleepUUIDs` -> `SleepEditHealthSampleOverlay` ->
+    /// `reconcileEditedNightSleep`), so this returns the nights a one-shot reconcile should re-run.
+    /// A row qualifies when it is edited AND its stored hypnogram now carries asserted time — i.e.
+    /// only nights re-saved under provenance. Legacy `unknown` rows are deliberately NOT retracted:
+    /// we cannot tell which of their minutes were invented, and deleting a user's Health sleep on a
+    /// guess is exactly the kind of destructive act this whole change exists to stop.
+    func nightsNeedingHealthRetraction() -> [Date] {
+        let rows = (try? context.fetch(FetchDescriptor<StoredSleepSummary>())) ?? []
+        return rows.compactMap { row in
+            guard row.isManuallyEdited,
+                  SleepBasis(stored: row.sleepBasis) == .assertedTagged,
+                  SleepHypnogramCodec.decode(row.hypnogramData).containsAssertedTime
+            else { return nil }
+            return row.night
+        }
     }
 
     /// Attach a decoded OSA SpO₂ summary (#91) to the most recent night's stored summary. The
@@ -1755,22 +2054,77 @@ struct LocalStore {
             return true
         }
         let m = summary.minutes
+
+        // REVERSIBILITY, BEFORE THE FIRST DESTRUCTIVE WRITE. `hypnogramData` is a single column and
+        // the line below overwrites it, so the ring's own reading has to be somewhere else FIRST.
+        // Only ever fill from a row that is still a pure recording; once a row is edited its
+        // `hypnogramData` is edit output and copying that in would fabricate a "recording" that
+        // never existed. Rows edited before this column shipped are already destroyed and are
+        // marked `unknown` by the migration — never claimed as restored.
+        if row.recordedHypnogramData.isEmpty, !row.isManuallyEdited, !row.hypnogramData.isEmpty {
+            row.recordedHypnogramData = row.hypnogramData
+        }
+        // Every step is undoable, not merely the original state (SleepEditPriorTimesOverlay keeps a
+        // night-keyed stack). Saved before the row mutates so the stack records what was replaced.
+        SleepEditPriorTimesOverlay.push(
+            .init(inBedStart: row.sleepEditCurrentInBedStart,
+                  sleepOnset: row.sleepEditCurrentOnset,
+                  sleepWake: row.sleepEditCurrentWake),
+            night: row.night)
+
         row.editedInBedStart = times.inBedStart
         row.editedInBedEnd = times.inBedEnd
         SleepEditOnsetOverlay.save(times.sleepOnset, night: row.night)
         row.isManuallyEdited = true
+
+        // ⚠️ THE MINUTES BELOW ARE THE **DISPLAY** HEADLINE AND STAY ASSERTION-INCLUSIVE (clause 1:
+        // an assertion wins for display — a user who dragged their window to 06:43 must not be told
+        // they slept until 02:37). What changes is that the row now also carries the split, so no
+        // consumer has to mistake the headline for a measurement.
         row.asleepMin = m.asleep
         row.deepMin = m.deep
         row.lightMin = m.light
         row.remMin = m.rem
         row.awakeMin = m.awake
+
+        let breakdown = hypnogram.map { SleepProvenanceBreakdown(segments: $0) }
+        // ⚠️ `efficiency` STAYS DISPLAY-BASIS AND IS NOT TOUCHED BY PROVENANCE. Two separate traps
+        // guard this line. (1) `asSummary` (`:275`) recovers in-bed as `asleep / efficiency` from the
+        // DISPLAY minutes, so writing the measured-only ratio here mixes bases and corrupts in-bed
+        // for every downstream reader — 490 min reconstructed for a 439-minute night on
+        // R2_2026-08-18. (2) The same expression treats 0 as a live SENTINEL, so "withheld" can
+        // never be signalled by zeroing it. The honest ratio goes in `measuredEfficiency`, and
+        // `-1` there means withheld.
         row.efficiency = summary.efficiency
         if let hypnogram { row.hypnogramData = SleepHypnogramCodec.encode(hypnogram) }
+        if let breakdown {
+            row.measuredAsleepSeconds = breakdown.measuredAsleep
+            row.assertedAsleepSeconds = breakdown.assertedAsleep
+            row.coverageFraction = breakdown.coverageFraction
+            row.longestGapSeconds = breakdown.longestUnmeasuredGap
+            row.measuredEfficiency = breakdown.efficiency ?? -1
+            row.sleepBasis = (breakdown.hasAssertedTime ? SleepBasis.assertedTagged
+                                                        : SleepBasis.measuredOnly).rawValue
+        }
+
         // Recompute the duration-driven Sleep Score from the edited night (HR/temp factors dropped →
         // renormalised, per SleepScore's contract — never fabricated).
-        row.sleepScore = SleepScore.composite(.init(
-            totalAsleep: summary.totalAsleep, timeAwake: summary.awake, efficiency: summary.efficiency,
-            deep: summary.deep, light: summary.light, rem: summary.rem)).score
+        //
+        // WITHHOLD it entirely when too much of the night was never measured. The score's dominant
+        // factor is `timeAsleep` at weight 0.30 (`SleepScore.swift:93`) and "how long did she sleep"
+        // is exactly the question an uncovered night cannot answer. 0 is this column's existing
+        // "not computed" sentinel (see the live type), so withholding here is expressible without
+        // inventing a new one — and it costs the headache engine nothing, because
+        // `HeadacheEngine.swift:136-142` consumes efficiency/awakeMin/asleepMin only and never the
+        // score.
+        if breakdown?.isScorable == false {
+            row.sleepScore = 0
+        } else {
+            row.sleepScore = SleepScore.composite(.init(
+                totalAsleep: summary.totalAsleep, timeAwake: summary.awake,
+                efficiency: summary.efficiency,
+                deep: summary.deep, light: summary.light, rem: summary.rem)).score
+        }
         row.updatedAt = Date()
         try context.save()
         return true
@@ -1818,6 +2172,7 @@ struct LocalStore {
     private func canRenameNightScopedOverlays(from oldKey: Date, to newKey: Date) -> Bool {
         SleepEditOnsetOverlay.canRename(from: oldKey, to: newKey)
             && SleepEditHealthSampleOverlay.canRename(from: oldKey, to: newKey)
+            && SleepEditPriorTimesOverlay.canRename(from: oldKey, to: newKey)
             && MirroredNightOverlay.canRename(from: oldKey, to: newKey)
             && PendingSleepReconcileStore.canRekey(from: oldKey, to: newKey)
             && ((try? canRenameCursor(from: Self.sleepEditLeadingCursorKey(oldKey),
@@ -1841,6 +2196,9 @@ struct LocalStore {
         try renameFrozenHeadacheNightKey(from: oldKey, to: newKey)
         SleepEditOnsetOverlay.rename(from: oldKey, to: newKey)
         SleepEditHealthSampleOverlay.rename(from: oldKey, to: newKey)
+        // The undo stack is night-keyed like the rest; leaving it behind would strand a user's only
+        // route back to what the ring recorded.
+        SleepEditPriorTimesOverlay.rename(from: oldKey, to: newKey)
         MirroredNightOverlay.rename(from: oldKey, to: newKey)
         PendingSleepReconcileStore.rekey(from: oldKey, to: newKey)
         Self.renameMorningNotificationLedger(from: oldKey, to: newKey)
@@ -2078,21 +2436,50 @@ struct LocalStore {
             let writtenStart = (try? sleepEditLeadingWatermark(row.night)) ?? recordedStart
             let writtenOnset = (try? sleepEditLeadingAsleepWatermark(row.night)) ?? recordedOnset
             let writtenEnd = max(recordedEnd, min(sleepCursor, row.editedInBedEnd))
+
+            // ⚠️ THIS IS THE SECOND, INDEPENDENT HEALTHKIT SLEEP CONSTRUCTION IN THE APP. It builds
+            // segments straight from the user's anchors: it never calls `SleepEdit.recompute`, never
+            // sees `baseSegments`, and holds no record timestamps of its own. A coverage fix confined
+            // to `SleepEdit` would leave this path inventing sleep exactly as before — the audit
+            // found it precisely because closing one of several paths is a false sense of safety.
+            //
+            // It recovers the coverage decision already persisted on the row's hypnogram rather than
+            // making a second, possibly different one. `fromProvenanceLabels` returns nil when the
+            // hypnogram carries no proven-unmeasured span — which means EITHER fully covered OR
+            // written before provenance existed, and those must not be conflated — so a legacy row
+            // keeps its previous behaviour untouched and is instead marked at the row level by the
+            // migration.
+            //
+            // ⚠️ AND IT IS NOT RE-GUARDED HERE. The retention guard belongs to the RECORDS-based
+            // call that wrote these labels; re-running `MeasuredCoverage.trusted(for:)` over the
+            // labels resolved its "oldest record" horizon to "the first non-hole LABEL" and handed
+            // every leading PROVEN hole back as `.unknown`, i.e. publishable — 🟢 measured at 60 min
+            // of invented sleep reaching Health in `SleepEditStoreTests`. `ProvenanceLabelCoverage`
+            // has no `trusted(for:)` at all, so that call cannot be written again.
+            let coverage = MeasuredCoverage
+                .fromProvenanceLabels(SleepHypnogramCodec.decode(row.hypnogramData))
+            func fill(_ range: Range<Date>, _ stage: SleepStage) -> [SleepSegment] {
+                guard range.upperBound > range.lowerBound else { return [] }
+                guard let coverage else {
+                    return [SleepSegment(start: range.lowerBound, end: range.upperBound, stage: stage)]
+                }
+                return coverage.partition(range).map {
+                    SleepSegment(start: $0.range.lowerBound, end: $0.range.upperBound, stage: stage,
+                                 provenance: SleepEdit.provenance(for: $0.ground))
+                }
+            }
+
             var segments: [SleepSegment] = []
             if row.editedInBedStart < writtenStart {
-                segments.append(SleepSegment(start: row.editedInBedStart, end: writtenStart,
-                                             stage: .inBed))
+                segments += fill(row.editedInBedStart ..< writtenStart, .inBed)
             }
             let editedOnset = row.sleepEditCurrentOnset
             if editedOnset < writtenOnset {
-                segments.append(SleepSegment(start: editedOnset, end: writtenOnset,
-                                             stage: .asleepCore))
+                segments += fill(editedOnset ..< writtenOnset, .asleepCore)
             }
             if row.editedInBedEnd > writtenEnd {
-                segments += [
-                    SleepSegment(start: writtenEnd, end: row.editedInBedEnd, stage: .inBed),
-                    SleepSegment(start: writtenEnd, end: row.editedInBedEnd, stage: .asleepCore),
-                ]
+                segments += fill(writtenEnd ..< row.editedInBedEnd, .inBed)
+                segments += fill(writtenEnd ..< row.editedInBedEnd, .asleepCore)
             }
             return segments.isEmpty ? nil : PendingSleepEditHealthWrite(night: row.night,
                                                                          segments: segments)
@@ -2228,15 +2615,40 @@ struct LocalStore {
     /// Edit an existing nap's window (#nap-parity, RingConn `isEdited`). OVERLAY: the unique `start`
     /// key is kept STABLE and the new window stored in `editedStart/editedEnd`, so a later auto
     /// re-detection updates the SAME row (no duplicate nap at the old start). Marks `isManuallyEdited`
-    /// so re-detection can't clobber it, and keeps `healthWritten` as-is: an already-mirrored nap is NOT
-    /// re-written (app-side edit — nothing is deleted from Apple Health); a not-yet-written nap flushes
-    /// with the new times. Returns false if the nap isn't found or the new window overlaps the night.
+    /// so re-detection can't clobber it.
+    ///
+    /// 🟢 TWO DEFECTS FIXED HERE, both found by the leak audit and both the nap-scale twins of
+    /// night-scale ones:
+    ///
+    /// 1. IT DESTROYED THE RING'S STAGING. The line below replaces `stagedSegments` with a
+    ///    whole-window `inBed + asleepCore` pair, so editing an AUTO-detected nap threw away its
+    ///    real Deep/Light/REM hypnogram with no backup — the same irreversibility that made
+    ///    `recordedHypnogramData` necessary for nights. The original now survives in
+    ///    `recordedNapSegmentsData`.
+    /// 2. A SHRINK LEFT THE OLD, WIDER SLEEP IN APPLE HEALTH FOREVER. `healthWritten` was left
+    ///    as-is and `pendingNaps()` only offers rows with `healthWritten == false`, so there was no
+    ///    nap analogue of `reconcileEditedNightSleep` and nothing ever removed the stale span. The
+    ///    row now records what was written, and a window that is not a superset of it re-arms the
+    ///    flush so the mirror can be corrected.
+    ///
+    /// Returns false if the nap isn't found or the new window overlaps the night.
     @discardableResult
     func editNap(originalStart: Date, newStart: Date, newEnd: Date) throws -> Bool {
         guard newEnd > newStart else { return false }
         if overlapsStoredNight(newStart, newEnd) { return false }
         let descriptor = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == originalStart })
         guard let row = try? context.fetch(descriptor).first else { return false }
+
+        // Reversibility BEFORE the destructive write, and only from a row that is still a pure
+        // recording — an already-edited row's `napSegmentsData` is edit output, and copying it in
+        // would fabricate a "recording" that never existed.
+        if row.recordedNapSegmentsData == nil, !row.isManuallyEdited {
+            row.recordedNapSegmentsData = row.napSegmentsData
+        }
+
+        let priorWrittenStart = row.healthWrittenStart
+        let priorWrittenEnd = row.healthWrittenEnd
+
         row.editedStart = newStart          // keep `start` (the dedup key) stable — overlay the edit
         row.editedEnd = newEnd
         row.asleepMin = Int((newEnd.timeIntervalSince(newStart) / 60).rounded())
@@ -2246,6 +2658,14 @@ struct LocalStore {
             SleepSegment(start: newStart, end: newEnd, stage: .inBed),
             SleepSegment(start: newStart, end: newEnd, stage: .asleepCore),
         ]
+
+        // Re-arm the Health flush when the mirrored span is no longer covered by the new window.
+        // A pure WIDENING is left alone: the existing append-only flush already handles it and
+        // re-writing would duplicate. A shrink or a move needs the stale span cleaned up.
+        if row.healthWritten, priorWrittenEnd > priorWrittenStart,
+           priorWrittenStart < newStart || priorWrittenEnd > newEnd {
+            row.healthWritten = false
+        }
         row.updatedAt = Date()
         do { try context.save() } catch { context.rollback(); return false }
         return true
@@ -2298,12 +2718,27 @@ struct LocalStore {
         return try context.fetch(descriptor)
     }
 
-    /// Mark a nap written to Apple Health so it isn't written again.
+    /// Mark a nap written to Apple Health so it isn't written again, RECORDING THE SPAN so a later
+    /// shrink can clean up what this write left behind (see `editNap`).
     func markNapWritten(start: Date) throws {
         let descriptor = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == start })
         guard let row = try? context.fetch(descriptor).first else { return }
         row.healthWritten = true
+        row.healthWrittenStart = row.effectiveStart
+        row.healthWrittenEnd = row.effectiveEnd
         try context.save()
+    }
+
+    /// The span a nap previously mirrored to Health that the CURRENT window no longer covers — what
+    /// `flushNaps` must delete before re-writing. Empty when nothing is stale.
+    func staleNapHealthSpan(start: Date) -> DateInterval? {
+        let descriptor = FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == start })
+        guard let row = try? context.fetch(descriptor).first,
+              row.healthWrittenEnd > row.healthWrittenStart else { return nil }
+        let lo = min(row.healthWrittenStart, row.effectiveStart)
+        let hi = max(row.healthWrittenEnd, row.effectiveEnd)
+        guard hi > lo else { return nil }
+        return DateInterval(start: lo, end: hi)
     }
 
     /// Accumulate a SAME-DAY step delta into the running total for `day`, UPSERTED by

@@ -40,6 +40,7 @@ Health** — no cloud, no subscription.
 | `docs/SLEEP_REPLAY_HARNESS.md` | **Swift replay harness — stage any night from raw bytes via `swift test`.** Measure a staging change instead of arguing about it; read §2 (production parity) and §4 (the edit trap) before quoting any number |
 | `docs/HEADACHE_SIGNALS.md` | **Headache signals (#183) — plan of record. Read §1 first: the honest accuracy arithmetic is why the alert must EARN its way on per-user** |
 | `docs/RUNBOOK_HEADACHE_VALIDATION.md` | **On-device validation for #183 (freeze / migration / HealthKit) + the tester-facing "What to Test"** |
+| `docs/RUNBOOK_SCHEMA_MIGRATION_REHEARSAL.md` | **MANDATORY before shipping any SwiftData schema change. Two gates: "Gate A" is the named suite invocation `-only-testing:OpenCircuitTests/ShippedStoreMigrationTests` — run it on its own and check the executed-test COUNT, because a full-target run has already skipped the whole suite silently; then rehearse the upgrade on a real phone from a PRE-45 build. Build 44 deleted every raw history row on upgrade; a simulator pass and a current-build store both skip the defect** |
 | `docs/HEALTHKIT_MAPPING.md` | Each metric → HealthKit type |
 | `docs/BACKGROUND_SYNC.md` | **How the official RingConn app syncs to Apple Health without being opened (RE'd blueprint) → mapped to our BGTask + CoreBluetooth-restoration implementation (#119); deliberate divergences + validation runbook** |
 | `docs/HANDOFF_MACOS_IOS.md` | **Pickup instructions for the iOS work on macOS** |
