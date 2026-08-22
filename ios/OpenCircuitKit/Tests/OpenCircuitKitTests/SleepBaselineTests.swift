@@ -21,16 +21,47 @@
 // dropping them would silently narrow the baseline to the nights that happened to be exported
 // within ~30 h. They must never be mixed into a "detected" aggregate — the status column is how.
 
+import CryptoKit
 import XCTest
 @testable import OpenCircuitKit
+
+/// THE PINNED GOLDEN — the only committed record of the number this campaign quotes.
+///
+/// Every honesty or staging change in this area ships with the claim *"no staged sleep number moved;
+/// the scoreboard hash is unchanged"*. Until now that hash lived only in review notes:
+/// `git grep ef5dc087` returned **nothing**, so a reader could not distinguish a re-derivation from
+/// a re-typing, and a change that DID move the scoreboard would have been caught only by whoever
+/// happened to remember the old value.
+///
+/// Both values were measured on 2026-08-20 in this repo, against the private corpus at
+/// `desktop/captures/sleep-corpus` (gitignored — real tester health data, never committed):
+///
+///     shasum -a 256 desktop/captures/sleep-corpus/manifest.json
+///     shasum -a 256 desktop/captures/sleep-corpus/baseline.tsv    # 74 lines: header + 73 rows
+///
+/// The manifest fingerprint is what makes the baseline hash meaningful: a hash naming no corpus is
+/// unreproducible. `testEmitBaselineTSV` asserts the baseline hash **only** when the manifest it
+/// just read matches the fingerprint recorded here; against any other corpus it prints both hashes
+/// and asserts nothing, because it has nothing to compare against.
+enum SleepBaselineGolden {
+    /// sha256 of `manifest.json` for the corpus the baseline below was measured on.
+    static let corpusManifestSHA256 = "63a07be8f28714b2c31a410c950dfb9c6f69b899097dccbc5f92f18b41061c0e"
+    /// sha256 of the `baseline.tsv` this emitter produces from that corpus on master `f042639`.
+    static let baselineSHA256 = "ef5dc087a16f0461d14d656d2e3461cc479cceb85ef5d30f5e4dd741eaa13e8f"
+
+    static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+}
 
 final class SleepBaselineTests: XCTestCase {
 
     func testEmitBaselineTSV() throws {
-        guard let dir = SleepReplay.dir("OC_SLEEP_BASELINE_CORPUS") else {
-            print("[baseline] OC_SLEEP_BASELINE_CORPUS unset — skipping. Point it at a corpus directory.")
-            return
-        }
+        let dir = try SleepReplay.requireCorpus(
+            "OC_SLEEP_BASELINE_CORPUS",
+            purpose: "the scoreboard emitter (SleepBaselineTests)",
+            consequence: "No baseline.tsv was written, so any sha256 you were about to quote as a "
+                       + "byte-identity proof would be from a stale file.")
         let outPath = ProcessInfo.processInfo.environment["OC_SLEEP_BASELINE_OUT"]
             ?? dir.appendingPathComponent("baseline.tsv").path
         // CANDIDATE A/B. `OC_SLEEP_ABSORB_CUT` sets `BulkSleep.observedGapAbsorbCoverageCut` for this
@@ -41,7 +72,9 @@ final class SleepBaselineTests: XCTestCase {
 
         // --- raw manifest, for the census columns SleepReplay's model does not carry
         let manifestURL = dir.appendingPathComponent("manifest.json")
-        let raw = try JSONSerialization.jsonObject(with: try Data(contentsOf: manifestURL))
+        let manifestData = try Data(contentsOf: manifestURL)
+        let manifestHash = SleepBaselineGolden.sha256Hex(manifestData)
+        let raw = try JSONSerialization.jsonObject(with: manifestData)
         guard let root = raw as? [String: Any], let rawRows = root["nights"] as? [[String: Any]] else {
             XCTFail("manifest.json has no `nights` array"); return
         }
@@ -176,15 +209,42 @@ final class SleepBaselineTests: XCTestCase {
             lines.append(cells.map { $0.replacingOccurrences(of: "\t", with: " ") }.joined(separator: "\t"))
         }
 
-        try (lines.joined(separator: "\n") + "\n").write(toFile: outPath, atomically: true, encoding: .utf8)
+        let tsv = lines.joined(separator: "\n") + "\n"
+        try tsv.write(toFile: outPath, atomically: true, encoding: .utf8)
+        let tsvHash = SleepBaselineGolden.sha256Hex(Data(tsv.utf8))
+        // Both halves of this line are load-bearing and were added independently: the absorb-cut
+        // label says WHICH staging produced the scoreboard (build 46's kill switch), and the hash
+        // is what the pinned golden below compares against. Dropping either makes a baseline run
+        // unattributable — do not "simplify" back to one print.
         print("\n=== SLEEP BASELINE — observedGapAbsorbCoverageCut = \(absorbCut)"
               + (absorbCut == BulkSleep.observedGapAbsorbCoverageCut ? " (shipped default)" : " (CANDIDATE)")
               + ", corpus \(dir.path)")
         print("=== \(nights.count) manifest rows: \(replayed) replayed, \(summaryOnly) summary-only, "
               + "\(failed) load failures")
         print("=== wrote \(lines.count - 1) rows x \(columns.count) columns -> \(outPath)")
+        print("=== manifest sha256 \(manifestHash)")
+        print("=== baseline sha256 \(tsvHash)")
         for f in failures { print("  LOAD FAILURE  " + f) }
         XCTAssertTrue(failures.isEmpty, "a corpus row failed to load — the baseline would be incomplete")
         XCTAssertGreaterThan(replayed, 0, "nothing was replayed at all")
+
+        // THE PINNED COMPARISON. Only meaningful against the corpus the golden was measured on —
+        // anyone else's corpus produces a different (and equally valid) scoreboard, so report rather
+        // than fail. See `SleepBaselineGolden`.
+        guard manifestHash == SleepBaselineGolden.corpusManifestSHA256 else {
+            print("=== golden NOT CHECKED — this is a different corpus.")
+            print("===   pinned manifest \(SleepBaselineGolden.corpusManifestSHA256)")
+            print("===   this   manifest \(manifestHash)")
+            print("===   pinned baseline \(SleepBaselineGolden.baselineSHA256) (not comparable)")
+            return
+        }
+        XCTAssertEqual(tsvHash, SleepBaselineGolden.baselineSHA256,
+                       "THE SCOREBOARD MOVED. This is the pinned corpus (manifest \(manifestHash)) "
+                       + "but the emitted baseline.tsv hashes to \(tsvHash), not the pinned "
+                       + "\(SleepBaselineGolden.baselineSHA256). Either a staging number changed — "
+                       + "in which case say so and re-pin deliberately — or the emitter's columns "
+                       + "changed, in which case re-pin and note it. Do NOT quote 'hash unchanged' "
+                       + "after seeing this.")
+        print("=== golden MATCH — baseline.tsv is byte-identical to the pinned scoreboard.")
     }
 }

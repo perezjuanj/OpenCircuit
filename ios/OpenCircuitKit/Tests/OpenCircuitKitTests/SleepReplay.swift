@@ -70,6 +70,7 @@
 // night the user edited has stored MINUTES that are not a staging output at all).
 
 import Foundation
+import XCTest
 import OpenCircuitKit
 
 // MARK: - Corpus model
@@ -193,9 +194,14 @@ enum SleepReplay {
         case noTimeZone(String)
         case timeZoneDidNotTake(String, String)
         case badDate(String)
+        case corpusDirectoryMissing(String, String)
 
         var description: String {
             switch self {
+            case let .corpusDirectoryMissing(v, p):
+                "\(v) is set to '\(p)', which is not a readable directory. The corpus gate REFUSES "
+                + "to skip here: the variable being set means someone intended to measure something, "
+                + "so a typo'd path must fail, not quietly report success."
             case let .noManifest(p): "no manifest.json under \(p)"
             case let .noRecords(id): "corpus night \(id): summary-only row, no records file — nothing to replay"
             case let .badBase64(id): "corpus night \(id): records file is not valid base64"
@@ -232,12 +238,52 @@ enum SleepReplay {
 
     // MARK: Loading
 
-    /// Directory for the measured corpus (`OC_SLEEP_CORPUS`), and for the asserted fidelity corpus
-    /// (`OC_SLEEP_FIDELITY_CORPUS`). Both nil ⇒ the tests skip rather than fail, so `swift test`
-    /// stays green on a machine that has no private health data on it.
-    static func dir(_ variable: String) -> URL? {
-        guard let p = ProcessInfo.processInfo.environment[variable], !p.isEmpty else { return nil }
+    /// Raw variable lookup. `private` ON PURPOSE — see `requireCorpus`. Making this internal again
+    /// re-opens the `guard let dir = … else { return }` hole that let a corpus-gated test report
+    /// PASSED having asserted nothing, and `CorpusGateLoudnessTests` will fail if you do.
+    private static func dir(_ variable: String, _ environment: [String: String]) -> URL? {
+        guard let p = environment[variable], !p.isEmpty else { return nil }
         return URL(fileURLWithPath: (p as NSString).expandingTildeInPath, isDirectory: true)
+    }
+
+    /// THE ONLY WAY a test may open a corpus.
+    ///
+    /// WHY THIS IS NOT `-> URL?`. Every corpus-gated entry point used to open with
+    /// `guard let dir = SleepReplay.dir(…) else { print("unset — skipping"); return }`. XCTest has
+    /// no way to know that early `return` meant "measured nothing": it reports the test as
+    /// **passed**. On a machine with no corpus — i.e. CI, and any reviewer following the commands in
+    /// `docs/SLEEP_REPLAY_HARNESS.md` — the fidelity *proof* therefore printed a green tick backed by
+    /// zero assertions. This harness is about to become the house regression gate for every staging
+    /// change, and a gate that passes on an empty run is worse than no gate at all.
+    ///
+    /// So: unset ⇒ `XCTSkip`, which XCTest reports as **skipped**, never as a pass. Set-but-not-a-
+    /// directory ⇒ a hard failure, because the variable being set means somebody meant to measure.
+    ///
+    /// - Parameter environment: injectable only so `CorpusGateLoudnessTests` can exercise both
+    ///   branches without mutating the process; production callers take the default.
+    static func requireCorpus(_ variable: String,
+                              purpose: String,
+                              consequence: String? = nil,
+                              environment: [String: String] = ProcessInfo.processInfo.environment,
+                              file: StaticString = #filePath,
+                              line: UInt = #line) throws -> URL {
+        guard let url = dir(variable, environment) else {
+            let reason = """
+                SKIPPED — NOTHING WAS MEASURED. \(variable) is unset, so \(purpose) DID NOT RUN. \
+                \(consequence.map { $0 + " " } ?? "")\
+                This is a skip, not a pass: do not quote this run as evidence of anything. \
+                To actually run it, point \(variable) at a corpus directory \
+                (see docs/SLEEP_REPLAY_HARNESS.md §1).
+                """
+            print("[corpus-gate] " + reason)
+            throw XCTSkip(reason, file: file, line: line)
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw ReplayError.corpusDirectoryMissing(variable, url.path)
+        }
+        return url
     }
 
     static func loadManifest(at dir: URL) throws -> [ReplayNight] {
