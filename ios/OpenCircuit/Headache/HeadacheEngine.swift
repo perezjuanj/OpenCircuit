@@ -51,6 +51,16 @@ struct HeadacheNightRow: Sendable, Equatable {
     let efficiency: Double
     /// Nightly mean sleeping skin temperature in °C. 0 = not measured this night.
     let skinTempC: Double
+    /// Share of the in-bed window the ring recorded across, 0…1. **`-1` = NOT COMPUTED** — a row
+    /// written before SchemaV7 — and must never be read as poor coverage.
+    var coverageFraction: Double = -1
+    /// Which basis this row's minutes were computed on (`SleepBasis`). Empty = unknown.
+    ///
+    /// The builder must not mix bases in one baseline: `HeadacheEngine` never recomputes a frozen
+    /// day, so priors already on testers' phones hold asserted-INCLUSIVE `asleepMin` and
+    /// `efficiency`. Comparing a measured-only today against those produces a spurious z for one
+    /// whole baseline window — a wave of false flags at exactly the moment an honesty fix ships.
+    var sleepBasis: String = ""
     /// The summary's `updatedAt` — the re-stage detector compares this against the frozen row's.
     let updatedAt: Date
 }
@@ -104,6 +114,14 @@ enum HeadacheAssessmentBuilder {
     /// there is no day 0 — i.e. days −2, −1, +1, +2, +3. Re-indexed onto CALENDAR offsets from the
     /// first bleeding day (offset 0 == MacGregor's day +1), that is exactly [−2, +2].
     static let perimenstrualDaysEitherSide = 2
+
+    /// Coverage at or above which a night's sleep features carry full weight. Below it they are
+    /// halved by `HeadacheSignals.Tuning.truncatedSleepQuality` — down-weighted, not dropped,
+    /// because dropping all three would leave GATE 4's anchor set (`HeadacheSignals.swift:445`)
+    /// resting on HRV and resting HR, and HRV is computed from the very epochs that are missing, so
+    /// those absences are CORRELATED and thin nights would flip `.scored` → `.insufficientData`
+    /// wholesale. 🔴 PROVISIONAL — set from device coverage data before this is quoted as a rate.
+    static let wellCoveredNightFraction = 0.90
 
     static func verdict(_ snapshot: HeadacheSnapshot,
                         tuning: HeadacheSignals.Tuning = HeadacheSignals.Tuning())
@@ -178,13 +196,32 @@ enum HeadacheAssessmentBuilder {
         } ?? []
 
         // A night the ring's buffer cut short looks exactly like a genuinely short, broken one, so
-        // the Kit halves the two features most prone to that false positive. Positive evidence only
-        // — without a bedtime reference `classify` correctly declines to guess.
-        let truncated = tonight.map {
+        // the Kit halves the three sleep features most prone to that false positive.
+        //
+        // TWO INDEPENDENT WITNESSES, OR'd:
+        //
+        // 1. `SleepCaptureCoverage` — the shipped front-edge test. Positive evidence only: without a
+        //    bedtime reference `classify` correctly declines to guess. That is also its limitation —
+        //    it needs a MANUAL bedtime schedule, and it therefore fires on 0 of 21 corpus nights, so
+        //    `truncatedSleepQuality` has been a dead knob since it shipped.
+        //
+        // 2. MEASURED COVERAGE — new, and the reason the knob comes alive. `coverageFraction` is
+        //    written by the same code that tags segment provenance, needs no schedule, and catches
+        //    the case the front-edge test structurally cannot: an INTERIOR hole. `R2_2026-08-18`
+        //    (0.377 covered, a 4 h hole in the middle of the night) is invisible to (1) and obvious
+        //    to (2).
+        //
+        // `-1` means "not computed" — a legacy row, or one written before SchemaV7 — and must NOT be
+        // read as poor coverage; those rows fall back to witness (1) alone, exactly as today.
+        let truncatedByFrontEdge = tonight.map {
             SleepCaptureCoverage.classify(capturedOnset: $0.inBedStart,
                                           capturedInBed: $0.inBedSeconds,
                                           scheduledBedtime: s.scheduledBedtime) == .likelyTruncated
         } ?? false
+        let truncatedByCoverage = tonight.map {
+            $0.coverageFraction >= 0 && $0.coverageFraction < Self.wellCoveredNightFraction
+        } ?? false
+        let truncated = truncatedByFrontEdge || truncatedByCoverage
 
         return HeadacheSignals.DayInput(
             day: s.day,
@@ -583,6 +620,8 @@ extension HeadacheNightRow {
                   awakeMin: row.awakeMin,
                   efficiency: row.efficiency,
                   skinTempC: row.skinTempC,
+                  coverageFraction: row.coverageFraction,
+                  sleepBasis: row.sleepBasis,
                   updatedAt: row.updatedAt)
     }
 }

@@ -26,6 +26,9 @@ struct OpenCircuitApp: App {
                 // (`SleepNightKey`). Must run before any sleep write this launch, or a night staged
                 // under the new key could land beside its own un-migrated row.
                 .task { OpenCircuitApp.rekeySleepNightsOnce(container) }
+                // Backfill the reversibility + provenance columns (SchemaV7). Idempotent and
+                // additive; runs AFTER the re-key so it sees each row under its final night key.
+                .task { OpenCircuitApp.backfillSleepProvenanceOnce(container) }
                 // Repair of any SyncCursor watermark stuck in the future by a corrupted-timestamp
                 // sample, BEFORE `ingest` guarded plausibility ahead of the cursor advance — run
                 // every launch (not one-time; see the function doc), after the sample scrubs so
@@ -229,10 +232,100 @@ struct OpenCircuitApp: App {
 
     /// Adds the four `StoredSleepSummary.widenedRecorded*` columns (the kept-edit clamp overlay —
     /// see the live type). Four defaulted Date columns on an existing model: lightweight migration.
-    /// V5 (pinned) and V6 (live) differ by exactly those four columns, which is what makes the two
+    /// V5 (pinned) and V6 (pinned) differ by exactly those four columns, which is what makes the two
     /// checksums distinct and the stage legal.
+    ///
+    /// ⚠️ V6 IS NOW FROZEN — it shipped in build 45 (`f042639`, the SchemaV6 store-wipe hotfix), so
+    /// its shape is the shape on real phones. Both `StoredSleepSummary` AND `StoredNap` are pinned to
+    /// nested snapshots of exactly that shape, because V7 adds columns to BOTH. This is the third
+    /// time this discipline has been applied and the second time it was learned the hard way; see
+    /// the build-44 note on V5.
     enum SchemaV6: VersionedSchema {
         static var versionIdentifier = Schema.Version(6, 0, 0)
+        static var models: [any PersistentModel.Type] {
+            // `StoredSleepSummary` and `StoredNap` here resolve to the nested snapshots below —
+            // deliberately. Every other entry is the live type, unchanged by V7.
+            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
+             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
+             StoredHeadacheEntry.self, StoredHeadacheRisk.self]
+        }
+
+        /// `StoredSleepSummary` EXACTLY as build 45 wrote it — V5's snapshot + the four
+        /// `widenedRecorded*` columns, WITHOUT the provenance/reversibility block. Same rules as the
+        /// V4 and V5 snapshots: nothing reads or writes through it, keep it byte-for-byte, and do NOT
+        /// add to it — a new column belongs on the live type plus a new schema version.
+        @Model final class StoredSleepSummary {
+            @Attribute(.unique) var night: Date = Date.distantPast
+            var asleepMin: Int = 0
+            var deepMin: Int = 0
+            var lightMin: Int = 0
+            var remMin: Int = 0
+            var awakeMin: Int = 0
+            var efficiency: Double = 0
+            var inBedStart: Date = Date.distantPast
+            var inBedEnd: Date = Date.distantPast
+            var sleepOnset: Date = Date.distantPast
+            var sleepWake: Date = Date.distantPast
+            var updatedAt: Date = Date.distantPast
+            var skinTempC: Double = 0
+            var sleepScore: Int = 0
+            var stressScore: Int = 0
+            var feelScore: Int = 0
+            var hrDeep: Int = 0
+            var hrLight: Int = 0
+            var hrRem: Int = 0
+            var hrAwake: Int = 0
+            var movementLevels: [Int] = []
+            var hypnogramData: Data = Data()
+            var osaAvgSpO2: Double = 0
+            var osaMinSpO2: Double = 0
+            var osaTimeBelow90Sec: Double = 0
+            var osaODI: Double = 0
+            var osaValidWindows: Int = 0
+            var editedInBedStart: Date = Date.distantPast
+            var editedInBedEnd: Date = Date.distantPast
+            var isManuallyEdited: Bool = false
+            var widenedRecordedInBedStart: Date = Date.distantPast
+            var widenedRecordedInBedEnd: Date = Date.distantPast
+            var widenedRecordedOnset: Date = Date.distantPast
+            var widenedRecordedWake: Date = Date.distantPast
+            init() {}
+        }
+
+        /// `StoredNap` EXACTLY as build 45 wrote it, WITHOUT `recordedNapSegmentsData` /
+        /// `healthWrittenStart` / `healthWrittenEnd`. Same rules as the snapshot above.
+        @Model final class StoredNap {
+            @Attribute(.unique) var start: Date = Date.distantPast
+            var end: Date = Date.distantPast
+            var asleepMin: Int = 0
+            var isLongNap: Bool = false
+            var healthWritten: Bool = false
+            var updatedAt: Date = Date.distantPast
+            var isManuallyEdited: Bool = false
+            var isManuallyAdded: Bool = false
+            var napSegmentsData: Data? = nil
+            var editedStart: Date? = nil
+            var editedEnd: Date? = nil
+            init() {}
+        }
+    }
+
+    /// Adds the reversibility + provenance block. On `StoredSleepSummary`: `recordedHypnogramData`
+    /// (the ring's own hypnogram, so an edit stops being irreversible), `measuredAsleepSeconds`,
+    /// `assertedAsleepSeconds`, `coverageFraction`, `longestGapSeconds`, and the `sleepBasis` stamp.
+    /// On `StoredNap`: `recordedNapSegmentsData` and the `healthWritten{Start,End}` span.
+    ///
+    /// ADDITIVE ONLY, and every column is DEFAULTED, so this is a lightweight stage: no existing
+    /// value is read, rewritten, or reinterpreted by the migration itself. The one BACKFILL — copying
+    /// `hypnogramData` into `recordedHypnogramData` for rows that are still pure recordings — runs
+    /// AFTER the container opens (`LocalStore.backfillRecordedHypnograms`), not inside the migration,
+    /// so a failure there can never take the store down with it.
+    ///
+    /// ⚠️ REHEARSE THIS ON A POPULATED DEVICE STORE, NOT A SIMULATOR. Build 44 added four defaulted
+    /// columns without a schema version and deleted every raw history row on upgrade; build 45 was
+    /// the hotfix. A migration in this area gets a device rehearsal.
+    enum SchemaV7: VersionedSchema {
+        static var versionIdentifier = Schema.Version(7, 0, 0)
         static var models: [any PersistentModel.Type] {
             [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
              StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
@@ -243,14 +336,15 @@ struct OpenCircuitApp: App {
     enum MigrationPlan: SchemaMigrationPlan {
         static var schemas: [any VersionedSchema.Type] {
             [SchemaV1.self, SchemaV2.self, SchemaV3.self, SchemaV4.self, SchemaV5.self,
-             SchemaV6.self]
+             SchemaV6.self, SchemaV7.self]
         }
         static var stages: [MigrationStage] {
             [.lightweight(fromVersion: SchemaV1.self, toVersion: SchemaV2.self),
              .lightweight(fromVersion: SchemaV2.self, toVersion: SchemaV3.self),
              .lightweight(fromVersion: SchemaV3.self, toVersion: SchemaV4.self),
              .lightweight(fromVersion: SchemaV4.self, toVersion: SchemaV5.self),
-             .lightweight(fromVersion: SchemaV5.self, toVersion: SchemaV6.self)]
+             .lightweight(fromVersion: SchemaV5.self, toVersion: SchemaV6.self),
+             .lightweight(fromVersion: SchemaV6.self, toVersion: SchemaV7.self)]
         }
     }
 
@@ -489,6 +583,22 @@ struct OpenCircuitApp: App {
         LocalStore(container.mainContext).ensureNightKeyMigrated()
     }
 
+    /// Fill the SchemaV7 reversibility + provenance columns on rows written before they existed.
+    ///
+    /// Deliberately NOT latched behind a UserDefaults flag: it is idempotent (it skips any row that
+    /// already carries a basis stamp), it is cheap (one fetch over the sleep table, which is one row
+    /// per night), and un-latched means a row that arrives later — from a restore, or from a night
+    /// re-keyed after the first run — is still picked up. It runs OUTSIDE the SwiftData migration on
+    /// purpose: a backfill that throws inside a migration takes the whole store down with it, which
+    /// is how build 44 deleted every raw history row on upgrade.
+    @MainActor
+    static func backfillSleepProvenanceOnce(_ container: ModelContainer) {
+        let changed = LocalStore(container.mainContext).backfillSleepProvenance()
+        if changed > 0 {
+            ringLog.info("[OC] sleep-provenance: backfilled \(changed, privacy: .public) night rows")
+        }
+    }
+
     /// Run the `SyncCursor` future-watermark repair (`LocalStore.repairFutureSyncCursors`) on
     /// EVERY launch — deliberately NOT gated to once like the scrubs above. A single one-time run
     /// was observed to NOT reliably clear the `hk:heartRate` mirror cursor (still stuck after the
@@ -527,6 +637,18 @@ struct RollupBackup: Codable {
         var sleepOnset, sleepWake: Date?
         var editedInBedStart, editedInBedEnd: Date?
         var isManuallyEdited: Bool?
+        /// ⚠️ THE TIMELINE AND ITS PROVENANCE MUST SURVIVE A WIPE, or the recovered row keeps its
+        /// asleep MINUTES while losing every way to check them. Before these fields existed, a
+        /// store-wipe recovery restored an edited night's 403 asserted-inclusive minutes and its
+        /// 0.918 efficiency but dropped the hypnogram entirely — so the export contract then
+        /// reported that night as "not recorded" (`hypnogram == []`) while the fabricated total
+        /// lived on, now unfalsifiable. `recordedHypnogram` is the ring's own reading and is the one
+        /// piece that cannot be re-derived from anything else after a wipe.
+        var hypnogramData: Data?
+        var recordedHypnogramData: Data?
+        var measuredAsleepSeconds, assertedAsleepSeconds: Double?
+        var coverageFraction, longestGapSeconds, measuredEfficiency: Double?
+        var sleepBasis: String?
     }
     struct Daily: Codable {
         var day: Date
@@ -640,7 +762,15 @@ struct RollupBackup: Codable {
                       inBedEnd: $0.inBedEnd, updatedAt: $0.updatedAt,
                       sleepOnset: $0.sleepOnset, sleepWake: $0.sleepWake,
                       editedInBedStart: $0.editedInBedStart, editedInBedEnd: $0.editedInBedEnd,
-                      isManuallyEdited: $0.isManuallyEdited)
+                      isManuallyEdited: $0.isManuallyEdited,
+                      hypnogramData: $0.hypnogramData,
+                      recordedHypnogramData: $0.recordedHypnogramData,
+                      measuredAsleepSeconds: $0.measuredAsleepSeconds,
+                      assertedAsleepSeconds: $0.assertedAsleepSeconds,
+                      coverageFraction: $0.coverageFraction,
+                      longestGapSeconds: $0.longestGapSeconds,
+                      measuredEfficiency: $0.measuredEfficiency,
+                      sleepBasis: $0.sleepBasis)
             },
             daily: dailyRows.map {
                 Daily(day: $0.day, steps: $0.steps, updatedAt: $0.updatedAt,
@@ -704,6 +834,17 @@ struct RollupBackup: Codable {
             row.editedInBedStart = s.editedInBedStart ?? .distantPast
             row.editedInBedEnd = s.editedInBedEnd ?? .distantPast
             row.isManuallyEdited = s.isManuallyEdited ?? false
+            // Restore the timeline and its provenance. Absent (a backup written by an older build)
+            // leaves the live defaults — empty timeline, `-1` sentinels, `unknown` basis — which is
+            // honest: those rows genuinely cannot say what they measured.
+            row.hypnogramData = s.hypnogramData ?? Data()
+            row.recordedHypnogramData = s.recordedHypnogramData ?? Data()
+            row.measuredAsleepSeconds = s.measuredAsleepSeconds ?? -1
+            row.assertedAsleepSeconds = s.assertedAsleepSeconds ?? -1
+            row.coverageFraction = s.coverageFraction ?? -1
+            row.longestGapSeconds = s.longestGapSeconds ?? -1
+            row.measuredEfficiency = s.measuredEfficiency ?? -1
+            row.sleepBasis = s.sleepBasis ?? ""
             ctx.insert(row)
         }
         for d in daily {

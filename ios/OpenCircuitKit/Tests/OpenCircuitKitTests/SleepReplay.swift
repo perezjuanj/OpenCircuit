@@ -286,6 +286,34 @@ enum SleepReplay {
         return url
     }
 
+    /// `requireCorpus` for an entry point that accepts more than one corpus variable.
+    ///
+    /// The provenance measurements can run against either their own corpus or the baseline one, and
+    /// the pre-gate code expressed that as `dir(a) ?? dir(b)` — which reintroduces the silent-pass
+    /// hole one level up, because the `??` chain still ends in an Optional somebody can `guard` on.
+    /// Routing the fallback through here keeps the skip loud and keeps the single choke point the
+    /// audit counts. `variables` is ordered: the first one SET wins, and the skip message names them
+    /// all so the reader knows what would have made the measurement run.
+    static func requireCorpus(anyOf variables: [String],
+                              purpose: String,
+                              consequence: String? = nil,
+                              environment: [String: String] = ProcessInfo.processInfo.environment,
+                              file: StaticString = #filePath,
+                              line: UInt = #line) throws -> URL {
+        precondition(!variables.isEmpty, "requireCorpus(anyOf:) needs at least one variable")
+        guard let set = variables.first(where: { environment[$0]?.isEmpty == false }) else {
+            // Delegate so there is exactly ONE place that formats the skip and exactly one place
+            // that decides an unset corpus is a skip rather than a pass.
+            return try requireCorpus(variables[0],
+                                     purpose: purpose,
+                                     consequence: (consequence.map { $0 + " " } ?? "")
+                                        + "Any of these would have run it: \(variables.joined(separator: ", ")).",
+                                     environment: environment, file: file, line: line)
+        }
+        return try requireCorpus(set, purpose: purpose, consequence: consequence,
+                                 environment: environment, file: file, line: line)
+    }
+
     static func loadManifest(at dir: URL) throws -> [ReplayNight] {
         let url = dir.appendingPathComponent("manifest.json")
         guard let data = try? Data(contentsOf: url) else { throw ReplayError.noManifest(dir.path) }

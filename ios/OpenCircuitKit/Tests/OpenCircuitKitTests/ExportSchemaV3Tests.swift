@@ -510,9 +510,56 @@ final class ExportSchemaV3Tests: XCTestCase {
                        "rows are emitted in the order given, never reordered")
     }
 
+    /// ⚠️ THE HEADER IS A CONTRACT AND `provenance` IS PART OF IT (M3). CSV is the DEFAULT export
+    /// format and the file people hand to a clinician; without this column an `asleepCore` block the
+    /// wearer asserted over ground holding no ring data is byte-identical to one the ring recorded.
+    /// The column is APPENDED, so every positional consumer of the first five keeps working.
     func testHypnogramCSVHeaderAndEmptyInput() {
         XCTAssertEqual(ExportEngine.hypnogramCSV([]),
-                       "sessionID,start,end,stage,durationSec")
+                       "sessionID,start,end,stage,durationSec,provenance")
+    }
+
+    /// The vocabulary must be the JSON's, character for character — one enum renders both, and a
+    /// consumer joining the two views must not have to translate.
+    func testHypnogramCSVProvenanceVocabularyMatchesTheJSONExactly() {
+        let mixed = [
+            SleepSegment(start: t0, end: t0.addingTimeInterval(150), stage: .asleepCore),
+            SleepSegment(start: t0.addingTimeInterval(150), end: t0.addingTimeInterval(300),
+                         stage: .asleepCore, provenance: .asserted),
+            SleepSegment(start: t0.addingTimeInterval(300), end: t0.addingTimeInterval(450),
+                         stage: .asleepCore, provenance: .assertedOverMeasured),
+            SleepSegment(start: t0.addingTimeInterval(450), end: t0.addingTimeInterval(600),
+                         stage: .asleepCore, provenance: .assertedCoverageUnknown),
+        ]
+        let rows = ExportEngineTests.parseCSV(
+            ExportEngine.hypnogramCSV([session(hypnogram: mixed)])).dropFirst()
+        XCTAssertEqual(rows.map { $0[5] },
+                       ["measured", "asserted", "assertedOverMeasured", "assertedCoverageUnknown"])
+
+        // …and every one of those strings is a `SleepProvenance` raw value, which is what the JSON
+        // emits. If a case is ever renamed, both views move together and this still holds.
+        let vocabulary = Set(SleepProvenance.allCases.map(\.rawValue))
+        XCTAssertTrue(rows.allSatisfy { vocabulary.contains($0[5]) })
+
+        let obj = parsed(ExportEngine.toJSON(samples: [], sleep: [], daily: [], now: t0,
+                                             sleepSessions: [session(hypnogram: mixed)]))
+        let json = (obj["sleepSessions"] as? [[String: Any]])?.first?["hypnogram"]
+            as? [[String: Any]]
+        // JSON omits the key for `.measured` (absence means measured, so an unedited night's export
+        // is unchanged); CSV always prints it. Every key the JSON DOES emit must match the CSV cell.
+        XCTAssertEqual(json?.map { $0["provenance"] as? String ?? "measured" },
+                       rows.map { $0[5] })
+    }
+
+    /// The invented block must not be able to hide in the clinician's copy. This is the M3 defect
+    /// stated as a test: identical spans and stages, different provenance, DIFFERENT bytes.
+    func testAnInventedBlockIsNoLongerByteIdenticalToAMeasuredOne() {
+        let span = [SleepSegment(start: t0, end: t0.addingTimeInterval(14_758), stage: .asleepCore)]
+        let invented = [SleepSegment(start: t0, end: t0.addingTimeInterval(14_758),
+                                     stage: .asleepCore, provenance: .asserted)]
+        XCTAssertNotEqual(ExportEngine.hypnogramCSV([session(hypnogram: span)]),
+                          ExportEngine.hypnogramCSV([session(hypnogram: invented)]),
+                          "246 invented minutes serialised exactly like 246 recorded ones")
     }
 
     func testHypnogramCSVEmitsOneRowPerSegmentAcrossSessions() {
@@ -534,7 +581,7 @@ final class ExportSchemaV3Tests: XCTestCase {
 
     func testSessionWithNoHypnogramEmitsNoHypnogramRows() {
         XCTAssertEqual(ExportEngine.hypnogramCSV([session()]),
-                       "sessionID,start,end,stage,durationSec")
+                       "sessionID,start,end,stage,durationSec,provenance")
     }
 
     // MARK: - The emitted hypnogram is a PARTITION, not a partition plus an umbrella
@@ -597,7 +644,7 @@ final class ExportSchemaV3Tests: XCTestCase {
     func testEnvelopeOnlyNightEmitsNoRowsRatherThanAnAllNightBar() {
         let envelopeOnly = [SleepSegment(start: t0, end: t1, stage: .inBed)]
         XCTAssertEqual(ExportEngine.hypnogramCSV([session(hypnogram: envelopeOnly)]),
-                       "sessionID,start,end,stage,durationSec")
+                       "sessionID,start,end,stage,durationSec,provenance")
     }
 
     // MARK: - sleepSessions JSON
