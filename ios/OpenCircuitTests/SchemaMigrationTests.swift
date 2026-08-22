@@ -17,6 +17,15 @@ import XCTest
 // The fix is `SchemaV4` pinning a snapshot of the pre-change shape plus a real `SchemaV5`. This test
 // writes a store with that pinned shape — i.e. the bytes build 34 wrote — and then opens it the way
 // the app does, so the failure mode above cannot come back silently.
+//
+// ⚠️ KNOWN LIMIT OF THIS SUITE, AND WHY `ShippedStoreMigrationTests` EXISTS. Everything below builds
+// its "old" store from `OpenCircuitApp.SchemaV4.models` — the CURRENT definition of V4 — so it
+// compares the code under test against itself. While V4 still named live types for the entities it
+// did not pin, "the shape build 34 wrote" here meant "whatever those types look like today", and
+// this suite stayed green straight through the change that made a genuine build-43 store
+// unopenable. It is kept because the V4↔V5 assertions are still worth having; the non-circular
+// coverage — shipped shapes transcribed from the git tags, opened through
+// `makeContainerOrThrow` — lives in `ShippedStoreMigrationTests`.
 @MainActor
 final class SchemaMigrationTests: XCTestCase {
     private var storeURL: URL!
@@ -49,16 +58,19 @@ final class SchemaMigrationTests: XCTestCase {
         summary.asleepMin = 431
         summary.deepMin = 92
         context.insert(summary)
-        context.insert(StoredSample(kindRaw: "heartRate", start: night, end: night, value: 58))
+        // The FROZEN sample type: V4's model list names snapshots now, and inserting the live class
+        // into a schema that does not contain it is a runtime trap, not a compile error.
+        context.insert(FrozenModels.StoredSample(kindRaw: "heartRate", start: night, end: night,
+                                                 value: 58))
         try context.save()
     }
 
-    /// Open it exactly as `makeContainerOrThrow` does: the current schema plus the migration plan.
+    /// Open it exactly as the app does — by calling the production builder itself, rather than
+    /// re-deriving "the current schema". It used to hand-build `Schema(SchemaV5.models)`, which
+    /// stopped being the current version at V6 and again at V7: the test was opening with a schema
+    /// no shipped build uses, so it could neither confirm nor deny what a real launch does.
     private func openAsTheAppDoes() throws -> ModelContainer {
-        let schema = Schema(OpenCircuitApp.SchemaV5.models)
-        return try ModelContainer(for: schema,
-                                  migrationPlan: OpenCircuitApp.MigrationPlan.self,
-                                  configurations: ModelConfiguration(schema: schema, url: storeURL))
+        try OpenCircuitApp.makeContainerOrThrow(storeURL: storeURL)
     }
 
     func testAStoreWrittenByTheShippedV4OpensAndKeepsEveryRow() throws {

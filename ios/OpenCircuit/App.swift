@@ -60,33 +60,70 @@ struct OpenCircuitApp: App {
     // by lightweight/custom migration instead of falling through to the last-resort wipe below.
     // Future schema changes append a `VersionedSchema` + a `MigrationStage` here rather than
     // relying on the wipe — which destroys un-resyncable local history.
+    /// ⚠️ EVERY VERSION BELOW EXCEPT THE LAST NAMES ONLY FROZEN TYPES — see `Store/FrozenSchemas.swift`.
+    /// A historical version that names a LIVE `@Model` does not describe a fixed shape, so the next
+    /// column added to that type silently changes this version's checksum and the store on the phone
+    /// stops being identifiable. `ShippedStoreMigrationTests.testNoHistoricalSchemaVersionNamesALiveType`
+    /// fails if one ever does again.
+    ///
+    /// ⚠️ CORRECTED, AND THE CORRECTION IS LOAD-BEARING. This note used to say "no store can match
+    /// V1, V2 or V3 any more, whatever they are pinned to". **That is false for V3**, measured by
+    /// re-scanning every `v1.0-b*` tag and by opening a store written in the b22–b33 shape through
+    /// the real plan (`ShippedStoreMigrationTests.testABuild33StoreOpensAndKeepsEveryRow`). What the
+    /// scan actually shows:
+    ///
+    ///   * **V1 — inert.** Six entities. The six-entity builds are b1–b17, and there the summary is
+    ///     19 props (b1–b12) or 21 (b13–b20) and `StoredNap` is 6 props. V1 pins the b22 summary
+    ///     (29) and the b22 nap (11), a combination no six-entity build ever wrote.
+    ///   * **V2 — inert.** Seven entities. `StoredDaytimeTemp` and `StoredStepSample` both first
+    ///     shipped at b18, so the entity count goes straight from 6 to 8: no build ever wrote a
+    ///     seven-entity store at all.
+    ///   * **V3 — NOT inert. It is exactly the shape builds 22 through 33 shipped**: eight entities,
+    ///     `StoredSleepSummary` at 29 props, `StoredNap` at 11. Those builds are ~3 weeks old, so a
+    ///     phone can still be sitting on one. Pinning V1…V3 to frozen snapshots did not merely add a
+    ///     tripwire, it handed b22–b33 stores back a matching version — they open and keep every
+    ///     row instead of being wiped.
+    ///
+    /// So do NOT "tidy" V3 back to naming live types on the argument that nothing can match it. That
+    /// edit would wipe every phone still on b22–b33. The claim is now enforced rather than asserted:
+    /// `testEachFrozenVersionStillDescribesTheShippedShape` compares `SchemaV3` against a shipped
+    /// shape transcribed independently in the test target, and the open test above exercises it
+    /// through `makeContainerOrThrow`.
     enum SchemaV1: VersionedSchema {
         static var versionIdentifier = Schema.Version(1, 0, 0)
         static var models: [any PersistentModel.Type] {
-            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
-             StoredNap.self, StoredPeriodEntry.self]
+            [FrozenModels.StoredSample.self, FrozenModels.StoredCursor.self,
+             SchemaV4.StoredSleepSummary.self, FrozenModels.StoredDaily.self,
+             FrozenModels.StoredNap.self, FrozenModels.StoredPeriodEntry.self]
         }
     }
 
     /// Adds `StoredDaytimeTemp` (Trends-only intraday skin temp, kept separate from #41's
     /// nightly baseline). Purely additive — no existing model changed — so this is a
     /// lightweight migration, not a custom stage.
+    ///
+    /// V2 never existed as an on-disk shape: `StoredDaytimeTemp` and `StoredStepSample` both first
+    /// shipped in build 18, so no build ever wrote a store with one and not the other (measured
+    /// across the tags). It stays in the plan because removing a version identifier from a shipped
+    /// plan is its own risk, and the V1→V2→V3 stages are pure no-op additions.
     enum SchemaV2: VersionedSchema {
         static var versionIdentifier = Schema.Version(2, 0, 0)
         static var models: [any PersistentModel.Type] {
-            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
-             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self]
+            SchemaV1.models + [FrozenModels.StoredDaytimeTemp.self]
         }
     }
 
     /// Adds `StoredStepSample` (timestamped step DELTAS — #steps-history) alongside the existing
     /// `StoredDaily` running total, so a step reading's actual observation window survives
     /// instead of being folded away. Purely additive — lightweight migration.
+    ///
+    /// ⚠️ V3 IS REACHABLE — unlike V1 and V2 it describes a shape that really shipped (builds 22
+    /// through 33). See the correction above the `SchemaV1` declaration before changing anything
+    /// here.
     enum SchemaV3: VersionedSchema {
         static var versionIdentifier = Schema.Version(3, 0, 0)
         static var models: [any PersistentModel.Type] {
-            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
-             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self]
+            SchemaV2.models + [FrozenModels.StoredStepSample.self]
         }
     }
 
@@ -120,12 +157,19 @@ struct OpenCircuitApp: App {
         static var versionIdentifier = Schema.Version(4, 0, 0)
         static var models: [any PersistentModel.Type] {
             // `StoredSleepSummary` here resolves to the nested snapshot below — deliberately.
-            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
-             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
-             StoredHeadacheEntry.self, StoredHeadacheRisk.self]
+            // Everything else is a FROZEN snapshot too (`Store/FrozenSchemas.swift`); this list
+            // named the live types until SchemaV7 widened `StoredNap` and a genuine build-34 store
+            // stopped opening (measured: NSCocoaErrorDomain 134504, `ShippedStoreMigrationTests`).
+            [FrozenModels.StoredSample.self, FrozenModels.StoredCursor.self,
+             StoredSleepSummary.self, FrozenModels.StoredDaily.self,
+             FrozenModels.StoredNap.self, FrozenModels.StoredPeriodEntry.self,
+             FrozenModels.StoredDaytimeTemp.self, FrozenModels.StoredStepSample.self,
+             FrozenModels.StoredHeadacheEntry.self, FrozenModels.StoredHeadacheRisk.self]
         }
 
-        /// `StoredSleepSummary` EXACTLY as build 34 wrote it — the pre-`hypnogramData` shape.
+        /// `StoredSleepSummary` EXACTLY as build 34 wrote it — the pre-`hypnogramData` shape, which
+        /// is also what builds 22 through 37 wrote (measured across the tags; the summary did not
+        /// change again until b38).
         ///
         /// It exists only to give V4 the checksum that is on disk; nothing reads or writes through
         /// it, and the live type in `Store/LocalStore.swift` remains the one the app uses. Keep the
@@ -170,9 +214,12 @@ struct OpenCircuitApp: App {
     /// say WHEN a stage happened and not only how many minutes of it there were. One defaulted column
     /// on an existing model: lightweight migration, not a custom stage (cf. #21).
     ///
-    /// V5 IS FROZEN. It shipped in build 35 (`v1.0-b35`, 2026-08-02) through build 43, so its shape
-    /// is the shape on real phones. `StoredSleepSummary` is pinned to a NESTED snapshot of exactly
-    /// that shape — the same discipline as V4 above, learned the hard way TWICE now:
+    /// V5 IS FROZEN. Its shape is the shape on real phones for **builds 38–43** — CORRECTED: this
+    /// note used to say build 35, but `hypnogramData` is absent at the `v1.0-b35`, `b36` and `b37`
+    /// tags and first appears at `v1.0-b38` (measured by scanning every `v1.0-b*` tag). The V4
+    /// snapshot therefore covers b22–b37, not b22–b34. `StoredSleepSummary` is pinned to a NESTED
+    /// snapshot of exactly the b38–b43 shape — the same discipline as V4 above, learned the hard
+    /// way TWICE now:
     ///
     /// ⚠️ 🟢 THE BUILD-44 WIPE (2026-08-16): build 44 added the four `widenedRecorded*` columns to
     /// the LIVE type while V5 still pointed at it — so a store written by build 43 matched NO
@@ -185,13 +232,16 @@ struct OpenCircuitApp: App {
     enum SchemaV5: VersionedSchema {
         static var versionIdentifier = Schema.Version(5, 0, 0)
         static var models: [any PersistentModel.Type] {
-            // `StoredSleepSummary` here resolves to the nested snapshot below — deliberately.
-            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
-             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
-             StoredHeadacheEntry.self, StoredHeadacheRisk.self]
+            // `StoredSleepSummary` here resolves to the nested snapshot below — deliberately; every
+            // other entry is a FROZEN snapshot (`Store/FrozenSchemas.swift`). See V4.
+            [FrozenModels.StoredSample.self, FrozenModels.StoredCursor.self,
+             StoredSleepSummary.self, FrozenModels.StoredDaily.self,
+             FrozenModels.StoredNap.self, FrozenModels.StoredPeriodEntry.self,
+             FrozenModels.StoredDaytimeTemp.self, FrozenModels.StoredStepSample.self,
+             FrozenModels.StoredHeadacheEntry.self, FrozenModels.StoredHeadacheRisk.self]
         }
 
-        /// `StoredSleepSummary` EXACTLY as builds 35–43 wrote it — V4's shape + `hypnogramData`,
+        /// `StoredSleepSummary` EXACTLY as builds 38–43 wrote it — V4's shape + `hypnogramData`,
         /// WITHOUT the `widenedRecorded*` columns. Same rules as V4's snapshot: nothing reads or
         /// writes through it, keep it byte-for-byte, and do NOT add to it — a new column belongs on
         /// the live type plus a new schema version.
@@ -244,10 +294,14 @@ struct OpenCircuitApp: App {
         static var versionIdentifier = Schema.Version(6, 0, 0)
         static var models: [any PersistentModel.Type] {
             // `StoredSleepSummary` and `StoredNap` here resolve to the nested snapshots below —
-            // deliberately. Every other entry is the live type, unchanged by V7.
-            [StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self,
-             StoredNap.self, StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
-             StoredHeadacheEntry.self, StoredHeadacheRisk.self]
+            // deliberately. Every other entry is a FROZEN snapshot (`Store/FrozenSchemas.swift`);
+            // they used to be the live types on the argument that V7 does not change them, which is
+            // true today and was true of `StoredNap` right up until V7 changed it.
+            [FrozenModels.StoredSample.self, FrozenModels.StoredCursor.self,
+             StoredSleepSummary.self, FrozenModels.StoredDaily.self,
+             StoredNap.self, FrozenModels.StoredPeriodEntry.self,
+             FrozenModels.StoredDaytimeTemp.self, FrozenModels.StoredStepSample.self,
+             FrozenModels.StoredHeadacheEntry.self, FrozenModels.StoredHeadacheRisk.self]
         }
 
         /// `StoredSleepSummary` EXACTLY as build 45 wrote it — V5's snapshot + the four
@@ -321,9 +375,14 @@ struct OpenCircuitApp: App {
     /// AFTER the container opens (`LocalStore.backfillRecordedHypnograms`), not inside the migration,
     /// so a failure there can never take the store down with it.
     ///
-    /// ⚠️ REHEARSE THIS ON A POPULATED DEVICE STORE, NOT A SIMULATOR. Build 44 added four defaulted
-    /// columns without a schema version and deleted every raw history row on upgrade; build 45 was
-    /// the hotfix. A migration in this area gets a device rehearsal.
+    /// ⚠️ REHEARSE THIS ON A POPULATED DEVICE STORE, NOT A SIMULATOR — the numbered procedure is
+    /// `docs/RUNBOOK_SCHEMA_MIGRATION_REHEARSAL.md`, and it starts from a PRE-45 build because a
+    /// rehearsal that starts from a current-build store skips the defect entirely. Build 44 added
+    /// four defaulted columns without a schema version and deleted every raw history row on upgrade;
+    /// build 45 was the hotfix. A migration in this area gets a device rehearsal.
+    ///
+    /// V7 is the CURRENT version and therefore the ONLY one that may name live types. When V8 is
+    /// added, V7 must first be pinned to snapshots of whatever the live shapes are the day V7 ships.
     enum SchemaV7: VersionedSchema {
         static var versionIdentifier = Schema.Version(7, 0, 0)
         static var models: [any PersistentModel.Type] {
@@ -380,9 +439,11 @@ struct OpenCircuitApp: App {
     /// The schema + default configuration shared by BOTH container builders, so the foreground
     /// (recovering) and background (non-destructive) paths can never drift apart. (#131)
     private static func makeSchemaAndConfig() -> (Schema, ModelConfiguration) {
-        // Must list exactly `SchemaV5.models` (the CURRENT version) — the container is built from
+        // Must list exactly `SchemaV7.models` (the CURRENT version) — the container is built from
         // THIS array, so a model present only in the versioned schema enum would migrate in and then
-        // be unreachable. `StoredSleepSummary` here is the LIVE type, never SchemaV4's snapshot.
+        // be unreachable. Every type here is the LIVE one, never a frozen snapshot; the current
+        // version is the ONLY place a live type may appear. (`ShippedStoreMigrationTests` asserts
+        // both halves of that rule.)
         let schema = Schema([StoredSample.self, StoredCursor.self,
                              StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
                              StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
@@ -649,6 +710,23 @@ struct RollupBackup: Codable {
         var measuredAsleepSeconds, assertedAsleepSeconds: Double?
         var coverageFraction, longestGapSeconds, measuredEfficiency: Double?
         var sleepBasis: String?
+        /// ⚠️ THE REST OF THE ROW. Until these existed the "durable rollup" backup restored a night's
+        /// asleep MINUTES and dropped its score, its stress and feel scores, its skin temperature,
+        /// its per-stage heart rates, its movement bars and its whole OSA block — so a recovered
+        /// night came back looking measured while every number a user could sanity-check it against
+        /// was silently gone. None of it is re-derivable: `skinTempC` comes from a LIVE-only
+        /// descriptor the ring never re-sends, and the scores are computed from raw samples the same
+        /// wipe deletes. Optional, so a backup written by an older build still decodes.
+        var skinTempC: Double?
+        var sleepScore, stressScore, feelScore: Int?
+        var hrDeep, hrLight, hrRem, hrAwake: Int?
+        var movementLevels: [Int]?
+        var osaAvgSpO2, osaMinSpO2, osaTimeBelow90Sec, osaODI: Double?
+        var osaValidWindows: Int?
+        /// The kept-edit clamp overlay (build 45). Without it a restored night loses the record of
+        /// what the ring actually recorded around a user's edit, which is the input the clamp uses.
+        var widenedRecordedInBedStart, widenedRecordedInBedEnd: Date?
+        var widenedRecordedOnset, widenedRecordedWake: Date?
     }
     struct Daily: Codable {
         var day: Date
@@ -670,8 +748,16 @@ struct RollupBackup: Codable {
         var hkSampleUUIDs: [String]
         var updatedAt: Date
     }
-    /// Auto-detected naps (#76). Re-derivable from synced sleep, but cheap to preserve and the
-    /// `healthWritten` flag round-trips so a restored nap isn't re-mirrored to Health.
+    /// Naps (#76). The AUTO-DETECTED window is re-derivable from synced sleep — the rest is not.
+    ///
+    /// ⚠️ Until the overlay fields below existed this struct carried six columns of fourteen, and
+    /// what it dropped was precisely the part a PERSON created: `isManuallyAdded` (a nap the ring
+    /// never detected — restoring it as `false` hands it to auto re-detection to overwrite),
+    /// `isManuallyEdited` + `editedStart`/`editedEnd` (the corrected window, so a restored nap
+    /// silently snapped back to the machine's guess), and `napSegmentsData` (the staged hypnogram
+    /// Apple Health is written from). `healthWrittenStart`/`healthWrittenEnd` round-trip for the
+    /// same reason `healthWritten` does: without them `flushNaps` cannot clean a stale wider span
+    /// out of Health. All optional, so an older backup still decodes.
     struct Nap: Codable {
         var start: Date
         var end: Date
@@ -679,6 +765,12 @@ struct RollupBackup: Codable {
         var isLongNap: Bool
         var healthWritten: Bool
         var updatedAt: Date
+        var isManuallyEdited: Bool?
+        var isManuallyAdded: Bool?
+        var napSegmentsData: Data?
+        var recordedNapSegmentsData: Data?
+        var editedStart, editedEnd: Date?
+        var healthWrittenStart, healthWrittenEnd: Date?
     }
     /// User-ENTERED headache logs (headache-signals Phase 1). Same irreplaceability argument as
     /// `Period` above, and it bites harder: this is the ground-truth LABEL series the detector can
@@ -740,7 +832,23 @@ struct RollupBackup: Codable {
     /// Read the rollup tables from the (un-openable-as-current) store using a schema LIMITED to
     /// just those tables — so a schema change to the sample/cursor tables can't block reading
     /// them — and write a JSON snapshot. Returns the snapshot (nil if even this best-effort read
-    /// fails). The file persists so a crash mid-wipe can't lose the rollups.
+    /// fails).
+    ///
+    /// ⚠️ TWO GAPS HERE, both pre-existing and both deliberately left alone by the M1 fix — they are
+    /// reported so the next person does not re-derive them from a comment that was wrong:
+    ///
+    ///  1. **The JSON file is WRITE-ONLY.** This comment used to end "the file persists so a crash
+    ///     mid-wipe can't lose the rollups". It cannot do that: `rollup-backup.json` is written
+    ///     here and deleted in `restore(into:)`, and **nothing in the app ever reads it back** —
+    ///     grep the target. Only the in-memory return value is used. A crash between
+    ///     `removeStoreFiles` and `restore` therefore loses the rollups anyway, with the file
+    ///     sitting on disk unread. Making it real means reading it at launch when it exists.
+    ///  2. **`StoredDaytimeTemp` is not backed up** — it is absent from the limited schema below,
+    ///     so the Trends intraday skin-temperature series is destroyed permanently by a wipe. Skin
+    ///     temp is LIVE-only (the `0x10`/`0x87` descriptor); the ring holds no history of it and
+    ///     can never re-send it, and it is deliberately not mirrored into Apple Health, so there is
+    ///     no second copy anywhere. Adding it here is a behaviour change to the wipe path and was
+    ///     out of scope for a comment-and-tests fix; it is the single biggest remaining hole.
     static func exportBeforeWipe(config: ModelConfiguration) -> RollupBackup? {
         let schema = Schema([StoredSleepSummary.self, StoredDaily.self,
                              StoredPeriodEntry.self, StoredNap.self,
@@ -770,7 +878,20 @@ struct RollupBackup: Codable {
                       coverageFraction: $0.coverageFraction,
                       longestGapSeconds: $0.longestGapSeconds,
                       measuredEfficiency: $0.measuredEfficiency,
-                      sleepBasis: $0.sleepBasis)
+                      sleepBasis: $0.sleepBasis,
+                      skinTempC: $0.skinTempC,
+                      sleepScore: $0.sleepScore, stressScore: $0.stressScore,
+                      feelScore: $0.feelScore,
+                      hrDeep: $0.hrDeep, hrLight: $0.hrLight, hrRem: $0.hrRem,
+                      hrAwake: $0.hrAwake,
+                      movementLevels: $0.movementLevels,
+                      osaAvgSpO2: $0.osaAvgSpO2, osaMinSpO2: $0.osaMinSpO2,
+                      osaTimeBelow90Sec: $0.osaTimeBelow90Sec, osaODI: $0.osaODI,
+                      osaValidWindows: $0.osaValidWindows,
+                      widenedRecordedInBedStart: $0.widenedRecordedInBedStart,
+                      widenedRecordedInBedEnd: $0.widenedRecordedInBedEnd,
+                      widenedRecordedOnset: $0.widenedRecordedOnset,
+                      widenedRecordedWake: $0.widenedRecordedWake)
             },
             daily: dailyRows.map {
                 Daily(day: $0.day, steps: $0.steps, updatedAt: $0.updatedAt,
@@ -783,7 +904,14 @@ struct RollupBackup: Codable {
             },
             naps: napRows.map {
                 Nap(start: $0.start, end: $0.end, asleepMin: $0.asleepMin,
-                    isLongNap: $0.isLongNap, healthWritten: $0.healthWritten, updatedAt: $0.updatedAt)
+                    isLongNap: $0.isLongNap, healthWritten: $0.healthWritten,
+                    updatedAt: $0.updatedAt,
+                    isManuallyEdited: $0.isManuallyEdited, isManuallyAdded: $0.isManuallyAdded,
+                    napSegmentsData: $0.napSegmentsData,
+                    recordedNapSegmentsData: $0.recordedNapSegmentsData,
+                    editedStart: $0.editedStart, editedEnd: $0.editedEnd,
+                    healthWrittenStart: $0.healthWrittenStart,
+                    healthWrittenEnd: $0.healthWrittenEnd)
             },
             headaches: headacheRows.map {
                 Headache(onset: $0.onset, end: $0.end, severityRaw: $0.severityRaw,
@@ -845,6 +973,27 @@ struct RollupBackup: Codable {
             row.longestGapSeconds = s.longestGapSeconds ?? -1
             row.measuredEfficiency = s.measuredEfficiency ?? -1
             row.sleepBasis = s.sleepBasis ?? ""
+            // The rest of the row. Absent (an older backup) leaves the live defaults, which read as
+            // "no value" everywhere: a 0 score hides the badge, a 0 skin temp is filtered by the
+            // Trends reader, an empty `movementLevels` draws no bar.
+            row.skinTempC = s.skinTempC ?? 0
+            row.sleepScore = s.sleepScore ?? 0
+            row.stressScore = s.stressScore ?? 0
+            row.feelScore = s.feelScore ?? 0
+            row.hrDeep = s.hrDeep ?? 0
+            row.hrLight = s.hrLight ?? 0
+            row.hrRem = s.hrRem ?? 0
+            row.hrAwake = s.hrAwake ?? 0
+            row.movementLevels = s.movementLevels ?? []
+            row.osaAvgSpO2 = s.osaAvgSpO2 ?? 0
+            row.osaMinSpO2 = s.osaMinSpO2 ?? 0
+            row.osaTimeBelow90Sec = s.osaTimeBelow90Sec ?? 0
+            row.osaODI = s.osaODI ?? 0
+            row.osaValidWindows = s.osaValidWindows ?? 0
+            row.widenedRecordedInBedStart = s.widenedRecordedInBedStart ?? .distantPast
+            row.widenedRecordedInBedEnd = s.widenedRecordedInBedEnd ?? .distantPast
+            row.widenedRecordedOnset = s.widenedRecordedOnset ?? .distantPast
+            row.widenedRecordedWake = s.widenedRecordedWake ?? .distantPast
             ctx.insert(row)
         }
         for d in daily {
@@ -858,9 +1007,21 @@ struct RollupBackup: Codable {
                 hkSampleUUIDs: p.hkSampleUUIDs, updatedAt: p.updatedAt))
         }
         for n in naps {
-            ctx.insert(StoredNap(start: n.start, end: n.end, asleepMin: n.asleepMin,
-                                 isLongNap: n.isLongNap, healthWritten: n.healthWritten,
-                                 updatedAt: n.updatedAt))
+            let nap = StoredNap(start: n.start, end: n.end, asleepMin: n.asleepMin,
+                                isLongNap: n.isLongNap, healthWritten: n.healthWritten,
+                                updatedAt: n.updatedAt)
+            // The user's own overlay. `isManuallyAdded` in particular is load-bearing: `saveNap`
+            // PRESERVES a manual nap across auto re-detection, so restoring it as `false` would let
+            // the next detection pass quietly delete a nap the person entered by hand.
+            nap.isManuallyEdited = n.isManuallyEdited ?? false
+            nap.isManuallyAdded = n.isManuallyAdded ?? false
+            nap.napSegmentsData = n.napSegmentsData
+            nap.recordedNapSegmentsData = n.recordedNapSegmentsData
+            nap.editedStart = n.editedStart
+            nap.editedEnd = n.editedEnd
+            nap.healthWrittenStart = n.healthWrittenStart ?? .distantPast
+            nap.healthWrittenEnd = n.healthWrittenEnd ?? .distantPast
+            ctx.insert(nap)
         }
         for h in headaches ?? [] {
             ctx.insert(StoredHeadacheEntry(
