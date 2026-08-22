@@ -84,6 +84,24 @@ public enum SleepEdit {
     /// wearer — who knew exactly when she woke — was refused. Same ring, previous report: last data
     /// 03:15, real wake 07:15, cap 06:15. Two for two, and it is the complaint she actually wrote in.
     ///
+    /// 🟢 IT IS A RACE, NOT A PERMANENT TRAP — established by adversarial review against her own two
+    /// preceding nights, and worth writing down because it is the reason this fix is about
+    /// DETERMINISM rather than about reachability. On 08-17 and 08-18 the ring's post-hole resume
+    /// block arrived at 06:42:51 and 06:38:57, coverage widened `latest` to 09:34:16 and 06:56:27,
+    /// and she successfully saved 06:45 and 06:43 — 66 minutes past the parity clamp each time. On
+    /// 08-22 she opened the editor at 06:39, minutes BEFORE the resume drained, so coverage held
+    /// nothing past 02:31:51. Re-opening the sheet a couple of hours later would have offered her
+    /// 06:15 with no code change at all (`bounds` is monotone; a sweep of the real shipped function
+    /// gives 07:00 → 08:00 → 09:00 → saturating at 11:16:51).
+    ///
+    /// That is precisely the behaviour worth removing. "Correct your night, but only after the ring
+    /// has finished catching up, and we will not tell you when that is" is not a rule anyone can
+    /// follow — she wrote in twice instead. The stranded margin does not make the ceiling constant
+    /// (coverage still raises it as the day goes on, and should — it is what rescued her on 08-17
+    /// and 08-18); it makes her real wake REACHABLE AT EVERY HOUR, which is the property she
+    /// experiences. `testHerRealWakeIsReachableAtEveryHourSheMightEdit` is that claim, and an
+    /// earlier draft asserting a single constant ceiling failed against the real function.
+    ///
     /// When the recording dies, the truth IS in open space, and the only evidence that exists is the
     /// wearer's. So `strandedEditMargin` is offered on both edges unconditionally — the editor no
     /// longer needs the archive's permission to let someone state their own night.

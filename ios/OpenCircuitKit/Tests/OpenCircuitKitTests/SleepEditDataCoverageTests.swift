@@ -99,6 +99,53 @@ final class SleepEditDataCoverageTests: XCTestCase {
                      "and the validator must accept what the picker offered")
     }
 
+    /// 🟢 THE RACE, REMOVED. Adversarial review established that the 05:08 ceiling was not a
+    /// permanent trap: her ring's post-hole resume block lands ~06:40, and on the two preceding
+    /// nights coverage then widened the ceiling to 09:34 and 06:56, letting her save 06:45 and
+    /// 06:43. On 2026-08-22 she simply opened the editor at 06:39, minutes too early. Sweeping the
+    /// edit hour on master therefore walks the ceiling up with the clock — 07:00, 08:00, 09:00 —
+    /// which means the answer to "can I enter the truth?" depended on WHEN she asked.
+    ///
+    /// What the stranded margin buys is REACHABILITY AT EVERY HOUR, not a constant ceiling. The
+    /// ceiling itself still rises with the clock, because the coverage widening is still there and
+    /// still earning its keep — it is what rescued her on 08-17 and 08-18. Asserting a single value
+    /// would therefore be asserting the removal of a lever that works; the first draft of this test
+    /// did exactly that and failed (4 distinct ceilings), which is the useful part.
+    ///
+    /// The property that matches what she experiences: at NO hour is her real wake out of reach, and
+    /// the ceiling never moves DOWN as the archive grows.
+    func testHerRealWakeIsReachableAtEveryHourSheMightEdit() {
+        let onset = d(22, 0, 16), stagedWake = d(22, 2, 8), realWake = d(22, 6, 15)
+        let firstEpoch = d(21, 20, 36), lastBeforeHole = d(22, 2, 31)
+        let strandedFloor = stagedWake.addingTimeInterval(SleepEdit.strandedEditMargin)
+
+        var previous: Date?
+        for editHour in [6, 7, 8, 9, 11, 14, 20] {
+            // The archive as it stands at `editHour`: the night, then the post-hole resume block
+            // once it has drained. Before ~06:40 there is nothing past the hole.
+            let upper = editHour <= 6 ? lastBeforeHole : d(22, editHour, 0)
+            let b = SleepEdit.bounds(recordedOnset: onset, recordedWake: stagedWake,
+                                     dataCoverage: firstEpoch...upper)
+            XCTAssertGreaterThanOrEqual(b.latest, realWake,
+                                        "editing at \(editHour):00 must still reach her real wake")
+            XCTAssertGreaterThanOrEqual(b.latest, strandedFloor,
+                                        "the stranded margin is a floor the clock cannot erode")
+            if let previous {
+                XCTAssertGreaterThanOrEqual(b.latest, previous,
+                                            "the ceiling must never move DOWN as the archive grows "
+                                            + "— that is what makes a Save safe while the sheet is open")
+            }
+            previous = b.latest
+        }
+
+        // …and on master the 06:39 case was NOT reachable, which is the whole report.
+        let atSixThirtyNine = SleepEdit.bounds(recordedOnset: onset, recordedWake: stagedWake,
+                                               dataCoverage: firstEpoch...lastBeforeHole)
+        XCTAssertLessThan(stagedWake.addingTimeInterval(SleepEdit.editMargin), realWake,
+                          "precondition: the old ±3 h ceiling was below her real wake")
+        XCTAssertGreaterThanOrEqual(atSixThirtyNine.latest, realWake)
+    }
+
     /// The mirror: whatever the editor offers, `validate` must agree — otherwise the picker hands
     /// out times Save then rejects, which is how this class of bug reaches a user in the first place.
     func testValidatorAgreesWithEveryEdgeTheStrandedPickerOffers() {
