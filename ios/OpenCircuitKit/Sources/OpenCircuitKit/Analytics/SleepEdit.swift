@@ -16,11 +16,24 @@ public enum SleepEdit {
     /// wake. (APK copy, see the sleep-edit spec.)
     public static let editMargin: TimeInterval = 3 * 3600
 
+    /// The margin the editor offers on top of `editMargin`, unconditionally, because the recording
+    /// may simply have STOPPED rather than the wearer having woken.
+    ///
+    /// Sized from measurement, not taste. 🟢 The Gen 2 Air stall (ring …59F91, FR04.009, four nights
+    /// decoded from raw epoch archives) runs 4 h 03 m – 4 h 05 m; the largest front-edge loss on
+    /// record is the 2026-08-04 #188 case at 4 h 15 m. 6 h is the smallest round margin that covers
+    /// every observed case with headroom, and it is what makes the two reports this exists for
+    /// answerable: last data 02:31 / real wake 06:15, and last data 03:15 / real wake 07:15.
+    ///
+    /// ⚠️ Raising this is cheap and lowering it is not — below ~4 h 15 m it silently stops covering
+    /// the failures it was measured against. If you shrink it, say which measurement changed.
+    public static let strandedEditMargin: TimeInterval = 6 * 3600
+
     /// The [earliest, latest] span the edited in-bed window may occupy, anchored on the RECORDED
     /// (ring-derived) onset + wake so the original data always bounds the edit.
     public struct Bounds: Equatable, Sendable {
-        public let earliest: Date   // recorded onset − 3 h
-        public let latest: Date     // recorded wake  + 3 h
+        public let earliest: Date   // recorded onset − `strandedEditMargin` (≥ the ±3 h floor)
+        public let latest: Date     // recorded wake  + `strandedEditMargin` (≥ the ±3 h floor)
         public init(earliest: Date, latest: Date) {
             self.earliest = earliest
             self.latest = latest
@@ -57,8 +70,36 @@ public enum SleepEdit {
     /// was unreachable entirely — the user could not correct the night at all.
     ///
     /// So `dataCoverage` — the span of epochs we actually HOLD for this night — may widen the
-    /// bounds outward, capped at `maxNightSpan`. The guarantee that survives: an edit may only
-    /// reach where the ring has data or within the parity margin, never into open space.
+    /// bounds outward, capped at `maxNightSpan`.
+    ///
+    /// ⚠️ 2026-08-22: THE "NEVER INTO OPEN SPACE" GUARANTEE IS GONE, DELIBERATELY. It used to read
+    /// "an edit may only reach where the ring has data or within the parity margin, never into open
+    /// space", and coverage was what widened the margin. That premise assumes the ring keeps
+    /// recording. It does not. 🟢 Gen 2 Air FR04.009, ring …59F91, four nights measured from raw
+    /// epoch archives: the recorder stops mid-night while the ring stays worn and connected (skin-
+    /// temperature descriptors continue unbroken at a ~42 s median, 35.4–36.4 °C, right through the
+    /// hole) and resumes ~4 h later. On 2026-08-22 the last epoch was 02:31:51 for a night that
+    /// really ended at 06:15. Coverage therefore stopped BEFORE the recorded wake and could not
+    /// widen anything; `latest` sat at the bare parity floor 02:08:51 + 3 h = 05:08:51, and the
+    /// wearer — who knew exactly when she woke — was refused. Same ring, previous report: last data
+    /// 03:15, real wake 07:15, cap 06:15. Two for two, and it is the complaint she actually wrote in.
+    ///
+    /// When the recording dies, the truth IS in open space, and the only evidence that exists is the
+    /// wearer's. So `strandedEditMargin` is offered on both edges unconditionally — the editor no
+    /// longer needs the archive's permission to let someone state their own night.
+    ///
+    /// What stops that from inventing a night from nothing is no longer the picker — it is
+    /// provenance. Time the ring did not record is tagged `.asserted` by `recompute`, kept out of
+    /// the stage minutes, out of efficiency, out of the score and out of Apple Health, and the card
+    /// says so in words. THE TWO CHANGES ARE A PAIR: widening these bounds without the provenance
+    /// quarantine would turn one wrong number into a bigger wrong number. Do not ship a revert of
+    /// the quarantine while leaving this widening in place.
+    ///
+    /// The widening is a CONSTANT given the recorded night, so `bounds` stays monotone and
+    /// time-invariant — the two properties the 2026-08-04 and 2026-08-16 seesaws were fixed to get.
+    /// `dataCoverage` can now only ever agree with it or be swallowed by it; it is kept because
+    /// `validate` must compute the identical bounds the picker offered, and because a corpus that
+    /// genuinely holds records past the cap should still be reachable.
     /// - Parameter existingEdit: the night's already-SAVED edited window, if any. Always inside the
     ///   returned bounds. `dataCoverage` can legitimately CONTRACT — `EpochArchive` prunes anything
     ///   older than 30 h behind its newest record — so without this, re-opening an edited night days
@@ -108,6 +149,13 @@ public enum SleepEdit {
         // The caps alone no longer bound the PAIRED window to one night (the two edges can be up to
         // 28 h − floorSpan apart); "one plausible night" is enforced where it belongs, on the
         // proposed window itself — `validate`'s `.tooLong` duration rule.
+        // THE STRANDED MARGIN — offered whatever the archive holds, and the reason the wearer whose
+        // ring stopped at 02:31 can now enter her real 06:15 wake. Deliberately a CONSTANT given the
+        // recorded night: an edge that moved with `dataCoverage` could contract between the picker
+        // offering a time and Save validating it, which is the failure floor-anchoring exists to
+        // prevent. Sits BEFORE the caps so it is clipped by them like every other widening.
+        earliest = min(earliest, recordedOnset.addingTimeInterval(-strandedEditMargin))
+        latest = max(latest, recordedWake.addingTimeInterval(strandedEditMargin))
         earliest = min(floorEarliest, max(earliest, floorLatest.addingTimeInterval(-maxNightSpan)))
         latest = max(floorLatest, min(latest, floorEarliest.addingTimeInterval(maxNightSpan)))
         // A night the user has ALREADY edited must always remain fully selectable. Deliberately

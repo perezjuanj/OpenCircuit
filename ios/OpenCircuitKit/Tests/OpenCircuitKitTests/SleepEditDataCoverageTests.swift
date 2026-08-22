@@ -26,11 +26,16 @@ final class SleepEditDataCoverageTests: XCTestCase {
     // MARK: - the regression
 
     func testUnwidenedBoundsCannotReachTheRealBedtime() {
-        // Documents the shipped behaviour that produced the report.
+        // Documents the shipped behaviour that produced the report. The pinned edges moved on
+        // 2026-08-22 when `strandedEditMargin` widened both sides from ±3 h to ±6 h (clipped by the
+        // one-night caps) — but the POINT of this test is unchanged and still holds: with no
+        // coverage at all, a 4 h 15 m front-edge loss is still out of reach, which is why the
+        // coverage widening below is not redundant.
         let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake)
-        XCTAssertEqual(b.earliest, d(4, 4, 30))
-        XCTAssertEqual(b.latest, d(4, 11, 55))
-        XCTAssertGreaterThan(b.earliest, d(4, 0, 15), "00:15 bedtime is outside the ±3 h margin")
+        XCTAssertEqual(b.earliest, d(4, 1, 30), "onset − 6 h")
+        XCTAssertEqual(b.latest, d(4, 14, 55), "wake + 6 h")
+        XCTAssertGreaterThan(b.earliest, d(4, 0, 15),
+                             "00:15 bedtime is still outside even the stranded margin")
     }
 
     func testArchiveCoverageWidensBoundsToReachTheRealBedtime() {
@@ -44,13 +49,69 @@ final class SleepEditDataCoverageTests: XCTestCase {
     }
 
     func testWideningNeverGoesTighterThanTheParityFloor() {
-        // A night whose data coverage is NARROWER than ±3 h must still offer the full RingConn
-        // margin — widening may only ever add.
+        // A night whose data coverage is NARROWER than the margin must still offer the full margin
+        // — widening may only ever add. (Same edges as the no-coverage case above: coverage this
+        // narrow contributes nothing, which is the assertion.)
         let narrow = d(4, 7, 45)...d(4, 8, 30)
         let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
                                  dataCoverage: narrow)
-        XCTAssertEqual(b.earliest, d(4, 4, 30))
-        XCTAssertEqual(b.latest, d(4, 11, 55))
+        XCTAssertEqual(b.earliest, d(4, 1, 30))
+        XCTAssertEqual(b.latest, d(4, 14, 55))
+        XCTAssertEqual(b, SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake),
+                       "narrow coverage must be indistinguishable from no coverage")
+    }
+
+    // MARK: - the recorder stops mid-night (Gen 2 Air, 2026-08-22)
+
+    /// 🟢 THE SECOND REPORT, and the one `strandedEditMargin` exists for. Ring …59F91, FR04.009,
+    /// Europe/Paris. The wearer slept 00:15 → 06:15. Her ring's last epoch of the night is
+    /// **02:31:51** — it kept sending live skin-temperature descriptors unbroken at a ~42 s median
+    /// through to 06:39, at 35.4–36.4 °C, so it was demonstrably worn and connected the whole time;
+    /// it simply stopped writing history. Staging ended the night at 02:08:51.
+    ///
+    /// Under the ±3 h rule the wake picker stopped at 02:08:51 + 3 h = 05:08:51, and she wrote in to
+    /// say so: "I can't write more than 5h15 AM". Coverage could not rescue it — the archive ENDS
+    /// before the recorded wake, so there was nothing to widen with. The previous night was the same
+    /// shape: last data 03:15, real wake 07:15, picker capped at 06:15.
+    ///
+    /// Times are UTC+2 wall clock expressed in the UTC helper, which is fine — the rule is
+    /// arithmetic on instants and carries no calendar.
+    func testTheWearerCanEnterHerRealWakeWhenTheRecorderStopped() throws {
+        let onset = d(22, 0, 16)     // staged onset, ≈ her real bedtime
+        let stagedWake = d(22, 2, 8) // where the data ran out, NOT where she woke
+        let lastEpoch = d(22, 2, 31)
+        let realWake = d(22, 6, 15)
+
+        let coverage = d(21, 20, 36)...lastEpoch
+        let b = SleepEdit.bounds(recordedOnset: onset, recordedWake: stagedWake,
+                                 dataCoverage: coverage)
+
+        XCTAssertLessThan(stagedWake.addingTimeInterval(SleepEdit.editMargin), realWake,
+                          "precondition: the ±3 h margin cannot reach her real wake")
+        XCTAssertLessThan(coverage.upperBound, stagedWake.addingTimeInterval(SleepEdit.editMargin),
+                          "precondition: coverage ends early, so it cannot widen anything either")
+
+        XCTAssertGreaterThanOrEqual(b.latest, realWake, "her real 06:15 wake must be selectable")
+        XCTAssertNil(SleepEdit.validate(.init(inBedStart: onset, sleepOnset: onset,
+                                              sleepWake: realWake),
+                                        recordedOnset: onset, recordedWake: stagedWake,
+                                        dataCoverage: coverage),
+                     "and the validator must accept what the picker offered")
+    }
+
+    /// The mirror: whatever the editor offers, `validate` must agree — otherwise the picker hands
+    /// out times Save then rejects, which is how this class of bug reaches a user in the first place.
+    func testValidatorAgreesWithEveryEdgeTheStrandedPickerOffers() {
+        let onset = d(22, 0, 16), stagedWake = d(22, 2, 8)
+        let b = SleepEdit.bounds(recordedOnset: onset, recordedWake: stagedWake)
+        for edge in [b.latest, b.latest.addingTimeInterval(-60), b.earliest.addingTimeInterval(3600)]
+        where edge > onset {
+            XCTAssertNil(SleepEdit.validate(.init(inBedStart: min(onset, b.earliest),
+                                                  sleepOnset: min(onset, b.earliest),
+                                                  sleepWake: edge),
+                                            recordedOnset: onset, recordedWake: stagedWake),
+                         "picker offered \(edge) but validate refused it")
+        }
     }
 
     func testOnePlausibleNightSurvivesTwoNightCoverage() {

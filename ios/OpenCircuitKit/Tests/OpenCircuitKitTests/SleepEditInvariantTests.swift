@@ -76,12 +76,40 @@ final class SleepEditInvariantTests: XCTestCase {
                                           window: .init(inBedStart: at(6), inBedEnd: at(5))).isEmpty)
     }
 
-    /// INVARIANT 5: bounds always span exactly the recorded (onset→wake) plus 6 h (±3 h), and clamp is
-    /// idempotent + a no-op inside the bounds.
+    /// INVARIANT 5: bounds always CONTAIN the recorded night ±3 h, never exceed the one-night caps,
+    /// and clamp is idempotent + a no-op inside them.
+    ///
+    /// This used to pin the width at exactly `recorded + 6 h`. `strandedEditMargin` (2026-08-22)
+    /// makes the width regime-dependent — a night long enough to fill `maxNightSpan` is unchanged,
+    /// a truncated one widens — so a single number can no longer express it. Both regimes are
+    /// asserted below with their exact expected edges, so the rule still cannot drift silently;
+    /// what is gone is the false claim that one formula covers every night.
     func testBoundsWidthAndClampIdempotence() {
         for (o, wk) in [(0.0, 8.0), (-2.0, 5.0), (1.0, 1.5)] {
             let b = SleepEdit.bounds(recordedOnset: at(o), recordedWake: at(wk))
-            XCTAssertEqual(b.latest.timeIntervalSince(b.earliest), (wk - o) * 3600 + 6 * 3600, accuracy: 0.1)
+            let floorEarliest = at(o).addingTimeInterval(-SleepEdit.editMargin)
+            let floorLatest = at(wk).addingTimeInterval(SleepEdit.editMargin)
+            let span = SleepEdit.defaultMaxNightSpan
+
+            XCTAssertLessThanOrEqual(b.earliest, floorEarliest, "the ±3 h parity floor is a FLOOR")
+            XCTAssertGreaterThanOrEqual(b.latest, floorLatest, "the ±3 h parity floor is a FLOOR")
+            XCTAssertGreaterThanOrEqual(b.earliest, floorLatest.addingTimeInterval(-span),
+                                        "an edge may not pass one night-span beyond the opposite floor")
+            XCTAssertLessThanOrEqual(b.latest, floorEarliest.addingTimeInterval(span),
+                                     "an edge may not pass one night-span beyond the opposite floor")
+
+            // The exact rule, spelled out: the stranded margin, clipped by the caps above.
+            let wantEarliest = min(floorEarliest,
+                                   max(at(o).addingTimeInterval(-SleepEdit.strandedEditMargin),
+                                       floorLatest.addingTimeInterval(-span)))
+            let wantLatest = max(floorLatest,
+                                 min(at(wk).addingTimeInterval(SleepEdit.strandedEditMargin),
+                                     floorEarliest.addingTimeInterval(span)))
+            XCTAssertEqual(b.earliest.timeIntervalSince1970, wantEarliest.timeIntervalSince1970,
+                           accuracy: 0.1)
+            XCTAssertEqual(b.latest.timeIntervalSince1970, wantLatest.timeIntervalSince1970,
+                           accuracy: 0.1)
+
             for probe in [-10.0, -3.0, 0.0, 4.0, 20.0] {
                 let once = SleepEdit.clamp(at(probe), to: b)
                 XCTAssertEqual(SleepEdit.clamp(once, to: b), once, "clamp is not idempotent")
@@ -89,6 +117,15 @@ final class SleepEditInvariantTests: XCTestCase {
                 XCTAssertLessThanOrEqual(once, b.latest)
             }
         }
+    }
+
+    /// A night that already fills `maxNightSpan` must be BIT-IDENTICAL to the pre-stranded-margin
+    /// rule. This is the blast-radius bound on the 2026-08-22 widening: it touches truncated nights
+    /// only, and cannot move the editor on a night that recorded properly.
+    func testAFullNightIsUnchangedByTheStrandedMargin() {
+        let b = SleepEdit.bounds(recordedOnset: at(0), recordedWake: at(8))
+        XCTAssertEqual(b.earliest, at(-3), "onset − 3 h, exactly as before")
+        XCTAssertEqual(b.latest, at(11), "wake + 3 h, exactly as before")
     }
 
     /// INVARIANT 6: validate's accept/reject boundary is exactly the ±3 h rule — a property sweep, not

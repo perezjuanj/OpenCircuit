@@ -172,9 +172,14 @@ struct EditSleepView: View {
     /// Describe the ACTUAL rule. The ±3 h sentence was RingConn's copy and stopped being true once
     /// `dataCoverage` may widen the bounds — showing the real clock times is both honest and more
     /// useful than a margin the user cannot compute in their head (#188 review).
+    ///
+    /// The "the period your ring recorded" wording went with it on 2026-08-22: the bounds are no
+    /// longer tied to what the ring recorded (see `SleepEdit.bounds`), and telling a wearer whose
+    /// ring stopped at 02:31 that the limit is what it recorded is both false and an accusation.
     private var boundsFooter: String {
-        "To help improve accuracy, edits are limited to the period your ring recorded around this "
-            + "night — \(clock(bounds.earliest)) to \(clock(bounds.latest))."
+        "You can set any time between \(clock(bounds.earliest)) and \(clock(bounds.latest)). "
+            + "If your ring missed part of the night, we keep your times and mark the rest as "
+            + "yours rather than measured."
     }
 
     private func clock(_ d: Date) -> String {
