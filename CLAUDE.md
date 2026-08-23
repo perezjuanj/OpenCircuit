@@ -36,6 +36,7 @@ Health** — no cloud, no subscription.
 | `docs/RUNBOOK_OVERNIGHT_TEMP.md` | **Overnight capture for skin temp / sleep stages / HRV (#7,#9,#12)** |
 | `docs/RUNBOOK_SLEEP_GROUNDTRUTH.md` | **Capture RingConn's computed hypnogram (`sleepPhases`) via mitmproxy → fit our staging to it** |
 | `docs/RUNBOOK_OSA_APNEA.md` | **OSA sleep-apnea (#91) — capture cracked (start `05 22 01`, dense PPG `0x48`), decode→AHI parked; forward plan** |
+| `docs/RUNBOOK_GEN3_BP_HAPTIC.md` | **Gen 3 vibrate motor + BP, written for a NON-DEV helper (iPhone→Mac capture). Read the ⚠️ box: the vibrate opcode is NOT in the APK (capture only), `BleSub*` means sub-DEVICE not sub-command, and RingConn's BP is CLOUD-computed so the number cannot be decoded at all** |
 | `desktop/ringconn_sleep_fit.py` | Supervised-fit harness: align our epochs to RingConn `sleepPhases`, fit `SleepStaging.Tuning` (`--synthetic` to demo) |
 | `docs/SLEEP_REPLAY_HARNESS.md` | **Swift replay harness — stage any night from raw bytes via `swift test`.** Measure a staging change instead of arguing about it; read §2 (production parity) and §4 (the edit trap) before quoting any number |
 | `docs/HEADACHE_SIGNALS.md` | **Headache signals (#183) — plan of record. Read §1 first: the honest accuracy arithmetic is why the alert must EARN its way on per-user** |

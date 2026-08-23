@@ -4,7 +4,11 @@ desktop/captures/*
 *.log
 *.pcap
 *.pcapng
+*.pklg
 *.btsnoop
+# Probe/verify session logs carry a ring's battery + firmware and a real MAC.
+desktop/vibrate_verify_*.txt
+desktop/sweep_*.txt
 
 # Python
 __pycache__/

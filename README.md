@@ -130,17 +130,38 @@ tool that decodes the protocol first.
 | `docs/ROADMAP.md` | Phases and current state |
 | `ios/` | Swift app (created in Phase 3) |
 
+## Get the code
+
+```bash
+git clone https://github.com/perezjuanj/OpenCircuit.git
+cd OpenCircuit
+```
+
 ## Quick start (desktop workbench)
+
+Decoding an existing capture needs **no setup at all** — `decode-log` and the converter are
+pure stdlib and run on the Python that ships with macOS:
 
 ```bash
 cd desktop
-python -m venv .venv && . .venv/Scripts/activate   # Windows; use bin/activate on *nix
-pip install -r requirements.txt
-
-python -m opencircuit scan          # find the ring, list services/characteristics
-python -m opencircuit listen        # connect and log every notification (hex)
-python -m opencircuit decode-log captures/btsnoop_hci.log   # parse an Android HCI capture
+python3 -m opencircuit decode-log captures/btsnoop_hci.log   # parse an Android HCI capture
+python3 pcap_to_btsnoop.py capture.pcap                      # iPhone/Mac capture → btsnoop
 ```
+
+Talking to a ring live needs `bleak`, and so needs a virtualenv:
+
+```bash
+cd desktop
+python3 -m venv .venv-live
+.venv-live/bin/pip install --upgrade pip      # macOS seeds pip 21.2.4, which can't
+.venv-live/bin/pip install -r requirements.txt  # install the prebuilt pyobjc wheel
+
+.venv-live/bin/python -m opencircuit scan     # find the ring, list services/characteristics
+.venv-live/bin/python -m opencircuit listen   # connect and log every notification (hex)
+```
+
+> The checked-in `desktop/.venv` is Python 3.9.6 — make your own as above rather than
+> reusing it. (On Windows the activate script is `.venv-live\Scripts\activate`.)
 
 ## Support
 
