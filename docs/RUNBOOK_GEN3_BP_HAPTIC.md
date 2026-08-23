@@ -5,7 +5,7 @@ that captures the official app talking to the ring while it (a) **buzzes** and (
 **blood-pressure assessment**. That one recording teaches OpenCircuit to drive the ring's
 motor, and collects the raw pulse data our own blood-pressure research needs.
 
-**Status:** written for a helper with **no development experience**. Everything you type is
+**Status:** Everything you type is
 copy-paste. Nothing here modifies your ring's settings or firmware. Budget **~90 minutes**
 the first time, most of it waiting.
 
