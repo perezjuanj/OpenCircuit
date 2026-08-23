@@ -2,8 +2,8 @@
 
 **Goal:** one recorded session on a **RingConn Gen 3**, from an **iPhone plugged into a Mac**,
 that captures the official app talking to the ring while it (a) **buzzes** and (b) runs a
-**blood-pressure assessment**. From that one recording we can teach OpenCircuit to drive the
-ring's motor.
+**blood-pressure assessment**. That one recording teaches OpenCircuit to drive the ring's
+motor, and collects the raw pulse data our own blood-pressure research needs.
 
 **Status:** written for a helper with **no development experience**. Everything you type is
 copy-paste. Nothing here modifies your ring's settings or firmware. Budget **~90 minutes**
@@ -23,16 +23,11 @@ different odds, and you deserve to know that before you start.
 | Target | Verdict | Why |
 |---|---|---|
 | **Vibration motor** | 🟢 **Winnable.** This is the real prize. | The buzz is a command your **phone sends to the ring** over Bluetooth. Your capture records exactly those bytes. Once we can read them, OpenCircuit can send them too. |
-| **Blood pressure** | 🔴 **The number cannot be decoded.** | RingConn's BP is **computed on their servers**, not on the ring. The app uploads a raw sensor file and waits for the answer to come back. There is no BP number on the wire to read. See §7. |
+| **Blood pressure** | 🟡 **Our own, eventually — not RingConn's.** | RingConn computes their number on their servers, so there's nothing to copy off the wire. But the **raw pulse data it's computed from does travel over Bluetooth**, and that's what we want. Paired with real cuff readings it's the raw material for our own estimate. §7. |
 
-**We still want the BP part of the session** — just not for the reason you'd assume. The
-*raw sensor data* the ring hands over during an assessment **is** on the wire, and that is
-the input we'd need to build our own estimate. Also, in the current app the ring **buzzes
-when a BP assessment finishes**, so a single BP run is the cleanest way to make it vibrate
-on demand. Doing BP gets us both targets in one go.
-
-Please don't skip §7 before drawing conclusions about blood pressure — the honest limits
-are there, and they're the difference between useful help and wasted evenings.
+So the BP half of this session is **data collection for our own research**, and it doubles
+as the vibration trigger: in the current app the ring buzzes when a BP assessment finishes.
+One BP run feeds both targets.
 
 ---
 
@@ -53,8 +48,9 @@ Tick these off before starting. Missing any one of them wastes the session.
       is the *ring's* DND schedule, set inside the app — **not** the iPhone's Focus 🟢.
       Turning off iOS Focus does nothing here, and this is an easy way to spend an
       evening getting no buzz for a reason you never see.
-- [ ] A **blood-pressure cuff**, if you have one — see §7 before buying anything. Not required
-      for the vibration half.
+- [ ] A **blood-pressure cuff**, if you have one. Not needed for the vibration half, but if
+      you do have one it roughly doubles the value of the session — see §7. An ordinary
+      home upper-arm monitor is fine.
 - [ ] Somewhere to **write down times** — paper, Notes, anything. §5 explains why this matters
       more than it sounds.
 - [ ] Your **free Apple account** (the ordinary one you use on the iPhone). You do **not**
@@ -198,7 +194,7 @@ mid-measurement, the ring will not vibrate and that step is wasted.
 | 7 | Wait **30 seconds** | | |
 | 8 | Run a **heart-rate / blood-oxygen spot measurement** | **ring buzzes** when it finishes | |
 | 9 | Wait **30 seconds** | | |
-| 10 | **Discover ▸ Blood Pressure Trends ▸ Check Again** — run an assessment | **ring buzzes** when done | |
+| 10 | **Discover ▸ Blood Pressure Trends ▸ Check Again** — run an assessment. **If you have a cuff, take a reading right before or after** (other arm — see §7) and note both numbers | **ring buzzes** when done | |
 | 11 | Wait **60 seconds** | | |
 
 Steps 4, 5, 8 and 10 are four independent chances at the same prize. **If some don't buzz,
@@ -293,36 +289,56 @@ that synced recently — there's then far less history in the buffer for it to h
 - Your **list of times** from §4.2 (the most important part), and your **time zone** — we
   need it to line your local clock up against the capture's timestamps
 - **Which steps buzzed** and which didn't
+- Any **cuff / ring blood-pressure pairs** you recorded (§7), with their times
 - The **ring's firmware version** and the **app version** — RingConn app ▸ Me ▸ Device
 - Anything that behaved oddly
 
 ---
 
-## 7. About blood pressure — please read before drawing conclusions
+## 7. Blood pressure — what we're collecting and why
 
-We looked hard at this, and the honest answer isn't the one we hoped for.
+RingConn computes their BP number on their servers 🟢: the app uploads a raw pulse-data file
+and waits for the answer to come back. So there's no number on the wire to copy — but **the
+raw pulse data itself is on the wire**, and that's the useful part. It's the same signal any
+cuffless BP estimate is built from, and we already have an experimental estimator that runs
+on it locally.
 
-**RingConn's blood-pressure number is computed on their servers, not on the ring** 🟢. The
-evidence, from the current app: it uploads a raw sensor file to cloud storage under a path
-shaped `…/{your-id}/bp/{timestamp}.csv`, then **waits for the server to push the result
-back** through a message channel that also carries their other cloud-computed features. There
-is no blood-pressure algorithm inside the app, and no BP number travelling over Bluetooth.
+What turns that raw signal into a reading is **calibration**: pairs of *(pulse data, real
+cuff reading)* taken at the same moment. That's the one thing we can't generate ourselves,
+and it's what makes your session valuable beyond the vibration work.
 
-Three consequences worth being straight about:
+### If you have a cuff — the highest-value thing you can do
 
-1. **We cannot make OpenCircuit reproduce RingConn's BP number.** Not "not yet" — there's
-   nothing on the wire to read. Anyone claiming otherwise hasn't checked.
-2. **We wouldn't want to route your data through their cloud anyway.** OpenCircuit's whole
-   promise is that your health data stays on your device. Uploading it to get a number back
-   would break the one thing that makes this project worth building.
-3. **What *is* achievable:** the ring hands the app raw pulse-sensor data during an
-   assessment, and *that* is on the wire. With enough of it, paired with real cuff readings,
-   an estimate could be built locally. That's a genuine research project, not a decode — and
-   it needs a cuff, repeated calibration, and honesty about accuracy. We have an experimental
-   version already, deliberately switched off in shipping builds.
+Around step 10 in §4.2, take a cuff reading **immediately before or after** the ring's
+assessment, and write both down:
 
-**So:** do step 10 in §4.2 for the buzz and the raw data. Please don't expect a working BP
-readout in the app as a result, and if anyone tells you Gen 3 BP has been "decoded", it hasn't.
+| | What to record |
+|---|---|
+| Time | to the minute |
+| Cuff | systolic / diastolic, e.g. `128/82` |
+| Ring | what the app showed, e.g. `122/83` |
+
+A few things make these far more useful:
+
+- **Sit still and quiet for ~5 minutes first**, feet flat, arm supported at heart height.
+  Same posture every time — posture alone moves the number more than most people expect.
+- **Cuff on one arm, ring on the other hand.** A cuff inflating on the same arm squeezes the
+  ring's blood flow and corrupts exactly the signal we're measuring.
+- **Spread readings out.** Three pairs at rest all day is worth less than pairs taken across
+  a range — after coffee, after a walk, morning vs evening. Variation is the whole point;
+  a model fitted to one blood pressure predicts one blood pressure.
+
+Even three or four good pairs are genuinely useful. If you're willing to keep logging them
+over following days, that's better still — but the capture session alone is a fine start.
+
+### If you don't have a cuff
+
+Do step 10 anyway. The assessment still triggers the buzz and still puts the raw pulse data
+on the wire; we just can't calibrate against it. Don't buy a cuff on our account unless you
+want one.
+
+**One expectation to set:** this is research, not a feature waiting to be switched on. Any
+estimate built this way needs validating before it's worth showing anyone a number.
 
 ---
 
@@ -411,6 +427,8 @@ This session succeeded if we have **all three**:
 2. Your **list of times**, with at least one confirmed buzz 🟢
 3. Ring firmware + app version recorded 🟢
 
+Bonus, and the thing that unlocks the BP research: **cuff / ring reading pairs** (§7).
+
 **Two and a half out of three is still worth sending.** A capture where nothing buzzed, with
 honest times and a note saying so, genuinely narrows the search — it tells us the trigger
 isn't where we thought. Send it either way.
@@ -432,6 +450,13 @@ isn't where we thought. Send it either way.
   `BleAutoOfflineBpMixin` — "auto offline BP", i.e. store-and-forward, the same shape as the
   OSA family. That makes `0x1f`/`0x9f` (from `desktop/probe_ppg_raw.py:52`, still 🔴) worth
   *watching for* in the capture, and still not worth blind-probing.
+- **BP direction of travel:** we are not chasing RingConn's number — it is cloud-side and
+  copying it would need their servers, which `docs/PRIVACY.md` rules out. The target is our
+  own estimate from the on-wire PPG, which is why §7 asks the helper for *(cuff, ring)*
+  pairs rather than just a capture. That feeds the existing PR #121 estimator
+  (`desktop/bp_estimator.py`, `bp_calibration.py`, currently `#if DEBUG`-fenced). ⚠️ The
+  calibration artefacts that pipeline references never existed in this repo — they lived on
+  the contributor's Mac — so a fresh calibration set is the gating input, not a nice-to-have.
 - The 2026-06-26 opcode sweep sent every candidate as `XX 00 00` — **param byte zero**
   (`sweep_opcodes.py:189`). For the LED that is literally the OFF command, which is why 0x24
   read as a bland ack and the LED was found a month later by other means. **"The sweep already
