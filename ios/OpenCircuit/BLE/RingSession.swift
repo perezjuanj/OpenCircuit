@@ -1852,8 +1852,13 @@ final class RingSession: NSObject {
         // 🟢 What it buys, measured on the tester night this exists for (R2_2026-08-18): the same
         // 403-minute headline is still displayed — the user asserted it and an assertion wins for
         // display — but 241.4 of those minutes are now tagged `.asserted` over a 4 h hole holding
-        // 2 of ~98 expected epochs, so they stay out of the stage minutes, out of efficiency, out
-        // of the score, and out of Apple Health.
+        // 2 of ~98 expected epochs, so they stay out of the stage minutes, out of efficiency and
+        // out of the score.
+        // ⚠️ NOT out of Apple Health — that clause was true until the 2026-08-24 reversal and is
+        // the one place a reader is most likely to look. Those 241.4 minutes now DO reach Health,
+        // written as sleep and tagged `HKMetadataKeyWasUserEntered` so the sample carries its own
+        // provenance rather than being silently dropped (see `SleepHealthPublication`). The label
+        // is what keeps the claim honest now; the withholding no longer is.
         let coverageOfRecord = MeasuredCoverage(records: epochArchiveStore.load())
         let segments = SleepEdit.recompute(baseSegments: base, times: times,
                                            coverage: coverageOfRecord)
