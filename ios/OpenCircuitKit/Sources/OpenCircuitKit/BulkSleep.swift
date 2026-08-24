@@ -960,7 +960,8 @@ public enum BulkSleep {
                                           temperatures: [TemperatureSample] = [],
                                           epoch: Int = Command.syncEpoch,
                                           morningContinuationGap: TimeInterval = morningContinuationMaxGap,
-                                          observedGapCoverageCut: Double = observedGapAbsorbCoverageCut) -> [BulkRecord] {
+                                          observedGapCoverageCut: Double = observedGapAbsorbCoverageCut,
+                                          declinedBridgeMayReanchor: Bool = declinedBridgeMayReanchor) -> [BulkRecord] {
         // Motion detection needs a time-ordered timeline; sort defensively so the helper is correct
         // for any caller, not only the pre-sorted EpochArchive union.
         let records = records.sorted { $0.counter < $1.counter }
@@ -1001,7 +1002,67 @@ public enum BulkSleep {
                                                          in: records, epoch: epoch))
             }
         }
-        guard let anchor = nights.max(by: { $0.end < $1.end }) else { return records }
+        guard var anchor = nights.max(by: { $0.end < $1.end }) else { return records }
+        let times = observedGapCoverageCut > 0 ? records.map { $0.date(epoch: epoch) } : []
+        // ── THE DECLINED-BRIDGE RE-ANCHOR ────────────────────────────────────────────────────────
+        //
+        // `anchor` is the latest-ENDING overnight block, and the backward chain below reaches back
+        // from it. That is right whenever the chain can actually reach — but the observed-gap guard
+        // can REFUSE to bridge, and a refusal does not undo the anchor choice. The result is that
+        // the guard silently promotes a short trailing bout to BE the night and drops the long one.
+        //
+        // 🟢 MEASURED on a real tester night (Gen 2, FR02.018, `America/New_York`, 707-record
+        // archive, 2026-08-24). Three overnight blocks: `00:14:14→02:35:44` (141 min),
+        // `20:31:42→02:45:02` (373 min) and `03:46:08→06:13:08` (147 min). The 147-min tail ends
+        // latest, so it anchors; the bridge back to the 373-min night spans 3666 s holding 24
+        // records against 24.44 expected = 0.982 ≥ 0.95, so it is DECLINED. The returned slice is
+        // then 71 records, on which the SAME detector re-labels the very block that justified the
+        // scope as `.active` — `mainSleepBlock` is nil and the night stages as ZERO segments.
+        // Every subsequent drain repeated it (`nightRowOutcome: noStagedSegments` at 09:48:57,
+        // 09:57:09 and 10:17:01 in her own export), so the stored row froze and ~1 h 32 m of
+        // measured sleep never landed. This is the false positive `testEnabledCutAlsoDropsARealMid`
+        // `NightBout` already asserts as the guard's "standing cost" — but that test only checks the
+        // TRIM, never that a night still stages, which is why the total loss went unseen.
+        //
+        // THE RULE, and it needs no new threshold: **the guard may separate two bouts, but it may
+        // never make the SMALLER bout the night.** So when the bridge back to the nearest earlier
+        // overnight block is DECLINED and that block is LONGER than the candidate anchor, the anchor
+        // was the wrong choice — re-anchor onto the block it just orphaned and repeat. A strict
+        // `>` comparison is deliberate: any margin here would be a fabricated constant, and the
+        // ordering it decides is exactly the one that matters.
+        //
+        // Note this does NOT bridge — the two bouts stay separate, which is the guard's whole point.
+        // The orphaned tail simply becomes a nap unless the morning-continuation absorb below can
+        // legitimately reach it under its own much stricter 30-min rule.
+        //
+        // ⚠️ This is the "leapfrog" hazard the note below has flagged as UNTESTED since the guard
+        // shipped; it is now measured, and it is worse than leapfrogging — the night vanishes.
+        // `declinedBridgeMayReanchor == false` is byte-identical to master (kill switch, pinned by
+        // test). The re-anchor can only ever move the anchor EARLIER, and only onto a block that is
+        // already a qualified overnight night, so it cannot invent a night that pass 1/2 rejected.
+        if declinedBridgeMayReanchor, observedGapCoverageCut > 0 {
+            // ⚠️ `maxIntraNightGap` IS LOAD-BEARING HERE, NOT COPIED FOR SYMMETRY. The re-anchor may
+            // only rescue a block the GUARD orphaned — never one the DISTANCE rule already, and
+            // correctly, rejected. Without this bound the walk reaches the PREVIOUS night: measured
+            // on the Gen 2 Air tester archive (FR04.009, `Europe/Paris`), whose 08-23 22:45→02:41
+            // night sits 13 h 50 m after a 473-min 08-23 01:01→08:54 night. Daytime records cover
+            // that whole span, so the coverage test alone reads ≥ 0.95 and "declines" it — and the
+            // walk re-anchored a night onto the one before it, staging 08-23 01:01→09:06 in place
+            // of the real night (dStart −1304 min). That is precisely the ANCHOR EVICTION failure
+            // the pass-1/pass-2 note above exists to make impossible; the bound restores it.
+            //
+            // Blocks are disjoint (detector output) and finite, and each step moves the anchor
+            // strictly earlier, so this terminates.
+            while let orphaned = nights
+                .filter({ $0.end <= anchor.start
+                          && $0.duration > anchor.duration
+                          && anchor.start.timeIntervalSince($0.end) <= maxIntraNightGap })
+                .max(by: { $0.end < $1.end }),
+                bridgeIsDeclined(from: anchor.start, backTo: orphaned.end,
+                                 recordTimes: times, cut: observedGapCoverageCut) {
+                anchor = orphaned
+            }
+        }
         // Cluster the night: starting from the latest-ending overnight block, absorb EARLIER overnight
         // blocks that sit within `maxIntraNightGap` of the running cluster start, chaining backward.
         // This is what lets a night fragmented across several drains be staged as ONE night — the old
@@ -1022,15 +1083,12 @@ public enum BulkSleep {
         // the case is unrepresented. `break` is the arguably cleaner semantics; it is not adopted
         // here because nothing available can measure the difference.
         var clusterStart = anchor.start
-        let times = observedGapCoverageCut > 0 ? records.map { $0.date(epoch: epoch) } : []
         for p in nights.sorted(by: { $0.start > $1.start }) where p.end <= anchor.end {
             let gap = clusterStart.timeIntervalSince(p.end)
             if gap <= maxIntraNightGap {
-                if observedGapCoverageCut > 0, gap > onsetContiguityGap {
-                    let observed = times.filter { $0 > p.end && $0 < clusterStart }.count
-                    let expected = gap / Double(BulkRecord.epochSeconds)
-                    if expected > 0, Double(observed) / expected >= observedGapCoverageCut { continue }
-                }
+                if observedGapCoverageCut > 0,
+                   bridgeIsDeclined(from: clusterStart, backTo: p.end,
+                                    recordTimes: times, cut: observedGapCoverageCut) { continue }
                 clusterStart = min(clusterStart, p.start)
             }
         }
@@ -1082,6 +1140,42 @@ public enum BulkSleep {
         let hi = clusterEnd.addingTimeInterval(margin)
         return records.filter { let t = $0.date(epoch: epoch); return t >= lo && t <= hi }
     }
+
+    /// The OBSERVED-GAP GUARD's one decision, factored out so the backward cluster chain and the
+    /// declined-bridge re-anchor in `latestNightRecords` can never drift apart — the re-anchor is
+    /// only correct if it asks the guard EXACTLY the question the chain would have asked.
+    ///
+    /// A bridge from `clusterStart` back to `blockEnd` is DECLINED when the gap it spans is
+    /// essentially completely covered by real records: the stitch exists for a night torn apart by a
+    /// MISSING drain, and a gap full of observed epochs is not that. Gaps at or below
+    /// `onsetContiguityGap` are never judged (detector granularity, not a hole), and a non-positive
+    /// `cut` disables the guard entirely.
+    ///
+    /// Returns `false` for a non-positive gap, so a candidate that does not actually sit earlier can
+    /// never be "declined" into a re-anchor.
+    static func bridgeIsDeclined(from clusterStart: Date, backTo blockEnd: Date,
+                                 recordTimes: [Date], cut: Double) -> Bool {
+        guard cut > 0 else { return false }
+        let gap = clusterStart.timeIntervalSince(blockEnd)
+        guard gap > onsetContiguityGap else { return false }
+        let observed = recordTimes.filter { $0 > blockEnd && $0 < clusterStart }.count
+        let expected = gap / Double(BulkRecord.epochSeconds)
+        guard expected > 0 else { return false }
+        return Double(observed) / expected >= cut
+    }
+
+    /// Whether a bridge the observed-gap guard DECLINES may RE-ANCHOR the night onto the (longer)
+    /// block it just orphaned, instead of leaving a short trailing bout standing as "the night".
+    ///
+    /// `false` is byte-identical to master (kill switch, pinned by test). See the measured Gen 2
+    /// tester night in `latestNightRecords` for why the default is `true`: with it `false`, one
+    /// ordinary 150 s epoch arriving at 04:47:41 takes that night from 463 staged asleep minutes to
+    /// ZERO, permanently, because the guard promotes a 147-minute tail over a 373-minute night.
+    ///
+    /// ⚠️ This only ever moves the anchor EARLIER, and only onto a block that already qualified as
+    /// an overnight night in pass 1/2 — it cannot invent a night, and it cannot bridge one. The two
+    /// bouts stay separate, which is the guard's actual purpose.
+    public static let declinedBridgeMayReanchor = true
 
     /// Longest arousal the morning-continuation absorb in `latestNightRecords` bridges between the
     /// anchor night's end and a later same-morning sleep block. Small ON PURPOSE — the backward

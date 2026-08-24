@@ -181,6 +181,98 @@ final class ObservedGapAbsorbTests: XCTestCase {
                              "the guard drops it — documented cost, not a surprise")
     }
 
+    // MARK: - The declined-bridge re-anchor (`BulkSleep.declinedBridgeMayReanchor`)
+
+    /// 🟢 THE REAL TESTER SHAPE THE RE-ANCHOR EXISTS FOR (Gen 2, FR02.018, 2026-08-24).
+    ///
+    /// A LONG first bout, a completely-observed hour awake, then a SHORTER trailing bout. The tail
+    /// ends latest so it anchors; the guard then declines the bridge back (the gap is real, observed
+    /// awake time — the guard is right about that), and master is left with the SHORT bout standing
+    /// alone as "the night". On her real archive that slice re-detected as `.active` and the night
+    /// staged as ZERO segments — every drain from 04:47 onward reported `noStagedSegments`, so the
+    /// stored row froze and ~1 h 32 m of measured sleep never landed.
+    ///
+    /// The rule asserted here needs no threshold: **the guard may separate two bouts, but it may
+    /// never make the SMALLER bout the night.** The two bouts still are NOT bridged — that is the
+    /// guard's actual purpose and it is preserved (asserted below).
+    func testDeclinedBridgeReanchorsOntoTheLongerOrphanedBout() {
+        let union = still(at(20, 30), at(2, 45, dayOffset: 1))            // 6 h 15 m — the real night
+            + moving(at(2, 45, dayOffset: 1), at(3, 45, dayOffset: 1))    // 60 min, fully observed
+            + still(at(3, 45, dayOffset: 1), at(6, 0, dayOffset: 1))      // 2 h 15 m — the short tail
+
+        let master = BulkSleep.latestNightRecords(from: union, declinedBridgeMayReanchor: false)
+        XCTAssertNotNil(firstKept(master))
+        XCTAssertGreaterThan(firstKept(master)!, at(2, 45, dayOffset: 1),
+                             "the fixture must reproduce the defect under master, or this test is "
+                             + "vacuous: the short tail should be all that survives")
+
+        let fixed = BulkSleep.latestNightRecords(from: union)
+        XCTAssertNotNil(firstKept(fixed))
+        XCTAssertLessThanOrEqual(firstKept(fixed)!, at(20, 30).addingTimeInterval(150),
+                                 "the re-anchor must return the LONGER first bout")
+        // …and it must still NOT bridge: the observed awake hour stays outside the night, so the
+        // slice must end before the tail. (The +30 min `margin` in `latestNightRecords` is why this
+        // compares against 03:15 rather than 02:45.)
+        XCTAssertLessThan(fixed.map { $0.date() }.max()!, at(3, 45, dayOffset: 1),
+                          "the re-anchor must not become a back-door bridge across measured awake time")
+    }
+
+    /// ⚠️ THE BOUND THAT KEEPS THE RE-ANCHOR FROM EATING THE PREVIOUS NIGHT — and it is not
+    /// hypothetical. Written after the first draft of the re-anchor, which omitted
+    /// `maxIntraNightGap`, was MEASURED re-anchoring the Gen 2 Air tester's 08-23 22:45 → 02:41
+    /// night onto her PREVIOUS night (08-23 01:01 → 08:54, 473 min, 13 h 50 m earlier): the ring
+    /// records all day, so the daytime span between them is ≥ 0.95 covered and the coverage test
+    /// alone "declines" it. Staged 08-23 01:01 → 09:06 in place of the real night, `dStart` −1304 min.
+    ///
+    /// The re-anchor may only rescue a block the GUARD orphaned — never one the DISTANCE rule
+    /// already, and correctly, rejected.
+    func testReanchorNeverReachesBackPastMaxIntraNightGap() {
+        // A long previous night, a full day of worn records, then a shorter real night.
+        let union = still(at(1, 0), at(8, 54))                             // 7 h 54 m, previous night
+            + moving(at(8, 54), at(22, 45))                                // all-day worn coverage
+            + still(at(22, 45), at(2, 41, dayOffset: 1))                   // 3 h 56 m, the real night
+
+        let scoped = BulkSleep.latestNightRecords(from: union)
+        XCTAssertNotNil(firstKept(scoped))
+        XCTAssertGreaterThan(firstKept(scoped)!, at(20, 0),
+                             "the real night must survive — a re-anchor onto the previous night is "
+                             + "the ANCHOR EVICTION failure `latestNightRecords` is built to prevent")
+        XCTAssertEqual(BulkSleep.latestNightRecords(from: union, declinedBridgeMayReanchor: false)
+                        .map { $0.date() },
+                       scoped.map { $0.date() },
+                       "with the distance bound respected, this shape must be identical either way")
+    }
+
+    /// `declinedBridgeMayReanchor == false` is the kill switch and must be byte-identical to the
+    /// pre-re-anchor code. Asserted on the fixture the default DOES change, so it cannot go vacuous.
+    func testReanchorKillSwitchIsByteIdentical() {
+        let union = still(at(20, 30), at(2, 45, dayOffset: 1))
+            + moving(at(2, 45, dayOffset: 1), at(3, 45, dayOffset: 1))
+            + still(at(3, 45, dayOffset: 1), at(6, 0, dayOffset: 1))
+
+        let off = BulkSleep.latestNightRecords(from: union, declinedBridgeMayReanchor: false)
+        let on = BulkSleep.latestNightRecords(from: union)
+        XCTAssertNotEqual(off.map { $0.date() }, on.map { $0.date() },
+                          "if these ever match, this kill-switch test has gone vacuous")
+        XCTAssertTrue(BulkSleep.declinedBridgeMayReanchor,
+                      "the shipped default is expected to be ON; if it is reverted, flip this test")
+    }
+
+    /// The re-anchor is strictly NARROWER than reverting the guard, and this pins the difference.
+    /// When the LATER bout is the longer one — the shape `testEnabledCutAlsoDropsARealMidNightBout`
+    /// asserts — nothing changes, because no smaller bout is being promoted over a larger one.
+    /// ⚠️ That remains a real, known, UNFIXED cost of the guard (a genuine first bout is still
+    /// dropped when the second is longer); the re-anchor does not claim to address it.
+    func testReanchorDoesNotFireWhenTheLaterBoutIsLonger() {
+        let union = still(at(22, 0), at(1, 0, dayOffset: 1))
+            + moving(at(1, 0, dayOffset: 1), at(1, 45, dayOffset: 1))
+            + still(at(1, 45, dayOffset: 1), at(7, 0, dayOffset: 1))
+        XCTAssertEqual(BulkSleep.latestNightRecords(from: union).map { $0.date() },
+                       BulkSleep.latestNightRecords(from: union, declinedBridgeMayReanchor: false)
+                        .map { $0.date() },
+                       "a longer later bout is not a smaller-bout promotion — leave it alone")
+    }
+
     /// A gap at or below `onsetContiguityGap` (450 s) is detector granularity, never judged. Both
     /// real corpus cases of this shape (R1 2026-08-16, R3 2026-07-04) are ~30 s splits.
     func testShortDetectorSplitIsNeverJudged() {
