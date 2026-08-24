@@ -139,9 +139,14 @@ struct EpochArchiveStore {
     // stored pair standing. The write used to be unconditional, and that was live collateral of the
     // #204 `noStagedSegments` defect: on the 2026-08-24 tester export the three consecutive drains at
     // 09:48:57 / 09:57:09 / 10:17:01 local all reported `nightRowOutcome: noStagedSegments` with
-    // `stagedSleepSegments: 0`, and each one re-ran this function — overwriting the relaunch fallback
-    // that `ContentView.flushHealth()` reads with `[]`. The night was stranded in
-    // `StoredSleepSummary` with nothing left to mirror to HealthKit.
+    // `stagedSleepSegments: 0`, so each was a pass that staged nothing while the relaunch fallback
+    // `ContentView.flushHealth()` reads was the only surviving copy.
+    // ⚠️ Stated precisely, because review pushed on it: the export proves the three EMPTY STAGINGS,
+    // not that this function ran on each of them — `savePendingSleepSegments` is reached only via
+    // `commitDecision == .stage`, and the export carries no field that witnesses that branch. The
+    // defect class is what is established; the per-row causal step is not. The new
+    // "STAGED NOTHING — kept previously persisted" log line makes it directly observable on the next
+    // tester night instead of inferred.
     // The explicit clear is `clearPendingSleepSegments()`, called from
     // `RingScanner.clearLastCommittedSleepSegments()` after a CONFIRMED HealthKit write. That is the
     // only path that may zero the slot, and it stays unconditional.

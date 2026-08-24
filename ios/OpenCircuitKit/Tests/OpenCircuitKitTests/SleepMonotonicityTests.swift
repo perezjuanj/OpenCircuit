@@ -25,6 +25,10 @@
 //      different sample. docs/SLEEP_REPLAY_HARNESS.md §7a measured REM RISING inside a strictly
 //      SMALLER window for the same reason, in the other direction. Measured here: `tester1` and
 //      `tester2` each take several −3 to −28 min steps mid-night and recover them a record later.
+//      ⚠️ Not all honest decreases are small: `tester2` also takes a −35 at cutoff 81 and a −122 at
+//      cutoff 498. The −122 is NOT attributed here — the printed table shows `inBedStart` moving to
+//      the next night at that same step, so a re-scope (mechanism 3) is at least as likely as a
+//      re-fit. Read the table rather than assuming a large drop is one or the other.
 //   2. `EpochArchive.merge` prunes to the 30 h retention window relative to the NEWEST record, so a
 //      growing prefix can drop records off the FRONT. That is production behaviour, not an artifact
 //      of this sweep — the device archive does the same thing — but it means a prefix's union is not
@@ -38,8 +42,13 @@
 //
 // What is NOT explainable by any of those is a COLLAPSE: a staged night going to exactly ZERO with
 // the SAME night still being the one in scope. Zero is not a re-fit and not a rollover — it is the
-// overnight-envelope gate (`RingSession :1613`) returning `[]` for a night it accepted one record
-// earlier, i.e. the whole night ceasing to exist. That is the property asserted here.
+// whole night ceasing to exist one record after it was accepted. ⚠️ This sweep CANNOT say which
+// stage produced the empty array: `SleepStaging.classify` emitting no in-bed segments and the
+// overnight-envelope gate (`RingSession :1613`) rejecting the envelope both return `[]` and are
+// indistinguishable from here. On the 2026-08-24 tester night it was measured to be neither —
+// `BulkSleep.latestNightRecords` returned a 37-record slice on which the detector re-labelled the
+// block that justified the scope as `.active`. Use the replay diagnostics, not this test, to
+// attribute a collapse. That is the property asserted here.
 //
 // Neither of the two numbers the collapse rule uses is a tolerance invented for this file; both are
 // production constants, so "make the test pass by nudging the threshold" is not available:
@@ -61,8 +70,12 @@
 // a collapse into a large-but-nonzero drop is visible in the table rather than hidden by the
 // assertion. Read `worst drop` in the per-night summary before quoting this test as green.
 //
-// ⚠️ This test is EXPECTED TO FAIL on master as of 2026-08-24 — that is the point of it. Do not
-// weaken the assertion to make it pass; the lane that fixes the collapse turns it green.
+// ⚠️ This test was written to FAIL, and it did: on master `9ca7521` it reports
+// `tester2-gen2-2026-08-24: 463 staged asleep minutes → 0 when the archive grew from 672 to 673
+// records`. It is GREEN as shipped because `BulkSleep.declinedBridgeMayReanchor` (the
+// declined-bridge re-anchor) fixes that collapse — the same sweep then grows 463 → 466 → … → 500
+// straight through the offending record. Green here is therefore a PROOF, not a missing failure.
+// Do not weaken the assertion; if it ever fails again, a night is being deleted.
 
 import XCTest
 @testable import OpenCircuitKit
@@ -124,9 +137,19 @@ final class SleepStagingMonotonicityTests: XCTestCase {
             let steps = try SleepReplay.withTimeZone(night.timeZone, at: anchor) {
                 Swift.stride(from: Self.stride, through: records.count, by: Self.stride).map { n -> Step in
                     let prefix = Array(records.prefix(n))
+                    // Truncate the temperature log to the prefix too. `wearTemperatureSamples()` is
+                    // stamped with frame ARRIVAL time, so an archive holding records only up to time
+                    // T cannot also hold a temperature from after T — handing the FULL list to every
+                    // cutoff would stage each prefix with information from its own future, and a
+                    // decrease caused by that is an artifact of the sweep, not of the pipeline.
+                    // (Both nights in the 2026-08-24 corpus declare `temperatures: []`, so this is
+                    // inert there; it matters the first time a corpus row carries a real log.)
+                    let horizon = prefix.last?.date() ?? .distantPast
                     let staged = SleepReplay.stage(
                         records: prefix,
-                        temperatures: night.temperatures.map { TemperatureSample(time: $0.t, celsius: $0.c) },
+                        temperatures: night.temperatures
+                            .filter { $0.t <= horizon }
+                            .map { TemperatureSample(time: $0.t, celsius: $0.c) },
                         deepHRBaseline: night.deepHRBaselineBPM)
                     let segs = staged.segments
                     return Step(cutoff: n,
