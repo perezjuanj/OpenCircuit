@@ -63,6 +63,44 @@ final class HealthKitShareTypesTests: XCTestCase {
         )
     }
 
+    /// The auto-extension cap has to actually reach the SAMPLE BUILDER, not just exist in
+    /// `CyclePredictor`. The Kit suite pins the date math; this pins the wiring, which is the part
+    /// that decides what really lands in the user's Health store.
+    ///
+    /// Reported 2026-08-24: an unended period kept mirroring "the following days as period days
+    /// even after it has ended", one new sample per elapsed day, without bound.
+    func testOpenPeriodStopsAddingDaysAtTheAutoExtendCap() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let start = Date(timeIntervalSince1970: 1_752_192_000) // 2025-07-11 00:00:00 UTC
+        let fortyDaysLater = calendar.date(byAdding: .day, value: 40, to: start)!
+
+        let open = HealthKitWriter.menstrualFlowSamples(
+            start: start, end: nil, flowLevelRaw: 2, today: fortyDaysLater, calendar: calendar)
+        XCTAssertEqual(open.count, CyclePredictor.maxAutoExtendPeriodDays,
+                       "an open period 40 days in must stop at the cap, not write 41 days")
+
+        // Every sample still carries the cycle-start key — the cap must not disturb the metadata
+        // contract that caused the build 17–22 crash loop.
+        XCTAssertEqual(open.compactMap { $0.metadata?[HKMetadataKeyMenstrualCycleStart] as? Bool },
+                       [true] + Array(repeating: false, count: open.count - 1))
+    }
+
+    /// The cap bounds AUTO-extension only. A period the user explicitly ended is their own
+    /// statement and must be mirrored at whatever length they logged.
+    func testExplicitlyEndedPeriodIsNotTruncatedByTheAutoExtendCap() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let start = Date(timeIntervalSince1970: 1_752_192_000) // 2025-07-11 00:00:00 UTC
+        let end = calendar.date(byAdding: .day, value: 13, to: start)!   // 14 days, logged
+        let later = calendar.date(byAdding: .day, value: 40, to: start)!
+
+        let samples = HealthKitWriter.menstrualFlowSamples(
+            start: start, end: end, flowLevelRaw: 2, today: later, calendar: calendar)
+        XCTAssertEqual(samples.count, 14,
+                       "a logged 14-day period must survive the cap intact")
+    }
+
     // MARK: Headache log (headache-signals Phase 1)
 
     /// The user-logged headache mirrors to Apple Health as `HKCategoryTypeIdentifierHeadache`, so
