@@ -547,4 +547,89 @@ final class ExportBuilderTests: XCTestCase {
                                        generation: "Gen 2", identifier: "id"))
         XCTAssertTrue(ExportEngine.metadataCSV(unstripped).contains("03AD"))
     }
+
+    // MARK: - 7. THE `sleep` SECTION MUST NOT PUBLISH AN IMPOSSIBLE NIGHT
+    //
+    // `applySleepEdit` rewrites the row's MINUTES to the post-edit staging and deliberately leaves
+    // `inBedStart`/`inBedEnd` frozen — those two columns ARE the recorded window
+    // (`sleepEditRecordedInBed*` is defined as them). `summaryRow` used to emit that pair, so the
+    // published row asserted more asleep minutes than its own window has minutes in it. 🟢 On the
+    // tester export of 2026-08-24: `asleepMin: 434` + `awakeMin: 45` inside a 239.5-minute in-bed
+    // window. This is what "my edit never stuck" looked like in the file.
+    //
+    // These tests are here rather than in the Kit because the defect is entirely about WHICH
+    // `StoredSleepSummary` accessor is read — there is no pure function to move.
+
+    /// Parse the JSON export; the sleep sections are what these assertions are about.
+    private func exportedJSON(_ store: LocalStore, mode: ExportBuilder.Mode,
+                              now: Date) throws -> [String: Any] {
+        guard case .file(let payload) = try ExportBuilder.build(store: store, mode: mode,
+                                                                format: .json, now: now)
+        else { throw XCTSkip("expected a file") }
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: payload.data) as? [String: Any])
+    }
+
+    private func isoDate(_ any: Any?) throws -> Date {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return try XCTUnwrap(formatter.date(from: try XCTUnwrap(any as? String)))
+    }
+
+    func testAnEditedNightsSleepRowCannotClaimMoreSleepThanItsWindowHolds() throws {
+        let store = try makeStore()
+        // Recorded: 8 h, 02:00 → 10:00. Edited: the wearer says she was in bed until 12:00 — two
+        // hours past the detector, comfortably inside the editor's ±3 h clamp, so this test is
+        // about the exported ROW and not about the clamp.
+        try save(night(from: 2, to: 10), to: store)
+        let edited = SleepEdit.Times(inBedStart: at(2), sleepOnset: at(2), sleepWake: at(12))
+        let editedSegments = [SleepSegment(start: at(2), end: at(12), stage: .asleepCore)]
+        XCTAssertTrue(try store.applySleepEdit(night: at(2), times: edited,
+                                               summary: SleepStaging.summary(editedSegments),
+                                               hypnogram: editedSegments))
+
+        let json = try exportedJSON(store, mode: .dateRange(start: at(-24), end: at(24)),
+                                    now: at(20))
+        let sleep = try XCTUnwrap((json["sleep"] as? [[String: Any]])?.first)
+
+        let windowStart = try isoDate(sleep["inBedStart"])
+        let windowEnd = try isoDate(sleep["inBedEnd"])
+        XCTAssertEqual(windowStart, at(2))
+        XCTAssertEqual(windowEnd, at(12), "the row's window must be the one its minutes describe")
+
+        // The arithmetic the tester ran by eye, as an assertion.
+        let windowMinutes = windowEnd.timeIntervalSince(windowStart) / 60
+        let claimed = Double(try XCTUnwrap(sleep["asleepMin"] as? Int))
+            + Double(try XCTUnwrap(sleep["awakeMin"] as? Int))
+        XCTAssertLessThanOrEqual(claimed, windowMinutes + 1,
+                                 """
+                                 \(claimed) minutes accounted for inside a \(windowMinutes)-minute \
+                                 in-bed window is not a rounding disagreement, it is impossible.
+                                 """)
+
+        // The two sleep sections of one file must agree about the same night…
+        let session = try XCTUnwrap((json["sleepSessions"] as? [[String: Any]])?.first)
+        let summary = try XCTUnwrap(session["summary"] as? [String: Any])
+        XCTAssertEqual(try isoDate(summary["inBedEnd"]), try isoDate(session["inBedEnd"]))
+        XCTAssertEqual(try isoDate(summary["inBedStart"]), try isoDate(session["inBedStart"]))
+
+        // …and NOTHING is lost: the untouched recorded window is still exported next to it.
+        let recorded = try XCTUnwrap(session["recorded"] as? [String: Any])
+        XCTAssertEqual(try isoDate(recorded["inBedEnd"]), at(10),
+                       "the detector's own wake must survive the edit, in the file")
+    }
+
+    /// The control. An UNEDITED night's effective window IS its recorded window, so every one of
+    /// those rows must be byte-identical to what this section emitted before the fix — the change
+    /// may not move a single unedited night.
+    func testAnUneditedNightsSleepRowStillCarriesTheRecordedWindow() throws {
+        let store = try makeStore()
+        let row = try save(night(from: 2, to: 10), to: store)
+        XCTAssertFalse(row.isManuallyEdited)
+
+        let json = try exportedJSON(store, mode: .dateRange(start: at(-24), end: at(24)),
+                                    now: at(20))
+        let sleep = try XCTUnwrap((json["sleep"] as? [[String: Any]])?.first)
+        XCTAssertEqual(try isoDate(sleep["inBedStart"]), row.inBedStart)
+        XCTAssertEqual(try isoDate(sleep["inBedEnd"]), row.inBedEnd)
+    }
 }
