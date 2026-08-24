@@ -229,10 +229,12 @@ final class SleepProvenanceCorpusTests: XCTestCase {
         Each behaves exactly as master (asserted 0.0, nothing withheld, nothing deleted). No list of
         night ids is involved — `MeasuredCoverage.trusted(for:)` refuses a window holding no record.
 
-        --- Apple Health
-        every asserted-asleep minute above is on the write path today (HealthKitWriter :1585/:1598
-        map EVERY segment 1:1 with no coverage filter). `[SleepSegment].healthPublishable` removes
-        exactly \(String(format: "%.1f", totalAssertedAsleepMin)) asleep-minutes from it and keeps the .inBed claim.
+        --- Apple Health (as of 2026-08-24)
+        every asserted-asleep minute above REACHES Apple Health, tagged `HKMetadataKeyWasUserEntered`
+        — \(String(format: "%.1f", totalAssertedAsleepMin)) asleep-minutes across this corpus written as the wearer's own
+        account rather than as a measurement. Build 47 withheld exactly these minutes; the maintainer
+        reversed that after a tester's correction failed to reach Health while the official app's did.
+        Nothing is withheld now, so `withheldSpans` is empty and the delete-exclusion it feeds is inert.
         """)
 
         XCTAssertGreaterThan(withBytes, 0, "nothing was replayed at all")

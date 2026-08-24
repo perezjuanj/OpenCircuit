@@ -108,10 +108,18 @@ public enum SleepEdit {
     ///
     /// What stops that from inventing a night from nothing is no longer the picker — it is
     /// provenance. Time the ring did not record is tagged `.asserted` by `recompute`, kept out of
-    /// the stage minutes, out of efficiency, out of the score and out of Apple Health, and the card
-    /// says so in words. THE TWO CHANGES ARE A PAIR: widening these bounds without the provenance
-    /// quarantine would turn one wrong number into a bigger wrong number. Do not ship a revert of
-    /// the quarantine while leaving this widening in place.
+    /// the stage minutes, out of efficiency and out of the score, written to Apple Health as the
+    /// wearer's own entry rather than as a measurement, and named on the card in words. THE TWO
+    /// CHANGES ARE A PAIR: widening these bounds without the provenance TAGGING would turn one wrong
+    /// number into a bigger wrong number. Do not ship a revert of the tagging while leaving this
+    /// widening in place.
+    ///
+    /// ⚠️ 2026-08-24 — THE PAIRING NOTE USED TO SAY "and out of Apple Health", AND THAT HALF IS
+    /// GONE. The maintainer reversed the Health withholding (a wearer's correction now reaches
+    /// Health tagged `HKMetadataKeyWasUserEntered`) while KEEPING and further widening this margin,
+    /// so the pair is no longer bounds ↔ withholding. It is bounds ↔ the label: what makes a 6 h
+    /// stranded allowance safe is that every minute of it is marked, quarantined from every derived
+    /// number, and visible as an assertion in the app AND in Health.
     ///
     /// The widening is a CONSTANT given the recorded night, so `bounds` stays monotone and
     /// time-invariant — the two properties the 2026-08-04 and 2026-08-16 seesaws were fixed to get.

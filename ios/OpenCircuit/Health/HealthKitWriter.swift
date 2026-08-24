@@ -338,8 +338,14 @@ final class HealthKitWriter {
         // succeeds; no HealthKit object is queried, replaced, or deleted.
         if let edits = try? store.pendingSleepEditHealthWrites() {
             for edit in edits {
-                guard SleepHealthGate.isSettled(
-                    latestSegmentEnd: edit.segments.map(\.end).max(), now: Date()
+                // Same rule as `reconcileEditedNightSleepLocked`: these segments are bounded by a
+                // window the WEARER typed and saved, which cannot grow the way an in-progress
+                // staged night can, so her Save is the finalization signal and the 20-minute quiet
+                // margin does not apply. Leaving it here would strand the leading in-bed slice of
+                // the very edit the reconcile had just written (2026-08-24 tester: saved 06:50
+                // against a 06:44 wake).
+                guard SleepHealthGate.isReadyToWrite(
+                    latestSegmentEnd: edit.segments.map(\.end).max(), now: Date(), finalized: true
                 ) else { continue }
                 do {
                     // Track the backfill sample UUIDs so a later TRIM of the same night can delete
@@ -347,9 +353,11 @@ final class HealthKitWriter {
                     let uuids = try await writeReturningSleepUUIDs(edit.segments)
                     store.appendSleepEditHealthUUIDs(uuids, night: edit.night)
                     // Watermark from what Health actually received, never from what was proposed —
-                    // see the note in `reconcileEditedNightSleepLocked` step 3. This is the path
-                    // where it bites hardest: a leading extension withheld by the coverage filter and
-                    // watermarked anyway is never offered again, so it could never be backfilled.
+                    // see the note in `reconcileEditedNightSleepLocked` step 3. Nothing is withheld
+                    // today (the two sets coincide), and the rule is kept anyway because it is the
+                    // path where a future withholding would bite hardest: a leading extension left
+                    // out of the write but watermarked anyway is never offered again, so the sleep
+                    // could not be backfilled even once records arrived to justify it.
                     let published = edit.segments.healthPublishable
                     try store.markSleepEditHealthWritten(night: edit.night, segments: published)
                     result.sleepSegments += published.count
@@ -506,13 +514,21 @@ final class HealthKitWriter {
                 SleepSegment(start: nap.effectiveStart, end: nap.effectiveEnd, stage: .inBed),
                 SleepSegment(start: nap.effectiveStart, end: nap.effectiveEnd, stage: .asleepCore),
             ]
+            // A MANUALLY ADDED nap is sleep the ring never detected, typed in full by the wearer —
+            // the same epistemic status as an `.asserted` span in an edited night, and until
+            // 2026-08-24 the two paths disagreed about it: the night withheld it while the nap wrote
+            // it as plain `.asleepCore` (`SleepEditedNightNotice` conceded the inconsistency in
+            // writing). Now both publish and both label. An EDITED auto-nap is not tagged: the ring
+            // did record there, and the edit only moved the edges — the nap-scale
+            // `.assertedOverMeasured`.
             do {
                 // WRITE FIRST, THEN CLEAN — the same ordering `reconcileEditedNightSleep` uses, so a
                 // HealthKit failure can never leave Health emptier than before. `editNap` re-arms
                 // `healthWritten` when a shrink or a move leaves a previously-mirrored span
                 // uncovered; without this, that stale sleep stayed in Apple Health permanently
                 // because `pendingNaps()` never offered the row again.
-                let uuids = try await writeReturningSleepUUIDs(segs)
+                let uuids = try await writeReturningSleepUUIDs(segs,
+                                                               userEntered: nap.isManuallyAdded)
                 if let stale = store.staleNapHealthSpan(start: nap.start) {
                     await deleteStaleNapSleep(stale, keeping: uuids,
                                               current: nap.effectiveStart ..< nap.effectiveEnd)
@@ -1640,58 +1656,91 @@ final class HealthKitWriter {
     //
     // Verified by grep 2026-08-20: every other `HKCategoryType(.sleepAnalysis)` in the app is a
     // READ, a DELETE predicate, or the authorization set. Five call sites reach Health with sleep —
-    // `flushToHealth`'s edit backfill (:335), `flushNaps` (:493), `reconcileEditedNightSleepLocked`
-    // (:1674), `mirrorSettledNight` (:1836), and the deferred-reconcile drain (:354) — and every one
-    // of them funnels through one of these two. So the coverage filter belongs HERE and nowhere
-    // else: a filter applied at four of five call sites is a false sense of safety, and the audit
-    // found exactly that shape of bug elsewhere in this feature.
+    // `flushToHealth`'s edit backfill, `flushNaps`, `reconcileEditedNightSleepLocked`,
+    // `mirrorSettledNight`, and the deferred-reconcile drain — and every one of them funnels through
+    // one of these two. So the provenance split belongs HERE and nowhere else: a rule applied at
+    // four of five call sites is a false sense of safety, and the audit found exactly that shape of
+    // bug elsewhere in this feature.
     //
-    // `healthPublishable` keeps the WHOLE `.inBed` layer (a user claim we have no reason to doubt)
-    // and drops any other segment whose ground holds no epoch records. See `SleepProvenance`.
-    // Segments with no provenance information — which is everything the staging path emits — are
-    // `.measured` and pass through untouched, so an unedited night's Health write is unchanged.
+    // `segments.healthPublication` is the single split: the `.inBed` layer and everything the ring
+    // measured go in as ordinary samples, and the wearer's claims over PROVEN-empty ground go in
+    // carrying `HKMetadataKeyWasUserEntered: true`. Segments with no provenance information — which
+    // is everything the staging path emits — are `.measured`, so an unedited night's Health write is
+    // byte-for-byte what it always was, metadata included (there is none).
+    //
+    // ⚠️ 2026-08-24 — THIS PATH USED TO DROP THE WEARER'S ASSERTED SLEEP, AND THE MAINTAINER
+    // REVERSED THAT. The report: "I corrected the night in your app, but the data in Apple Health
+    // wasn't updated… I compared it with the RingConn app, and this time the entire night was
+    // correctly imported into Apple Health." Silently subtracting her own correction from the one
+    // surface she checks it against cost more truth than it bought. The tag is how the sample now
+    // carries its own provenance instead.
 
     /// Write a night as contiguous sleepAnalysis category samples (mapping notes).
     func write(sleep segments: [SleepSegment]) async throws {
-        let type = HKCategoryType(.sleepAnalysis)
-        let publishable = segments.healthPublishable
-        Self.logUnmeasuredRetraction(segments, publishable, site: "write(sleep:)")
-        let samples = publishable.map { seg in
-            HKCategorySample(type: type, value: Self.sleepValue(seg.stage).rawValue,
-                             start: seg.start, end: seg.end)
-        }
+        let samples = Self.sleepSamples(segments, site: "write(sleep:)")
         guard !samples.isEmpty else { return }
         try await store.save(samples)
     }
 
     /// Write a night's sleepAnalysis samples and RETURN their UUID strings, so a later edit can delete
     /// exactly these (menstrual-flow-style tracked delete/replace).
+    ///
+    /// - Parameter userEntered: force the whole block to carry `HKMetadataKeyWasUserEntered`. Used
+    ///   for a MANUALLY ADDED nap, whose segments the wearer typed in full — see `flushNaps`. It is
+    ///   a separate argument rather than an `.asserted` provenance on those segments because
+    ///   `.asserted` means "we PROVED the ring recorded nothing here", and no coverage test was run
+    ///   for a typed nap; `isManuallyAdded` is the fact we actually hold.
     @discardableResult
-    func writeReturningSleepUUIDs(_ segments: [SleepSegment]) async throws -> [String] {
-        let type = HKCategoryType(.sleepAnalysis)
-        let publishable = segments.healthPublishable
-        Self.logUnmeasuredRetraction(segments, publishable, site: "writeReturningSleepUUIDs")
-        let samples = publishable.map { seg in
-            HKCategorySample(type: type, value: Self.sleepValue(seg.stage).rawValue,
-                             start: seg.start, end: seg.end)
-        }
+    func writeReturningSleepUUIDs(_ segments: [SleepSegment],
+                                  userEntered: Bool = false) async throws -> [String] {
+        let samples = Self.sleepSamples(segments, allUserEntered: userEntered,
+                                        site: "writeReturningSleepUUIDs")
         guard !samples.isEmpty else { return [] }
         try await store.save(samples)
         return samples.map { $0.uuid.uuidString }
     }
 
-    /// Breadcrumb what the coverage filter removed, so the effect is auditable on a real phone
-    /// instead of inferred. Silent when nothing was removed — which is every unedited night.
-    private static func logUnmeasuredRetraction(_ all: [SleepSegment],
-                                                _ publishable: [SleepSegment],
-                                                site: String) {
-        let droppedAsleepMin = all.unmeasuredAsleepSeconds / 60
-        guard droppedAsleepMin > 0 else { return }
-        let mins = String(format: "%.1f", droppedAsleepMin)
-        let dropped = all.count - publishable.count
+    /// Build the category samples for one night from the publication split — the ONE place the
+    /// user-entered tag is applied, for the same reason the coverage filter lived in one place: a
+    /// rule applied at some of the write sites is a false sense of safety.
+    private static func sleepSamples(_ segments: [SleepSegment], allUserEntered: Bool = false,
+                                     site: String) -> [HKCategorySample] {
+        let type = HKCategoryType(.sleepAnalysis)
+        let split = segments.healthPublication
+        let publication = allUserEntered
+            ? SleepHealthPublication(measured: [], userEntered: split.published,
+                                     withheld: split.withheld, published: split.published)
+            : split
+        logUserEnteredSleep(segments, publication, site: site)
+        func sample(_ seg: SleepSegment, metadata: [String: Any]?) -> HKCategorySample {
+            HKCategorySample(type: type, value: Self.sleepValue(seg.stage).rawValue,
+                             start: seg.start, end: seg.end, metadata: metadata)
+        }
+        return publication.measured.map { sample($0, metadata: nil) }
+            // `HKMetadataKeyWasUserEntered` is Apple's own flag for "a person typed this", which is
+            // exactly what an asserted span is. It does NOT exclude the sample from any total — see
+            // `SleepHealthPublication` — it only lets a reader (and us, later) tell the two apart.
+            + publication.userEntered.map { sample($0, metadata: [HKMetadataKeyWasUserEntered: true]) }
+    }
+
+    /// Breadcrumb how much of a night reached Health as the wearer's own entry, so the effect is
+    /// auditable on a real phone instead of inferred. Silent when there is none — every unedited
+    /// night. (Until 2026-08-24 this logged the same quantity as a WITHHELD one; the minutes are the
+    /// same, their destination is not.)
+    private static func logUserEnteredSleep(_ all: [SleepSegment],
+                                            _ publication: SleepHealthPublication,
+                                            site: String) {
+        // Measured from what is ACTUALLY being tagged, not from the segments' provenance: the
+        // manual-nap path tags a block whose segments carry no provenance at all, and reading
+        // `unmeasuredAsleepSeconds` there would print a silent 0 for a real user-entered write.
+        let userEnteredAsleepMin = SleepStaging.totalAsleep(publication.userEntered) / 60
+        guard userEnteredAsleepMin > 0 else { return }
+        let mins = String(format: "%.1f", userEnteredAsleepMin)
         ringLog.info("""
-            [OC] sleep-health: withheld \(mins, privacy: .public) asserted asleep-min from \
-            \(site, privacy: .public) (\(dropped, privacy: .public) of \(all.count, privacy: .public) segments)
+            [OC] sleep-health: \(mins, privacy: .public) asserted asleep-min written as USER-ENTERED \
+            from \(site, privacy: .public) \
+            (\(publication.userEntered.count, privacy: .public) of \(all.count, privacy: .public) segments \
+            tagged; \(publication.withheld.count, privacy: .public) withheld)
             """)
     }
 
@@ -1747,10 +1796,23 @@ final class HealthKitWriter {
         // churn). `.notDetermined` falls through and retries — the write throws until Sleep is granted.
         if store.authorizationStatus(for: HKCategoryType(.sleepAnalysis)) == .sharingDenied { return true }
         guard let row = try? local.sleepSummary(night: night) else { return true }  // night gone → clear
-        // Only reconcile a settled (finalized) night — the edit UI is only offered for a past night,
-        // so this is normally always true; it just guards against clobbering an in-progress night.
-        guard SleepHealthGate.isSettled(latestSegmentEnd: editedSegments.map(\.end).max(),
-                                        now: Date()) else { return false }
+        // A USER'S SAVE **IS** THE FINALIZATION SIGNAL, so the 20-minute quiet margin does not apply
+        // here.
+        //
+        // 🟢 THE DEFECT (2026-08-24, Gen 2 Air FR04.009). She woke, saw the app had ended her night
+        // at the bathroom trip, and corrected her wake to 06:44. She saved at 06:50–06:53 — SIX
+        // MINUTES later, inside `SleepHealthGate.settleMargin` (20 min) — so this returned `false`,
+        // wrote nothing, and merely queued the reconcile. Editing your wake time right after waking
+        // is the NORMAL case, not an edge case, and "nothing happened when I saved" is exactly what
+        // she reported.
+        //
+        // The margin exists to stop an IN-PROGRESS night being mirrored while it is still GROWING
+        // (`SleepHealthGate`'s own doc). An edited night cannot grow: every edge here is one the
+        // wearer typed, and the whole point of `isReadyToWrite(finalized:)` is that an authoritative
+        // signal may write immediately. It still requires real segments — the empty guard above and
+        // the `nil` check inside — so nothing is fabricated by writing early.
+        guard SleepHealthGate.isReadyToWrite(latestSegmentEnd: editedSegments.map(\.end).max(),
+                                             now: Date(), finalized: true) else { return false }
 
         let recordedStart = row.sleepEditRecordedInBedStart > .distantPast
             ? row.sleepEditRecordedInBedStart : times.inBedStart
@@ -1768,14 +1830,21 @@ final class HealthKitWriter {
         //    the night later grew over is never deleted). Returns prior UUIDs we could NOT confirm
         //    deleted, so we keep tracking them for a retry instead of forgetting them.
         //
-        //    ⚠️ AND EXCLUDING EVERY SPAN THE COVERAGE FILTER WITHHELD. A coverage-driven shrink must
-        //    never drive a Health DELETE. Withholding a span from our own write is reversible — the
-        //    next sync can add it back. Deleting across that span is not, and what it removes is
-        //    whatever an earlier, better-informed run wrote there, when the epoch archive still held
-        //    the records this run no longer does. Retention already fooled this code once (measured:
+        //    ⚠️ AND EXCLUDING EVERY SPAN WE DECLINED TO PUBLISH. A coverage-driven shrink must never
+        //    drive a Health DELETE. Withholding a span from our own write is reversible — the next
+        //    sync can add it back. Deleting across that span is not, and what it removes is whatever
+        //    an earlier, better-informed run wrote there, when the epoch archive still held the
+        //    records this run no longer does. Retention already fooled this code once (measured:
         //    403.0 asleep-min in Apple Health replaced by 0.0 on a fully-recorded night edited two
         //    days late); `MeasuredCoverage.trusted(for:)` is the primary guard and this is the
         //    backstop that keeps the failure non-destructive even if that guard is ever wrong.
+        //
+        //    ⚠️ 2026-08-24: `withheldSpans` IS EMPTY NOW, AND IT MUST BE. Asserted sleep is published
+        //    (tagged user-entered) rather than withheld, so nothing is declined — and a stale
+        //    "asserted spans" reading here would have protected the ground we DO write, sparing the
+        //    PREVIOUS write over the same span from this cleanup and duplicating the night on every
+        //    re-edit. It is derived from `healthPublication.withheld` so the two answers cannot
+        //    drift apart again.
         let napWindows = local.healthWrittenNapWindows(overlapping: recordedStart, to: recordedEnd)
         let survivingPrior = await deletePriorEditedNightSleep(
             priorUUIDs: local.sleepEditHealthUUIDs(night: night),
@@ -1926,6 +1995,12 @@ final class HealthKitWriter {
         let night = row?.night ?? SleepNightKey.night(inBedStart: start, inBedEnd: end)
         // A manually-edited night is OWNED by the edit reconcile, which writes the EDITED picture.
         // The raw staging here must never overwrite it, so leave edited nights entirely alone.
+        //
+        // ⚠️ THIS BAIL ALSO FREEZES THE NIGHT'S PROVENANCE, WHICH IS WHY THE RE-DERIVATION DOES NOT
+        // GO THROUGH HERE. A night scored `.asserted` against a shorter archive would otherwise keep
+        // that verdict forever (🟢 2026-08-24: 1350 s of a "proven hole" had records under it within
+        // the hour). `LocalStore.rederiveEditedNightProvenance` upgrades the stored LABELS and
+        // queues a reconcile, so the edit stays authoritative here and the correction still lands.
         if row?.isManuallyEdited == true { return .unchanged }
         // Don't let a thinner drain fragment shrink Health below the merge-protected card: if the card
         // (summary) is fuller than this staging, `SleepSummaryMerge` kept the older, fuller night — so
@@ -1948,6 +2023,9 @@ final class HealthKitWriter {
         // returned at the guard above. If that ever stops being true, this path would write a filtered
         // night and then delete the span it declined to fill — the exact irreversible shape of M2. Bail
         // instead; the edit reconcile, which IS protected, owns any night with asserted time.
+        // (Nothing is withheld as of 2026-08-24, so the shrink is currently unreachable from either
+        // path — this stays because the bail is ALSO the ownership rule, and the ownership rule is
+        // what keeps asserted nights on the one path that tags them and tracks their sample UUIDs.)
         if segments.containsAssertedTime { return .unchanged }
 
         let signature = Self.sleepSignature(segments)

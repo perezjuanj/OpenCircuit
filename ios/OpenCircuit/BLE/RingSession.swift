@@ -1954,7 +1954,42 @@ final class RingSession: NSObject {
         // Naps are detected over the whole drained window (independent of the overnight gate)
         // so a daytime-only sync still records them, never folded into the main night (#76).
         persistNaps(store: localStore)
+        // A PREVIOUSLY EDITED night may have been scored against a SHORTER archive than the one we
+        // now hold — see below. Runs here because this is the one function every commit path and
+        // every re-stage passes through, and it is the moment the archive is at its widest.
+        rederiveEditedNightProvenance(store: localStore)
         // Steps are accumulated live in didUpdateValue (addDailySteps) — nothing to do here.
+    }
+
+    /// Re-score any manually-edited night whose provenance was decided when the archive was shorter
+    /// than it is now, and queue the Apple Health rewrite.
+    ///
+    /// 🟢 THE CASE (2026-08-24, Gen 2 Air FR04.009): she saved a corrected wake at 06:50 while the
+    /// newest archived record was 02:42:47, so everything after it was labelled `.asserted` — a
+    /// PROVEN hole. Nine more records covering 02:48:53 → 03:11:23 arrived on the 04:53Z / 04:59Z /
+    /// 05:08Z drains, so 1350 s of that "proven hole" was measurable data within the hour, and
+    /// nothing in the app ever went back to look.
+    ///
+    /// Built from the WHOLE archive and passed RAW — not `MeasuredCoverage.trusted(for:)`. The guard
+    /// exists to stop retention being read as ABSENCE; this pass reads PRESENCE only (records exist
+    /// here now), and retention can delete records but cannot invent them. `upgraded` cannot express
+    /// a shrink, so the 403-asleep-minutes-to-0.0 failure the guard was written for is unreachable
+    /// through it.
+    private func rederiveEditedNightProvenance(store: LocalStore) {
+        let archive = epochArchiveStore.load()
+        guard !archive.isEmpty else { return }
+        guard let changed = try? store.rederiveEditedNightProvenance(
+            coverage: MeasuredCoverage(records: archive)), !changed.isEmpty else { return }
+        for change in changed {
+            // The night KEY only (a start-of-day stamp), never a clock time — this line goes to the
+            // system log, where the rest of the sleep breadcrumbs keep the same coarse granularity.
+            ringLog.notice("""
+                sleep-provenance: re-derived night \
+                \(change.night.timeIntervalSince1970, privacy: .public) — \
+                \(Int(change.upgradedAsleepSeconds.rounded()), privacy: .public) s of asserted sleep \
+                now has records under it (Health rewrite queued)
+                """)
+        }
     }
 
     /// Compute the Wave-1 sleep analytics for the night being persisted (#69/#70/#71): nightly

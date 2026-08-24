@@ -137,7 +137,14 @@ final class ProvenanceLabelCoverageTests: XCTestCase {
          SleepSegment(start: at(60), end: at(480), stage: .asleepCore)]
     }
 
-    func testALeadingPROVENHoleIsStillAHoleAndItsFillIsWithheld() throws {
+    /// ⚠️ RE-BASELINED 2026-08-24. The label recovery is unchanged and is what this test is for: a
+    /// hole the records PROVED empty must still come back `.unmeasured`, never softened to
+    /// `.unknown`. What changed is the consequence — build 47 withheld the fill from Apple Health;
+    /// the maintainer reversed that, so the hour is now PUBLISHED carrying
+    /// `HKMetadataKeyWasUserEntered`. The assertion follows the label to its new destination rather
+    /// than being weakened: it still pins that exactly the proven hour, and only it, is treated as
+    /// the wearer's own account.
+    func testALeadingPROVENHoleIsStillAHoleAndItsFillIsTaggedUserEntered() throws {
         let cov = try XCTUnwrap(MeasuredCoverage.fromProvenanceLabels(labels))
         let parts = cov.partition(at(0) ..< at(480))
         XCTAssertEqual(parts.map(\.ground), [.unmeasured, .measured],
@@ -148,8 +155,11 @@ final class ProvenanceLabelCoverageTests: XCTestCase {
             SleepSegment(start: $0.range.lowerBound, end: $0.range.upperBound, stage: .asleepCore,
                          provenance: SleepEdit.provenance(for: $0.ground))
         }
-        XCTAssertEqual(SleepStaging.totalAsleep(filled.healthPublishable), 420 * 60, accuracy: 1,
-                       "the 60-minute proven hole must not reach Health as sleep")
+        XCTAssertEqual(SleepStaging.totalAsleep(filled.healthPublishable), 480 * 60, accuracy: 1,
+                       "the whole window reaches Health — the wearer's account included")
+        XCTAssertEqual(SleepStaging.totalAsleep(filled.healthUserEntered), 60 * 60, accuracy: 1,
+                       "…and exactly the 60-minute proven hole is tagged as entered by her")
+        XCTAssertTrue(filled.withheldSpans.isEmpty, "nothing is withheld ⇒ nothing may be deleted")
     }
 
     func testGroundLabelledCoverageUNKNOWNCountsAsCoveredAndPublishes() throws {
@@ -236,11 +246,18 @@ final class SleepEditRetentionGuardTests: XCTestCase {
         XCTAssertEqual(b.displayedAsleep, 490 * 60, accuracy: 1, "the card total is untouched")
         XCTAssertEqual(b.unknownInBed, 240 * 60, accuracy: 1)
 
-        // Health keeps the unknown half — that is the whole point of the third bucket. Only the
-        // 10 proven minutes are withheld, and only they can gate a delete.
+        // ⚠️ RE-BASELINED 2026-08-24. Health keeps the unknown half — that is still the whole point
+        // of the third bucket, and it is still written UNLABELLED, because "we cannot say" is not
+        // "she told us". What changed is the 10 proven minutes: they used to be withheld (and were
+        // the only thing that could gate a delete), and are now published carrying the user-entered
+        // tag. `withheldSpans` is therefore empty, which is exactly what the delete-exclusion
+        // predicate must see — see `withheldSpans`' own note.
         let published = out.healthPublishable
-        XCTAssertEqual(SleepStaging.totalAsleep(published), 480 * 60, accuracy: 1)
-        XCTAssertEqual(out.withheldSpans.map(\.duration), [600])
+        XCTAssertEqual(SleepStaging.totalAsleep(published), 490 * 60, accuracy: 1,
+                       "the whole 490-minute window she asserted now reaches Health")
+        XCTAssertEqual(SleepStaging.totalAsleep(out.healthUserEntered), 600, accuracy: 1,
+                       "only the 10 PROVEN minutes are tagged; the unknown half is not hers to own")
+        XCTAssertTrue(out.withheldSpans.isEmpty, "nothing withheld ⇒ nothing may be deleted")
     }
 }
 
