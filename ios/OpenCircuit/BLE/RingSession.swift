@@ -352,6 +352,15 @@ final class RingSession: NSObject {
     /// Pages received by the channel currently being drained. Unlike `bulkRecords.count`, this also
     /// advances for `0x47` optical pages and channel-0x02 `0x4d` sport pages.
     private var activeDrainPageCount = 0
+    /// 0x4c pages this SESSION acked whose XOR trailer did not validate, so `BulkSleep.records`
+    /// yielded nothing decodable. The ack advances the ring's single shared resume pointer, so each
+    /// one is permanently unrecoverable history — and until now it left no trace at all: the 0x4d
+    /// path logs `invalid page (acked, not decoded)`, the 0x4c path logged only `records=<unchanged>`,
+    /// which is indistinguishable from a valid page that legitimately carried no records. Cumulative
+    /// for the life of the session (NOT per drain) so a page corrupted between drains — during a
+    /// `livePreparing` enter-drain or an unattributed page — is still reported by the next drain that
+    /// finishes; per-drain deltas are recoverable by differencing successive `history-drain` events.
+    private var corruptPage4CCount = 0
     /// COARSE sleep segments from the motion channel (inBed/asleepCore/awake, no HR onset
     /// trim). The fallback for HealthKit/store when no HR-staged block exists. Its non-emptiness
     /// also doubles as the wear gate (#41) — empty on a charging/off-wrist night.
@@ -3699,8 +3708,12 @@ final class RingSession: NSObject {
             // a background task expiry or session reconnect clears the in-memory arrays and
             // `flushHealth()` fires with empty segments — sleep is permanently stranded in
             // StoredSleepSummary and never reaches HealthKit. The `.sleep` cursor prevents re-writes.
+            // A pass that staged NOTHING is a no-op inside the store (it must not erase the last-good
+            // fallback — see `savePendingSleepSegments`), so say which of the two happened rather than
+            // logging "saved 0" for a write that never ran.
+            let publishedSegments = !sleepSegments.isEmpty || !stagedSegments.isEmpty
             epochArchiveStore.savePendingSleepSegments(coarse: sleepSegments, staged: stagedSegments)
-            ringLog.notice("sleep-persist: saved coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count) segments to archive (survives teardown)")
+            ringLog.notice("sleep-persist: \(publishedSegments ? "saved" : "STAGED NOTHING — kept previously persisted", privacy: .public) coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count) segments to archive (survives teardown)")
             print("[OC] sleep COMMITTED coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count)")
             // #204: "committed" now means the STORE took it, not that we walked the stage path.
             committedSleep = lastSleepPersistOutcome?.wroteRow ?? false
@@ -4011,9 +4024,14 @@ final class RingSession: NSObject {
         trace.exitReason = exitReason
         drainTraces.append(trace)
         let outcome = trace.outcome.rawValue
+        // `4cBad` is the SESSION-cumulative count of acked-but-undecodable 0x4c pages (see
+        // `corruptPage4CCount`). Reported here rather than as its own event so a burst of corrupt
+        // pages cannot flood the observability ring buffer and evict the very evidence it explains —
+        // one field on an event that already fires once per channel drain, and it is what turns
+        // "this drain added fewer records than the ring had" into an attributable cause.
         observability.recordMetricEvent(
             source: "history-drain",
-            detail: "trigger=\(historySyncTrigger) label=\(trace.label) outcome=\(outcome) ack=\(trace.sawSyncAck) 4c=\(trace.page4CCount) 47=\(trace.page47Count) 50=\(trace.endMarkerCount) added=\(trace.recordsAdded)"
+            detail: "trigger=\(historySyncTrigger) label=\(trace.label) outcome=\(outcome) ack=\(trace.sawSyncAck) 4c=\(trace.page4CCount) 4cBad=\(corruptPage4CCount) 47=\(trace.page47Count) 50=\(trace.endMarkerCount) added=\(trace.recordsAdded)"
         )
         activeDrainTrace = nil
     }
@@ -4565,6 +4583,19 @@ extension RingSession: CBPeripheralDelegate {
                 // silent, permanent data loss — it cost two testers a whole night each on
                 // 2026-08-04. See `unattributedBuffer` for the measured evidence.
                 let pageRecords = BulkSleep.records(fromPage: bytes)
+                // …and NAME the one state where ack-vs-retention legitimately cannot agree: a page
+                // whose XOR trailer doesn't validate. `BulkSleep.records(fromPage:)` returns `[]` for
+                // BOTH "structurally corrupt" and "valid page that carried no whole 23-byte record",
+                // so `pageRecords.isEmpty` alone cannot tell them apart — `Frame.parse` is the
+                // discriminator (we are inside `case 0x4C`, so `bytes[0]` already matches
+                // `Frame.responseID(Opcode.page4C)`; only the trailer/length check can fail here).
+                // ⚠️ This is OBSERVABILITY ONLY. The `write(Command.pageAck4C)` below stays
+                // unconditional on purpose — it is what keeps the drain flowing, and this project has
+                // a documented history of drain-flow regressions. Mirrors the 0x4d treatment below.
+                if pageRecords.isEmpty, Frame.parse(bytes) == nil {
+                    self.corruptPage4CCount += 1
+                    ringLog.warning("← 0x4c sleep page (\(bytes.count)B): invalid page (acked, not decoded) — sessionTotal=\(self.corruptPage4CCount)")
+                }
                 if self.syncing || self.livePreparing {   // keep records during a sync OR a live-enter drain
                     self.bulkRecords += pageRecords
                     self.syncQuietTicks = 0
