@@ -235,4 +235,44 @@ final class CyclePeriodMirrorTests: XCTestCase {
         inHealth.formUnion(fresh)
         XCTAssertEqual(inHealth, Set(fresh))
     }
+
+    // MARK: The anti-retraction floor — the cap may STOP the app, never UNDO it
+
+    /// ⚠️ THE BLOCKER THIS FLOOR EXISTS FOR, caught in adversarial review before it shipped.
+    ///
+    /// The cap was retroactive on the UPGRADE path. A period left open before this change arrives
+    /// with `healthWritten == false` and N tracked UUIDs naming N real menstrual-flow samples in
+    /// Apple Health (one per elapsed day, N ≫ 8, because the pre-fix mirror extended to today
+    /// forever). The first flush after upgrade rebuilt only the capped 8, and the
+    /// delete-the-stale step then removed all N — a net loss of N − 8 days from the wearer's
+    /// medical record, irreversibly, with no action from her.
+    ///
+    /// Stopping the app from ADDING days it was never told about is the fix. Taking back days it
+    /// already wrote is a different act entirely, and not one this app may perform.
+    func testTheCapNeverRetractsADayAlreadyInHealth() {
+        // 20 days elapsed, 20 already mirrored: every one survives.
+        XCTAssertEqual(CyclePredictor.periodMirrorDayCount(start: start, end: nil, today: day(19),
+                                                           alreadyCoveredDays: 20, calendar: cal), 20)
+        // …and it still does not GROW past what is covered — day 21 is not added.
+        XCTAssertEqual(CyclePredictor.periodMirrorDayCount(start: start, end: nil, today: day(25),
+                                                           alreadyCoveredDays: 20, calendar: cal), 20)
+        // A never-written period is capped normally: the floor is inert at 0.
+        XCTAssertEqual(CyclePredictor.periodMirrorDayCount(start: start, end: nil, today: day(19),
+                                                           alreadyCoveredDays: 0, calendar: cal),
+                       CyclePredictor.maxAutoExtendPeriodDays)
+    }
+
+    /// The floor must never push the mirror into the FUTURE, which is the one thing neither the cap
+    /// nor the floor may do. A stale/oversized tracking array is clamped to today.
+    func testTheFloorNeverAssertsADayThatHasNotHappened() {
+        XCTAssertEqual(CyclePredictor.periodMirrorDayCount(start: start, end: nil, today: day(2),
+                                                           alreadyCoveredDays: 20, calendar: cal), 3)
+    }
+
+    /// The up-to-date gate must agree with the floor, or a legacy over-cap period would be judged
+    /// "stale" on every flush and rewritten forever — the churn defect, resurrected by the fix.
+    func testALegacyOverCapPeriodIsReportedUpToDateOnceWritten() {
+        XCTAssertTrue(CyclePredictor.periodMirrorIsUpToDate(writtenSampleCount: 20, start: start,
+                                                            end: nil, today: day(25), calendar: cal))
+    }
 }

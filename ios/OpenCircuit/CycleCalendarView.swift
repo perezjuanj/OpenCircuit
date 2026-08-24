@@ -439,8 +439,23 @@ struct CycleCalendarView: View {
             // One tap to end an in-progress period TODAY — the overwhelmingly common case, which
             // otherwise cost a sheet, a toggle and a date picker. Ending on some other day is
             // still the Edit button next to this one.
+            // ⚠️ ONCE THE CAP HAS BITTEN, "End today" IS THE WRONG DEFAULT. An explicit end is
+            // deliberately uncapped, so on a period started 20 days ago and never ended, tapping
+            // "End today" would assert all 20 days — reversing the very bound the row just said had
+            // stopped it, in the one state where the wearer is most likely to tap without reading.
+            // Offer the honest default instead: end on the last day actually mirrored. Any other
+            // day, longer or shorter, is still one tap away in Edit. (Adversarial review of this
+            // change; `openPeriodHasReachedAutoExtendCap` is the same predicate the note uses.)
             if entry.end == nil {
-                Button("End today") { endPeriodToday(entry) }
+                let capped = CyclePredictor.openPeriodHasReachedAutoExtendCap(start: entry.start,
+                                                                              today: Date())
+                let lastMirrored = CyclePredictor.periodMirrorLastDay(
+                    start: entry.start, end: nil, today: Date(),
+                    alreadyCoveredDays: entry.hkSampleUUIDs.count)
+                Button(capped ? "End \(lastMirrored.formatted(.dateTime.month().day()))"
+                              : "End today") {
+                    endPeriod(entry, on: capped ? lastMirrored : Date())
+                }
                     .font(.caption.weight(.medium))
                     .buttonStyle(.bordered)
                     .tint(Theme.accent)
@@ -475,7 +490,7 @@ struct CycleCalendarView: View {
         let capped = CyclePredictor.openPeriodHasReachedAutoExtendCap(start: entry.start,
                                                                       today: Date())
         Text(capped
-             ? "Stopped adding days after \(CyclePredictor.maxAutoExtendPeriodDays). Tap End today, or Edit to set the last day."
+             ? "Stopped adding days after \(CyclePredictor.maxAutoExtendPeriodDays) days. Use the End button, or Edit to set a different last day."
              : "Adds a day at a time until you end it, for up to \(CyclePredictor.maxAutoExtendPeriodDays) days.")
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -485,11 +500,10 @@ struct CycleCalendarView: View {
     /// End an in-progress period today. Routed through the same `savePeriodEntry` the Edit sheet
     /// uses, so the clinical-change path — and with it the Apple Health re-write that trims the
     /// mirror to the stated end — behaves identically however the end date was set.
-    private func endPeriodToday(_ entry: StoredPeriodEntry) {
-        let today = cal.startOfDay(for: Date())
+    private func endPeriod(_ entry: StoredPeriodEntry, on day: Date) {
         // A period cannot end before it began: if the row was somehow started in the future, end
         // it on its own start day rather than writing an inverted range.
-        let end = max(today, cal.startOfDay(for: entry.start))
+        let end = max(cal.startOfDay(for: day), cal.startOfDay(for: entry.start))
         let store = LocalStore(modelContext)
         try? store.savePeriodEntry(start: entry.start, end: end,
                                    flowLevelRaw: entry.flowLevelRaw,

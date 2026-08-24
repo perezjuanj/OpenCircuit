@@ -170,11 +170,27 @@ extension LocalStore {
     /// HK-agnostic) so there is exactly one place that rule can be wrong. An open period past the
     /// auto-extension cap therefore stays in this set forever but is skipped every time, at the
     /// cost of one integer comparison.
-    func periodEntriesNeedingHealthMirror() throws -> [StoredPeriodEntry] {
+    func periodEntriesNeedingHealthMirror(today: Date = Date()) throws -> [StoredPeriodEntry] {
         let descriptor = FetchDescriptor<StoredPeriodEntry>(
-            predicate: #Predicate { $0.healthWritten == false || $0.end == nil },
             sortBy: [SortDescriptor(\.start, order: .forward)])
-        return try context.fetch(descriptor)
+        let all = try context.fetch(descriptor)
+        // Filtered in Swift rather than in the `#Predicate`: the third clause needs a date
+        // comparison against an optional, and there are at most a few dozen period rows ever (one
+        // per cycle), so the fetch is trivially cheap and the rule stays readable.
+        //
+        // THE THIRD CLAUSE IS NOT REDUNDANT. A period whose logged end is in the FUTURE is written
+        // once — clamped to today, because a future day is never asserted — and then finalized. With
+        // only the first two clauses it has `healthWritten == true` and a non-nil `end`, so it is
+        // never revisited and the remaining days NEVER reach Apple Health: the wearer logs a period
+        // ending Friday on Tuesday, and Wednesday through Friday are silently dropped. Keep it in
+        // the candidate set until its end day has actually elapsed; the up-to-date gate in
+        // `flushMenstrualFlow` then settles it on the day it completes. (Adversarial review, 2026-08-24.)
+        let todayDay = Calendar.current.startOfDay(for: today)
+        return all.filter { row in
+            if !row.healthWritten { return true }
+            guard let end = row.end else { return true }
+            return Calendar.current.startOfDay(for: end) > todayDay
+        }
     }
 
     /// Record the result of a HealthKit menstrual-flow write for a period entry: store the

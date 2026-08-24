@@ -621,8 +621,12 @@ final class HealthKitWriter {
                                                      today: now) {
                 continue
             }
+            // `alreadyCoveredDays` is the anti-retraction floor: one tracked UUID == one mirrored
+            // day, so a legacy open period past the cap keeps every day it already put in Health.
             let samples = Self.menstrualFlowSamples(start: entry.start, end: entry.end,
-                                                    flowLevelRaw: entry.flowLevelRaw, today: now)
+                                                    flowLevelRaw: entry.flowLevelRaw,
+                                                    alreadyCoveredDays: entry.hkSampleUUIDs.count,
+                                                    today: now)
             guard !samples.isEmpty else { continue }   // nothing to assert yet (future start date)
             let stale = entry.hkSampleUUIDs   // read BEFORE `recordPeriodEntryHK` overwrites it
             let fresh = samples.map { $0.uuid.uuidString }
@@ -673,6 +677,7 @@ final class HealthKitWriter {
     static func menstrualFlowSamples(start: Date,
                                      end: Date?,
                                      flowLevelRaw: Int,
+                                     alreadyCoveredDays: Int = 0,
                                      today now: Date = Date(),
                                      calendar cal: Calendar = .current) -> [HKCategorySample] {
         let type = HKCategoryType(.menstrualFlow)
@@ -687,9 +692,13 @@ final class HealthKitWriter {
         // explicitly logged end is authoritative at any length). Open period: up to today OR the
         // auto-extension cap, whichever comes first, so an unended period stops inventing days
         // instead of growing by one sample per elapsed day forever. Either way, never a future
-        // day. The rule itself is `CyclePredictor`'s so it is covered by the Kit suite.
-        let lastDay = CyclePredictor.periodMirrorLastDay(start: start, end: end,
-                                                          today: now, calendar: cal)
+        // day. `alreadyCoveredDays` floors the open case at the span ALREADY mirrored, so the cap
+        // can only ever stop the app ADDING days — it can never withdraw one already written to a
+        // wearer's medical record (the upgrade path; see `openPeriodAutoExtendLastDay`).
+        // The rule itself is `CyclePredictor`'s so it is covered by the Kit suite.
+        let lastDay = CyclePredictor.periodMirrorLastDay(start: start, end: end, today: now,
+                                                          alreadyCoveredDays: alreadyCoveredDays,
+                                                          calendar: cal)
         guard lastDay >= firstDay else { return [] }
 
         var samples: [HKCategorySample] = []

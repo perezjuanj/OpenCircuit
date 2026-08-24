@@ -277,16 +277,36 @@ public enum CyclePredictor {
     // exactly the rules that were silently wrong in production.
 
     /// The last day an OPEN period (no logged end) may cover: today, or the auto-extension cap,
-    /// whichever comes FIRST. Both operands are already day-floored, so this never reaches into
-    /// the future and never past `start + maxAutoExtendPeriodDays - 1`.
+    /// whichever comes FIRST — but NEVER earlier than the span already mirrored.
+    ///
+    /// ⚠️ `alreadyCoveredDays` IS THE ANTI-RETRACTION FLOOR AND IT IS LOAD-BEARING. The cap exists
+    /// to stop the app ADDING days the wearer never stated; it must never take back a day it
+    /// already wrote. Without this floor the cap is retroactive on the UPGRADE path, which is a
+    /// silent deletion from a medical record: a period left open before this shipped arrives with
+    /// `healthWritten == false` and N tracked samples in Apple Health (N ≫ 8, one per elapsed day),
+    /// the first flush after upgrade rebuilds only 8, and the delete-the-stale step removes all N —
+    /// a net loss of N − 8 menstrual-flow days the wearer can never recover. Caught in adversarial
+    /// review of this change, before it shipped; `testTheCapNeverRetractsADayAlreadyInHealth` and
+    /// `testLegacyOpenPeriodPastTheCapKeepsEveryDayAlreadyWritten` pin it.
+    ///
+    /// Pass the number of days ALREADY mirrored (for this app that is `hkSampleUUIDs.count`, since
+    /// the mirror writes exactly one sample per covered day). 0 for a period that has never been
+    /// written, which is the ordinary new-period case and leaves the plain cap in force.
     public static func openPeriodAutoExtendLastDay(start: Date, today: Date,
+                                                   alreadyCoveredDays: Int = 0,
                                                    calendar: Calendar = .current) -> Date {
         let firstDay = calendar.startOfDay(for: start)
         let todayDay = calendar.startOfDay(for: today)
         // -1 because the span is INCLUSIVE of the start day: an 8-day cap covers day 1…day 8.
         let capDay = calendar.date(byAdding: .day, value: maxAutoExtendPeriodDays - 1, to: firstDay)
             ?? firstDay
-        return min(todayDay, capDay)
+        let capped = min(todayDay, capDay)
+        guard alreadyCoveredDays > 0 else { return capped }
+        let coveredDay = calendar.date(byAdding: .day, value: alreadyCoveredDays - 1, to: firstDay)
+            ?? firstDay
+        // `min(_, todayDay)` on the floor too: a stale tracking array must not push the mirror into
+        // the future, which is the one thing neither the cap nor the floor may ever do.
+        return max(capped, min(coveredDay, todayDay))
     }
 
     /// The last day this period should be mirrored to Apple Health.
@@ -296,9 +316,12 @@ public enum CyclePredictor {
     /// This is the pre-existing finalized behaviour, kept byte-for-byte. Only the open case, where
     /// the app would otherwise be inventing days on the user's behalf, is bounded.
     public static func periodMirrorLastDay(start: Date, end: Date?, today: Date,
+                                            alreadyCoveredDays: Int = 0,
                                             calendar: Calendar = .current) -> Date {
         guard let end else {
-            return openPeriodAutoExtendLastDay(start: start, today: today, calendar: calendar)
+            return openPeriodAutoExtendLastDay(start: start, today: today,
+                                               alreadyCoveredDays: alreadyCoveredDays,
+                                               calendar: calendar)
         }
         return min(calendar.startOfDay(for: end), calendar.startOfDay(for: today))
     }
@@ -306,9 +329,12 @@ public enum CyclePredictor {
     /// How many one-day Apple Health samples this period should currently have. 0 when the span
     /// is empty (a start dated in the future).
     public static func periodMirrorDayCount(start: Date, end: Date?, today: Date,
+                                             alreadyCoveredDays: Int = 0,
                                              calendar: Calendar = .current) -> Int {
         let firstDay = calendar.startOfDay(for: start)
-        let lastDay = periodMirrorLastDay(start: start, end: end, today: today, calendar: calendar)
+        let lastDay = periodMirrorLastDay(start: start, end: end, today: today,
+                                          alreadyCoveredDays: alreadyCoveredDays,
+                                          calendar: calendar)
         guard lastDay >= firstDay else { return 0 }
         return (calendar.dateComponents([.day], from: firstDay, to: lastDay).day ?? 0) + 1
     }
@@ -329,7 +355,9 @@ public enum CyclePredictor {
     public static func periodMirrorIsUpToDate(writtenSampleCount: Int,
                                               start: Date, end: Date?, today: Date,
                                               calendar: Calendar = .current) -> Bool {
-        let expected = periodMirrorDayCount(start: start, end: end, today: today, calendar: calendar)
+        let expected = periodMirrorDayCount(start: start, end: end, today: today,
+                                            alreadyCoveredDays: writtenSampleCount,
+                                            calendar: calendar)
         // expected == 0 means nothing should be written; that is "nothing to do", not "up to date
         // with 0 samples", and the caller's `samples.isEmpty` guard handles it. Requiring > 0 here
         // keeps a never-written entry from ever being mistaken for a settled one.
