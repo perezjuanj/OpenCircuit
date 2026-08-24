@@ -259,13 +259,25 @@ final class SleepBaselineTests: XCTestCase {
             print("===   pinned baseline \(SleepBaselineGolden.baselineSHA256) (not comparable)")
             return
         }
-        XCTAssertEqual(tsvHash, SleepBaselineGolden.baselineSHA256,
-                       "THE SCOREBOARD MOVED. This is the pinned corpus (manifest \(manifestHash)) "
-                       + "but the emitted baseline.tsv hashes to \(tsvHash), not the pinned "
-                       + "\(SleepBaselineGolden.baselineSHA256). Either a staging number changed — "
-                       + "in which case say so and re-pin deliberately — or the emitter's columns "
-                       + "changed, in which case re-pin and note it. Do NOT quote 'hash unchanged' "
-                       + "after seeing this.")
+        // ⚠️ THE SUCCESS LINE IS GUARDED, AND IT HAS TO BE. `XCTAssertEqual` RECORDS a failure and
+        // RETURNS — it does not abort — so an unconditional `print("golden MATCH")` after it emitted
+        // the reassuring line on a run that had just failed the pin. 🟢 Reproduced 2026-08-24: a
+        // staging change moved the scoreboard to 1b8aeeef…40fb5e, the test reported
+        // "Executed 1 test, with 1 failure", and it STILL printed "golden MATCH — baseline.tsv is
+        // byte-identical to the pinned scoreboard" underneath. Anyone grepping the output for
+        // "golden" — which is exactly how this line is meant to be read — would have quoted a green
+        // gate off a red run. That is the same failure shape as the corpus entry points that
+        // "passed" while asserting nothing (docs/SLEEP_REPLAY_HARNESS.md §1).
+        guard tsvHash == SleepBaselineGolden.baselineSHA256 else {
+            XCTFail("THE SCOREBOARD MOVED. This is the pinned corpus (manifest \(manifestHash)) "
+                    + "but the emitted baseline.tsv hashes to \(tsvHash), not the pinned "
+                    + "\(SleepBaselineGolden.baselineSHA256). Either a staging number changed — "
+                    + "in which case say so and re-pin deliberately — or the emitter's columns "
+                    + "changed, in which case re-pin and note it. Do NOT quote 'hash unchanged' "
+                    + "after seeing this.")
+            print("=== golden MOVED — baseline.tsv is NOT the pinned scoreboard. See the failure above.")
+            return
+        }
         print("=== golden MATCH — baseline.tsv is byte-identical to the pinned scoreboard.")
     }
 }
