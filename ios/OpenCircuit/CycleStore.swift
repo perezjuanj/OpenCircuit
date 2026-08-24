@@ -23,11 +23,16 @@ final class StoredPeriodEntry {
     var symptoms: [String] = []
     /// Optional free-text notes.
     var notes: String = ""
-    /// True once this entry has been fully mirrored to Apple Health. For a FINALIZED
-    /// period (`end != nil`) this is set after the write so it isn't re-written. For an
-    /// OPEN period (`end == nil`) it stays `false` so each flush extends the per-day
-    /// samples as new days elapse. Reset to `false` on any clinical edit so the writer
-    /// deletes the stale sample(s) (see `hkSampleUUIDs`) and re-writes the corrected one.
+    /// True once this entry's Apple Health mirror is up to date AS OF the last write — for OPEN
+    /// and finalized periods alike. Reset to `false` on any clinical edit so the writer re-writes
+    /// the corrected entry (see `hkSampleUUIDs`).
+    ///
+    /// An open period used to be left `false` forever, "so each flush extends it as days elapse".
+    /// That meant it was re-deleted and re-rewritten on every foreground activation, sync
+    /// completion, BLE wake-drain and BGTask for the life of the entry — the "several dozen
+    /// entries per day" a tester saw arriving in Apple Health on 2026-08-24. An open period is now
+    /// finalized like any other and is re-driven only when a new DAY actually appears, which the
+    /// writer detects from the covered span (see `periodEntriesNeedingHealthMirror`).
     var healthWritten: Bool = false
     /// UUID strings of the HKCategorySample(s) last written for this entry. Used to delete
     /// the prior Apple Health sample(s) before re-writing on edit, and to remove them on
@@ -150,19 +155,36 @@ extension LocalStore {
         return try context.fetch(descriptor)
     }
 
-    /// Period entries not yet written to Apple Health (oldest first).
-    func pendingPeriodEntries() throws -> [StoredPeriodEntry] {
+    /// Entries the Apple Health mirror may have something to say about (oldest first) — the input
+    /// set for `HealthKitWriter.flushMenstrualFlow`.
+    ///
+    /// Two disjoint reasons to be here: the entry has never been written or was edited
+    /// (`healthWritten == false`), or it is OPEN (`end == nil`) and a further day may have
+    /// elapsed since the last write. The second clause is why this replaced a plain
+    /// `healthWritten == false` query: an open period is now finalized after each write, so the
+    /// watermark alone can no longer be what re-drives it.
+    ///
+    /// Being in this set is NOT a decision to write. Whether an open entry actually needs a
+    /// rewrite is `CyclePredictor.periodMirrorIsUpToDate`'s call, made by the writer against the
+    /// same `now` it builds the samples from — the store deliberately stays date-free (and
+    /// HK-agnostic) so there is exactly one place that rule can be wrong. An open period past the
+    /// auto-extension cap therefore stays in this set forever but is skipped every time, at the
+    /// cost of one integer comparison.
+    func periodEntriesNeedingHealthMirror() throws -> [StoredPeriodEntry] {
         let descriptor = FetchDescriptor<StoredPeriodEntry>(
-            predicate: #Predicate { $0.healthWritten == false },
+            predicate: #Predicate { $0.healthWritten == false || $0.end == nil },
             sortBy: [SortDescriptor(\.start, order: .forward)])
         return try context.fetch(descriptor)
     }
 
     /// Record the result of a HealthKit menstrual-flow write for a period entry: store the
-    /// written sample UUIDs and set the written watermark. A FINALIZED period (`finalized ==
-    /// true`) sets `healthWritten = true` so it isn't re-written; an OPEN period keeps it
-    /// `false` so each subsequent flush extends the per-day samples as new days elapse (the
-    /// flush deletes the stored UUIDs before re-writing, so no duplicates accumulate).
+    /// written sample UUIDs and set the written watermark.
+    ///
+    /// Called TWICE per successful mirror by `flushMenstrualFlow`, which is the point of the
+    /// `finalized` parameter: first with the stale + fresh UUIDs and `finalized: false` (so a
+    /// crash before the delete leaves every written sample still nameable, and the surviving
+    /// count mismatch re-drives the entry), then with the fresh UUIDs alone and `finalized: true`
+    /// once the stale copies are actually gone from Health.
     func recordPeriodEntryHK(start: Date, hkSampleUUIDs: [String], finalized: Bool) throws {
         let descriptor = FetchDescriptor<StoredPeriodEntry>(
             predicate: #Predicate { $0.start == start })

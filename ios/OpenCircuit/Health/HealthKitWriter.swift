@@ -570,47 +570,99 @@ final class HealthKitWriter {
     }
 
     /// Write pending user-logged period flow entries to Apple Health, returning the count
-    /// written. Apple Health Cycle Tracking models flow as one sample PER DAY, so each logged
-    /// day from start through the logged end (capped at today) is mirrored as its own one-day
-    /// `menstrualFlow` sample. We NEVER invent a duration: an OPEN period (no logged end) only
-    /// mirrors days up to today and stays pending, so subsequent days are added as they are
-    /// actually logged/elapse. Before re-writing (after an edit, or extending an open period)
-    /// the previously-written sample(s) are deleted by UUID so the append-only HealthKit store
-    /// doesn't accumulate duplicates. (#78)
+    /// written. Apple Health Cycle Tracking models flow as one sample PER DAY, so each logged day
+    /// from start through the mirrored last day is written as its own one-day `menstrualFlow`
+    /// sample. We NEVER invent a duration: a FINALIZED period mirrors exactly the days the user
+    /// logged, and an OPEN one mirrors up to today bounded by `maxAutoExtendPeriodDays`. (#78)
+    ///
+    /// Reshaped after `flushHeadacheLog`, which already documents why this shape is the correct
+    /// one. Two defects reported by a tester on 2026-08-24 ("I can see a lot of entries being
+    /// added every day, not just one, but several dozen per day") are fixed here:
+    ///
+    /// 1. NO REWRITE UNLESS THE CONTENT CAN DIFFER. An open period was never finalized, so it was
+    ///    returned by the pending query on EVERY flush — foreground activation, sync completion,
+    ///    every BLE wake-drain and every BGTask — and each one deleted and rewrote the entire
+    ///    span. Now every successful mirror finalizes the row, and it re-opens for exactly the two
+    ///    reasons the content can actually change: a clinical edit (`savePeriodEntry` clears the
+    ///    watermark) or a new DAY appearing on an open period (`periodMirrorIsUpToDate`, which
+    ///    reads the covered span off the tracked sample count and so needs no new stored column).
+    ///    An entry that is already correct now costs one comparison and touches neither store.
+    ///
+    /// 2. WRITE FIRST, DELETE AFTER. The old delete-first order left a window in which a crash
+    ///    made the user's Health store EMPTIER than before the flush — data loss on a log they can
+    ///    never reconstruct. Write-first's own hazard is narrower and is closed explicitly: the
+    ///    new UUIDs are recorded ALONGSIDE the stale ones before anything is deleted, so a kill
+    ///    mid-flush can only leave a TRACKED duplicate that the next flush removes — never a
+    ///    sample this app wrote but can no longer name, which the user could then never delete
+    ///    through our UI. This goes one step FURTHER than `flushHeadacheLog`, which records the
+    ///    new UUIDs after its save and so still has a (small) window where a kill strands real
+    ///    samples untracked; recording before the save closes it outright, and the Kit suite
+    ///    steps a kill through every point to prove it. Worth porting back to the headache path.
     private func flushMenstrualFlow(localStore: LocalStore) async -> Int {
-        guard let pending = try? localStore.pendingPeriodEntries(), !pending.isEmpty else { return 0 }
+        // EXPLICIT denial is TERMINAL — the save can never succeed, so return before touching
+        // either store rather than throwing on every entry on every flush (the same guard, for the
+        // same reason, as `flushHeadacheLog`). `.notDetermined` deliberately falls THROUGH: the
+        // save throws until the user grants, the entries stay pending, and the whole log backfills
+        // on the first flush after Cycle Tracking sharing is turned on.
+        if store.authorizationStatus(for: HKCategoryType(.menstrualFlow)) == .sharingDenied {
+            return 0
+        }
+        guard let candidates = try? localStore.periodEntriesNeedingHealthMirror(),
+              !candidates.isEmpty else { return 0 }
         var written = 0
-        for entry in pending {
-            // Remove any prior samples for this entry first (edit / open-period extension).
-            if !entry.hkSampleUUIDs.isEmpty {
-                await deleteMenstrualFlowSamples(uuidStrings: entry.hkSampleUUIDs)
+        for entry in candidates {
+            let now = Date()
+            // An entry whose watermark is still set has had no clinical edit, so the ONLY thing
+            // that can have changed is the elapsed-day span. If that matches what we already
+            // wrote, this flush has nothing to say — write nothing, delete nothing, touch nothing.
+            if entry.healthWritten,
+               CyclePredictor.periodMirrorIsUpToDate(writtenSampleCount: entry.hkSampleUUIDs.count,
+                                                     start: entry.start, end: entry.end,
+                                                     today: now) {
+                continue
             }
-            let finalized = entry.end != nil
+            let samples = Self.menstrualFlowSamples(start: entry.start, end: entry.end,
+                                                    flowLevelRaw: entry.flowLevelRaw, today: now)
+            guard !samples.isEmpty else { continue }   // nothing to assert yet (future start date)
+            let stale = entry.hkSampleUUIDs   // read BEFORE `recordPeriodEntryHK` overwrites it
+            let fresh = samples.map { $0.uuid.uuidString }
             do {
-                let uuids = try await writeMenstrualFlow(entry: entry)
+                // Track new AND stale together BEFORE the save, not between the save and the
+                // delete. `HKObject` assigns its `uuid` at construction, so the names exist while
+                // the samples are still only in memory — which lets this close the one window the
+                // headache path cannot: a kill between `save` and a record-after would leave real
+                // samples in Health that no row names, and the user could never delete them
+                // through our UI. Recording a UUID that never reached Health is harmless in the
+                // other direction: the delete predicate simply matches nothing.
                 try localStore.recordPeriodEntryHK(start: entry.start,
-                                                   hkSampleUUIDs: uuids, finalized: finalized)
-                if !uuids.isEmpty { written += 1 }
-            } catch { break }   // stop on first failure; unwritten entries retry next flush
+                                                   hkSampleUUIDs: stale + fresh, finalized: false)
+                try await store.save(samples)
+                // Only now that the replacement is actually IN Health may the previous copy go.
+                if !stale.isEmpty { await deleteMenstrualFlowSamples(uuidStrings: stale) }
+                try localStore.recordPeriodEntryHK(start: entry.start,
+                                                   hkSampleUUIDs: fresh, finalized: true)
+                written += 1
+            } catch {
+                // Roll the tracking back to what it was before this attempt. Recording ahead of
+                // the save is what makes every written sample nameable, but it means a FAILED save
+                // would otherwise leave `fresh` — UUIDs that never reached Health — tracked
+                // forever, and the next attempt would append another generation on top: the array
+                // would grow by a full span on every flush for as long as the save kept failing
+                // (a `.notDetermined` authorization does exactly that). Restoring `stale` bounds
+                // it. If we are killed before this lands, the row simply carries one extra
+                // generation of unreachable UUIDs, which the next successful flush deletes
+                // harmlessly — the delete predicate matches nothing for samples that never existed.
+                try? localStore.recordPeriodEntryHK(start: entry.start,
+                                                    hkSampleUUIDs: stale, finalized: false)
+                break   // stop on first failure; unwritten entries retry next flush
+            }
         }
         return written
     }
 
-    /// Write one single-day `menstrualFlow` category sample per logged day of a period (start
-    /// through the logged end, capped at today — future days are never asserted). Returns the
-    /// UUID strings of the samples saved so the caller can persist them for later delete/replace.
-    /// `HKMetadataKeyMenstrualCycleStart: true` is set on the FIRST day only (period start =
-    /// cycle start). Never fabricates a duration the user didn't log (P1 fix).
-    private func writeMenstrualFlow(entry: StoredPeriodEntry) async throws -> [String] {
-        let samples = Self.menstrualFlowSamples(
-            start: entry.start,
-            end: entry.end,
-            flowLevelRaw: entry.flowLevelRaw
-        )
-        guard !samples.isEmpty else { return [] }
-        try await store.save(samples)
-        return samples.map { $0.uuid.uuidString }
-    }
+    // (`writeMenstrualFlow` was folded into `flushMenstrualFlow` above: the write-first/
+    // delete-after order needs the sample UUIDs in hand BEFORE the save is committed to the store,
+    // so a helper that both built and saved them could no longer sit between those two steps.)
 
     /// Build one HealthKit menstrual-flow sample per logged day. HealthKit requires
     /// `HKMetadataKeyMenstrualCycleStart` on EVERY menstrual-flow sample: `true` on the first
@@ -630,12 +682,14 @@ final class HealthKitWriter {
         case 3: flowValue = .heavy
         default: flowValue = .medium
         }
-        let today = cal.startOfDay(for: now)
         let firstDay = cal.startOfDay(for: start)
-        // Finalized period: through the logged end day. Open period: only up to today.
-        // Either way, never write a day in the future.
-        let endCandidate = end.map { cal.startOfDay(for: $0) } ?? today
-        let lastDay = min(endCandidate, today)
+        // Finalized period: through the logged end day, clamped to today (unchanged — an
+        // explicitly logged end is authoritative at any length). Open period: up to today OR the
+        // auto-extension cap, whichever comes first, so an unended period stops inventing days
+        // instead of growing by one sample per elapsed day forever. Either way, never a future
+        // day. The rule itself is `CyclePredictor`'s so it is covered by the Kit suite.
+        let lastDay = CyclePredictor.periodMirrorLastDay(start: start, end: end,
+                                                          today: now, calendar: cal)
         guard lastDay >= firstDay else { return [] }
 
         var samples: [HKCategorySample] = []

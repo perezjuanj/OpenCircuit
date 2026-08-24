@@ -46,6 +46,26 @@ public enum CyclePredictor {
     /// Require two nights to reduce single-reading noise.
     public static let tempRiseNightsRequired = 2
 
+    /// Maximum number of days an OPEN period (started, never ended) may AUTO-EXTEND itself.
+    ///
+    /// 🟡 probable — a clinical convention, not a measurement from this device. FIGO's AUB
+    /// System 1 (Munro et al., *Int J Gynaecol Obstet* 2018;143:393–408) defines normal
+    /// menstrual bleeding DURATION as ≤ 8 days, and classifies anything longer as "prolonged
+    /// menstrual bleeding"; ACOG's patient guidance uses the same ≤ 8-day frame. Eight days
+    /// (inclusive of the start day) is therefore the widest span we can assert on the user's
+    /// behalf while still being ordinary rather than a reportable clinical finding.
+    ///
+    /// This bounds AUTO-EXTENSION ONLY. It is not a claim about how long the user bled and it
+    /// never shortens anything: a period with an EXPLICIT logged end is untouched by this at
+    /// any length (see `periodMirrorLastDay`), and days already written to Apple Health are
+    /// never retroactively withdrawn — reaching the cap only stops the app ADDING further days
+    /// on its own. A wearer who genuinely bled longer says so by logging the end date.
+    ///
+    /// Without this bound an unended period grew by one Apple Health sample per elapsed day
+    /// forever, which is the accuracy half of the 2026-08-24 tester report ("once a period has
+    /// started, the app keeps syncing the following days as period days even after it ended").
+    public static let maxAutoExtendPeriodDays = 8
+
     // MARK: Input types
 
     /// One manually-logged period entry.
@@ -247,5 +267,82 @@ public enum CyclePredictor {
     public static func isOvulationDay(_ date: Date, prediction: CyclePrediction,
                                        calendar: Calendar = .current) -> Bool {
         calendar.isDate(date, inSameDayAs: prediction.ovulationEstimate)
+    }
+
+    // MARK: Apple Health mirror bounds (open-period auto-extension)
+    //
+    // Apple Health models flow as one sample PER DAY, so mirroring a period means deciding which
+    // DAYS it covers. That decision is pure date math, so it lives here rather than in the app
+    // target's `HealthKitWriter` — the app-target XCTest suite is not in preflight, and these are
+    // exactly the rules that were silently wrong in production.
+
+    /// The last day an OPEN period (no logged end) may cover: today, or the auto-extension cap,
+    /// whichever comes FIRST. Both operands are already day-floored, so this never reaches into
+    /// the future and never past `start + maxAutoExtendPeriodDays - 1`.
+    public static func openPeriodAutoExtendLastDay(start: Date, today: Date,
+                                                   calendar: Calendar = .current) -> Date {
+        let firstDay = calendar.startOfDay(for: start)
+        let todayDay = calendar.startOfDay(for: today)
+        // -1 because the span is INCLUSIVE of the start day: an 8-day cap covers day 1…day 8.
+        let capDay = calendar.date(byAdding: .day, value: maxAutoExtendPeriodDays - 1, to: firstDay)
+            ?? firstDay
+        return min(todayDay, capDay)
+    }
+
+    /// The last day this period should be mirrored to Apple Health.
+    ///
+    /// An EXPLICIT end is authoritative and is NOT capped — the user stated it, so we assert it at
+    /// whatever length they logged (clamped only to today, since a future day is never asserted).
+    /// This is the pre-existing finalized behaviour, kept byte-for-byte. Only the open case, where
+    /// the app would otherwise be inventing days on the user's behalf, is bounded.
+    public static func periodMirrorLastDay(start: Date, end: Date?, today: Date,
+                                            calendar: Calendar = .current) -> Date {
+        guard let end else {
+            return openPeriodAutoExtendLastDay(start: start, today: today, calendar: calendar)
+        }
+        return min(calendar.startOfDay(for: end), calendar.startOfDay(for: today))
+    }
+
+    /// How many one-day Apple Health samples this period should currently have. 0 when the span
+    /// is empty (a start dated in the future).
+    public static func periodMirrorDayCount(start: Date, end: Date?, today: Date,
+                                             calendar: Calendar = .current) -> Int {
+        let firstDay = calendar.startOfDay(for: start)
+        let lastDay = periodMirrorLastDay(start: start, end: end, today: today, calendar: calendar)
+        guard lastDay >= firstDay else { return 0 }
+        return (calendar.dateComponents([.day], from: firstDay, to: lastDay).day ?? 0) + 1
+    }
+
+    /// Whether an already-mirrored period's Apple Health copy is still CORRECT — i.e. rebuilding
+    /// it now would produce the same set of days, so a rewrite carries no new information and must
+    /// be skipped.
+    ///
+    /// `writtenSampleCount` is the number of samples the store currently tracks for this entry.
+    /// Because the mirror is exactly one sample per covered day, that count IS the covered span,
+    /// which is why this needs no extra stored watermark (and therefore no SwiftData schema
+    /// change — see `docs/RUNBOOK_SCHEMA_MIGRATION_REHEARSAL.md` for why that matters).
+    ///
+    /// This deliberately answers only "has a new DAY appeared?". A change to a CLINICAL field
+    /// (flow level, symptoms, the end date) leaves the day count equal, so it is NOT detected
+    /// here — it is caught upstream by `savePeriodEntry` clearing the written watermark. Both
+    /// gates are required; neither is sufficient alone.
+    public static func periodMirrorIsUpToDate(writtenSampleCount: Int,
+                                              start: Date, end: Date?, today: Date,
+                                              calendar: Calendar = .current) -> Bool {
+        let expected = periodMirrorDayCount(start: start, end: end, today: today, calendar: calendar)
+        // expected == 0 means nothing should be written; that is "nothing to do", not "up to date
+        // with 0 samples", and the caller's `samples.isEmpty` guard handles it. Requiring > 0 here
+        // keeps a never-written entry from ever being mistaken for a settled one.
+        return expected > 0 && writtenSampleCount == expected
+    }
+
+    /// Whether an OPEN period has hit the auto-extension cap and has therefore stopped growing.
+    /// Drives the UI copy that tells the wearer what happens if they never log an end date.
+    public static func openPeriodHasReachedAutoExtendCap(start: Date, today: Date,
+                                                         calendar: Calendar = .current) -> Bool {
+        let firstDay = calendar.startOfDay(for: start)
+        let todayDay = calendar.startOfDay(for: today)
+        let elapsed = (calendar.dateComponents([.day], from: firstDay, to: todayDay).day ?? 0) + 1
+        return elapsed >= maxAutoExtendPeriodDays
     }
 }
