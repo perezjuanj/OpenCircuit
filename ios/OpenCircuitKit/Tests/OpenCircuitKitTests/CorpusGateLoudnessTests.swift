@@ -304,6 +304,7 @@ final class CorpusGateLoudnessTests: XCTestCase {
             "SleepProvenanceCorpusTests.swift": 1, // asserted-vs-measured blast radius
             "SleepProvenanceFixtureProbe.swift": 1, // fixture-geometry scaffold
             "SleepEditedNightNoticeCorpusTests.swift": 1, // how often the card's notice appears
+            "SleepMonotonicityTests.swift": 1,    // the growing-archive collapse sweep
         ]
         let gateCall = "SleepReplay" + ".requireCorpus("
         var found: [String: Int] = [:]
@@ -350,6 +351,7 @@ final class CorpusGateLoudnessTests: XCTestCase {
             oc + "_BASELINE_CORPUS",  // SleepBaselineTests — the pinned-golden emitter
             oc + "_PROVENANCE_CORPUS", // SleepProvenanceCorpusTests + its fixture scaffold
             oc + "_NOTICE_CORPUS",     // SleepEditedNightNoticeCorpusTests
+            oc + "_MONOTONICITY_CORPUS", // SleepStagingMonotonicityTests — the growing-archive sweep
             oc + "_BASELINE_OUT",     // …and where that emitter writes its TSV. NOT a corpus: an
                                       // output path, legitimately Optional, read raw.
             oc + "_GATE_SELFTEST",    // this file's own injected variable; never a real corpus
