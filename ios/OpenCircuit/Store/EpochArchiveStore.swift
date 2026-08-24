@@ -132,9 +132,32 @@ struct EpochArchiveStore {
     // to the last committed segments when `session?.stagedSegments` is empty. The `.sleep` cursor in
     // `LocalStore` guards against double-writing — segments whose end is already past the cursor are
     // filtered by `pendingHealthSleep`, so re-using stale segments is harmless.
+    //
+    // ⚠️ "SAVE NOTHING" AND "CLEAR" ARE DIFFERENT OPERATIONS — do not collapse them.
+    // `savePendingSleepSegments` PUBLISHES what one drain staged. A pass that staged nothing is the
+    // ABSENCE of a publication, not an instruction to forget the last good one, so it must leave the
+    // stored pair standing. The write used to be unconditional, and that was live collateral of the
+    // #204 `noStagedSegments` defect: on the 2026-08-24 tester export the three consecutive drains at
+    // 09:48:57 / 09:57:09 / 10:17:01 local all reported `nightRowOutcome: noStagedSegments` with
+    // `stagedSleepSegments: 0`, and each one re-ran this function — overwriting the relaunch fallback
+    // that `ContentView.flushHealth()` reads with `[]`. The night was stranded in
+    // `StoredSleepSummary` with nothing left to mirror to HealthKit.
+    // The explicit clear is `clearPendingSleepSegments()`, called from
+    // `RingScanner.clearLastCommittedSleepSegments()` after a CONFIRMED HealthKit write. That is the
+    // only path that may zero the slot, and it stays unconditional.
 
-    /// Persist the last committed sleep segments so they survive session teardown.
+    /// Publish the sleep segments a committed drain just staged, so they survive session teardown.
+    ///
+    /// The two arrays are ONE drain's two views of the same night (`coarse` = wear-gated motion
+    /// segments, `staged` = the preferred HR-aware hypnogram) and are therefore written as an atomic
+    /// pair: `ContentView.flushHealth()` picks `staged` when non-empty and falls back to `coarse`, so
+    /// letting the slots come from two different passes could leave a stale `staged` permanently
+    /// shadowing a fresher `coarse` (the flush only clears the slot after a write that produced
+    /// segments, and a cursor-filtered stale set produces none — it would never self-heal).
+    /// An empty member is therefore allowed to clear its slot ONLY when its pair-mate carries a real
+    /// publication from the same pass; a pass with nothing in either slot writes neither.
     func savePendingSleepSegments(coarse: [SleepSegment], staged: [SleepSegment]) {
+        guard !coarse.isEmpty || !staged.isEmpty else { return }
         if let data = try? JSONEncoder().encode(coarse) { defaults.set(data, forKey: pendingCoarseSleepKey) }
         if let data = try? JSONEncoder().encode(staged)  { defaults.set(data, forKey: pendingStagedSleepKey) }
     }
