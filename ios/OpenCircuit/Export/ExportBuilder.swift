@@ -337,11 +337,17 @@ enum ExportBuilder {
         // archive still holds every epoch of it. Scoping the coverage witness to the window-filtered
         // set would then silently drop the witness on exactly the export a triager asks for first.
         //
-        // BOUNDED, per the main-actor rule in this file's header. One read per DISTINCT ring in a
-        // 24-entry buffer (one on every install in the field), and each archive is capped by
-        // `EpochArchive.retention` at ~30 h ≈ 720 records × 23 B ≈ 17 KB. Decoding it once here and
-        // indexing the map is strictly LESS work than the previous per-section reload, not more,
-        // and nothing about it grows with install age or with the export's date range.
+        // BOUNDED, per the main-actor rule in this file's header. One read per DISTINCT ring named
+        // by the 24-entry evidence buffer, and each archive is capped by `EpochArchive.retention` at
+        // ~30 h ≈ 720 records × 23 B ≈ 17 KB. So the cost is O(distinct rings), and it grows with
+        // neither install age nor the export's date range.
+        //
+        // ⚠️ Stated as a bound, not as a saving, because review pushed on an earlier wording that
+        // claimed this is "strictly LESS work than the previous per-section reload". It is not:
+        // multi-ring pairing SHIPPED (this file's own `notes["ringIdentity"]` contemplates an
+        // install that paired more than one ring), so on a two-ring install this is two decodes
+        // where the old path did one. Two 17 KB decodes is still bounded and still trivial; the
+        // honest claim is the bound, not a comparison.
         let archivesByRing: [String: [BulkRecord]] = Dictionary(
             uniqueKeysWithValues: Set(allEvidence.map(\.ringID)).sorted()
                 .map { ($0, EpochArchiveStore(namespace: $0).load()) })

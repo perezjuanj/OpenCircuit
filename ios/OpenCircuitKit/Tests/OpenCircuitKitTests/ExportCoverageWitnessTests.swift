@@ -127,7 +127,10 @@ final class ExportCoverageWitnessTests: XCTestCase {
     /// unioning them into a coverage number neither ring earned.
     func testTwoRingArchivesAreNotMergedIntoOneWitness() {
         let wornRing = epochs(count: 72)
-        // The other ring was on a charger for the first half of the same window.
+        // The other ring contributed only 12 epochs to the same window — it covers the first 30
+        // minutes and then has nothing. (These ARE worn records; `epochs(count:)` builds no charging
+        // state, so this fixture says "recorded less", not "was on a charger". The witness must pick
+        // the archive that actually covers the night either way.)
         let otherRing = epochs(count: 12)
         let witness = ExportCoverageWitness.sampleTimes(
             archives: [otherRing, wornRing], storedHeartRateTimes: [], from: start, to: end)
