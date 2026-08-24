@@ -39,17 +39,23 @@ final class SleepEditTests: XCTestCase {
             && $0.end == t(12, 1, 13) })
     }
 
-    func testBoundsAreOnsetMinus3hToWakePlus3h() {
+    /// ⚠️ RE-BASELINED 2026-08-24: the editable bound is the ±6 h `strandedEditMargin` on each
+    /// edge's own recorded anchor. The ±3 h parity margin is still a FLOOR (asserted), but it is no
+    /// longer the limit — it was cancelling the stranded margin on any night spanning ≥ 8 h. See
+    /// `SleepEditInvariantTests.testAFullNightIsWidenedByTheStrandedMarginToo`.
+    func testBoundsAreOnsetMinus6hToWakePlus6h() {
         // Recorded: onset 0h, wake 8h.
         let b = SleepEdit.bounds(recordedOnset: at(0), recordedWake: at(8))
-        XCTAssertEqual(b.earliest, at(-3))
-        XCTAssertEqual(b.latest, at(11))
+        XCTAssertEqual(b.earliest, at(-6))
+        XCTAssertEqual(b.latest, at(14))
+        XCTAssertLessThanOrEqual(b.earliest, at(-3), "the ±3 h parity margin is a FLOOR")
+        XCTAssertGreaterThanOrEqual(b.latest, at(11), "the ±3 h parity margin is a FLOOR")
     }
 
     func testClampPinsToBounds() {
         let b = SleepEdit.bounds(recordedOnset: at(0), recordedWake: at(8))
-        XCTAssertEqual(SleepEdit.clamp(at(-5), to: b), at(-3))   // below → earliest
-        XCTAssertEqual(SleepEdit.clamp(at(20), to: b), at(11))   // above → latest
+        XCTAssertEqual(SleepEdit.clamp(at(-8), to: b), at(-6))   // below → earliest
+        XCTAssertEqual(SleepEdit.clamp(at(20), to: b), at(14))   // above → latest
         XCTAssertEqual(SleepEdit.clamp(at(2), to: b), at(2))     // inside → unchanged
     }
 
@@ -72,18 +78,18 @@ final class SleepEditTests: XCTestCase {
     }
 
     func testExactBoundaryIsAllowed() {
-        // Exactly onset−3h .. wake+3h is allowed (inclusive).
-        let w = SleepEdit.Window(inBedStart: at(-3), inBedEnd: at(11))
+        // Exactly onset−6h .. wake+6h is allowed (inclusive).
+        let w = SleepEdit.Window(inBedStart: at(-6), inBedEnd: at(14))
         XCTAssertNil(SleepEdit.validate(w, recordedOnset: at(0), recordedWake: at(8)))
     }
 
     func testStartTooEarlyRejected() {
-        let w = SleepEdit.Window(inBedStart: at(-3.5), inBedEnd: at(8))
+        let w = SleepEdit.Window(inBedStart: at(-6.5), inBedEnd: at(8))
         XCTAssertEqual(SleepEdit.validate(w, recordedOnset: at(0), recordedWake: at(8)), .startBeforeEarliest)
     }
 
     func testEndTooLateRejected() {
-        let w = SleepEdit.Window(inBedStart: at(0), inBedEnd: at(11.5))
+        let w = SleepEdit.Window(inBedStart: at(0), inBedEnd: at(14.5))
         XCTAssertEqual(SleepEdit.validate(w, recordedOnset: at(0), recordedWake: at(8)), .endAfterLatest)
     }
 

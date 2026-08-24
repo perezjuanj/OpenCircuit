@@ -331,11 +331,21 @@ final class SleepEditDataCoverageTests: XCTestCase {
 
     /// Pins the parity FLOOR inside the cap. With a long recorded night the cap arithmetic would
     /// otherwise be free to push `earliest` later than onset − 3 h.
+    ///
+    /// ⚠️ RE-BASELINED 2026-08-24. The no-coverage expectations were `onset − 3 h` / `wake + 3 h`,
+    /// which pinned the old rule that a long recorded night gets NO stranded margin because the
+    /// opposite-floor caps cancelled it. That cancellation was the defect behind "won't allow me to
+    /// edit wake time" — see `SleepEditInvariantTests`
+    /// `testAFullNightIsWidenedByTheStrandedMarginToo` for the measured night and the reasoning.
+    /// What this test is really for — the floor being a FLOOR that widening only ever adds to — is
+    /// unchanged and is still asserted below.
     func testParityFloorSurvivesTheCapOnALongNight() {
         let onset = d(3, 22, 0), wake = d(4, 8, 0)          // a 10 h night
         let noCoverage = SleepEdit.bounds(recordedOnset: onset, recordedWake: wake)
-        XCTAssertEqual(noCoverage.earliest, d(3, 19, 0), "exactly onset − 3 h")
-        XCTAssertEqual(noCoverage.latest, d(4, 11, 0), "exactly wake + 3 h")
+        XCTAssertEqual(noCoverage.earliest, d(3, 16, 0), "onset − 6 h (stranded margin, own anchor)")
+        XCTAssertEqual(noCoverage.latest, d(4, 14, 0), "wake + 6 h (ditto)")
+        XCTAssertLessThanOrEqual(noCoverage.earliest, d(3, 19, 0), "onset − 3 h is a FLOOR")
+        XCTAssertGreaterThanOrEqual(noCoverage.latest, d(4, 11, 0), "wake + 3 h is a FLOOR")
 
         let wide = SleepEdit.bounds(recordedOnset: onset, recordedWake: wake,
                                     dataCoverage: d(2, 20, 0)...d(4, 20, 0))
