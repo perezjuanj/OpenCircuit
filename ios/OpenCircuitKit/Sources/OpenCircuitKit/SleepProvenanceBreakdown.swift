@@ -15,9 +15,14 @@
 // THREE BUCKETS, NOT TWO, AND THE THIRD IS LOAD-BEARING. `.asserted` is a claim over ground we can
 // PROVE holds no records, and it is the only thing excluded from a derived number. Ground our
 // retained records cannot reach is `.assertedCoverageUnknown` and lands in its own `unknown*`
-// bucket: counted in the display total, published to Health, never quoted as either measurement or
-// hole. Collapsing it into `asserted` is precisely how retention got read as absence (measured: 403
-// asleep-minutes to 0.0 in Apple Health — see `MeasuredCoverage.trusted(for:)`).
+// bucket: counted in the display total, published to Health unlabelled, never quoted as either
+// measurement or hole. Collapsing it into `asserted` is precisely how retention got read as absence
+// (measured: 403 asleep-minutes to 0.0 in Apple Health — see `MeasuredCoverage.trusted(for:)`).
+//
+// ⚠️ "EXCLUDED FROM A DERIVED NUMBER" IS NOT "KEPT OUT OF APPLE HEALTH" — not since 2026-08-24.
+// Asserted sleep reaches Health tagged `HKMetadataKeyWasUserEntered`; what it stays out of is
+// efficiency, the score, the stage minutes and the headache features, all of which are computed
+// here. `SleepHealthPublication` at the bottom of this file owns the Health half.
 //
 // 🟢 WORKED EXAMPLE, re-derived from raw bytes 2026-08-20 (`R2_2026-08-18`, Gen 2 Air, Europe/Paris):
 //   in-bed window 23:24 → 06:43 (439 min), of which 195.1 min is covered ground (fraction 0.444)
@@ -235,6 +240,34 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
     }
 }
 
+/// One night's segments, split by what Apple Health must be told about each of them.
+///
+/// Three buckets, and the third is kept EMPTY on purpose. `withheld` is what this app declines to
+/// write at all; today's rule withholds nothing, but the concept is load-bearing — its one consumer
+/// is a DELETE-EXCLUSION predicate (`HealthKitWriter.deletePriorEditedNightSleep`), and a rule that
+/// ever starts withholding again must not also start deleting across the ground it withheld.
+/// Deriving the predicate's input from this partition rather than from a free-standing filter is
+/// what keeps those two answers married.
+public struct SleepHealthPublication: Equatable, Sendable {
+    /// Written as ordinary samples: the ring measured this ground, or we cannot prove it did not.
+    public let measured: [SleepSegment]
+    /// Written with `HKMetadataKeyWasUserEntered: true` — the wearer's own account of ground we can
+    /// PROVE holds no records.
+    public let userEntered: [SleepSegment]
+    /// Not written at all. Empty under today's rule; see the type's note.
+    public let withheld: [SleepSegment]
+    /// Everything that reaches Health, in the caller's original order.
+    public let published: [SleepSegment]
+
+    public init(measured: [SleepSegment], userEntered: [SleepSegment],
+                withheld: [SleepSegment], published: [SleepSegment]) {
+        self.measured = measured
+        self.userEntered = userEntered
+        self.withheld = withheld
+        self.published = published
+    }
+}
+
 public extension Array where Element == SleepSegment {
     /// Everything except claims over nothing — the filter for a DERIVED STATISTIC.
     ///
@@ -243,46 +276,104 @@ public extension Array where Element == SleepSegment {
     /// span is a user claim we have no reason to doubt. Use `healthPublishable` there.
     var measuredOnly: [SleepSegment] { filter { $0.provenance.hasMeasurement } }
 
-    /// What may be written to Apple Health.
+    /// HOW THIS NIGHT IS SPLIT FOR APPLE HEALTH — the single place that decides what reaches Health
+    /// and how each sample must be tagged. `healthPublishable` and `withheldSpans` are both derived
+    /// from it, so "what we write" and "what we declined to write" can never disagree.
     ///
-    /// Keeps the WHOLE `.inBed` layer — asserted or not — because in-bed is a statement about where
-    /// the body was, the user is the better authority, and we hold no competing measurement. Drops
-    /// every other segment whose ground holds no records: an `.asleepCore` block over a four-hour
-    /// hole is the defect, and an `.awake` block over the same hole is the same claim in the other
-    /// direction. Both spans remain covered by the `.inBed` sample, which is exactly how Apple's own
-    /// Sleep UI represents "in bed, not known to be asleep".
+    /// ⚠️ 2026-08-24: THIS WAS A FILTER AND IS NOW A PARTITION, AND THE CHANGE IS DELIBERATE. Build
+    /// 47 DROPPED every non-`.inBed` segment over proven-empty ground. The maintainer reversed that
+    /// half of the decision after the tester report this partition exists for: she corrected a night
+    /// the ring had stopped recording through, and her correction never reached Apple Health while
+    /// the official RingConn app's did. Sleep the wearer asserts over ground the ring did not record
+    /// now REACHES Health — as the stage her edit assigned, carrying
+    /// `HKMetadataKeyWasUserEntered: true` so the sample states its own provenance to every reader.
     ///
-    /// Deliberately NOT `.asleepUnspecified`: every reader that reports "time asleep" — Apple's
-    /// Sleep UI included — sums `asleepCore + asleepDeep + asleepREM + asleepUnspecified`, so it
-    /// would land in third-party totals identically to `.asleepCore`. It looks like a compromise and
-    /// functions as the status quo.
+    /// What did NOT change is the honest accounting: `.asserted` time is still excluded from every
+    /// derived number here (clause 3), still named on the Sleep card, and still distinguishable in
+    /// Health itself. What changed is that we no longer silently subtract a wearer's own account of
+    /// her night from the one surface she checks it against.
     ///
-    /// ⚠️ `.assertedCoverageUnknown` PUBLISHES. Only a PROVEN hole is withheld. Ground our retained
-    /// records cannot reach is written exactly as the pre-provenance build wrote it — see
-    /// `MeasuredCoverage.trusted(for:)` for the 403-minutes-to-zero measurement that rule exists for.
-    var healthPublishable: [SleepSegment] {
-        filter { $0.stage == .inBed || !$0.provenance.isProvenUnmeasured }
+    /// The `.inBed` layer is published whole either way — in-bed is a statement about where the body
+    /// was, the user is the better authority, and we hold no competing measurement. The part of it
+    /// sitting over a PROVEN hole is tagged like any other asserted span: the tag answers "who says
+    /// so", and there the answer is her, whatever the stage. The rest of the layer
+    /// (`.assertedOverMeasured` — her boundary over ground the ring recorded) is not tagged, because
+    /// there the ring corroborates her.
+    ///
+    /// ⚠️ THE TAG DOES NOT EXCLUDE THE SAMPLE FROM APPLE'S "TIME ASLEEP", AND THAT IS THE ACCEPTED
+    /// CONSEQUENCE OF THE DECISION — not an oversight. 🟢 On the 2026-08-24 tester night her Health
+    /// headline goes back to the card's 434 min: 218 measured + 216 tagged, once
+    /// `SleepProvenanceRederivation` has reclaimed the 1350 s her archive filled in after she saved
+    /// (195 + 239 without it — the split her export was frozen at).
+    /// `HKMetadataKeyWasUserEntered` is a provenance flag, not a filter: every reader that reports
+    /// time asleep still sums the sample.
+    ///
+    /// It is also why the tagged samples keep the STAGE her edit assigned instead of collapsing to
+    /// `.asleepUnspecified`. That was considered as a middle ground and rejected on the same
+    /// arithmetic: Apple's Sleep UI sums `asleepCore + asleepDeep + asleepREM + asleepUnspecified`,
+    /// so it would change no total anywhere while discarding the one thing the wearer actually told
+    /// us. (Until 2026-08-24 this paragraph used that argument to reject `.asleepUnspecified` in
+    /// favour of publishing NOTHING; the argument survives the reversal, the conclusion does not.)
+    var healthPublication: SleepHealthPublication {
+        var measured: [SleepSegment] = []
+        var userEntered: [SleepSegment] = []
+        for segment in self {
+            // ONE PREDICATE, EVERY STAGE. A `.asleepCore` block over a four-hour hole, an `.awake`
+            // block over the same hole and the `.inBed` span across it are the same claim by the
+            // same person; splitting them by stage would mean two of the three carried her name and
+            // one did not. `.assertedCoverageUnknown` is NOT tagged: "we cannot say whether the ring
+            // recorded here" is not "she told us", and mislabelling it would make every night older
+            // than the ~30 h archive look hand-entered.
+            if segment.provenance.isProvenUnmeasured {
+                userEntered.append(segment)
+            } else {
+                measured.append(segment)
+            }
+        }
+        return SleepHealthPublication(measured: measured, userEntered: userEntered,
+                                      withheld: [], published: self)
     }
+
+    /// What may be written to Apple Health — every segment, since the partition above withholds
+    /// nothing. Kept as the write set (and as the set the watermarks are pinned from) so a future
+    /// rule that DOES withhold something is honoured at both places by construction.
+    var healthPublishable: [SleepSegment] { healthPublication.published }
+
+    /// The subset of `healthPublishable` that must carry `HKMetadataKeyWasUserEntered: true`.
+    var healthUserEntered: [SleepSegment] { healthPublication.userEntered }
 
     /// True when any segment is a claim over ground we can PROVE holds no records.
     var containsAssertedTime: Bool { contains { $0.provenance.isProvenUnmeasured } }
 
-    /// Asleep seconds that would reach Health today but must not — the retraction quantity.
+    /// Asleep seconds that reach Health as the WEARER'S OWN ENTRY — tagged
+    /// `HKMetadataKeyWasUserEntered`, counted in Apple's Time Asleep, and named on the Sleep card.
+    ///
+    /// Until 2026-08-24 this was the RETRACTION quantity: the same seconds, withheld instead of
+    /// tagged. The number is unchanged and so is its meaning ("asleep over ground we can prove holds
+    /// no records") — only its destination changed, which is why the breadcrumb that prints it and
+    /// the two device nights it was measured on still line up.
     var unmeasuredAsleepSeconds: TimeInterval {
         let asleep: Set<SleepStage> = [.asleepCore, .asleepDeep, .asleepREM]
         return filter { asleep.contains($0.stage) && $0.provenance.isProvenUnmeasured }
             .reduce(0) { $0 + Swift.max(0, $1.duration) }
     }
 
-    /// The spans this app is DECLINING to publish — the exact ground a coverage-driven shrink
-    /// removes from a Health write. Merged, so overlapping stage/in-bed views of one hole count once.
+    /// The spans this app is DECLINING to publish — the exact ground a coverage-driven shrink would
+    /// remove from a Health write. Merged, so overlapping stage/in-bed views of one hole count once.
     ///
     /// ⚠️ ITS ONE PRODUCTION CONSUMER IS A DELETE PREDICATE, AND THAT IS THE POINT. Withholding a
     /// span from our own write is reversible — the next sync can add it. Deleting Apple Health
     /// samples across the same span is not, and it would take with it whatever an earlier, better-
     /// informed run of this app had already written there. See `deletePriorEditedNightSleep`.
+    ///
+    /// ⚠️ 2026-08-24: IT IS DERIVED FROM `healthPublication.withheld`, SO IT IS EMPTY TODAY, AND
+    /// KEEPING IT HONEST IS WHY. Asserted sleep is now PUBLISHED (tagged user-entered) rather than
+    /// withheld. Had this stayed a free-standing "asserted spans" filter it would have gone on
+    /// naming ground we DO write — and the delete-exclusion it feeds would then protect the freshly
+    /// written samples from the very cleanup that removes the PREVIOUS write over the same ground.
+    /// Every re-edit and every re-derivation would leave a duplicate night in Apple Health.
     var withheldSpans: [DateInterval] {
-        let spans = filter { $0.provenance.isProvenUnmeasured && $0.end > $0.start }
+        let spans = healthPublication.withheld.filter { $0.end > $0.start }
             .map { $0.start ..< $0.end }
         return MeasuredCoverage(intervals: spans).intervals
             .map { DateInterval(start: $0.lowerBound, end: $0.upperBound) }
