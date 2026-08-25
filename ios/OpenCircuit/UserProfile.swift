@@ -30,9 +30,14 @@ struct UserProfileSettingsView: View {
     // Height is edited via local feet/inches buffers, seeded from `heightCm` on appear and
     // written back on change. Binding the text fields straight to a `heightCm`-derived value
     // reset them on every keystroke (the shared @AppStorage write re-rendered the field
-    // mid-edit), which made the inches field nearly uneditable — couldn't enter 10/11.
+    // mid-edit), which made the inches field nearly uneditable — couldn't enter 10/11. The
+    // imperial weight field below had the identical problem for any 2+ digit value.
     @State private var heightFeetInput = 0
     @State private var heightInchesInput = 0
+    /// Local lb editing buffer, seeded from `weightKg` on appear — mirrors the ft/in buffers
+    /// above for the same reason (a live `weightKg`-converting Binding reset the field on
+    /// every keystroke, so only the first digit of e.g. "250" would ever stick).
+    @State private var weightLbInput = 0
 
     /// Presents the onboarding/welcome flow again from About ▸ "How it works" (#103).
     @State private var showOnboarding = false
@@ -178,11 +183,19 @@ struct UserProfileSettingsView: View {
                                 .multilineTextAlignment(.trailing)
                             Text("kg").foregroundStyle(.secondary)
                         } else {
-                            TextField("lb", value: weightLb, format: .number.precision(.fractionLength(0)))
-                                .keyboardType(.decimalPad)
+                            TextField("lb", value: $weightLbInput, format: .number)
+                                .keyboardType(.numberPad)
                                 .multilineTextAlignment(.trailing)
+                                .onChange(of: weightLbInput) { _, _ in commitWeight() }
                             Text("lb").foregroundStyle(.secondary)
                         }
+                    }
+                    // Seed the lb buffer from the current `weightKg` when the imperial field is
+                    // (or becomes) visible — on first appear AND when the user flips the unit
+                    // picker to imperial — mirroring the height ft/in seeding below (#151).
+                    .onAppear { if bodyUnit == .imperial { seedWeightInput() } }
+                    .onChange(of: bodyUnitRaw) { _, newRaw in
+                        if newRaw == BodyUnit.imperial.rawValue { seedWeightInput() }
                     }
                 }
                 LabeledContent("Height") {
@@ -740,9 +753,16 @@ struct UserProfileSettingsView: View {
     private static let lbPerKg = 2.2046226218
     private static let cmPerIn = 2.54
 
-    private var weightLb: Binding<Double> {
-        Binding(get: { weightKg * Self.lbPerKg },
-                set: { weightKg = max($0, 0) / Self.lbPerKg })
+    /// Seed the local lb editing field from the stored weight. Done on appear (and when the
+    /// unit picker switches to imperial) so the text field holds its own state and typing
+    /// isn't reset by the shared `weightKg` store — see `weightLbInput` above (#151).
+    private func seedWeightInput() {
+        weightLbInput = Int((weightKg * Self.lbPerKg).rounded())
+    }
+
+    /// Write the local lb field back to `weightKg`, clamping to non-negative.
+    private func commitWeight() {
+        weightKg = Double(max(weightLbInput, 0)) / Self.lbPerKg
     }
 
     /// Total height in whole inches (rounded), the basis for the ft/in split.
