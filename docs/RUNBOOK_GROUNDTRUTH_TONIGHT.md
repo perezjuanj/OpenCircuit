@@ -35,13 +35,20 @@ RingConn's cloud. Syncing would drain ring history and move the ring's single re
 which is how we've previously shredded our own nights. Reading history costs nothing; syncing
 costs a night.
 
-### A1. Proxy setup (~20 min, laptop + phone on the same Wi-Fi)
+### A1. Start the capture (~5 min — everything is pre-staged)
+
+mitmproxy is installed (12.2.3) and its CA is already generated at `~/.mitmproxy/`. Run:
+
 ```bash
-brew install mitmproxy
-ipconfig getifaddr en0        # note this IP
-mitmweb --listen-port 8080    # UI opens at http://127.0.0.1:8081
+./desktop/capture_groundtruth.sh
 ```
-Phone → **Wi-Fi → your network → ⚙ → Proxy → Manual** → hostname = the IP above, port = `8080`.
+
+It prints this Mac's current Wi-Fi IP and the exact phone settings, then starts the proxy
+with an addon that **saves each hypnogram automatically** — you never open the mitmweb UI
+and never right-click-export anything. Every night you tap prints a `✅ SAVED <date>` line
+with its stage histogram.
+
+On the phone: **Wi-Fi → your network → ⚙ → Proxy → Manual** → hostname and port as printed.
 
 Then phone browser → **http://mitm.it** → download + install the **Android** cert via
 **Settings → Security → Encryption & credentials → Install a certificate → CA certificate**.
@@ -55,16 +62,20 @@ Browse to any `https://` site on the phone. It should appear in mitmweb.
 
 ### A3. Capture the nights
 Open the RingConn app and tap into the **Sleep detail** for each target night. *Opening that
-screen* is what triggers the fetch — one tap per night.
-
-In mitmweb, filter for `ringconn` and look for a request whose path contains `sleep`. Click it →
-**Response** → confirm the body contains `sleepPhases`. Save each response body as:
+screen* is what triggers the fetch — one tap per night. Watch the terminal; each night saves
+itself to `desktop/captures/groundtruth_sleep_<YYYYMMDD>.json` (named by **wake-up date**) and
+prints a line like:
 
 ```
-desktop/captures/groundtruth_sleep_<YYYYMMDD>.json
+[groundtruth] ✅ SAVED 20260819  (78 phases: AWAKE=2 AWAKE_IN_BED=4 DEEP=12 LIGHT=50 REM=10)
 ```
 
-`<YYYYMMDD>` = the **wake-up date** (the morning you got up), matching the list below.
+That histogram is your live confirmation the night is real and not an empty stub. Re-tapping a
+night is safe — a capture is never replaced by one with fewer phases.
+
+When you Ctrl-C, it prints a summary of everything captured, or — if nothing was — tells you
+*which* failure you hit (no traffic at all / traffic but no RingConn / RingConn but no
+hypnogram, with the paths it did see).
 
 **Priority list — the 14 nights we already hold your raw ring bytes for.** These pair
 immediately; anything else is a bonus.
