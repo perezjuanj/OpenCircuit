@@ -1,5 +1,31 @@
 # Runbook — capture RingConn's computed hypnogram (sleep ground truth)
 
+> # ❌ DEAD — DO NOT FOLLOW THIS RUNBOOK (proven on device 2026-08-24)
+>
+> The RingConn app has **no data for a night OpenCircuit drained**. Verified on Juan's own
+> iPhone with TLS interception fully working (92 decrypted HTTPS requests, 0 handshake
+> failures) — RingConn showed **no night at all for 2026-08-19**, a night we hold 454 raw
+> records for, and its history stopped at 2026-07-11.
+>
+> The ring has ONE resume pointer. Whoever drains a night gets it, and RingConn computes its
+> hypnogram *from the raw data it received*. **So a night we have bytes for is exactly a night
+> RingConn cannot have staged** — the two halves this runbook needs are mutually exclusive as
+> long as we honour the sole-syncer rule. Neither capture order rescues it.
+>
+> ⚠️ This RESOLVES §2's open question against the optimistic reading: `ack-implies-retain`
+> wins over `sync-cursor-and-app-behavior`. The official app **cannot** re-read a night we
+> already drained and acked. **§2's "sidestep it — same morning, in this order" advice is
+> therefore WRONG** and predates the test.
+>
+> Ground truth now comes from a **Helio strap worn alongside the ring** — an independent
+> device on the same nights, which is strictly better: RingConn's hypnogram was only ever
+> derived from the same raw ring signals we already decode, so it was never an independent
+> opinion in the first place.
+>
+> The capture plumbing itself works and is kept for any future app-traffic job:
+> `desktop/capture_groundtruth.sh` + `desktop/mitm_sleep_capture.py`.
+
+
 Goal: capture the **per-epoch sleep stages RingConn computes on-device** so we can FIT
 our staging to reproduce them. RingConn runs its hypnogram algorithm on the ring, syncs
 the result to its cloud, and the app fetches it back as a `sleepPhases` JSON array. We
