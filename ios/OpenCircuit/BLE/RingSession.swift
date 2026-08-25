@@ -352,6 +352,15 @@ final class RingSession: NSObject {
     /// Pages received by the channel currently being drained. Unlike `bulkRecords.count`, this also
     /// advances for `0x47` optical pages and channel-0x02 `0x4d` sport pages.
     private var activeDrainPageCount = 0
+    /// 0x4c pages this SESSION acked whose XOR trailer did not validate, so `BulkSleep.records`
+    /// yielded nothing decodable. The ack advances the ring's single shared resume pointer, so each
+    /// one is permanently unrecoverable history — and until now it left no trace at all: the 0x4d
+    /// path logs `invalid page (acked, not decoded)`, the 0x4c path logged only `records=<unchanged>`,
+    /// which is indistinguishable from a valid page that legitimately carried no records. Cumulative
+    /// for the life of the session (NOT per drain) so a page corrupted between drains — during a
+    /// `livePreparing` enter-drain or an unattributed page — is still reported by the next drain that
+    /// finishes; per-drain deltas are recoverable by differencing successive `history-drain` events.
+    private var corruptPage4CCount = 0
     /// COARSE sleep segments from the motion channel (inBed/asleepCore/awake, no HR onset
     /// trim). The fallback for HealthKit/store when no HR-staged block exists. Its non-emptiness
     /// also doubles as the wear gate (#41) — empty on a charging/off-wrist night.
@@ -1843,8 +1852,13 @@ final class RingSession: NSObject {
         // 🟢 What it buys, measured on the tester night this exists for (R2_2026-08-18): the same
         // 403-minute headline is still displayed — the user asserted it and an assertion wins for
         // display — but 241.4 of those minutes are now tagged `.asserted` over a 4 h hole holding
-        // 2 of ~98 expected epochs, so they stay out of the stage minutes, out of efficiency, out
-        // of the score, and out of Apple Health.
+        // 2 of ~98 expected epochs, so they stay out of the stage minutes, out of efficiency and
+        // out of the score.
+        // ⚠️ NOT out of Apple Health — that clause was true until the 2026-08-24 reversal and is
+        // the one place a reader is most likely to look. Those 241.4 minutes now DO reach Health,
+        // written as sleep and tagged `HKMetadataKeyWasUserEntered` so the sample carries its own
+        // provenance rather than being silently dropped (see `SleepHealthPublication`). The label
+        // is what keeps the claim honest now; the withholding no longer is.
         let coverageOfRecord = MeasuredCoverage(records: epochArchiveStore.load())
         let segments = SleepEdit.recompute(baseSegments: base, times: times,
                                            coverage: coverageOfRecord)
@@ -1945,7 +1959,42 @@ final class RingSession: NSObject {
         // Naps are detected over the whole drained window (independent of the overnight gate)
         // so a daytime-only sync still records them, never folded into the main night (#76).
         persistNaps(store: localStore)
+        // A PREVIOUSLY EDITED night may have been scored against a SHORTER archive than the one we
+        // now hold — see below. Runs here because this is the one function every commit path and
+        // every re-stage passes through, and it is the moment the archive is at its widest.
+        rederiveEditedNightProvenance(store: localStore)
         // Steps are accumulated live in didUpdateValue (addDailySteps) — nothing to do here.
+    }
+
+    /// Re-score any manually-edited night whose provenance was decided when the archive was shorter
+    /// than it is now, and queue the Apple Health rewrite.
+    ///
+    /// 🟢 THE CASE (2026-08-24, Gen 2 Air FR04.009): she saved a corrected wake at 06:50 while the
+    /// newest archived record was 02:42:47, so everything after it was labelled `.asserted` — a
+    /// PROVEN hole. Nine more records covering 02:48:53 → 03:11:23 arrived on the 04:53Z / 04:59Z /
+    /// 05:08Z drains, so 1350 s of that "proven hole" was measurable data within the hour, and
+    /// nothing in the app ever went back to look.
+    ///
+    /// Built from the WHOLE archive and passed RAW — not `MeasuredCoverage.trusted(for:)`. The guard
+    /// exists to stop retention being read as ABSENCE; this pass reads PRESENCE only (records exist
+    /// here now), and retention can delete records but cannot invent them. `upgraded` cannot express
+    /// a shrink, so the 403-asleep-minutes-to-0.0 failure the guard was written for is unreachable
+    /// through it.
+    private func rederiveEditedNightProvenance(store: LocalStore) {
+        let archive = epochArchiveStore.load()
+        guard !archive.isEmpty else { return }
+        guard let changed = try? store.rederiveEditedNightProvenance(
+            coverage: MeasuredCoverage(records: archive)), !changed.isEmpty else { return }
+        for change in changed {
+            // The night KEY only (a start-of-day stamp), never a clock time — this line goes to the
+            // system log, where the rest of the sleep breadcrumbs keep the same coarse granularity.
+            ringLog.notice("""
+                sleep-provenance: re-derived night \
+                \(change.night.timeIntervalSince1970, privacy: .public) — \
+                \(Int(change.upgradedAsleepSeconds.rounded()), privacy: .public) s of asserted sleep \
+                now has records under it (Health rewrite queued)
+                """)
+        }
     }
 
     /// Compute the Wave-1 sleep analytics for the night being persisted (#69/#70/#71): nightly
@@ -3699,8 +3748,12 @@ final class RingSession: NSObject {
             // a background task expiry or session reconnect clears the in-memory arrays and
             // `flushHealth()` fires with empty segments — sleep is permanently stranded in
             // StoredSleepSummary and never reaches HealthKit. The `.sleep` cursor prevents re-writes.
+            // A pass that staged NOTHING is a no-op inside the store (it must not erase the last-good
+            // fallback — see `savePendingSleepSegments`), so say which of the two happened rather than
+            // logging "saved 0" for a write that never ran.
+            let publishedSegments = !sleepSegments.isEmpty || !stagedSegments.isEmpty
             epochArchiveStore.savePendingSleepSegments(coarse: sleepSegments, staged: stagedSegments)
-            ringLog.notice("sleep-persist: saved coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count) segments to archive (survives teardown)")
+            ringLog.notice("sleep-persist: \(publishedSegments ? "saved" : "STAGED NOTHING — kept previously persisted", privacy: .public) coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count) segments to archive (survives teardown)")
             print("[OC] sleep COMMITTED coarse=\(self.sleepSegments.count) staged=\(self.stagedSegments.count)")
             // #204: "committed" now means the STORE took it, not that we walked the stage path.
             committedSleep = lastSleepPersistOutcome?.wroteRow ?? false
@@ -4011,9 +4064,14 @@ final class RingSession: NSObject {
         trace.exitReason = exitReason
         drainTraces.append(trace)
         let outcome = trace.outcome.rawValue
+        // `4cBad` is the SESSION-cumulative count of acked-but-undecodable 0x4c pages (see
+        // `corruptPage4CCount`). Reported here rather than as its own event so a burst of corrupt
+        // pages cannot flood the observability ring buffer and evict the very evidence it explains —
+        // one field on an event that already fires once per channel drain, and it is what turns
+        // "this drain added fewer records than the ring had" into an attributable cause.
         observability.recordMetricEvent(
             source: "history-drain",
-            detail: "trigger=\(historySyncTrigger) label=\(trace.label) outcome=\(outcome) ack=\(trace.sawSyncAck) 4c=\(trace.page4CCount) 47=\(trace.page47Count) 50=\(trace.endMarkerCount) added=\(trace.recordsAdded)"
+            detail: "trigger=\(historySyncTrigger) label=\(trace.label) outcome=\(outcome) ack=\(trace.sawSyncAck) 4c=\(trace.page4CCount) 4cBad=\(corruptPage4CCount) 47=\(trace.page47Count) 50=\(trace.endMarkerCount) added=\(trace.recordsAdded)"
         )
         activeDrainTrace = nil
     }
@@ -4565,6 +4623,19 @@ extension RingSession: CBPeripheralDelegate {
                 // silent, permanent data loss — it cost two testers a whole night each on
                 // 2026-08-04. See `unattributedBuffer` for the measured evidence.
                 let pageRecords = BulkSleep.records(fromPage: bytes)
+                // …and NAME the one state where ack-vs-retention legitimately cannot agree: a page
+                // whose XOR trailer doesn't validate. `BulkSleep.records(fromPage:)` returns `[]` for
+                // BOTH "structurally corrupt" and "valid page that carried no whole 23-byte record",
+                // so `pageRecords.isEmpty` alone cannot tell them apart — `Frame.parse` is the
+                // discriminator (we are inside `case 0x4C`, so `bytes[0]` already matches
+                // `Frame.responseID(Opcode.page4C)`; only the trailer/length check can fail here).
+                // ⚠️ This is OBSERVABILITY ONLY. The `write(Command.pageAck4C)` below stays
+                // unconditional on purpose — it is what keeps the drain flowing, and this project has
+                // a documented history of drain-flow regressions. Mirrors the 0x4d treatment below.
+                if pageRecords.isEmpty, Frame.parse(bytes) == nil {
+                    self.corruptPage4CCount += 1
+                    ringLog.warning("← 0x4c sleep page (\(bytes.count)B): invalid page (acked, not decoded) — sessionTotal=\(self.corruptPage4CCount)")
+                }
                 if self.syncing || self.livePreparing {   // keep records during a sync OR a live-enter drain
                     self.bulkRecords += pageRecords
                     self.syncQuietTicks = 0

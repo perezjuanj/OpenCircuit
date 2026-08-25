@@ -39,6 +39,13 @@ deletes-then-rewrites (HealthKit is append-only) and a delete removes the sample
   You cannot detect denial vs absence of data, so design for partial grants.
 - **Sleep modeling.** HealthKit represents a night as many contiguous
   `sleepAnalysis` category samples (one per stage segment), not one summary record.
+- **Sleep provenance (2026-08-24).** When a wearer edits a night, the part of it over
+  ground the epoch archive PROVES holds no records is written with
+  `HKMetadataKeyWasUserEntered: true`; everything else goes in unlabelled. The flag is
+  provenance only — Apple's "Time Asleep" still sums those samples — so a corrected night
+  reaches Health in full while a reader can still tell which minutes came from the wearer.
+  Manually ADDED naps carry the same flag. 🟢 Reversal of build 47, which withheld those
+  samples entirely; see `SleepHealthPublication`.
 - **Derived vs raw.** Metrics openwhoop *computes* (sleep detection, strain, stress)
   are written from the Swift-ported analytics; raw device metrics are written as-is.
   Decide per-metric whether the ring already reports it or we derive it.

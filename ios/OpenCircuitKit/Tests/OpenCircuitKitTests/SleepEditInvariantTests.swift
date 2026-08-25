@@ -93,18 +93,23 @@ final class SleepEditInvariantTests: XCTestCase {
 
             XCTAssertLessThanOrEqual(b.earliest, floorEarliest, "the ±3 h parity floor is a FLOOR")
             XCTAssertGreaterThanOrEqual(b.latest, floorLatest, "the ±3 h parity floor is a FLOOR")
-            XCTAssertGreaterThanOrEqual(b.earliest, floorLatest.addingTimeInterval(-span),
-                                        "an edge may not pass one night-span beyond the opposite floor")
-            XCTAssertLessThanOrEqual(b.latest, floorEarliest.addingTimeInterval(span),
-                                     "an edge may not pass one night-span beyond the opposite floor")
+            // ⚠️ RE-BASELINED 2026-08-24. This used to assert "an edge may not pass one night-span
+            // beyond the OPPOSITE floor". That coupling is exactly what cancelled the stranded
+            // margin on any night spanning ≥ 8 h (see
+            // `testAFullNightIsWidenedByTheStrandedMarginToo`). The bound that replaces it is each
+            // edge's OWN anchor plus the stranded margin — a constant, so still no seesaw — while
+            // `span` continues to clip `dataCoverage`, which is what it was really for.
+            XCTAssertGreaterThanOrEqual(b.earliest,
+                                        at(o).addingTimeInterval(-SleepEdit.strandedEditMargin),
+                                        "no coverage was supplied, so nothing may reach past the "
+                                        + "stranded margin on the edge's own anchor")
+            XCTAssertLessThanOrEqual(b.latest, at(wk).addingTimeInterval(SleepEdit.strandedEditMargin),
+                                     "ditto on the late edge")
+            _ = span
 
-            // The exact rule, spelled out: the stranded margin, clipped by the caps above.
-            let wantEarliest = min(floorEarliest,
-                                   max(at(o).addingTimeInterval(-SleepEdit.strandedEditMargin),
-                                       floorLatest.addingTimeInterval(-span)))
-            let wantLatest = max(floorLatest,
-                                 min(at(wk).addingTimeInterval(SleepEdit.strandedEditMargin),
-                                     floorEarliest.addingTimeInterval(span)))
+            // The exact rule, spelled out: the parity floor, widened by the stranded margin.
+            let wantEarliest = min(floorEarliest, at(o).addingTimeInterval(-SleepEdit.strandedEditMargin))
+            let wantLatest = max(floorLatest, at(wk).addingTimeInterval(SleepEdit.strandedEditMargin))
             XCTAssertEqual(b.earliest.timeIntervalSince1970, wantEarliest.timeIntervalSince1970,
                            accuracy: 0.1)
             XCTAssertEqual(b.latest.timeIntervalSince1970, wantLatest.timeIntervalSince1970,
@@ -119,27 +124,83 @@ final class SleepEditInvariantTests: XCTestCase {
         }
     }
 
-    /// A night that already fills `maxNightSpan` must be BIT-IDENTICAL to the pre-stranded-margin
-    /// rule. This is the blast-radius bound on the 2026-08-22 widening: it touches truncated nights
-    /// only, and cannot move the editor on a night that recorded properly.
-    func testAFullNightIsUnchangedByTheStrandedMargin() {
+    /// ⚠️ RE-BASELINED 2026-08-24. This test used to assert the OPPOSITE — that a night already
+    /// filling `maxNightSpan` is bit-identical to the pre-stranded-margin rule, because the margin
+    /// was clipped by the opposite-floor caps and so "touched truncated nights only".
+    ///
+    /// That blast-radius bound was the DEFECT, not the guarantee. 🟢 Measured on the Gen 2
+    /// (FR02.018) tester night of 2026-08-24: the clipped ceiling is
+    /// `recordedWake + max(3 h, min(6 h, 11 h − recordedSpan))`, so any recorded span ≥ 8 h cancels
+    /// the margin outright. Her night spanned 8 h 05 m 49 s and her wake picker stopped at 07:40:38,
+    /// which is the report this was re-baselined for ("won't allow me to edit wake time").
+    ///
+    /// The old rule used the recorded SPAN as evidence that the recording had not been truncated.
+    /// But a wearer only opens this editor when the recorded night is WRONG, and hers read 8 h only
+    /// because staging had absorbed her evening — so the evidence was drawn from the very number
+    /// being corrected, and the editor was tightest exactly where detection was worst.
+    ///
+    /// The margin is now granted on each edge's own anchor, after the caps. What the caps still
+    /// clip is `dataCoverage` — see `testLateEdgeIsCappedAtOneNightSpan`, which still passes and is
+    /// what stops an evening claim.
+    func testAFullNightIsWidenedByTheStrandedMarginToo() {
         let b = SleepEdit.bounds(recordedOnset: at(0), recordedWake: at(8))
-        XCTAssertEqual(b.earliest, at(-3), "onset − 3 h, exactly as before")
-        XCTAssertEqual(b.latest, at(11), "wake + 3 h, exactly as before")
+        XCTAssertEqual(b.earliest, at(-6), "onset − 6 h: the margin is no longer span-dependent")
+        XCTAssertEqual(b.latest, at(14), "wake + 6 h: ditto")
+        // The parity floor is still a FLOOR, not the rule.
+        XCTAssertLessThanOrEqual(b.earliest, at(-3))
+        XCTAssertGreaterThanOrEqual(b.latest, at(11))
     }
 
-    /// INVARIANT 6: validate's accept/reject boundary is exactly the ±3 h rule — a property sweep, not
-    /// a single case, so the limit can't quietly drift.
+    /// INVARIANT 6: validate's accept/reject boundary is exactly `bounds`, swept rather than spot-
+    /// checked so the limit cannot quietly drift.
+    ///
+    /// ⚠️ RE-BASELINED 2026-08-24 with `testAFullNightIsWidenedByTheStrandedMarginToo`: the boundary
+    /// is the ±6 h stranded margin, not the ±3 h parity floor. The sweep is widened past it so the
+    /// REJECT side is still exercised — a sweep that stopped at ±6 h would assert only accepts and
+    /// go vacuous.
     func testValidateBoundaryProperty() {
         let onset = at(0), wake = at(8)
-        // Start edge: allowed iff ≥ onset−3h; end edge: allowed iff ≤ wake+3h (with the other edge fixed inside).
-        for deltaH in stride(from: -4.0, through: 4.0, by: 0.25) {
+        let margin = SleepEdit.strandedEditMargin / 3600
+        for deltaH in stride(from: -8.0, through: 8.0, by: 0.25) {
             let startEdit = SleepEdit.Window(inBedStart: at(deltaH), inBedEnd: wake)
+            // `deltaH < 8` keeps the window non-degenerate: at Δ = +8 h the start reaches the fixed
+            // end and `.endNotAfterStart` fires first, which is an ordering rule, not a bound.
             XCTAssertEqual(SleepEdit.isValid(startEdit, recordedOnset: onset, recordedWake: wake),
-                           deltaH >= -3.0, "start-edge validity wrong at Δ=\(deltaH)h")
+                           deltaH >= -margin && deltaH < 8.0,
+                           "start-edge validity wrong at Δ=\(deltaH)h")
             let endEdit = SleepEdit.Window(inBedStart: onset, inBedEnd: at(8 + deltaH))
             XCTAssertEqual(SleepEdit.isValid(endEdit, recordedOnset: onset, recordedWake: wake),
-                           deltaH <= 3.0 && (8 + deltaH) > 0, "end-edge validity wrong at Δ=\(deltaH)h")
+                           deltaH <= margin && (8 + deltaH) > 0, "end-edge validity wrong at Δ=\(deltaH)h")
         }
+    }
+
+    /// 🟢 THE REPORTED NIGHT, end to end (Gen 2 FR02.018, `America/New_York`, 2026-08-24):
+    /// "Went to bed at 3am 8/24/26 and won't allow me to edit wake time."
+    ///
+    /// Her staged night after the scoping fix is onset 20:34:49 → wake 05:55:14 — a recorded span of
+    /// 9 h 20 m, i.e. comfortably past the 8 h cliff where the old arithmetic cancelled the margin.
+    /// Under the old rule her ceiling was `wake + 3 h`; a 10:00 or 11:00 wake was refused with
+    /// `.endAfterLatest` and Save stayed disabled with no way forward.
+    func testTheReportedNightCanNowReachAPlausibleMorningWake() {
+        let cal = Calendar(identifier: .gregorian)
+        let day = cal.date(from: DateComponents(year: 2026, month: 8, day: 23))!
+        func t(_ h: Int, _ m: Int, _ s: Int = 0, plusDays: Int = 0) -> Date {
+            cal.date(byAdding: .second, value: h * 3600 + m * 60 + s,
+                     to: cal.date(byAdding: .day, value: plusDays, to: day)!)!
+        }
+        let onset = t(20, 34, 49)
+        let wake = t(5, 55, 14, plusDays: 1)
+        XCTAssertGreaterThan(wake.timeIntervalSince(onset), 8 * 3600,
+                             "precondition: this night is past the cliff the old arithmetic had")
+
+        let b = SleepEdit.bounds(recordedOnset: onset, recordedWake: wake)
+        XCTAssertGreaterThanOrEqual(b.latest, t(11, 0, 0, plusDays: 1),
+                                    "her real morning wake must be reachable")
+        // …and the corrected window validates end to end, with her 3am bedtime.
+        let times = SleepEdit.Times(inBedStart: t(3, 0, 0, plusDays: 1),
+                                    sleepOnset: t(3, 15, 0, plusDays: 1),
+                                    sleepWake: t(11, 0, 0, plusDays: 1))
+        XCTAssertNil(SleepEdit.validate(times, recordedOnset: onset, recordedWake: wake,
+                                        minDuration: 30 * 60))
     }
 }

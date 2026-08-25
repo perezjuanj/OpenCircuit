@@ -1,10 +1,18 @@
-// THE ONE LINE THAT LETS THE APPLE HEALTH SUBTRACTION SHIP.
+// THE ONE LINE THAT NAMES THE PART OF A NIGHT NOBODY MEASURED.
 //
-// The provenance change stops writing invented sleep to Apple Health. Shipped alone, that opens a
-// gap nothing on screen accounts for: on a real tester night the Sleep card still reads 6 h 43 m at
-// 92 % while Health quietly holds 2 h 42 m. The land review made the release conditional on closing
-// exactly that gap — "ship the semantics and storage alone, OR ship the Health subtraction together
-// with the card copy — never the subtraction alone."
+// ⚠️ 2026-08-24 — WHAT THIS LINE IS FOR CHANGED, AND THE CHANGE IS DELIBERATE. It shipped in build
+// 47 to account for a SUBTRACTION: asserted sleep was withheld from Apple Health, so the card read
+// 6 h 43 m at 92 % while Health quietly held 2 h 42 m, and the land review made the release
+// conditional on closing exactly that gap. The maintainer then reversed the withholding — a wearer
+// who corrects a night the ring stopped recording through now has her correction reach Health,
+// tagged `HKMetadataKeyWasUserEntered` (see `SleepHealthPublication`). There is no subtraction left
+// to explain.
+//
+// The line stays, because the OTHER half of what it says is unchanged and is the honest half: part
+// of the sleep on this card is her account rather than a measurement. Only the Health sentence was
+// rewritten — from "Apple Health holds less than this card" to "Apple Health holds this, and knows
+// which part you told us". A caption that went on claiming a subtraction we no longer make would be
+// the same defect in the opposite direction.
 //
 // WHY THIS CARRIES NO DETECTION RISK, unlike the parked coverage-caveat card. That card fires on a
 // DETECTED condition (a suspected data gap) whose false-positive rate is unknown and unmeasurable
@@ -25,9 +33,10 @@
 // writes — never as a judgement about the night.
 //
 // 🟢 THE TWO DEVICE NIGHTS IT WAS WRITTEN AGAINST (Gen 2 Air, Europe/Paris, both hand-corrected by
-// the wearer; numbers re-derived from raw bytes by `SleepProvenanceCardProbe`):
-//   R2_2026-08-18  card 403 asleep = 162 measured + 241 asserted -> Health 161.6 asleep-min
-//   R2_2026-08-17  card 246 asleep =   3 measured + 243 asserted -> Health   2.9 asleep-min
+// the wearer; numbers re-derived from raw bytes by `SleepProvenanceCardProbe`). The split is
+// unchanged by the 2026-08-24 reversal — only the destination of the asserted half is:
+//   R2_2026-08-18  card 403 asleep = 162 measured + 241 asserted -> Health 403, 241 user-entered
+//   R2_2026-08-17  card 246 asleep =   3 measured + 243 asserted -> Health 246, 243 user-entered
 //
 // Pure (no Apple frameworks) so the exact rendered sentence unit-tests on the CLI and can be printed
 // per-night by the corpus harness.
@@ -37,16 +46,13 @@ import Foundation
 /// The Sleep-card line for an edited night that contains asserted-unmeasured sleep.
 ///
 /// ⚠️ SCOPED TO ASSERTED **ASLEEP**, DELIBERATELY, AND THIS IS A DECLARED LIMIT — not an oversight.
-/// `healthPublishable` also drops `.awake` segments over unrecorded ground, so a night can hold
-/// asserted AWAKE with zero asserted asleep and still differ from Health. Measured on the corpus:
-/// exactly one such night (`R1_2026-08-16`, 120.3 min asserted awake, 0.0 asserted asleep) out of
-/// the three non-discounted replayable edits. It stays SILENT, because the difference it produces is
-/// representational rather than quantitative: the `.inBed` layer is published in full, so Apple
-/// Health's "Time in Bed" is unchanged and those minutes simply read as in-bed instead of as awake —
-/// which is how Apple's own Sleep UI shows "in bed, not known to be asleep" anyway. The asleep case
-/// is different in kind: Health's headline "Time Asleep" falls by four hours, which is the number a
-/// wearer notices and disbelieves. Widening to awake would need a third sentence for a difference no
-/// user has reported; if a reviewer disagrees, the gate is one comparison.
+/// A night can hold asserted AWAKE with zero asserted asleep. Measured on the corpus: exactly one
+/// such night (`R1_2026-08-16`, 120.3 min asserted awake, 0.0 asserted asleep) out of the three
+/// non-discounted replayable edits. It stays SILENT, and since 2026-08-24 that is easier to defend
+/// than it was: asserted awake is published to Health too (tagged), so nothing differs there at all
+/// and the only thing a sentence could add is a second caveat about a number no wearer has queried.
+/// The asleep case earns its line on the OTHER ground — "some of the sleep above is your account,
+/// not a measurement" is worth saying whether or not Health agrees with the card.
 public enum SleepEditedNightNotice {
 
     /// Least asserted-asleep time worth a line. NOT a detection threshold — the condition is already
@@ -84,11 +90,18 @@ public enum SleepEditedNightNotice {
         guard measuredAsleep >= 0, assertedAsleep >= minAssertedAsleep else { return nil }
         let asserted = duration(assertedAsleep)
 
-        // ⚠️ THE HEALTH CLAUSE IS SCOPED TO **THIS NIGHT**, on purpose. A blanket "only measured
-        // sleep is written to Apple Health" would be FALSE in this app: a manually typed nap is
-        // unmeasured sleep and is still mirrored unlabelled (a declared open decision, not a
-        // defect this line may paper over). "The measured part" refers to the figure named in the
-        // sentence before it, so the claim stays inside what this night's row can support.
+        // ⚠️ THE HEALTH CLAUSE STATES WHAT WE WRITE, NOT WHAT WE WITHHOLD — rewritten 2026-08-24
+        // with the behaviour it describes. Build 47's "only the measured part reaches Apple Health,
+        // so your sleep there reads shorter" is now FALSE: the whole night reaches Health, and the
+        // asserted part carries `HKMetadataKeyWasUserEntered`, HealthKit's documented "the user
+        // entered this" flag. "Marked there as entered by you" is the plain-language reading of that
+        // flag and claims nothing beyond it — deliberately NOT "you'll see it labelled in Health",
+        // because how Apple's Health UI renders the flag is not something we have checked.
+        //
+        // It also no longer has to carve out the nap path: a manually added nap is written with the
+        // same tag (`HealthKitWriter.flushNaps`), so the two agree and the "declared open decision"
+        // this comment used to flag is closed.
+        //
         // ⚠️ "FOR THE OTHER <span> WE HAVE…" IS A GRAMMAR FIX, NOT A STYLE ONE. The obvious phrasing
         // — "the other \(asserted) is your account" — is ungrammatical for every sub-hour plural the
         // formatter can produce ("the other 2 minutes is…"), which is reachable on any modest edit
@@ -98,13 +111,13 @@ public enum SleepEditedNightNotice {
             let head = "We kept the times you set. The ring wasn’t recording for any of this night, "
                 + "so all \(asserted) of the sleep above is your account, not a measurement."
             guard mirrorsSleepToHealth else { return head }
-            return head + " No sleep reaches Apple Health for this night — only your time in bed."
+            return head + " It all reaches Apple Health, marked there as entered by you."
         }
 
         let head = "We kept the times you set. The ring recorded \(duration(measuredAsleep)) of the "
             + "sleep above; for the other \(asserted) we have your account, not a measurement."
         guard mirrorsSleepToHealth else { return head }
-        return head + " Only the measured part reaches Apple Health, so your sleep there reads shorter."
+        return head + " Both reach Apple Health; your part is marked there as entered by you."
     }
 
     /// A span at the precision the measurement supports — whole minutes under an hour, then hours and

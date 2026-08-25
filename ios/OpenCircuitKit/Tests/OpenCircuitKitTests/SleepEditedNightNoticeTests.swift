@@ -1,9 +1,16 @@
 // THE GATE AND THE EXACT SENTENCE for the edited-night notice.
 //
 // Two things are pinned here and nothing else: WHEN the line appears, and WHAT IT SAYS to the
-// character. The copy is pinned verbatim because it is the surface the Apple Health subtraction
-// ships behind — a silent reword would put the tester back in front of a card that does not account
-// for the gap, which is the exact defect the line exists to close.
+// character. The copy is pinned verbatim because it is the one place the app tells a wearer which
+// part of her night is her own account rather than a measurement.
+//
+// ⚠️ RE-BASELINED 2026-08-24 — THE HEALTH SENTENCE ONLY. The maintainer reversed build 47's
+// withholding: asserted sleep now REACHES Apple Health, tagged `HKMetadataKeyWasUserEntered`. The
+// old copy ("Only the measured part reaches Apple Health, so your sleep there reads shorter" /
+// "No sleep reaches Apple Health for this night") described a subtraction the app no longer makes,
+// so keeping it would have been the same defect pointing the other way. Every other assertion in
+// this file — the silence gates, the sentinels, the grammar, the tone, the arithmetic — is
+// unchanged, and the two halves of the sentence still quote the same two measured spans.
 
 import XCTest
 @testable import OpenCircuitKit
@@ -31,9 +38,9 @@ final class SleepEditedNightNoticeTests: XCTestCase {
 
     func testSilentWhenOnlyAWAKETimeIsAsserted() {
         // 🟢 The real corpus night this pins is `R1_2026-08-16`: 0.0 asserted asleep, 120.3 asserted
-        // awake. `healthPublishable` drops those awake segments, so Health's AWAKE band shrinks —
-        // but the `.inBed` layer is published whole, so "Time in Bed" and "Time Asleep" both match
-        // the card exactly. Declared scope limit, not an oversight: see the type's doc comment.
+        // awake. Those awake segments are published like everything else (tagged user-entered), so
+        // Health and the card agree on Time in Bed, Time Asleep AND awake. Declared scope limit, not
+        // an oversight: see the type's doc comment.
         XCTAssertNil(line(measured: 237, asserted: 0),
                      "asserted-awake-only leaves the asleep headline in agreement with Health")
     }
@@ -52,8 +59,8 @@ final class SleepEditedNightNoticeTests: XCTestCase {
         XCTAssertEqual(
             line(measured: 162, asserted: 241),
             "We kept the times you set. The ring recorded 2h 42m of the sleep above; for the other "
-            + "4h 1m we have your account, not a measurement. Only the measured part reaches Apple "
-            + "Health, so your sleep there reads shorter.")
+            + "4h 1m we have your account, not a measurement. Both reach Apple Health; your part is "
+            + "marked there as entered by you.")
     }
 
     func testDropsTheHealthSentenceWhenSleepIsNotBeingWrittenThere() {
@@ -71,8 +78,8 @@ final class SleepEditedNightNoticeTests: XCTestCase {
         XCTAssertEqual(
             line(measured: 0, asserted: 246),
             "We kept the times you set. The ring wasn’t recording for any of this night, so all "
-            + "4h 6m of the sleep above is your account, not a measurement. No sleep reaches Apple "
-            + "Health for this night — only your time in bed.")
+            + "4h 6m of the sleep above is your account, not a measurement. It all reaches Apple "
+            + "Health, marked there as entered by you.")
         XCTAssertEqual(
             line(measured: 0, asserted: 246, health: false),
             "We kept the times you set. The ring wasn’t recording for any of this night, so all "

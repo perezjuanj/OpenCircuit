@@ -108,10 +108,18 @@ public enum SleepEdit {
     ///
     /// What stops that from inventing a night from nothing is no longer the picker — it is
     /// provenance. Time the ring did not record is tagged `.asserted` by `recompute`, kept out of
-    /// the stage minutes, out of efficiency, out of the score and out of Apple Health, and the card
-    /// says so in words. THE TWO CHANGES ARE A PAIR: widening these bounds without the provenance
-    /// quarantine would turn one wrong number into a bigger wrong number. Do not ship a revert of
-    /// the quarantine while leaving this widening in place.
+    /// the stage minutes, out of efficiency and out of the score, written to Apple Health as the
+    /// wearer's own entry rather than as a measurement, and named on the card in words. THE TWO
+    /// CHANGES ARE A PAIR: widening these bounds without the provenance TAGGING would turn one wrong
+    /// number into a bigger wrong number. Do not ship a revert of the tagging while leaving this
+    /// widening in place.
+    ///
+    /// ⚠️ 2026-08-24 — THE PAIRING NOTE USED TO SAY "and out of Apple Health", AND THAT HALF IS
+    /// GONE. The maintainer reversed the Health withholding (a wearer's correction now reaches
+    /// Health tagged `HKMetadataKeyWasUserEntered`) while KEEPING and further widening this margin,
+    /// so the pair is no longer bounds ↔ withholding. It is bounds ↔ the label: what makes a 6 h
+    /// stranded allowance safe is that every minute of it is marked, quarantined from every derived
+    /// number, and visible as an assertion in the app AND in Health.
     ///
     /// The widening is a CONSTANT given the recorded night, so `bounds` stays monotone and
     /// time-invariant — the two properties the 2026-08-04 and 2026-08-16 seesaws were fixed to get.
@@ -132,12 +140,18 @@ public enum SleepEdit {
         let floorLatest = recordedWake.addingTimeInterval(editMargin)
         var earliest = floorEarliest
         var latest = floorLatest
+        // COVERAGE widening, and it is the one that needs the opposite-floor cap: `dataCoverage`
+        // tracks whatever the archive happens to hold, so on a worn ring it can reach a whole day
+        // away from the night. The two incidents below are both coverage running away.
         if let coverage = dataCoverage {
             earliest = min(earliest, coverage.lowerBound)
             latest = max(latest, coverage.upperBound)
         }
-        // ⚠️ BOTH CAPS ARE ANCHORED ON THE *FLOOR*, NEVER ON THE COVERAGE-WIDENED EDGE. Do not
-        // "simplify" either line to use `latest`/`earliest` after widening — in EITHER direction.
+        // ⚠️ NEITHER EDGE MAY EVER BE DERIVED FROM THE OTHER. Do not reintroduce a cap that reads
+        // `latest` when computing `earliest`, or vice versa — in EITHER direction, and whether the
+        // value it reads is raw, coverage-widened, or already capped. Three drafts have now failed
+        // that way; the first two are recorded here because their failure modes are not obvious, and
+        // the third is recorded at the stranded margin below.
         //
         // The first draft capped the early edge with `latest.addingTimeInterval(-maxNightSpan)`,
         // where `latest` had already been widened to `coverage.upperBound`. On a worn ring the
@@ -156,26 +170,64 @@ public enum SleepEdit {
         // archive HELD epochs through 10:51. The 14 h budget was spent on eight useless evening
         // hours and denied on the side the user actually needed.
         //
-        // So each cap anchors on the OPPOSITE FLOOR edge: an edge may reach at most `maxNightSpan`
-        // beyond the recorded night's far margin, independent of how far coverage widened the other
-        // side. Floor-anchoring keeps both edges time-invariant, and keeps `bounds` MONOTONE in
-        // coverage: growing the archive can only ever widen, never contract. That monotonicity is
-        // load-bearing for two more failures review found — a drain landing while the sheet is open
-        // could otherwise make Save reject a time the picker had offered, and re-opening an edited
-        // night could clamp the user's own stored edit inward.
+        // Both drafts were fixed by anchoring each cap on the OPPOSITE FLOOR edge. That removed the
+        // time-variance, but it kept the coupling — and the coupling is what the third failure below
+        // is made of. Every edge is now derived ONLY from its own recorded anchor, which keeps both
+        // edges time-invariant and keeps `bounds` MONOTONE in coverage (growing the archive can only
+        // ever widen, never contract). That monotonicity is load-bearing for two more failures
+        // review found — a drain landing while the sheet is open could otherwise make Save reject a
+        // time the picker had offered, and re-opening an edited night could clamp the user's own
+        // stored edit inward.
         //
         // The caps alone no longer bound the PAIRED window to one night (the two edges can be up to
         // 28 h − floorSpan apart); "one plausible night" is enforced where it belongs, on the
         // proposed window itself — `validate`'s `.tooLong` duration rule.
+        earliest = min(floorEarliest, max(earliest, floorLatest.addingTimeInterval(-maxNightSpan)))
+        latest = max(floorLatest, min(latest, floorEarliest.addingTimeInterval(maxNightSpan)))
         // THE STRANDED MARGIN — offered whatever the archive holds, and the reason the wearer whose
         // ring stopped at 02:31 can now enter her real 06:15 wake. Deliberately a CONSTANT given the
         // recorded night: an edge that moved with `dataCoverage` could contract between the picker
         // offering a time and Save validating it, which is the failure floor-anchoring exists to
-        // prevent. Sits BEFORE the caps so it is clipped by them like every other widening.
+        // prevent.
+        //
+        // ⚠️ IT SITS *AFTER* THE CAPS, AND THE ORDER IS THE FIX — 🟢 MEASURED DEFECT (2026-08-24,
+        // Gen 2 FR02.018 tester: "Went to bed at 3am and won't allow me to edit wake time").
+        //
+        // It used to sit BEFORE them and was therefore clipped by them. Substituting the floors into
+        // the late cap, that made the real ceiling
+        //
+        //     latest = recordedWake + max(3 h, min(6 h, 11 h − recordedSpan))
+        //
+        // so for ANY night whose recorded onset→wake span reaches 8 h the 6 h stranded margin was
+        // arithmetically cancelled and the ceiling collapsed back to the bare ±3 h parity floor.
+        // Measured sweep on this function: span 1/2/4/5 h → 6.00 h of headroom; 6 h → 5.00; 7 h →
+        // 4.00; 7.9 h → 3.10; 8.0 h and beyond → 3.00. That tester's night spanned 8 h 05 m 49 s —
+        // five minutes and forty-nine seconds past the cliff — so her ceiling was 07:40:38 and every
+        // later wake returned `.endAfterLatest`. Her previous night corroborates it: she saved a
+        // wake of 08:35:00 against a ceiling of 08:35:16, i.e. she took the last minute the editor
+        // would accept.
+        //
+        // WHY THE OLD ORDER LOOKED RIGHT, AND WHY IT IS NOT. The intent was "a night long enough to
+        // fill `maxNightSpan` was not truncated, so it does not need the stranded margin" — the span
+        // stood in as evidence that the recording ran to the end. But the span is measured on the
+        // DETECTED night, and a wearer only opens this sheet when the detected night is WRONG. Hers
+        // read 8 h because staging had absorbed her whole evening; the inference "long ⇒ not
+        // truncated" was drawing its evidence from the very number she was trying to correct. The
+        // rule was therefore at its tightest exactly when the detection was at its worst, which is
+        // backwards.
+        //
+        // THE CAPS STILL APPLY TO `dataCoverage`, WHICH IS WHAT THEY WERE FOR. Coverage tracks
+        // whatever the archive holds and can legitimately run a whole day from the night (both
+        // incidents above are coverage running away), so it stays clipped. The stranded margin is
+        // not an archive fact at all — it is a bounded, CONSTANT allowance for the wearer's own
+        // testimony about ground the ring never covered, so it is granted on its own anchor and
+        // capped only by its own 6 h size. `testLateEdgeIsCappedAtOneNightSpan` pins that the
+        // coverage cap still bites.
+        //
+        // WHAT BOUNDS THE PAIRED WINDOW is `validate`'s `.tooLong` rule, which is where this file
+        // already says the rule belongs. A far single edge is not a long window; only the pair is.
         earliest = min(earliest, recordedOnset.addingTimeInterval(-strandedEditMargin))
         latest = max(latest, recordedWake.addingTimeInterval(strandedEditMargin))
-        earliest = min(floorEarliest, max(earliest, floorLatest.addingTimeInterval(-maxNightSpan)))
-        latest = max(floorLatest, min(latest, floorEarliest.addingTimeInterval(maxNightSpan)))
         // A night the user has ALREADY edited must always remain fully selectable. Deliberately
         // outside the caps above.
         if let existing = existingEdit {

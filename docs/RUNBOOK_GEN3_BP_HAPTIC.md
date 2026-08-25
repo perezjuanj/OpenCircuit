@@ -5,7 +5,7 @@ that captures the official app talking to the ring while it (a) **buzzes** and (
 **blood-pressure assessment**. That one recording teaches OpenCircuit to drive the ring's
 motor, and collects the raw pulse data our own blood-pressure research needs.
 
-**Status:** written for a helper with **no development experience**. Everything you type is
+**Status:** Everything you type is
 copy-paste. Nothing here modifies your ring's settings or firmware. Budget **~90 minutes**
 the first time, most of it waiting.
 
@@ -275,7 +275,7 @@ It does **not** contain your RingConn password, your photos, your messages, or a
 other apps — this records Bluetooth traffic only, not your phone's activity.
 
 - ✅ **Send:** the `.pcap` and/or the converted `_btsnoop.log`, plus your list of times.
-- ✅ **Send it privately** — direct message or email, to a person you've chosen to trust.
+- ✅ **Send it privately** — direct message or email
 - ❌ **Do not post it publicly** — not in a GitHub issue, not on a forum, not in a public
   chat. It is genuinely your medical data.
 - ❌ **We will never commit it to the repo.** Captures are gitignored precisely because they

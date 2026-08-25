@@ -309,8 +309,8 @@ enum ExportBuilder {
             .map { ExportEngine.DaytimeTemperatureRow(time: $0.time, celsius: $0.celsius) }
 
         // Recent sync-forensics whose capture time falls in the export window
-        let evidence = ObservabilityStore().historySyncEvidence()
-            .filter { $0.date >= from && $0.date < to }
+        let allEvidence = ObservabilityStore().historySyncEvidence()
+        let evidence = allEvidence.filter { $0.date >= from && $0.date < to }
         let evidenceRows = evidence
             .map {
                 ExportEngine.HistorySyncEvidenceRow(
@@ -327,13 +327,48 @@ enum ExportBuilder {
                 )
             }
 
+        // Every ring whose ~30 h epoch archive could still speak for a night in this file, loaded
+        // ONCE and shared by the two consumers below.
+        //
+        // Keyed off the UNFILTERED evidence list on purpose, unlike `archiveRows`. The evidence ring
+        // buffer is already bounded to 24 entries / 3 days (`ObservabilityStore`), so this can name
+        // at most the rings that synced in that window — but a `.singleSession` export of last night
+        // narrows `from`/`to` to the night itself, which can easily contain no evidence row while the
+        // archive still holds every epoch of it. Scoping the coverage witness to the window-filtered
+        // set would then silently drop the witness on exactly the export a triager asks for first.
+        //
+        // BOUNDED, per the main-actor rule in this file's header. One read per DISTINCT ring named
+        // by the 24-entry evidence buffer, and each archive is capped by `EpochArchive.retention` at
+        // ~30 h ≈ 720 records × 23 B ≈ 17 KB. So the cost is O(distinct rings), and it grows with
+        // neither install age nor the export's date range.
+        //
+        // ⚠️ Stated as a bound, not as a saving, because review pushed on an earlier wording that
+        // claimed this is "strictly LESS work than the previous per-section reload". It is not:
+        // multi-ring pairing SHIPPED (this file's own `notes["ringIdentity"]` contemplates an
+        // install that paired more than one ring), so on a two-ring install this is two decodes
+        // where the old path did one. Two 17 KB decodes is still bounded and still trivial; the
+        // honest claim is the bound, not a comparison.
+        let archivesByRing: [String: [BulkRecord]] = Dictionary(
+            uniqueKeysWithValues: Set(allEvidence.map(\.ringID)).sorted()
+                .map { ($0, EpochArchiveStore(namespace: $0).load()) })
+        // Deterministic order so the witness's tie-break (see `ExportCoverageWitness`) is stable
+        // across runs rather than following a Dictionary's hash order.
+        let archivesForCoverage = archivesByRing.keys.sorted().map { archivesByRing[$0] ?? [] }
+
         // The app's OWN epoch archive, per ring, plus a statement of what the per-drain blobs
         // above MISS of it (#203). The evidence list is a bounded ring buffer, so its blobs are a
         // LOSSY view of the record set staging actually ran on — and a replay that assumes otherwise
         // reads a phantom data hole as lost sleep. Ring-scoped exactly as `RingSession` scopes it,
         // so a two-ring household exports two archives instead of one corrupted union.
+        //
+        // Still keyed off the WINDOW-FILTERED evidence: this section pairs each archive with the
+        // drain blobs captured in the same window, so widening it would emit an archive next to an
+        // empty evidence set and change what `ArchiveEvidenceCoverage` is reporting about.
         let archiveRows: [ExportEngine.EpochArchiveRow] = Set(evidence.map(\.ringID)).sorted().compactMap { ringID in
-            let archive = EpochArchiveStore(namespace: ringID).load()
+            // `?? []` cannot fire: `evidence` is a filtered subset of `allEvidence`, so every ring
+            // named here was already loaded above. Reading through the map is what keeps this
+            // section on ONE archive read per ring instead of two.
+            let archive = archivesByRing[ringID] ?? []
             guard !archive.isEmpty else { return nil }
             let blobbed = evidence.filter { $0.ringID == ringID }
                 .flatMap { EpochArchive.decode($0.rawRecordBlob) }
@@ -350,7 +385,8 @@ enum ExportBuilder {
         // ── v3 sections ───────────────────────────────────────────────────────────────────────
         let meta = metadata(rangeStart: from, rangeEnd: to, now: now)
         let sessionRows = zip(nights, sleepRows).map { night, summary in
-            sessionRow(night, summary: summary, store: store, now: now)
+            sessionRow(night, summary: summary, store: store,
+                       archives: archivesForCoverage, now: now)
         }
 
         let content: String
@@ -435,8 +471,27 @@ enum ExportBuilder {
             deepMin: row.deepMin, lightMin: row.lightMin,
             remMin: row.remMin, awakeMin: row.awakeMin,
             efficiency: row.efficiency,
-            inBedStart: row.inBedStart == .distantPast ? nil : row.inBedStart,
-            inBedEnd: row.inBedEnd == .distantPast ? nil : row.inBedEnd,
+            // THE MINUTES AND THE WINDOW MUST COME FROM THE SAME NIGHT.
+            //
+            // `applySleepEdit` (LocalStore.swift) rewrites `asleepMin`/`deepMin`/… to the POST-edit
+            // staging but deliberately leaves `inBedStart`/`inBedEnd` frozen — those two columns ARE
+            // the recorded window (`sleepEditRecordedInBed*` is defined as them). Pairing the two
+            // published a row that could not exist: 🟢 measured on the tester export of 2026-08-24,
+            // `asleepMin: 434` (+ `awakeMin: 45`) inside an in-bed window of 20:45:19 → 00:44:47 Z,
+            // which is 14368 s = 239.5 minutes. 479 minutes of sleep inside 239.5 minutes of bed is
+            // not a rounding disagreement, it is arithmetically impossible, and it is a large part of
+            // why the tester read the export as proof her edit never stuck. Present on a second
+            // tester's 2026-08-22 night too (533 + 16 min against a 607.6-minute recorded window,
+            // which happens to fit and so reads as merely wrong rather than impossible) — so it is
+            // not a one-off, and the milder presentation is the more dangerous one.
+            //
+            // Emit the EFFECTIVE (edit-aware) window instead: the same pair `sessionRow` already
+            // publishes, so the two sections of one file now agree. Nothing is lost — the untouched
+            // recorded window is exported next to it as `recordedInBedStart`/`recordedInBedEnd`, and
+            // on an UNEDITED night these accessors return the identical values this line used to,
+            // so every unedited row is byte-identical to before.
+            inBedStart: effectiveInBedStart(row),
+            inBedEnd: effectiveInBedEnd(row),
             skinTempC: row.skinTempC, sleepScore: row.sleepScore, stressScore: row.stressScore,
             feelScore: row.feelScore, hrDeep: row.hrDeep, hrLight: row.hrLight,
             hrRem: row.hrRem, hrAwake: row.hrAwake, movementLevels: row.movementLevels)
@@ -445,6 +500,7 @@ enum ExportBuilder {
     private static func sessionRow(_ row: StoredSleepSummary,
                                    summary: ExportEngine.SleepRow,
                                    store: LocalStore,
+                                   archives: [[BulkRecord]],
                                    now: Date) -> ExportEngine.SleepSessionRow {
         // EFFECTIVE (edit-aware) clock times, i.e. what the sleep card and Apple Health show for
         // this night. An export that disagreed with the app's own screen would be the bigger
@@ -478,15 +534,28 @@ enum ExportBuilder {
         var coverage: ExportCoverage.Assessment?
         if let start = inBedStart, let end = inBedEnd, end > start, start >= retentionHorizon {
             // Heart rate is the coverage witness because the ring emits at most one HR value per
-            // 0x4c epoch record (BulkSleep.swift:960) — so the count of HR timestamps in a window
-            // IS the count of epochs we hold for it. HRV/SpO2/RR are sparser by layout and would
-            // under-report coverage that is genuinely complete.
+            // 0x4c epoch record — so the count of HR timestamps in a window IS the count of epochs
+            // we hold for it. HRV/SpO2/RR are sparser by layout and would under-report coverage
+            // that is genuinely complete.
             //
             // Re-queried per night rather than filtered out of `sampleRows`: a night bucketed on the
             // LAST day of a date-range export wakes after the range ends, so the in-range array is
             // missing its morning — and a missing morning would be reported as a real gap.
+            //
+            // …BUT THE STORE ROWS ARE NOT THE RECORD SET, AND ON THEIR OWN THEY MEASURED OUR CURSOR.
+            // The persisted rows are what survived `SyncCursor.selectNew`, which is strictly
+            // forward-only, so a single live auto-measure sample can strand every earlier epoch the
+            // ring delivers afterwards. 🟢 Measured on the tester export of 2026-08-24: the store
+            // held 143 HR rows over that night's window and the epoch archive held 205, with the
+            // "gaps" bounded at 20:57:44.551 / 21:19:50.059 / 23:14:00.580 — sub-second stamps, the
+            // fingerprint of a live sample rather than of a 150 s epoch stream. The row published
+            // `coverageFraction 0.7333 / 4 gaps` about a window the ring had recorded end to end.
+            // Union the archive in (`ExportCoverageWitness` carries the full derivation, including
+            // why archive-ONLY is worse: it would turn ~30 h of retention into a reported hole).
             let hr = (try? store.samples(kind: .heartRate, from: start, to: end)) ?? []
-            coverage = ExportCoverage.assess(sampleTimes: hr.map(\.start), from: start, to: end)
+            let witness = ExportCoverageWitness.sampleTimes(
+                archives: archives, storedHeartRateTimes: hr.map(\.start), from: start, to: end)
+            coverage = ExportCoverage.assess(sampleTimes: witness, from: start, to: end)
         }
 
         // Edge provenance — what sits just OUTSIDE each edge, which is the half `coverage` above

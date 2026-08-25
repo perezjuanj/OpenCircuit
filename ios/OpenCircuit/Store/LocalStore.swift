@@ -2144,6 +2144,104 @@ struct LocalStore {
                            summary: summary, hypnogram: hypnogram)
     }
 
+    /// RE-SCORE every manually-edited night's provenance labels against a record set that has GROWN
+    /// since they were written, and queue the Apple Health rewrite that follows.
+    ///
+    /// 🟢 THE DEFECT (2026-08-24, Gen 2 Air FR04.009, Europe/Paris — "I got up to go to the bathroom,
+    /// and the app assumed that I didn't go back to sleep"). She saved her corrected wake at 06:50,
+    /// when the newest archived record was 02:42:47, so the span after it was scored `.asserted` —
+    /// "we can prove no records exist here" — as one 14323 s block. Her export, pulled 50 minutes
+    /// later, holds nine further 0x4c records covering 02:48:53 → 03:11:23: **1350 s of that "proven
+    /// hole" was measurable data the app itself held within the hour.** Nothing re-derived it. The
+    /// ordinary mirror bails on `isManuallyEdited` (correctly — that guard is what stops a re-drain
+    /// overwriting her edit) and `pendingSleepEditHealthWrites` recovers coverage from the frozen
+    /// labels, which by construction "can only repeat" the hole.
+    ///
+    /// THIS IS THE NARROW WAY THROUGH, and it deliberately leaves the mirror bail alone. The edit
+    /// stays authoritative: her window, her onset, her wake and her displayed minutes are not read
+    /// here, let alone written. Only the LABELS move, only in the direction of more measurement
+    /// (`SleepProvenanceRederivation` cannot express a shrink), and the row's derived columns are
+    /// re-rolled from the same upgraded segments so the timeline and the totals cannot disagree.
+    ///
+    /// It also repairs the second Health path for free: `pendingSleepEditHealthWrites` reads these
+    /// same stored labels back, so upgrading the source of truth is what makes its
+    /// `fromProvenanceLabels` recovery stop repeating a hole that has since filled.
+    ///
+    /// The Health rewrite is QUEUED, not performed — this type is synchronous and holds no HealthKit
+    /// gate. `HealthKitWriter.flushToHealth` drains the queue through `reconcileEditedNightSleepLocked`,
+    /// which is write-first and deletes only the tracked UUIDs of its own previous write, so a
+    /// re-derivation cannot duplicate or lose a sample. An `upsert` here can replace a reconcile the
+    /// user's own Save queued moments earlier; that is safe because the item we queue is built from
+    /// the row that Save had already persisted, upgraded — never from a staler picture.
+    ///
+    /// - Parameter coverage: RAW coverage over the whole retained archive (never `trusted`) — see
+    ///   `SleepProvenanceRederivation.upgraded`, which consumes presence of records only.
+    /// - Returns: one entry per night actually changed, with the asleep seconds that moved out of the
+    ///   asserted bucket. Empty is the steady state, and a second run over the same archive is empty.
+    @discardableResult
+    func rederiveEditedNightProvenance(coverage: MeasuredCoverage)
+        throws -> [(night: Date, upgradedAsleepSeconds: TimeInterval)] {
+        guard !coverage.isEmpty else { return [] }
+        let rows = try context.fetch(FetchDescriptor<StoredSleepSummary>())
+        var changed: [(night: Date, upgradedAsleepSeconds: TimeInterval)] = []
+        // Queued only AFTER the SwiftData save succeeds. UserDefaults has no rollback of its own —
+        // the same rule `renameNightScopedOverlays` follows — so a throw here must not leave a
+        // reconcile queued against labels the store then rolled back.
+        var toQueue: [PendingSleepReconcile] = []
+        var details: [String] = []
+
+        for row in rows where row.isManuallyEdited && !row.hypnogramData.isEmpty {
+            let stored = SleepHypnogramCodec.decode(row.hypnogramData)
+            guard let upgraded = SleepProvenanceRederivation.upgraded(stored, against: coverage)
+            else { continue }
+            let gained = SleepProvenanceRederivation.upgradedAsleepSeconds(before: stored,
+                                                                          after: upgraded)
+            row.hypnogramData = SleepHypnogramCodec.encode(upgraded)
+
+            // The same six columns `applySleepEdit` writes, from the same breakdown type, so the
+            // stored split can never drift from the stored timeline. The DISPLAY minutes
+            // (`asleepMin` and friends) and `efficiency` are deliberately untouched: they are the
+            // wearer's assertion-inclusive headline (clause 1) and re-deriving coverage says nothing
+            // about them.
+            let breakdown = SleepProvenanceBreakdown(segments: upgraded)
+            row.measuredAsleepSeconds = breakdown.measuredAsleep
+            row.assertedAsleepSeconds = breakdown.assertedAsleep
+            row.coverageFraction = breakdown.coverageFraction
+            row.longestGapSeconds = breakdown.longestUnmeasuredGap
+            row.measuredEfficiency = breakdown.efficiency ?? -1
+            row.sleepBasis = (breakdown.hasAssertedTime ? SleepBasis.assertedTagged
+                                                        : SleepBasis.measuredOnly).rawValue
+            // ⚠️ `sleepScore` IS LEFT AS SAVED, including a withheld 0. Un-withholding it would mean
+            // recomputing the composite from this row's ROUNDED display minutes rather than from the
+            // second-precision summary `applySleepEdit` used, so the number could move by a point on
+            // any drain that grew the archive — churning a health figure the wearer reads. The score
+            // is recomputed the next time she edits the night, which is the only moment we hold the
+            // inputs it was originally built from.
+            row.updatedAt = Date()
+
+            toQueue.append(PendingSleepReconcile(night: row.night,
+                                                 inBedStart: row.sleepEditCurrentInBedStart,
+                                                 sleepOnset: row.sleepEditCurrentOnset,
+                                                 sleepWake: row.sleepEditCurrentWake,
+                                                 segments: upgraded))
+            changed.append((row.night, gained))
+            // Breadcrumbed AFTER the save, unlike the `sleep-drop` traces above: this one asserts
+            // that a Health rewrite is queued, and on a throw neither the labels nor the queue
+            // would exist. A breadcrumb for something that did not happen is worse than none.
+            details.append("night=\(Self.stamp(row.night)) REDERIVED asserted->measured "
+                + "asleep=\(Int(gained.rounded()))s "
+                + "assertedLeft=\(Int(breakdown.assertedAsleep.rounded()))s "
+                + "(archive grew past the edit; Health rewrite queued)")
+        }
+        guard !changed.isEmpty else { return [] }
+        try context.save()
+        for item in toQueue { PendingSleepReconcileStore.upsert(item) }
+        for detail in details {
+            ObservabilityStore().recordMetricEvent(source: "sleep-provenance", detail: detail)
+        }
+        return changed
+    }
+
     struct PendingSleepEditHealthWrite {
         let night: Date
         let segments: [SleepSegment]

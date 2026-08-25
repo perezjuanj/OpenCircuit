@@ -1259,7 +1259,14 @@ public enum ExportEngine {
             "epochs were lost — the export cannot tell those apart. The coverage fields are left " +
             "EMPTY for a night older than the app's raw-sample retention window: those epochs " +
             "were deleted by local housekeeping, so a number there would report routine " +
-            "housekeeping as missing data.",
+            "housekeeping as missing data. It is assessed over TWO witnesses unioned: the raw " +
+            "0x4c epoch archive (~30 h, per ring) and the persisted heart-rate rows. The archive " +
+            "witness exists because the persisted rows are filtered by a strictly forward-only " +
+            "sync cursor, so a single late-stamped live sample can strand every earlier epoch " +
+            "delivered after it and make a fully-recorded night read as a gap — that reports our " +
+            "own cursor, not the ring. Neither witness can invent data: every counted instant is " +
+            "a record or a sample actually on disk. Nights older than the archive's retention are " +
+            "carried by the store witness alone, exactly as before.",
         "edgeProvenance":
             "edgeProvenance says whether the record stream ran INTO the printed bedtime and " +
             "CONTINUED past the printed wake — the question coverageFraction structurally cannot " +

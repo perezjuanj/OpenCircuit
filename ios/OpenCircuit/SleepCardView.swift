@@ -63,10 +63,10 @@ struct SleepCardView: View {
     /// granted the sleep-analysis share type and has not since turned it off.
     ///
     /// Injected, never inferred, and deliberately defaulting to `false`. It gates one sentence of the
-    /// edited-night notice: the sentence that tells the user what Apple Health holds. Saying "only
-    /// measured sleep is written to Apple Health" to someone whose sleep permission is off would be
-    /// an unearned claim about a surface we are not writing to — the exact failure mode this whole
-    /// change removes — so absent evidence the sentence is dropped rather than reworded.
+    /// edited-night notice: the sentence that tells the user what Apple Health holds. Telling
+    /// someone whose sleep permission is off what "reaches Apple Health" would be an unearned claim
+    /// about a surface we are not writing to — the exact failure mode this whole change removes —
+    /// so absent evidence the sentence is dropped rather than reworded.
     var mirrorsSleepToHealth: Bool = false
     /// What the last drain's attempt to STORE the night actually did (#204). nil = no drain has
     /// tried this session. When it reports a silent loss AND the night on screen has no stored row,
@@ -488,13 +488,15 @@ struct SleepCardView: View {
 
     // MARK: Edited night with asserted-unmeasured sleep
 
-    /// Account for the difference between this card's total and Apple Health, on a night where both
-    /// halves of the statement are CERTAIN.
+    /// Name the part of this night that is the wearer's own account rather than a measurement, on a
+    /// night where both halves of the statement are CERTAIN.
     ///
-    /// This is the copy half of the provenance change, and the release depends on the two shipping
-    /// together: the Health write now drops asleep segments over ground holding no records, so on the
-    /// tester's 08-18 night the card reads 403 min while Health holds 162. Shipping the subtraction
-    /// with nothing on screen accounting for it was the land review's one blocking objection.
+    /// ⚠️ 2026-08-24: IT NO LONGER EXPLAINS A GAP, BECAUSE THERE ISN'T ONE. It shipped to account
+    /// for the Health write dropping asleep segments over unrecorded ground (card 403 min, Health
+    /// 162 on the tester's 08-18 night); the maintainer reversed that, so Health now holds the whole
+    /// night with the asserted part tagged as user-entered. The line stays for the half that was
+    /// always the honest half — which minutes she told us — and its Health sentence was rewritten to
+    /// match what we actually write (`SleepEditedNightNotice`).
     ///
     /// ⚠️ IT CARRIES NO DETECTION RISK, and that is why it can ship while the coverage-caveat card
     /// stays parked. That card fires on a SUSPECTED data gap whose false-positive rate is unknown.

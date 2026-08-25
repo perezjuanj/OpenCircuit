@@ -100,7 +100,11 @@ public enum SleepStage: String, Codable, CaseIterable, Sendable {
 ///   1. AN ASSERTION ALWAYS WINS FOR DISPLAY — it is the user's record and they were there.
 ///   2. A MEASUREMENT IS NEVER DESTROYED — the ring-derived hypnogram is persisted separately.
 ///   3. ASSERTED-**PROVEN-UNMEASURED** TIME NEVER ENTERS A DERIVED NUMBER — not a stage minute, not
-///      efficiency, not the sleep score, not a headache feature, and never Apple Health as sleep.
+///      efficiency, not the sleep score, not a headache feature. It IS written to Apple Health, as
+///      the stage the wearer's edit assigned and carrying `HKMetadataKeyWasUserEntered: true`, so
+///      the claim travels with its own provenance instead of being silently dropped. (This clause
+///      read "and never Apple Health as sleep" in build 47; the maintainer reversed that half on
+///      2026-08-24 — see `SleepHealthPublication`. The quarantine of DERIVED NUMBERS is unchanged.)
 ///   4. AND WE MUST BE ABLE TO PROVE IT. "We hold no records here" is only evidence of absence when
 ///      our record set could have held them. Where it could not — the ground predates what we still
 ///      retain — the honest answer is `.assertedCoverageUnknown`, which behaves EXACTLY as this app
@@ -114,7 +118,7 @@ public enum SleepProvenance: String, Codable, CaseIterable, Sendable {
     case measured
     /// The user asserted this span and the ring recorded NOTHING here, AND our record set reaches
     /// back far enough to prove it. Honoured for display and for in-bed; excluded from every derived
-    /// statistic; never written to Health as sleep.
+    /// statistic; written to Apple Health tagged `HKMetadataKeyWasUserEntered` (see clause 3).
     case asserted
     /// The user asserted this span and the ring DID record here — the two disagree. The user's
     /// label is displayed and counted; the ring's reading survives in the recorded hypnogram.

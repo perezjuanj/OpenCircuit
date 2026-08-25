@@ -165,27 +165,40 @@ final class SleepProvenanceTesterNight0818Tests: XCTestCase {
 
     // MARK: Apple Health
 
-    func testNothingUnmeasuredReachesHealthAsSleepButTheInBedClaimSurvives() {
-        let publishable = on.healthPublishable
+    /// ⚠️ RE-BASELINED 2026-08-24, AND THE NUMBER IT PINS DID NOT MOVE. This used to assert that no
+    /// asleep sample overlaps the 4 h hole and that 241.4 minutes were REMOVED from the Apple Health
+    /// write. The maintainer reversed the withholding after a second tester wrote in — her corrected
+    /// night never reached Health while the official RingConn app's did — so the same 241.4 minutes
+    /// are now written, carrying `HKMetadataKeyWasUserEntered`. The assertion follows them: every
+    /// asleep sample over the hole must be in the USER-ENTERED bucket, which is a strictly stronger
+    /// statement than "there are none" (it fails both if one is missing and if one is untagged).
+    func testTheAssertedSleepReachesHealthTaggedAndTheInBedClaimSurvives() {
+        let publication = on.healthPublication
         let asleepStages: Set<SleepStage> = [.asleepCore, .asleepDeep, .asleepREM]
 
-        // No sleep sample may overlap the hole.
+        // No PLAIN asleep sample may overlap the hole — a sample over ground holding no records
+        // must never be indistinguishable from a measurement.
         let hole = d(1_787_013_452) ..< d(1_787_027_937)
-        for seg in publishable where asleepStages.contains(seg.stage) {
+        for seg in publication.measured where asleepStages.contains(seg.stage) {
             XCTAssertFalse(seg.start < hole.upperBound && seg.end > hole.lowerBound,
-                           "an asleep sample still overlaps the 4 h hole: \(seg)")
+                           "an UNTAGGED asleep sample overlaps the 4 h hole: \(seg)")
         }
 
-        // …but the user's in-bed claim is still written, because we hold no competing measurement
-        // about where their body was. Apple's own Sleep UI then reads Time in Bed 7 h 19 m,
-        // Time Asleep ~2 h 42 m — the native semantics for exactly this situation.
-        let inBedEnd = publishable.filter { $0.stage == .inBed }.map(\.end).max()
+        // …the user's in-bed claim is still written, because we hold no competing measurement about
+        // where their body was. Apple's own Sleep UI reads Time in Bed 7 h 19 m.
+        let inBedEnd = publication.published.filter { $0.stage == .inBed }.map(\.end).max()
         XCTAssertEqual(inBedEnd, d(1_787_028_180),
                        "the in-bed envelope must still reach 06:43 — dropping it discards a user claim")
 
-        let removed = (SleepStaging.totalAsleep(off) - SleepStaging.totalAsleep(publishable)) / 60
-        XCTAssertEqual(removed, 241.4, accuracy: 0.2,
-                       "241.4 invented asleep-minutes no longer reach Apple Health")
+        // …and Apple's Time Asleep now matches the card, with 241.4 of its minutes attributed to her.
+        let removed = (SleepStaging.totalAsleep(off) - SleepStaging.totalAsleep(publication.published)) / 60
+        XCTAssertEqual(removed, 0, accuracy: 0.01, "nothing is retracted from the write any more")
+        let tagged = SleepStaging.totalAsleep(publication.userEntered) / 60
+        XCTAssertEqual(tagged, 241.4, accuracy: 0.2,
+                       "241.4 asleep-minutes reach Apple Health as the wearer's own entry")
+        XCTAssertTrue(on.withheldSpans.isEmpty,
+                      "withheld ground drives a DELETE exclusion — publishing while still reporting "
+                      + "these spans as withheld duplicates the night on every re-edit")
     }
 
     // MARK: The measurement survives
@@ -286,14 +299,23 @@ final class SleepProvenanceTesterNight0817Tests: XCTestCase {
         XCTAssertEqual(deep, 30.0, accuracy: 0.5, "30 minutes of measured deep sleep, recoverable")
     }
 
-    func testNoInventedSleepReachesHealthOnThisNight() {
+    /// ⚠️ RE-BASELINED 2026-08-24, SAME SPLIT, NEW DESTINATION. This asserted that Health received
+    /// 2.9 of the 246 asleep-minutes — the other 243.1 withheld. The maintainer reversed the
+    /// withholding, so Health receives all 246 and 243.1 of them carry
+    /// `HKMetadataKeyWasUserEntered`. The 243.1 is still pinned, on the bucket it now lands in; the
+    /// 2.9 measured minutes are still pinned as the part the ring actually saw.
+    func testTheAssertedSleepIsWrittenAsHerOwnEntryOnThisNight() {
         let on = SleepEdit.recompute(baseSegments: stagedBase, times: times, coverage: coverage)
-        let publishable = on.healthPublishable
-        let asleep = SleepStaging.totalAsleep(publishable) / 60
-        XCTAssertEqual(asleep, 2.9, accuracy: 0.2,
-                       "243.1 of the 246 minutes stop reaching Apple Health as sleep")
+        let publication = on.healthPublication
+        XCTAssertEqual(SleepStaging.totalAsleep(publication.published) / 60, 246, accuracy: 0.5,
+                       "the night she asserted reaches Apple Health in full")
+        XCTAssertEqual(SleepStaging.totalAsleep(publication.userEntered) / 60, 243.1, accuracy: 0.2,
+                       "243.1 of those minutes are her account, and are tagged as such")
+        XCTAssertEqual(SleepStaging.totalAsleep(publication.measured) / 60, 2.9, accuracy: 0.2,
+                       "only 2.9 asleep-minutes go in as an unqualified measurement")
         // The in-bed claim survives in full: 22:33:46 -> 06:45:00.
-        XCTAssertEqual(publishable.filter { $0.stage == .inBed }.map(\.start).min(), d(1_786_912_426))
-        XCTAssertEqual(publishable.filter { $0.stage == .inBed }.map(\.end).max(), d(1_786_941_900))
+        let published = publication.published
+        XCTAssertEqual(published.filter { $0.stage == .inBed }.map(\.start).min(), d(1_786_912_426))
+        XCTAssertEqual(published.filter { $0.stage == .inBed }.map(\.end).max(), d(1_786_941_900))
     }
 }
