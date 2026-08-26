@@ -1909,25 +1909,73 @@ struct LocalStore {
         return changed
     }
 
-    /// Nights whose Apple Health record still holds sleep this app invented over unmeasured ground —
-    /// the RETRACTION list.
+    /// Nights whose Apple Health record was written under a rule this app no longer applies — the
+    /// one-shot RE-RUN list.
     ///
-    /// Invented blocks already written to testers' phones are recoverable because edited nights are
-    /// UUID-tracked (`writeReturningSleepUUIDs` -> `SleepEditHealthSampleOverlay` ->
-    /// `reconcileEditedNightSleep`), so this returns the nights a one-shot reconcile should re-run.
-    /// A row qualifies when it is edited AND its stored hypnogram now carries asserted time — i.e.
-    /// only nights re-saved under provenance. Legacy `unknown` rows are deliberately NOT retracted:
-    /// we cannot tell which of their minutes were invented, and deleting a user's Health sleep on a
-    /// guess is exactly the kind of destructive act this whole change exists to stop.
-    func nightsNeedingHealthRetraction() -> [Date] {
+    /// ⚠️ IT USED TO BE CALLED `nightsNeedingHealthRetraction`, AND THE DIRECTION HAS REVERSED. It
+    /// was written for build 47, which DROPPED asserted sleep from the Health write; the list named
+    /// nights whose Health record still held sleep to take back. The 2026-08-24 reversal
+    /// (`SleepProvenanceBreakdown`, `healthPublication`) publishes that sleep instead, tagged
+    /// `HKMetadataKeyWasUserEntered` — so the same predicate now names nights whose Health record is
+    /// MISSING sleep, and its consumer ADDS rather than removes. The name was changed with the
+    /// meaning; a list called "retraction" driving a write is exactly the comment/name drift that
+    /// has bitten this file before.
+    ///
+    /// The re-run is safe (and cheap to repeat) because edited nights are UUID-tracked
+    /// (`writeReturningSleepUUIDs` -> `SleepEditHealthSampleOverlay` -> `reconcileEditedNightSleep`),
+    /// so a second write of the same night replaces the first instead of duplicating it.
+    ///
+    /// A row qualifies when it is edited AND its stored hypnogram carries asserted time — i.e. only
+    /// nights saved under provenance, where we know exactly which minutes are the wearer's claim.
+    /// ⚠️ LEGACY `unknown` ROWS ARE DELIBERATELY EXCLUDED AND MUST STAY EXCLUDED. Their
+    /// `hypnogramData` is edit OUTPUT from before `recordedHypnogramData` existed, so we cannot tell
+    /// which of their minutes were measured and which were invented — and the consumer's reconcile
+    /// deletes this app's prior samples across the recorded span. Acting on a guess there is the
+    /// destructive act the whole provenance layer exists to stop.
+    func nightsNeedingHealthRepublish() -> [Date] {
+        let rows = (try? context.fetch(FetchDescriptor<StoredSleepSummary>())) ?? []
+        return rows.compactMap { row -> Date? in
+            Self.republishableSegments(of: row) == nil ? nil : row.night
+        }
+    }
+
+    /// The one-shot republish WORK ITEMS: for every night `nightsNeedingHealthRepublish()` names,
+    /// the reconcile built from what is STORED and from nothing else.
+    ///
+    /// 🚨 THE SEGMENTS COME FROM `hypnogramData`, AND RE-STAGING HERE WOULD DESTROY DATA. The
+    /// obvious-looking alternative — replay `RingSession.applySleepEdit`, which re-stages from the
+    /// epoch archive (`RingSession.swift:1826-1834`) — is unusable for a night older than
+    /// `EpochArchive.retention` (30 h). With no records under the window, `MeasuredCoverage.trusted`
+    /// returns nil and `SleepEdit.fill` (`SleepEdit.swift:495-507`) collapses the night into
+    /// "exactly one `.measured` segment": one flat block, falsely labelled measured, with the
+    /// wearer's real Deep/REM/Light split gone and untagged invented sleep going to Apple Health.
+    /// This method is the structural guard against that — `LocalStore` cannot reach the epoch
+    /// archive at all, so no caller of it can re-stage by accident.
+    ///
+    /// The edges come from `sleepEditCurrent*`, the same accessors `rederiveEditedNightProvenance`
+    /// queues with (`:2301-2305`), so a republished night and a re-derived one are byte-identical
+    /// items.
+    func editedNightRepublishItems() -> [PendingSleepReconcile] {
         let rows = (try? context.fetch(FetchDescriptor<StoredSleepSummary>())) ?? []
         return rows.compactMap { row in
-            guard row.isManuallyEdited,
-                  SleepBasis(stored: row.sleepBasis) == .assertedTagged,
-                  SleepHypnogramCodec.decode(row.hypnogramData).containsAssertedTime
-            else { return nil }
-            return row.night
+            guard let segments = Self.republishableSegments(of: row) else { return nil }
+            return PendingSleepReconcile(night: row.night,
+                                         inBedStart: row.sleepEditCurrentInBedStart,
+                                         sleepOnset: row.sleepEditCurrentOnset,
+                                         sleepWake: row.sleepEditCurrentWake,
+                                         segments: segments)
         }
+    }
+
+    /// ONE conservatism source for both readers above, so the list and the work can never disagree
+    /// about which nights are safe to touch. Returns the stored hypnogram when the row qualifies.
+    private static func republishableSegments(of row: StoredSleepSummary) -> [SleepSegment]? {
+        guard row.isManuallyEdited,
+              SleepBasis(stored: row.sleepBasis) == .assertedTagged
+        else { return nil }
+        let segments = SleepHypnogramCodec.decode(row.hypnogramData)
+        guard segments.containsAssertedTime else { return nil }
+        return segments
     }
 
     /// Attach a decoded OSA SpO₂ summary (#91) to the most recent night's stored summary. The
@@ -2110,21 +2158,42 @@ struct LocalStore {
         // Recompute the duration-driven Sleep Score from the edited night (HR/temp factors dropped →
         // renormalised, per SleepScore's contract — never fabricated).
         //
-        // WITHHOLD it entirely when too much of the night was never measured. The score's dominant
-        // factor is `timeAsleep` at weight 0.30 (`SleepScore.swift:93`) and "how long did she sleep"
-        // is exactly the question an uncovered night cannot answer. 0 is this column's existing
-        // "not computed" sentinel (see the live type), so withholding here is expressible without
-        // inventing a new one — and it costs the headache engine nothing, because
-        // `HeadacheEngine.swift:136-142` consumes efficiency/awakeMin/asleepMin only and never the
-        // score.
-        if breakdown?.isScorable == false {
-            row.sleepScore = 0
-        } else {
-            row.sleepScore = SleepScore.composite(.init(
-                totalAsleep: summary.totalAsleep, timeAwake: summary.awake,
-                efficiency: summary.efficiency,
-                deep: summary.deep, light: summary.light, rem: summary.rem)).score
-        }
+        // ⚠️ IT IS COMPUTED UNCONDITIONALLY, AND THE WITHHOLD THAT USED TO SIT HERE IS GONE (b49).
+        // The removed line was `if breakdown?.isScorable == false { row.sleepScore = 0 }`. It was
+        // meant as honesty and the wearer read it as data loss: "editing my night deleted my
+        // readiness score". Reported 2026-08-25 (Gen 2 Air FR04.009 on build 47); the per-night
+        // figures quoted below — coverage 0.654 against `minCoverageForScore` 0.75, and a score of
+        // 61 on the night she did NOT touch — are from that report and were not re-derived here.
+        // Three reasons the withhold had to go, each of them checkable in this repo:
+        //
+        //  1. `0` IS THIS COLUMN'S APP-WIDE "NEVER COMPUTED" SENTINEL, so a withheld score is
+        //     indistinguishable from a night we never scored: `SleepCardView.swift:428` hides the
+        //     badge on `score > 0`, `App.swift:980` restores an absent backup score AS 0 under the
+        //     comment "a 0 score hides the badge", `TrendsEngine.swift:140` drops it with
+        //     `.filter { $0 > 0 }`. Worst of all `WellnessBalanceCardView.swift:188` then dropped
+        //     READINESS for the whole day and the card told her to sync — the one action that
+        //     cannot help, because nothing re-scores a stored night (`rederiveEditedNightProvenance`
+        //     deliberately leaves `sleepScore` as saved, see the note at `:2283`).
+        //
+        //  2. IT COULD ONLY EVER FIRE ON A CORRECTION. `isScorable` had exactly ONE production
+        //     consumer in the whole app and it was this line, so a badly-measured night the app got
+        //     wrong on its own kept a confident score, while the same night corrected by the wearer
+        //     lost hers. The tester's untouched 76-minute night kept a score of 61.
+        //
+        //  3. THE NUMBER HERE IS THE DISPLAY HEADLINE AND ALWAYS WAS — the same clause-1 basis as
+        //     the minutes above and as `row.efficiency`, both of which stay assertion-inclusive on
+        //     purpose. Scoring that basis is consistent with it; zeroing was the one place this
+        //     file's display-vs-measurement split leaked out as a MISSING value the wearer reads.
+        //
+        // THE HONESTY SIGNAL IS NOT DROPPED, it just stops being expressed as an absent number:
+        // `row.sleepBasis = .assertedTagged` (:2154), `row.measuredEfficiency`, `row.coverageFraction`
+        // and the Sleep card's caveat line all still say how much of this night was measured, and
+        // `SleepProvenanceBreakdown.isScorable` is still published in the export
+        // (`ExportEngine.swift:1015`) for anyone who wants to weigh the score themselves.
+        row.sleepScore = SleepScore.composite(.init(
+            totalAsleep: summary.totalAsleep, timeAwake: summary.awake,
+            efficiency: summary.efficiency,
+            deep: summary.deep, light: summary.light, rem: summary.rem)).score
         row.updatedAt = Date()
         try context.save()
         return true
@@ -2211,12 +2280,22 @@ struct LocalStore {
             row.measuredEfficiency = breakdown.efficiency ?? -1
             row.sleepBasis = (breakdown.hasAssertedTime ? SleepBasis.assertedTagged
                                                         : SleepBasis.measuredOnly).rawValue
-            // ⚠️ `sleepScore` IS LEFT AS SAVED, including a withheld 0. Un-withholding it would mean
-            // recomputing the composite from this row's ROUNDED display minutes rather than from the
-            // second-precision summary `applySleepEdit` used, so the number could move by a point on
-            // any drain that grew the archive — churning a health figure the wearer reads. The score
-            // is recomputed the next time she edits the night, which is the only moment we hold the
-            // inputs it was originally built from.
+            // ⚠️ `sleepScore` IS LEFT AS SAVED. Recomputing it here would mean building the composite
+            // from this row's ROUNDED display minutes rather than from the second-precision summary
+            // `applySleepEdit` used, so the number could move by a point on any drain that grew the
+            // archive — churning a health figure the wearer reads. The score is recomputed the next
+            // time she edits the night, which is the only moment we hold the inputs it was originally
+            // built from.
+            //
+            // ⚠️ A `0` HERE IS NOW ONLY A SCAR, NOT A POLICY. Builds 47–48 withheld the score by
+            // zeroing it when coverage fell under `minCoverageForScore`; b49 removed that (see
+            // `applySleepEdit`). Rows written by those builds keep their 0, and this pass does not
+            // heal them — with no consumer able to tell that 0 from "never computed", such a night
+            // shows no Sleep-Score badge and no readiness until the wearer edits it again.
+            // KNOWN AND UNFIXED HERE ON PURPOSE: healing it is a one-shot backfill over a different
+            // population than this function's, and it must recompute from the row's stored
+            // HYPNOGRAM (which is second-precision and is what the score was built from), never from
+            // the rounded minutes.
             row.updatedAt = Date()
 
             toQueue.append(PendingSleepReconcile(night: row.night,

@@ -6,6 +6,23 @@ import OpenCircuitKit
 // docs/HEALTHKIT_MAPPING.md. Samples are saved with the device's own timestamps
 // so history backfills; a stable bundle id + the SyncCursor avoid duplicates.
 
+/// Latch for the one-shot Apple Health republish of nights edited under build 47's withholding rule
+/// (`HealthKitWriter.republishPreUpgradeEditedNights`). Registered rather than read bare, matching
+/// `HealthAlertDefaults` / `HeadacheDefaults` / `SleepScheduleDefaults`, and registered AT THE READ
+/// SITE for the same reason they are: there is no single launch path every entry point goes through
+/// (a BGTask or CoreBluetooth-restoration launch never connects a scene).
+///
+/// ⚠️ THE VERSION SUFFIX IS THE ONLY WAY TO RUN THIS AGAIN. Bump it if — and only if — a later build
+/// changes what an edited night is entitled to publish, the way build 48 changed it. Reusing `v1`
+/// would leave every existing install latched and the new rule unapplied to their history.
+enum SleepHealthRepublishDefaults {
+    static let doneKey = "health.republishedEditedNightSleep.v1"
+
+    static func register(_ defaults: UserDefaults = .standard) {
+        defaults.register(defaults: [doneKey: false])
+    }
+}
+
 @MainActor
 final class HealthKitWriter {
     private let store = HKHealthStore()
@@ -373,6 +390,7 @@ final class HealthKitWriter {
         // run the locked core directly — it deletes the trimmed sleep the append-only paths can't.
         // Clear ONLY if the stored marker is still the one we processed, so a newer same-night edit
         // enqueued during our awaits is preserved (not lost) and drained next flush.
+        var drainedNights: [Date] = []
         for pending in store.pendingSleepReconciles() {
             let times = SleepEdit.Times(inBedStart: pending.inBedStart, sleepOnset: pending.sleepOnset,
                                         sleepWake: pending.sleepWake)
@@ -380,7 +398,16 @@ final class HealthKitWriter {
                                                              times: times,
                                                              editedSegments: pending.segments)
             if done { store.clearPendingSleepReconcileIfUnchanged(pending) }
+            drainedNights.append(pending.night)
         }
+        // ONE-SHOT: re-run the Health write for nights the wearer edited BEFORE this build, whose
+        // asserted sleep build 47 dropped on the floor. Placed HERE, at the end of the sleep block,
+        // for three reasons: `Self.isFlushing` is already held so it can call the locked reconcile
+        // core directly (exactly as the drain above does); `flushToHealth` is the one Health entry
+        // point that runs on a BGTask / CoreBluetooth-restoration launch as well as a foreground
+        // one, so the repair does not wait for the wearer to open the app; and running AFTER the
+        // drain means a night that is already queued is written once, not twice.
+        await republishPreUpgradeEditedNights(local: store, alreadyDrained: drainedNights)
         // Naps (#76): each carries its own `healthWritten` flag (NOT the night's `.sleep` cursor),
         // so a daytime nap and the overnight night write independently and never collide.
         result.naps = await flushNaps(store: store)
@@ -1961,6 +1988,93 @@ final class HealthKitWriter {
         try? local.markSleepEditHealthWritten(night: night, segments: published)
         try? local.markSleepEditHealthCovered(by: published)
         return true   // applied to Health; caller clears the pending marker (conditionally, on drain)
+    }
+
+    /// ONE-SHOT, IDEMPOTENT REPUBLISH of every night the wearer edited BEFORE this build.
+    ///
+    /// THE DEFECT. Reported 2026-08-25 (Gen 2 Air FR04.009 on build 47) and reproduced from the
+    /// tester's own bytes by the reporter — the figures below are quoted from that report, not
+    /// re-derived here. Build 47 wrote her edited night to Apple Health but silently dropped every
+    /// asleep segment sitting over ground it had proved holds no records — 2 h 53 m of that night, so
+    /// Health received 340 asleep minutes against the card's 513. What IS verified in this lane is
+    /// the mechanism: the four exits below were each re-read at the file:line given.
+    ///
+    /// Build 48 reversed the policy: `healthPublication` now PUBLISHES those
+    /// segments carrying `HKMetadataKeyWasUserEntered` (see `SleepProvenanceBreakdown`). But nothing
+    /// re-triggers the write for a night edited BEFORE the upgrade, and all four exits are shut:
+    ///   - `mirrorSettledNight` bails on `isManuallyEdited` (`:2181`) — correctly; that guard is what
+    ///     stops a re-drain overwriting her edit;
+    ///   - the `pendingSleepEditHealthWrites` watermarks already sit on the edited edges, so it
+    ///     offers nothing;
+    ///   - the pending-reconcile marker was cleared when build 47's write SUCCEEDED (`:1872`);
+    ///   - `SleepProvenanceRederivation` (`:75-79`) upgrades a label only where NEW records have
+    ///     appeared under the asserted span, and the 30 h archive holds none for an older night.
+    /// So the only way her correction reaches Health is for this build to go back and write it once.
+    ///
+    /// 🚨 IT REBUILDS FROM THE STORED HYPNOGRAM, NEVER BY RE-STAGING. `LocalStore.editedNightRepublishItems`
+    /// is the structural guard and carries the full argument: re-staging a night older than
+    /// `EpochArchive.retention` (30 h) collapses it into ONE flat block falsely marked `.measured`,
+    /// which would write invented, untagged sleep to Apple Health — a data-destroying regression
+    /// dressed as a fix.
+    ///
+    /// INTERRUPTION IS HARMLESS because the work is idempotent and the latch is set only at the end:
+    /// a kill mid-loop leaves the flag unset and the whole set re-runs on the next flush, and a night
+    /// written twice is replaced rather than duplicated (`reconcileEditedNightSleepLocked` writes
+    /// first, then deletes the exact tracked UUIDs of its own previous write).
+    ///
+    /// A PHONE WITH NO EDITED NIGHTS IS A NO-OP: one SwiftData fetch, no HealthKit call, latched for
+    /// the life of the install.
+    private func republishPreUpgradeEditedNights(local: LocalStore, alreadyDrained: [Date]) async {
+        SleepHealthRepublishDefaults.register()
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: SleepHealthRepublishDefaults.doneKey) else { return }
+
+        // Sleep sharing EXPLICITLY denied → we can never write these, and latching now would strand
+        // the repair permanently if the wearer later switches Sleep back on in Settings ▸ Health.
+        // Not latching costs one `authorizationStatus` call per flush. `.notDetermined` deliberately
+        // falls THROUGH: the write throws, the night lands in the pending queue below, and the
+        // ordinary drain retries it the moment access is granted — the same route a fresh edit takes
+        // (see the note on `reconcileEditedNightSleep`).
+        guard store.authorizationStatus(for: HKCategoryType(.sleepAnalysis)) != .sharingDenied
+        else { return }
+
+        let items = local.editedNightRepublishItems()
+        guard !items.isEmpty else {
+            defaults.set(true, forKey: SleepHealthRepublishDefaults.doneKey)
+            return
+        }
+
+        var rewritten = 0
+        var queued = 0
+        var skipped = 0
+        for item in items {
+            // Already written this pass by the deferred-reconcile drain, from the same stored labels.
+            // Same-day comparison because that is how `PendingSleepReconcileStore` keys its items.
+            if alreadyDrained.contains(where: { Calendar.current.isDate($0, inSameDayAs: item.night) }) {
+                skipped += 1
+                continue
+            }
+            let times = SleepEdit.Times(inBedStart: item.inBedStart, sleepOnset: item.sleepOnset,
+                                        sleepWake: item.sleepWake)
+            if await reconcileEditedNightSleepLocked(local: local, night: item.night, times: times,
+                                                     editedSegments: item.segments) {
+                rewritten += 1
+            } else {
+                // A transient HealthKit write failure (or Sleep still `.notDetermined`). Hand it to
+                // the app's own durable retry path instead of re-running the whole set forever.
+                local.setPendingSleepReconcile(night: item.night, times: times, segments: item.segments)
+                queued += 1
+            }
+        }
+        defaults.set(true, forKey: SleepHealthRepublishDefaults.doneKey)
+        // Counts only — never a clock time — so this is safe in the system log, like the sleep
+        // breadcrumbs above it.
+        ringLog.notice("""
+            [OC] sleep-health: one-shot republish of pre-upgrade edited nights — \
+            \(rewritten, privacy: .public) rewritten, \(queued, privacy: .public) queued for retry, \
+            \(skipped, privacy: .public) already drained this pass, of \
+            \(items.count, privacy: .public) eligible
+            """)
     }
 
     /// Delete the app's own prior sleep for an edited night: the exact tracked UUIDs from the last
