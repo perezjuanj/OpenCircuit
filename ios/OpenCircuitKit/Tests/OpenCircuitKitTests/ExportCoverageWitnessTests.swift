@@ -152,4 +152,219 @@ final class ExportCoverageWitnessTests: XCTestCase {
         XCTAssertEqual(ExportCoverageWitness.sampleTimes(
             archives: [inside], storedHeartRateTimes: stored, from: end, to: start), stored)
     }
+
+    // MARK: - Edge probes
+
+    /// THE TESTER'S NIGHT, IN MINIATURE (🟢 2026-08-25, Gen 2 Air FR04.009, build 47). The ring
+    /// recorded continuously INTO the bedtime; the persisted heart-rate rows stop 6641 s earlier
+    /// because the forward-only sync cursor stranded everything after a late-stamped live sample.
+    /// Store-only calls that a `resumedAfterGap(6641)` and tells the wearer the ring recorded
+    /// nothing for 1h51m; the union sees the epochs and calls it `witnessed`.
+    func testAStrandedCursorNoLongerManufacturesABedtimeGap() {
+        let bedtime = start
+        // 44 epochs running right up to the bedtime — the last one 150 s before it.
+        let archive = (1...44).map { wornRecord(at: bedtime.addingTimeInterval(Double(-$0) * 150)) }
+        let strandedStoreRow = bedtime.addingTimeInterval(-6641)
+
+        let storeOnly = BedtimeProvenance.classify(
+            inBedStart: bedtime,
+            lastMeasurementBefore: strandedStoreRow,
+            earliestRetainedMeasurement: bedtime.addingTimeInterval(-30 * 86_400))
+        XCTAssertEqual(storeOnly, .resumedAfterGap(6641))
+
+        let edges = ExportCoverageWitness.edges(
+            archives: [archive],
+            storedLastBeforeStart: strandedStoreRow,
+            storedFirstAfterEnd: nil,
+            storedEarliestRetained: bedtime.addingTimeInterval(-30 * 86_400),
+            inBedStart: bedtime, inBedEnd: end)
+        XCTAssertEqual(BedtimeProvenance.classify(
+            inBedStart: edges.inBedStart,
+            lastMeasurementBefore: edges.lastMeasurementBeforeStart,
+            earliestRetainedMeasurement: edges.earliestRetainedMeasurement), .witnessed)
+        XCTAssertTrue(edges.archiveMovedAnEdge)
+        XCTAssertEqual(edges.witnessDescription, "store+archive(44,moved)")
+    }
+
+    /// The trailing edge, same shape: the store's next row is four hours later, the archive holds
+    /// epochs that continue straight past the wake. `stoppedThenResumed` becomes `witnessed`.
+    func testTheWakeEdgeIsAlsoRescuedByTheArchive() {
+        let archive = (1...10).map { wornRecord(at: end.addingTimeInterval(Double($0) * 150)) }
+        let lateStoreRow = end.addingTimeInterval(4 * 3600)
+
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               firstMeasurementAfter: lateStoreRow,
+                                               earliestRetainedMeasurement: start),
+                       .stoppedThenResumed(4 * 3600))
+
+        let edges = ExportCoverageWitness.edges(
+            archives: [archive],
+            storedLastBeforeStart: nil,
+            storedFirstAfterEnd: lateStoreRow,
+            storedEarliestRetained: start,
+            inBedStart: start, inBedEnd: end)
+        XCTAssertEqual(WakeProvenance.classify(
+            inBedEnd: edges.inBedEnd,
+            firstMeasurementAfter: edges.firstMeasurementAfterEnd,
+            earliestRetainedMeasurement: edges.earliestRetainedMeasurement), .witnessed)
+    }
+
+    /// MONOTONICITY AT AN EDGE. A hole the archive ALSO has stays reported at its full width — the
+    /// union may only shrink a gap by producing a record that genuinely exists, never paper one
+    /// over. (The archive here starts 4 h before the bedtime and then stops 2 h before it.)
+    func testARealEdgeGapSurvivesTheUnionAtItsFullWidth() {
+        let bedtime = start
+        let archive = (0..<48).map {
+            wornRecord(at: bedtime.addingTimeInterval(-4 * 3600 + Double($0) * 150))
+        }
+        let edges = ExportCoverageWitness.edges(
+            archives: [archive],
+            storedLastBeforeStart: nil,
+            storedFirstAfterEnd: nil,
+            storedEarliestRetained: nil,
+            inBedStart: bedtime, inBedEnd: end)
+        guard case .resumedAfterGap(let gap) = BedtimeProvenance.classify(
+            inBedStart: edges.inBedStart,
+            lastMeasurementBefore: edges.lastMeasurementBeforeStart,
+            earliestRetainedMeasurement: edges.earliestRetainedMeasurement) else {
+            return XCTFail("a two-hour hole before the bedtime must still be reported")
+        }
+        // Last archive epoch sits at bedtime − 4 h + 47 × 150 s = bedtime − 7350 s.
+        XCTAssertEqual(gap, 7350, accuracy: 1)
+    }
+
+    /// THE RETENTION HORIZON IS NOT A RECORDING GAP. A night five days old is far outside the
+    /// archive's ~30 h, so the widened window never reaches it: the archive's own oldest record
+    /// must not be offered as "the ring resumed here". Store answers stand untouched.
+    func testAnArchiveOutOfReachOfTheNightLeavesTheStoreAnswersAlone() {
+        let nightStart = start.addingTimeInterval(-5 * 86_400)
+        let nightEnd = nightStart.addingTimeInterval(8 * 3600)
+        // Archive = the last 30 h, i.e. days AFTER this night.
+        let archive = (0..<720).map { wornRecord(at: start.addingTimeInterval(Double($0) * 150)) }
+
+        let storedBefore = nightStart.addingTimeInterval(-200)
+        let storedAfter = nightEnd.addingTimeInterval(200)
+        let storedEarliest = nightStart.addingTimeInterval(-10 * 86_400)
+        let edges = ExportCoverageWitness.edges(
+            archives: [archive],
+            storedLastBeforeStart: storedBefore,
+            storedFirstAfterEnd: storedAfter,
+            storedEarliestRetained: storedEarliest,
+            inBedStart: nightStart, inBedEnd: nightEnd)
+
+        XCTAssertEqual(edges.archiveEpochsInReach, 0)
+        XCTAssertFalse(edges.archiveMovedAnEdge)
+        XCTAssertEqual(edges.witnessDescription, "store")
+        XCTAssertEqual(edges.lastMeasurementBeforeStart, storedBefore)
+        XCTAssertEqual(edges.firstMeasurementAfterEnd, storedAfter)
+        XCTAssertEqual(edges.earliestRetainedMeasurement, storedEarliest)
+    }
+
+    /// THE RETENTION GUARD STILL FIRES. Store is empty (every row pruned) and the archive holds
+    /// only ground AFTER the night's trailing edge — so we hold nothing at or before that edge and
+    /// "the ring stopped" is indistinguishable from "our data does not reach". `.unknown`, silent,
+    /// exactly as `WakeProvenance`'s guard intends; the union must not convert it into a loud
+    /// multi-hour "recording gap".
+    func testUnioningEarliestRetainedDoesNotDisarmTheRetentionGuard() {
+        let nightEnd = start
+        let archive = (1...20).map { wornRecord(at: nightEnd.addingTimeInterval(3600 + Double($0) * 150)) }
+        let edges = ExportCoverageWitness.edges(
+            archives: [archive],
+            storedLastBeforeStart: nil,
+            storedFirstAfterEnd: nil,
+            storedEarliestRetained: nil,
+            inBedStart: nightEnd.addingTimeInterval(-3 * 3600), inBedEnd: nightEnd)
+
+        XCTAssertNotNil(edges.firstMeasurementAfterEnd, "the archive does hold later records")
+        XCTAssertEqual(WakeProvenance.classify(
+            inBedEnd: edges.inBedEnd,
+            firstMeasurementAfter: edges.firstMeasurementAfterEnd,
+            earliestRetainedMeasurement: edges.earliestRetainedMeasurement), .unknown)
+    }
+
+    /// An `.idle` (unworn/charging) archive is not a measurement here either — a ring asleep in its
+    /// case must not witness a bedtime.
+    func testIdleArchiveRecordsCannotWitnessAnEdge() {
+        let bedtime = start
+        let idle = (1...20).map { idleRecord(at: bedtime.addingTimeInterval(Double(-$0) * 150)) }
+        let edges = ExportCoverageWitness.edges(
+            archives: [idle],
+            storedLastBeforeStart: nil, storedFirstAfterEnd: nil, storedEarliestRetained: nil,
+            inBedStart: bedtime, inBedEnd: end)
+        XCTAssertEqual(edges.archiveEpochsInReach, 0)
+        XCTAssertNil(edges.lastMeasurementBeforeStart)
+        XCTAssertEqual(edges.witnessDescription, "store")
+    }
+
+    /// Two rings are still not one timeline: the edge probe uses the SAME per-ring tie-break as
+    /// `sampleTimes` rather than merging both archives' instants.
+    func testEdgeProbeKeepsTheRingsSeparate() {
+        let bedtime = start
+        let wornRing = (1...40).map { wornRecord(at: bedtime.addingTimeInterval(Double(-$0) * 150)) }
+        // A DIFFERENT ring, worn much closer to the bedtime but with almost no history.
+        let otherRing = [wornRecord(at: bedtime.addingTimeInterval(-10))]
+        let edges = ExportCoverageWitness.edges(
+            archives: [otherRing, wornRing],
+            storedLastBeforeStart: nil, storedFirstAfterEnd: nil, storedEarliestRetained: nil,
+            inBedStart: bedtime, inBedEnd: end)
+        XCTAssertEqual(edges.archiveEpochsInReach, 40)
+        XCTAssertEqual(edges.lastMeasurementBeforeStart, bedtime.addingTimeInterval(-150),
+                       "the winning ring's own newest epoch, not the other ring's")
+    }
+
+    /// A caller with no wake time (a legacy rollup on the Sleep card) passes the same instant for
+    /// both edges; that must still probe a real window rather than an empty one.
+    func testDegenerateWindowStillProbesTheLeadingEdge() {
+        let bedtime = start
+        let archive = (1...4).map { wornRecord(at: bedtime.addingTimeInterval(Double(-$0) * 150)) }
+        let edges = ExportCoverageWitness.edges(
+            archives: [archive],
+            storedLastBeforeStart: nil, storedFirstAfterEnd: nil, storedEarliestRetained: nil,
+            inBedStart: bedtime, inBedEnd: bedtime)
+        XCTAssertEqual(edges.lastMeasurementBeforeStart, bedtime.addingTimeInterval(-150))
+    }
+
+    /// The widening is the ARCHIVE'S OWN retention horizon, not a number invented here — so an
+    /// archive record exactly one horizon before the bedtime is still in reach, and one beyond it
+    /// is not. (Guards against the constant being quietly re-typed to something arbitrary.)
+    func testTheWideningIsTheArchiveRetentionHorizon() {
+        let bedtime = start
+        let atHorizon = wornRecord(at: bedtime.addingTimeInterval(-EpochArchive.retention))
+        let pastHorizon = wornRecord(at: bedtime.addingTimeInterval(-EpochArchive.retention - 150))
+
+        XCTAssertEqual(ExportCoverageWitness.edges(
+            archives: [[atHorizon]],
+            storedLastBeforeStart: nil, storedFirstAfterEnd: nil, storedEarliestRetained: nil,
+            inBedStart: bedtime, inBedEnd: bedtime).archiveEpochsInReach, 1)
+
+        XCTAssertEqual(ExportCoverageWitness.edges(
+            archives: [[pastHorizon]],
+            storedLastBeforeStart: nil, storedFirstAfterEnd: nil, storedEarliestRetained: nil,
+            inBedStart: bedtime, inBedEnd: bedtime).archiveEpochsInReach, 0)
+    }
+
+    /// No archive at all ⇒ byte-identical to the store-only behaviour these three probes shipped
+    /// with. The degeneration is now VISIBLE (`witnessDescription == "store"`), which is the whole
+    /// point of carrying it: an empty archive used to be indistinguishable from a covered night.
+    func testWithNoArchiveTheProbeIsExactlyTheOldStoreOnlyBehaviour() {
+        let before = start.addingTimeInterval(-6641)
+        let after = end.addingTimeInterval(900)
+        let earliest = start.addingTimeInterval(-86_400)
+        let edges = ExportCoverageWitness.edges(
+            archives: [],
+            storedLastBeforeStart: before,
+            storedFirstAfterEnd: after,
+            storedEarliestRetained: earliest,
+            inBedStart: start, inBedEnd: end)
+        XCTAssertEqual(edges.lastMeasurementBeforeStart, before)
+        XCTAssertEqual(edges.firstMeasurementAfterEnd, after)
+        XCTAssertEqual(edges.earliestRetainedMeasurement, earliest)
+        XCTAssertFalse(edges.archiveMovedAnEdge)
+        XCTAssertEqual(edges.witnessDescription, "store")
+        XCTAssertEqual(edges.coverage,
+                       SleepConfidence.Coverage(inBedStart: start, inBedEnd: end,
+                                                lastMeasurementBeforeStart: before,
+                                                firstMeasurementAfterEnd: after,
+                                                earliestRetainedMeasurement: earliest))
+    }
 }
