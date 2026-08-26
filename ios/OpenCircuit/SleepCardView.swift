@@ -585,9 +585,43 @@ struct SleepCardView: View {
     /// the user-visible half of #198 at zero schema risk. The cost is that a night older than sample
     /// retention degrades to `.unknown` — which the classifier reports honestly rather than
     /// mistaking for "witnessed".
+    ///
+    /// ⚠️ THE PERSISTED ROWS ALONE MEASURE OUR SYNC CURSOR, NOT THE RING — and this is the one of
+    /// the three edge probes that says the answer to the WEARER, in plain English. The stored
+    /// samples are what survived `SyncCursor.selectNew`, which is strictly forward-only, so a single
+    /// late-stamped live auto-measure sample strands every earlier epoch the ring hands over
+    /// afterwards. 🟢 Measured on the tester's night of 2026-08-25 (Gen 2 Air FR04.009, build 47) —
+    /// in the EXPORT, which runs this same store-only probe: `bedtimeVerdict=resumedAfterGap`,
+    /// `bedtimeGapSeconds=6641` before a 02:04:37 bedtime, where 02:04:37 − 6641 s = 00:13:56 is
+    /// exactly the last PERSISTED heart-rate row — while the ring HAD recorded all 111 of those
+    /// minutes, they being inside an unbroken run of 162 consecutive 150 s epochs
+    /// (20:36:37 → 03:19:07). `BedtimeProvenance` turns that verdict into
+    /// "…it recorded nothing for 1h 51m before that. If you were already in bed, tap Edit to
+    /// correct it" — an invitation to overwrite a bedtime that was right.
+    ///
+    /// ⚠️ Stated as what the verdict DRIVES, not as what she saw. This function probes the window
+    /// the card PRINTS (edit-aware) while the export probes the RECORDED one, so on an edited night
+    /// the two edges are not the same instant; and `bedtimeProvenanceHint` suppresses itself when
+    /// `isLikelyTruncated` fires. What is established is the probe's defect class, not that this
+    /// exact sentence rendered on her phone.
+    ///
+    /// So the two instants are unioned with this ring's ~30 h epoch archive, exactly as the export's
+    /// `coverageFraction` already is — `ExportCoverageWitness.edges` carries the derivation, the
+    /// widening (`EpochArchive.retention`, not a number chosen here) and why the union can only ever
+    /// SHRINK a reported gap, so a night whose recording really did stop still says so.
+    ///
+    /// The archive is read straight from `EpochArchiveStore` rather than injected, because this view
+    /// has no `RingSession` and the hint must render with the ring disconnected — which is most of
+    /// the day. `RingMetadataStore.load().identifier` is the same CoreBluetooth peripheral UUID
+    /// `RingSession` namespaces the archive with (`RingSession.swift:822` / `:1752`), so it names an
+    /// archive rather than inventing a key. Cost is one UserDefaults blob decode (~17 KB, capped by
+    /// `EpochArchive.retention`) per appearance, off the `body` path in the same `.task(id:)` that
+    /// already runs two indexed store fetches here.
     @MainActor
     private func refreshBedtimeProvenance() async {
-        guard let start = night?.inBedStart else {
+        // Resolved ONCE: `night` re-stages `liveSegments` and re-reads the stored rollup on every
+        // access, and this function needs both of its clock times.
+        guard let resolved = night, let start = resolved.inBedStart else {
             bedtimeProvenance = .unknown
             return
         }
@@ -597,10 +631,22 @@ struct SleepCardView: View {
         // ring, and the #198 night is precisely a charge cycle, so they would call it "witnessed".
         let last = try? store.latestSample(kind: .heartRate, before: start)
         let earliest = try? store.earliestSample(kind: .heartRate)
+        let ringID = RingMetadataStore().load().identifier
+        let archive = ringID.isEmpty ? [] : EpochArchiveStore(namespace: ringID).load()
+        // `inBedEnd` falls back to the bedtime on a legacy rollup that stored no wake clock; the
+        // trailing-edge instant is unused here, and `edges` normalises a degenerate window rather
+        // than collapsing it (`ExportCoverageWitness.edges`).
+        let edges = ExportCoverageWitness.edges(
+            archives: archive.isEmpty ? [] : [archive],
+            storedLastBeforeStart: last?.start,
+            storedFirstAfterEnd: nil,
+            storedEarliestRetained: earliest?.start,
+            inBedStart: start,
+            inBedEnd: resolved.inBedEnd ?? start)
         bedtimeProvenance = BedtimeProvenance.classify(
             inBedStart: start,
-            lastMeasurementBefore: last?.start,
-            earliestRetainedMeasurement: earliest?.start)
+            lastMeasurementBefore: edges.lastMeasurementBeforeStart,
+            earliestRetainedMeasurement: edges.earliestRetainedMeasurement)
     }
 
     /// Say plainly when the printed bedtime is where DATA starts rather than where the user settled.

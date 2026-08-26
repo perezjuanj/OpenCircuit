@@ -70,6 +70,48 @@ struct WellnessBalanceCardView: View {
         return MissedNight.endedToday(inBedEnd: inBedEnd, nightKey: s.night)
     }
 
+    /// WHY THE CARD IS EMPTY, AND WHETHER SYNCING WOULD ACTUALLY HELP.
+    ///
+    /// ⚠️ NEVER TELL THE USER TO SYNC WHEN A SYNC CANNOT CHANGE THE ANSWER. Until b49 this card had
+    /// one empty state — "Sync last night's sleep to see today's readiness." — and the commonest way
+    /// to reach it was editing your own sleep times, which zeroed the stored score
+    /// (`LocalStore.applySleepEdit`, now fixed). The wearer was then told to perform the one action
+    /// that provably cannot restore it: nothing in the app re-scores a night that is already stored,
+    /// so she re-synced, saw nothing change, and reported the score as deleted.
+    ///
+    /// So the cases are separated by the ONE thing that decides whether a sync is the fix: whether
+    /// we already hold last night, and whether it carries a score. Both are read from the STORED
+    /// row rather than from `result`, because `result` is also nil for the moment before the first
+    /// `.task` lands — and telling a wearer whose night IS scored that it isn't would be the same
+    /// class of lie in the other direction.
+    private enum ReadinessGap { case noNight, noScore, computing }
+
+    private var readinessGap: ReadinessGap {
+        // `sleepCredited` is the same recency rule the Sleep card and the Goals ring use (#147):
+        // a days-old night is not "last night", and for it a sync IS the right advice.
+        guard sleepCredited else { return .noNight }
+        // 0 is the app-wide "never computed" sentinel for this column (`SleepCardView`'s badge,
+        // `TrendsEngine`'s filter, `App`'s backup restore). The night is here either way, so no
+        // amount of syncing changes the answer.
+        return (latestSleep.first?.sleepScore ?? 0) > 0 ? .computing : .noScore
+    }
+
+    private var emptyStateText: String {
+        switch readinessGap {
+        case .noNight:   return "Sync last night's sleep to see today's readiness."
+        case .noScore:   return "Last night doesn't have a sleep score, so there's no readiness to show today."
+        case .computing: return "Working out today's readiness…"
+        }
+    }
+
+    private var emptyStateAccessibilityLabel: String {
+        switch readinessGap {
+        case .noNight:   return "Readiness unavailable — sync last night's sleep"
+        case .noScore:   return "Readiness unavailable — last night has no sleep score"
+        case .computing: return "Readiness, working it out"
+        }
+    }
+
     /// Recompute identity — changes only when an input to readiness changes.
     private var inputsKey: String {
         "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(weightKg)|\(heightCm)|\(sexRaw)|"
@@ -96,7 +138,7 @@ struct WellnessBalanceCardView: View {
                 Text("Estimate — a blend of last night's sleep, overnight recovery & today's activity. Not the RingConn app's readiness score, and not medical advice.")
                     .font(.caption2).foregroundStyle(.tertiary)
             } else {
-                Text("Sync last night's sleep to see today's readiness.")
+                Text(emptyStateText)
                     .font(.callout).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -104,7 +146,7 @@ struct WellnessBalanceCardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(result.map { "Readiness, estimate, \($0.score) out of 100, \(tierLabel($0.tier))" }
-                            ?? "Readiness unavailable — sync last night's sleep")
+                            ?? emptyStateAccessibilityLabel)
         .task(id: inputsKey) {
             // Snapshot SwiftData rows to Sendable value types on the main actor, run the O(n) activity
             // math off-main, then compose the readiness on the way back.
