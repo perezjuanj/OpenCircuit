@@ -337,10 +337,26 @@ enum ExportBuilder {
         // archive still holds every epoch of it. Scoping the coverage witness to the window-filtered
         // set would then silently drop the witness on exactly the export a triager asks for first.
         //
+        // …AND THE CURRENT RING, EVEN WHEN THE EVIDENCE BUFFER NAMES NOBODY. Keying the set purely
+        // off `allEvidence` still made the archive witness a function of a BUFFER: `historySyncEvidence`
+        // is empty on a fresh install, after a reinstall, before the first drain of a new ring, and
+        // whenever `ObservabilityStore` cannot decode its blob (its reads are all `?? []`). An empty
+        // buffer produced an EMPTY map — so `archivesForCoverage` was `[]`, and both the coverage
+        // union above and the edge probes in `sessionRow` degenerated silently to the store-only
+        // behaviour they exist to fix, with nothing in the file saying it had happened.
+        //
+        // `RingMetadataStore.load().identifier` is the CoreBluetooth peripheral UUID of the last ring
+        // this app connected to. That is not a new identity: it is written from
+        // `peripheral.identifier.uuidString` (`RingSession.swift:1752`) — the SAME string
+        // `RingSession` namespaces its `EpochArchiveStore` with (`RingSession.swift:822`) — so it
+        // names an archive that exists rather than inventing a key. Empty means no ring has ever
+        // connected, in which case there is no archive to miss.
+        //
         // BOUNDED, per the main-actor rule in this file's header. One read per DISTINCT ring named
-        // by the 24-entry evidence buffer, and each archive is capped by `EpochArchive.retention` at
-        // ~30 h ≈ 720 records × 23 B ≈ 17 KB. So the cost is O(distinct rings), and it grows with
-        // neither install age nor the export's date range.
+        // by the 24-entry evidence buffer, plus at most one more for the current ring, and each
+        // archive is capped by `EpochArchive.retention` at ~30 h ≈ 720 records × 23 B ≈ 17 KB. So
+        // the cost is O(distinct rings), and it grows with neither install age nor the export's
+        // date range.
         //
         // ⚠️ Stated as a bound, not as a saving, because review pushed on an earlier wording that
         // claimed this is "strictly LESS work than the previous per-section reload". It is not:
@@ -348,8 +364,11 @@ enum ExportBuilder {
         // install that paired more than one ring), so on a two-ring install this is two decodes
         // where the old path did one. Two 17 KB decodes is still bounded and still trivial; the
         // honest claim is the bound, not a comparison.
+        let currentRingID = RingMetadataStore().load().identifier
+        var archiveRingIDs = Set(allEvidence.map(\.ringID))
+        if !currentRingID.isEmpty { archiveRingIDs.insert(currentRingID) }
         let archivesByRing: [String: [BulkRecord]] = Dictionary(
-            uniqueKeysWithValues: Set(allEvidence.map(\.ringID)).sorted()
+            uniqueKeysWithValues: archiveRingIDs.sorted()
                 .map { ($0, EpochArchiveStore(namespace: $0).load()) })
         // Deterministic order so the witness's tie-break (see `ExportCoverageWitness`) is stable
         // across runs rather than following a Dictionary's hash order.
@@ -576,6 +595,17 @@ enum ExportBuilder {
         // pocketed ring yields none, while a skin-temp row keeps arriving from a docked ring and
         // would report a dead night as "still recording".
         //
+        // …AND, LIKE THE COVERAGE BLOCK ABOVE, UNIONED WITH THE EPOCH ARCHIVE. Those three store
+        // reads are `SyncCursor.selectNew`'s forward-only output, so on their own they measure OUR
+        // CURSOR and print it as a statement about the ring. 🟢 Measured on the tester's night of
+        // 2026-08-25 (Gen 2 Air FR04.009, build 47): this row published
+        // `bedtimeVerdict=resumedAfterGap`, `bedtimeGapSeconds=6641`,
+        // `reasons=[noRecordingBeforeBedtime]` over 110 minutes the ring recorded END TO END —
+        // 162 consecutive epochs, none missing — because 02:04:37 − 6641 s = 00:13:56 is exactly the
+        // last PERSISTED heart-rate row. `ExportCoverageWitness.edges` carries the derivation,
+        // including why its widening is `EpochArchive.retention` rather than a number chosen at a
+        // call site, and why the union can only ever SHRINK a reported gap.
+        //
         // …but only for nights whose raw rows can still EXIST, gated on the very same
         // `retentionHorizon` the coverage block above uses. Two reasons, and the second is the one
         // that made this a defect rather than a tidy-up:
@@ -597,11 +627,12 @@ enum ExportBuilder {
         let recordedEnd = realDate(row.sleepEditRecordedInBedEnd)
         if let s = recordedStart, let e = recordedEnd, e > s {
             let edgeCoverage: SleepConfidence.Coverage? = s >= retentionHorizon
-                ? SleepConfidence.Coverage(
-                    inBedStart: s, inBedEnd: e,
-                    lastMeasurementBeforeStart: (try? store.latestSample(kind: .heartRate, before: s))?.start,
-                    firstMeasurementAfterEnd: (try? store.earliestSample(kind: .heartRate, after: e))?.start,
-                    earliestRetainedMeasurement: (try? store.earliestSample(kind: .heartRate))?.start)
+                ? ExportCoverageWitness.edges(
+                    archives: archives,
+                    storedLastBeforeStart: (try? store.latestSample(kind: .heartRate, before: s))?.start,
+                    storedFirstAfterEnd: (try? store.earliestSample(kind: .heartRate, after: e))?.start,
+                    storedEarliestRetained: (try? store.earliestSample(kind: .heartRate))?.start,
+                    inBedStart: s, inBedEnd: e).coverage
                 : nil
             let assessment = SleepConfidence.assess(
                 asleep: row.asSummary.totalAsleep, inBed: row.asSummary.inBed,

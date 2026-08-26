@@ -45,7 +45,13 @@ enum DiagnosticsReport {
         s.append("")
 
         // 1) Epoch-archive gap report — the key sleep-loss signal.
-        s.append(EpochArchiveDiagnostics.report(session.archivedEpochs, timeZone: timeZone))
+        //
+        // Decoded ONCE and reused by the `edges:` lines in section 2, which union it with the
+        // persisted rows: `EpochArchiveStore.load()` re-reads and re-decodes a ~17 KB blob on every
+        // call, and re-reading it per night would make a six-night section do seven decodes for one
+        // ring's worth of data.
+        let archive = session.archivedEpochs
+        s.append(EpochArchiveDiagnostics.report(archive, timeZone: timeZone))
         s.append("")
 
         // 2) Nightly sleep summaries (the symptom) + the EDGE PROVENANCE behind each one.
@@ -67,6 +73,14 @@ enum DiagnosticsReport {
         s.append("  edges: measured at the RECORDED window with heart-rate rows;"
                  + " material gap \(Int(WakeProvenance.materialGapSeconds / 60))m,"
                  + " continuous tolerance \(Int(WakeProvenance.continuousToleranceSeconds))s")
+        // The `witness=` token on each line is the part that keeps this section honest about
+        // ITSELF: the store rows alone are `SyncCursor.selectNew`'s forward-only output, so they
+        // measure our cursor rather than the ring, and `store` on a night the ~30 h archive should
+        // still cover is the tell that the archive was empty or out of reach.
+        s.append("  witness=store means the epoch archive could not speak for that night;"
+                 + " store+archive(n[,moved]) means n archive epochs sat inside the night ±"
+                 + "\(Int(EpochArchive.retention / 3600))h, and `moved` that one of them sat"
+                 + " closer to an edge than any persisted row")
         let nights = (try? store?.recentSleepSummaries(limit: 6)) ?? []
         if nights.isEmpty {
             s.append("  (none stored)")
@@ -83,7 +97,7 @@ enum DiagnosticsReport {
                 s.append("  \(t(start)) → \(t(end))  asleep \(n.asleepMin)m"
                          + " (D\(n.deepMin)/R\(n.remMin)/L\(n.lightMin)/A\(n.awakeMin))  score \(n.sleepScore)"
                          + editedSuffix)
-                s.append("      edges: \(edgeLine(n, store: store))")
+                s.append("      edges: \(edgeLine(n, store: store, archive: archive))")
             }
         }
         s.append("")
@@ -192,18 +206,44 @@ enum DiagnosticsReport {
     /// whole section. Never a scan, so this cannot become the reason a big archive times out the
     /// export. Every read is `try?`, like every other read in this file: a bundle must not be lost
     /// because one night could not be probed.
-    private static func edgeLine(_ n: StoredSleepSummary, store: LocalStore?) -> String {
+    ///
+    /// ⚠️ THOSE ROWS ALONE MEASURE OUR CURSOR, NOT THE RING, so `archive` (this ring's ~30 h epoch
+    /// archive, decoded once by `build`) is unioned in — the same union the export's
+    /// `coverageFraction` already uses, extended to the two edge probes. The persisted rows are what
+    /// survived `SyncCursor.selectNew`, which is strictly forward-only, so one late-stamped live
+    /// sample strands every earlier epoch the ring delivers afterwards. 🟢 On the tester's night of
+    /// 2026-08-25 (Gen 2 Air FR04.009, build 47) the export's copy of this probe — the SAME three
+    /// store reads over the SAME recorded window — published `bedtimeVerdict=resumedAfterGap`,
+    /// `bedtimeGapSeconds=6641` across 162 consecutive epochs with nothing missing, so this line
+    /// would have read `bed=resumedAfterGap(111m)`: a triager's first row saying the ring stopped
+    /// when it had not. `ExportCoverageWitness.edges` carries the derivation, the widening
+    /// (`EpochArchive.retention`, not a number chosen here) and the proof that the union can only
+    /// SHRINK a gap.
+    ///
+    /// The trailing `witness=` token names what actually answered, because the degeneration is
+    /// otherwise invisible: an empty or out-of-reach archive silently returns the old store-only
+    /// verdict and nothing else on the line changes.
+    ///
+    /// One archive, not all of them: this bundle is scoped to the ring that is CONNECTED (`session`),
+    /// which is the ring a tester is complaining about. The export's copy of this probe passes every
+    /// known ring's archive and lets `edges` pick the most-covering one; on the single-ring install
+    /// that is every install in the field the two are the same array.
+    private static func edgeLine(_ n: StoredSleepSummary,
+                                 store: LocalStore?,
+                                 archive: [BulkRecord]) -> String {
         guard let store, n.inBedEnd > n.inBedStart, n.inBedStart > .distantPast else {
             return "(no recorded window to measure)"
         }
         let start = n.inBedStart, end = n.inBedEnd
+        let edges = ExportCoverageWitness.edges(
+            archives: archive.isEmpty ? [] : [archive],
+            storedLastBeforeStart: (try? store.latestSample(kind: .heartRate, before: start))?.start,
+            storedFirstAfterEnd: (try? store.earliestSample(kind: .heartRate, after: end))?.start,
+            storedEarliestRetained: (try? store.earliestSample(kind: .heartRate))?.start,
+            inBedStart: start, inBedEnd: end)
         let assessment = SleepConfidence.assess(
             asleep: n.asSummary.totalAsleep, inBed: n.asSummary.inBed,
-            coverage: SleepConfidence.Coverage(
-                inBedStart: start, inBedEnd: end,
-                lastMeasurementBeforeStart: (try? store.latestSample(kind: .heartRate, before: start))?.start,
-                firstMeasurementAfterEnd: (try? store.earliestSample(kind: .heartRate, after: end))?.start,
-                earliestRetainedMeasurement: (try? store.earliestSample(kind: .heartRate))?.start))
+            coverage: edges.coverage)
         func gap(_ seconds: TimeInterval?) -> String {
             guard let seconds else { return "" }
             return "(\(Int((seconds / 60).rounded()))m)"
@@ -213,6 +253,7 @@ enum DiagnosticsReport {
             + gap(SleepConfidence.gapSeconds(assessment.bedtime))
             + "  wake=\(SleepConfidence.exportName(assessment.wake))"
             + gap(SleepConfidence.gapSeconds(assessment.wake))
+            + "  witness=\(edges.witnessDescription)"
             + "  reasons=" + (reasons.isEmpty ? "(none)" : reasons.joined(separator: ","))
     }
 
