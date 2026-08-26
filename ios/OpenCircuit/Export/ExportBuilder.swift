@@ -600,9 +600,10 @@ enum ExportBuilder {
         // CURSOR and print it as a statement about the ring. 🟢 Measured on the tester's night of
         // 2026-08-25 (Gen 2 Air FR04.009, build 47): this row published
         // `bedtimeVerdict=resumedAfterGap`, `bedtimeGapSeconds=6641`,
-        // `reasons=[noRecordingBeforeBedtime]` over 110 minutes the ring recorded END TO END —
-        // 162 consecutive epochs, none missing — because 02:04:37 − 6641 s = 00:13:56 is exactly the
-        // last PERSISTED heart-rate row. `ExportCoverageWitness.edges` carries the derivation,
+        // `reasons=[noRecordingBeforeBedtime]` over the 111 minutes before a 02:04:37 bedtime, all
+        // of which the ring HAD recorded — they sit inside an unbroken run of 162 consecutive 150 s
+        // epochs (20:36:37 → 03:19:07). It said that because 02:04:37 − 6641 s = 00:13:56 is exactly
+        // the last PERSISTED heart-rate row. `ExportCoverageWitness.edges` carries the derivation,
         // including why its widening is `EpochArchive.retention` rather than a number chosen at a
         // call site, and why the union can only ever SHRINK a reported gap.
         //

@@ -78,9 +78,11 @@ enum DiagnosticsReport {
         // measure our cursor rather than the ring, and `store` on a night the ~30 h archive should
         // still cover is the tell that the archive was empty or out of reach.
         s.append("  witness=store means the epoch archive could not speak for that night;"
-                 + " store+archive(n[,moved]) means n archive epochs sat inside the night ±"
-                 + "\(Int(EpochArchive.retention / 3600))h, and `moved` that one of them sat"
-                 + " closer to an edge than any persisted row")
+                 + " store+archive(n[,moved]) means n heart-rate-bearing epochs from the"
+                 + " most-covering ring's archive sat inside the night ±"
+                 + "\(Int(EpochArchive.retention / 3600))h, and `moved` that at least one of the"
+                 + " three probe instants differs from the persisted-row answer — which may be an"
+                 + " edge gap shrinking OR the retained-history floor reaching further back")
         let nights = (try? store?.recentSleepSummaries(limit: 6)) ?? []
         if nights.isEmpty {
             s.append("  (none stored)")
@@ -214,7 +216,8 @@ enum DiagnosticsReport {
     /// sample strands every earlier epoch the ring delivers afterwards. 🟢 On the tester's night of
     /// 2026-08-25 (Gen 2 Air FR04.009, build 47) the export's copy of this probe — the SAME three
     /// store reads over the SAME recorded window — published `bedtimeVerdict=resumedAfterGap`,
-    /// `bedtimeGapSeconds=6641` across 162 consecutive epochs with nothing missing, so this line
+    /// `bedtimeGapSeconds=6641` across 111 minutes that sit inside an unbroken run of 162
+    /// consecutive 150 s epochs (20:36:37 → 03:19:07) with nothing missing, so this line
     /// would have read `bed=resumedAfterGap(111m)`: a triager's first row saying the ring stopped
     /// when it had not. `ExportCoverageWitness.edges` carries the derivation, the widening
     /// (`EpochArchive.retention`, not a number chosen here) and the proof that the union can only

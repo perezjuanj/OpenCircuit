@@ -593,8 +593,9 @@ struct SleepCardView: View {
     /// afterwards. 🟢 Measured on the tester's night of 2026-08-25 (Gen 2 Air FR04.009, build 47) —
     /// in the EXPORT, which runs this same store-only probe: `bedtimeVerdict=resumedAfterGap`,
     /// `bedtimeGapSeconds=6641` before a 02:04:37 bedtime, where 02:04:37 − 6641 s = 00:13:56 is
-    /// exactly the last PERSISTED heart-rate row, across 110 minutes the ring had recorded end to
-    /// end (162 consecutive epochs, none missing). `BedtimeProvenance` turns that verdict into
+    /// exactly the last PERSISTED heart-rate row — while the ring HAD recorded all 111 of those
+    /// minutes, they being inside an unbroken run of 162 consecutive 150 s epochs
+    /// (20:36:37 → 03:19:07). `BedtimeProvenance` turns that verdict into
     /// "…it recorded nothing for 1h 51m before that. If you were already in bed, tap Edit to
     /// correct it" — an invitation to overwrite a bedtime that was right.
     ///

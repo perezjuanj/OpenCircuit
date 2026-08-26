@@ -97,9 +97,10 @@ public enum ExportCoverageWitness {
     //
     // 🟢 MEASURED on the tester's night of 2026-08-25 (Gen 2 Air FR04.009, build 47): the export
     // published `bedtimeVerdict=resumedAfterGap`, `bedtimeGapSeconds=6641`,
-    // `reasons=[noRecordingBeforeBedtime]` across 110 minutes the ring had recorded END TO END —
-    // 162 consecutive epochs, none missing. 02:04:37 − 6641 s = 00:13:56, which is exactly the last
-    // PERSISTED heart-rate row. The probe measured our cursor and printed it as a statement about
+    // `reasons=[noRecordingBeforeBedtime]` across the 111 minutes before a 02:04:37 bedtime — every
+    // one of which the ring HAD recorded, because they sit inside an unbroken run of 162 consecutive
+    // 150 s epochs spanning 20:36:37 → 03:19:07 with none missing. 02:04:37 − 6641 s = 00:13:56,
+    // which is exactly the last PERSISTED heart-rate row. The probe measured our cursor and printed it as a statement about
     // the ring — and the Sleep card renders that same verdict to the WEARER in plain English ("it
     // recorded nothing for 1h 51m before that. If you were already in bed, tap Edit to correct it").
     //
