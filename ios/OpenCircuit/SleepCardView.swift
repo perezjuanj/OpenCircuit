@@ -38,6 +38,10 @@ struct SleepCardView: View {
     /// Whether this night's leading edge was observed or is just where recording resumed (#198).
     /// Held as @State and refreshed in `.task(id:)` — never read from the store inside `body`.
     @State private var bedtimeProvenance: BedtimeProvenance.Verdict = .unknown
+    /// Trailing-edge provenance, resolved beside `bedtimeProvenance` in the same off-render-path
+    /// task. Read ONLY by `confidenceHint`, which must not claim a night ran LONG unless we actually
+    /// watched it end. `.unknown` is the safe default: it suppresses that claim.
+    @State private var wakeProvenance: WakeProvenance.Verdict = .unknown
     /// Freshly staged segments from the just-finished sync (empty when none / after disconnect).
     /// Preferred over the store so a completed sync updates the card immediately.
     var liveSegments: [SleepSegment]
@@ -122,6 +126,14 @@ struct SleepCardView: View {
                     && $0.start > lookback && $0.value > 0
             },
             sortBy: [SortDescriptor(\.start, order: .reverse)]))
+    }
+
+    /// `.task(id:)` key for the edge-provenance refresh — both in-bed edges, so a wake-only Edit
+    /// re-runs it. A struct rather than a tuple because `.task(id:)` needs `Equatable`.
+    private struct EdgeKey: Equatable {
+        let start: Date?
+        let end: Date?
+        init(_ night: Night?) { start = night?.inBedStart; end = night?.inBedEnd }
     }
 
     /// One night resolved for display, from either the live staging or the persisted rollup.
@@ -369,7 +381,9 @@ struct SleepCardView: View {
         // Bedtime provenance (#198). Recomputed off the render path — two fetchLimit-1 reads, but
         // `body` runs on every @Query invalidation and a store read there is how #14's black-screen
         // launch happened. Keyed on the edge itself, so it re-runs only when the night changes.
-        .task(id: night?.inBedStart) { await refreshBedtimeProvenance() }
+        // Keyed on BOTH edges: the same task now resolves the trailing edge too, and an Edit that
+        // moves only the wake would otherwise leave `wakeProvenance` stale against the new window.
+        .task(id: EdgeKey(night)) { await refreshBedtimeProvenance() }
         .sheet(item: $editTarget) { target in
             EditSleepView(
                 night: target.night,
@@ -536,7 +550,22 @@ struct SleepCardView: View {
             guard let s = night.inBedStart, let e = night.inBedEnd, night.summary.inBed > 0 else { return true }
             return e.timeIntervalSince(s) <= night.summary.inBed * 1.15
         }()
-        if contiguous, !isLikelyTruncated(night),
+        // 🟢 AND the trailing edge must be WITNESSED. `isLikelyTruncated` above only tests the
+        // LEADING edge (a late onset vs a scheduled bedtime) and only when the wearer enabled a
+        // manual schedule, so it is structurally blind to a night that stops early — which is the
+        // shape this hint gets exactly backwards.
+        //
+        // THE CASE (Gen 2 Air FR04.009, night 2026-08-25/26, build 48): the record stream ended at
+        // 02:47:30 against a real 06:46 wake, so the night was missing ~4 h — and the ONLY caption
+        // the card showed her said "duration may read a little high". Her export carries the
+        // evidence: `wakeVerdict: "unknown"` next to `reasons: ["durationLikelyHigh"]`.
+        //
+        // `.unknown` must suppress it just as `.stoppedThenResumed` does: a duration-reads-HIGH claim
+        // asserts the measured window IS the whole night, and only a witnessed edge establishes that
+        // ("we did not look" must never read as "we watched" — `WakeProvenance.Verdict.unknown`).
+        // Coverage inside the detected window cannot substitute: it is 0.976–1.049 on 21 of 21
+        // corpus nights, vacuous by construction because the window is DEFINED by the records.
+        if contiguous, !isLikelyTruncated(night), wakeProvenance == .witnessed,
            SleepConfidence.classify(night.summary) == .durationLikelyHigh {
             hintRow(systemImage: "info.circle", tint: .secondary,
                     "Very still night — duration may read a little high. The ring can't sense motionless wakefulness (no movement, near-sleep heart rate), so quiet time awake in bed is counted as light sleep.")
@@ -623,6 +652,7 @@ struct SleepCardView: View {
         // access, and this function needs both of its clock times.
         guard let resolved = night, let start = resolved.inBedStart else {
             bedtimeProvenance = .unknown
+            wakeProvenance = .unknown
             return
         }
         let store = LocalStore(modelContext)
@@ -631,21 +661,29 @@ struct SleepCardView: View {
         // ring, and the #198 night is precisely a charge cycle, so they would call it "witnessed".
         let last = try? store.latestSample(kind: .heartRate, before: start)
         let earliest = try? store.earliestSample(kind: .heartRate)
+        // `inBedEnd` falls back to the bedtime on a legacy rollup that stored no wake clock; `edges`
+        // normalises a degenerate window rather than collapsing it (`ExportCoverageWitness.edges`).
+        let end = resolved.inBedEnd ?? start
+        // THIRD fetchLimit-1 read, and the reason the trailing edge can be classified at all: this
+        // argument was `nil` while only the bedtime hint consumed the result. Same kind and the same
+        // band guard as the two above, so both edges are judged by one witness.
+        let first = try? store.earliestSample(kind: .heartRate, after: end)
         let ringID = RingMetadataStore().load().identifier
         let archive = ringID.isEmpty ? [] : EpochArchiveStore(namespace: ringID).load()
-        // `inBedEnd` falls back to the bedtime on a legacy rollup that stored no wake clock; the
-        // trailing-edge instant is unused here, and `edges` normalises a degenerate window rather
-        // than collapsing it (`ExportCoverageWitness.edges`).
         let edges = ExportCoverageWitness.edges(
             archives: archive.isEmpty ? [] : [archive],
             storedLastBeforeStart: last?.start,
-            storedFirstAfterEnd: nil,
+            storedFirstAfterEnd: first?.start,
             storedEarliestRetained: earliest?.start,
             inBedStart: start,
-            inBedEnd: resolved.inBedEnd ?? start)
+            inBedEnd: end)
         bedtimeProvenance = BedtimeProvenance.classify(
             inBedStart: start,
             lastMeasurementBefore: edges.lastMeasurementBeforeStart,
+            earliestRetainedMeasurement: edges.earliestRetainedMeasurement)
+        wakeProvenance = WakeProvenance.classify(
+            inBedEnd: end,
+            firstMeasurementAfter: edges.firstMeasurementAfterEnd,
             earliestRetainedMeasurement: edges.earliestRetainedMeasurement)
     }
 

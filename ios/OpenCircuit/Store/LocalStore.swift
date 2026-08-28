@@ -2321,6 +2321,89 @@ struct LocalStore {
         return changed
     }
 
+    /// ONE-SHOT REPAIR for nights whose Sleep Score was zeroed by builds 47–48 (the scar described
+    /// at `rederiveEditedNightProvenance`'s `sleepScore` note and at `applySleepEdit`). Returns the
+    /// nights it healed, newest first, or `[]`.
+    ///
+    /// WHY IT IS SEPARATE FROM `rederiveEditedNightProvenance`, which is the obvious place to put it:
+    /// that function returns early on an EMPTY ARCHIVE and is only ever called from the drain path
+    /// (`RingSession.persistSleep`), so a phone whose 30 h archive has aged out — which is precisely
+    /// a phone with OLD scarred nights — would never run it. This pass reads only the stored
+    /// hypnogram and therefore needs no archive, no ring, and no connection.
+    ///
+    /// ⚠️ THE SCORE IS REBUILT FROM `row.hypnogramData`, NEVER FROM `row.asleepMin` AND FRIENDS.
+    /// `SleepScoreHeal` carries the full argument; the short version is that the stored minutes are
+    /// the rounded form of the second-precision summary the score was originally built from, so a
+    /// minutes-based rebuild would move the number for no reason the wearer could see.
+    ///
+    /// IDEMPOTENT AND INTERRUPTION-SAFE. The latch is set only after the save succeeds, so a kill
+    /// mid-pass simply re-runs the whole set next launch; healing an already-healed row is a no-op
+    /// because the predicate requires `sleepScore == 0`. A phone with no scarred nights costs one
+    /// SwiftData fetch and latches for the life of the install.
+    ///
+    /// ⚠️ `row.updatedAt` IS BUMPED — the Sleep card and Readiness are `@Query`-backed and would
+    /// otherwise keep showing the empty badge until something else touched the row. Only that field
+    /// and `sleepScore` change: the minutes, `efficiency`, the hypnogram, and every provenance column
+    /// are left exactly as stored, so this turns a missing number into the number build 46 would have
+    /// shown and restates nothing about the night. (`updatedAt` is the row's "changed at" stamp, not
+    /// a health figure; bumping it is what makes the repair visible.)
+    ///
+    /// ⚠️ DELIBERATELY NOT LATCHED, unlike the Health republish pass — the same reasoning
+    /// `backfillSleepProvenance` records for itself. It is idempotent (the predicate demands
+    /// `sleepScore == 0`, so a healed row is skipped for ever after), it is cheap (one fetch over
+    /// the sleep table, which holds one row per night), and un-latched means a row that arrives
+    /// LATER is still picked up — from an iCloud restore, from a night re-keyed after the first run,
+    /// or from a basis that changes when `rederiveEditedNightProvenance` upgrades it. An earlier
+    /// draft of this pass latched unconditionally, which turned any row the predicate missed into a
+    /// PERMANENT miss: the wearer would have been left in exactly the state this exists to end.
+    ///
+    /// NOT A HEALTHKIT PATH. `sleepScore` is ours alone — it is not written to Apple Health — so
+    /// unlike the republish pass this needs no authorization check and queues no reconcile.
+    @discardableResult
+    func healWithheldSleepScores() throws -> [Date] {
+        let rows = try context.fetch(FetchDescriptor<StoredSleepSummary>())
+        var healed: [(night: Date, score: Int)] = []
+        // ⚠️ THE BASIS CLAUSE IS `!= .unknown`, NOT `== .assertedTagged`, and the difference is a
+        // measured bug rather than a preference. The withhold's own predicate was
+        // `breakdown.isScorable == false`, which is COVERAGE-based and says nothing about the basis
+        // string; two paths leave a scarred row stamped `.measuredOnly`:
+        //   • An edit whose unmeasured ground is UNKNOWN rather than proven-empty emits
+        //     `.assertedCoverageUnknown`, which `hasAssertedTime` does not count, so the row is
+        //     written `.measuredOnly` — while `isScorable` was still false and the score still zeroed.
+        //   • `rederiveEditedNightProvenance` rewrites `.asserted` spans to `.assertedOverMeasured`
+        //     as the archive grows. Once every asserted span is upgraded, `hasAssertedTime` is false
+        //     and it restamps the row `.measuredOnly` (:2154 and the sibling write below) while
+        //     leaving `sleepScore` at 0 on purpose.
+        // Legacy `.unknown` rows stay OUT: their split is genuinely unrecoverable, and
+        // `backfillSleepProvenance` deliberately refuses to invent one for an edited row.
+        // Widening costs nothing, because `applySleepEdit` ALWAYS writes a score — so on a
+        // non-legacy edited row a stored 0 can only be the withhold or a genuine composite of 0,
+        // and `SleepScoreHeal.healedScore` refuses to write a recomputed 0 back.
+        for row in rows where row.isManuallyEdited && row.sleepScore == 0
+            && SleepBasis(stored: row.sleepBasis) != .unknown {
+            // A row with no stored timeline cannot be rebuilt at second precision, and the minutes
+            // are not an acceptable substitute — leave it for the wearer's next edit.
+            guard !row.hypnogramData.isEmpty else { continue }
+            let segments = SleepHypnogramCodec.decode(row.hypnogramData)
+            guard let score = SleepScoreHeal.healedScore(hypnogram: segments) else { continue }
+            row.sleepScore = score
+            row.updatedAt = Date()
+            healed.append((row.night, score))
+        }
+
+        if !healed.isEmpty { try context.save() }
+
+        for item in healed.sorted(by: { $0.night > $1.night }) {
+            // Night KEY and score only — no clock time — matching the granularity of the sleep
+            // breadcrumbs around it.
+            ObservabilityStore().recordMetricEvent(
+                source: "sleep-score-heal",
+                detail: "night=\(Self.stamp(item.night)) HEALED withheld score -> \(item.score) "
+                    + "(rebuilt from stored hypnogram; b47/b48 zeroed it on the wearer's own edit)")
+        }
+        return healed.map(\.night).sorted(by: >)
+    }
+
     struct PendingSleepEditHealthWrite {
         let night: Date
         let segments: [SleepSegment]

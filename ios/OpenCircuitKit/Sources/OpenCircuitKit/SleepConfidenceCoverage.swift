@@ -227,8 +227,42 @@ extension SleepConfidence {
         if case .resumedAfterGap(let gap) = bedtime, gap > materialGapSeconds {
             reasons.append(.noRecordingBeforeBedtime(until: c.inBedStart, silentFor: gap))
         }
-        // The duration claim is the OPPOSITE of the acquisition claim — never both.
-        if reasons.isEmpty, level == .durationLikelyHigh {
+        // The duration claim is the OPPOSITE of the acquisition claim — never both. It ALSO requires
+        // a WITNESSED back edge, which is a separate condition and not a redundant one.
+        //
+        // 🟢 THE CASE THIS SECOND CLAUSE EXISTS FOR (Gen 2 Air FR04.009, night 2026-08-25/26, build
+        // 48). Her record stream ended at 02:47:30 and she got up at 06:46 — the night is missing its
+        // last ~4 h. `WakeProvenance.classify` returned `.unknown`, because "the ring stopped" and
+        // "you synced the moment you woke" are the same picture when NOTHING follows the wake. With
+        // only the mutual-exclusion clause, `.unknown` emits no acquisition reason, `reasons` stays
+        // empty, and the assessment therefore said `.durationLikelyHigh` — "duration may read a
+        // little high" — on a night that read four hours LOW. Her export carries exactly that:
+        // `wakeVerdict: "unknown"` beside `reasons: ["durationLikelyHigh"]`. So routing a caller to
+        // `assess` was NOT by itself enough to fix the inversion; the precedence rule had to.
+        //
+        // The logic is the type's own, stated in `Verdict.unknown`: "we did not look" must never read
+        // as "we watched". A duration-reads-HIGH claim asserts that the window we measured is the
+        // whole night, and only a witnessed trailing edge establishes that. On `.unknown` the night
+        // may equally have been truncated, so silence is the only honest output — the same reason
+        // `.stoppedThenResumed` suppresses it.
+        //
+        // ⚠️ COST, MEASURED. The gate is "NOT WITNESSED", which is wider than "nothing follows the
+        // wake": it also covers a `.stoppedThenResumed` whose gap is BELOW `materialGapSeconds` and
+        // which therefore emitted no acquisition reason either. By `WakeProvenance`'s header
+        // partition that reachable set is 11 of 21 staged corpus nights (7 `.unknown` + 4
+        // `.stoppedThenResumed`), of which 2 were already suppressed by the mutual-exclusion clause.
+        //
+        // The MEASURED delta is 2 of 21 — `.durationLikelyHigh` goes 5/21 → 3/21:
+        //   • `R3_2026-08-15` — wake `unknown`. Labelled GOOD (worst edge error 8 min), so this
+        //     removes one of the two measured FALSE POSITIVES on the labelled set.
+        //   • `R5_2026-08-11` — wake `stop 33m`, i.e. below the material cut, NOT "nothing follows".
+        //   • `R3_2026-08-19` (labelled GOOD, 10 min) still fires: its wake IS witnessed, so the
+        //     signal is scoped rather than retired.
+        // ⚠️ Those FP counts come out of ONE good labelled night. They are not a rate.
+        //
+        // It moves NO staged number (nothing in `SleepStaging` reads this type); it only decides
+        // which caveat, if any, is printed. `SleepCoverageMeasureTests` prints both sides.
+        if reasons.isEmpty, level == .durationLikelyHigh, wake == .witnessed {
             reasons.append(.durationLikelyHigh)
         }
 
