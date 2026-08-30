@@ -112,15 +112,29 @@ struct DeviceInfoView: View {
             //
             // Gen 2 Air (#186): RingConn does NOT ship this feature on the Air (vendor comparison
             // table — Sleep Apnea Pattern: Gen 3 yes / Gen 2 yes / Gen 2 Air no). That's a PRODUCT
-            // removal, not a sensor one: the Air still streams 0x47 PPG and real SpO₂, so we say
-            // "not available" out loud instead of silently hiding the row, and nothing else on the
-            // Air is gated. UI-layer only — OpenCircuitKit stays device-agnostic.
+            // removal, not a sensor one: the Air still streams 0x47 PPG and real SpO₂, so we say so
+            // out loud instead of silently hiding the row, and nothing else on the Air is gated.
+            // UI-layer only — OpenCircuitKit stays device-agnostic.
+            //
+            // ⚠️ COPY CORRECTION (2026-08-27). This row said "Not available" and its footer told Air
+            // owners "the ring never records the overnight burst". 🟢 That is FALSE — a Gen 2 Air
+            // delivered a ≈5.67 h `0x48` burst. THE ARITHMETIC, so the next reader can redo it: a
+            // real export carried `odi = 0.17638724911452186`, and `OSASpO2.summarize` defines
+            // `odi = desaturationEvents / durationHours` with
+            // `durationHours = totalSamples / sampleRateHz / 3600`. Inverting at ONE event gives
+            // 5.6693 h — and 5.6693 × 4.15 Hz × 3600 = exactly 84,700 samples/channel. (Two events
+            // would mean an 11.3 h night, so one is the only plausible reading; the integer sample
+            // count does not discriminate between them.) The decode path is device-agnostic and
+            // `SleepCardView.osaRow` gates only on `osaValidWindows > 0`, so those results DID reach
+            // the Sleep card on that Air. Only the ARMING toggle is withheld here, and that is all
+            // this row may claim. 🔴 HOW an unarmed Air came to record a burst is NOT established —
+            // we never send `05 22 01` on this model — so claim no mechanism.
             Section {
                 if sleepApneaUnavailable {
                     HStack {
                         Label("Sleep apnea assessment", systemImage: "lungs.fill")
                         Spacer()
-                        Text("Not available")
+                        Text("Not offered on this model")
                     }
                     .foregroundStyle(.secondary)
                     .accessibilityElement(children: .combine)
@@ -133,14 +147,18 @@ struct DeviceInfoView: View {
                     }
                     .disabled(session?.ready != true)
                 }
+                osaBurstProvenanceRow()
             } header: {
                 Text("Sleep apnea (experimental)")
             } footer: {
                 if sleepApneaUnavailable {
-                    Text("Not available on RingConn Gen 2 Air. RingConn doesn't offer the sleep-apnea "
-                         + "assessment on this model, so the ring never records the overnight burst — "
-                         + "this isn't something OpenCircuit can turn on. Your ring's blood oxygen, "
-                         + "heart rate, and sleep tracking all work normally.")
+                    Text("RingConn doesn't list the sleep-apnea assessment for the Gen 2 Air, so "
+                         + "OpenCircuit doesn't offer the switch on this ring. That's about the "
+                         + "feature, not the sensor — a Gen 2 Air has been seen recording a full "
+                         + "night of the dense blood-oxygen data this assessment reads, and when "
+                         + "that happens OpenCircuit decodes it and the results appear on the Sleep "
+                         + "card just like on any other model. Your ring's blood oxygen, heart rate, "
+                         + "and sleep tracking all work normally.")
                 } else {
                     Text("Turn this on before bed and wear the ring overnight — it records a dense "
                          + "blood-oxygen reading. Open the app in the morning to sync, and the results appear "
@@ -407,6 +425,33 @@ struct DeviceInfoView: View {
             Text(value?.isEmpty == false ? value! : "--")
                 .foregroundStyle(value?.isEmpty == false ? .primary : .tertiary)
                 .textSelection(.enabled)
+        }
+    }
+
+    /// Identity of the last `0x48` burst this session decoded. WHY it is on screen at all: the OSA
+    /// summary carries no date and no cursor, so last night's burst and a morning re-dump of an
+    /// OLDER night read identically in a report — the only way anyone has dated one is by inverting
+    /// `odi` for a duration, which says nothing about WHICH night. The session cursor (`frame[6..9]`)
+    /// is the per-night key: two reports quoting the same cursor are the same night, dumped twice.
+    /// Selectable so a tester can copy it into a message. Absent until a burst decodes, so this
+    /// costs a non-OSA user nothing.
+    @ViewBuilder
+    private func osaBurstProvenanceRow() -> some View {
+        if let burst = session?.latestOSABurst {
+            let cursor = burst.sessionCursor.map { String(format: "0x%08X", $0) } ?? "unknown"
+            let hours = burst.durationHours.map { String(format: "%.2f h", $0) }
+                ?? "no usable series"
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Last oxygen burst")
+                    .font(.subheadline)
+                Text("\(burst.decodedAt.formatted(date: .abbreviated, time: .shortened)) · "
+                     + "\(burst.nightFrames) of \(burst.wireFrames) frames · \(hours)")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("session \(cursor)")
+                    .font(.caption.monospaced()).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            .accessibilityElement(children: .combine)
         }
     }
 }

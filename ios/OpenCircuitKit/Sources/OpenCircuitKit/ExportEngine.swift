@@ -616,8 +616,16 @@ public enum ExportEngine {
         // for columns too, and `testHostileValuesRoundTripThroughTheCSV` is what enforces it).
         var lines = ["capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64,nightRowOutcome"]
         for r in rows {
-            let channelSummary = r.channels.map {
-                "\($0.label):\($0.outcome.rawValue):4c=\($0.page4CCount):47=\($0.page47Count):50=\($0.endMarkerCount):added=\($0.recordsAdded)"
+            // `4d`/`sport` are APPENDED inside the existing `channelSummary` column, so no column
+            // index moves (the same contract `nightRowOutcome` states above). They are OMITTED for
+            // a trace decoded from a pre-2026-08-27 bundle, where the counters are nil: emitting
+            // `4d=0` there would report "we counted zero sport pages" for a build that never
+            // counted at all.
+            let channelSummary = r.channels.map { c -> String in
+                var s = "\(c.label):\(c.outcome.rawValue):4c=\(c.page4CCount):47=\(c.page47Count):50=\(c.endMarkerCount):added=\(c.recordsAdded)"
+                if let p4d = c.page4DCount { s += ":4d=\(p4d)" }
+                if let sport = c.sportSampleCount { s += ":sport=\(sport)" }
+                return s
             }.joined(separator: "|")
             lines.append(csvLine([
                 iso8601.string(from: r.capturedAt),
@@ -928,6 +936,13 @@ public enum ExportEngine {
                     "syncAckFlag": jsonOrNull(channel.syncAckFlag),
                     "page4CCount": channel.page4CCount,
                     "page47Count": channel.page47Count,
+                    // ADDITIVE, and NULL rather than 0 on a bundle written before the counters
+                    // existed — `jsonOrNull` preserves the one distinction they were added for
+                    // ("we counted zero sport pages" vs "this build never counted"). A 0x4d page
+                    // is the sport channel's ONLY page kind, so without these a drain full of
+                    // workout history was indistinguishable from an empty one.
+                    "page4DCount": jsonOrNull(channel.page4DCount),
+                    "sportSampleCount": jsonOrNull(channel.sportSampleCount),
                     "endMarkerCount": channel.endMarkerCount,
                     "recordsAtStart": channel.recordsAtStart,
                     "recordsAtEnd": channel.recordsAtEnd,
@@ -1241,11 +1256,18 @@ public enum ExportEngine {
             "osaTimeBelow90Sec and osaODI are EXPERIMENTAL estimates — reproducing the app's " +
             "numbers needs its proprietary artifact rejection and event scoring (OSASpO2.swift " +
             "header, docs/RUNBOOK_OSA_APNEA.md).",
+        // ⚠️ The second sentence used to read "Overnight temperature coverage is expected to be
+        // sparse because the app deliberately stays quiet during the sleep window" — an
+        // expectation the data contradicts (a 2026-08-26 tester night banked 378 overnight
+        // samples with the quiet gate in force). A reader who trusted it would have written a
+        // dense overnight run off as impossible. Say what varies and why it is not predictable
+        // from the gate, and claim no mechanism.
         "skinTemperature":
             "Skin temperature is LIVE-only: it is not part of the drainable 0x4c history, so a " +
-            "window the app did not observe cannot be back-filled. Overnight temperature " +
-            "coverage is expected to be sparse because the app deliberately stays quiet during " +
-            "the sleep window.",
+            "window the app did not observe cannot be back-filled. Overnight coverage is NOT " +
+            "predictable from the app's sleep-window quiet gate: a night recorded under that gate " +
+            "has carried hundreds of overnight readings, so a quiet night is not an empty one. " +
+            "Read the timestamps in this file rather than inferring coverage from the gate.",
         "ringIdentity":
             "The meta.ring* fields describe the LAST RING THIS APP CONNECTED TO, which is not " +
             "necessarily the ring that produced every night in this file. Rings are used one at a " +

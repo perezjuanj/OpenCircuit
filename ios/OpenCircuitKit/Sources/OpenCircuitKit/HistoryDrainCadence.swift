@@ -20,11 +20,20 @@
 // window we do NOT drain — the link is kept warm with `0xD0` statusQuery (no pointer walk) and the
 // night accumulates UNTOUCHED on the ring (it buffers for DAYS — §3, a 19-day backlog drained in one
 // shot; the scattered "~4.75 h drop-oldest" notes elsewhere are the stale, pre-§3 belief), then is
-// pulled in ONE pass at wake. TRADEOFFS: overnight skin temp is ELIMINATED (statusQuery yields no
-// descriptor) and the sleep wear-gate reverts to motion-only overnight; and a co-installed official app
-// can win the whole night in the morning. Sleep-history integrity wins (it is the reported loss).
-// Daytime cadence is unchanged. ⚠️ NEEDS ON-DEVICE VALIDATION (a full >5 h night must drain intact in
-// one morning pass, early hours included) before this is trusted as the #111/#119 fix.
+// pulled in ONE pass at wake. TRADEOFF: a co-installed official app can win the whole night in the
+// morning. Sleep-history integrity wins (it is the reported loss). Daytime cadence is unchanged.
+// ⚠️ NEEDS ON-DEVICE VALIDATION (a full >5 h night must drain intact in one morning pass, early
+// hours included) before this is trusted as the #111/#119 fix.
+//
+// ⚠️ CORRECTION (2026-08-27). This header used to list a second tradeoff — "overnight skin temp is
+// ELIMINATED (statusQuery yields no descriptor)" — and that is FALSE as written. 🟢 A tester night
+// on 2026-08-26 (FR04.009) banked 378 overnight temperature samples with this gate in force, so the
+// gate does NOT eliminate overnight skin temp on that ring. 🔴 WHY it survives is NOT established:
+// nobody has captured whether `0xD0` elicits the `0x10`/`0x87` descriptor, whether the ring pushes
+// it unsolicited, or whether those samples came from a foreground/manual moment or from clock edges
+// where `isInSleepWindow` read false. Do not restate any of those as the mechanism without a
+// capture — and do not reason from "overnight temp is gone" anywhere, including the #41 wear-gate
+// claim this header used to make.
 //
 // Pure (no Apple frameworks) so it unit-tests on the CLI, matching KeepaliveCadence / ReconnectBackoff.
 

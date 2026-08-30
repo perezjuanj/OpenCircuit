@@ -203,6 +203,12 @@ final class ExportSchemaV3Tests: XCTestCase {
                 "syncAckFlag": NSNull(),
                 "page4CCount": 1,
                 "page47Count": 0,
+                // ADDITIVE (2026-08-27), same superset promise as `nightRowOutcome` above. Present
+                // as 0 because `HistoryChannelTrace.init` zeroes them; a trace decoded from a
+                // bundle written before they existed emits NULL here instead, which is the
+                // distinction the pair was added to preserve.
+                "page4DCount": 0,
+                "sportSampleCount": 0,
                 "endMarkerCount": 1,
                 "recordsAtStart": 2,
                 "recordsAtEnd": 8,
@@ -918,7 +924,7 @@ final class ExportSchemaV3Tests: XCTestCase {
         "schemaVersion", "channel", "firstOpcode", "lastOpcode", "syncAckFlag",
         // Plain counts of rows/pages/epochs — dimensionless by construction.
         "stagedSleepSegments", "mergedRecordCount", "historySampleCount",
-        "page4CCount", "page47Count", "endMarkerCount",
+        "page4CCount", "page47Count", "page4DCount", "sportSampleCount", "endMarkerCount",
         "recordsAtStart", "recordsAtEnd", "recordsAdded",
         "validWindows", "expectedSamples", "observedSamples",
         // #203 — archive-vs-evidence coverage: plain counts of epochs, and one duration that DOES
