@@ -149,16 +149,20 @@ final class HealthKitWriter {
     ///     (HKHealthStore.h). A denied type would therefore have reported `.unnecessary` and no
     ///     sheet would have appeared. This is why the heal in `reconcileNewlyAuthorizableShareTypes`
     ///     can reach these users at all.
-    ///   • 🟢 The wipe was SCOPED, not wholesale — on the same deduction, since that reconcile runs
-    ///     only inside `if healthAuthorized` (`isShareAuthorized`, probed on HEART RATE). Heart-rate
-    ///     share was therefore still granted while the workout rows were being re-asked for. (It
-    ///     rests on the sheet being UNPROMPTED at launch, which is how it was reported; a sheet the
-    ///     user summoned with the Connect button would not carry this.)
-    ///   • 🟡 Its exact scope is NOT explained by any evidence we have. Build 50's second request
-    ///     named `HKObjectType.workoutType()` and nothing else, yet Workout ROUTES — a type that
-    ///     request never mentioned — lost its write grant too. So "the named type's share bit is
-    ///     re-derived from the new (empty) `toShare`" is too narrow to fit, and "the app's whole
-    ///     request record is replaced" is too wide to fit. Do not write either down as the cause.
+    ///   • 🟢 The wipe was SCOPED, not wholesale — now DIRECTLY OBSERVED, no longer only deduced.
+    ///     Maintainer, 2026-08-30, reading Health ▸ Sharing ▸ Apps ▸ OpenCircuit while the device
+    ///     sat in the broken state: Heart Rate, Steps and Sleep were ALL still granted. Only the two
+    ///     workout rows had gone. (The earlier deduction agreed and is kept as corroboration: the
+    ///     relaunch reconcile runs only inside `if healthAuthorized` — `isShareAuthorized`, probed
+    ///     on HEART RATE — so heart-rate share had to survive for the loop to run at all.)
+    ///   • 🟡 WHY those two and no others is still NOT established. Build 50's second request named
+    ///     `HKObjectType.workoutType()` and nothing else, yet Workout ROUTES — never mentioned by
+    ///     that request — went with it, while every non-workout type was untouched. So "the named
+    ///     type's share bit is re-derived from the new (empty) `toShare`" is too narrow to fit, and
+    ///     "the app's whole request record is replaced" is now positively EXCLUDED by the direct
+    ///     observation above. The blast radius matches the grouping the permission SHEET uses (both
+    ///     workout types appear under one "Workouts" row), which is suggestive and nothing more —
+    ///     it is a shape, not a mechanism. Do not write any of the three down as the cause.
     ///   • 🟡 WHY HealthKit clears it: NOT documented by Apple and NOT claimed here. The header
     ///     documents only that a repeat request over already-answered types completes silently; it
     ///     says nothing about a request RESETTING one. Two corroborating third-party reports,
