@@ -984,6 +984,18 @@ struct ContentView: View {
     /// `authorizationPromptAvailable()` flips false, so this never re-fires (a decline lands the type in
     /// the `.sharingDenied` "not reaching Health" banner instead). Uses the existing `allTypes` set,
     /// which deliberately excludes the non-shareable correlation types (#121/#128) — no new auth-crash risk.
+    ///
+    /// THIS IS ALSO THE HEAL FOR THE BUILD-50 WORKOUT PERMISSION LOOP. It carries newly-added READ
+    /// types too, now that `authorizationPromptAvailable()` probes the same read set the request
+    /// sends (`HealthKitWriter.authorizationReadTypes`) — Apple's status probe only answers for "the
+    /// same collections of types" (HKHealthStore.h), so a narrower probe could never see one. Two
+    /// cohorts land here on first foreground of the fixed build and are settled by ONE sheet:
+    ///   • a build-50 user left in the loop — workout SHARE was reset to `.notDetermined` (deduced
+    ///     in `authorizationReadTypes`), so the probe reports `.shouldRequest` and the sheet carries
+    ///     the workout write row AND the new workout read row together;
+    ///   • a build-49-or-earlier user who never opened the Activity tab — share is fully answered,
+    ///     but workout READ has never been requested, so the probe still reports `.shouldRequest`.
+    /// Expect exactly ONE extra Health sheet per existing install on the upgrade, then silence.
     @MainActor
     private func reconcileNewlyAuthorizableShareTypes() async {
         guard await health.authorizationPromptAvailable() == true else { return }

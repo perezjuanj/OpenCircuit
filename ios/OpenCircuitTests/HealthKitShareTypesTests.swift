@@ -19,6 +19,56 @@ final class HealthKitShareTypesTests: XCTestCase {
         XCTAssertTrue(types.contains(HKQuantityType(.bloodPressureDiastolic)))
     }
 
+    // MARK: One authorization request (the build-50 workout permission loop)
+
+    /// The Activity tab reads this app's own workouts back out of Health, and a HealthKit read
+    /// without authorization does not error — it returns an empty result. So `HKWorkoutType` must be
+    /// in the READ half of the app's single request.
+    ///
+    /// Build 50 asked for it in a SECOND request instead (`toShare: []`), while this one kept the
+    /// same type in `toShare` only. The two disagreed about that type, and on device the user could
+    /// never settle: grant Workouts + Workout Routes WRITE at launch → open the Activity tab → the
+    /// write grant is gone → next launch asks for write again, forever. Both halves must now name
+    /// it, from one request.
+    ///
+    /// N10 is satisfied by the TYPE, not by a try/catch: `HKWorkoutType` is a plain `HKSampleType`
+    /// (HealthKit/HKObjectType.h), not the `HKCorrelationType` of #121/#128 nor an Apple-computed
+    /// type like `.appleExerciseTime` (#110) — and it already sits in the stricter `toShare` half,
+    /// which is where `_throwIfAuthorizationDisallowedForSharing:` lives.
+    func testWorkoutTypeIsBothSharedAndReadByTheSingleRequest() {
+        let writer = HealthKitWriter()
+        XCTAssertTrue(writer.allTypes.contains(HKWorkoutType.workoutType()),
+                      "workouts are written — the share half must keep naming the type")
+        XCTAssertTrue(writer.authorizationReadTypes.contains(HKObjectType.workoutType()),
+                      "the Activity-tab card reads workouts back; without READ in the ONE request "
+                      + "the query returns empty forever and no second request may be added")
+    }
+
+    /// The read half must stay clear of the same crash class the share half is pinned against.
+    func testAuthorizationReadSetContainsNoCorrelationTypes() {
+        XCTAssertFalse(HealthKitWriter().authorizationReadTypes.contains { $0 is HKCorrelationType },
+                       "correlation types must never enter either half of the auth request")
+    }
+
+    /// The read set is exactly the share set minus the write-only GPS route series.
+    ///
+    /// `HKSeriesType.workoutRoute()` is excluded because nothing reads a route back —
+    /// `WorkoutSessionManager` inserts routes via `HKWorkoutRouteBuilder` and `WorkoutHistoryReader`
+    /// queries `HKWorkoutType` only — so requesting route READ would ask for an access this build
+    /// never exercises. It is NOT excluded for safety: `HKSeriesType` is a plain `HKSampleType` and
+    /// is readable. Pinned as an equality so a type added to `allTypes` cannot silently land in one
+    /// half and not the other, which is the shape that broke build 50.
+    func testAuthorizationReadSetIsTheShareSetMinusTheWriteOnlyRouteSeries() {
+        let writer = HealthKitWriter()
+        var expected = Set<HKObjectType>()
+        for type in writer.allTypes where !(type is HKSeriesType) { expected.insert(type) }
+        XCTAssertEqual(writer.authorizationReadTypes, expected)
+        XCTAssertFalse(writer.authorizationReadTypes.contains(HKSeriesType.workoutRoute()),
+                       "routes are write-only — we insert them, we never read them back")
+        XCTAssertTrue(writer.allTypes.contains(HKSeriesType.workoutRoute()),
+                      "…but they ARE written, so the share half must keep naming the type")
+    }
+
     /// Apple Exercise Time is an Apple-COMPUTED Activity-ring metric and is NOT third-party
     /// shareable. Listing it in HealthKit's auth `toShare` set raises an Obj-C
     /// NSInvalidArgumentException (-[HKHealthStore _throwIfAuthorizationDisallowedForSharing:])
