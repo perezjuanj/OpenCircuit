@@ -151,8 +151,90 @@ final class WorkoutSessionManager: NSObject {
     }
 
     /// Convenience for the end paths and the launch-time orphan cleanup.
+    ///
+    /// ⚠️ Deliberately does NOT touch the session snapshot below. The launch-time orphan path calls
+    /// this, and the snapshot is the ONLY evidence that launch has of the interrupted workout —
+    /// clearing the two together would re-create the exact defect the snapshot was added to fix.
+    /// The snapshot is cleared by the end paths and by whoever resolves the recovery offer.
     nonisolated static func clearWorkoutInProgressFlag() {
         setWorkoutInProgressPersisted(false)
+    }
+
+    // MARK: - Crash-orphan session snapshot
+
+    /// UserDefaults key for the running session's `WorkoutSessionSnapshot` (JSON).
+    ///
+    /// WHY (tester report 2026-08-29, build 49): the durable flag above says a workout WAS underway
+    /// but nothing said which one, so the only thing a relaunch could do with a crash orphan was
+    /// clear the flag and end its Live Activity — deleting the last evidence a workout had ever
+    /// existed. This blob is the evidence. UserDefaults, not SwiftData, deliberately: a schema
+    /// change is a launch-crash surface whose recovery path wipes un-resyncable raw history (see the
+    /// build-44 note in `App.swift`), which is a wildly disproportionate risk for a recovery record.
+    nonisolated static let sessionSnapshotKey = "workout.sessionSnapshot"
+
+    /// The snapshot a previous (or the current) process last wrote, or nil when there is none /
+    /// this build cannot read it. Feed it to `WorkoutSessionRecovery.decide` — never interpret it
+    /// directly, and in particular never treat "now" as the session's end (see that file).
+    nonisolated static var persistedSessionSnapshot: WorkoutSessionSnapshot? {
+        WorkoutSessionSnapshot.decoded(
+            from: UserDefaults.standard.data(forKey: sessionSnapshotKey))
+    }
+
+    nonisolated static func clearSessionSnapshot() {
+        UserDefaults.standard.removeObject(forKey: sessionSnapshotKey)
+    }
+
+    /// Write down what this session looks like RIGHT NOW, stamping `lastAliveAt` with the current
+    /// clock — the instant a later launch is allowed to call the workout's end. Called at start and
+    /// on the session's ~10 s heartbeat, so a crash costs at most one heartbeat of duration (an
+    /// under-count, which is the safe direction: we never claim time we did not observe).
+    private func persistSessionSnapshot(now: Date = Date()) {
+        guard let sessionStart, let agg = aggregator else { return }
+        let samples = agg.collectedSamples
+        let snapshot = WorkoutSessionSnapshot(
+            sport: selectedSport,
+            startDate: sessionStart,
+            lastAliveAt: now,
+            hrSampleCount: samples.count,
+            // No reading ever locked ⇒ carry no energy at all rather than a zero that reads as a
+            // measurement (#45). `liveActiveKcal` is HR-derived, so it is meaningless without them.
+            activeKcal: samples.isEmpty
+                ? nil
+                : agg.liveActiveKcal(profile: profileSnapshot ?? HealthKitWriter.storedUserProfile(),
+                                     asOf: now),
+            // `currentAvgHR` (not a local mean) so a recovered save reports the same truncated
+            // average the live UI and `finalize` would have shown.
+            avgHR: agg.currentAvgHR,
+            maxHR: samples.map(\.bpm).max())
+        guard let data = snapshot.encoded() else { return }
+        UserDefaults.standard.set(data, forKey: Self.sessionSnapshotKey)
+    }
+
+    /// Write a workout recovered from a crash-orphaned snapshot to Apple Health.
+    ///
+    /// Routed through the SAME `writeWorkout` the live path uses, so the hard-won ordering there
+    /// still holds: the daily active-energy estimate is netted ONLY if the energy sample actually
+    /// landed, and nothing is credited before `finishWorkout` commits.
+    ///
+    /// What it does NOT carry: the per-reading HR series and the GPS route. Those lived in memory
+    /// and died with the process; the snapshot records how MANY readings there were so the UI can
+    /// say so, but reconstructing samples from a count would be fabrication. The zone breakdown is
+    /// therefore empty and the summary screen's "No HR zone data captured" branch tells the truth.
+    func saveRecoveredWorkout(_ recovered: RecoveredWorkout) async -> Bool {
+        let summary = WorkoutSummary(
+            sport: recovered.sport,
+            startDate: recovered.start,
+            endDate: recovered.end,
+            avgHR: recovered.avgHR,
+            maxHR: recovered.maxHR,
+            estimatedActiveKcal: recovered.activeKcal,
+            zoneBreakdown: WorkoutZoneBreakdown(),
+            distanceMeters: nil,
+            hasRoute: false,
+            hrSampleCount: recovered.hrSampleCount,
+            steps: nil,
+            usedFormulaMaxHR: true)
+        return await writeWorkout(summary: summary, hrSamples: [], routeLocations: [])
     }
 
     private weak var session: RingSession?
@@ -251,6 +333,9 @@ final class WorkoutSessionManager: NSObject {
         // starved by a drain that holds `syncTask`. Cleared on every end path (stop/cancel/reset)
         // and reconciled at launch if the process was killed mid-workout.
         Self.setWorkoutInProgressPersisted(true)
+        // …and write down WHICH workout, so a process death leaves recoverable evidence instead of
+        // a bare boolean. Refreshed on the heartbeat below; cleared on every end path.
+        persistSessionSnapshot(now: start)
 
         // Enter the ring's NATIVE sport mode for this workout (#90): SportStart → the ring streams
         // `0x4e` HR+steps frames (~10 s) which RingSession routes into `liveHR`/`liveHRAt` (picked up
@@ -294,7 +379,13 @@ final class WorkoutSessionManager: NSObject {
                 guard let self else { break }   // self-terminate if the manager went away
                 self.elapsedSeconds = self.sessionStart.map { Date().timeIntervalSince($0) } ?? self.elapsedSeconds
                 tick += 1
-                if tick % 10 == 0 { await self.pushLiveActivityUpdate() }
+                if tick % 10 == 0 {
+                    await self.pushLiveActivityUpdate()
+                    // Same heartbeat re-stamps the crash-recovery snapshot's `lastAliveAt`, so a
+                    // process death costs at most ~10 s of recovered duration — an UNDER-count,
+                    // which is the only safe direction (we never claim time we didn't observe).
+                    self.persistSessionSnapshot()
+                }
             }
         }
 
@@ -356,6 +447,16 @@ final class WorkoutSessionManager: NSObject {
         // BOTH the normal completion below AND the `guard let agg` error-return, so no end path can
         // leave the flag set and suppress the morning drain forever (#119 lane).
         Self.setWorkoutInProgressPersisted(false)
+        // The session is ending under user control, so there is nothing to recover: drop the
+        // crash-recovery snapshot here rather than letting the next launch offer to re-save a
+        // workout this call is about to write to Health itself.
+        //
+        // Cleared HERE, before the HealthKit write below, deliberately. A kill inside that ~1–2 s
+        // window loses the recovery offer for one workout; keeping the snapshot until after the
+        // write would instead risk the next launch offering to save a workout Health already has —
+        // a permanent, user-visible duplicate that ALSO double-nets the daily active-energy
+        // estimate. Bounded loss beats unretractable duplication.
+        Self.clearSessionSnapshot()
 
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
@@ -499,6 +600,7 @@ final class WorkoutSessionManager: NSObject {
         // T6: clear the durable flag on the cancel end path too (before `endSportSession()` below
         // releases `workoutHolding` and re-arms the deferred drain).
         Self.setWorkoutInProgressPersisted(false)
+        Self.clearSessionSnapshot()   // discarded by the user — nothing to recover
         hrPollTask?.cancel(); hrPollTask = nil
         timerTask?.cancel(); timerTask = nil
         // Tear down the Live Activity too — a discarded session should leave nothing on the Lock
@@ -521,15 +623,27 @@ final class WorkoutSessionManager: NSObject {
         // T6: belt-and-suspenders — `reset()` runs from the summary "Done" / error "Dismiss"
         // buttons (after `stop()` already cleared it), but clear again so no path can leave it set.
         Self.setWorkoutInProgressPersisted(false)
+        Self.clearSessionSnapshot()
         recordingState = .idle
         elapsedSeconds = 0
         currentHR = nil
     }
 
-    // Belt-and-suspenders: the poll/timer loops capture `self` weakly and `break` as soon as
-    // the manager is deallocated (the `guard let self else { break }` in `start`), so they can
-    // never outlive the manager even without an explicit cancel. Ring teardown
-    // (`stopLiveMonitoring`) is handled by `stop()` via the view's `.onDisappear`. (#75)
+    // ⚠️ OWNERSHIP — CORRECTED (tester report 2026-08-29, build 49). This note used to end "Ring
+    // teardown (`stopLiveMonitoring`) is handled by `stop()` via the view's `.onDisappear` (#75)".
+    // That was the DEFECT: this manager was a `@State` of the workout SHEET, so any sheet teardown
+    // both fired `stop()` — which writes the in-progress workout to HealthKit and finalizes it —
+    // and destroyed the app's only copy of the session. A tester's ~55-minute walk therefore landed
+    // in Apple Health while vanishing from OpenCircuit, and re-opening the sheet showed the "record
+    // a new activity" screen. The manager is now owned by `ContentView` for the app's lifetime and
+    // handed to `WorkoutView`, so dismissing the sheet is a pure UI event.
+    //
+    // What #75 was actually protecting — a leaked poll/timer task and a ring left in sport mode —
+    // still holds, by construction rather than by teardown: the loops capture `self` weakly and
+    // `break` once the manager is deallocated (`guard let self else { break }` in `start`), the
+    // manager now outlives every sheet so nothing is orphaned, and ending a workout is an explicit
+    // user action reachable from the Live Activity (`widgetURL`), the Activity tab's recording
+    // banner, and the workout sheet itself.
 
     // MARK: - HR collection
 

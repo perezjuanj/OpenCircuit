@@ -11,6 +11,14 @@
 //
 // HONESTY (#45): when HR hasn't locked / has gone stale, `bpm == nil` or `hrIsStale == true`; the
 // UI shows "--" / dims the number rather than freezing a held value as if it were live.
+//
+// TAP TARGET (tester report 2026-08-29, build 49): every surface below carries
+// `WorkoutQuickLink.activeSession` as its `widgetURL`. Before that there was no `widgetURL`
+// anywhere in `ios/`, so tapping this activity cold-opened the app onto its default screen and the
+// tester "[didn't] know where the currently recording activity went". `widgetURL` is the ONLY
+// supported tap target for a Live Activity — the lock-screen view and the compact/minimal Dynamic
+// Island presentations cannot host a Button — so it is set on the lock-screen content, on the
+// `DynamicIsland` itself (which covers compact + minimal), and on each expanded region.
 
 import ActivityKit
 import WidgetKit
@@ -24,6 +32,8 @@ struct WorkoutLiveActivity: Widget {
             LockScreenLiveActivityView(context: context)
                 .activityBackgroundTint(Color.black.opacity(0.35))
                 .activitySystemActionForegroundColor(.white)
+                // Route the tap to the running session instead of a cold open (see the header).
+                .widgetURL(WorkoutQuickLink.activeSession)
         } dynamicIsland: { context in
             DynamicIsland {
                 // Expanded — the full three-metric view.
@@ -36,10 +46,12 @@ struct WorkoutLiveActivity: Widget {
                         Image(systemName: context.attributes.sportSymbolName)
                             .foregroundStyle(.blue)
                     }
+                    .widgetURL(WorkoutQuickLink.activeSession)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
                     HeartRateLabel(bpm: context.state.bpm, isStale: context.state.hrIsStale || context.isStale)
                         .font(.caption).fontWeight(.semibold)
+                        .widgetURL(WorkoutQuickLink.activeSession)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     HStack(alignment: .firstTextBaseline) {
@@ -51,6 +63,7 @@ struct WorkoutLiveActivity: Widget {
                             .font(.system(.title3, design: .rounded).weight(.semibold))
                     }
                     .padding(.top, 2)
+                    .widgetURL(WorkoutQuickLink.activeSession)
                 }
             } compactLeading: {
                 // Sport icon + ticking timer.
@@ -67,6 +80,10 @@ struct WorkoutLiveActivity: Widget {
                 Image(systemName: "heart.fill")
                     .foregroundStyle((context.state.hrIsStale || context.isStale) ? AnyShapeStyle(.secondary) : AnyShapeStyle(.red))
             }
+            // Tap target for the COMPACT and MINIMAL presentations — those closures render into a
+            // system-owned container that cannot host a Button, so the URL must be set here on the
+            // DynamicIsland itself. (The expanded regions each carry their own, above.)
+            .widgetURL(WorkoutQuickLink.activeSession)
             .keylineTint(.red)
         }
     }
