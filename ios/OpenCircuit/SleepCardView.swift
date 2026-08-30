@@ -42,6 +42,10 @@ struct SleepCardView: View {
     /// task. Read ONLY by `confidenceHint`, which must not claim a night ran LONG unless we actually
     /// watched it end. `.unknown` is the safe default: it suppresses that claim.
     @State private var wakeProvenance: WakeProvenance.Verdict = .unknown
+    /// The asserted share of the displayed night's stage minutes (#export-honesty). nil until the
+    /// off-render-path task has resolved it, and on every night that has none — which is every
+    /// unedited night, so the bar and legend are byte-identical to before for almost all of them.
+    @State private var assertedStages: AssertedStages?
     /// Freshly staged segments from the just-finished sync (empty when none / after disconnect).
     /// Preferred over the store so a completed sync updates the card immediately.
     var liveSegments: [SleepSegment]
@@ -154,6 +158,41 @@ struct SleepCardView: View {
         /// relative term, so a pre-midnight night isn't mislabeled "yesterday".
         let wakeKnown: Bool
         let isManuallyEdited: Bool
+        /// WHICH TIMELINE THE STAGE MINUTES ABOVE CAME FROM. The stage bar's provenance overlay has
+        /// to be computed from the SAME segments the totals were, or it would hatch a share of one
+        /// night's minutes measured on another's timeline.
+        let stageSource: StageSource
+        enum StageSource: Equatable { case live, stored }
+    }
+
+    /// Per-stage seconds of the displayed night that are the WEARER'S OWN ACCOUNT over ground we can
+    /// PROVE holds no records (`SleepProvenance.asserted`) — the share the stage bar hatches and the
+    /// legend caption names.
+    ///
+    /// Carries its `nightKey` so a stale value from the previous night can never be painted over the
+    /// current one while the refresh task is in flight.
+    private struct AssertedStages: Equatable {
+        let nightKey: Date
+        let light: TimeInterval
+        let deep: TimeInterval
+        let rem: TimeInterval
+        let awake: TimeInterval
+        var total: TimeInterval { light + deep + rem + awake }
+    }
+
+    /// `.task(id:)` key for the stage-provenance refresh. The window alone is not enough: a re-stage
+    /// can rewrite the timeline without moving either edge.
+    private struct StageProvenanceKey: Equatable {
+        let night: Date?
+        let source: Night.StageSource?
+        let asleepMin: Int
+        let liveCount: Int
+        init(_ night: Night?, liveCount: Int) {
+            self.night = night?.nightKey
+            self.source = night?.stageSource
+            self.asleepMin = night?.summary.minutes.asleep ?? 0
+            self.liveCount = liveCount
+        }
     }
 
     /// Value snapshot for sheet presentation. Keeping it independent of the live SwiftData model
@@ -210,7 +249,8 @@ struct SleepCardView: View {
                          summary: s, inBedStart: start, inBedEnd: end,
                          onset: sleep?.onset, wake: sleep?.wake,
                          when: end ?? start ?? Date(), wakeKnown: end != nil,
-                         isManuallyEdited: false)
+                         isManuallyEdited: false,
+                         stageSource: .live)
         }()
         let stored: Night? = {
             guard let s = storedSleep.first, s.asleepMin > 0 else { return nil }
@@ -225,7 +265,8 @@ struct SleepCardView: View {
             return Night(nightKey: s.night, summary: s.asSummary, inBedStart: start, inBedEnd: end,
                          onset: onset, wake: wake,
                          when: end ?? start ?? s.night, wakeKnown: end != nil,
-                         isManuallyEdited: s.isManuallyEdited)
+                         isManuallyEdited: s.isManuallyEdited,
+                         stageSource: .stored)
         }()
         switch (live, stored) {
         case let (l?, r?):
@@ -384,6 +425,12 @@ struct SleepCardView: View {
         // Keyed on BOTH edges: the same task now resolves the trailing edge too, and an Edit that
         // moves only the wake would otherwise leave `wakeProvenance` stale against the new window.
         .task(id: EdgeKey(night)) { await refreshBedtimeProvenance() }
+        // Stage provenance, on its own key and its own task. Deliberately NOT folded into `EdgeKey`:
+        // that key and `refreshBedtimeProvenance` are pinned by the corpus harness, and a re-stage
+        // can rewrite the timeline without moving either edge, so the two need different triggers.
+        .task(id: StageProvenanceKey(night, liveCount: liveSegments.count)) {
+            await refreshStageProvenance()
+        }
         .sheet(item: $editTarget) { target in
             EditSleepView(
                 night: target.night,
@@ -441,8 +488,8 @@ struct SleepCardView: View {
             Spacer()
             if let score = latest?.sleepScore, score > 0 { scoreBadge(score) }
         }
-        stageBar(m)
-        stageLegend(m)
+        stageBar(night, m)
+        stageLegend(night, m)
         // When we actually fell asleep / woke (distinct from the bedtime window) + latency — this is
         // what makes the in-bed-vs-asleep gap legible ("I wasn't asleep yet at 11pm").
         sleepWindowCaption(night)
@@ -685,6 +732,69 @@ struct SleepCardView: View {
             inBedEnd: end,
             firstMeasurementAfter: edges.firstMeasurementAfterEnd,
             earliestRetainedMeasurement: edges.earliestRetainedMeasurement)
+    }
+
+    // MARK: Stage provenance (the hatched share of the bar)
+
+    /// Resolve how much of each displayed stage is the wearer's own account over ground we can PROVE
+    /// holds no records, from the SAME timeline the displayed minutes were summed from.
+    ///
+    /// Off the render path for the reason `refreshBedtimeProvenance` gives: `body` runs on every
+    /// `@Query` invalidation, and the stored branch has to decode `hypnogramData` (a JSON blob whose
+    /// backing store is faulted on first touch). One decode per night change, not one per render.
+    ///
+    /// A LIVE night can never produce a hatch: `SleepStaging.classify` emits only `.measured`
+    /// segments, so this resolves to nil there and the bar is drawn exactly as before.
+    @MainActor
+    private func refreshStageProvenance() async {
+        guard let resolved = night else {
+            assertedStages = nil
+            return
+        }
+        let segments: [SleepSegment]
+        switch resolved.stageSource {
+        case .live:
+            segments = liveSegments
+        case .stored:
+            // Same identity guard as `editableSleepSummary`: only the row that IS the night on
+            // screen may speak for it.
+            guard let row = latest, row.night == resolved.nightKey else {
+                assertedStages = nil
+                return
+            }
+            segments = SleepHypnogramCodec.decode(row.hypnogramData)
+        }
+        let b = SleepProvenanceBreakdown(segments: segments)
+        // `.asserted` ONLY, matching `hasAssertedTime` — `.assertedCoverageUnknown` behaves exactly
+        // as this app behaved before provenance existed, and hatching it would put a mark on every
+        // night older than the ~30 h epoch archive.
+        let resolvedStages = AssertedStages(nightKey: resolved.nightKey,
+                                            light: b.assertedLight,
+                                            deep: b.assertedDeep,
+                                            rem: b.assertedREM,
+                                            awake: b.assertedAwake)
+        assertedStages = resolvedStages.total > 0 ? resolvedStages : nil
+    }
+
+    /// The asserted split for the night currently on screen, in whole minutes and CLAMPED to the
+    /// minutes actually displayed for each stage.
+    ///
+    /// The clamp is load-bearing, not defensive tidiness: the displayed totals come from the stored
+    /// minute COLUMNS while the split comes from the stored TIMELINE, and the two are written by
+    /// different code paths. Without it a disagreement between them could hatch more of a bar than
+    /// the bar contains, or print more asserted minutes for a stage than the legend shows for it —
+    /// a caveat that contradicts its own headline. Clamping can only ever UNDER-state the asserted
+    /// share, which is the safe direction for a caveat about our own honesty.
+    private func assertedMinutes(_ night: Night,
+                                 _ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int))
+        -> (light: Int, deep: Int, rem: Int, awake: Int)? {
+        guard let a = assertedStages, a.nightKey == night.nightKey else { return nil }
+        func mins(_ seconds: TimeInterval, cap: Int) -> Int {
+            min(cap, max(0, Int((seconds / 60).rounded())))
+        }
+        let out = (light: mins(a.light, cap: m.light), deep: mins(a.deep, cap: m.deep),
+                   rem: mins(a.rem, cap: m.rem), awake: mins(a.awake, cap: m.awake))
+        return (out.light + out.deep + out.rem + out.awake) > 0 ? out : nil
     }
 
     /// Say plainly when the printed bedtime is where DATA starts rather than where the user settled.
@@ -1226,14 +1336,42 @@ struct SleepCardView: View {
     }
 
     /// Proportional Deep/Light/REM/Awake bar, driven by the night's stage minutes.
-    private func stageBar(_ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)) -> some View {
+    ///
+    /// ⚠️ THE ASSERTED SHARE IS HATCHED, AND IT IS NOT SUBTRACTED. On an edited night part of a
+    /// stage's minutes is the wearer's own account over ground the ring never recorded — on the
+    /// committed `R2_2026-08-18` tester fixture the app stored 329 Light minutes of which only 88
+    /// are measured, so 241 of that bar is her account (`SleepProvenanceTesterNightTests`
+    /// `.testPerStageMinutesExcludeTheInventedBlock` / `.testTheAssertedLightIsTheHatchedShare`) —
+    /// and the bar drew all 329 as solid Light, i.e. gave
+    /// fabricated fill a stage name and the ring's authority. Clause 1 of the provenance rule says
+    /// an assertion WINS FOR DISPLAY, so the minutes stay (removing them would contradict the
+    /// headline, and the build-47 withholding was shipped and then deliberately reversed — see
+    /// `SleepProvenanceBreakdown`). What changes is that the claim now looks like a claim.
+    private func stageBar(_ night: Night,
+                          _ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)) -> some View {
         let total = Double(m.deep + m.light + m.rem + m.awake)
+        let asserted = assertedMinutes(night, m)
         return GeometryReader { geo in
             HStack(spacing: 1) {
                 ForEach(Self.stages, id: \.name) { stage in
                     let mins = stage.minutes(m)
-                    Rectangle().fill(stage.color)
-                        .frame(width: total > 0 ? geo.size.width * Double(mins) / total : 0)
+                    let claimed = asserted.map { stage.asserted($0) } ?? 0
+                    let width = total > 0 ? geo.size.width * Double(mins) / total : 0
+                    let claimedWidth = mins > 0 ? width * Double(claimed) / Double(mins) : 0
+                    // Split only when there IS an asserted share. An unedited night renders the
+                    // single solid rectangle it always did, with no Canvas in the tree.
+                    if claimedWidth > 0 {
+                        HStack(spacing: 0) {
+                            Rectangle().fill(stage.color)
+                                .frame(width: max(0, width - claimedWidth))
+                            Rectangle().fill(stage.color.opacity(0.45))
+                                .overlay(AssertedHatch())
+                                .frame(width: claimedWidth)
+                        }
+                        .frame(width: width)
+                    } else {
+                        Rectangle().fill(stage.color).frame(width: width)
+                    }
                 }
             }
         }
@@ -1241,19 +1379,91 @@ struct SleepCardView: View {
         .clipShape(Capsule())
     }
 
-    /// Color key with per-stage minutes (omits stages with no time).
-    private func stageLegend(_ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)) -> some View {
-        HStack(spacing: 12) {
-            ForEach(Self.stages, id: \.name) { stage in
-                let mins = stage.minutes(m)
-                if mins > 0 {
-                    HStack(spacing: 4) {
-                        Circle().fill(stage.color).frame(width: 7, height: 7)
-                        Text("\(stage.name) \(mins)m").font(.caption2).foregroundStyle(.secondary)
+    /// Diagonal hatch marking the part of a stage block the WEARER asserted rather than the ring
+    /// measured. Drawn rather than tinted because colour alone is not a distinction — the four stage
+    /// colours are already carrying meaning, and a de-saturated teal next to a solid teal is exactly
+    /// the comparison a colour-vision deficiency loses.
+    private struct AssertedHatch: View {
+        var body: some View {
+            Canvas { ctx, size in
+                var path = Path()
+                var x = -size.height
+                while x < size.width {
+                    path.move(to: CGPoint(x: x, y: size.height))
+                    path.addLine(to: CGPoint(x: x + size.height, y: 0))
+                    x += 4
+                }
+                // The card's own background colour, so the stripes read against every stage colour
+                // in both light and dark appearance without picking a literal.
+                ctx.stroke(path, with: .color(Color(.secondarySystemGroupedBackground).opacity(0.85)),
+                           lineWidth: 1.2)
+            }
+            .allowsHitTesting(false)
+        }
+    }
+
+    /// Color key with per-stage minutes (omits stages with no time), plus — only on a night that has
+    /// any — one line naming the minutes that are the wearer's own account rather than a recording.
+    ///
+    /// The numbers go in a CAPTION rather than inside each legend item on purpose: four legend items
+    /// already fill the row on the narrowest device, and a suffix on two of them would clip exactly
+    /// the words that carry the caveat. The legend item still marks itself — its dot is hatched the
+    /// same way its share of the bar is — so the caption and the bar are visibly about one thing.
+    @ViewBuilder
+    private func stageLegend(_ night: Night,
+                             _ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)) -> some View {
+        let asserted = assertedMinutes(night, m)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 12) {
+                ForEach(Self.stages, id: \.name) { stage in
+                    let mins = stage.minutes(m)
+                    if mins > 0 {
+                        HStack(spacing: 4) {
+                            Circle().fill(stage.color).frame(width: 7, height: 7)
+                                .overlay {
+                                    if (asserted.map { stage.asserted($0) } ?? 0) > 0 {
+                                        Circle().fill(stage.color.opacity(0.45))
+                                            .overlay(AssertedHatch())
+                                            .clipShape(Circle())
+                                            .mask(alignment: .trailing) {
+                                                Rectangle().frame(width: 3.5)
+                                            }
+                                    }
+                                }
+                            Text("\(stage.name) \(mins)m").font(.caption2).foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
+            if let asserted, let line = Self.assertedStagesLine(asserted) {
+                Text(line).font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
+    }
+
+    /// Reads, on a night with an asserted Light and Awake share:
+    /// "Hatched: <n>m Light · <n>m Awake — your own account of time the ring recorded nothing
+    /// across." The minutes are whatever `assertedMinutes` resolved for the night on screen; no
+    /// example is quoted here, because a number in a comment is read as a measurement.
+    ///
+    /// Names the stages and their minutes rather than one lump total, because the defect is that a
+    /// STAGE NAME was applied to fabricated fill; a bare "3h 56m asserted" would leave the reader to
+    /// guess which of the four bars it came out of. nil when nothing is asserted.
+    ///
+    /// ⚠️ IT SAYS NOTHING ABOUT APPLE HEALTH, and that is deliberate — the same rule
+    /// `editedNightNoticeText` follows via `mirrorsSleepToHealth`. Whether these minutes reach
+    /// Health depends on a share permission this line has no access to, and telling someone whose
+    /// sleep permission is off what Health holds would be exactly the unearned claim this whole
+    /// change removes. The line states provenance only.
+    private static func assertedStagesLine(_ a: (light: Int, deep: Int, rem: Int, awake: Int)) -> String? {
+        let parts = [("Light", a.light), ("Deep", a.deep), ("REM", a.rem), ("Awake", a.awake)]
+            .filter { $0.1 > 0 }
+            .map { "\($0.1)m \($0.0)" }
+        guard !parts.isEmpty else { return nil }
+        return "Hatched: \(parts.joined(separator: " · ")) — your own account of time the ring "
+            + "recorded nothing across. Still counted in the totals above, marked so it reads as "
+            + "yours rather than as a measurement."
     }
 
     /// The actual-sleep clock window + sleep latency, shown as a caption under the stage legend.
@@ -1337,13 +1547,16 @@ struct SleepCardView: View {
         let name: String
         let color: Color
         let minutes: (_ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)) -> Int
+        /// This stage's share of the asserted minutes — the same selector as `minutes`, over the
+        /// provenance split, so the bar cannot hatch one stage's share onto another's block.
+        let asserted: (_ a: (light: Int, deep: Int, rem: Int, awake: Int)) -> Int
     }
     /// Display order + colors (match the prior sync-card stage bar): Deep, Light, REM, Awake.
     private static let stages: [Stage] = [
-        Stage(name: "Deep", color: .indigo, minutes: { $0.deep }),
-        Stage(name: "Light", color: .teal, minutes: { $0.light }),
-        Stage(name: "REM", color: .purple, minutes: { $0.rem }),
-        Stage(name: "Awake", color: .orange, minutes: { $0.awake }),
+        Stage(name: "Deep", color: .indigo, minutes: { $0.deep }, asserted: { $0.deep }),
+        Stage(name: "Light", color: .teal, minutes: { $0.light }, asserted: { $0.light }),
+        Stage(name: "REM", color: .purple, minutes: { $0.rem }, asserted: { $0.rem }),
+        Stage(name: "Awake", color: .orange, minutes: { $0.awake }, asserted: { $0.awake }),
     ]
 
     // MARK: Night label

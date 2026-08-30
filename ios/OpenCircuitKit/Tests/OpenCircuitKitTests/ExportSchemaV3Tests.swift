@@ -346,7 +346,10 @@ final class ExportSchemaV3Tests: XCTestCase {
 
     func testSleepSessionsCSVHeaderIsExactAndEmptyIsHeaderOnly() {
         let csv = ExportEngine.sleepSessionsCSV([])
-        XCTAssertEqual(csv, "sessionID,night,inBedStart,inBedEnd,sleepOnset,sleepWake,isManuallyEdited,asleepMin,deepMin,lightMin,remMin,awakeMin,efficiency,sleepScore,stressScore,hypnogramSegments,osaAvgSpO2,osaMinSpO2,osaTimeBelow90Sec,osaODI,osaValidWindows,coverageFraction,expectedSamples,observedSamples,longestGapSeconds,bedtimeVerdict,bedtimeGapSeconds,wakeVerdict,wakeGapSeconds,confidenceReasons")
+        // The four trailing columns are APPENDED, and `coverageFraction` keeps index 21: this file's
+        // rule is that a shipped column keeps its name and its position, so every positional
+        // consumer of an earlier export still resolves every earlier field.
+        XCTAssertEqual(csv, "sessionID,night,inBedStart,inBedEnd,sleepOnset,sleepWake,isManuallyEdited,asleepMin,deepMin,lightMin,remMin,awakeMin,efficiency,sleepScore,stressScore,hypnogramSegments,osaAvgSpO2,osaMinSpO2,osaTimeBelow90Sec,osaODI,osaValidWindows,coverageFraction,expectedSamples,observedSamples,longestGapSeconds,bedtimeVerdict,bedtimeGapSeconds,wakeVerdict,wakeGapSeconds,confidenceReasons,durationBasis,referenceWakeSource,referenceWakeAt,coverageToReferenceWake")
         XCTAssertFalse(csv.contains("\n"), "empty input is header-only")
     }
 
@@ -355,8 +358,8 @@ final class ExportSchemaV3Tests: XCTestCase {
         let records = ExportEngineTests.parseCSV(csv)
         XCTAssertEqual(records.count, 2)
         let row = records[1]
-        XCTAssertEqual(row.count, 30)
-        for index in 16 ... 29 {
+        XCTAssertEqual(row.count, 34)
+        for index in 16 ... 33 {
             XCTAssertEqual(row[index], "",
                            "column \(index) must be EMPTY when absent — 0 is a real reading")
         }
