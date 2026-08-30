@@ -8,9 +8,11 @@ public enum HistoryChannelOutcome: String, Codable, Sendable {
     /// end-marker (or went quiet after pages). It does NOT mean the RING IS EMPTY, and reading it
     /// that way is how a truncated night gets called healthy.
     ///
-    /// 🟢 Device-proven false twice inside FIVE MINUTES on 2026-08-26: a drain exited
-    /// `endMarker`/`.complete` with its newest record at 02:42:30, and the next two opens on the
-    /// same connection delivered 02:45:00 and 02:47:30. The `0x50` reports where the ring's resume
+    /// 🟢 Device-proven false twice inside FIVE MINUTES on 2026-08-26 (Gen 2 Air FR04.009, build 48;
+    /// three consecutive drains at 04:47:44 / 04:49:43 / 04:52:41 UTC, `historySyncEvidence` blobs
+    /// decoded from that tester's Data Export — health data, so it is not in the repo, per CLAUDE.md):
+    /// the 04:47:44 drain exited `endMarker`/`.complete` with its newest record at 02:42:30, and the
+    /// next two opens delivered 02:45:00 and 02:47:30. The `0x50` reports where the ring's resume
     /// pointer stood AT THAT MOMENT; the ring keeps recording, so "cleanly finished" and "nothing
     /// left" are different facts. `.complete` is only ever a statement about the OPEN, never about
     /// the device. It is the one outcome that unlocks `allowsSleepCommit` for that reason: a clean
@@ -25,6 +27,13 @@ public enum HistoryChannelOutcome: String, Codable, Sendable {
     /// own notes say "the RING returns EMPTY sport history": the instrument could not tell a drain
     /// full of workout history from a channel that returned nothing. Like every non-`.complete`
     /// outcome it does not allow a sleep commit — sport records carry no sleep epochs.
+    ///
+    /// ⚠️ NOT a proof that the SPORT CHANNEL was the source. `0x4d` is the per-epoch record, and
+    /// the sport channel is not its only emitter: `docs/RUNBOOK_OSA_APNEA.md` (§Opcodes) records a
+    /// brief `0x4d` burst at OSA ASSESSMENT START, which is pushed rather than requested and can
+    /// therefore land on whatever trace happens to be open. So on a non-sport channel read this as
+    /// "some `0x4d` arrived during this open and no epoch/PPG page did", not as "the ring sent
+    /// workout history on the sleep channel". Cross-check `label`/`channel` before concluding.
     case sportOnly
     case noAck
     /// The channel's sync-open never reached the wire — the BLE link was down or half-open, so
@@ -76,10 +85,13 @@ public struct HistoryChannelTrace: Equatable, Codable, Sendable {
     public var openWriteFailed: Bool?
     public var page4CCount = 0
     public var page47Count = 0
-    /// `0x4d` pages seen on this channel — the per-epoch SPORT record (#179), which the sport
-    /// channel (`0x02`) is the only channel that streams. Nothing counted `0x4d` anywhere before
-    /// 2026-08-27, so a sport drain FULL of workout history classified `.empty` and exported as
-    /// such: "auto-detect doesn't work for walks" was structurally unanswerable from a bundle.
+    /// `0x4d` pages seen on this channel — the per-epoch SPORT record (#179). The sport channel
+    /// (`0x02`) is the only channel that streams it AS HISTORY; it is not the only emitter, because
+    /// an OSA assessment also pushes a brief `0x4d` burst at start (`docs/RUNBOOK_OSA_APNEA.md`,
+    /// §Opcodes), so do not read a non-zero count on another channel as workout history. Nothing
+    /// counted `0x4d` anywhere before 2026-08-27, so a sport drain FULL of workout history
+    /// classified `.empty` and exported as such: "auto-detect doesn't work for walks" was
+    /// structurally unanswerable from a bundle.
     /// Counted from the WIRE (before decode) on purpose, so it stays true even when a page fails
     /// its XOR — a page/sample disagreement is then itself the signal that decoding, not the ring,
     /// is at fault.
@@ -138,9 +150,15 @@ public struct HistoryChannelTrace: Equatable, Codable, Sendable {
         if page47Count > 0 { return .ppgOnly }
         // Ordered AFTER both epoch/PPG branches so it can only ever narrow `.empty`/`.noAck`: a
         // channel that delivered 0x4c or 0x47 keeps the exact classification it had before this
-        // case existed. Today only the sport channel (0x02) streams 0x4d, so in practice this
-        // touches nothing but sport — and every branch it takes over already had
-        // `allowsSleepCommit == false`, so no sleep decision can move.
+        // case existed, and every branch it takes over already had `allowsSleepCommit == false`,
+        // so no sleep-commit decision can move (`HistoryCommitGate` treats the two identically).
+        //
+        // ⚠️ It is NOT sport-channel-only in practice: an OSA assessment pushes a brief 0x4d burst
+        // at start (`docs/RUNBOOK_OSA_APNEA.md`, §Opcodes), so an armed OSA user whose sleep channel
+        // returned nothing can land here instead of `.empty`. The one place that is user-visible is
+        // `RingSession.finalizeSync`, which shows a "Partial sync — sleep channel …" line for any
+        // sleep outcome that is neither `.complete` nor `.empty`; see the note at that call site.
+        // Nothing else branches on the distinction.
         if (page4DCount ?? 0) > 0 { return .sportOnly }
         if sawSyncAck { return .empty }
         // Ordered AFTER every "we heard something" branch: if pages or an ACK arrived, the link

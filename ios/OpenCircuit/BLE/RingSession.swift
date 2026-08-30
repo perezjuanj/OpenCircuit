@@ -4119,6 +4119,14 @@ final class RingSession: NSObject {
             // Count only what came off the WIRE: a drain that pulled nothing but re-hydrated banked
             // epochs must not report "Synced N epochs" (#188 follow-up).
             let wireRecords = bulkRecords.count - rehydratedCounters.count
+            // ⚠️ This is the ONLY place `.empty` is load-bearing beyond `allowsSleepCommit`, so the
+            // 2026-08-27 `.sportOnly` split is visible here: a sleep channel that returned no page
+            // but picked up a stray `0x4d` (an OSA assessment pushes one at start —
+            // `docs/RUNBOOK_OSA_APNEA.md`, §Opcodes) now reads `.sportOnly` and takes the "Partial
+            // sync" branch where it used to say "Up to date". Deliberately NOT special-cased back:
+            // a sleep open that delivered no epoch page and no ACK-clean empty IS worth surfacing,
+            // and suppressing it would also have to suppress the `.noAck`-derived half of the same
+            // case, which is a real fault. Cosmetic either way — nothing reads `syncStatus`.
             if let sleepOutcome, sleepOutcome != .complete, sleepOutcome != .empty {
                 syncStatus = "Partial sync — sleep channel \(sleepOutcome.rawValue); raw data kept for retry"
             } else if wireRecords > 0 {

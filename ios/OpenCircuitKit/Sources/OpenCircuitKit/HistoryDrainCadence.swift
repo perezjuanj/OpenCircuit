@@ -28,7 +28,13 @@
 // ⚠️ CORRECTION (2026-08-27). This header used to list a second tradeoff — "overnight skin temp is
 // ELIMINATED (statusQuery yields no descriptor)" — and that is FALSE as written. 🟢 A tester night
 // on 2026-08-26 (FR04.009) banked 378 overnight temperature samples with this gate in force, so the
-// gate does NOT eliminate overnight skin temp on that ring. 🔴 WHY it survives is NOT established:
+// gate does NOT eliminate overnight skin temp on that ring. (The count came from that tester's Data
+// Export, which is health data and NOT in the repo per CLAUDE.md — unauditable here by design, the
+// same convention the tester figures in HistoryDrainPlan.swift are recorded under. To re-check it on
+// a future export, read `samples[kind=temperature]`: `RingSession`'s descriptor handler routes an
+// IN-window worn reading there and an out-of-window one to `daytimeTemperatures`, so the daytime
+// table is empty overnight even on a link that never dropped.)
+// 🔴 WHY it survives is NOT established:
 // nobody has captured whether `0xD0` elicits the `0x10`/`0x87` descriptor, whether the ring pushes
 // it unsolicited, or whether those samples came from a foreground/manual moment or from clock edges
 // where `isInSleepWindow` read false. Do not restate any of those as the mechanism without a
