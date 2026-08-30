@@ -42,35 +42,28 @@ struct WorkoutHistoryReader {
         var duration: TimeInterval { end.timeIntervalSince(start) }
     }
 
-    /// READ AUTHORIZATION — the one thing that makes this card work or silently show nothing.
-    ///
-    /// `HealthKitWriter.requestAuthorization()` builds its `read:` set from `allTypes` MINUS workout
-    /// and series types (`if type is HKWorkoutType || type is HKSeriesType { continue }`), because
-    /// until now the app only ever WROTE workouts. A HealthKit read without authorization does not
-    /// error — it returns an empty result — so without this the card would look like "you have no
-    /// workouts" forever.
-    ///
-    /// This is a SCOPED, ADDITIVE request for exactly `HKObjectType.workoutType()`: a plain,
-    /// third-party-readable workout type that the app already lists in its share set. It is NOT the
-    /// class of type that must never enter an auth set — no `HKCorrelationType` (the uncatchable
-    /// `NSInvalidArgumentException` of #121/#128) and no Apple-computed type (`.appleExerciseTime`,
-    /// the #110 crash). Requested separately rather than by widening `HealthKitWriter.allTypes`,
-    /// which is a shared, crash-regression-pinned surface.
-    ///
-    /// Gated on `statusForAuthorizationRequest` so it prompts at most once and is a no-op for a user
-    /// who has already answered.
-    func requestReadAuthorizationIfNeeded() async {
-        guard HKHealthStore.isHealthDataAvailable() else { return }
-        // Only ask a user who has already opted into Health. Someone who never granted share access
-        // has no OpenCircuit workouts in Health for this card to find, so a permission sheet
-        // appearing merely because they opened the Activity tab would be a prompt with nothing
-        // behind it. The main authorization flow stays the one place Health access is introduced.
-        guard HealthKitWriter().isShareAuthorized else { return }
-        let read: Set<HKObjectType> = [HKObjectType.workoutType()]
-        guard let status = try? await store.statusForAuthorizationRequest(toShare: [], read: read),
-              status == .shouldRequest else { return }
-        try? await store.requestAuthorization(toShare: [], read: read)
-    }
+    // READ AUTHORIZATION — NOT REQUESTED, AND NOT NEEDED.
+    //
+    // Apple, on `HKHealthStore.authorizationStatus(for:)`: "If your app is given share permission
+    // but not read permission, you see only the data that your app has written to the store. Data
+    // from other sources remains hidden." This query is `predicateForObjects(from: .default())` —
+    // our own source only, by design (see the SCOPE note in the file header) — so the workout SHARE
+    // grant the app has held since #75 is already sufficient. Read authorization would widen this
+    // to OTHER apps' workouts, which this card deliberately does not show.
+    //
+    // Build 50 asked for it anyway, in its own `requestAuthorization(toShare: [], read:
+    // [HKObjectType.workoutType()])`, while `HealthKitWriter`'s request kept naming that same
+    // workout type in `toShare` only. On device that left the user in a permission loop with no
+    // settled state: grant Workouts + Workout Routes WRITE at launch → open this tab → the read
+    // prompt appears → the write grant is gone → next launch asks for write again. It bought
+    // nothing and cost the grant. The full evidence, and what is and is not established about the
+    // HealthKit mechanism, is on `HealthKitWriter.authorizationReadTypes`.
+    //
+    // ⚠️ DO NOT ADD A REQUEST HERE. A HealthKit read without authorization does not error — it
+    // returns an empty result — so if this card is ever empty on a device that has OpenCircuit
+    // workouts, the cause is the SHARE grant (Health ▸ Data Access ▸ OpenCircuit ▸ Workouts), or
+    // the write path, never a missing read. If a future card must show other apps' workouts, add
+    // `HKWorkoutType` to `HealthKitWriter.authorizationReadTypes` — the app's one read set.
 
     /// The most recent workouts OpenCircuit itself wrote, newest first. Returns `[]` on any failure
     /// (unavailable / denied / query error) — an empty list is honest here, and the card says
@@ -228,7 +221,6 @@ struct RecentWorkoutsCard: View {
 
     private func load() async {
         let reader = WorkoutHistoryReader()
-        await reader.requestReadAuthorizationIfNeeded()
         items = await reader.recentWorkouts(limit: limit)
         loaded = true
     }
