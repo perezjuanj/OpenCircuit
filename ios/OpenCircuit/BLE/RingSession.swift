@@ -1857,6 +1857,18 @@ final class RingSession: NSObject {
         // Scope the archive to THIS stored night before asking the staging model to pick a block.
         // The 30 h archive can contain two nights; calling `latestNightRecords` on the whole union
         // silently edits the newer one while persisting the result under the requested row's key.
+        //
+        // ⚠️ THE 2026-08-27 TRUNCATION CEILING WIDENS `editBounds.latest` BY UP TO 5 h ON A SHORT
+        // NIGHT, AND THAT CANNOT WIDEN THIS SCOPE. Checked rather than assumed, because a wider scope
+        // would touch the anchor-eviction hazard: the added band is
+        // `(max(recordedWake + 6 h, coverage.upperBound), floorEarliest + maxNightSpan]`, and
+        // `coverage.upperBound` is by construction the LAST archive record at or before
+        // `recordedOnset + maxNightSpan` (`SleepEdit.dataCoverage`), which is strictly later than the
+        // top of that band. So the band provably holds no records and `scopedArchive` is unchanged
+        // record-for-record — the ceiling only widens a filter over empty ground. (The one residual
+        // is pre-existing and unrelated to the ceiling: `live` is computed from an earlier
+        // `epochArchiveStore.load()` than the filter below, so a drain landing between the two is
+        // seen by the filter and not by the bounds. That race is identical on master.)
         let editBounds = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
                                           dataCoverage: coverage, existingEdit: existingEdit)
         let archiveMargin: TimeInterval = 30 * 60

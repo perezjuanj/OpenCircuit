@@ -118,14 +118,22 @@ final class SleepEditDataCoverageTests: XCTestCase {
     /// edit hour on master therefore walks the ceiling up with the clock — 07:00, 08:00, 09:00 —
     /// which means the answer to "can I enter the truth?" depended on WHEN she asked.
     ///
-    /// What the stranded margin buys is REACHABILITY AT EVERY HOUR, not a constant ceiling. The
-    /// ceiling itself still rises with the clock, because the coverage widening is still there and
+    /// What the stranded margin bought was REACHABILITY AT EVERY HOUR, not a constant ceiling. The
+    /// ceiling itself still rose with the clock, because the coverage widening was still there and
     /// still earning its keep — it is what rescued her on 08-17 and 08-18. Asserting a single value
-    /// would therefore be asserting the removal of a lever that works; the first draft of this test
-    /// did exactly that and failed (4 distinct ceilings), which is the useful part.
+    /// would therefore have been asserting the removal of a lever that worked; the first draft of
+    /// this test did exactly that and failed (4 distinct ceilings), which is the useful part.
     ///
-    /// The property that matches what she experiences: at NO hour is her real wake out of reach, and
-    /// the ceiling never moves DOWN as the archive grows.
+    /// ⚠️ 2026-08-27 — THE CEILING IS NOW CONSTANT AFTER ALL, so the monotonicity assertion below can
+    /// no longer fail for its original reason and the sweep alone would be vacuous. The truncation
+    /// ceiling grants `floorEarliest + maxNightSpan` outright, which is the cap the coverage widening
+    /// was already clipped to, so it swallows every coverage term. The lever was not removed, it was
+    /// superseded — the constant is ≥ everything coverage could buy at every hour, which is asserted
+    /// explicitly below and pinned in
+    /// `SleepEditTruncatedCeilingTests.testTheLateEdgeIsTheSameAtEveryStateOfTheArchive`.
+    ///
+    /// The property that matches what she experiences is unchanged: at NO hour is her real wake out
+    /// of reach, and the ceiling never moves DOWN as the archive grows.
     func testHerRealWakeIsReachableAtEveryHourSheMightEdit() {
         let onset = d(22, 0, 16), stagedWake = d(22, 2, 8), realWake = d(22, 6, 15)
         let firstEpoch = d(21, 20, 36), lastBeforeHole = d(22, 2, 31)
@@ -146,6 +154,10 @@ final class SleepEditDataCoverageTests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(b.latest, previous,
                                             "the ceiling must never move DOWN as the archive grows "
                                             + "— that is what makes a Save safe while the sheet is open")
+                XCTAssertEqual(b.latest.timeIntervalSince1970, previous.timeIntervalSince1970,
+                               accuracy: 0.1,
+                               "…and since 2026-08-27 it must not move at ALL: the truncation "
+                               + "ceiling swallows the coverage widening on this edge")
             }
             previous = b.latest
         }
@@ -212,9 +224,15 @@ final class SleepEditDataCoverageTests: XCTestCase {
     }
 
     /// The `.tooLong` rule is the load-bearing replacement for the removed pairwise edge cap — it
-    /// must not be deletable without a failure. Coverage widening BOTH sides makes the bounds span
-    /// strictly exceed one night (earliest = floorLatest − 14 h = Aug 3 21:55; latest = min(13:00,
-    /// floorEarliest + 14 h) = Aug 4 13:00 → 15 h 05 m), so the assertions below run unconditionally.
+    /// must not be deletable without a failure. Coverage widening the EARLY side makes the bounds
+    /// span strictly exceed one night, so the assertions below run unconditionally.
+    ///
+    /// ⚠️ The arithmetic in this comment has been corrected twice and is now stated as the code
+    /// actually computes it. earliest = floorLatest − 14 h = Aug 3 21:55. latest = Aug 4 18:30 =
+    /// floorEarliest (04:30) + 14 h, the truncation ceiling — NOT the coverage upper bound: this
+    /// night's recorded span is 1 h 25 m, so since 2026-08-27 the late edge is that constant and the
+    /// 13:00 coverage end cannot move it. Span = 20 h 35 m. (It said "13:00 → 15 h 05 m", which was
+    /// already wrong on master, where the stranded margin made it 14:55 → 17 h.)
     func testWindowStretchedAcrossWidenedBoundsIsTooLong() {
         let coverage = d(3, 2, 53)...d(4, 13, 0)
         let b = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,

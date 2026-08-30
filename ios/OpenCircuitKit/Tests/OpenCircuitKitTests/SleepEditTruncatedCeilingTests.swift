@@ -9,7 +9,17 @@ import XCTest
 /// her night and nothing here claims to be her data — the numbers below are a SHAPE ("staging kept a
 /// short head fragment of a full night"), chosen to be arithmetically representative of a sub-2 h
 /// report, not a measurement. The justification for the fix is structural, and it is the sweep in
-/// `testTheCeilingNeverTightensAsTheTruncationGetsWorse`, not any single night.
+/// `testTheCeilingHasAFloorTheTruncationCannotMove`, not any single night.
+///
+/// 🟢 THIS SUITE WAS RUN ON MASTER (f3afc88) BY ADVERSARIAL REVIEW, 2026-08-30, copied in verbatim:
+/// **11 tests, 38 failures.** Seven tests fail — the sweep above (19 failures, one per 15-minute step
+/// below the 5 h crossover and none above it), `testAHeadFragmentNightCanReachTheRealMorningWake`,
+/// `testTheCeilingIsOneNightAfterTheParityBedtime`, `testATwentyHourNightIsStillRejected`,
+/// `testEveryMinuteTheNewCeilingUnlocksIsStillTaggedAsserted`,
+/// `testTheLateEdgeIsTheSameAtEveryStateOfTheArchive` and
+/// `testAFullerStagingLowersTheCeilingButNeverBelowTheFloors`. The four that PASS on master are the
+/// guard rails — they are meant to hold before and after, and their job is to fail if this widening
+/// ever takes something away.
 ///
 /// THE STRUCTURAL DEFECT. `bounds` anchored its ceiling on `recordedWake + strandedEditMargin` —
 /// `recordedWake` being the very number the wearer opened the sheet to correct. Truncation moves
@@ -171,6 +181,68 @@ final class SleepEditTruncatedCeilingTests: XCTestCase {
             }
             previous = b.latest
         }
+    }
+
+    /// THE LEVER THIS TERM RETIRES, PINNED RATHER THAN LEFT IMPLICIT. Every coverage path in `bounds`
+    /// is clipped to `floorEarliest + maxNightSpan`, which is exactly what the truncation ceiling
+    /// grants outright — so the late edge is now INDEPENDENT of `dataCoverage` altogether, not merely
+    /// monotone in it. That is a stronger property than the one the 2026-08-22 note describes ("the
+    /// ceiling still rises with the clock"), and it is the reason that note carries a correction.
+    ///
+    /// The second assertion is the one that matters to a wearer: nothing coverage used to buy is
+    /// lost. Whatever the archive holds, the constant ceiling is at least the value the coverage
+    /// widening could ever have reached.
+    ///
+    /// 🟢 Fails on master, where `b.latest` takes THREE distinct values across this sweep (the
+    /// stranded floor, one coverage-widened value, and the cap) — 4 of the 7 archive states below
+    /// disagree with the no-coverage answer. Measured 2026-08-30 on f3afc88.
+    func testTheLateEdgeIsTheSameAtEveryStateOfTheArchive() {
+        let onset = at(0), wake = at(1.75)
+        let noCoverage = SleepEdit.bounds(recordedOnset: onset, recordedWake: wake).latest
+        let cap = onset.addingTimeInterval(-SleepEdit.editMargin)
+            .addingTimeInterval(SleepEdit.defaultMaxNightSpan)
+        for upperH in [1.9, 3.0, 6.0, 8.0, 11.0, 13.0, 14.0] {
+            let coverage = at(-3)...at(upperH)
+            let b = SleepEdit.bounds(recordedOnset: onset, recordedWake: wake,
+                                     dataCoverage: coverage)
+            XCTAssertEqual(b.latest.timeIntervalSince1970, noCoverage.timeIntervalSince1970,
+                           accuracy: 0.1,
+                           "an archive ending at \(upperH)h moved a ceiling that is supposed to be a "
+                           + "pure function of the recorded night")
+            XCTAssertGreaterThanOrEqual(b.latest, min(coverage.upperBound, cap),
+                                        "the constant ceiling must be at least what the coverage "
+                                        + "widening could have bought — no wearer loses reach")
+        }
+    }
+
+    /// THE DISCLOSED NON-MONOTONICITY, MEASURED. The truncation ceiling is anchored on the recorded
+    /// ONSET, so a later fuller staging (`widenRecorded`, outward-only) that pulls the onset EARLIER
+    /// lowers it. This is not a property anyone wants; it is the unavoidable dual of "more headroom
+    /// when less was recorded", and it is pinned here with exact values so it cannot quietly get
+    /// worse, and so the floors underneath it stay proven.
+    ///
+    /// ⚠️ The direction of coupling is NOT new — master's coverage cap reads `floorEarliest` too, so
+    /// an onset moving earlier already lowered a coverage-widened ceiling. What is new is that it now
+    /// applies with no coverage at all. `widenRecorded`'s doc comment used to claim the opposite and
+    /// has been corrected.
+    func testAFullerStagingLowersTheCeilingButNeverBelowTheFloors() {
+        let wake = at(1)
+        let strandedFloor = wake.addingTimeInterval(SleepEdit.strandedEditMargin)   // at(7)
+
+        let before = SleepEdit.bounds(recordedOnset: at(0), recordedWake: wake).latest
+        let after = SleepEdit.bounds(recordedOnset: at(-2), recordedWake: wake).latest
+        XCTAssertEqual(before.timeIntervalSince1970, at(11).timeIntervalSince1970, accuracy: 0.1)
+        XCTAssertEqual(after.timeIntervalSince1970, at(9).timeIntervalSince1970, accuracy: 0.1)
+        XCTAssertLessThan(after, before, "precondition: this is the drop, stated plainly")
+        XCTAssertGreaterThanOrEqual(after, strandedFloor,
+                                    "…but never through the stranded floor, which is master's "
+                                    + "entire ceiling")
+
+        // And once she has SAVED an edit, the drop cannot reach her own times at all.
+        let saved = at(0)...before
+        XCTAssertGreaterThanOrEqual(
+            SleepEdit.bounds(recordedOnset: at(-2), recordedWake: wake, existingEdit: saved).latest,
+            saved.upperBound)
     }
 
     /// A WELL-RECORDED NIGHT IS UNTOUCHED. The truncation ceiling is dominated by the stranded margin
