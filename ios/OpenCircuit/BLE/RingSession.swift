@@ -1860,15 +1860,17 @@ final class RingSession: NSObject {
         //
         // ⚠️ THE 2026-08-27 TRUNCATION CEILING WIDENS `editBounds.latest` BY UP TO 5 h ON A SHORT
         // NIGHT, AND THAT CANNOT WIDEN THIS SCOPE. Checked rather than assumed, because a wider scope
-        // would touch the anchor-eviction hazard: the added band is
-        // `(max(recordedWake + 6 h, coverage.upperBound), floorEarliest + maxNightSpan]`, and
-        // `coverage.upperBound` is by construction the LAST archive record at or before
-        // `recordedOnset + maxNightSpan` (`SleepEdit.dataCoverage`), which is strictly later than the
-        // top of that band. So the band provably holds no records and `scopedArchive` is unchanged
-        // record-for-record — the ceiling only widens a filter over empty ground. (The one residual
-        // is pre-existing and unrelated to the ceiling: `live` is computed from an earlier
-        // `epochArchiveStore.load()` than the filter below, so a drain landing between the two is
-        // seen by the filter and not by the bounds. That race is identical on master.)
+        // would touch the anchor-eviction hazard. The band the ceiling adds is
+        // `(max(recordedWake + 6 h, coverage.upperBound), recordedOnset − 3 h + maxNightSpan]`, and
+        // its whole length sits INSIDE the window `SleepEdit.dataCoverage` searches (which runs to
+        // `recordedOnset + maxNightSpan`, three hours later still). `coverage.upperBound` is the last
+        // record that search found, so a record inside the band would have to be both later than the
+        // last record found and inside the window that found it. There is none — and if `coverage` is
+        // nil the search found nothing in that window at all, so the band is empty for the same
+        // reason. `scopedArchive` is therefore unchanged record-for-record: the ceiling only widens a
+        // filter over empty ground. (One residual, pre-existing and unrelated to the ceiling: `live`
+        // is computed from an earlier `epochArchiveStore.load()` than the filter below, so a drain
+        // landing between the two is seen by the filter and not by the bounds. Identical on master.)
         let editBounds = SleepEdit.bounds(recordedOnset: recordedOnset, recordedWake: recordedWake,
                                           dataCoverage: coverage, existingEdit: existingEdit)
         let archiveMargin: TimeInterval = 30 * 60
