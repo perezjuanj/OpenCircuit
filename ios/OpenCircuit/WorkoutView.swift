@@ -19,7 +19,15 @@ import OpenCircuitKit
 
 struct WorkoutView: View {
     let session: RingSession?
-    @State private var manager = WorkoutSessionManager()
+    /// The running session — OWNED BY `ContentView`, not by this sheet.
+    ///
+    /// ⚠️ This was `@State private var manager = WorkoutSessionManager()`, and that single line was
+    /// the tester-reported data-loss defect of 2026-08-29 (build 49): the live workout existed
+    /// ONLY inside the sheet, so every sheet teardown destroyed it (and `.onDisappear` finalized it
+    /// into Apple Health on the way out). Do not move ownership back in here — a sheet is a
+    /// presentation, and a recording session must outlive it. `WorkoutSessionManager` is
+    /// `@Observable`, so a plain `let` still re-renders this view on every state change.
+    let manager: WorkoutSessionManager
     @State private var detectedCandidate: AutomaticWorkoutDetector.Candidate?
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
@@ -80,18 +88,32 @@ struct WorkoutView: View {
                         Button("Cancel") { dismiss() }
                     }
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    // Leaving the sheet mid-workout is now a first-class action, not an accident to
+                    // be blocked: the session lives in ContentView, so closing this only puts the
+                    // recording in the background. Named "Minimize" so it can't be misread as
+                    // "finish" — ending a workout is only ever the red Stop button below.
+                    if isRecording {
+                        Button("Minimize") { dismiss() }
+                    }
+                }
             }
         }
-        // Block interactive swipe-to-dismiss while recording so the session can't be abandoned
-        // mid-workout (which would leave the ring stuck polling and silently drop the workout).
-        .interactiveDismissDisabled(isRecording)
-        // Guarantee teardown if the sheet is dismissed any other way while still recording:
-        // stop() cancels the poll/timer tasks, calls session.stopLiveMonitoring() (so the ring
-        // stops live-HR polling), and writes the in-progress workout to HealthKit. No-op once
-        // the session has already finished/idled (stop() guards its own state). (#75)
-        .onDisappear {
-            if isRecording { Task { await manager.stop() } }
-        }
+        // ⚠️ NO `.onDisappear { stop() }` HERE, AND NO `.interactiveDismissDisabled`.
+        //
+        // Tester report 2026-08-29 (build 49): "I tapped the live activity on my lock screen and it
+        // opened the app but with the record a new activity screen open and I don't know where the
+        // currently recording activity went… it still ended up in my Apple Health and Bevel as an
+        // activity but I didn't see it in Open Circuit." That is precisely what an `.onDisappear`
+        // calling `stop()` does — it FINALIZES the workout into HealthKit and resets the session —
+        // and it fired on a teardown the user never asked for. Ending a workout must be an explicit
+        // user action (the Stop button), so this sheet does nothing on disappear at all; the
+        // interactive-dismiss block that used to paper over the same bug is gone with it.
+        //
+        // What #75 was protecting (a leaked poll/timer task, a ring left in live-HR/sport mode) is
+        // preserved by ownership instead of teardown — see the ownership note in
+        // `WorkoutSessionManager`. The running session stays reachable from the Live Activity
+        // (`widgetURL` → `opencircuit://workout/active`) and the Activity tab's recording banner.
     }
 
     // MARK: - Idle

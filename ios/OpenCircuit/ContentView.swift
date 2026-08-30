@@ -39,6 +39,22 @@ struct ContentView: View {
     @State private var showBluetoothOffAlert = false
     @State private var showDebug = false
     @State private var showWorkout = false
+    /// THE running workout, owned here for the app's whole lifetime and handed to `WorkoutView`.
+    ///
+    /// ⚠️ It used to be a `@State` of the workout SHEET, which meant the only copy of a live session
+    /// was destroyed by any sheet teardown — and the sheet's `.onDisappear` finalized it into Apple
+    /// Health on the way out. A tester's ~55-minute evening walk on 2026-08-28 therefore appeared in
+    /// Health and Bevel while OpenCircuit showed the "record a new activity" screen (report
+    /// 2026-08-29, build 49). Ownership must stay ABOVE the sheet: a presentation may not own a
+    /// recording.
+    @State private var workoutManager = WorkoutSessionManager()
+    /// Bumped whenever a workout ends, so the Activity tab's "Recent Workouts" card re-queries
+    /// Apple Health and the just-finished session shows up without a relaunch.
+    @State private var workoutHistoryToken = 0
+    /// A workout the previous process was running when it died, offered back to the user (save to
+    /// Apple Health, or discard). Non-nil presents the recovery alert. See
+    /// `WorkoutSessionRecovery` for what the app is allowed to claim about it.
+    @State private var recoverableWorkout: RecoveredWorkout?
     @State private var showCalibration = false
     @StateObject private var calibration = CalibrationSessionManager()
     /// Raw-capture export state for the activity-channel probe (debug / RE — issue #93).
@@ -202,6 +218,18 @@ struct ContentView: View {
                     pendingAutoSync = true
                     maybeAutoSyncOnReady()   // fires now if the link is already ready; else onChange(ready) will
                 }
+                // OFFER A CRASH-ORPHANED WORKOUT BACK rather than deleting the last evidence of it.
+                // Until now the branch above (plus `endOrphanedActivitiesAtLaunch`) was the app's
+                // entire response to a crash mid-workout: clear a boolean, end the Live Activity,
+                // and lose the session in silence. The snapshot a running session persists is what
+                // makes recovery possible; `WorkoutSessionRecovery.decide` owns what may be claimed
+                // from it — notably that the workout ended when the app last SAW it, never at "now".
+                //
+                // Deliberately OUTSIDE the in-progress-flag branch: that flag is cleared the first
+                // time a launch sees it, so a user who answers "Not now" would never be asked again
+                // and the workout would be stranded. Keyed on the snapshot instead, which survives
+                // until it is explicitly resolved.
+                resolveOrphanedWorkoutSnapshot()
                 // Reflect any prior Health authorization so the UI shows the mirrored state,
                 // and backfill anything the background refresh persisted while we were away.
                 // Runs in `.task` (after first frame), never `.onAppear` — a synchronous store
@@ -295,9 +323,30 @@ struct ContentView: View {
             .sheet(isPresented: $showProbeShareSheet) {
                 if let url = probeExportURL { ShareActivityView(url: url) }
             }
-            // Quick-log deep link (`opencircuit://headache/log?when=…`) from the Control Centre /
-            // Lock Screen control. Hoisted to the TabView so it lands whichever tab is showing.
-            .onOpenURL { url in handleQuickLogLink(url) }
+            // Deep links, hoisted to the TabView so they land whichever tab is showing. Two hosts
+            // share the app's single registered scheme: `opencircuit://workout/active` (the workout
+            // Live Activity's tap target) and `opencircuit://headache/log?when=…` (the Control
+            // Centre / Lock Screen control). Workout is checked first and the headache handler is
+            // the fall-through, matching the order the parsers are strict in — each returns
+            // nil/false for anything that isn't its own link, so neither can swallow the other's.
+            .onOpenURL { url in
+                if WorkoutQuickLink.isActiveSession(url) {
+                    handleActiveWorkoutLink()
+                } else {
+                    handleQuickLogLink(url)
+                }
+            }
+            // Crash-orphan recovery: a workout the previous process was running when it died.
+            .alert("Interrupted workout", isPresented: Binding(
+                get: { recoverableWorkout != nil },
+                set: { if !$0 { recoverableWorkout = nil } })
+            ) {
+                Button("Save to Health") { saveRecoverableWorkout() }
+                Button("Discard", role: .destructive) { discardRecoverableWorkout() }
+                Button("Not now", role: .cancel) { recoverableWorkout = nil }
+            } message: {
+                if let recoverableWorkout { Text(recoveryMessage(recoverableWorkout)) }
+            }
             // The correction sheet for a JUST-BANKED quick log. The row is already stored by the
             // time this appears (see `handleQuickLogLink`), so dismissing without saving still
             // leaves the label captured — that is the point of the whole path.
@@ -428,6 +477,11 @@ struct ContentView: View {
                                  metricUnit: "", metricDecimals: 0)
                     }
                     workoutCard
+                    // The app's own workout history, read back out of Apple Health (no SwiftData
+                    // model, no schema version). Before this a finished workout was visible exactly
+                    // once — on the summary screen — which is the other half of the tester's "it
+                    // ended up in my Apple Health … but I didn't see it in Open Circuit".
+                    RecentWorkoutsCard(reloadToken: workoutHistoryToken)
                     card { GoalsCardView() }
                     caloriesCard
                     if !trends.points.isEmpty {
@@ -627,6 +681,99 @@ struct ContentView: View {
         case .headache:    HeadacheSignalsView()
         case .activityLog: ActivityLogView(session: session)
         }
+    }
+
+    // MARK: - Workout deep link + crash-orphan recovery
+
+    /// Handle `opencircuit://workout/active` — the workout Live Activity's tap target.
+    ///
+    /// Tester report 2026-08-29 (build 49): tapping the Live Activity "opened the app but with the
+    /// record a new activity screen open and I don't know where the currently recording activity
+    /// went." With the session now owned here rather than by the sheet, re-presenting the sheet
+    /// lands on the LIVE session (`WorkoutView` switches on `manager.recordingState`), which is what
+    /// the tap has always implied. The Activity tab is selected too, so dismissing the sheet leaves
+    /// the user somewhere that makes sense rather than back on Today.
+    @MainActor
+    private func handleActiveWorkoutLink() {
+        selectedTab = .activity
+        showWorkout = true
+    }
+
+    /// Look for a workout the previous process was running when it died and, if there is a
+    /// defensible one, offer it back. No-op when there is no snapshot, when the snapshot describes
+    /// nothing worth claiming, or when a workout is genuinely live in THIS process.
+    @MainActor
+    private func resolveOrphanedWorkoutSnapshot() {
+        // A live session in this process owns the snapshot — never offer to "recover" a workout the
+        // user is still recording. (`recordingState` is `.idle` at launch; this guard matters
+        // because the snapshot outlives a Not-now answer and this runs on the launch task.)
+        if case .idle = workoutManager.recordingState {} else { return }
+        guard session?.workoutHolding != true else { return }
+
+        switch WorkoutSessionRecovery.decide(snapshot: WorkoutSessionManager.persistedSessionSnapshot) {
+        case .nothingToRecover:
+            return
+        case .discard(let refusal):
+            // Nothing defensible to save (no observed span, or a future-dated snapshot from a clock
+            // that moved backwards). Drop it silently — asking the user about a workout we could
+            // not describe would be worse than saying nothing.
+            ringLog.notice("workout: discarding orphaned session snapshot (\(refusal.rawValue, privacy: .public))")
+            WorkoutSessionManager.clearSessionSnapshot()
+        case .offer(let recovered):
+            ringLog.notice("workout: offering an interrupted session back to the user")
+            // A cold launch through `opencircuit://workout/active` (tapping a Live Activity the
+            // dead process left on the Lock Screen) opens the workout sheet in the same run-loop
+            // turn as this. SwiftUI will not reliably present a sheet and an alert at once, and the
+            // sheet in that state is just the idle picker — so close it and let the alert be the
+            // one thing on screen. Nothing is lost: the picker is one tap away afterwards.
+            showWorkout = false
+            recoverableWorkout = recovered
+        }
+    }
+
+    /// The recovery alert's body. States the span the app can actually defend and — when the HR
+    /// series died with the process — says so, rather than letting a save look richer than it is.
+    private func recoveryMessage(_ recovered: RecoveredWorkout) -> String {
+        let df = DateFormatter(); df.dateStyle = .none; df.timeStyle = .short
+        let minutes = Int((recovered.durationSeconds / 60).rounded())
+        var text = "OpenCircuit closed during a workout on "
+        let dayFmt = DateFormatter(); dayFmt.dateStyle = .medium; dayFmt.timeStyle = .none
+        text += dayFmt.string(from: recovered.start)
+        text += ", \(df.string(from: recovered.start))–\(df.string(from: recovered.end)) (\(minutes) min)."
+        // Honest about the ceiling: the end is the last moment we OBSERVED the session, so a
+        // recovered workout can only ever be as long as, or shorter than, the real one.
+        text += " That end time is when the app last saw the workout running, so it may be short."
+        if recovered.hrSampleCount > 0 {
+            let n = recovered.hrSampleCount
+            text += " Its \(n) heart-rate reading\(n == 1 ? " was" : "s were") lost with the app, so only the time"
+            text += recovered.activeKcal != nil ? " and an estimated calorie total" : ""
+            text += " can be saved."
+        } else {
+            text += " No heart-rate readings were captured before it stopped."
+        }
+        return text
+    }
+
+    @MainActor
+    private func saveRecoverableWorkout() {
+        guard let recovered = recoverableWorkout else { return }
+        recoverableWorkout = nil
+        // Clear the snapshot BEFORE the async write, not after: a second launch racing this one
+        // must not be able to offer (and write) the same workout twice. A failed write is reported
+        // to the log rather than re-armed — HealthKit rejecting a save is not a reason to keep
+        // prompting on every launch.
+        WorkoutSessionManager.clearSessionSnapshot()
+        Task {
+            let saved = await workoutManager.saveRecoveredWorkout(recovered)
+            ringLog.notice("workout: recovered-session save to Health returned \(saved, privacy: .public)")
+            if saved { workoutHistoryToken += 1 }
+        }
+    }
+
+    @MainActor
+    private func discardRecoverableWorkout() {
+        recoverableWorkout = nil
+        WorkoutSessionManager.clearSessionSnapshot()
     }
 
     // MARK: - Headache quick-log deep link (#183)
@@ -1382,7 +1529,15 @@ struct ContentView: View {
                     Image(systemName: "chevron.right")
                         .font(.caption).foregroundStyle(.tertiary)
                 }
-                if let count = session?.automaticWorkoutCandidates.count, count > 0 {
+                // An IN-APP way back to a running session. The Live Activity's `widgetURL` is the
+                // lock-screen route; this is the one for a user who is already in the app, and it
+                // is why closing the workout sheet is now safe rather than a way to lose the
+                // recording (tester report 2026-08-29).
+                if workoutIsRecording {
+                    Label("Recording \(workoutManager.selectedSport.displayName) — tap to open",
+                          systemImage: "record.circle")
+                        .font(.subheadline.weight(.semibold)).foregroundStyle(.red)
+                } else if let count = session?.automaticWorkoutCandidates.count, count > 0 {
                     Label("\(count) workout\(count == 1 ? "" : "s") ready to review", systemImage: "sparkles")
                         .font(.subheadline.weight(.semibold)).foregroundStyle(.blue)
                 } else {
@@ -1392,8 +1547,32 @@ struct ContentView: View {
             }
         }
         .buttonStyle(.plain)
-        .sheet(isPresented: $showWorkout) {
-            WorkoutView(session: session)
+        .sheet(isPresented: $showWorkout, onDismiss: {
+            // Re-query Health so a workout the user just finished appears in the list below. The
+            // sheet closing no longer ends anything — see the ownership note on `workoutManager`.
+            workoutHistoryToken += 1
+            // A TERMINAL state must not outlive the sheet that displayed it. The summary and the
+            // error screen are cleared by their own "Done"/"Dismiss" buttons, which is all a
+            // per-sheet `@State` manager ever needed — it was rebuilt on the next presentation.
+            // Now that the manager lives for the app's lifetime, swiping the summary away instead
+            // of tapping Done would strand `recordingState` on `.finished` forever: re-opening the
+            // workout card would show the PREVIOUS workout's summary and there would be no way to
+            // reach the sport picker. Reset only `.finished`/`.error` — never `.starting`,
+            // `.active` or `.finishing`, which is the whole point of the ownership move.
+            switch workoutManager.recordingState {
+            case .finished, .error: workoutManager.reset()
+            default: break
+            }
+        }) {
+            WorkoutView(session: session, manager: workoutManager)
+        }
+    }
+
+    /// True while the app-owned session is starting or active.
+    private var workoutIsRecording: Bool {
+        switch workoutManager.recordingState {
+        case .starting, .active: return true
+        default: return false
         }
     }
 

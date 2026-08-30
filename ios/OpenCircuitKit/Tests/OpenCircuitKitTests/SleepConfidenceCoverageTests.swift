@@ -116,6 +116,36 @@ final class SleepConfidenceCoverageTests: XCTestCase {
         XCTAssertEqual(a.primary, .noRecordingAfterWake(from: end, silentFor: 14_515))
     }
 
+    /// 🟢 THE 2026-08-26 TESTER NIGHT — an UNWITNESSED back edge must suppress the duration claim
+    /// just as a resumed one does. This combination (coverage present, `wake == .unknown`, level
+    /// `.durationLikelyHigh`) was never pinned, and it is exactly the shape that reached her.
+    ///
+    /// Her stream ended at 02:47:30 and she got up at 06:46, so the night read ~4 h LOW — and the
+    /// only caption the card offered said it "may read a little high". Nothing follows the wake, so
+    /// `WakeProvenance` cannot distinguish "the ring stopped" from "you synced the moment you woke"
+    /// and returns `.unknown`; with only the mutual-exclusion rule, no acquisition reason fires and
+    /// `.durationLikelyHigh` was emitted by default. Her export carries the pair verbatim:
+    /// `wakeVerdict: "unknown"` beside `reasons: ["durationLikelyHigh"]`.
+    func testAnUnwitnessedWakeSuppressesTheDurationClaim() {
+        let a = SleepConfidence.assess(asleep: mins(572), inBed: mins(579),
+                                       coverage: coverage(before: 150, after: nil))
+        XCTAssertEqual(a.wake, .unknown)
+        XCTAssertEqual(a.level, .durationLikelyHigh, "the legacy verdict is still reported")
+        XCTAssertFalse(a.reasons.contains(.durationLikelyHigh),
+                       "a night we did not watch end must not be told it ran long")
+        XCTAssertTrue(a.reasons.isEmpty, "and nothing else may be invented in its place")
+    }
+
+    /// The other side of the same rule: the hint is SUPPRESSED, not deleted. A night whose stream
+    /// runs continuously past the wake is genuinely witnessed, so the legacy claim still ships —
+    /// otherwise the change would silently retire the signal instead of scoping it.
+    func testAWitnessedWakeStillEmitsTheDurationClaim() {
+        let a = SleepConfidence.assess(asleep: mins(572), inBed: mins(579),
+                                       coverage: coverage(before: 150, after: 150))
+        XCTAssertEqual(a.wake, .witnessed)
+        XCTAssertEqual(a.reasons, [.durationLikelyHigh])
+    }
+
     // MARK: - Precedence and multiplicity
 
     func testBothEdgesHoleyReportsBothBackEdgeFirst() {

@@ -122,10 +122,38 @@ enum ExportBuilder {
     /// one place both callers go through.
     static let maxExportDays = 365
 
+    /// A wake instant for the night ending near `date` that this app did NOT derive from the
+    /// records — the denominator `sleepSessions[].coverage` structurally cannot have (read
+    /// `ExportReferenceCoverage`). nil when the wearer has set no manual sleep schedule.
+    ///
+    /// ⚠️ THE MANUAL SCHEDULE SPECIFICALLY, NOT `SleepSchedule.current`. The swap point prefers the
+    /// HealthKit sleep schedule, but that read is `async` and this builder is a synchronous
+    /// `@MainActor` pass by design (see the file header), and the HealthKit entitlement is off in
+    /// this build so it returns nil anyway. The export names the reference it used
+    /// (`manualScheduleWake`) rather than implying it consulted every source.
+    typealias ScheduleWake = (Date) -> Date?
+
+    /// The default `ScheduleWake`: the wearer's own bed/wake times out of `UserDefaults`, resolved
+    /// through the Kit's cross-midnight window math. `enabled == false` means they never set one, so
+    /// there is no reference and nothing is invented in its place.
+    static func manualScheduleWake(_ schedule: ManualSleepSchedule
+                                    = ManualSleepSchedule.fromDefaults()) -> ScheduleWake {
+        { nightEnd in
+            guard schedule.enabled else { return nil }
+            return SleepWindow.interval(bedMinutes: schedule.bedMinutes,
+                                        wakeMinutes: schedule.wakeMinutes,
+                                        nightEndingNear: nightEnd)?.end
+        }
+    }
+
     static func build(store: LocalStore,
                       mode: Mode,
                       format: Format,
-                      now: Date = Date()) throws -> Outcome {
+                      now: Date = Date(),
+                      scheduleWake: ScheduleWake? = nil) throws -> Outcome {
+        // Resolved ONCE for the whole file: it is a `UserDefaults` read plus pure date math, and a
+        // per-night resolve would repeat both across up to `maxExportDays` nights on the main actor.
+        let scheduleWake = scheduleWake ?? manualScheduleWake()
         let calendar = Calendar.current
         var rangeNotice: String?
 
@@ -405,7 +433,7 @@ enum ExportBuilder {
         let meta = metadata(rangeStart: from, rangeEnd: to, now: now)
         let sessionRows = zip(nights, sleepRows).map { night, summary in
             sessionRow(night, summary: summary, store: store,
-                       archives: archivesForCoverage, now: now)
+                       archives: archivesForCoverage, now: now, scheduleWake: scheduleWake)
         }
 
         let content: String
@@ -520,7 +548,8 @@ enum ExportBuilder {
                                    summary: ExportEngine.SleepRow,
                                    store: LocalStore,
                                    archives: [[BulkRecord]],
-                                   now: Date) -> ExportEngine.SleepSessionRow {
+                                   now: Date,
+                                   scheduleWake: ScheduleWake) -> ExportEngine.SleepSessionRow {
         // EFFECTIVE (edit-aware) clock times, i.e. what the sleep card and Apple Health show for
         // this night. An export that disagreed with the app's own screen would be the bigger
         // surprise; `isManuallyEdited` travels alongside so a consumer can always tell an override
@@ -551,6 +580,33 @@ enum ExportBuilder {
         let retentionHorizon = Calendar.current.date(
             byAdding: .day, value: -LocalStore.sampleRetentionDays, to: now) ?? now
         var coverage: ExportCoverage.Assessment?
+        // THE FALSIFIABLE COMPANION TO `coverage`, and the reason it had to exist.
+        //
+        // `coverage` below is measured over `[inBedStart, inBedEnd]`, which are the EDIT-AWARE
+        // (`sleepEditCurrent*`) edges — so the shape of the defect depends on whether the wearer
+        // corrected the night, and the scope was overstated in review before it was narrowed here:
+        //
+        //   • NOT CORRECTED (the overwhelming majority, and every corpus night): `inBedEnd` IS the
+        //     last record, because `SleepStaging` builds the night out of the epochs it was handed.
+        //     A night that ends early BECAUSE the recording stopped has its own denominator
+        //     shortened by exactly the thing it should be reporting: the hole is always outside the
+        //     window, the gaps list is empty, and the fraction pins at ~1.0. The comment on
+        //     `edgeProvenance` below has said this in words since it was written (0.976–1.049 on 21
+        //     of 21 corpus nights, "vacuous by construction").
+        //   • CORRECTED: `inBedEnd` is the wearer's own wake, which the recording had no vote in, so
+        //     the hole is already inside the window and the fraction already falls. The committed
+        //     `R2_2026-08-18` fixture is one of these and its real export carries
+        //     `appCoverageFraction 0.377` — while the SAME records over that night's detected window
+        //     score 1.0000 with no gaps (`SleepProvenanceTesterNightTests`
+        //     `.testCoverageInTheDetectedWindowCannotSeeTheFourHourHole`). A wearer who never opens
+        //     the editor only ever sees the second number.
+        //
+        // `referenceCoverage` re-measures the SAME witness over a window closed at a wake the
+        // recording had no vote in. It is emitted even when there is no such wake — carrying the
+        // reason — because "the check found nothing wrong" and "the check could not run" had been
+        // indistinguishable, which is the whole defect. Nothing is gated on it and no denominator is
+        // invented: see `ExportReferenceCoverage` for why only the RIGHT edge is moved.
+        var referenceCoverage: ExportReferenceCoverage.Outcome?
         if let start = inBedStart, let end = inBedEnd, end > start, start >= retentionHorizon {
             // Heart rate is the coverage witness because the ring emits at most one HR value per
             // 0x4c epoch record — so the count of HR timestamps in a window IS the count of epochs
@@ -571,10 +627,51 @@ enum ExportBuilder {
             // `coverageFraction 0.7333 / 4 gaps` about a window the ring had recorded end to end.
             // Union the archive in (`ExportCoverageWitness` carries the full derivation, including
             // why archive-ONLY is worse: it would turn ~30 h of retention into a reported hole).
-            let hr = (try? store.samples(kind: .heartRate, from: start, to: end)) ?? []
+            //
+            // Fetched out to whichever edge is LATER so one query serves both measurements. This
+            // cannot move `coverage`: `ExportCoverage.assess` discards every instant outside the
+            // window it is given, and `ExportCoverageWitness` filters the archive to the same
+            // window — so the reported-window number is byte-identical to before the reference
+            // measurement existed. Bounded exactly as before: one indexed range fetch per night.
+            //
+            // ⚠️ AND THE REFERENCE NEVER REACHES PAST `now`. A schedule wake is a time of day, so on
+            // the freshest night in the file it can easily lie in the FUTURE — export at 05:00 with a
+            // 06:30 schedule and the window would run 90 minutes past the present. No recording can
+            // exist for time that has not happened, so `ExportCoverage.assess` would count those
+            // epochs as expected-but-missing and publish a hole the export's own clock manufactured,
+            // on exactly the row a triager reads first. Clamped to `now` and SAID so in `reference`
+            // (`manualScheduleWakeSoFar`), so the number still falls for a hole that has already
+            // opened and can never report one that has not — and no reader is left comparing a
+            // published `referenceEnd` against a schedule it no longer equals.
+            let scheduledWake = scheduleWake(end)
+            let bounded = ExportReferenceCoverage.reference(forScheduledWake: scheduledWake,
+                                                           asOf: now)
+            let hr = (try? store.samples(kind: .heartRate,
+                                         from: start,
+                                         to: max(end, bounded?.end ?? end))) ?? []
+            let storedTimes = hr.map(\.start)
             let witness = ExportCoverageWitness.sampleTimes(
-                archives: archives, storedHeartRateTimes: hr.map(\.start), from: start, to: end)
+                archives: archives, storedHeartRateTimes: storedTimes, from: start, to: end)
             coverage = ExportCoverage.assess(sampleTimes: witness, from: start, to: end)
+
+            if let bounded,
+               let reference = ExportReferenceCoverage.assess(
+                   sampleTimes: ExportCoverageWitness.sampleTimes(
+                       archives: archives, storedHeartRateTimes: storedTimes,
+                       from: start, to: bounded.end),
+                   reportedStart: start, reportedEnd: end,
+                   referenceEnd: bounded.end, reference: bounded.reference) {
+                referenceCoverage = .measured(reference)
+            } else {
+                // Two distinct answers, kept distinct: no schedule at all, versus a schedule that
+                // resolved to a wake at or before this night's start (a shift worker's window, a
+                // degenerate bed == wake setting, or a night whose bedtime is itself already past
+                // `now` once the clamp above applies). Neither is filled in with a guess.
+                referenceCoverage = .unavailable(
+                    reason: scheduledWake == nil
+                        ? ExportReferenceCoverage.Outcome.noManualSleepSchedule
+                        : ExportReferenceCoverage.Outcome.referenceNotAfterBedtime)
+            }
         }
 
         // Edge provenance — what sits just OUTSIDE each edge, which is the half `coverage` above
@@ -635,11 +732,42 @@ enum ExportBuilder {
                     storedEarliestRetained: (try? store.earliestSample(kind: .heartRate))?.start,
                     inBedStart: s, inBedEnd: e).coverage
                 : nil
+            // ONE FRAME OF REFERENCE FOR THE WHOLE BLOCK, AND IT USED TO BE TWO.
+            //
+            // The edges above are measured over the RECORDED window for the three reasons stated
+            // there, but `SleepConfidence.assess` was handed `row.asSummary` — the POST-EDIT totals.
+            // So the duration half of `reasons` described the night the wearer corrected while the
+            // coverage half described the night the ring recorded, and an edit could add or remove a
+            // `durationLikelyHigh` caveat about a window it had never touched. That is not a
+            // rounding disagreement: `durationLikelyHigh` asserts "the measured window IS the whole
+            // night, and you lay still in it", which is a claim about the RECORDING.
+            //
+            // `recordedHypnogramData` exists precisely for this — it is the detector's own timeline,
+            // frozen before the first edit overwrote `hypnogramData` (LocalStore.swift, "THE SINGLE
+            // MOST IMPORTANT COLUMN IN THIS BLOCK"). Summing it gives the recorded totals in exact
+            // seconds. On an UNEDITED night it is a copy of `hypnogramData`, so this is the same
+            // night either way — the totals differ from `asSummary` only in that they are summed
+            // rather than reconstructed from the minute columns through an efficiency division.
+            //
+            // A row written before that column existed has no recorded timeline to sum. Rather than
+            // fabricate one, fall back to the stored minute columns and SAY SO in `durationBasis` —
+            // but only call that fallback `"edited"` when the row actually WAS edited. On an
+            // unedited row those columns were written by the staging path and never touched since,
+            // so they ARE the recorded night's totals; the token names the frame of reference, and
+            // claiming a corrected night there would misreport our own confidence.
+            let recordedSegments = SleepHypnogramCodec.decode(row.recordedHypnogramData)
+            let recordedSummary = recordedSegments.isEmpty
+                ? nil : SleepStaging.summary(recordedSegments)
+            let basis = recordedSummary ?? row.asSummary
+            let onRecordedFrame = recordedSummary != nil || !row.isManuallyEdited
             let assessment = SleepConfidence.assess(
-                asleep: row.asSummary.totalAsleep, inBed: row.asSummary.inBed,
+                asleep: basis.totalAsleep, inBed: basis.inBed,
                 coverage: edgeCoverage)
             edgeProvenance = ExportEngine.SleepEdgeProvenanceRow(
-                windowStart: s, windowEnd: e, assessment: assessment)
+                windowStart: s, windowEnd: e, assessment: assessment,
+                durationBasis: onRecordedFrame
+                    ? ExportEngine.SleepEdgeProvenanceRow.durationBasisRecorded
+                    : ExportEngine.SleepEdgeProvenanceRow.durationBasisEdited)
         }
 
         return ExportEngine.SleepSessionRow(
@@ -669,6 +797,7 @@ enum ExportBuilder {
             summary: summary,
             osa: osa,
             coverage: coverage,
+            referenceCoverage: referenceCoverage,
             edgeProvenance: edgeProvenance)
     }
 

@@ -29,6 +29,13 @@ struct OpenCircuitApp: App {
                 // Backfill the reversibility + provenance columns (SchemaV7). Idempotent and
                 // additive; runs AFTER the re-key so it sees each row under its final night key.
                 .task { OpenCircuitApp.backfillSleepProvenanceOnce(container) }
+                // Repair of a Sleep Score zeroed by builds 47–48 on the wearer's own correction.
+                // NO ordering dependency on the provenance backfill above — that pass `continue`s
+                // on every `isManuallyEdited` row (LocalStore.swift:1907) and this one selects only
+                // such rows, so the two populations are disjoint by construction. It does want to
+                // run after `rekeySleepNightsOnce`, for the same reason the backfill does: so it
+                // sees rows under their final night key.
+                .task { OpenCircuitApp.healWithheldSleepScores(container) }
                 // Repair of any SyncCursor watermark stuck in the future by a corrupted-timestamp
                 // sample, BEFORE `ingest` guarded plausibility ahead of the cursor advance — run
                 // every launch (not one-time; see the function doc), after the sample scrubs so
@@ -657,6 +664,39 @@ struct OpenCircuitApp: App {
         let changed = LocalStore(container.mainContext).backfillSleepProvenance()
         if changed > 0 {
             ringLog.info("[OC] sleep-provenance: backfilled \(changed, privacy: .public) night rows")
+        }
+    }
+
+    /// Give back a Sleep Score that builds 47–48 zeroed because the wearer CORRECTED the night.
+    ///
+    /// Build 49 removed the withhold but deliberately does not heal rows already written, so without
+    /// this pass a tester who corrected a night on 47/48 upgrades and still sees no Sleep-Score badge
+    /// and no Readiness for that day — with no action that fixes it except editing the night again.
+    /// Reported by the Gen 2 Air FR04.009 tester on 2026-08-26 (her 08-26 night scored 89 before the
+    /// correction and 0 after it).
+    ///
+    /// Runs at LAUNCH rather than on the drain path on purpose: `rederiveEditedNightProvenance`,
+    /// the other repair in this area, returns early on an empty epoch archive, and a phone holding
+    /// OLD scarred nights is exactly a phone whose 30 h archive has aged out. This one needs no
+    /// archive, no ring and no connection — only the stored hypnogram.
+    ///
+    /// Deliberately NOT latched, and NOT named `…Once` — see `healWithheldSleepScores`. It is
+    /// idempotent and cheap, and re-running it means a row restored from backup, re-keyed, or
+    /// re-stamped by `rederiveEditedNightProvenance` after the first launch is still repaired.
+    @MainActor
+    static func healWithheldSleepScores(_ container: ModelContainer) {
+        do {
+            let healed = try LocalStore(container.mainContext).healWithheldSleepScores()
+            if !healed.isEmpty {
+                ringLog.notice("""
+                    [OC] sleep-score-heal: restored \(healed.count, privacy: .public) \
+                    withheld Sleep Score(s) zeroed by builds 47–48
+                    """)
+            }
+        } catch {
+            // A fetch/save failure here costs a badge, nothing more, and the pass is unlatched — so
+            // the next launch simply retries the whole set.
+            ringLog.error("[OC] sleep-score-heal: failed — \(error.localizedDescription, privacy: .public)")
         }
     }
 

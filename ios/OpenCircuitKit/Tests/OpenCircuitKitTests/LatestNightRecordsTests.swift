@@ -87,4 +87,49 @@ final class LatestNightRecordsTests: XCTestCase {
         let nap = night(startingAt: twoPM)
         XCTAssertEqual(BulkSleep.latestNightRecords(from: nap).count, nap.count)
     }
+
+    // MARK: - The pre-filter may never be stricter than its consumer (2026-08-29)
+
+    /// 🟢 THE INVARIANT THE 2026-08-29 WAKE-EDGE BUG VIOLATED, pinned as a property rather than as a
+    /// number so it cannot regress by someone "tightening" either side alone.
+    ///
+    /// `latestNightRecords` is a PRE-FILTER. It slices the record array to `clusterEnd + 30 min` and
+    /// hands the result to `SleepStaging.classify` → `BulkSleep.mainSleep` →
+    /// `SleepDetection.mainSleepBlock`, which bridges any pause under `ActivityPeriod.maxSleepPause`.
+    /// While the pre-filter's forward absorb capped at 30 min and the consumer bridged 60, a pause in
+    /// between was "same night" to the consumer and "night over" to the filter — and the filter runs
+    /// FIRST, so its verdict was final and every later record was DELETED before staging saw it.
+    ///
+    /// Measured cost on three build-49 tester reports (two rings, two firmwares): the reported wake
+    /// was exactly `anchor.end + 30 min` on both New York nights, and one discarded 152 records
+    /// spanning 7 h 15 m of textbook sleep.
+    ///
+    /// If a future change genuinely needs the forward absorb to be tighter than `maxSleepPause`, it
+    /// must ALSO stop `mainSleepBlock` bridging that far — otherwise it reinstates this defect.
+    func testForwardAbsorbIsNeverStricterThanTheBridgeItFeeds() {
+        XCTAssertGreaterThanOrEqual(
+            BulkSleep.morningContinuationMaxGap, ActivityPeriod.maxSleepPause,
+            """
+            The night-scoping pre-filter would drop records that `mainSleepBlock` would have bridged \
+            into the same night. That is the 2026-08-29 wake-edge truncation: a pause the app itself \
+            calls "same night" deletes every record after it.
+            """)
+    }
+
+    // ⚠️ NO SYNTHETIC "45-minute pause is now absorbed" TEST LIVES HERE, and that is deliberate.
+    // One was written for this change and measured VACUOUS: a fixture of constant-motion records
+    // either side of a record GAP returns all 120 records with the absorb on AND with
+    // `morningContinuationGap: 0`, because a hole with no records in it is not an awake period —
+    // the detector sees one continuous still block and there is nothing to absorb. That is exactly
+    // the trap `flat-motion-fixture-trap` records: a CONSTANT motion value is not "moving", and a
+    // synthetic awake fixture silently produces sleep, so the assertion passes or fails for reasons
+    // unrelated to the rule under test.
+    //
+    // The BEHAVIOURAL evidence for this constant is real bytes, and it is recorded where it can be
+    // re-run rather than asserted here:
+    //   • the pinned corpus scoreboard — exactly one of 73 rows moved (`R2_2026-08-04`), see
+    //     `SleepBaselineGolden.baselineSHA256`'s 2026-08-29 note for the full per-column diff;
+    //   • the three 2026-08-29 tester nights replayed through `SleepReplayMeasureTests`, where the
+    //     maintainer's own night moves from a 07:12 wake to 08:54:46 against a reported ~09:00.
+    // A property test guards the invariant (above); real bytes guard the behaviour.
 }

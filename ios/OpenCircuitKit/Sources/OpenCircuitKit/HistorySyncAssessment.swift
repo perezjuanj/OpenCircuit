@@ -4,10 +4,37 @@ import Foundation
 /// trace incrementally while draining; this pure layer turns that trace into a conservative
 /// success/failure verdict for downstream sleep persistence.
 public enum HistoryChannelOutcome: String, Codable, Sendable {
+    /// ⚠️ MEANS "THIS CHANNEL OPEN ENDED CLEANLY" — pages arrived and the drain exited on a `0x50`
+    /// end-marker (or went quiet after pages). It does NOT mean the RING IS EMPTY, and reading it
+    /// that way is how a truncated night gets called healthy.
+    ///
+    /// 🟢 Device-proven false twice inside FIVE MINUTES on 2026-08-26 (Gen 2 Air FR04.009, build 48;
+    /// three consecutive drains at 04:47:44 / 04:49:43 / 04:52:41 UTC, `historySyncEvidence` blobs
+    /// decoded from that tester's Data Export — health data, so it is not in the repo, per CLAUDE.md):
+    /// the 04:47:44 drain exited `endMarker`/`.complete` with its newest record at 02:42:30, and the
+    /// next two opens delivered 02:45:00 and 02:47:30. The `0x50` reports where the ring's resume
+    /// pointer stood AT THAT MOMENT; the ring keeps recording, so "cleanly finished" and "nothing
+    /// left" are different facts. `.complete` is only ever a statement about the OPEN, never about
+    /// the device. It is the one outcome that unlocks `allowsSleepCommit` for that reason: a clean
+    /// exit means what we pulled is trustworthy to stage, not that we pulled everything there is.
     case complete
     case empty
     case partial
     case ppgOnly
+    /// Pages arrived, but every one was a `0x4d` sport record — no `0x4c` epoch, no `0x47` PPG.
+    /// This is the NORMAL shape of a healthy sport-channel (0x02) drain. Split out of `.empty`
+    /// (2026-08-27) because before this the two were indistinguishable, which is why the project's
+    /// own notes say "the RING returns EMPTY sport history": the instrument could not tell a drain
+    /// full of workout history from a channel that returned nothing. Like every non-`.complete`
+    /// outcome it does not allow a sleep commit — sport records carry no sleep epochs.
+    ///
+    /// ⚠️ NOT a proof that the SPORT CHANNEL was the source. `0x4d` is the per-epoch record, and
+    /// the sport channel is not its only emitter: `docs/RUNBOOK_OSA_APNEA.md` (§Opcodes) records a
+    /// brief `0x4d` burst at OSA ASSESSMENT START, which is pushed rather than requested and can
+    /// therefore land on whatever trace happens to be open. So on a non-sport channel read this as
+    /// "some `0x4d` arrived during this open and no epoch/PPG page did", not as "the ring sent
+    /// workout history on the sleep channel". Cross-check `label`/`channel` before concluding.
+    case sportOnly
     case noAck
     /// The channel's sync-open never reached the wire — the BLE link was down or half-open, so
     /// `RingSession.write` dropped the commands. Split out of `.noAck` (2026-07-27) because the two
@@ -58,6 +85,28 @@ public struct HistoryChannelTrace: Equatable, Codable, Sendable {
     public var openWriteFailed: Bool?
     public var page4CCount = 0
     public var page47Count = 0
+    /// `0x4d` pages seen on this channel — the per-epoch SPORT record (#179). The sport channel
+    /// (`0x02`) is the only channel that streams it AS HISTORY; it is not the only emitter, because
+    /// an OSA assessment also pushes a brief `0x4d` burst at start (`docs/RUNBOOK_OSA_APNEA.md`,
+    /// §Opcodes), so do not read a non-zero count on another channel as workout history. Nothing
+    /// counted `0x4d` anywhere before 2026-08-27, so a sport drain FULL of workout history
+    /// classified `.empty` and exported as such: "auto-detect doesn't work for walks" was
+    /// structurally unanswerable from a bundle.
+    /// Counted from the WIRE (before decode) on purpose, so it stays true even when a page fails
+    /// its XOR — a page/sample disagreement is then itself the signal that decoding, not the ring,
+    /// is at fault.
+    ///
+    /// OPTIONAL ON PURPOSE — see the `openWriteFailed` note above; a non-optional field here wipes
+    /// every stored evidence bundle on upgrade. Zeroed by `init`, so on a trace THIS build produced
+    /// it is always a measured count and `nil` means exactly one thing: the bundle was written
+    /// before the counter existed. That distinction is the whole point — "we counted and it was
+    /// zero" and "we never counted" are the two readings this change exists to separate.
+    public var page4DCount: Int?
+    /// Sport SAMPLES decoded out of those `0x4d` pages (`HistoricalSportFrame.decode`). Same
+    /// Optional/zero-init contract as `page4DCount`. Kept separate from the page count because the
+    /// pair is the diagnostic: pages > 0 with samples == 0 says the channel delivered and OUR
+    /// decode dropped it; both zero on an acked channel says the ring really had nothing.
+    public var sportSampleCount: Int?
     public var endMarkerCount = 0
     public var recordsAtStart = 0
     public var recordsAtEnd = 0
@@ -69,10 +118,16 @@ public struct HistoryChannelTrace: Equatable, Codable, Sendable {
         self.label = label
         self.channel = channel
         self.startedAt = startedAt
+        // Zeroed here, NOT via a property default: the synthesized decoder never consults a
+        // property default, so a trace this build creates carries a measured 0 while one decoded
+        // from pre-2026-08-27 JSON reads back nil. That is the discriminator described above.
+        self.page4DCount = 0
+        self.sportSampleCount = 0
     }
 
     public var recordsAdded: Int { max(recordsAtEnd - recordsAtStart, 0) }
-    public var sawAnyPage: Bool { page4CCount > 0 || page47Count > 0 }
+    /// Any history page at all, sport included — the name promises "any", so `0x4d` counts.
+    public var sawAnyPage: Bool { page4CCount > 0 || page47Count > 0 || (page4DCount ?? 0) > 0 }
 
     /// `firstOpcode` is stamped by the first frame seen AFTER this trace was installed. A healthy
     /// attempt sees its OWN handshake first — `0x81` (auth challenge) or `0x82` (sync-open ACK). A
@@ -93,6 +148,18 @@ public struct HistoryChannelTrace: Equatable, Codable, Sendable {
         if page4CCount > 0, exitReason == .quietAfterPages { return .complete }
         if page4CCount > 0 { return .partial }
         if page47Count > 0 { return .ppgOnly }
+        // Ordered AFTER both epoch/PPG branches so it can only ever narrow `.empty`/`.noAck`: a
+        // channel that delivered 0x4c or 0x47 keeps the exact classification it had before this
+        // case existed, and every branch it takes over already had `allowsSleepCommit == false`,
+        // so no sleep-commit decision can move (`HistoryCommitGate` treats the two identically).
+        //
+        // ⚠️ It is NOT sport-channel-only in practice: an OSA assessment pushes a brief 0x4d burst
+        // at start (`docs/RUNBOOK_OSA_APNEA.md`, §Opcodes), so an armed OSA user whose sleep channel
+        // returned nothing can land here instead of `.empty`. The one place that is user-visible is
+        // `RingSession.finalizeSync`, which shows a "Partial sync — sleep channel …" line for any
+        // sleep outcome that is neither `.complete` nor `.empty`; see the note at that call site.
+        // Nothing else branches on the distinction.
+        if (page4DCount ?? 0) > 0 { return .sportOnly }
         if sawSyncAck { return .empty }
         // Ordered AFTER every "we heard something" branch: if pages or an ACK arrived, the link
         // plainly worked and a stale write-failure flag must not override real evidence.

@@ -12,6 +12,24 @@
 // is real, so the span belongs in both numerator and denominator. Getting this backwards would
 // delete the user's corrections from their own statistics.
 //
+// ⚠️ "MEASURED" THEREFORE MEANS "OVER GROUND THE RING RECORDED ACROSS", NOT "THE STAGE THE RING
+// REPORTED", AND ONE FIELD USED TO TRADE ON THE AMBIGUITY. `measuredAwake` summed
+// `stage == .awake && provenance.hasMeasurement`, so a wearer's own awake paint over recorded ground
+// was published to the export as `measuredAwakeSec` — the ring's word for a stage only she had
+// chosen. On the fixture in `SleepProvenanceTesterNightTests` that is ~100 min of `.awake` painted
+// across sleep the ring DID record (`testTheRelabelledMeasuredSleepIsVisibleAsADisagreement`), and
+// nothing in the export said so. `measuredAwake` is now `.measured` ONLY and the relabelled part
+// has its own bucket, `assertedOverMeasuredAwake`.
+//
+// WHY AWAKE AND NOT ALSO ASLEEP. `measuredAsleep` and `coveredInBed` are the NUMERATOR and
+// DENOMINATOR of `efficiency` and the input to `isScorable`; narrowing them would move a published
+// health number, which is a separate decision needing its own evidence (and would contradict the
+// paragraph above, which is the rule for a DERIVED STATISTIC). `measuredAwake` feeds no derived
+// number at all — its only consumer is the export key of the same name — so narrowing it costs
+// nothing and stops a claim we cannot support. The asleep side gets `assertedOverMeasuredAsleep`
+// instead: an informational SUBSET of `measuredAsleep`, so a reader can make the same distinction
+// without any total moving.
+//
 // THREE BUCKETS, NOT TWO, AND THE THIRD IS LOAD-BEARING. `.asserted` is a claim over ground we can
 // PROVE holds no records, and it is the only thing excluded from a derived number. Ground our
 // retained records cannot reach is `.assertedCoverageUnknown` and lands in its own `unknown*`
@@ -83,8 +101,16 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
     public let totalInBed: TimeInterval
     /// The part of `totalInBed` the ring actually recorded across.
     public let coveredInBed: TimeInterval
-    /// Asleep (core + deep + REM) over covered ground.
+    /// Asleep (core + deep + REM) over covered ground — i.e. over ground the ring recorded across,
+    /// whoever chose the label. `assertedOverMeasuredAsleep` names the part of this the WEARER
+    /// labelled; see the header for why this total is not narrowed the way `measuredAwake` is.
     public let measuredAsleep: TimeInterval
+    /// The part of `measuredAsleep` the wearer's edit labelled asleep over ground the ring recorded.
+    ///
+    /// ⚠️ A SUBSET, NOT A FOURTH BUCKET. `measuredAsleep + assertedAsleep + unknownAsleep` still
+    /// equals `displayedAsleep`; this one overlaps the first term on purpose, so stating it moves no
+    /// total. Any consumer that adds it in is double-counting.
+    public let assertedOverMeasuredAsleep: TimeInterval
     /// Asleep the user asserted over ground we can PROVE holds no records.
     public let assertedAsleep: TimeInterval
     /// Asleep the user asserted over ground our retained records cannot speak about at all — neither
@@ -92,8 +118,15 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
     /// before provenance existed; kept in its own bucket so it is never quoted as either of the
     /// other two.
     public let unknownAsleep: TimeInterval
-    /// Awake over covered ground.
+    /// Awake the RING's own staging called awake — `.measured` only.
+    ///
+    /// ⚠️ NARROWER THAN `hasMeasurement` ON PURPOSE, unlike every other `measured*` field here. See
+    /// the header: this is the one field a reader takes as "the ring said awake", and it used to
+    /// include the wearer's own awake paint over recorded ground.
     public let measuredAwake: TimeInterval
+    /// Awake the WEARER labelled over ground the ring recorded — real ground, her stage. Split out
+    /// of `measuredAwake`, so `measuredAwake + assertedOverMeasuredAwake` is the old value exactly.
+    public let assertedOverMeasuredAwake: TimeInterval
     /// Awake the user asserted over ground we can PROVE holds no records.
     public let assertedAwake: TimeInterval
     /// Awake over ground our retained records cannot speak about. See `unknownAsleep`.
@@ -102,6 +135,17 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
     public let measuredLight: TimeInterval
     public let measuredDeep: TimeInterval
     public let measuredREM: TimeInterval
+    /// Per-stage seconds the wearer asserted over ground we can PROVE holds no records — the stage
+    /// minutes a card's legend would otherwise present under a stage NAME the ring never assigned.
+    ///
+    /// Deliberately `.asserted` only, not "everything the wearer touched": `.assertedCoverageUnknown`
+    /// behaves exactly as this app behaved before provenance existed (counted, displayed, published),
+    /// and marking it would put a caveat on every night older than the ~30 h archive. Same predicate
+    /// as `hasAssertedTime`, so a surface that renders these and a surface that decides whether to
+    /// say anything at all can never disagree.
+    public let assertedLight: TimeInterval
+    public let assertedDeep: TimeInterval
+    public let assertedREM: TimeInterval
     /// Longest single unmeasured run inside the in-bed window.
     public let longestUnmeasuredGap: TimeInterval
 
@@ -127,7 +171,11 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
     /// The headline the CARD shows: everything, however we came by it. Clause 1 — an assertion wins
     /// for display.
     public var displayedAsleep: TimeInterval { measuredAsleep + assertedAsleep + unknownAsleep }
-    public var displayedAwake: TimeInterval { measuredAwake + assertedAwake + unknownAwake }
+    /// FOUR terms, because `measuredAwake` no longer carries the relabelled part (see the header).
+    /// Its value is unchanged from when it had three.
+    public var displayedAwake: TimeInterval {
+        measuredAwake + assertedOverMeasuredAwake + assertedAwake + unknownAwake
+    }
 
     /// True when any of this night's displayed sleep is a claim over ground we can prove holds no
     /// records. Deliberately NOT true for unknown ground: that is the pre-provenance situation, and
@@ -205,14 +253,23 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
         }
 
         measuredAsleep = sum { asleepStages.contains($0.stage) && $0.provenance.hasMeasurement }
+        assertedOverMeasuredAsleep = sum {
+            asleepStages.contains($0.stage) && $0.provenance == .assertedOverMeasured
+        }
         assertedAsleep = sum { asleepStages.contains($0.stage) && $0.provenance.isProvenUnmeasured }
         unknownAsleep = sum { asleepStages.contains($0.stage) && $0.provenance.isCoverageUnknown }
-        measuredAwake = sum { $0.stage == .awake && $0.provenance.hasMeasurement }
+        // `.measured` EXACTLY, not `hasMeasurement` — the one asymmetry in this initialiser, and the
+        // header says why. The relabelled part is not dropped, it moves one line down.
+        measuredAwake = sum { $0.stage == .awake && $0.provenance == .measured }
+        assertedOverMeasuredAwake = sum { $0.stage == .awake && $0.provenance == .assertedOverMeasured }
         assertedAwake = sum { $0.stage == .awake && $0.provenance.isProvenUnmeasured }
         unknownAwake = sum { $0.stage == .awake && $0.provenance.isCoverageUnknown }
         measuredLight = sum { $0.stage == .asleepCore && $0.provenance.hasMeasurement }
         measuredDeep = sum { $0.stage == .asleepDeep && $0.provenance.hasMeasurement }
         measuredREM = sum { $0.stage == .asleepREM && $0.provenance.hasMeasurement }
+        assertedLight = sum { $0.stage == .asleepCore && $0.provenance.isProvenUnmeasured }
+        assertedDeep = sum { $0.stage == .asleepDeep && $0.provenance.isProvenUnmeasured }
+        assertedREM = sum { $0.stage == .asleepREM && $0.provenance.isProvenUnmeasured }
 
         // Longest PROVEN unmeasured run: merge the asserted spans (the in-bed layer and the stage
         // layer overlap, so a naive max over segments would report the shorter of two views of one
@@ -230,12 +287,12 @@ public struct SleepProvenanceBreakdown: Equatable, Sendable {
     /// see the warning on it.
     public var minutes: (inBed: Int, coveredInBed: Int,
                          measuredAsleep: Int, assertedAsleep: Int,
-                         measuredAwake: Int, assertedAwake: Int,
+                         measuredAwake: Int, assertedOverMeasuredAwake: Int, assertedAwake: Int,
                          light: Int, deep: Int, rem: Int) {
         func m(_ t: TimeInterval) -> Int { Int((t / 60).rounded()) }
         return (m(totalInBed), m(coveredInBed),
                 m(measuredAsleep), m(assertedAsleep),
-                m(measuredAwake), m(assertedAwake),
+                m(measuredAwake), m(assertedOverMeasuredAwake), m(assertedAwake),
                 m(measuredLight), m(measuredDeep), m(measuredREM))
     }
 }

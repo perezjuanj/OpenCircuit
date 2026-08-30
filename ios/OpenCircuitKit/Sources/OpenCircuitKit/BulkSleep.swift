@@ -1106,10 +1106,14 @@ public enum BulkSleep {
         // 86-min 09:04→10:30 "nap"; the sleep card (which excludes naps) reported 4 h for a 6¾ h
         // night. Chain FORWARD over later sleep blocks the same way the backward pass chains earlier
         // ones, but under much stricter rules — each one keeps a real failure out:
-        //   * the gap must be ≤ `morningContinuationMaxGap` (30 min — the same slop this function
-        //     already grants as `margin`; the device split was ~1 min). Deliberately a small fraction
-        //     of `maxIntraNightGap` (6 h): a genuine late-morning or afternoon nap keeps its hours-
-        //     wide gap and stays a nap.
+        //   * the gap must be ≤ `morningContinuationMaxGap`, which IS `ActivityPeriod.maxSleepPause`
+        //     (60 min) and must never be tightened below it — pinned by
+        //     `testForwardAbsorbIsNeverStricterThanTheBridgeItFeeds`.
+        //     While this read 30 min it was stricter than the `mainSleepBlock`
+        //     bridge it feeds, so a 30–60 min morning pause DELETED every later record before staging
+        //     ran (2026-08-29, three tester nights, two firmwares; the device split was ~1 min).
+        //     Still a small fraction of `maxIntraNightGap` (6 h): a genuine late-morning or afternoon
+        //     nap keeps its hours-wide gap and stays a nap.
         //   * the extended envelope must still satisfy `isOvernightBlock`, or absorbing the tail
         //     would get the WHOLE night rejected by the downstream overnight gate — losing a real
         //     night to recover its tail is the anchor-eviction failure shape all over again.
@@ -1178,11 +1182,35 @@ public enum BulkSleep {
     public static let declinedBridgeMayReanchor = true
 
     /// Longest arousal the morning-continuation absorb in `latestNightRecords` bridges between the
-    /// anchor night's end and a later same-morning sleep block. Small ON PURPOSE — the backward
-    /// pass's `maxIntraNightGap` (6 h) would swallow genuine daytime naps if applied forward.
+    /// anchor night's end and a later same-morning sleep block. Deliberately NOT the backward pass's
+    /// `maxIntraNightGap` (6 h), which would swallow genuine daytime naps if applied forward.
     /// Passing `morningContinuationGap: 0` (or any non-positive value) disables the absorb and is
     /// byte-identical to the pre-fix scoping (kill switch, pinned by test).
-    public static let morningContinuationMaxGap: TimeInterval = 30 * 60
+    ///
+    /// 🟢 IT IS `ActivityPeriod.maxSleepPause` BECAUSE THIS FILTER MUST NEVER BE STRICTER ABOUT
+    /// "SAME NIGHT" THAN THE FUNCTION IT FEEDS. `latestNightRecords` is a PRE-FILTER: it slices the
+    /// record array down to `clusterEnd + 30 min` (`:1140`) and hands the result to
+    /// `SleepStaging.classify` → `BulkSleep.mainSleep` → `SleepDetection.mainSleepBlock`, which
+    /// bridges any pause under `maxSleepPause` (`SleepDetection.swift:80`, 60 min). While this
+    /// constant was 30 min the two disagreed, and because the pre-filter runs FIRST
+    /// (`RingSession:3620` before `:1580`) its verdict was final: a 30–60 min morning pause that
+    /// `mainSleepBlock` would have bridged instead broke the forward chain (`:1132`), froze
+    /// `clusterEnd` at the anchor's end, and DELETED every record after it.
+    ///
+    /// 🟢 MEASURED on three 2026-08-29 tester reports, all build 49, two rings, two firmwares — the
+    /// reported wake was literally `anchor.end + 30 min` on both NY nights, to the second:
+    ///   • maintainer (Gen 2 FR02.018): a 47-min pause cut the night at 07:12:46 (`06:42:46 + 1800`)
+    ///     against a reported ~09:00 wake, discarding records that ran to 10:02. At 60 min the same
+    ///     bytes stage to 09:50:46 — his own recollection is ~09:00.
+    ///   • Tester B (Gen 2 Air FR04.009): cut at 03:12:52 (`02:42:52 + 1800`) against a reported
+    ///     10:15 wake, discarding 152 records spanning 03:13:52 → 10:28:57 = 7 h 15 m of textbook
+    ///     sleep — unbroken 150 s cadence, HR 63–77, no gap anywhere near the cut.
+    ///
+    /// ⚠️ NOT A FITTED CONSTANT. It is not a new number and was not swept: it is the value the
+    /// consumer already uses, and the change is "make the pre-filter agree with its consumer". If
+    /// `maxSleepPause` ever moves, this must move with it — which is exactly why it references the
+    /// symbol rather than repeating `60 * 60`.
+    public static let morningContinuationMaxGap: TimeInterval = ActivityPeriod.maxSleepPause
 
     /// OBSERVED-GAP GUARD on the BACKWARD cluster chain in `latestNightRecords` — **DEFAULT 0.95 =
     /// ENABLED. Setting it to 0 disables the whole check and is byte-identical to the pre-guard

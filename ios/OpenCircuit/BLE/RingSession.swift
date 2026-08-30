@@ -287,14 +287,24 @@ final class RingSession: NSObject {
     /// so ending quiet at the learned wake reopened auto-drains while the ring was still recording — the
     /// cursor≈now open then walked the ring's single resume pointer past the still-unwritten tail,
     /// truncating the night (🟢 2026-07-12: archive ended 05:55, real wake 09:06, 3h11m never drained).
-    /// ⚠️ SCOPE: this latch only advances on a path that produces a `0x10/0x87` step descriptor — i.e. a
-    /// FOREGROUND/manual `Command.fetch` (setLiveMode / manual measure / a non-sleep-window status fetch).
-    /// On a fully SUSPENDED overnight the in-window keepalive sends `statusQuery` (no step field) and every
-    /// automatic `fetch` is `!isInSleepWindow`-gated, so NO step descriptor arrives and this latch stays
-    /// nil — there the CEILING below is what ends quiet. So: latch = wake accelerator for the app-open /
-    /// manual-sync morning (the common case: user checks the app on waking); ceiling = the passive-night
-    /// fallback. We deliberately do NOT fetch in-window to feed the latch — an in-window `0x07` is the
-    /// exact resume-pointer walker this whole gate exists to avoid.
+    /// ⚠️ SCOPE: this latch only advances on a `0x10/0x87` descriptor, because the step field lives
+    /// there. The path we KNOW produces one is a FOREGROUND/manual `Command.fetch` (setLiveMode /
+    /// manual measure / a non-sleep-window status fetch), so the latch is the wake accelerator for the
+    /// app-open / manual-sync morning (the common case: the user checks the app on waking) and the
+    /// CEILING below is the fallback that ends quiet with no latch at all. We deliberately do NOT
+    /// fetch in-window to feed it — an in-window `0x07` is the exact resume-pointer walker this whole
+    /// gate exists to avoid.
+    ///
+    /// ⚠️ CORRECTION (2026-08-27). This note used to go further and assert that on a fully SUSPENDED
+    /// overnight "NO step descriptor arrives and this latch stays nil", reasoning from the (now
+    /// withdrawn) claim that `0xD0` statusQuery elicits no descriptor. 🟢 A 2026-08-26 tester night
+    /// banked 378 in-window temperature readings, and skin temp rides the SAME `0x10/0x87` descriptor
+    /// as the step field (`[6:10]` vs `[4:6]`) — so descriptors plainly DO reach us inside the window
+    /// and the latch cannot be assumed unreachable there. 🔴 By what path is unresolved (see
+    /// `evaluatePeriodicDrain`). This does not loosen the gate: the latch's own guard already requires
+    /// the reading to land at or after `earliestWake` (`w.end - drainWakeMarginTrim`), so an in-window
+    /// descriptor in the deep night still cannot open quiet — but do not reason from "the latch is
+    /// impossible overnight" when auditing that.
     private var morningWakeConfirmedAt: Date?
     /// The window (start) the latch was resolved against, so a stale latch from a PRIOR night can't leak
     /// into a later night's gate (the read is also bounded by `confirmed >= w.start`).
@@ -526,6 +536,25 @@ final class RingSession: NSObject {
     /// Latest decoded OSA SpO₂ night summary (nil until an assessment burst is drained). `averageSpO2`
     /// is validated (±1 %); `timeBelow90Seconds`/`odi` are ESTIMATES — label EXPERIMENTAL wherever shown.
     private(set) var latestOSASummary: OSASpO2.NightSummary?
+
+    /// WHICH burst produced `latestOSASummary`. Nothing recorded a burst's IDENTITY before
+    /// 2026-08-27, and without it last night's burst and a re-dumped previous night are
+    /// indistinguishable in a report — the summary carries no date and no cursor, so a triager
+    /// could only invert `odi` to guess a duration. `sessionCursor` is the `0x48` per-night key
+    /// (`frame[6..9]`, PROTOCOL.md via `OSAWaveform.sessionCursor`), which is what actually dates
+    /// one burst against another.
+    struct OSABurstProvenance: Equatable {
+        let decodedAt: Date
+        /// Raw frames buffered off the wire. NOT a night's length: the store-and-forward burst is
+        /// retransmit-heavy (real captures hold 7200 / 6014 / 13141), which is why `nightFrames` —
+        /// the dominant-cursor subset that actually decodes — is carried separately.
+        let wireFrames: Int
+        let nightFrames: Int
+        let sessionCursor: UInt32?
+        /// nil when the burst produced no usable SpO₂ series — the case most worth dating.
+        let durationHours: Double?
+    }
+    private(set) var latestOSABurst: OSABurstProvenance?
     /// Local hint that we've armed an overnight OSA assessment this session (the ring can't be queried
     /// for it, so this resets on relaunch/reconnect — it drives the toggle, not ground truth).
     private(set) var osaAssessmentArmed = false
@@ -1187,13 +1216,18 @@ final class RingSession: NSObject {
     /// does NOT walk the pointer) and let the night accumulate UNTOUCHED on the ring (it
     /// buffers for days), then drain the whole night in ONE pass at WAKE: when `night` flips
     /// false, `lastDrainAt` is hours old ⇒ `isDue` ⇒ `shouldDrain` ⇒ one catch-up drain.
-    /// TRADEOFFS (honest): (1) overnight skin temp is ELIMINATED, not merely lower-res —
-    /// statusQuery elicits no 0x10/0x87 descriptor, so the only night temp is at wake, and
-    /// the #41 sleep wear-gate reverts to MOTION-ONLY overnight (can re-expose the
-    /// still/charging-reads-as-sleep over-count). (2) the phone banks NOTHING overnight, so
-    /// a co-installed official RingConn app that syncs first in the morning can take the
-    /// WHOLE night (shared resume pointer, §3). Accepted because the night's SLEEP data —
-    /// the reported loss — is recovered; revisit if temp/over-count regress on device.
+    /// TRADEOFF (honest): the phone banks NOTHING overnight, so a co-installed official RingConn
+    /// app that syncs first in the morning can take the WHOLE night (shared resume pointer, §3).
+    /// Accepted because the night's SLEEP data — the reported loss — is recovered.
+    ///
+    /// ⚠️ CORRECTION (2026-08-27). This used to list a first tradeoff: "overnight skin temp is
+    /// ELIMINATED, not merely lower-res — statusQuery elicits no 0x10/0x87 descriptor", and from it
+    /// concluded the #41 wear-gate reverts to motion-only overnight. 🟢 FALSE as written: a tester
+    /// night on 2026-08-26 (FR04.009) banked 378 overnight temperature samples with this gate in
+    /// force. 🔴 The MECHANISM is open — no capture says whether `0xD0` elicits the descriptor,
+    /// whether the ring pushes it unsolicited, or whether those readings came from foreground /
+    /// manual moments or from window edges where `isInSleepWindow` read false. State the observed
+    /// outcome, not a mechanism, until someone captures one.
     @discardableResult
     private func evaluatePeriodicDrain(trigger: String?) -> Bool {
         // `!workoutHolding`: never open the history channel during an active workout (native sport
@@ -2503,6 +2537,25 @@ final class RingSession: NSObject {
             if monitoring { stopLiveMonitoring(scheduleStatusRefresh: false) }   // stop the fallback poll
         }
         write(Command.sportStop)
+        // RE-ARM the automatic-workout recognizer after a manual workout (#179). The latch below is
+        // per-CONNECTION, and until now nothing ever cleared it: once the connect-time reassert (or
+        // the user's own toggle) had set it, `reassertAutomaticWorkoutDetectionIfNeeded` returned
+        // immediately for the rest of the link, so `05 23 01 00` could never be sent again. A ring
+        // that dropped the recognizer across a manual workout therefore stayed disarmed until the
+        // next reconnect, with nothing in the app or a bundle saying so.
+        //
+        // We do NOT claim the ring forgets: its recognizer state is not queryable, and what `06 00 00`
+        // does to the `05 23` flag has never been captured. This is the same "assert the state we want
+        // whenever we know no workout is running" move that `clearStrandedSportModeIfNeeded` makes for
+        // sport mode — cheap, idempotent, and it removes the app-side reason re-assertion was
+        // impossible. `05 23` is a recognizer setting, NOT a history open and NOT `0x07`, so it walks
+        // no resume pointer (N5); and reaching here at all means the APP held a live workout, i.e. the
+        // user was awake — the same reasoning `runGuardedHistoryDrain(allowInSleepWindow:)` already
+        // uses for the workout prime. The helper's own guards (ready / notifySubscribed / gotDataFrame
+        // / no syncTask / not syncing / not monitoring / not livePreparing / not workoutHolding / not
+        // calibrating) keep the write off a busy link, so this cannot land mid-drain.
+        automaticWorkoutDetectionAppliedThisConnection = false
+        reassertAutomaticWorkoutDetectionIfNeeded()
         return sportSteps
     }
 
@@ -2741,8 +2794,11 @@ final class RingSession: NSObject {
 
     /// A persisted toggle is desired state, not an observation of firmware state. Wait until the
     /// link has delivered authenticated data and the single-writer BLE path is idle, then arm the
-    /// detector again. This runs once per RingSession (therefore once per reconnect) and never
-    /// interrupts history, live measurement, calibration, or a manual workout.
+    /// detector again. Never interrupts history, live measurement, calibration, or a manual workout.
+    ///
+    /// Fires at most once per ARMING, not once per RingSession: the connect path arms it, and
+    /// `endSportSession()` re-arms it by clearing the latch (a manual workout is the one event in a
+    /// connection's life after which the recognizer's state is least certain — see the note there).
     private func reassertAutomaticWorkoutDetectionIfNeeded() {
         guard automaticWorkoutDetectionEnabled,
               !automaticWorkoutDetectionAppliedThisConnection,
@@ -3990,9 +4046,28 @@ final class RingSession: NSObject {
         ringLog.notice("OSA: decoding 0x48 burst — \(count) frames")
         Task.detached(priority: .utility) { [weak self] in
             let summary = OSASpO2.summarize(frames: frames)
+            // Burst IDENTITY, computed on this same off-main pass. `dominantSessionFrames` is the
+            // exact filter `summarize` applies, so `nightFrames`/`sessionCursor` describe the frames
+            // the summary was actually built from — not the whole buffer, which can hold a re-dumped
+            // previous night (a real capture held 13141 frames = one night plus a re-dump).
+            let nightFrames = OSAWaveform.dominantSessionFrames(frames)
+            let cursor = nightFrames.first.flatMap { OSAWaveform.sessionCursor(of: $0) }
             await MainActor.run {
                 guard let self else { return }
                 self.osaDecoding = false
+                let provenance = OSABurstProvenance(
+                    decodedAt: Date(), wireFrames: count, nightFrames: nightFrames.count,
+                    sessionCursor: cursor, durationHours: summary?.durationHours)
+                self.latestOSABurst = provenance
+                // Persisted (unlike os_log, which no tester bundle carries) so "is this last night's
+                // burst or a re-dump of an older one?" is answerable after the fact. The cursor is
+                // the discriminator: two reports with the SAME cursor are the same night dumped twice.
+                self.observability.recordMetricEvent(
+                    source: "osa",
+                    detail: "burst decoded wireFrames=\(count) nightFrames=\(nightFrames.count) "
+                        + "cursor=\(cursor.map { String(format: "0x%08x", $0) } ?? "none") "
+                        + "hours=\(summary.map { String(format: "%.2f", $0.durationHours) } ?? "none") "
+                        + "windows=\(summary?.validWindows ?? 0)")
                 if let summary {
                     self.latestOSASummary = summary
                     let attached = self.localStore?.applyOSASummary(summary) ?? false
@@ -4044,6 +4119,14 @@ final class RingSession: NSObject {
             // Count only what came off the WIRE: a drain that pulled nothing but re-hydrated banked
             // epochs must not report "Synced N epochs" (#188 follow-up).
             let wireRecords = bulkRecords.count - rehydratedCounters.count
+            // ⚠️ This is the ONLY place `.empty` is load-bearing beyond `allowsSleepCommit`, so the
+            // 2026-08-27 `.sportOnly` split is visible here: a sleep channel that returned no page
+            // but picked up a stray `0x4d` (an OSA assessment pushes one at start —
+            // `docs/RUNBOOK_OSA_APNEA.md`, §Opcodes) now reads `.sportOnly` and takes the "Partial
+            // sync" branch where it used to say "Up to date". Deliberately NOT special-cased back:
+            // a sleep open that delivered no epoch page and no ACK-clean empty IS worth surfacing,
+            // and suppressing it would also have to suppress the `.noAck`-derived half of the same
+            // case, which is a real fault. Cosmetic either way — nothing reads `syncStatus`.
             if let sleepOutcome, sleepOutcome != .complete, sleepOutcome != .empty {
                 syncStatus = "Partial sync — sleep channel \(sleepOutcome.rawValue); raw data kept for retry"
             } else if wireRecords > 0 {
@@ -4069,9 +4152,14 @@ final class RingSession: NSObject {
         // pages cannot flood the observability ring buffer and evict the very evidence it explains —
         // one field on an event that already fires once per channel drain, and it is what turns
         // "this drain added fewer records than the ring had" into an attributable cause.
+        // `4d`/`sport` are the sport channel's ONLY evidence: it streams no 0x4c and no 0x47, so
+        // without them every sport drain read `outcome=empty added=0` in the one place a tester's
+        // bundle surfaces drains (`DiagnosticsReport`'s "# History drains & burst decodes" section
+        // reads these `history-drain` rows verbatim). `added` is a `bulkRecords` delta and is
+        // STRUCTURALLY 0 on the sport channel — do not read it as "the sport drain pulled nothing".
         observability.recordMetricEvent(
             source: "history-drain",
-            detail: "trigger=\(historySyncTrigger) label=\(trace.label) outcome=\(outcome) ack=\(trace.sawSyncAck) 4c=\(trace.page4CCount) 4cBad=\(corruptPage4CCount) 47=\(trace.page47Count) 50=\(trace.endMarkerCount) added=\(trace.recordsAdded)"
+            detail: "trigger=\(historySyncTrigger) label=\(trace.label) outcome=\(outcome) ack=\(trace.sawSyncAck) 4c=\(trace.page4CCount) 4cBad=\(corruptPage4CCount) 47=\(trace.page47Count) 4d=\(trace.page4DCount ?? 0) sport=\(trace.sportSampleCount ?? 0) 50=\(trace.endMarkerCount) added=\(trace.recordsAdded)"
         )
         activeDrainTrace = nil
     }
@@ -4093,6 +4181,13 @@ final class RingSession: NSObject {
             trace.page47Count += 1
         case 0x4C:
             trace.page4CCount += 1
+        case 0x4D:
+            // Counted from the WIRE, before `HistoricalSportFrame.decode` runs, so an undecodable
+            // page still proves the sport channel answered. Nothing counted 0x4d until 2026-08-27,
+            // which is why a sport drain full of workout history classified `.empty` and made
+            // "auto-detect doesn't work for walks" unanswerable from a diagnostics bundle. The
+            // decoded yield is `sportSampleCount`, stamped in the 0x4d frame handler.
+            trace.page4DCount = (trace.page4DCount ?? 0) + 1
         case 0x50:
             trace.endMarkerCount += 1
         default:
@@ -4667,6 +4762,15 @@ extension RingSession: CBPeripheralDelegate {
                 }
                 if let samples = HistoricalSportFrame.decode(bytes) {
                     self.mergeHistoricalSportSamples(samples)
+                    // The DECODED yield, paired with `page4DCount` (stamped from the wire in
+                    // `updateActiveDrainTrace`). Kept separate on purpose: pages > 0 with samples == 0
+                    // says the ring delivered and our decode dropped it; both zero on an acked channel
+                    // says the ring really had nothing. Before these two existed a bundle could not
+                    // tell those apart from an empty channel at all.
+                    if self.syncing, var t = self.activeDrainTrace {
+                        t.sportSampleCount = (t.sportSampleCount ?? 0) + samples.count
+                        self.activeDrainTrace = t
+                    }
                     ringLog.notice("← 0x4d sport history: +\(samples.count) samples, candidates=\(self.automaticWorkoutCandidates.count)")
                 } else {
                     ringLog.warning("← 0x4d sport history: invalid page (acked, not decoded)")

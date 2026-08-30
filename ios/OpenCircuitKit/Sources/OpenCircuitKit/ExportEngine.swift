@@ -291,6 +291,15 @@ public enum ExportEngine {
         public let summary: SleepRow
         public let osa: OSARow?
         public let coverage: ExportCoverage.Assessment?
+        /// THE SAME RECORDS, MEASURED AGAINST A WAKE THE RECORDING DID NOT DEFINE — or the reason
+        /// there was no such wake. On a night nobody corrected, `coverage` above closes its window
+        /// on the last record, so a night truncated BY the missing data cannot see the hole and
+        /// reports ~1.0 with no gaps; this is the falsifiable companion. (A CORRECTED night's
+        /// `coverage` already closes on the wearer's own wake and can fall on its own.) Read
+        /// `ExportReferenceCoverage` before quoting either.
+        ///
+        /// nil only when `coverage` itself is nil — there is nothing to compare against.
+        public let referenceCoverage: ExportReferenceCoverage.Outcome?
         /// What the record stream says about the two EDGES of this night (`SleepConfidence.assess`).
         /// nil when the night has no clock times to measure against.
         public let edgeProvenance: SleepEdgeProvenanceRow?
@@ -304,6 +313,7 @@ public enum ExportEngine {
                     summary: SleepRow,
                     osa: OSARow? = nil,
                     coverage: ExportCoverage.Assessment? = nil,
+                    referenceCoverage: ExportReferenceCoverage.Outcome? = nil,
                     edgeProvenance: SleepEdgeProvenanceRow? = nil) {
             self.sessionID = sessionID; self.night = night
             self.inBedStart = inBedStart; self.inBedEnd = inBedEnd
@@ -313,6 +323,7 @@ public enum ExportEngine {
             self.recordedOnset = recordedOnset; self.recordedWake = recordedWake
             self.hypnogram = hypnogram; self.summary = summary
             self.osa = osa; self.coverage = coverage
+            self.referenceCoverage = referenceCoverage
             self.edgeProvenance = edgeProvenance
         }
     }
@@ -360,15 +371,36 @@ public enum ExportEngine {
         /// The gap threshold in force when these reasons were produced, so a bundle collected under
         /// a different cut is still interpretable. Not fitted — see `WakeProvenance.materialGapSeconds`.
         public let materialGapSeconds: TimeInterval
+        /// WHICH NIGHT'S TOTALS THE DURATION HALF OF `reasons` WAS COMPUTED FROM — `"recorded"` or
+        /// `"edited"`.
+        ///
+        /// ⚠️ THE BLOCK USED TO MIX TWO FRAMES OF REFERENCE AND SAY NOTHING ABOUT IT. The edges are
+        /// measured over the RECORDED window (the note under the `edgeProvenance` key in `notes`
+        /// explains why), but `durationLikelyHigh` was fed the POST-EDIT totals — so a correction
+        /// could add or remove a caveat about a window it had not touched. `ExportBuilder` now feeds
+        /// the recorded hypnogram's own totals, and states here when it could not: a row stored
+        /// before `recordedHypnogramData` existed has no recorded timeline to sum, and falls back to
+        /// the stored minute columns — which are only reported as `"edited"` when the night actually
+        /// was edited, because on an unedited row those columns ARE the detector's own totals.
+        public let durationBasis: String
+
+        /// `durationBasis` for a verdict computed on the RECORDED night's totals — the same frame of
+        /// reference as the two edge verdicts.
+        public static let durationBasisRecorded = "recorded"
+        /// `durationBasis` for a verdict computed on POST-EDIT totals, i.e. a different night from
+        /// the one the edges were measured on. Emitted only where the recorded timeline is missing.
+        public static let durationBasisEdited = "edited"
 
         public init(windowStart: Date, windowEnd: Date,
                     bedtimeVerdict: String, bedtimeGapSeconds: TimeInterval?,
                     wakeVerdict: String, wakeGapSeconds: TimeInterval?,
-                    reasons: [String], materialGapSeconds: TimeInterval) {
+                    reasons: [String], materialGapSeconds: TimeInterval,
+                    durationBasis: String = SleepEdgeProvenanceRow.durationBasisRecorded) {
             self.windowStart = windowStart; self.windowEnd = windowEnd
             self.bedtimeVerdict = bedtimeVerdict; self.bedtimeGapSeconds = bedtimeGapSeconds
             self.wakeVerdict = wakeVerdict; self.wakeGapSeconds = wakeGapSeconds
             self.reasons = reasons; self.materialGapSeconds = materialGapSeconds
+            self.durationBasis = durationBasis
         }
 
         /// Build the row from an assessment measured over `[windowStart, windowEnd]`.
@@ -382,14 +414,16 @@ public enum ExportEngine {
         /// own evidence with nothing able to notice. `materialGapSeconds` is now a fact about the
         /// verdict, not about the call site.
         public init(windowStart: Date, windowEnd: Date,
-                    assessment: SleepConfidence.Assessment) {
+                    assessment: SleepConfidence.Assessment,
+                    durationBasis: String = SleepEdgeProvenanceRow.durationBasisRecorded) {
             self.init(windowStart: windowStart, windowEnd: windowEnd,
                       bedtimeVerdict: SleepConfidence.exportName(assessment.bedtime),
                       bedtimeGapSeconds: SleepConfidence.gapSeconds(assessment.bedtime),
                       wakeVerdict: SleepConfidence.exportName(assessment.wake),
                       wakeGapSeconds: SleepConfidence.gapSeconds(assessment.wake),
                       reasons: assessment.reasons.map(SleepConfidence.exportName),
-                      materialGapSeconds: assessment.materialGapSeconds)
+                      materialGapSeconds: assessment.materialGapSeconds,
+                      durationBasis: durationBasis)
         }
     }
 
@@ -616,8 +650,16 @@ public enum ExportEngine {
         // for columns too, and `testHostileValuesRoundTripThroughTheCSV` is what enforces it).
         var lines = ["capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64,nightRowOutcome"]
         for r in rows {
-            let channelSummary = r.channels.map {
-                "\($0.label):\($0.outcome.rawValue):4c=\($0.page4CCount):47=\($0.page47Count):50=\($0.endMarkerCount):added=\($0.recordsAdded)"
+            // `4d`/`sport` are APPENDED inside the existing `channelSummary` column, so no column
+            // index moves (the same contract `nightRowOutcome` states above). They are OMITTED for
+            // a trace decoded from a pre-2026-08-27 bundle, where the counters are nil: emitting
+            // `4d=0` there would report "we counted zero sport pages" for a build that never
+            // counted at all.
+            let channelSummary = r.channels.map { c -> String in
+                var s = "\(c.label):\(c.outcome.rawValue):4c=\(c.page4CCount):47=\(c.page47Count):50=\(c.endMarkerCount):added=\(c.recordsAdded)"
+                if let p4d = c.page4DCount { s += ":4d=\(p4d)" }
+                if let sport = c.sportSampleCount { s += ":sport=\(sport)" }
+                return s
             }.joined(separator: "|")
             lines.append(csvLine([
                 iso8601.string(from: r.capturedAt),
@@ -708,6 +750,25 @@ public enum ExportEngine {
         row.hypnogram.isEmpty ? "" : "\(emittableHypnogram(row).count)"
     }
 
+    /// The reference-coverage measurement, or nil when none was made.
+    private static func referenceRow(_ row: SleepSessionRow) -> ExportReferenceCoverage.Row? {
+        if case .measured(let r) = row.referenceCoverage { return r }
+        return nil
+    }
+
+    /// The CSV token for where the reference wake came from: the reference's own name, `none` when
+    /// there was no wake this app did not derive from the records, or empty when the night has no
+    /// coverage window at all. `none` is printed rather than left blank on purpose — a blank would be
+    /// indistinguishable from a file written before the column existed, which is the exact ambiguity
+    /// the second measurement was added to remove.
+    private static func referenceSource(_ row: SleepSessionRow) -> String {
+        switch row.referenceCoverage {
+        case .measured(let r):  return r.reference.rawValue
+        case .unavailable:      return "none"
+        case nil:               return ""
+        }
+    }
+
     /// CSV for sleep SESSIONS — one row per night, carrying the boundaries, the derived summary,
     /// the OSA assessment and the coverage measurement side by side.
     ///
@@ -715,8 +776,16 @@ public enum ExportEngine {
     /// (an ODI of 0 is a good night) and writing it for "we have nothing" would fabricate a
     /// measurement. Decimal places are display precision only — they carry no physiological meaning
     /// and mirror `sleepCSV`'s existing `%.4f` efficiency / `%.2f` choices.
+    ///
+    /// ⚠️ `coverageFraction` KEEPS ITS COLUMN NAME AND ITS INDEX (21), and the JSON carries the
+    /// honest name (`coverageWithinReportedWindow`) as an ADDITIONAL key rather than a rename. This
+    /// file's compatibility rule is that a shipped key keeps working, the exports are files people
+    /// have already been handed, and the schema version is not bumped for this change — so the four
+    /// new columns below (`durationBasis` plus the three reference-wake ones) are APPENDED and
+    /// nothing existing moves. `notes["coverage"]` is where a reader is told what the old name
+    /// actually means.
     public static func sleepSessionsCSV(_ rows: [SleepSessionRow]) -> String {
-        var lines = ["sessionID,night,inBedStart,inBedEnd,sleepOnset,sleepWake,isManuallyEdited,asleepMin,deepMin,lightMin,remMin,awakeMin,efficiency,sleepScore,stressScore,hypnogramSegments,osaAvgSpO2,osaMinSpO2,osaTimeBelow90Sec,osaODI,osaValidWindows,coverageFraction,expectedSamples,observedSamples,longestGapSeconds,bedtimeVerdict,bedtimeGapSeconds,wakeVerdict,wakeGapSeconds,confidenceReasons"]
+        var lines = ["sessionID,night,inBedStart,inBedEnd,sleepOnset,sleepWake,isManuallyEdited,asleepMin,deepMin,lightMin,remMin,awakeMin,efficiency,sleepScore,stressScore,hypnogramSegments,osaAvgSpO2,osaMinSpO2,osaTimeBelow90Sec,osaODI,osaValidWindows,coverageFraction,expectedSamples,observedSamples,longestGapSeconds,bedtimeVerdict,bedtimeGapSeconds,wakeVerdict,wakeGapSeconds,confidenceReasons,durationBasis,referenceWakeSource,referenceWakeAt,coverageToReferenceWake"]
         for r in rows {
             let osa = emittableOSA(r)
             let cov = r.coverage
@@ -753,7 +822,16 @@ public enum ExportEngine {
                 // the CLASSIFIER found nothing to say — a real and common answer (12 of 21 corpus
                 // nights) — and says nothing about any screen: no coverage caveat ships in this
                 // build. See the ⚠️ on `SleepEdgeProvenanceRow`.
-                edge?.reasons.joined(separator: " ") ?? ""
+                edge?.reasons.joined(separator: " ") ?? "",
+                // Which night's totals the duration half of `confidenceReasons` was computed from.
+                // Empty only when there is no edge row at all.
+                edge?.durationBasis ?? "",
+                // The second, FALSIFIABLE coverage measurement. `referenceWakeSource` is never empty
+                // when a coverage window exists: it either names the reference or says `none`, so a
+                // reader can tell "the check found nothing wrong" from "the check could not run".
+                referenceSource(r),
+                referenceRow(r).map { offsetISO8601($0.referenceEnd) } ?? "",
+                referenceRow(r).map { String(format: "%.4f", $0.assessment.coverageFraction) } ?? ""
             ]))
         }
         return lines.joined(separator: "\n")
@@ -928,6 +1006,13 @@ public enum ExportEngine {
                     "syncAckFlag": jsonOrNull(channel.syncAckFlag),
                     "page4CCount": channel.page4CCount,
                     "page47Count": channel.page47Count,
+                    // ADDITIVE, and NULL rather than 0 on a bundle written before the counters
+                    // existed — `jsonOrNull` preserves the one distinction they were added for
+                    // ("we counted zero sport pages" vs "this build never counted"). A 0x4d page
+                    // is the sport channel's ONLY page kind, so without these a drain full of
+                    // workout history was indistinguishable from an empty one.
+                    "page4DCount": jsonOrNull(channel.page4DCount),
+                    "sportSampleCount": jsonOrNull(channel.sportSampleCount),
                     "endMarkerCount": channel.endMarkerCount,
                     "recordsAtStart": channel.recordsAtStart,
                     "recordsAtEnd": channel.recordsAtEnd,
@@ -1001,11 +1086,22 @@ public enum ExportEngine {
                         // asleep = measured + asserted + unknown. Omitting the unknown bucket would
                         // leave a reader with minutes that belong to no category and no way to tell
                         // a proven hole from ground this app no longer retains records for.
+                        //
+                        // ⚠️ `measuredAwakeSec` IS `.measured` ONLY, AND IT DID NOT USE TO BE. It
+                        // summed everything `hasMeasurement` accepts, so a wearer's own awake paint
+                        // over recorded ground was published as the stage the RING reported.
+                        // `assertedOverMeasuredAwakeSec` is the part that moved out; the two still
+                        // sum to the old value, and awake's four buckets still close on
+                        // `displayedAwake`. `assertedOverMeasuredAsleepSec` states the same fact for
+                        // asleep WITHOUT moving a total — it is a SUBSET of `measuredAsleepSec`
+                        // (which stays the efficiency numerator), never a fourth asleep bucket.
                         var summary: [String: Any] = [
                             "measuredAsleepSec": breakdown.measuredAsleep,
+                            "assertedOverMeasuredAsleepSec": breakdown.assertedOverMeasuredAsleep,
                             "assertedAsleepSec": breakdown.assertedAsleep,
                             "coverageUnknownAsleepSec": breakdown.unknownAsleep,
                             "measuredAwakeSec": breakdown.measuredAwake,
+                            "assertedOverMeasuredAwakeSec": breakdown.assertedOverMeasuredAwake,
                             "assertedAwakeSec": breakdown.assertedAwake,
                             "coverageUnknownAwakeSec": breakdown.unknownAwake,
                             "coveredInBedSec": breakdown.coveredInBed,
@@ -1041,6 +1137,17 @@ public enum ExportEngine {
                         "expectedSamples": cov.expectedSamples,
                         "observedSamples": cov.observedSamples,
                         "coverageFraction": cov.coverageFraction,
+                        // THE SAME NUMBER UNDER THE NAME THAT SAYS WHAT IT MEASURES. The window is
+                        // the night's REPORTED in-bed window, and on a night nobody corrected that
+                        // window's right edge IS the last record — so on those nights this fraction
+                        // is structurally incapable of falling because the recording stopped at the
+                        // wake. It is coverage WITHIN the reported window, not coverage of the
+                        // night. (On a CORRECTED night the right edge is the wearer's own wake, so
+                        // it can and does fall — see the note.) Both keys are emitted: this export's
+                        // schema version is unchanged and the files are already in third-party
+                        // hands, so dropping the old name would break a reader silently.
+                        // `referenceCoverage` beside it is the falsifiable measurement.
+                        "coverageWithinReportedWindow": cov.coverageFraction,
                         "longestGapSeconds": cov.longestGapSeconds,
                         "gaps": cov.gaps.map { gap in [
                             "start": offsetISO8601(gap.start),
@@ -1048,6 +1155,40 @@ public enum ExportEngine {
                             "seconds": gap.seconds
                         ] as [String: Any] }
                     ] as [String: Any]
+                }
+                // Emitted whenever `coverage` is — including when there was no reference to measure
+                // against, in which case it says so. See `ExportReferenceCoverage.Outcome`.
+                switch session.referenceCoverage {
+                case .measured(let ref):
+                    let a = ref.assessment
+                    obj["referenceCoverage"] = [
+                        "reference": ref.reference.rawValue,
+                        "referenceEnd": offsetISO8601(ref.referenceEnd),
+                        // Signed. Negative means the reference closed EARLIER than the reported
+                        // window, so `coverageToReference` is measured over a shorter span and is
+                        // not comparable with `coverage.coverageFraction`.
+                        "beyondReportedEndSeconds": ref.beyondReportedEndSeconds,
+                        "windowStart": offsetISO8601(a.windowStart),
+                        "windowEnd": offsetISO8601(a.windowEnd),
+                        "expectedSamples": a.expectedSamples,
+                        "observedSamples": a.observedSamples,
+                        "coverageToReference": a.coverageFraction,
+                        "longestGapSeconds": a.longestGapSeconds,
+                        "gaps": a.gaps.map { gap in [
+                            "start": offsetISO8601(gap.start),
+                            "end": offsetISO8601(gap.end),
+                            "seconds": gap.seconds
+                        ] as [String: Any] }
+                    ] as [String: Any]
+                case .unavailable(let reason):
+                    // An explicit null, not an omitted key: no denominator was invented, and a reader
+                    // must be able to tell that from an export written before this key existed.
+                    obj["referenceCoverage"] = [
+                        "reference": NSNull(),
+                        "unavailableReason": reason
+                    ] as [String: Any]
+                case nil:
+                    break
                 }
                 // Omitted, never zero-filled, for the same reason as `osa`/`coverage`: a night with
                 // no clock times to measure is not a night whose edges we watched.
@@ -1058,7 +1199,11 @@ public enum ExportEngine {
                         "bedtimeVerdict": edge.bedtimeVerdict,
                         "wakeVerdict": edge.wakeVerdict,
                         "reasons": edge.reasons,
-                        "materialGapSeconds": edge.materialGapSeconds
+                        "materialGapSeconds": edge.materialGapSeconds,
+                        // Which night's totals fed the DURATION half of `reasons`. The edges are
+                        // always the recorded window; before this key the duration was fed the
+                        // post-edit totals with nothing saying so. See `SleepEdgeProvenanceRow`.
+                        "durationBasis": edge.durationBasis
                     ]
                     // Present ONLY on a verdict that measured a silence. `witnessed` has none and
                     // `unknown` could not look — a 0 here would turn "we don't know" into "we
@@ -1133,6 +1278,11 @@ public enum ExportEngine {
             map["sleepSessions.hypnogram"] = "derived"
             // MEASURED: coverage counts rows we actually hold, it estimates nothing.
             map["sleepSessions.coverage"] = "measured"
+            // DERIVED, and NOT "measured", even though the counting half is identical to `coverage`
+            // above. Its window closes on a wake the WEARER's schedule named — an intention, not an
+            // observation — so the fraction is only as good as the schedule. Calling it measured
+            // would dress a chosen denominator as an observation.
+            map["sleepSessions.referenceCoverage"] = "derived"
             // DERIVED, not measured. The two GAPS in it are measured (distances between stored
             // timestamps), but `bedtimeVerdict`/`wakeVerdict`/`reasons` are the output of a
             // classifier with a chosen threshold — and the reasons are literally the sentences the
@@ -1189,6 +1339,13 @@ public enum ExportEngine {
             map[jsonKey] = unit
         }
         map["coverageFraction"] = "fraction"
+        // Same number as `coverageFraction`, under the name that states its frame of reference.
+        map["coverageWithinReportedWindow"] = "fraction"
+        // `sleepSessions[].referenceCoverage` — the CSV column and the JSON key differ here, so both
+        // are listed, exactly as the `osa*` pairs above are.
+        map["coverageToReference"] = "fraction"
+        map["coverageToReferenceWake"] = "fraction"
+        map["beyondReportedEndSeconds"] = "s"
         map["longestGapSeconds"] = "s"
         // `sleepSessions[].edgeProvenance` — the CSV column names and the JSON keys are the same
         // strings here, so there is nothing to keep in sync.
@@ -1241,11 +1398,18 @@ public enum ExportEngine {
             "osaTimeBelow90Sec and osaODI are EXPERIMENTAL estimates — reproducing the app's " +
             "numbers needs its proprietary artifact rejection and event scoring (OSASpO2.swift " +
             "header, docs/RUNBOOK_OSA_APNEA.md).",
+        // ⚠️ The second sentence used to read "Overnight temperature coverage is expected to be
+        // sparse because the app deliberately stays quiet during the sleep window" — an
+        // expectation the data contradicts (a 2026-08-26 tester night banked 378 overnight
+        // samples with the quiet gate in force). A reader who trusted it would have written a
+        // dense overnight run off as impossible. Say what varies and why it is not predictable
+        // from the gate, and claim no mechanism.
         "skinTemperature":
             "Skin temperature is LIVE-only: it is not part of the drainable 0x4c history, so a " +
-            "window the app did not observe cannot be back-filled. Overnight temperature " +
-            "coverage is expected to be sparse because the app deliberately stays quiet during " +
-            "the sleep window.",
+            "window the app did not observe cannot be back-filled. Overnight coverage is NOT " +
+            "predictable from the app's sleep-window quiet gate: a night recorded under that gate " +
+            "has carried hundreds of overnight readings, so a quiet night is not an empty one. " +
+            "Read the timestamps in this file rather than inferring coverage from the gate.",
         "ringIdentity":
             "The meta.ring* fields describe the LAST RING THIS APP CONNECTED TO, which is not " +
             "necessarily the ring that produced every night in this file. Rings are used one at a " +
@@ -1266,7 +1430,35 @@ public enum ExportEngine {
             "delivered after it and make a fully-recorded night read as a gap — that reports our " +
             "own cursor, not the ring. Neither witness can invent data: every counted instant is " +
             "a record or a sample actually on disk. Nights older than the archive's retention are " +
-            "carried by the store witness alone, exactly as before.",
+            "carried by the store witness alone, exactly as before. READ ITS NAME AS " +
+            "coverageWithinReportedWindow, which is emitted beside it in JSON and is the same " +
+            "number: the window is the night's REPORTED in-bed window (windowStart/windowEnd say " +
+            "which). On a night the wearer never corrected, that window's right edge IS the last " +
+            "record, so no amount of missing data at the wake can lower this fraction: a night " +
+            "whose recording stopped four hours before the wearer got up reports 1.0000 with an " +
+            "empty gaps list, and that is the arithmetic working as written, not a clean night. On " +
+            "a night the wearer DID correct (isManuallyEdited true) the right edge is her own wake " +
+            "instead, so a trailing hole is inside the window and this fraction does fall — a low " +
+            "value there is real. referenceCoverage is the falsifiable companion for the nights " +
+            "nobody corrected; the old key is kept because this file's schema version is unchanged.",
+        "referenceCoverage":
+            "referenceCoverage measures the SAME records over a window whose right edge came from " +
+            "somewhere the recording had no vote in — today the wake time in the wearer's own " +
+            "manual sleep schedule (reference = manualScheduleWake). That is the only kind of " +
+            "denominator a trailing data hole can actually show up in. It is a REFERENCE and not a " +
+            "truth: a scheduled wake is when the wearer intends to get up, so a night they slept " +
+            "in or rose early scores low for a reason that is about the schedule, not the ring — " +
+            "compare beyondReportedEndSeconds (signed: negative means the reference closed EARLIER " +
+            "than the reported window, so coverageToReference is over a shorter span and is not " +
+            "comparable with coverageFraction). Nothing in the app is gated on it. It never reaches " +
+            "past the moment the file was written: when the schedule wake has not arrived yet the " +
+            "window is closed at exportedAt instead and reference says manualScheduleWakeSoFar, " +
+            "because measuring to a wake in the future would report the future as a hole. When the " +
+            "wearer has set no schedule the block is still emitted, with reference = null and an " +
+            "unavailableReason, because no denominator is invented in its place and a missing key " +
+            "would be indistinguishable from an older export. Only the right edge is moved: a " +
+            "schedule also names a bedtime, but a wearer who went to bed late would then be " +
+            "reported as a hole on a night nothing was wrong with.",
         "edgeProvenance":
             "edgeProvenance says whether the record stream ran INTO the printed bedtime and " +
             "CONTINUED past the printed wake — the question coverageFraction structurally cannot " +
@@ -1284,6 +1476,23 @@ public enum ExportEngine {
             "what the app shows, not what was recorded. reasons[] is the classifier's own list, " +
             "NOT a record of what the app displayed: no coverage caveat is shown to the wearer in " +
             "this build, and any future card would apply its own render guards on top, so treat " +
-            "reasons[] as an upper bound on what anyone actually saw."
+            "reasons[] as an upper bound on what anyone actually saw. durationBasis says which " +
+            "night's totals fed the durationLikelyHigh half of reasons[]: 'recorded' is the " +
+            "recorded night's own totals, which is the same frame of reference as the edges, and " +
+            "'edited' means the night was corrected AND predates the stored recorded timeline, so " +
+            "only the post-edit totals were available. Before durationBasis existed the block " +
+            "always used the post-edit totals against a recorded-window coverage, so an edit could " +
+            "add or remove a caveat about a window it had never touched.",
+        "provenanceSummary":
+            "In provenanceSummary, 'measured' means OVER GROUND THE RING RECORDED ACROSS — not " +
+            "'the stage the ring reported'. measuredAsleepSec is the efficiency numerator and " +
+            "therefore includes spans the wearer relabelled asleep over recorded ground; " +
+            "assertedOverMeasuredAsleepSec states how much of it that is and is a SUBSET of it, " +
+            "never a separate bucket to add in. measuredAwakeSec is the one exception: it counts " +
+            "only what the ring's own staging called awake, and the wearer's awake paint over " +
+            "recorded ground is reported separately as assertedOverMeasuredAwakeSec, because " +
+            "nothing derived depends on that total and a reader takes it as the ring's word. So " +
+            "asleep sums as measured + asserted + coverageUnknown, and awake as measured + " +
+            "assertedOverMeasured + asserted + coverageUnknown."
     ] }
 }

@@ -208,11 +208,17 @@ final class SleepCoverageMeasureTests: XCTestCase {
               + "  [\(acq.map(\.id).joined(separator: ", "))]")
 
         // ---- what the CARD shows today, reproduced from the shipped guards rather than assumed.
-        // `confidenceHint` (SleepCardView.swift:451-461) needs contiguity AND !isLikelyTruncated;
-        // `bedtimeProvenanceHint` (:535-551) needs !isLikelyTruncated and renders EmptyView for
-        // `.witnessed`/`.unknown`. `isLikelyTruncated` calls the real `SleepCaptureCoverage`.
-        var cardDuration: [String] = [], cardBedtime: [String] = [], truncated: [String] = [],
-            nonContiguous: [String] = []
+        // `confidenceHint` needs contiguity AND !isLikelyTruncated AND — since the 2026-08-26
+        // tester night — a WITNESSED trailing edge (`SleepCardView.confidenceHint`, the
+        // `wakeProvenance == .witnessed` conjunct). `bedtimeProvenanceHint` needs !isLikelyTruncated
+        // and renders EmptyView for `.witnessed`/`.unknown`. `isLikelyTruncated` calls the real
+        // `SleepCaptureCoverage`.
+        //
+        // BOTH SIDES of the wake gate are printed, so the change's cost comes out of this harness
+        // instead of being asserted in a comment: `cardDurationPreGate` is the pre-2026-08-28
+        // behaviour, `cardDuration` is what ships.
+        var cardDuration: [String] = [], cardDurationPreGate: [String] = [],
+            cardBedtime: [String] = [], truncated: [String] = [], nonContiguous: [String] = []
         for row in rows {
             let a = assess(row, cut: WakeProvenance.materialGapSeconds)
             let wallSpan = row.coverage.inBedEnd.timeIntervalSince(row.coverage.inBedStart)
@@ -224,13 +230,19 @@ final class SleepCoverageMeasureTests: XCTestCase {
                                                             scheduledBedtime: nil) == .likelyTruncated
             if isTruncated { truncated.append(row.id) }
             if !contiguous { nonContiguous.append(row.id) }
-            if contiguous, !isTruncated, row.legacy == .durationLikelyHigh { cardDuration.append(row.id) }
+            if contiguous, !isTruncated, row.legacy == .durationLikelyHigh {
+                cardDurationPreGate.append(row.id)
+                if a.wake == .witnessed { cardDuration.append(row.id) }
+            }
             if !isTruncated, a.bedtime == .noPriorMeasurement { cardBedtime.append(row.id) }
             if !isTruncated, case .resumedAfterGap = a.bedtime { cardBedtime.append(row.id) }
         }
         let cardToday = Set(cardDuration).union(cardBedtime)
         print("\nCARD TODAY (shipped guards re-run, not assumed):")
+        print("  confidenceHint (pre wake-gate) : \(cardDurationPreGate.count)/\(rows.count)  [\(cardDurationPreGate.joined(separator: ", "))]")
         print("  confidenceHint fires        : \(cardDuration.count)/\(rows.count)  [\(cardDuration.joined(separator: ", "))]")
+        print("    …suppressed by wake != witnessed : "
+              + "\(Set(cardDurationPreGate).subtracting(cardDuration).sorted().joined(separator: ", "))")
         print("  bedtimeProvenanceHint fires : \(cardBedtime.count)/\(rows.count)  [\(cardBedtime.sorted().joined(separator: ", "))]")
         print("  SleepCaptureCoverage == .likelyTruncated : \(truncated.count)/\(rows.count)")
         print("  contiguity guard fails      : \(nonContiguous.count)/\(rows.count)")
