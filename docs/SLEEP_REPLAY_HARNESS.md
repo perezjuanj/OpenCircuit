@@ -93,8 +93,17 @@ this?* rather than nothing at all:
 | what | sha256 |
 |---|---|
 | corpus `manifest.json` (identity of the corpus) | `63a07be8f28714b2c31a410c950dfb9c6f69b899097dccbc5f92f18b41061c0e` |
-| `baseline.tsv` at the **shipped default** — master `f790c19`, build 46 (74 lines: header + 73 rows) | `b1df05475ae15b243c35b8c25c6bd76888e596248f569160c3dba33bbb9bf148` |
+| `baseline.tsv` at the **shipped default** — the CURRENT pin (74 lines: header + 73 rows) | `58fef4b861246576b87a9881fc3ae6e89f04d9c97d5260b5c194232b16b8c6c5` |
+| the same at build 46–49, before the 2026-08-29 wake-edge fix (master `f790c19`) | `b1df05475ae15b243c35b8c25c6bd76888e596248f569160c3dba33bbb9bf148` |
 | the same, with the evening-absorb guard **OFF** (`OC_SLEEP_ABSORB_CUT=0`, ≡ master `f042639`) | `ef5dc087a16f0461d14d656d2e3461cc479cceb85ef5d30f5e4dd741eaa13e8f` |
+
+> **2026-08-29 — the pin moved, deliberately, and one staged number moved with it.**
+> `BulkSleep.morningContinuationMaxGap` changed from a literal `30 * 60` to
+> `ActivityPeriod.maxSleepPause` (60 min): the night-scoping PRE-FILTER was stricter about "same
+> night" than `mainSleepBlock`, the function it feeds, so a 30–60 min morning pause deleted every
+> record after it. Exactly **one** of the 73 rows moved — `R2_2026-08-04`, which is UNLABELLED
+> (in-bed end 07:36:34 → 08:21:36, asleep 408 → 435). No labelled night moved. The full per-column
+> diff and the three tester nights behind the change are in `SleepBaselineGolden.baselineSHA256`.
 
 ⚠️ **These two are not interchangeable and the pin got it wrong once.** `SleepBaselineGolden`
 originally pinned `ef5dc087` as the default; that is the guard-OFF scoreboard, so the golden failed

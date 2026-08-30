@@ -63,7 +63,26 @@ enum SleepBaselineGolden {
     ///
     /// Keep BOTH written down. `docs/SLEEP_REPLAY_HARNESS.md` and `BulkSleep.swift`'s comment quote
     /// `ef5dc087` and are CORRECT — they are talking about the guard being off. Do not "fix" them.
-    static let baselineSHA256 = "b1df05475ae15b243c35b8c25c6bd76888e596248f569160c3dba33bbb9bf148"
+    ///
+    /// ⚠️ RE-PINNED 2026-08-29, DELIBERATELY, AND A STAGED NUMBER DID MOVE. Previous value
+    /// `b1df05475ae15b243c35b8c25c6bd76888e596248f569160c3dba33bbb9bf148` (build 46 → 49).
+    ///
+    /// Cause: `BulkSleep.morningContinuationMaxGap` changed from a literal `30 * 60` to
+    /// `ActivityPeriod.maxSleepPause` (60 min) — see that constant's doc for the full argument. The
+    /// night-scoping PRE-FILTER was stricter about "same night" than `mainSleepBlock`, the function
+    /// it feeds, so a 30–60 min morning pause deleted every record after it. Three tester reports on
+    /// 2026-08-29 (two rings, two firmwares, all build 49) each had a wake of exactly
+    /// `anchor.end + 30 min`.
+    ///
+    /// EXACTLY ONE of the 73 rows moved — `R2_2026-08-04`, and it is UNLABELLED, so this is not
+    /// evidence either way about accuracy on it:
+    ///     detInBedEnd  2026-08-04T07:36:34+02:00 → 08:21:36   (+45 min)
+    ///     detWake      07:36:34 → 08:13:36 · detAsleepMin 408 → 435 · detAwakeMin 76 → 94
+    ///     detRemMin 108 → 115 · detLightMin 250 → 270 · detEfficiency 0.8430 → 0.8223
+    ///     nightScopedRecords 206 → 232
+    /// Its wake was already `witnessed` (the stream ran continuously past it), so the extension sits
+    /// over records we hold rather than over a hole. NO LABELLED NIGHT MOVED.
+    static let baselineSHA256 = "58fef4b861246576b87a9881fc3ae6e89f04d9c97d5260b5c194232b16b8c6c5"
 
     /// The same scoreboard with the evening-absorb guard OFF (`OC_SLEEP_ABSORB_CUT=0`). Recorded so
     /// the two can never be mistaken for each other again.
