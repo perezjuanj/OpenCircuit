@@ -1106,10 +1106,14 @@ public enum BulkSleep {
         // 86-min 09:04→10:30 "nap"; the sleep card (which excludes naps) reported 4 h for a 6¾ h
         // night. Chain FORWARD over later sleep blocks the same way the backward pass chains earlier
         // ones, but under much stricter rules — each one keeps a real failure out:
-        //   * the gap must be ≤ `morningContinuationMaxGap` (30 min — the same slop this function
-        //     already grants as `margin`; the device split was ~1 min). Deliberately a small fraction
-        //     of `maxIntraNightGap` (6 h): a genuine late-morning or afternoon nap keeps its hours-
-        //     wide gap and stays a nap.
+        //   * the gap must be ≤ `morningContinuationMaxGap`, which IS `ActivityPeriod.maxSleepPause`
+        //     (60 min) and must never be tightened below it — pinned by
+        //     `testForwardAbsorbIsNeverStricterThanTheBridgeItFeeds`.
+        //     While this read 30 min it was stricter than the `mainSleepBlock`
+        //     bridge it feeds, so a 30–60 min morning pause DELETED every later record before staging
+        //     ran (2026-08-29, three tester nights, two firmwares; the device split was ~1 min).
+        //     Still a small fraction of `maxIntraNightGap` (6 h): a genuine late-morning or afternoon
+        //     nap keeps its hours-wide gap and stays a nap.
         //   * the extended envelope must still satisfy `isOvernightBlock`, or absorbing the tail
         //     would get the WHOLE night rejected by the downstream overnight gate — losing a real
         //     night to recover its tail is the anchor-eviction failure shape all over again.
