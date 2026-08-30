@@ -217,6 +217,49 @@ final class SleepProvenanceTesterNight0818Tests: XCTestCase {
         // …and the recorded hypnogram round-trips through the codec unchanged, provenance included.
         XCTAssertEqual(SleepHypnogramCodec.decode(SleepHypnogramCodec.encode(stagedBase)), stagedBase)
     }
+
+    // MARK: The export's coverage number cannot see this night's hole
+
+    /// THE FALSIFIABILITY DEFECT, ON THE NIGHT IT WAS FOUND ON.
+    ///
+    /// `sleepSessions[].coverage` is measured over the DETECTED window, and this fixture's detected
+    /// window is 22:24:25 → 02:37:02 — it ends there because that is where the records end. So the
+    /// four-hour hole this whole file exists for begins one instant AFTER the window closes, and the
+    /// coverage number reports a flawless night. Move only the right edge to a wake the recording
+    /// did not define and the same records score barely half.
+    ///
+    /// The instants are generated at the ring's own 150 s epoch step across this fixture's COMMITTED
+    /// recording spans — they are that fixture's statement of when the ring was and was not
+    /// recording, not a new measurement. The reference instant is this night's own corrected wake
+    /// (06:43, the one externally-supplied instant the fixture carries); in production the reference
+    /// is the wearer's manual schedule wake (`ExportReferenceCoverage`), and the arithmetic below
+    /// does not depend on which of the two supplies it.
+    func testCoverageInTheDetectedWindowCannotSeeTheFourHourHole() {
+        var witness: [Date] = []
+        for span in coverage.intervals {
+            var t = span.lowerBound
+            while t < span.upperBound {
+                witness.append(t)
+                t = t.addingTimeInterval(150)
+            }
+        }
+        let detectedStart = d(1_786_998_265)   // 22:24:25 — stagedBase's in-bed start
+        let detectedEnd = d(1_787_013_422)     // 02:37:02 — and its end, i.e. the last record
+
+        let detected = ExportCoverage.assess(sampleTimes: witness,
+                                             from: detectedStart, to: detectedEnd)
+        XCTAssertEqual(detected.coverageFraction, 1.0, accuracy: 1e-9,
+                       "1.0000 on the night the app invented 246 minutes of sleep")
+        XCTAssertTrue(detected.gaps.isEmpty, "and not one gap, because the hole is outside")
+
+        let againstHerWake = ExportCoverage.assess(sampleTimes: witness,
+                                                   from: detectedStart, to: times.sleepWake)
+        XCTAssertLessThan(againstHerWake.coverageFraction, 0.60,
+                          "the same records, one denominator the recording did not choose")
+        XCTAssertEqual(againstHerWake.gaps.count, 1)
+        XCTAssertGreaterThan(againstHerWake.gaps.first?.seconds ?? 0, 4 * 3600,
+                             "over four hours, and it was invisible to the number we published")
+    }
 }
 
 final class SleepProvenanceTesterNight0817Tests: XCTestCase {
