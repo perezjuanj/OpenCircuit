@@ -147,9 +147,109 @@ final class HistorySyncAssessmentTests: XCTestCase {
         XCTAssertEqual(trace.outcome, .noAck)
     }
 
+    // MARK: 0x4d sport counters (added 2026-08-27)
+
+    func testLegacyTraceJSONWithoutTheSportCountersStillDecodes() throws {
+        // THE ONE THAT MATTERS ON UPGRADE. `ObservabilityStore.historySyncEvidence()` decodes with
+        // `try? … ?? []`, so a single `keyNotFound` does not surface as an error — it silently
+        // returns the empty list and the user's ENTIRE diagnostics history disappears. A
+        // non-optional `page4DCount` would do exactly that to every bundle stored before today.
+        // This JSON is a verbatim pre-2026-08-27 trace: it has neither new key.
+        let legacy = """
+        {"label":"sport","channel":2,"startedAt":0,"sawSyncAck":true,\
+        "sawEmptyHistorySignal":false,"page4CCount":0,"page47Count":0,\
+        "endMarkerCount":1,"recordsAtStart":0,"recordsAtEnd":0,"exitReason":"endMarker"}
+        """.data(using: .utf8)!
+        let trace = try JSONDecoder().decode(HistoryChannelTrace.self, from: legacy)
+        XCTAssertNil(trace.page4DCount)
+        XCTAssertNil(trace.sportSampleCount)
+        // …and nil must classify EXACTLY as the pre-change code did, so re-reading an old bundle
+        // cannot invent a sport drain that never happened.
+        XCTAssertEqual(trace.outcome, .empty)
+    }
+
+    func testNilCountersMeanPreUpgradeWhileAFreshTraceMeansMeasuredZero() {
+        // The whole point of the pair: "we counted and it was zero" (a fresh trace) must be
+        // distinguishable from "this build never counted" (a decoded legacy trace). `init` zeroes
+        // them; the synthesized decoder leaves them nil.
+        let fresh = HistoryChannelTrace(label: "sport", channel: 0x02)
+        XCTAssertEqual(fresh.page4DCount, 0)
+        XCTAssertEqual(fresh.sportSampleCount, 0)
+    }
+
+    func testSportPagesClassifyAsSportOnlyNotEmpty() {
+        // The defect: a sport drain FULL of workout history exported `outcome: "empty"`, because
+        // nothing counted 0x4d. That is why the project's own notes say the ring returns empty
+        // sport history — the instrument could not tell that from a drain we mishandled.
+        var trace = HistoryChannelTrace(label: "sport", channel: 0x02)
+        trace.sawSyncAck = true
+        trace.page4DCount = 7
+        trace.sportSampleCount = 210
+        trace.exitReason = .endMarker
+        XCTAssertEqual(trace.outcome, .sportOnly)
+        XCTAssertTrue(trace.sawAnyPage)
+    }
+
+    func testSportChannelThatTrulyReturnedNothingIsStillEmpty() {
+        // The mirror case — this is the reading the old code CLAIMED to be making. It must still
+        // be reachable, or `.sportOnly` would just relabel the ambiguity instead of resolving it.
+        var trace = HistoryChannelTrace(label: "sport", channel: 0x02)
+        trace.sawSyncAck = true
+        trace.exitReason = .endMarker
+        XCTAssertEqual(trace.outcome, .empty)
+        XCTAssertFalse(trace.sawAnyPage)
+    }
+
+    func testPagesWithoutSamplesIsDistinguishableFromAnEmptyChannel() {
+        // Pages > 0 with samples == 0 means the ring delivered and OUR decode dropped it. Before
+        // the counters existed this was indistinguishable from a channel that returned nothing —
+        // the two need opposite fixes, so the classification must not merge them.
+        var decodeBroken = HistoryChannelTrace(label: "sport", channel: 0x02)
+        decodeBroken.sawSyncAck = true
+        decodeBroken.page4DCount = 5
+        decodeBroken.sportSampleCount = 0
+        XCTAssertEqual(decodeBroken.outcome, .sportOnly)
+
+        var ringEmpty = HistoryChannelTrace(label: "sport", channel: 0x02)
+        ringEmpty.sawSyncAck = true
+        XCTAssertEqual(ringEmpty.outcome, .empty)
+        XCTAssertNotEqual(decodeBroken.outcome, ringEmpty.outcome)
+    }
+
+    func testSportOnlyNeverCommitsSleep() {
+        // Sport records carry no sleep epochs. `.sportOnly` took over branches of `.empty`/`.noAck`
+        // that were both non-committing, so this invariant must survive the new case.
+        XCTAssertFalse(HistoryChannelOutcome.sportOnly.allowsSleepCommit)
+        XCTAssertEqual(HistoryCommitGate.decide(outcome: .sportOnly, recordsAdded: 5,
+                                                adoptedRecordCount: 0),
+                       .skip)
+    }
+
+    func testSportCountersNeverDegradeAnEpochOrPPGChannel() {
+        // Ordering lock: `.sportOnly` sits AFTER the 0x4c and 0x47 branches, so a channel that
+        // delivered real epoch or PPG pages keeps the exact classification it had before the case
+        // existed — even if a 0x4d somehow landed on it. A regression here could flip a committable
+        // sleep drain to non-committable, which is the night-losing class.
+        var sleep = HistoryChannelTrace(label: "sleep", channel: 0x00)
+        sleep.sawSyncAck = true
+        sleep.page4CCount = 3
+        sleep.page4DCount = 2
+        sleep.endMarkerCount = 1
+        sleep.exitReason = .endMarker
+        XCTAssertEqual(sleep.outcome, .complete)
+        XCTAssertTrue(sleep.outcome.allowsSleepCommit)
+
+        var ppg = HistoryChannelTrace(label: "sleep", channel: 0x00)
+        ppg.sawSyncAck = true
+        ppg.page47Count = 1
+        ppg.page4DCount = 2
+        XCTAssertEqual(ppg.outcome, .ppgOnly)
+    }
+
     func testOutcomeAndExitReasonRawValuesAreStable() {
         // Both are persisted as strings in ObservabilityStore evidence bundles.
         XCTAssertEqual(HistoryChannelOutcome.linkDown.rawValue, "linkDown")
+        XCTAssertEqual(HistoryChannelOutcome.sportOnly.rawValue, "sportOnly")
         XCTAssertEqual(HistoryChannelExitReason.linkUnusable.rawValue, "linkUnusable")
     }
 }

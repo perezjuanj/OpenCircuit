@@ -228,10 +228,59 @@ final class ExportEngineTests: XCTestCase {
             mergedRecordCount: 8, historySampleCount: 10,
             rawRecordBlobBase64: "AQID", channels: [trace],
             nightRowOutcome: SleepPersistOutcome.updated.rawValue)
+        // `4d`/`sport` are APPENDED after `added=` inside the same `channelSummary` column: every
+        // key=value pair a v2 consumer already parses keeps its text and its order, and no CSV
+        // column index moves. They appear here because `HistoryChannelTrace.init` zeroes the
+        // counters — see `testLegacyChannelSummaryOmitsTheSportCountersEntirely` for the trace that
+        // predates them, where they are omitted rather than reported as a measured zero.
         XCTAssertEqual(ExportEngine.historySyncEvidenceCSV([row]), """
         capturedAt,ringID,trigger,sleepCommitted,stagedSleepSegments,mergedRecordCount,historySampleCount,channelSummary,rawRecordBlobBase64,nightRowOutcome
-        2023-11-14T22:13:20.000Z,ring-1,manual,true,4,8,10,sleep:complete:4c=1:47=0:50=1:added=6,AQID,updated
+        2023-11-14T22:13:20.000Z,ring-1,manual,true,4,8,10,sleep:complete:4c=1:47=0:50=1:added=6:4d=0:sport=0,AQID,updated
         """)
+    }
+
+    func testSportChannelSummaryCarriesItsOwnEvidence() {
+        // The sport channel streams no 0x4c and no 0x47, so before the 0x4d counters a drain full
+        // of workout history exported `sport:empty:4c=0:47=0:50=1:added=0` — indistinguishable
+        // from a channel that returned nothing, which is why "auto-detect doesn't work for walks"
+        // could not be answered from a bundle. `added` is a bulkRecords delta and is structurally 0
+        // here; `4d`/`sport` are the only evidence this channel can produce.
+        var trace = HistoryChannelTrace(label: "sport", channel: 0x02, startedAt: t0)
+        trace.finishedAt = t1
+        trace.sawSyncAck = true
+        trace.page4DCount = 7
+        trace.sportSampleCount = 210
+        trace.endMarkerCount = 1
+        trace.exitReason = .endMarker
+        let row = ExportEngine.HistorySyncEvidenceRow(
+            capturedAt: t0, ringID: "ring-1", trigger: "manual",
+            sleepCommitted: false, stagedSleepSegments: 0,
+            mergedRecordCount: 0, historySampleCount: 0,
+            rawRecordBlobBase64: "", channels: [trace])
+        XCTAssertTrue(
+            ExportEngine.historySyncEvidenceCSV([row])
+                .contains("sport:sportOnly:4c=0:47=0:50=1:added=0:4d=7:sport=210"))
+    }
+
+    func testLegacyChannelSummaryOmitsTheSportCountersEntirely() throws {
+        // A trace decoded from a pre-2026-08-27 bundle has nil counters. Emitting `4d=0` there
+        // would claim a measurement that build never took, so the pairs are omitted — the CSV then
+        // reads byte-for-byte as it did before this change.
+        let legacy = """
+        {"label":"sport","channel":2,"startedAt":0,"sawSyncAck":true,\
+        "sawEmptyHistorySignal":false,"page4CCount":0,"page47Count":0,\
+        "endMarkerCount":1,"recordsAtStart":0,"recordsAtEnd":0,"exitReason":"endMarker"}
+        """.data(using: .utf8)!
+        let trace = try JSONDecoder().decode(HistoryChannelTrace.self, from: legacy)
+        let row = ExportEngine.HistorySyncEvidenceRow(
+            capturedAt: t0, ringID: "ring-1", trigger: "manual",
+            sleepCommitted: false, stagedSleepSegments: 0,
+            mergedRecordCount: 0, historySampleCount: 0,
+            rawRecordBlobBase64: "", channels: [trace])
+        let csv = ExportEngine.historySyncEvidenceCSV([row])
+        XCTAssertTrue(csv.contains("sport:empty:4c=0:47=0:50=1:added=0"))
+        XCTAssertFalse(csv.contains("4d="))
+        XCTAssertFalse(csv.contains(":sport="))
     }
 
     func testSleepCSVBytesUnchanged() {

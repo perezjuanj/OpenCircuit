@@ -24,7 +24,8 @@ final class HistoryCommitGateTests: XCTestCase {
     func testPartialDrainMayNotStageItsOwnSlice() {
         // The truncated-night gate: a drain cut mid-stream must never overwrite a fuller stored
         // night, however many records it happens to hold.
-        for outcome in [HistoryChannelOutcome.partial, .ppgOnly, .noAck, .linkDown, .empty] {
+        for outcome in [HistoryChannelOutcome.partial, .ppgOnly, .noAck, .linkDown, .empty,
+                        .sportOnly] {
             XCTAssertNotEqual(decide(outcome, added: 174), .stage,
                               "\(outcome.rawValue) must not stage its own slice")
         }
@@ -53,7 +54,8 @@ final class HistoryCommitGateTests: XCTestCase {
     }
 
     func testAdoptedRecordsRescueEveryNonCompleteOutcome() {
-        for outcome in [HistoryChannelOutcome.empty, .partial, .ppgOnly, .noAck, .linkDown] {
+        for outcome in [HistoryChannelOutcome.empty, .partial, .ppgOnly, .noAck, .linkDown,
+                        .sportOnly] {
             XCTAssertEqual(decide(outcome, adopted: 189), .restageFromArchive,
                            "\(outcome.rawValue) still owes the user the night it already ACKed")
         }
