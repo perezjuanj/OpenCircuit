@@ -11,6 +11,10 @@ import XCTest
 /// Activity tab → the read prompt appears → the write grant is gone → next fresh launch prompts for
 /// write again, forever. Reported first-hand off a build-50 device.
 ///
+/// The read it destroyed the grant for was never needed: the card queries our OWN source, and Apple
+/// documents share-without-read as seeing "only the data that your app has written to the store"
+/// (`HKHealthStore.authorizationStatus(for:)`). So the second request bought nothing at all.
+///
 /// Why HealthKit clears the grant is NOT documented by Apple and is NOT asserted anywhere in this
 /// suite — see `HealthKitWriter.authorizationReadTypes` for exactly what is and is not established.
 /// This audit pins the SHAPE that made the mechanism reachable, which is the part we control: one
@@ -113,17 +117,21 @@ final class HealthKitAuthorizationSurfaceTests: XCTestCase {
             """)
     }
 
-    /// The #129 upgrade re-prompt — the ONLY path that can heal a device already stuck in the loop,
-    /// and the only path that carries a newly-added read type to an existing install — is built on
-    /// `statusForAuthorizationRequest`. Apple documents that probe as reporting whether the user
-    /// would be prompted "if the same collections of types are passed to
+    /// The #129 upgrade re-prompt — the ONLY path that can heal a device already stuck in the loop —
+    /// is built on `statusForAuthorizationRequest`. Apple documents that probe as reporting whether
+    /// the user would be prompted "if the same collections of types are passed to
     /// requestAuthorizationToShareTypes:readTypes:" (HKHealthStore.h), so it answers for the request
-    /// it was handed, not for the one the app actually sends. Build 50's probe passed
-    /// `read: [sleepAnalysis]` while the request sent a far larger read set — which is why a type
-    /// added to the request's read half was invisible to the heal.
+    /// it was handed, not for the one the app actually sends. Build 50's probe passed a
+    /// `[sleepAnalysis]` read set while the request sent a far larger one, so it was answering for a
+    /// request the app never makes, and any type added to the request's read half was invisible to
+    /// the heal.
     ///
-    /// Both call sites must therefore take the read set from the ONE property. An inline literal is
-    /// how they drift apart, so an inline literal is what this bans.
+    /// SO THIS PINS THE POSITIVE FORM: every authorization call in `HealthKitWriter` passes
+    /// `read: authorizationReadTypes` BY NAME. A ban on inline `read: [...]` literals is not enough
+    /// and was measured not to be — build 50's own shape (`let read: Set<HKObjectType> = [...]`
+    /// bound above the call, then `read: read`) walks straight past such a ban, so a test built on
+    /// it passes against the exact code it claims to forbid. Requiring the property name closes both
+    /// the literal and the local.
     func testAuthorizationRequestAndItsStatusProbeShareOneReadSet() throws {
         let sources = try appSources()
         guard let writer = sources.first(where: { $0.name == "HealthKitWriter.swift" }) else {
@@ -131,20 +139,30 @@ final class HealthKitAuthorizationSurfaceTests: XCTestCase {
         }
 
         // Both the request and its status probe must be present, or this test is checking nothing.
-        XCTAssertEqual(try matchCount(#"requestAuthorization\s*\(\s*toShare\s*:"#, in: writer), 2)
-        XCTAssertEqual(try matchCount(#"statusForAuthorizationRequest\s*\(\s*toShare\s*:"#, in: writer), 1)
+        let requests = try matchCount(#"requestAuthorization\s*\(\s*toShare\s*:"#, in: writer)
+        let probes = try matchCount(#"statusForAuthorizationRequest\s*\(\s*toShare\s*:"#, in: writer)
+        XCTAssertEqual(requests, 2, "the request + its temperature-drop retry")
+        XCTAssertEqual(probes, 1, "authorizationPromptAvailable()'s status probe")
 
-        let inlineReadSet = try NSRegularExpression(pattern: #"read\s*:\s*\["#)
-        let ns = writer.flat as NSString
-        let matches = inlineReadSet.matches(in: writer.flat, range: NSRange(location: 0, length: ns.length))
-        let lines = matches.map { writer.line(forUTF16Offset: $0.range.location) }
-        XCTAssertTrue(matches.isEmpty, """
-            HealthKitWriter.swift passes an inline `read: [...]` set at line(s) \(lines).
+        // `[^)]*?` cannot cross the call's own closing paren, so each match is confined to one
+        // argument list. A nested paren in `toShare:` would break the match and fail loudly here —
+        // that is intended: fix the audit, don't let the pin go dark.
+        let byName = try matchCount(
+            #"(?:requestAuthorization|statusForAuthorizationRequest)\s*\(\s*toShare\s*:[^)]*?read\s*:\s*authorizationReadTypes\s*\)"#,
+            in: writer)
+        XCTAssertEqual(byName, requests + probes, """
+            \(requests + probes) authorization call(s) in HealthKitWriter.swift, but only \(byName) \
+            pass `read: authorizationReadTypes` by name.
 
-            The authorization request and `authorizationPromptAvailable()`'s status probe must both
-            read from `authorizationReadTypes`. When they disagree, `statusForAuthorizationRequest`
-            silently answers for a request the app never makes, and the #129 upgrade re-prompt stops
-            carrying new read types — the failure that stranded the workout read grant in build 50.
+            The request and `authorizationPromptAvailable()`'s status probe must both take the read
+            set from that ONE property, spelled out at the call. When they disagree,
+            `statusForAuthorizationRequest` silently answers for a request the app never makes, and
+            the #129 upgrade re-prompt — the only thing that can heal an install whose grant was
+            already destroyed — stops seeing what the request would ask for.
+
+            A local (`let read = ...` then `read: read`) is NOT acceptable here even when it happens
+            to hold the right value: it is the shape build 50 shipped, and it is invisible to this
+            audit. Pass the property.
             """)
     }
 }

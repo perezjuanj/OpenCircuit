@@ -985,17 +985,22 @@ struct ContentView: View {
     /// the `.sharingDenied` "not reaching Health" banner instead). Uses the existing `allTypes` set,
     /// which deliberately excludes the non-shareable correlation types (#121/#128) — no new auth-crash risk.
     ///
-    /// THIS IS ALSO THE HEAL FOR THE BUILD-50 WORKOUT PERMISSION LOOP. It carries newly-added READ
-    /// types too, now that `authorizationPromptAvailable()` probes the same read set the request
-    /// sends (`HealthKitWriter.authorizationReadTypes`) — Apple's status probe only answers for "the
-    /// same collections of types" (HKHealthStore.h), so a narrower probe could never see one. Two
-    /// cohorts land here on first foreground of the fixed build and are settled by ONE sheet:
-    ///   • a build-50 user left in the loop — workout SHARE was reset to `.notDetermined` (deduced
-    ///     in `authorizationReadTypes`), so the probe reports `.shouldRequest` and the sheet carries
-    ///     the workout write row AND the new workout read row together;
-    ///   • a build-49-or-earlier user who never opened the Activity tab — share is fully answered,
-    ///     but workout READ has never been requested, so the probe still reports `.shouldRequest`.
-    /// Expect exactly ONE extra Health sheet per existing install on the upgrade, then silence.
+    /// THIS IS ALSO THE HEAL FOR THE BUILD-50 WORKOUT PERMISSION LOOP, and it needed no new code:
+    /// that loop left `HKWorkoutType`/`HKSeriesType` SHARE back at `.notDetermined` (deduced in
+    /// `HealthKitWriter.authorizationReadTypes`), both are in `allTypes`, so the existing probe
+    /// already reports `.shouldRequest` and this re-asks for exactly those rows. What the branch
+    /// removed — the second, `toShare: []` request in `WorkoutHistoryReader` — is what could undo
+    /// the grant afterwards; with it gone, the answer sticks.
+    ///
+    /// NOBODY ELSE IS RE-PROMPTED. The read half was NOT widened (workouts are read from our own
+    /// source, which share permission already covers — Apple, `authorizationStatus(for:)`), so a
+    /// healthy existing install sees no sheet on this upgrade at all.
+    ///
+    /// ⚠️ UNVERIFIED ON DEVICE. That this fires once and then goes quiet is a code trace plus the
+    /// `.notDetermined` deduction, not an observation — `HKHealthStore` is not mockable and the
+    /// simulator reports every type `.notDetermined`. The falsifying check is step E of the lane's
+    /// device script: if a Health sheet returns on the SECOND cold launch after answering it, this
+    /// path is looping and the deduction is wrong.
     @MainActor
     private func reconcileNewlyAuthorizableShareTypes() async {
         guard await health.authorizationPromptAvailable() == true else { return }

@@ -149,6 +149,16 @@ final class HealthKitWriter {
     ///     (HKHealthStore.h). A denied type would therefore have reported `.unnecessary` and no
     ///     sheet would have appeared. This is why the heal in `reconcileNewlyAuthorizableShareTypes`
     ///     can reach these users at all.
+    ///   • 🟢 The wipe was SCOPED, not wholesale — on the same deduction, since that reconcile runs
+    ///     only inside `if healthAuthorized` (`isShareAuthorized`, probed on HEART RATE). Heart-rate
+    ///     share was therefore still granted while the workout rows were being re-asked for. (It
+    ///     rests on the sheet being UNPROMPTED at launch, which is how it was reported; a sheet the
+    ///     user summoned with the Connect button would not carry this.)
+    ///   • 🟡 Its exact scope is NOT explained by any evidence we have. Build 50's second request
+    ///     named `HKObjectType.workoutType()` and nothing else, yet Workout ROUTES — a type that
+    ///     request never mentioned — lost its write grant too. So "the named type's share bit is
+    ///     re-derived from the new (empty) `toShare`" is too narrow to fit, and "the app's whole
+    ///     request record is replaced" is too wide to fit. Do not write either down as the cause.
     ///   • 🟡 WHY HealthKit clears it: NOT documented by Apple and NOT claimed here. The header
     ///     documents only that a repeat request over already-answered types completes silently; it
     ///     says nothing about a request RESETTING one. Two corroborating third-party reports,
@@ -159,10 +169,24 @@ final class HealthKitWriter {
     ///     adding READ for `workoutType`/`workoutRoute` after WRITE was already granted left the
     ///     Health Data Access rows wrong, which the DTS engineer called "a HealthKit bug … I don't
     ///     see anything you can do from the app side to work around the issue" (thread/765556).
-    ///     Candidate mechanisms this evidence cannot separate: a per-type share bit re-derived from
-    ///     the new (empty) `toShare`; wholesale replacement of the app's request record. The fix
-    ///     does not depend on which — with one request, no type ever carries two disagreeing
-    ///     `toShare` memberships.
+    ///     The fix does not depend on the mechanism: with one request, no type ever carries two
+    ///     disagreeing `toShare` memberships in the first place.
+    ///
+    /// WHY WORKOUTS ARE NOT IN THIS SET, even though the Activity tab reads workouts back.
+    /// Apple, on `HKHealthStore.authorizationStatus(for:)`: "If your app is given share permission
+    /// but not read permission, you see only the data that your app has written to the store. Data
+    /// from other sources remains hidden." `WorkoutHistoryReader.recentWorkouts` queries with
+    /// `HKQuery.predicateForObjects(from: .default())` — OUR OWN source only, deliberately and
+    /// permanently (see that file's header) — so the workout SHARE grant this app has held since
+    /// #75 already covers it. Build 50's read request bought nothing; it only cost the write grant.
+    /// Asking for workout READ is also not free: it would put a fresh HealthKit sheet in front of
+    /// EVERY existing install on upgrade, and it is the exact operation of thread/765556 above.
+    /// If a card ever needs OTHER apps' workouts, that is when to add the read — and it is added
+    /// HERE, to this one set, never in a request of its own.
+    ///
+    /// `HKSeriesType` — the GPS workout route — is excluded for that reason and one more: nothing
+    /// reads a route back at all. `WorkoutSessionManager` inserts routes
+    /// (`HKWorkoutRouteBuilder.insertRouteData`) and no query in this app names the type.
     ///
     /// BOTH `requestAuthorization()` AND `authorizationPromptAvailable()` MUST PASS THIS SET. Apple
     /// documents `getRequestStatusForAuthorizationToShareTypes:readTypes:` as reporting whether the
@@ -170,20 +194,22 @@ final class HealthKitWriter {
     /// requestAuthorizationToShareTypes:readTypes:" (HKHealthStore.h). A probe over a narrower read
     /// set answers a different question than the request it guards — and the #129 upgrade re-prompt
     /// is built entirely on that probe, so a drift there is what silently strands a new type.
+    ///
+    /// Aligning the probe to this set prompts NOBODY new, and that follows from the derivation, not
+    /// from optimism: this set is `allTypes` minus the two workout types, so it can only be stale for
+    /// a user whose SHARE half is stale too — and that user's probe already reported `.shouldRequest`
+    /// off the share half alone. The derivation has held since `97a7803`, and the one `allTypes`
+    /// growth since (`.headache`, `7deb02f`) went out through this same single request.
     var authorizationReadTypes: Set<HKObjectType> {
         // Read sleepAnalysis so the iOS Sleep-schedule window (HealthKitSleepSchedule) works the
         // moment the HealthKit entitlement is enabled — no further auth change needed.
         var read: Set<HKObjectType> = [HKCategoryType(.sleepAnalysis)]
         for type in allTypes {
-            // `HKSeriesType` — the GPS workout route — stays WRITE-ONLY, and NOT for safety: it is a
-            // plain `HKSampleType` (HealthKit/HKObjectType.h) and is perfectly readable. It is
-            // excluded because nothing in this app reads a route back. `WorkoutSessionManager`
-            // inserts routes (`HKWorkoutRouteBuilder.insertRouteData`) and `WorkoutHistoryReader`
-            // queries `HKWorkoutType` only, so asking for route READ would request an access this
-            // build never exercises. `HKWorkoutType` itself IS read (that is the Activity-tab card)
-            // — and it is a plain `HKSampleType` too, already carried in the stricter `toShare`
-            // half, so it is nowhere near the correlation / Apple-computed class of #110 / #121.
-            if type is HKSeriesType { continue }
+            // Workouts and the GPS route series stay WRITE-ONLY, and NOT for safety — both are plain
+            // `HKSampleType`s (HealthKit/HKObjectType.h) and both are readable. They are excluded
+            // because share permission already covers reading back our OWN samples, which is all
+            // this app ever reads. See the note above for Apple's wording and the cost of asking.
+            if type is HKWorkoutType || type is HKSeriesType { continue }
             read.insert(type)
         }
         return read
@@ -290,14 +316,17 @@ final class HealthKitWriter {
     /// status unknown (the entitlement-stripped sideload case) — treat as promptable so the
     /// tap path can throw and surface `healthUnavailable` as before. A new shareable type
     /// added in an update flips this back to `true` (the sheet re-appears for the new types
-    /// only), so the prompt path self-heals across upgrades. A newly-added READ type does the same,
-    /// which is what carries the workout-read grant to already-authorized users on upgrade.
+    /// only), so the prompt path self-heals across upgrades. That is also what heals a device left
+    /// in the build-50 workout loop: its `HKWorkoutType`/`HKSeriesType` SHARE status is back to
+    /// `.notDetermined`, both are in `allTypes`, so this reports `.shouldRequest` and #129 re-asks.
     ///
     /// The two sets passed here MUST stay the two sets `requestAuthorization()` passes — Apple
     /// defines this probe as "whether the user would be prompted if the SAME collections of types
     /// are passed to requestAuthorization" (HKHealthStore.h). Until this build the read half was
-    /// `[sleepAnalysis]` while the request sent a much larger set, so a type added to the request's
-    /// read half was invisible here and the #129 upgrade re-prompt could never carry it.
+    /// `[sleepAnalysis]` while the request sent a much larger set, so this probe was answering for a
+    /// request the app never makes, and a type added to the request's read half would have been
+    /// invisible to the #129 upgrade re-prompt. Aligning them adds no prompt for anyone — see
+    /// `authorizationReadTypes`.
     func authorizationPromptAvailable() async -> Bool? {
         guard Self.isAvailable else { return false }
         guard let status = try? await store.statusForAuthorizationRequest(toShare: allTypes,
@@ -992,8 +1021,8 @@ final class HealthKitWriter {
     /// never anything about whether the user gets headaches.
     ///
     /// Read authorization needs no separate change: `requestAuthorization()` already builds its
-    /// `read` set from `allTypes` (minus the write-only route series type), so `.headache` joining
-    /// `allTypes` puts it in BOTH halves of the request, and Info.plist already carries
+    /// `read` set from `allTypes` (minus the write-only workout + route types), so `.headache`
+    /// joining `allTypes` puts it in BOTH halves of the request, and Info.plist already carries
     /// NSHealthShareUsageDescription for the existing reads. Users who already authorized are
     /// re-prompted because a newly-added shareable type flips `authorizationPromptAvailable()` back
     /// to `true` (see its note).
@@ -1039,7 +1068,11 @@ final class HealthKitWriter {
     /// this branch — see `authorizationReadTypes`. A new type belongs in `allTypes` (to write) or in
     /// `authorizationReadTypes` (to read), never in a request of its own.
     func requestAuthorization() async throws {
-        let read = authorizationReadTypes
+        // `authorizationReadTypes` is passed BY NAME at every call site here and in
+        // `authorizationPromptAvailable()` — never bound to a local first. A local is how the probe
+        // and the request drifted apart before this build, and `HealthKitAuthorizationSurfaceTests`
+        // pins the by-name form precisely because a local named `read` walks past a text audit.
+        //
         // Every type in `allTypes` is deliberately third-party-WRITABLE (that's why `.temperature`
         // maps to `.bodyTemperature`, not the read-only `.appleSleepingWristTemperature`) —
         // an unshareable type here would poison the whole request. Defensive isolation: if the
@@ -1048,11 +1081,11 @@ final class HealthKitWriter {
         // access for every metric. (A genuinely non-shareable Apple-computed type raises an Obj-C
         // NSInvalidArgumentException this can't catch — which is exactly why we never list one.)
         do {
-            try await store.requestAuthorization(toShare: allTypes, read: read)
+            try await store.requestAuthorization(toShare: allTypes, read: authorizationReadTypes)
         } catch {
             var writable = allTypes
             if let temp = Self.quantityType(for: .temperature) { writable.remove(temp) }
-            try await store.requestAuthorization(toShare: writable, read: read)
+            try await store.requestAuthorization(toShare: writable, read: authorizationReadTypes)
         }
     }
 

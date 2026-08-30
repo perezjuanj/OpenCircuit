@@ -42,25 +42,28 @@ struct WorkoutHistoryReader {
         var duration: TimeInterval { end.timeIntervalSince(start) }
     }
 
-    // READ AUTHORIZATION — deliberately NOT requested here.
+    // READ AUTHORIZATION — NOT REQUESTED, AND NOT NEEDED.
     //
-    // Build 50 asked for it here, in its own `requestAuthorization(toShare: [], read:
+    // Apple, on `HKHealthStore.authorizationStatus(for:)`: "If your app is given share permission
+    // but not read permission, you see only the data that your app has written to the store. Data
+    // from other sources remains hidden." This query is `predicateForObjects(from: .default())` —
+    // our own source only, by design (see the SCOPE note in the file header) — so the workout SHARE
+    // grant the app has held since #75 is already sufficient. Read authorization would widen this
+    // to OTHER apps' workouts, which this card deliberately does not show.
+    //
+    // Build 50 asked for it anyway, in its own `requestAuthorization(toShare: [], read:
     // [HKObjectType.workoutType()])`, while `HealthKitWriter`'s request kept naming that same
     // workout type in `toShare` only. On device that left the user in a permission loop with no
     // settled state: grant Workouts + Workout Routes WRITE at launch → open this tab → the read
-    // prompt appears → the write grant is gone → next launch asks for write again. The full
-    // evidence, and what is and is not established about the HealthKit mechanism, is on
-    // `HealthKitWriter.authorizationReadTypes`.
-    //
-    // `HKObjectType.workoutType()` now rides the app's SINGLE authorization request: it is in
-    // `HealthKitWriter.allTypes` (share) and in `HealthKitWriter.authorizationReadTypes` (read), so
-    // one sheet settles both halves. Already-authorized users pick the read half up through
-    // `ContentView.reconcileNewlyAuthorizableShareTypes()` (#129), which re-runs the one request
-    // while `statusForAuthorizationRequest` still reports it as needed.
+    // prompt appears → the write grant is gone → next launch asks for write again. It bought
+    // nothing and cost the grant. The full evidence, and what is and is not established about the
+    // HealthKit mechanism, is on `HealthKitWriter.authorizationReadTypes`.
     //
     // ⚠️ DO NOT ADD A REQUEST HERE. A HealthKit read without authorization does not error — it
-    // returns an empty result — so if this card is ever empty on a device that has workouts, the
-    // fix is in that single request, never a second one.
+    // returns an empty result — so if this card is ever empty on a device that has OpenCircuit
+    // workouts, the cause is the SHARE grant (Health ▸ Data Access ▸ OpenCircuit ▸ Workouts), or
+    // the write path, never a missing read. If a future card must show other apps' workouts, add
+    // `HKWorkoutType` to `HealthKitWriter.authorizationReadTypes` — the app's one read set.
 
     /// The most recent workouts OpenCircuit itself wrote, newest first. Returns `[]` on any failure
     /// (unavailable / denied / query error) — an empty list is honest here, and the card says
