@@ -292,9 +292,11 @@ public enum ExportEngine {
         public let osa: OSARow?
         public let coverage: ExportCoverage.Assessment?
         /// THE SAME RECORDS, MEASURED AGAINST A WAKE THE RECORDING DID NOT DEFINE — or the reason
-        /// there was no such wake. `coverage` above closes its window on the last record, so a night
-        /// truncated BY the missing data cannot see the hole and reports ~1.0 with no gaps; this is
-        /// the falsifiable companion. Read `ExportReferenceCoverage` before quoting either.
+        /// there was no such wake. On a night nobody corrected, `coverage` above closes its window
+        /// on the last record, so a night truncated BY the missing data cannot see the hole and
+        /// reports ~1.0 with no gaps; this is the falsifiable companion. (A CORRECTED night's
+        /// `coverage` already closes on the wearer's own wake and can fall on its own.) Read
+        /// `ExportReferenceCoverage` before quoting either.
         ///
         /// nil only when `coverage` itself is nil — there is nothing to compare against.
         public let referenceCoverage: ExportReferenceCoverage.Outcome?
@@ -768,11 +770,12 @@ public enum ExportEngine {
     /// and mirror `sleepCSV`'s existing `%.4f` efficiency / `%.2f` choices.
     ///
     /// ⚠️ `coverageFraction` KEEPS ITS COLUMN NAME AND ITS INDEX (21), and the JSON carries the
-    /// honest name (`coverageWithinDetectedWindow`) as an ADDITIONAL key rather than a rename. This
+    /// honest name (`coverageWithinReportedWindow`) as an ADDITIONAL key rather than a rename. This
     /// file's compatibility rule is that a shipped key keeps working, the exports are files people
     /// have already been handed, and the schema version is not bumped for this change — so the four
-    /// `referenceWake*` columns below are APPENDED and nothing existing moves. `notes["coverage"]`
-    /// is where a reader is told what the old name actually means.
+    /// new columns below (`durationBasis` plus the three reference-wake ones) are APPENDED and
+    /// nothing existing moves. `notes["coverage"]` is where a reader is told what the old name
+    /// actually means.
     public static func sleepSessionsCSV(_ rows: [SleepSessionRow]) -> String {
         var lines = ["sessionID,night,inBedStart,inBedEnd,sleepOnset,sleepWake,isManuallyEdited,asleepMin,deepMin,lightMin,remMin,awakeMin,efficiency,sleepScore,stressScore,hypnogramSegments,osaAvgSpO2,osaMinSpO2,osaTimeBelow90Sec,osaODI,osaValidWindows,coverageFraction,expectedSamples,observedSamples,longestGapSeconds,bedtimeVerdict,bedtimeGapSeconds,wakeVerdict,wakeGapSeconds,confidenceReasons,durationBasis,referenceWakeSource,referenceWakeAt,coverageToReferenceWake"]
         for r in rows {
@@ -1119,14 +1122,17 @@ public enum ExportEngine {
                         "expectedSamples": cov.expectedSamples,
                         "observedSamples": cov.observedSamples,
                         "coverageFraction": cov.coverageFraction,
-                        // THE SAME NUMBER UNDER THE NAME THAT SAYS WHAT IT MEASURES. `windowEnd` is
-                        // the last record, so this fraction is structurally incapable of falling
-                        // because the recording stopped at the wake — it is coverage WITHIN the
-                        // detected window, not coverage of the night. Both keys are emitted: this
-                        // export's schema version is unchanged and the files are already in
-                        // third-party hands, so dropping the old name would break a reader silently.
+                        // THE SAME NUMBER UNDER THE NAME THAT SAYS WHAT IT MEASURES. The window is
+                        // the night's REPORTED in-bed window, and on a night nobody corrected that
+                        // window's right edge IS the last record — so on those nights this fraction
+                        // is structurally incapable of falling because the recording stopped at the
+                        // wake. It is coverage WITHIN the reported window, not coverage of the
+                        // night. (On a CORRECTED night the right edge is the wearer's own wake, so
+                        // it can and does fall — see the note.) Both keys are emitted: this export's
+                        // schema version is unchanged and the files are already in third-party
+                        // hands, so dropping the old name would break a reader silently.
                         // `referenceCoverage` beside it is the falsifiable measurement.
-                        "coverageWithinDetectedWindow": cov.coverageFraction,
+                        "coverageWithinReportedWindow": cov.coverageFraction,
                         "longestGapSeconds": cov.longestGapSeconds,
                         "gaps": cov.gaps.map { gap in [
                             "start": offsetISO8601(gap.start),
@@ -1143,10 +1149,10 @@ public enum ExportEngine {
                     obj["referenceCoverage"] = [
                         "reference": ref.reference.rawValue,
                         "referenceEnd": offsetISO8601(ref.referenceEnd),
-                        // Signed. Negative means the reference closed EARLIER than the detected
+                        // Signed. Negative means the reference closed EARLIER than the reported
                         // window, so `coverageToReference` is measured over a shorter span and is
                         // not comparable with `coverage.coverageFraction`.
-                        "beyondDetectedEndSeconds": ref.beyondDetectedEndSeconds,
+                        "beyondReportedEndSeconds": ref.beyondReportedEndSeconds,
                         "windowStart": offsetISO8601(a.windowStart),
                         "windowEnd": offsetISO8601(a.windowEnd),
                         "expectedSamples": a.expectedSamples,
@@ -1319,12 +1325,12 @@ public enum ExportEngine {
         }
         map["coverageFraction"] = "fraction"
         // Same number as `coverageFraction`, under the name that states its frame of reference.
-        map["coverageWithinDetectedWindow"] = "fraction"
+        map["coverageWithinReportedWindow"] = "fraction"
         // `sleepSessions[].referenceCoverage` — the CSV column and the JSON key differ here, so both
         // are listed, exactly as the `osa*` pairs above are.
         map["coverageToReference"] = "fraction"
         map["coverageToReferenceWake"] = "fraction"
-        map["beyondDetectedEndSeconds"] = "s"
+        map["beyondReportedEndSeconds"] = "s"
         map["longestGapSeconds"] = "s"
         // `sleepSessions[].edgeProvenance` — the CSV column names and the JSON keys are the same
         // strings here, so there is nothing to keep in sync.
@@ -1403,12 +1409,16 @@ public enum ExportEngine {
             "own cursor, not the ring. Neither witness can invent data: every counted instant is " +
             "a record or a sample actually on disk. Nights older than the archive's retention are " +
             "carried by the store witness alone, exactly as before. READ ITS NAME AS " +
-            "coverageWithinDetectedWindow, which is emitted beside it in JSON and is the same " +
-            "number: the window's right edge IS the last record, so no amount of missing data at " +
-            "the wake can lower this fraction. A night whose recording stopped four hours before " +
-            "the wearer got up reports 1.0000 with an empty gaps list, and that is the arithmetic " +
-            "working as written, not a clean night. referenceCoverage is the falsifiable companion; " +
-            "the old key is kept because this file's schema version is unchanged.",
+            "coverageWithinReportedWindow, which is emitted beside it in JSON and is the same " +
+            "number: the window is the night's REPORTED in-bed window (windowStart/windowEnd say " +
+            "which). On a night the wearer never corrected, that window's right edge IS the last " +
+            "record, so no amount of missing data at the wake can lower this fraction: a night " +
+            "whose recording stopped four hours before the wearer got up reports 1.0000 with an " +
+            "empty gaps list, and that is the arithmetic working as written, not a clean night. On " +
+            "a night the wearer DID correct (isManuallyEdited true) the right edge is her own wake " +
+            "instead, so a trailing hole is inside the window and this fraction does fall — a low " +
+            "value there is real. referenceCoverage is the falsifiable companion for the nights " +
+            "nobody corrected; the old key is kept because this file's schema version is unchanged.",
         "referenceCoverage":
             "referenceCoverage measures the SAME records over a window whose right edge came from " +
             "somewhere the recording had no vote in — today the wake time in the wearer's own " +
@@ -1416,10 +1426,13 @@ public enum ExportEngine {
             "denominator a trailing data hole can actually show up in. It is a REFERENCE and not a " +
             "truth: a scheduled wake is when the wearer intends to get up, so a night they slept " +
             "in or rose early scores low for a reason that is about the schedule, not the ring — " +
-            "compare beyondDetectedEndSeconds (signed: negative means the reference closed EARLIER " +
-            "than the detected window, so coverageToReference is over a shorter span and is not " +
-            "comparable with coverageFraction). Nothing in the app is gated on it. When the wearer " +
-            "has set no schedule the block is still emitted, with reference = null and an " +
+            "compare beyondReportedEndSeconds (signed: negative means the reference closed EARLIER " +
+            "than the reported window, so coverageToReference is over a shorter span and is not " +
+            "comparable with coverageFraction). Nothing in the app is gated on it. It never reaches " +
+            "past the moment the file was written: when the schedule wake has not arrived yet the " +
+            "window is closed at exportedAt instead and reference says manualScheduleWakeSoFar, " +
+            "because measuring to a wake in the future would report the future as a hole. When the " +
+            "wearer has set no schedule the block is still emitted, with reference = null and an " +
             "unavailableReason, because no denominator is invented in its place and a missing key " +
             "would be indistinguishable from an older export. Only the right edge is moved: a " +
             "schedule also names a bedtime, but a wearer who went to bed late would then be " +

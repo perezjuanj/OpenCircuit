@@ -782,7 +782,8 @@ struct SleepCardView: View {
     /// The clamp is load-bearing, not defensive tidiness: the displayed totals come from the stored
     /// minute COLUMNS while the split comes from the stored TIMELINE, and the two are written by
     /// different code paths. Without it a disagreement between them could hatch more of a bar than
-    /// the bar contains, or print "236m of 200m". Clamping can only ever UNDER-state the asserted
+    /// the bar contains, or print more asserted minutes for a stage than the legend shows for it —
+    /// a caveat that contradicts its own headline. Clamping can only ever UNDER-state the asserted
     /// share, which is the safe direction for a caveat about our own honesty.
     private func assertedMinutes(_ night: Night,
                                  _ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int))
@@ -1337,8 +1338,11 @@ struct SleepCardView: View {
     /// Proportional Deep/Light/REM/Awake bar, driven by the night's stage minutes.
     ///
     /// ⚠️ THE ASSERTED SHARE IS HATCHED, AND IT IS NOT SUBTRACTED. On an edited night part of a
-    /// stage's minutes is the wearer's own account over ground the ring never recorded — 236 of a
-    /// "Light 286m" on the 2026-08-26 tester night — and the bar drew it as solid Light, i.e. gave
+    /// stage's minutes is the wearer's own account over ground the ring never recorded — on the
+    /// committed `R2_2026-08-18` tester fixture the app stored 329 Light minutes of which only 88
+    /// are measured, so 241 of that bar is her account (`SleepProvenanceTesterNightTests`
+    /// `.testPerStageMinutesExcludeTheInventedBlock` / `.testTheAssertedLightIsTheHatchedShare`) —
+    /// and the bar drew all 329 as solid Light, i.e. gave
     /// fabricated fill a stage name and the ring's authority. Clause 1 of the provenance rule says
     /// an assertion WINS FOR DISPLAY, so the minutes stay (removing them would contradict the
     /// headline, and the build-47 withholding was shipped and then deliberately reversed — see
@@ -1438,7 +1442,10 @@ struct SleepCardView: View {
         }
     }
 
-    /// "Hatched: 236m Light · 35m Awake — your own account of time the ring recorded nothing across."
+    /// Reads, on a night with an asserted Light and Awake share:
+    /// "Hatched: <n>m Light · <n>m Awake — your own account of time the ring recorded nothing
+    /// across." The minutes are whatever `assertedMinutes` resolved for the night on screen; no
+    /// example is quoted here, because a number in a comment is read as a measurement.
     ///
     /// Names the stages and their minutes rather than one lump total, because the defect is that a
     /// STAGE NAME was applied to fabricated fill; a bare "3h 56m asserted" would leave the reader to

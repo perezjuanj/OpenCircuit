@@ -582,14 +582,24 @@ enum ExportBuilder {
         var coverage: ExportCoverage.Assessment?
         // THE FALSIFIABLE COMPANION TO `coverage`, and the reason it had to exist.
         //
-        // `coverage` below is measured over `[inBedStart, inBedEnd]` — and `inBedEnd` IS the last
-        // record, because `SleepStaging` builds the night out of the epochs it was handed. So a
-        // night that ends early BECAUSE the recording stopped has its own denominator shortened by
-        // exactly the thing it should be reporting: the hole is always outside the window, the gaps
-        // list is empty, and the fraction pins at ~1.0. The comment on `edgeProvenance` below has
-        // said this in words since it was written (0.976–1.049 on 21 of 21 corpus nights, "vacuous
-        // by construction"), and the 2026-08-26 tester investigation is the same fact from the
-        // wearer's end: `coverageFraction 1.0000, gaps: []` on a night missing its last hours.
+        // `coverage` below is measured over `[inBedStart, inBedEnd]`, which are the EDIT-AWARE
+        // (`sleepEditCurrent*`) edges — so the shape of the defect depends on whether the wearer
+        // corrected the night, and the scope was overstated in review before it was narrowed here:
+        //
+        //   • NOT CORRECTED (the overwhelming majority, and every corpus night): `inBedEnd` IS the
+        //     last record, because `SleepStaging` builds the night out of the epochs it was handed.
+        //     A night that ends early BECAUSE the recording stopped has its own denominator
+        //     shortened by exactly the thing it should be reporting: the hole is always outside the
+        //     window, the gaps list is empty, and the fraction pins at ~1.0. The comment on
+        //     `edgeProvenance` below has said this in words since it was written (0.976–1.049 on 21
+        //     of 21 corpus nights, "vacuous by construction").
+        //   • CORRECTED: `inBedEnd` is the wearer's own wake, which the recording had no vote in, so
+        //     the hole is already inside the window and the fraction already falls. The committed
+        //     `R2_2026-08-18` fixture is one of these and its real export carries
+        //     `appCoverageFraction 0.377` — while the SAME records over that night's detected window
+        //     score 1.0000 with no gaps (`SleepProvenanceTesterNightTests`
+        //     `.testCoverageInTheDetectedWindowCannotSeeTheFourHourHole`). A wearer who never opens
+        //     the editor only ever sees the second number.
         //
         // `referenceCoverage` re-measures the SAME witness over a window closed at a wake the
         // recording had no vote in. It is emitted even when there is no such wake — carrying the
@@ -621,31 +631,44 @@ enum ExportBuilder {
             // Fetched out to whichever edge is LATER so one query serves both measurements. This
             // cannot move `coverage`: `ExportCoverage.assess` discards every instant outside the
             // window it is given, and `ExportCoverageWitness` filters the archive to the same
-            // window — so the detected-window number is byte-identical to before the reference
+            // window — so the reported-window number is byte-identical to before the reference
             // measurement existed. Bounded exactly as before: one indexed range fetch per night.
-            let referenceWake = scheduleWake(end)
+            //
+            // ⚠️ AND THE REFERENCE NEVER REACHES PAST `now`. A schedule wake is a time of day, so on
+            // the freshest night in the file it can easily lie in the FUTURE — export at 05:00 with a
+            // 06:30 schedule and the window would run 90 minutes past the present. No recording can
+            // exist for time that has not happened, so `ExportCoverage.assess` would count those
+            // epochs as expected-but-missing and publish a hole the export's own clock manufactured,
+            // on exactly the row a triager reads first. Clamped to `now` and SAID so in `reference`
+            // (`manualScheduleWakeSoFar`), so the number still falls for a hole that has already
+            // opened and can never report one that has not — and no reader is left comparing a
+            // published `referenceEnd` against a schedule it no longer equals.
+            let scheduledWake = scheduleWake(end)
+            let bounded = ExportReferenceCoverage.reference(forScheduledWake: scheduledWake,
+                                                           asOf: now)
             let hr = (try? store.samples(kind: .heartRate,
                                          from: start,
-                                         to: max(end, referenceWake ?? end))) ?? []
+                                         to: max(end, bounded?.end ?? end))) ?? []
             let storedTimes = hr.map(\.start)
             let witness = ExportCoverageWitness.sampleTimes(
                 archives: archives, storedHeartRateTimes: storedTimes, from: start, to: end)
             coverage = ExportCoverage.assess(sampleTimes: witness, from: start, to: end)
 
-            if let wake = referenceWake,
+            if let bounded,
                let reference = ExportReferenceCoverage.assess(
                    sampleTimes: ExportCoverageWitness.sampleTimes(
                        archives: archives, storedHeartRateTimes: storedTimes,
-                       from: start, to: wake),
-                   detectedStart: start, detectedEnd: end,
-                   referenceEnd: wake, reference: .manualScheduleWake) {
+                       from: start, to: bounded.end),
+                   reportedStart: start, reportedEnd: end,
+                   referenceEnd: bounded.end, reference: bounded.reference) {
                 referenceCoverage = .measured(reference)
             } else {
                 // Two distinct answers, kept distinct: no schedule at all, versus a schedule that
-                // resolved to a wake at or before this night's start (a shift worker's window, or a
-                // degenerate bed == wake setting). Neither is filled in with a guess.
+                // resolved to a wake at or before this night's start (a shift worker's window, a
+                // degenerate bed == wake setting, or a night whose bedtime is itself already past
+                // `now` once the clamp above applies). Neither is filled in with a guess.
                 referenceCoverage = .unavailable(
-                    reason: referenceWake == nil
+                    reason: scheduledWake == nil
                         ? ExportReferenceCoverage.Outcome.noManualSleepSchedule
                         : ExportReferenceCoverage.Outcome.referenceNotAfterBedtime)
             }

@@ -1,10 +1,12 @@
 // THE THREE EXPORT CLAIMS WE COULD NOT SUPPORT, AND THE ASSERTIONS THAT KEEP THEM SUPPORTED.
 //
 // Each block below pins one defect from the 2026-08-26 tester investigation:
-//   1. `coverageFraction` is measured over a window whose right edge IS the last record, so it is
-//      STRUCTURALLY incapable of falling when the recording stops at the wake. Proven here by
-//      construction rather than argued: the same records score 1.0000/no-gaps against the detected
-//      window and well under 1 against a wake the recording did not define.
+//   1. `coverageFraction` is measured over the night's REPORTED in-bed window — and on a night the
+//      wearer never corrected, that window's right edge IS the last record, so it is STRUCTURALLY
+//      incapable of falling when the recording stops at the wake. Proven here by construction rather
+//      than argued: the same records score 1.0000/no-gaps against that window and well under 1
+//      against a wake the recording did not define. (A CORRECTED night's window already closes on
+//      the wearer's own wake and can fall on its own — see `ExportReferenceCoverage`.)
 //   2. `edgeProvenance` mixed two frames of reference — recorded-window coverage against post-edit
 //      totals — with nothing in the file saying which. `durationBasis` now says.
 //   3. `measuredAwakeSec` counted a wearer's own awake label over recorded ground as a measurement.
@@ -53,7 +55,7 @@ final class ExportHonestyTests: XCTestCase {
         // The wearer's schedule says she gets up at +600 min. Nothing about that instant came from
         // the recording, which is the only property that makes the next number able to fall.
         let reference = try XCTUnwrap(ExportReferenceCoverage.assess(
-            sampleTimes: witness, detectedStart: detectedStart, detectedEnd: detectedEnd,
+            sampleTimes: witness, reportedStart: detectedStart, reportedEnd: detectedEnd,
             referenceEnd: at(600), reference: .manualScheduleWake))
 
         XCTAssertEqual(reference.assessment.coverageFraction, 360.0 / 600.0, accuracy: 0.01,
@@ -61,7 +63,7 @@ final class ExportHonestyTests: XCTestCase {
         XCTAssertEqual(reference.assessment.gaps.count, 1)
         XCTAssertEqual(reference.assessment.gaps.first?.seconds ?? 0, 240 * 60, accuracy: 150,
                        "the hole the detected window could not see, now inside the window")
-        XCTAssertEqual(reference.beyondDetectedEndSeconds, 240 * 60, accuracy: 1e-9)
+        XCTAssertEqual(reference.beyondReportedEndSeconds, 240 * 60, accuracy: 1e-9)
         XCTAssertLessThan(reference.assessment.coverageFraction, detected.coverageFraction,
                           "the whole point: one of these two numbers can be wrong")
     }
@@ -72,11 +74,11 @@ final class ExportHonestyTests: XCTestCase {
         let start = at(0)
         let wake = at(480)
         let reference = try XCTUnwrap(ExportReferenceCoverage.assess(
-            sampleTimes: epochs(from: start, to: wake), detectedStart: start, detectedEnd: wake,
+            sampleTimes: epochs(from: start, to: wake), reportedStart: start, reportedEnd: wake,
             referenceEnd: wake, reference: .manualScheduleWake))
         XCTAssertEqual(reference.assessment.coverageFraction, 1.0, accuracy: 1e-9)
         XCTAssertTrue(reference.assessment.gaps.isEmpty)
-        XCTAssertEqual(reference.beyondDetectedEndSeconds, 0, accuracy: 1e-9)
+        XCTAssertEqual(reference.beyondReportedEndSeconds, 0, accuracy: 1e-9)
     }
 
     func testAReferenceEarlierThanTheDetectedEndIsStillPublishedWithANegativeDelta() throws {
@@ -87,17 +89,62 @@ final class ExportHonestyTests: XCTestCase {
         let detectedEnd = at(480)
         let reference = try XCTUnwrap(ExportReferenceCoverage.assess(
             sampleTimes: epochs(from: start, to: detectedEnd),
-            detectedStart: start, detectedEnd: detectedEnd,
+            reportedStart: start, reportedEnd: detectedEnd,
             referenceEnd: at(400), reference: .manualScheduleWake))
-        XCTAssertEqual(reference.beyondDetectedEndSeconds, -80 * 60, accuracy: 1e-9)
+        XCTAssertEqual(reference.beyondReportedEndSeconds, -80 * 60, accuracy: 1e-9)
     }
 
     func testAReferenceAtOrBeforeTheBedtimeIsRefusedRatherThanMeasuredAsZero() {
         // A non-positive window has no denominator, and 0 would read as a total outage.
         XCTAssertNil(ExportReferenceCoverage.assess(
             sampleTimes: epochs(from: at(0), to: at(60)),
-            detectedStart: at(0), detectedEnd: at(60),
+            reportedStart: at(0), reportedEnd: at(60),
             referenceEnd: at(0), reference: .manualScheduleWake))
+    }
+
+    // MARK: - 1a. The reference never reaches past the present
+
+    func testAScheduleWakeThatHasNotArrivedIsClampedToNowAndSaysSo() {
+        // Export at 05:00 against an 06:30 schedule. Measuring to 06:30 would count 90 minutes no
+        // recording could exist for as expected-but-missing — a hole made by the export's clock, on
+        // the freshest night in the file.
+        let now = at(300)
+        let bounded = ExportReferenceCoverage.reference(forScheduledWake: at(390), asOf: now)
+        XCTAssertEqual(bounded?.end, now, "the window closes at the export instant, not the wake")
+        XCTAssertEqual(bounded?.reference, .manualScheduleWakeSoFar,
+                       "and the token says which of the two it is")
+    }
+
+    func testAScheduleWakeAlreadyPastIsUsedUnchanged() {
+        let bounded = ExportReferenceCoverage.reference(forScheduledWake: at(390), asOf: at(600))
+        XCTAssertEqual(bounded?.end, at(390))
+        XCTAssertEqual(bounded?.reference, .manualScheduleWake)
+    }
+
+    func testNoScheduleYieldsNoReferenceRatherThanNow() {
+        XCTAssertNil(ExportReferenceCoverage.reference(forScheduledWake: nil, asOf: at(600)),
+                     "`now` is not a wake anybody named — it must not become the denominator")
+    }
+
+    func testTheClampedReferenceStillSeesAHoleThatHasAlreadyOpened() throws {
+        // The clamp must bound the number, not blunt it: the recording stopped at +120, the export
+        // runs at +300, the schedule says +600. The three hours already missing are inside the
+        // window; the five that have not happened are not.
+        let start = at(0)
+        let witness = epochs(from: start, to: at(120))
+        let bounded = try XCTUnwrap(ExportReferenceCoverage.reference(forScheduledWake: at(600),
+                                                                     asOf: at(300)))
+        let reference = try XCTUnwrap(ExportReferenceCoverage.assess(
+            sampleTimes: witness, reportedStart: start, reportedEnd: at(120),
+            referenceEnd: bounded.end, reference: bounded.reference))
+        XCTAssertEqual(reference.assessment.windowEnd, at(300), "and never a minute past it")
+        XCTAssertEqual(reference.assessment.coverageFraction, 120.0 / 300.0, accuracy: 0.01)
+        XCTAssertEqual(reference.beyondReportedEndSeconds, 180 * 60, accuracy: 1e-9)
+        let toTheUnclampedWake = ExportCoverage.assess(sampleTimes: witness, from: start, to: at(600))
+        XCTAssertGreaterThan(reference.assessment.coverageFraction,
+                             toTheUnclampedWake.coverageFraction,
+                             "measuring to the un-arrived wake would have understated it further, "
+                             + "and every second of that extra shortfall is time that has not happened")
     }
 
     // MARK: - 1b. Both names, and the explicit "could not check"
@@ -109,7 +156,7 @@ final class ExportHonestyTests: XCTestCase {
         guard let block = obj["coverage"] as? [String: Any] else {
             return XCTFail("coverage block missing")
         }
-        XCTAssertEqual(block["coverageWithinDetectedWindow"] as? Double,
+        XCTAssertEqual(block["coverageWithinReportedWindow"] as? Double,
                        block["coverageFraction"] as? Double,
                        "same number, and the second name is the one that states its frame")
         XCTAssertNotNil(block["coverageFraction"],
@@ -143,7 +190,7 @@ final class ExportHonestyTests: XCTestCase {
                                             referenceCoverage: .unavailable(reason: "x"))), "none")
         let measured = try XCTUnwrap(ExportReferenceCoverage.assess(
             sampleTimes: epochs(from: at(0), to: at(360)),
-            detectedStart: at(0), detectedEnd: at(360),
+            reportedStart: at(0), reportedEnd: at(360),
             referenceEnd: at(600), reference: .manualScheduleWake))
         XCTAssertEqual(sourceColumn(session(coverage: coverage,
                                             referenceCoverage: .measured(measured))),
@@ -283,7 +330,7 @@ final class ExportHonestyTests: XCTestCase {
 
     func testTheNotesNameEveryClaimThisFilePins() {
         let notes = json(session())["notes"] as? [String: String]
-        XCTAssertTrue(notes?["coverage"]?.contains("coverageWithinDetectedWindow") == true)
+        XCTAssertTrue(notes?["coverage"]?.contains("coverageWithinReportedWindow") == true)
         XCTAssertTrue(notes?["referenceCoverage"]?.contains("manualScheduleWake") == true)
         XCTAssertTrue(notes?["referenceCoverage"]?.contains("REFERENCE and not a") == true,
                       "it must not be presented as ground truth")
