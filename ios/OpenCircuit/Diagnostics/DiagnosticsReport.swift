@@ -162,11 +162,17 @@ enum DiagnosticsReport {
         // Kept in its OWN section with its own budget on purpose: these fire ~2-3× per drain and
         // ~20 drains a day, so folding them into the scheduling whitelist above would evict the
         // bgschedule/bgtask lines that answer a different question.
-        let drainSources: Set<String> = ["history-drain", "history-orphan", "archive-repair"]
+        //
+        // `osa` rides along here for the same reason the others do: `RingSession` persists it
+        // (unlike os_log, which no tester bundle carries) precisely so a reader can tell last
+        // night's burst from a re-dump of an older one by its cursor — and then nothing printed it,
+        // which is the exact defect this section was created to fix. It is a burst decode rather
+        // than a drain, hence the heading names both.
+        let drainSources: Set<String> = ["history-drain", "history-orphan", "archive-repair", "osa"]
         let drainLog = observability.metricRecords()
             .filter { drainSources.contains($0.source) }
             .sorted { $0.date > $1.date }
-        s.append("# History drains (latest \(min(drainLog.count, 40)) of \(drainLog.count))")
+        s.append("# History drains & burst decodes (latest \(min(drainLog.count, 40)) of \(drainLog.count))")
         if drainLog.isEmpty { s.append("  (no drain events recorded)") }
         for r in drainLog.prefix(40) {
             s.append("  \(t(r.date))  \(r.source)  \(r.detail)")

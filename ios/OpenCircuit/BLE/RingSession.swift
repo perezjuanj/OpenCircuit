@@ -4154,9 +4154,9 @@ final class RingSession: NSObject {
         // "this drain added fewer records than the ring had" into an attributable cause.
         // `4d`/`sport` are the sport channel's ONLY evidence: it streams no 0x4c and no 0x47, so
         // without them every sport drain read `outcome=empty added=0` in the one place a tester's
-        // bundle surfaces drains (`DiagnosticsReport`'s "# History drains" section reads these
-        // `history-drain` rows verbatim). `added` is a `bulkRecords` delta and is structurally 0 on
-        // the sport channel — do not read it as "the sport drain pulled nothing".
+        // bundle surfaces drains (`DiagnosticsReport`'s "# History drains & burst decodes" section
+        // reads these `history-drain` rows verbatim). `added` is a `bulkRecords` delta and is
+        // STRUCTURALLY 0 on the sport channel — do not read it as "the sport drain pulled nothing".
         observability.recordMetricEvent(
             source: "history-drain",
             detail: "trigger=\(historySyncTrigger) label=\(trace.label) outcome=\(outcome) ack=\(trace.sawSyncAck) 4c=\(trace.page4CCount) 4cBad=\(corruptPage4CCount) 47=\(trace.page47Count) 4d=\(trace.page4DCount ?? 0) sport=\(trace.sportSampleCount ?? 0) 50=\(trace.endMarkerCount) added=\(trace.recordsAdded)"
