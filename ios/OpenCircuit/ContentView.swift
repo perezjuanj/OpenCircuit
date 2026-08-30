@@ -744,7 +744,8 @@ struct ContentView: View {
         // recovered workout can only ever be as long as, or shorter than, the real one.
         text += " That end time is when the app last saw the workout running, so it may be short."
         if recovered.hrSampleCount > 0 {
-            text += " Its \(recovered.hrSampleCount) heart-rate readings were lost with the app, so only the time"
+            let n = recovered.hrSampleCount
+            text += " Its \(n) heart-rate reading\(n == 1 ? " was" : "s were") lost with the app, so only the time"
             text += recovered.activeKcal != nil ? " and an estimated calorie total" : ""
             text += " can be saved."
         } else {
@@ -1550,6 +1551,18 @@ struct ContentView: View {
             // Re-query Health so a workout the user just finished appears in the list below. The
             // sheet closing no longer ends anything — see the ownership note on `workoutManager`.
             workoutHistoryToken += 1
+            // A TERMINAL state must not outlive the sheet that displayed it. The summary and the
+            // error screen are cleared by their own "Done"/"Dismiss" buttons, which is all a
+            // per-sheet `@State` manager ever needed — it was rebuilt on the next presentation.
+            // Now that the manager lives for the app's lifetime, swiping the summary away instead
+            // of tapping Done would strand `recordingState` on `.finished` forever: re-opening the
+            // workout card would show the PREVIOUS workout's summary and there would be no way to
+            // reach the sport picker. Reset only `.finished`/`.error` — never `.starting`,
+            // `.active` or `.finishing`, which is the whole point of the ownership move.
+            switch workoutManager.recordingState {
+            case .finished, .error: workoutManager.reset()
+            default: break
+            }
         }) {
             WorkoutView(session: session, manager: workoutManager)
         }

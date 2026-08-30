@@ -886,7 +886,18 @@ final class WorkoutSessionManager: NSObject {
         // Credit the daily estimate ONLY when the active-energy sample actually landed in Health
         // (see `energySampleWritten` above) — otherwise netting would subtract energy Health never
         // received, permanently under-counting the day.
-        if energySampleWritten, let kcal = summary.estimatedActiveKcal, kcal > 0 {
+        //
+        // …and only for a workout that ended TODAY. `recordWorkoutActiveKcal` is a SINGLE day-keyed
+        // slot (`hk.workoutActiveKcal.day`/`.kcal` in HealthKitWriter): crediting a past day rewrites
+        // that slot's date and drops whatever was banked for today, so `workoutActiveKcalCredited`
+        // then returns 0 and today's daily active-energy estimate stops netting a workout it already
+        // wrote — the same double-count the credit exists to prevent. Crediting a past day buys
+        // nothing anyway: that day's estimate was written when it was current and is not recomputed.
+        // Only two callers can reach `writeWorkout` with a past `endDate` — `saveRecoveredWorkout`
+        // (a crash orphan recovered the next morning) and `importDetectedWorkout` — and a live
+        // session always ends now, so this leaves the live path byte-identical.
+        if energySampleWritten, let kcal = summary.estimatedActiveKcal, kcal > 0,
+           Calendar.current.isDateInToday(summary.endDate) {
             HealthKitWriter.recordWorkoutActiveKcal(kcal, day: summary.endDate)
         }
 

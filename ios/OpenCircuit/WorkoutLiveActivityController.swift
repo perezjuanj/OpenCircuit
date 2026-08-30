@@ -89,10 +89,12 @@ final class WorkoutLiveActivityController {
     ///
     /// ⚠️ THIS USED TO DESTROY THE LAST EVIDENCE OF THE WORKOUT. Ending the activity was the app's
     /// entire response to a crash mid-workout, so the session — and everything the user had
-    /// recorded — went with it, silently (tester report 2026-08-29, build 49). It is safe now only
-    /// because a running session persists a `WorkoutSessionSnapshot` as it goes and `ContentView`'s
-    /// launch task offers that workout back BEFORE anything is cleaned up. Do not add a snapshot
-    /// teardown here: this runs at every launch, including ones that must still recover.
+    /// recorded — went with it, silently (tester report 2026-08-29, build 49). It is safe now
+    /// because the evidence no longer lives in the Live Activity: a running session persists a
+    /// `WorkoutSessionSnapshot` as it goes, and this function touches ActivityKit ONLY. Nothing
+    /// here reads or clears that snapshot, so `ContentView`'s recovery offer is unaffected however
+    /// the two launch tasks happen to interleave. Do not add a snapshot teardown here — this runs
+    /// at every launch, including the ones that must still recover.
     static func endOrphanedActivitiesAtLaunch() {
         Task {
             for activity in ActivityKit.Activity<WorkoutActivityAttributes>.activities {
