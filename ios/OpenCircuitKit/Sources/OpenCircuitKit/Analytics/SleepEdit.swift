@@ -33,7 +33,12 @@ public enum SleepEdit {
     /// (ring-derived) onset + wake so the original data always bounds the edit.
     public struct Bounds: Equatable, Sendable {
         public let earliest: Date   // recorded onset − `strandedEditMargin` (≥ the ±3 h floor)
-        public let latest: Date     // recorded wake  + `strandedEditMargin` (≥ the ±3 h floor)
+        /// `max(recorded wake + strandedEditMargin, recorded onset − editMargin + maxNightSpan,
+        /// existingEdit.upperBound)` — the second term is the truncation ceiling, which binds only on
+        /// a night whose recorded span is under 5 h. Note what is NOT in that list: since the
+        /// truncation ceiling landed, `dataCoverage` cannot move this edge at all. It still moves
+        /// `earliest`. See `bounds`.
+        public let latest: Date
         public init(earliest: Date, latest: Date) {
             self.earliest = earliest
             self.latest = latest
@@ -96,11 +101,24 @@ public enum SleepEdit {
     ///
     /// That is precisely the behaviour worth removing. "Correct your night, but only after the ring
     /// has finished catching up, and we will not tell you when that is" is not a rule anyone can
-    /// follow — she wrote in twice instead. The stranded margin does not make the ceiling constant
-    /// (coverage still raises it as the day goes on, and should — it is what rescued her on 08-17
-    /// and 08-18); it makes her real wake REACHABLE AT EVERY HOUR, which is the property she
-    /// experiences. `testHerRealWakeIsReachableAtEveryHourSheMightEdit` is that claim, and an
-    /// earlier draft asserting a single constant ceiling failed against the real function.
+    /// follow — she wrote in twice instead. The stranded margin ALONE did not make the ceiling
+    /// constant (coverage still raised it as the day went on, and should have — it is what rescued
+    /// her on 08-17 and 08-18); what it bought was her real wake being REACHABLE AT EVERY HOUR, which
+    /// is the property she experiences. `testHerRealWakeIsReachableAtEveryHourSheMightEdit` is that
+    /// claim, and an earlier draft asserting a single constant ceiling failed against the real
+    /// function.
+    ///
+    /// ⚠️ 2026-08-27 — THAT PARENTHESIS IS NOW OUT OF DATE: THE CEILING *IS* CONSTANT. The truncation
+    /// ceiling at the bottom of this function grants `floorEarliest + maxNightSpan` outright, and
+    /// that is precisely the value the coverage widening was already clipped to, so
+    /// `max(recordedWake + strandedEditMargin, floorEarliest + maxNightSpan)` swallows every coverage
+    /// term. `latest` is therefore a pure function of the recorded night (plus `existingEdit`):
+    /// `dataCoverage` can no longer raise it, lower it, or make it depend on the hour. Nobody loses
+    /// reach — since coverage was clipped to the same cap, the new edge is ≥ the shipped one for
+    /// EVERY archive state (`testTheLateEdgeIsTheSameAtEveryStateOfTheArchive`). The coverage CAP
+    /// below is NOT dead code and must not be "cleaned up": delete it and a far-reaching archive
+    /// pushes `latest` past one night again (`testLateEdgeIsCappedAtOneNightSpan`). `dataCoverage`
+    /// still widens `earliest`, which this change does not touch.
     ///
     /// When the recording dies, the truth IS in open space, and the only evidence that exists is the
     /// wearer's. So `strandedEditMargin` is offered on both edges unconditionally — the editor no
@@ -228,6 +246,85 @@ public enum SleepEdit {
         // already says the rule belongs. A far single edge is not a long window; only the pair is.
         earliest = min(earliest, recordedOnset.addingTimeInterval(-strandedEditMargin))
         latest = max(latest, recordedWake.addingTimeInterval(strandedEditMargin))
+        // THE TRUNCATION CEILING — the same argument as the stranded margin above, but aimed at the
+        // ANCHOR rather than at the caps, because moving the margin after the caps fixed only half
+        // of it.
+        //
+        // 🟢 REPORTED 2026-08-27, Gen 2 tester, verbatim: "this morning it again said I only slept
+        // for less than 2h and then when I tried to edit it manually it had a limit on how late I
+        // could set the wake up time." No export was sent, so nothing here is fitted to her night
+        // and nothing here claims to be. The defect is visible without one, in the arithmetic.
+        //
+        // Every term above anchors the ceiling on `recordedWake`. That is the number the wearer
+        // opened the sheet to CORRECT. When staging truncates a night, `recordedWake` moves earlier
+        // by the size of the truncation — and so, one-for-one, does the ceiling. Sweeping the
+        // recorded wake backwards on the shipped function walks the ceiling back with it in exact
+        // lockstep: 30 minutes of extra truncation costs the wearer 30 minutes of reach, every step,
+        // all the way down. 🟢 RE-MEASURED BY ADVERSARIAL REVIEW 2026-08-30, by copying this branch's
+        // `SleepEditTruncatedCeilingTests` verbatim onto master f3afc88 and running it there:
+        // 11 tests, 38 failures, of which 19 are `testTheCeilingHasAFloorTheTruncationCannotMove`
+        // alone — one per 15-minute step, from a 4 h 45 m recorded night down to a 15 m one, i.e.
+        // every step below the 5 h crossover and no step above it. (An earlier draft of this comment
+        // cited a test name that never landed and a count of 17; both are corrected here.) The editor
+        // is tightest
+        // exactly where detection is worst, which is the same thing
+        // this file already says three paragraphs up about the SPAN — and it is just as wrong about
+        // the ANCHOR. A wearer only opens this sheet when the recorded night is wrong; deriving her
+        // allowance from it is circular.
+        //
+        // So the ceiling also gets an anchor a wake-side truncation cannot move: the recorded ONSET.
+        // The rule reads — a night may be asserted to end at most ONE PLAUSIBLE NIGHT after the
+        // earliest bedtime the ±3 h parity rule itself would accept.
+        //
+        // NO NEW CONSTANT, AND NOT EVEN A NEW EXPRESSION (N1). `floorEarliest + maxNightSpan` is
+        // character-for-character the cap the late edge already applies to `dataCoverage` twelve
+        // lines up. All that changes is its role: it was only ever a CEILING on what coverage could
+        // buy, and it is now also a FLOOR that is granted outright. 🟢 The shipped function already
+        // hands this exact value to wearers who wait long enough — the 2026-08-22 note above records
+        // master saturating her ceiling at 11:16:51, which is her 00:16 onset − 3 h + 14 h to the
+        // second. This does not invent an allowance; it removes the race that decided WHETHER she
+        // got it, the same correction the stranded margin made to the floor.
+        //
+        // SCOPE, MEASURED ON THIS FUNCTION: the term is dominated by `recordedWake + 6 h` for any
+        // recorded span of 5 h or more (`maxNightSpan − editMargin − strandedEditMargin`), so every
+        // night that was already reachable is byte-identical. It binds only on nights the recording
+        // demonstrably cut short, which is the population that cannot currently be corrected.
+        //
+        // THE SIDE EFFECT WORTH KNOWING ABOUT, because it silently retires a lever: this term makes
+        // the late edge INDEPENDENT OF `dataCoverage`. Every coverage path above is clipped to
+        // `floorEarliest + maxNightSpan`, which is exactly what is granted here, so
+        // `latest == max(recordedWake + strandedEditMargin, floorEarliest + maxNightSpan)` for every
+        // archive state — strictly ≥ what coverage used to buy, never less
+        // (`testTheLateEdgeIsTheSameAtEveryStateOfTheArchive`). The coverage clipping above is what
+        // keeps that equality true; it is load-bearing, not leftovers.
+        //
+        // WHAT STILL BOUNDS THE PAIRED WINDOW is `validate`'s `.tooLong` rule, exactly as this file
+        // already argues: a far single edge is not a long window; only the pair is. A 20-hour
+        // "night" built out of these bounds is refused (`testATwentyHourNightIsStillRejected`), and
+        // `testLateEdgeIsCappedAtOneNightSpan` still pins that coverage cannot push the late edge
+        // past this same value.
+        //
+        // ⚠️ THE ONE PROPERTY THIS TERM DOES NOT HAVE, STATED PLAINLY. It is anchored on the recorded
+        // onset, so a later fuller staging that pulls that onset EARLIER lowers it — `bounds` is not
+        // monotone under `widenRecorded` in the way it is monotone under coverage growth. That is
+        // unavoidable rather than sloppy: "more headroom when less was recorded" is by definition a
+        // decreasing function of the recorded span, and `widenRecorded` grows the span. It is also
+        // semantically right — learning the night began earlier makes a late wake less plausible,
+        // not more. What makes it harmless is that it can never fall below the two floors underneath
+        // it: `recordedWake + strandedEditMargin`, which is master's whole ceiling, and the
+        // already-saved `existingEdit` applied below. So a re-opened sheet can never offer less than
+        // the shipped build offered, and can never strand a wearer's own saved times
+        // (`testAnOnsetWideningCannotStrandASavedEdit`).
+        //
+        // THE EXACT SHAPE, PINNED SO IT CANNOT GET WORSE UNNOTICED: recorded 00:00 → 01:00 gives a
+        // ceiling of 11:00; a fuller staging that moves the recorded ONSET back to 22:00 (wake
+        // unchanged) gives 09:00 — a 2 h drop, still 2 h above the `recordedWake + 6 h` = 07:00 floor.
+        // `testAFullerStagingLowersTheCeilingButNeverBelowTheFloors` is that measurement. Note this
+        // direction of coupling is NOT new: master's coverage cap reads `floorEarliest` too, so an
+        // onset that moves earlier already lowered a coverage-widened ceiling. What is new is that it
+        // now applies with no coverage at all — which is why `widenRecorded`'s "re-opening can only
+        // ever offer MORE" line has been corrected rather than left standing.
+        latest = max(latest, floorEarliest.addingTimeInterval(maxNightSpan))
         // A night the user has ALREADY edited must always remain fully selectable. Deliberately
         // outside the caps above.
         if let existing = existingEdit {
@@ -271,8 +368,21 @@ public enum SleepEdit {
     ///
     /// The recorded anchors describe WHAT THE RING RECORDED, not what the user asserted — updating
     /// them from a fuller staging contradicts nothing the user edited. Widening is OUTWARD-ONLY
-    /// (min start / max end), so the editable floor derived from them is monotone: re-opening the
-    /// sheet can only ever offer MORE, never invalidate a previously offered time.
+    /// (min start / max end), so every part of `bounds` that an anchor drives from its OWN side is
+    /// monotone: the ±3 h parity margins and the 6 h stranded margins can only ever move outward.
+    ///
+    /// ⚠️ THE EDITABLE WINDOW AS A WHOLE IS NOT MONOTONE UNDER THIS, and the one-line claim that used
+    /// to sit here ("re-opening the sheet can only ever offer MORE, never invalidate a previously
+    /// offered time") was already false when it was written — corrected 2026-08-27 by adversarial
+    /// review. `bounds` derives its LATE edge partly from the EARLY anchor: on master through the
+    /// coverage cap `floorEarliest + maxNightSpan`, and now also through the truncation ceiling,
+    /// which grants that same value outright. Moving the recorded ONSET earlier therefore lowers that
+    /// term — recorded 00:00 → 01:00 offers a ceiling of 11:00, and a fuller staging with onset 22:00
+    /// offers 09:00 (`SleepEditTruncatedCeilingTests.testAFullerStagingLowersTheCeilingButNeverBelowTheFloors`).
+    /// What IS guaranteed, and tested, are the floors underneath: `recordedWake + strandedEditMargin`
+    /// (which outward widening only ever raises) and the user's own `existingEdit`, so a saved edit
+    /// can never be stranded (`testAnOnsetWideningCannotStrandASavedEdit`). The 2026-08-16 defect this
+    /// function exists for — a frozen anchor pinning the sheet forever — is unaffected either way.
     ///
     /// Returns nil when there is nothing to do: the incoming staging has no known window, or
     /// widening changes nothing. The caller persists only on non-nil.

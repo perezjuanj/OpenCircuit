@@ -103,13 +103,27 @@ final class SleepEditInvariantTests: XCTestCase {
                                         at(o).addingTimeInterval(-SleepEdit.strandedEditMargin),
                                         "no coverage was supplied, so nothing may reach past the "
                                         + "stranded margin on the edge's own anchor")
-            XCTAssertLessThanOrEqual(b.latest, at(wk).addingTimeInterval(SleepEdit.strandedEditMargin),
-                                     "ditto on the late edge")
-            _ = span
+            // ⚠️ RE-BASELINED 2026-08-27. The late edge used to be pinned at `wake + 6 h` and
+            // nothing else. That is the ceiling the 2026-08-27 report is about ("a limit on how late
+            // I could set the wake up time" on a night reported as under 2 h): anchored solely on
+            // `recordedWake`, it moved earlier by exactly the size of the truncation, so the sweep
+            // case `(1, 1.5)` below — a 30-MINUTE recorded night — was pinned to a ceiling 6 h after
+            // a wake that never happened. The late edge now also carries the truncation ceiling
+            // `floorEarliest + maxNightSpan` (see `SleepEdit.bounds` and
+            // `SleepEditTruncatedCeilingTests`), which binds only when the recorded span is under
+            // 5 h. Both regimes keep an EXACT expected value below, so the rule still cannot drift.
+            XCTAssertLessThanOrEqual(b.latest,
+                                     max(at(wk).addingTimeInterval(SleepEdit.strandedEditMargin),
+                                         floorEarliest.addingTimeInterval(span)),
+                                     "no coverage was supplied, so the late edge may reach the "
+                                     + "stranded margin or the truncation ceiling, and nothing more")
 
-            // The exact rule, spelled out: the parity floor, widened by the stranded margin.
+            // The exact rule, spelled out: the parity floor, widened by the stranded margin, and —
+            // on the late edge only — by one plausible night after the parity bedtime.
             let wantEarliest = min(floorEarliest, at(o).addingTimeInterval(-SleepEdit.strandedEditMargin))
-            let wantLatest = max(floorLatest, at(wk).addingTimeInterval(SleepEdit.strandedEditMargin))
+            let wantLatest = max(floorLatest,
+                                 max(at(wk).addingTimeInterval(SleepEdit.strandedEditMargin),
+                                     floorEarliest.addingTimeInterval(span)))
             XCTAssertEqual(b.earliest.timeIntervalSince1970, wantEarliest.timeIntervalSince1970,
                            accuracy: 0.1)
             XCTAssertEqual(b.latest.timeIntervalSince1970, wantLatest.timeIntervalSince1970,
