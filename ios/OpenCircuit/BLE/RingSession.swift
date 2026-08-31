@@ -930,6 +930,8 @@ final class RingSession: NSObject {
         bankUnattributedRecords(restage: false)   // teardown — keep it cheap; next session re-stages
         monitorTask?.cancel(); monitorTask = nil
         keepaliveTask?.cancel(); keepaliveTask = nil
+        vibrationBurstTask?.cancel(); vibrationBurstTask = nil
+        alarmWarmUpTask?.cancel(); alarmWarmUpTask = nil; endAlarmWarmUpAssertion()
         autoMeasureTask?.cancel(); autoMeasureTask = nil
         postSyncStatusTask?.cancel(); postSyncStatusTask = nil
         streamWatchdogTask?.cancel(); streamWatchdogTask = nil
@@ -1180,6 +1182,7 @@ final class RingSession: NSObject {
                 // Re-resolve the night window (self-throttled to ≤ every 30 min) so the cadence
                 // tightens/relaxes as the window rolls over, not just at connect.
                 await self.refreshNightWindowIfNeeded()
+                self.checkRingAlarm()
                 if self.ready, !self.monitoring, !self.livePreparing, self.syncTask == nil, !self.calibrationCapturing {
                     self.maybeRequestDeviceStatusRefresh(reason: "idle keepalive")
                     // Connected+idle: either drain the ring's 0x4c history on a cadence
@@ -2774,6 +2777,174 @@ final class RingSession: NSObject {
     func setAirplaneModeOn() {
         write(Command.airplaneModeOn)
     }
+
+    // MARK: - Vibration motor (Gen 3)
+    //
+    // 🟢 `0b 03 <pattern> 64 00`, 12/12 buzzes across four frames on a tester's Gen 3 (FR05.011).
+    // Full provenance in OpenCircuitKit/RingVibration.swift and docs/PROTOCOL.md §5.9.
+
+    /// Whether this ring has a motor we can drive. Gen 3 only, and false until the DIS
+    /// firmware-revision read lands — the settings UI hides the feature rather than offering a
+    /// button that would do nothing.
+    var supportsVibration: Bool { RingVibration.isSupported(firmwareInfo.generation) }
+
+    /// Why the last vibration attempt did not reach the ring, or nil if it did. Kept so the
+    /// settings screen can say what happened instead of leaving a silent ring unexplained.
+    private(set) var lastVibrationBlock: RingAlarmBlock?
+
+    /// Buzz the ring once.
+    ///
+    /// Returns false WITHOUT writing when the ring can't take the command; `lastVibrationBlock`
+    /// says which condition stopped it. The idle guards are the same one-writer discipline every
+    /// other command on this link observes (a stray write during a history drain or a native sport
+    /// session is how this project has lost data before) — a caller that cares should retry rather
+    /// than force its way past them.
+    ///
+    /// ⚠️ `true` means the bytes reached CoreBluetooth. The ring's `8b 00 8b` reply confirms the
+    /// frame was accepted, not that the motor ran and not that anyone felt it. There is no
+    /// delivery receipt.
+    @discardableResult
+    func vibrate(_ pattern: VibrationPattern) -> Bool {
+        guard supportsVibration else { lastVibrationBlock = .ringUnsupported; return false }
+        guard ready, notifySubscribed else { lastVibrationBlock = .linkNotReady; return false }
+        guard syncTask == nil, !syncing, !monitoring, !livePreparing,
+              !workoutHolding, !calibrationCapturing else {
+            lastVibrationBlock = .ringBusy
+            return false
+        }
+        // A ring in the charging case can buzz, but nobody is wearing it — treat a docked ring as
+        // a block so an alarm keeps retrying (and eventually reports a miss) instead of silently
+        // vibrating an empty case and marking the job done.
+        if charging { lastVibrationBlock = .ringOnCharger; return false }
+        guard write(Command.vibrate(pattern)) else { lastVibrationBlock = .linkNotReady; return false }
+        lastVibrationBlock = nil
+        ringLog.notice("vibrate: pattern 0x\(String(format: "%02x", pattern.rawValue), privacy: .public) (0b 03 xx 64 00)")
+        return true
+    }
+
+    /// Buzz `count` times, `spacing` seconds apart, for an alarm that has to survive being slept
+    /// through. Returns false if the FIRST buzz was blocked (nothing was sent and the caller should
+    /// retry); once the first one lands the rest are best-effort — a link that drops mid-burst
+    /// stops the burst rather than queueing writes at a ring that isn't there.
+    @discardableResult
+    func vibrateBurst(_ pattern: VibrationPattern, count: Int, spacing: TimeInterval) -> Bool {
+        guard vibrate(pattern) else { return false }
+        guard count > 1 else { return true }
+        vibrationBurstTask?.cancel()
+        vibrationBurstTask = Task { [weak self] in
+            for _ in 1..<count {
+                try? await Task.sleep(for: .seconds(spacing))
+                guard let self, !Task.isCancelled else { return }
+                guard self.vibrate(pattern) else { return }
+            }
+        }
+        return true
+    }
+
+    /// Give the wake-up alarm a chance to fire.
+    ///
+    /// Called from every place this app reliably has runtime — the keepalive tick and the two
+    /// frame handlers that double as background wake slots (`0x10`/`0x87` descriptors and the
+    /// `0x11` heartbeat). That spread IS the mechanism: iOS gives us no timer that survives
+    /// suspension, so the alarm rides on whatever moments the ring's own traffic buys us, and the
+    /// controller decides whether the moment is inside the alarm's grace window. Cheap and
+    /// idempotent by design — one occurrence fires once no matter how many times this is called.
+    private func checkRingAlarm() {
+        RingAlarmController.shared.evaluate(session: self)
+        maybeWarmUpForAlarm()
+    }
+
+    /// Hold the BLE link open across the alarm time so the buzz lands in seconds, not on the
+    /// ring's next spontaneous beat.
+    ///
+    /// ══ THE MECHANISM, AND WHY IT IS NOT A HACK ══
+    ///
+    /// A suspended app cannot start a write — but this app already proves a request/response chain
+    /// keeps itself alive while suspended: the overnight history drain runs to completion because
+    /// its own `0x4c` page acks keep renewing the wake window (see `maybeDrainOnBackgroundWake`).
+    /// The alarm uses the identical trick with a cheaper payload. We still need the ring to hand us
+    /// ONE opening inside the warm-up window to start from — it offers one about every 2.5 min —
+    /// and from there each `0xD0` reply buys the next slice, with a background-task assertion
+    /// covering the gaps exactly as `performHistoryDrain` does.
+    ///
+    /// ⚠️ `0xD0` statusQuery is chosen deliberately, and nothing louder may be substituted here.
+    /// It keeps the link warm WITHOUT walking the ring's history resume pointer — which is why the
+    /// overnight keepalive already sends it instead of `0x07` inside the sleep window. A warm-up
+    /// firing at 06:55 sits squarely in the tail of the night, and a `0x07` fetch there would
+    /// contend the single resume pointer and risk the very data loss #111/#119 were about. This
+    /// sends the same frame the night keepalive sends, only for a few minutes and more often.
+    private func maybeWarmUpForAlarm() {
+        guard alarmWarmUpTask == nil else { return }
+        guard let target = RingAlarmController.shared.warmUpTarget() else { return }
+        // One-writer discipline: never take the link from a drain, a live read, or a workout. A
+        // warm-up that can't start now simply retries on the next wake — it is an optimisation,
+        // and the alarm still fires without it.
+        guard ready, notifySubscribed, syncTask == nil, !syncing, !monitoring,
+              !livePreparing, !workoutHolding, !calibrationCapturing else { return }
+
+        beginAlarmWarmUpAssertion()
+        ringLog.notice("alarm warm-up: holding the link until \(target, privacy: .public)")
+        alarmWarmUpTask = Task { [weak self] in
+            defer {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.alarmWarmUpTask = nil
+                    self.endAlarmWarmUpAssertion()
+                }
+            }
+            while !Task.isCancelled {
+                guard let self else { return }
+                // Stop the moment the alarm is dealt with — fired, or written off as missed.
+                if RingAlarmController.shared.isHandled(target) { return }
+                // Or if it stopped being the pending alarm at all (the user edited or disabled it).
+                guard RingAlarmController.shared.warmUpTarget() == target
+                        || Date() >= target else { return }
+                // Hard cap past the alarm time. A buzz blocked at T-0 (ring docked, link busy) stays
+                // unhandled for the whole 15-minute grace window, and polling every 8 s for all of it
+                // to chase an alarm that is already failing is not worth the radio — ordinary wake
+                // slots keep retrying it for free. iOS would reclaim the assertion long before this
+                // in the background; the cap is what bounds the FOREGROUND case.
+                guard Date() < target.addingTimeInterval(Self.alarmWarmUpTailSeconds) else { return }
+                // Yield to anything that needs the link more than an optimisation does.
+                guard self.ready, self.syncTask == nil, !self.syncing, !self.monitoring,
+                      !self.livePreparing, !self.workoutHolding, !self.calibrationCapturing else { return }
+                self.write(Command.statusQuery)     // D0 00 00 — warm, and does NOT walk the pointer
+                RingAlarmController.shared.evaluate(session: self)
+                try? await Task.sleep(for: .seconds(Self.alarmWarmUpPollSeconds))
+            }
+        }
+    }
+
+    /// Poll spacing during the warm-up. This is the alarm's worst-case lateness once a warm-up is
+    /// running, so it is short — and cheap: a handful of 3-byte frames per minute, for a few
+    /// minutes, once a day.
+    private static let alarmWarmUpPollSeconds: TimeInterval = 8
+
+    /// How long past the alarm time the warm-up keeps polling before giving the link back.
+    private static let alarmWarmUpTailSeconds: TimeInterval = 120
+
+    private func beginAlarmWarmUpAssertion() {
+        endAlarmWarmUpAssertion()
+        alarmWarmUpAssertion = UIApplication.shared.beginBackgroundTask(withName: "ring.alarm.warmup") {
+            [weak self] in
+            MainActor.assumeIsolated {
+                self?.alarmWarmUpTask?.cancel()
+                self?.endAlarmWarmUpAssertion()
+            }
+        }
+    }
+
+    private func endAlarmWarmUpAssertion() {
+        guard alarmWarmUpAssertion != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(alarmWarmUpAssertion)
+        alarmWarmUpAssertion = .invalid
+    }
+
+    /// The in-flight multi-buzz burst, so a new alarm (or `invalidate()`) can cancel a stale one.
+    private var vibrationBurstTask: Task<Void, Never>?
+    /// The in-flight pre-alarm link hold, and the background-task assertion covering its gaps.
+    private var alarmWarmUpTask: Task<Void, Never>?
+    private var alarmWarmUpAssertion: UIBackgroundTaskIdentifier = .invalid
 
     /// Arm (or disarm) an overnight OSA sleep-apnea assessment (#91). `05 22 01` tells the ring to
     /// record the dense `0x48` PPG overnight; it buffers it store-and-forward and our morning sync's
@@ -4700,6 +4871,7 @@ extension RingSession: CBPeripheralDelegate {
             // overnight-quiet preserved). (#daytime-bg-drain)
             if let op = bytes.first, op == 0x10 || op == 0x87 {
                 self.maybeDrainOnBackgroundWake(trigger: "descriptor-wake")
+                self.checkRingAlarm()
             }
             // Bulk history pages: accumulate + ack to continue draining (47→c7, 4c→cc).
             switch bytes.first {
@@ -4825,6 +4997,7 @@ extension RingSession: CBPeripheralDelegate {
                 // This heartbeat is the app's steady background wake source — use it (#119):
                 // previously it was spent ack-only, so a suspended app never drained all day.
                 self.maybeDrainOnBackgroundWake(trigger: "0x11-wake")
+                self.checkRingAlarm()
                 return
             case 0x13:
                 if self.calibrationCapturing {

@@ -878,6 +878,11 @@ struct HealthNotificationCenter {
         let request = UNNotificationRequest(identifier: "alerts.health.\(n.rawValue)",
                                             content: content, trigger: nil)
         try? await center.add(request)
+        // Optional companion haptic on a Gen 3 ring's motor. Placed HERE, at the one site every
+        // reminder and health alert already funnels through, so it inherits quiet hours, the
+        // anti-spam backoff and each family's own toggle rather than re-deriving them — it can
+        // only add a buzz to a notification that was already going out.
+        await MainActor.run { RingAlarmController.shared.buzzForAlert() }
     }
 
     // MARK: Copy

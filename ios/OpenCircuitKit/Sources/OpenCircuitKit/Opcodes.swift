@@ -79,6 +79,23 @@ public enum Command {
     /// there is no "off" command). `08 04 00` → resp `88 00 88`.
     public static let airplaneModeOn: [UInt8] = [0x08, 0x04, 0x00]
 
+    // MARK: Vibration motor (Gen 3) — see RingVibration.swift for the full provenance
+    //
+    // 🟢 CONFIRMED, 12/12 buzzes across four frames on a tester's Gen 3 (FR05.011), each result
+    // reported blind by the wearer. Recovered from an HCI capture, NOT from the APK — the opcode
+    // does not appear in a decompile, so don't go mining for it.
+    //
+    // `0b 03 <pattern> 64 00` → resp `8b 00 8b`. `[2]` selects the pattern (0x01 short-short-long,
+    // 0x02 one long buzz). `[3]` is MEASURED INERT — tested at 0x64/0x32/0x0a and the wearer felt
+    // no difference in strength or pattern — so it is pinned to the official app's 0x64 rather
+    // than exposed as an "intensity" we know does nothing.
+    //
+    // ⚠️ The `8b 00 8b` reply means the frame was ACCEPTED, not that the motor ran or that anyone
+    // felt it. There is no delivery receipt and no stop command.
+    public static func vibrate(_ pattern: VibrationPattern) -> [UInt8] {
+        [0x0B, 0x03, pattern.rawValue, RingVibration.intensityByte, 0x00]
+    }
+
     /// Arm an overnight OSA (sleep-apnea) assessment (#91, 🟢 captured 2026-07-08). One write; the
     /// ring then records the dense `0x48` PPG through the night (persistent — survives disconnects)
     /// and dumps it store-and-forward on the morning sync. Same `05 2x` detection-control family as

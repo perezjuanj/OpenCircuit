@@ -53,6 +53,17 @@ struct OpenCircuitApp: App {
         // `earliestBeginDate` toward the coming morning as bedtime nears
         // (`BackgroundSyncPolicy.aimedFireDate`).
         .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                // Foreground is the one moment we're certain of runtime: give the wake-up alarm a
+                // chance (someone who opens the app at 07:02 for a 07:00 alarm still inside the
+                // grace window should get their buzz), and re-place the OS-scheduled backup alert
+                // so a reinstall, a restore, or a revoked notification permission can't quietly
+                // leave the guaranteed half of the alarm unarmed. Both are no-ops when the alarm
+                // is off. (`RingAlarmController`)
+                RingAlarmController.shared.evaluate(session: RingScanner.shared.session)
+                RingAlarmController.shared.refreshBackupNotification()
+                return
+            }
             guard phase == .background else { return }
             let scheduler = BackgroundRefreshScheduler()
             scheduler.schedule()

@@ -92,6 +92,20 @@ struct DeviceInfoView: View {
                     Label("Find My Ring", systemImage: "wave.3.right")
                 }
                 .disabled(session?.ready != true)
+                // Vibration + wake-up alarm (Gen 3 only). The motor command is 🟢 confirmed on a
+                // Gen 3 (FR05.011) and has never been sent to any other model, so the row is hidden
+                // rather than shown-and-disabled elsewhere: we don't know whether a Gen 2 would
+                // ignore `0x0b`, buzz, or fault, and a control whose behaviour is unknown is worse
+                // than one that isn't there. Fails CLOSED — `generation` is `.unknown` until the DIS
+                // firmware read lands, so the row appears a moment after connecting.
+                if RingVibration.isSupported(info.generation) {
+                    NavigationLink {
+                        RingVibrationView(session: session)
+                    } label: {
+                        Label("Vibration & alarm", systemImage: "alarm.waves.left.and.right")
+                    }
+                    .disabled(session?.ready != true)
+                }
                 Button(role: .destructive) {
                     showAirplaneConfirm = true
                 } label: {
@@ -102,7 +116,11 @@ struct DeviceInfoView: View {
                 Text("Ring actions")
             } footer: {
                 Text("Find My Ring shows how close the ring is over Bluetooth and can flash its LED so "
-                     + "you can locate it. Airplane mode turns off the ring's Bluetooth to save power — "
+                     + "you can locate it. "
+                     + (RingVibration.isSupported(info.generation)
+                        ? "Vibration & alarm sets a silent wake-up buzz on the ring's motor. "
+                        : "")
+                     + "Airplane mode turns off the ring's Bluetooth to save power — "
                      + "the ring reconnects only after you put it back in the charging case (there's no "
                      + "way to turn it back on over Bluetooth).")
             }

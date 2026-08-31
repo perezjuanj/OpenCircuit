@@ -11,6 +11,12 @@ Confidence legend: 🟢 confirmed (reproduced) · 🟡 probable · 🔴 guess / 
 measurement (`0x95` poll loop), and a bulk history/PPG download. Pin observations
 below to this FW until re-confirmed on another version.
 
+**Gen 3 reference capture (§5.9/§5.10):** iPhone `idevicebtlogger` snoop, FW **FR05.011**,
+RingConn app **4.3.1**, 2026-08-27. 20 943 HCI packets / 1 962 ATT events over 14 m 44 s, driven
+by `docs/RUNBOOK_GEN3_BP_HAPTIC.md` §4.2 (vibration test taps, workout, HR + SpO2 spot
+measurements, 3 blood-pressure assessments, one paired with a cuff). Gen 3 speaks the same
+framing and reuses the Gen 2 opcodes; `0x0b` (motor) and mode `06 05` are Gen-3-only additions.
+
 ---
 
 ## 0. Encryption gate — ANSWERED 🟢
@@ -126,6 +132,9 @@ Bulk frames (`0x47`/`0x4c`) pack fixed-size records, each prefixed by delimiter
 | Poll | `95 00 00` | `15 ..` | one live sample per poll | 🟢 |
 | Page ACK | `c7 00 00` / `cc 00 00` | `47`/`4c` | continue bulk transfer | 🟢 |
 | Status query | `d0 00 00` | `10`/`50` | session/record status | 🟡 |
+| **Vibrate motor** | `0b 03 <pattern> 64 00` | `8b 00 8b` | **drive the Gen 3 haptic motor** (§5.9) | 🟡 |
+| **BP / dense-PPG mode** | `06 05 00` | `86 00 86` | mode 5 → pushes 100 Hz `0x12` raw PPG (§5.10) | 🟢 |
+| Sensor/temp readout | `29 00 00` | `a9 ..` (10B) | descriptor `[6:14]` slice; app sends it before every BP run | 🟡 |
 
 **The `02` arg is a sync CURSOR, not a timestamp** (🟢, this was the key unlock). The cursor
 is *seconds since 2019* (§5.6). ⚠️ **`02 00 FF FF FF FF 00 01 00` does NOT mean "sync
@@ -759,6 +768,24 @@ fell **31.4→26.6 °C**; against that ground truth:
   *average* (358) — earlier exact-358 searches missed it by 1–3 LSB.
 - **Implication:** readable **live, no sync session / nonce needed** — poll `d0 00 00`→`0x10`
   (or listen for spontaneous descriptors) and parse `[6:8]`/`[8:10]`. Sidesteps the §4 auth wall.
+- ⚠️ **COUNTER-OBSERVATION 🟡 (2026-08-28, Gen 3 FW FR05.011, `verify_vibrate.py` session).**
+  In an authenticated session with **no sync-open**, the ring returned **no descriptor at all**:
+  `d0 00 00` drew no reply, and **65 s** of listening produced no spontaneous `0x10` either.
+  The link was demonstrably healthy — notifications were enabled and every `0x0b` write in the
+  same session was answered `8b 00 8b`. So the "streams spontaneously every 30–60 s / pollable
+  with no session" claim above does **not** hold universally. Candidate explanations, untested:
+  (a) telemetry only flows once a sync session is open (the reference captures all had one),
+  (b) a Gen 3 / FR05 behaviour change, (c) `d0 00 00` answered `0x50` rather than `0x10` and the
+  tool's 19-byte `0x10`/`0x87` filter discarded it.
+  **REFINED 2026-08-30 — it is INTERMITTENT, not absent.** A third session on the same ring,
+  same tool, still with no sync-open, *did* receive one: `10 45 03 00 00 00 01 38 01 37 00 00
+  00 00 0f 2b 4a ff 00 c8` — XOR-valid and parsing cleanly on the **Gen 2 schema** (battery
+  69 %, state `0x03` idle, skin temp 31.2/31.1 °C, 3883 mV, `[17]=0xff` not in case), further
+  evidence that Gen 3 reuses the Gen 2 descriptor byte-for-byte. So the claim to retire is not
+  "descriptors need a session" but the **cadence**: "~30–60 s" is unreliable here, and a client
+  must tolerate 65 s+ of silence rather than treat it as a fault. **Consequence for tooling:** any battery,
+  skin-temp or state-byte read must treat "no descriptor" as an expected outcome and say so,
+  never silently skip a safety check that depends on it.
 
 **`[4:6]` = the ring's onboard step count** 🟢 (live test 2026-06-14). After clearing
 the official app and forcing a from-scratch ring re-sync, the app showed **81 steps** and
@@ -923,6 +950,194 @@ a one-time pairing (seen once at 17:51:58; every reconnect since is re-encryptio
 LTK — 25 EncryptionChange events, zero re-pairings, incl. across the 2026-06-16 login). So offline
 decoding is sound and HCI-snoop ATT is plaintext. CoreBluetooth auto-bonds; there is **no app-layer
 key exchange to replicate for the bond** — the replicable gate is the `f(chal)` auth above.
+
+### 5.9 `0x0b` — VIBRATION MOTOR (Gen 3) 🟢 CONFIRMED
+
+**Command `0b 03 <pattern> 64 00` → `8b 00 8b`.** Decoded from the Gen 3 tester capture
+`ringcapture_btsnoop.log`, **FW FR05.011 / app 4.3.1**, 2026-08-27, 20 943 HCI packets over
+14 m 44 s, driven by `docs/RUNBOOK_GEN3_BP_HAPTIC.md` §4.2. This is the first Gen-3-only
+opcode in this file — the Gen 2/2 Air have no motor.
+
+**🟢 REPRODUCED FROM OUR OWN CLIENT 2026-08-28** (`verify_vibrate.py`, tester's Gen 3,
+FW FR05.011). A fresh session ~17 h after the capture, new auth challenge (`0xa7`), no
+official app involved: `0b 03 01 64 00` written three times, **buzzed 3 of 3**, each
+answered `8b 00 8b`, and the wearer reported the **short-short-long** pattern predicted in
+advance from the capture. That is the full 🟡→🟢 promotion — decoded from a snoop, then
+reproduced independently from a Mac with a stated prediction that held.
+
+**Every byte of this command is now either confirmed or measured to be inert** (2026-08-30,
+12/12 buzzes across 4 distinct frames, all from our own client). Details per byte below.
+
+**The correlation (🟢).** The tester logged the wall-clock time of 8 buzzes. `0x0b` is written
+**9 times in the whole capture and at no other moment**. Fitting a single global clock offset
+(the capture's own wall clock is ~1 h adrift of the tester's notes, so absolute time is not
+usable — only structure is):
+
+| Tester's noted buzz | Step | Frame | Residual |
+|---|---|---|---|
+| 14:03:57 | 4 — vibration-settings test tap #1 | `0b 03 01 64 00` | +0.8 s |
+| 14:04:14 | 4 — test tap #2 | `0b 03 01 64 00` | +1.0 s |
+| *(not noted)* | 5 — 1st workout start | `0b 03 **02** 64 00` | — |
+| 14:06:52 | 5 — 2nd workout start countdown | `0b 03 **02** 64 00` | +0.8 s |
+| 14:09:47 | 8 — HR spot measurement done | `0b 03 01 64 00` | +0.9 s |
+| 14:10:39 | 8 — SpO2 spot measurement done | `0b 03 01 64 00` | +0.7 s |
+| 14:12:21 | 10 — BP attempt 1 done | `0b 03 01 64 00` | +0.4 s |
+| 14:14:18 | 10 — BP attempt 2 done | `0b 03 01 64 00` | +0.0 s |
+| 14:15:30 | 10 — BP attempt 3 done | `0b 03 01 64 00` | +0.3 s |
+
+Worst residual **1.0 s**, and every residual is *positive* and inside 1 s — the signature of a
+human writing the time down a moment after feeling the buzz, on top of minute-level rounding.
+
+**The falsification test (🟢).** Every other command family was scored the same way, free to
+pick its own best offset and its best-matching event per buzz. Only `0b 03` fits:
+
+- `0b 03` (9 writes) → worst residual **1.0 s**
+- `07 00` (56 writes — the 30 s fetch heartbeat, 6× more events to draw from) → worst **9.1 s**
+- `95 00` (69 writes) → worst **83.8 s**; `01 00`/`02 00`/`01 01` → worst **> 207 s**
+- Every remaining family has fewer than 8 writes and cannot cover the buzzes at all.
+
+So no rival command explains the pattern, and the fit is not a pigeonhole artifact of a
+frequently-repeated frame.
+
+**Argument bytes.**
+- `[1] = 0x03` — constant across all 9. Sub-command.
+- `[2]` — **PATTERN selector 🟢 CONFIRMED, and NOT a count** (this corrects an earlier
+  "pattern / count" hedge). **Replayed from our own client 2026-08-30: `0b 03 02 64 00` produced
+  "a single long buzz", 3/3 — the pattern predicted in advance from the capture** — while every
+  `[2]=0x01` frame produced short-short-long. The prediction came first, then the measurement.
+  It was also confirmed on a prior independent axis: the tester was asked what the buzzes *felt*
+  like, **blind to the byte values**, and his two descriptions partition the nine captured events
+  exactly along the two observed values:
+
+  | Felt pattern (tester, blind) | Events | Frame |
+  |---|---|---|
+  | **short-short-long** | settings toggle ×2, HR done, SpO2 done, BP done ×3 | `0b 03 **01** 64 00` (7×) |
+  | **one long buzz** | workout-start countdown ×2 | `0b 03 **02** 64 00` (2×) |
+
+  So `0x02` is *one long pulse*, not two pulses. ⚠️ **Only 2 of the value space is exercised
+  here.** The app's Vibration screen carries three separate notification categories (Battery
+  Reminder / Sedentary Reminder / Health Alerts), none of which fired during the capture, so
+  more `[2]` values very likely exist. Sweep it only after the base replay works.
+  *Mild caveat:* the question offered "two pulses / longer / stronger" as examples. He answered
+  with "short-short-long", a shape never suggested to him, and independently grouped the settings
+  and HR/SpO2 buzzes together against the workout one — that grouping was not hinted.
+- `[3] = 0x64` = 100 — **NOT intensity, NOT duration, no observable effect at all 🟢
+  (directly tested and refuted).** The obvious reading — a percentage — was wrong twice over:
+  - The Vibration settings screen (tester screenshot, app 4.3.1) has **no intensity control**:
+    three on/off toggles and a DND schedule, nothing more. So it is not a user-facing setting.
+  - **Decisive test 2026-08-30:** we replayed the byte across a **10× range** — `0x64` (100),
+    `0x32` (50), `0x0a` (10) — all with `[2]=0x01`. All three buzzed 3/3, and the wearer reported
+    **"all the vibration intensities felt the same"**, with `0x32` and `0x0a` producing buzzes
+    *identical* to `0x64`'s short-short-long. A 10× swing with no perceptible difference rules
+    out intensity and duration alike.
+  - Residual 🔴: what it *is*. Candidates — reserved/ignored, a firmware floor clamping low
+    values to full power, or a field that means something outside the haptic path. Untested
+    below `0x0a` and at `0x00`. **Practical guidance: send `0x64`, exactly as the app does, and
+    do not vary it** — it buys nothing and is the only value with field evidence behind it.
+- `[4] = 0x00` — the ordinary command terminator (§3); commands are not checksummed.
+
+**Where the vibration SETTINGS live — phone-side, for the reminder toggles at least 🟡.**
+The tester's two step-4 buzzes came from **toggling a reminder switch on/off** (app 4.3.1 has no
+"tap to feel it" control — the earlier runbook's wording assumed one). Across the whole 14-minute
+capture the ring received **no settings write of any kind**: the only host writes in that window
+are the two `0x0b` frames and routine `07 00 00` fetches. So the three reminder toggles are
+evaluated on the phone, and the ring is a dumb motor driven by `0x0b`.
+- **A direct `0x0b` is NEVER gated by Do-Not-Disturb 🟢** (2026-08-28, Gen 3 FR05.011).
+  Decisive positive control, with the condition documented rather than asserted: the tester
+  **edited the app's DND window to 11:00–19:00** so it covered the present, screenshotted it
+  enabled at **11:08**, then ran `0b 03 01 64 00` from our own Mac client at **11:09:17** —
+  9 minutes inside the active window — and it **buzzed 3 of 3**.
+  - The conclusion holds either way the edit went: if the app never pushed the new window the
+    ring has no DND knowledge; if it did push it, the ring knew DND covered that moment and
+    buzzed regardless. **So a direct vibrate command is unsuppressed no matter where the
+    setting lives** — the app's caption ("the ring won't vibrate during Do Not Disturb hours")
+    describes the app choosing not to send.
+  - **Consequence for us: our own alerts are NOT suppressed by the user's RingConn DND
+    setting**, including overnight, which is exactly when a health alert matters most. We own
+    the quiet-hours policy end to end and must implement our own — a user who set quiet hours
+    in the RingConn app will reasonably expect us to honour them, and nothing enforces that for
+    us. See also the low-battery cut-off, which IS firmware-side and does still bind us.
+  - Scope: proven for a **direct command**. Untested whether some *other* ring-initiated buzz
+    path (if one exists) is gated differently — but we only ever drive the motor directly.
+- The **low-battery cut-off is firmware-side** 🟢 — the same screen states "Vibration turns off
+  automatically when the battery is low", matching the app's 20 % refusal message.
+
+**Preconditions observed in this session (not isolated):** the ring was authenticated, battery
+read `0x20` = 32 % from the descriptor (above the app's own 20 % refusal threshold), and the
+app was foregrounded. Which of these the motor actually requires is untested.
+
+**Next step — the 🟢 gate.** Runbook §8: `verify_vibrate.py --hex 0b03016400`. `0x0b` is not in
+that tool's `DANGEROUS_PRIMARY` block-list, so it runs as-is. A buzz the wearer feels from our
+own frame promotes this to 🟢; then vary `[2]` and `[3]` to settle pattern vs intensity.
+
+### 5.10 `0x12` — 100 Hz 4-channel raw PPG (BP / dense-measurement mode) 🟢
+
+**The densest optical stream found on this hardware, and ~4× the rate of the known `0x13`.**
+Same Gen 3 FR05.011 capture. Not to be confused with the `0x4c` epoch field `[8] = 0x12`
+("no SpO2" activity sentinel, §5.3) — unrelated, different layer.
+
+**How it starts and stops (🟢).** The app runs, in order:
+`29 00 00` → `a9 ..` (sensor/temp readout) · ~2–3 s later `06 05 00` → `86 00 86` (**mode 5**) ·
+~0.5 s later the ring begins pushing `0x12` · ~39 s later `0b 03 01 64 00` (buzz) then
+`06 00 00` → `86 00 86` stops it. Observed 3/3 times.
+
+**Push-only — there is NO per-frame ACK (🟢).** 902 frames over 39 s of streaming with not one
+host write in between. Unlike `0x47`/`0x4c`/`0x4e`, nothing has to be acked to keep it flowing.
+
+**Frame layout (135 bytes, fixed):**
+```
+[0]     0x12
+[1:3]   seq, 16-bit BE — session-wide, starts at 1, never resets per attempt
+[3]     0x01        [4] 0x00
+[5]     0x83        (length-ish; 135 - 4. NOTE: 0x13's equivalent byte is 135-3. 🔴 unreconciled)
+[6:126] 10 samples x 12 bytes = 4 channels x 24-bit BE per sample
+[126]   0x0a = 10   samples in this frame
+[127]   0x0f/0x11   🔴      [128] 0x00      [129] 0x11..0x19, settles 🔴
+[130:133]           cumulative sample counter, 24-bit BE (steps of 10/frame) 🟢
+[133]   0x00
+[134]   XOR trailer (§3)
+```
+**Integrity over the whole session: 902/902 XOR-valid, sequence 1→902 with ZERO gaps.** Nothing
+was dropped; the complete assessment is recoverable from a snoop.
+
+**Channels — measured over BP attempt 3 (38 s, 3 820 samples, fs = 100.73 Hz):**
+
+| ch | mean | std | reading |
+|---|---|---|---|
+| 0 | 407 034 | 10 864 | LED, large DC + pulsatile 🟢 |
+| 1 | 438 108 | 4 681 | LED, large DC + pulsatile 🟢 |
+| 2 | 2 726 | 85 | small-DC channel, not pulsatile 🟡 |
+| 3 | -6.5 | 112 | small **signed** value, 20-bit two's complement (99.8 % within ±1000, zero-centred) — ambient / dark-current cancellation 🟡 |
+
+**Proof it is a real optical pulse waveform (🟢, `desktop/` FFT, cubic-detrended, Hann):**
+- Attempt 3: ch0 peaks at **1.239 Hz = 74.4 bpm, SNR 30.6**; ch1 peaks at the **same** 1.239 Hz,
+  SNR 28.5. Two independent channels agreeing to the FFT bin on a plausible resting HR.
+- Attempt 1, a separate 37 s window: ch0 **1.252 Hz = 75.1 bpm**, ch1 **1.252 Hz** — reproduced.
+- The already-known `0x13` stream over the *same* windows is far weaker and channel-inconsistent
+  (SNR 2.3–3.4, peaks scattered 0.98–2.93 Hz). **`0x12` is the better BP/HRV substrate.**
+- The first ~2 frames of each run are a monotone AGC/DC-cancellation settling ramp, not signal —
+  discard them.
+
+**`0x13` for comparison (already known, `stream_ppg_13.py`):** 160 B, 25 samples x 3 x int16 BE,
+**25.8 Hz**, 146/146 XOR-valid. It streams *concurrently* with `0x12` in mode 5.
+
+**Rate caveat 🟡:** attempts 1 and 3 both ran **100.6/100.7 Hz**. Attempt 2 measured 27.6 Hz —
+but the BLE link dropped and re-authenticated mid-measurement in that window (a fresh `01 00 00`
+challenge cycle sits inside it), so that is a transport loss, not a second sampling mode.
+
+**RingConn's BP NUMBER is still not on the wire — reconfirmed 🟢.** The tester reported the
+app's systolic/diastolic result for attempt 3 plus a same-minute cuff reading (**values held
+privately — tester health data, not published**). Searching the entire capture for each of
+those four numbers as adjacent byte pairs, in both orders, returns **one** hit, and it is
+inside a `0x12` PPG sample payload — coincidence, not a result. Of the 31 frames after the
+successful assessment completed, **zero** contain a reported pair anywhere. This is consistent with the APK evidence
+(§ RUNBOOK_GEN3_BP_HAPTIC §7): the raw signal goes up, the number comes back from RingConn's
+server. **What we get from the wire is the input, not their answer** — which is exactly the
+calibration substrate #120/#38 need.
+
+**Unresolved from this capture 🔴:** `05 23 01 00` → `85 00 85`, sent once, between BP attempts
+1 and 2, right after a reconnect. Sibling of the OSA arm command `05 22 01` (`RUNBOOK_OSA_APNEA`),
+so treat the `0x05` family as potentially mode-arming and **do not replay it speculatively**.
 
 ## 6. Ground-truth captures needed (prioritized)
 
