@@ -246,6 +246,7 @@ once more; it clears the state on startup.
 | `pip install bleak` dies with clang errors | macOS ships an old pip | Run the `--upgrade pip` line first |
 | Stops saying the battery is too low | Below 20% the motor is disabled in firmware | Charge it, re-run |
 | Connects, no buzz, no errors | Unknown — that's a real finding | Send the file. Don't try other frames. |
+| `ModuleNotFoundError: No module named 'bleak'` | You ran it with the system `python3` instead of the venv | `cd ~/Documents/Git/OpenRingConn/desktop` then `.venv-probe/bin/python bp_collect.py` — the leading `.venv-probe/bin/` is the whole fix |
 | `bp_collect.py` says no data arrived | Expected — this path is untested | Send the file and stop. Ours to fix. |
 
 ---

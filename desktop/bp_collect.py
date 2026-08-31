@@ -216,7 +216,27 @@ async def _force_stop(client, s):
 
 
 async def collect(address, seconds, s):
-    from bleak import BleakClient, BleakScanner
+    try:
+        from bleak import BleakClient, BleakScanner
+    except ImportError:
+        # Almost always a tester running the system python instead of the runbook's venv.
+        s.note("")
+        s.note("This needs the `bleak` Bluetooth library, and the python you started it with")
+        s.note("does not have it. Run it with the virtual environment the runbook builds:")
+        s.note("")
+        s.note("    cd ~/Documents/Git/OpenRingConn/desktop")
+        s.note("    .venv-probe/bin/python bp_collect.py")
+        s.note("")
+        s.note("If there is no `.venv-probe` folder there, build it once (3 lines):")
+        s.note("")
+        s.note("    cd ~/Documents/Git/OpenRingConn/desktop")
+        s.note("    python3 -m venv .venv-probe")
+        s.note("    .venv-probe/bin/pip install --upgrade pip")
+        s.note("    .venv-probe/bin/pip install bleak")
+        s.note("")
+        s.note("Nothing was sent to the ring. Ignore the files this run wrote —")
+        s.note("just re-run with the command above.")
+        return 2
 
     if address:
         dev = await BleakScanner.find_device_by_address(address, timeout=30.0) or address
