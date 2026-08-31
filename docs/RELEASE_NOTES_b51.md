@@ -13,6 +13,22 @@ relying on it to wake you.
 
 ---
 
+## Thanks to lawruhl
+
+The vibration motor is in this build because of **lawruhl**. He captured his Gen 3 talking to
+the official app, and then — over several rounds, on his own finger — described each buzz
+*blind*, without being told what we had sent. That blind reporting is what let the pattern byte
+be established rather than guessed: the two buzz shapes he described partitioned exactly along
+one byte, and the prediction we made from it held 3 for 3 on the next round.
+
+He also ran the falsification pass that killed our other hypothesis. We thought byte `[3]` was
+intensity; he tested it across a 10× range and reported all three identical, which is why the
+app pins that byte instead of offering you a slider that does nothing.
+
+Twelve buzzes for twelve attempts, across four frames. Thank you.
+
+---
+
 ## Your Health permissions stop being wiped
 
 **The defect.** On a fresh launch the app asked for Workouts + Workout Routes *write*. You
