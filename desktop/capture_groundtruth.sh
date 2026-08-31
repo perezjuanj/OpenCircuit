@@ -63,4 +63,7 @@ Press Ctrl-C when you have tapped through every night you can see.
 
 EOF
 
-exec mitmdump -s "$ADDON" --listen-port "$PORT" --set console_eventlog_verbosity=info -q
+# NOTE: do NOT add -q. It sets the log level to `error`, which suppresses the addon's own
+# `✅ SAVED` lines (they are emitted at warning level) — you would sit watching a silent
+# terminal while nights captured invisibly. `warn` hides the per-flow noise and keeps them.
+exec mitmdump -s "$ADDON" --listen-port "$PORT" --set termlog_verbosity=warn

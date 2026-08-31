@@ -30,6 +30,8 @@ Thumbs.db
 
 # Swift / Xcode (Phase 3+)
 ios/build/
+ios/build-device/
+ios/build-devinstall/
 ios/DerivedData/
 *.xcuserstate
 
