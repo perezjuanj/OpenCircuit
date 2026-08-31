@@ -459,6 +459,16 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                 }
                 .padding()
+                // Pin the content to the scroll view's own width so a vertical ScrollView can never
+                // pan SIDEWAYS. Measured on device (iPhone 15 Pro, 393pt): the NavigationStack is
+                // 393.00, the ScrollView 393.33 and this content 393.67 — SwiftUI rounds a fractional
+                // row width UP to the 1/3pt pixel grid, and the rounding compounds one step per
+                // nesting level. Two thirds of a point is two physical pixels, and that is enough for
+                // UIScrollView to allow horizontal dragging, which rubber-banding then amplifies into
+                // a ~77pt drag. No subview is actually over-wide — every row measured at or under its
+                // 329.33pt proposal (widest: 329.33 `hints`, 308.00 `stageLegend`) — so there is
+                // nothing to narrow; the content simply has to be told it is exactly viewport-width.
+                .containerRelativeFrame(.horizontal)
             }
             .background(Theme.pageBackground)
             .navigationTitle("Sleep")
