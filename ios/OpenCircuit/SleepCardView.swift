@@ -1112,12 +1112,26 @@ struct SleepCardView: View {
                 Text("Movement").font(.caption2).foregroundStyle(.secondary)
                 // Encode level in BAR HEIGHT as well as colour (still=short, light=mid, active=full)
                 // so the strip is legible in greyscale — yellow-vs-orange is a hard colourblind pair.
+                //
+                // ONE FIXED-WIDTH COLUMN PER EPOCH, with the bar drawn inside its column — rather
+                // than sizing the bars and letting `HStack(spacing:)` add the gaps on top. The old
+                // form paid for its 1pt gap out of each bar (`geo.width / N - 1`), which balances
+                // only while that subtraction is affordable: once `geo.width / N` fell below 1.5 the
+                // `max(…, 0.5)` floor took over, the gaps stopped being paid for, and the strip's
+                // content grew to `1.5N - 1` — wider than the strip itself, so the end of the night
+                // was silently clipped away. At the 329.4pt card that begins at N = 220 epochs, i.e.
+                // a 9h09m night (`Command.syncEpoch`, 150 s per level); a 12h30m night lost 27% of
+                // its strip. Columns sum to exactly `geo.size.width` for any N, so it cannot overflow.
                 GeometryReader { geo in
-                    HStack(alignment: .bottom, spacing: 1) {
+                    let column = geo.size.width / CGFloat(levels.count)
+                    // Spend a 1pt gap only where the column can afford one and still leave ink.
+                    let bar = max(column - (column >= 1.5 ? 1 : 0), 0.5)
+                    HStack(alignment: .bottom, spacing: 0) {
                         ForEach(Array(levels.enumerated()), id: \.offset) { _, lvl in
                             Rectangle().fill(movementColor(lvl))
-                                .frame(width: max(geo.size.width / CGFloat(levels.count) - 1, 0.5),
+                                .frame(width: bar,
                                        height: max(geo.size.height * movementHeightFraction(lvl), 1))
+                                .frame(width: column, alignment: .leading)
                         }
                     }
                     .frame(maxHeight: .infinity, alignment: .bottom)
@@ -1351,12 +1365,20 @@ struct SleepCardView: View {
                           _ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)) -> some View {
         let total = Double(m.deep + m.light + m.rem + m.awake)
         let asserted = assertedMinutes(night, m)
+        // Only the stages this night actually has. A zero-minute stage drew a zero-width rectangle
+        // but still cost a 1pt gap, so a night with no REM spent a gap on nothing.
+        let drawn = Self.stages.filter { $0.minutes(m) > 0 }
+        let gaps = CGFloat(max(drawn.count - 1, 0))     // matches `HStack(spacing: 1)` below
         return GeometryReader { geo in
+            // Proportion the stages over the width LEFT AFTER the gaps. Proportioning over the FULL
+            // width and then letting the HStack add 1pt between segments made the bar `geo.width + 3`
+            // wide, so the capsule clipped 3pt off the trailing stage on every night.
+            let usable = max(geo.size.width - gaps, 0)
             HStack(spacing: 1) {
-                ForEach(Self.stages, id: \.name) { stage in
+                ForEach(drawn, id: \.name) { stage in
                     let mins = stage.minutes(m)
                     let claimed = asserted.map { stage.asserted($0) } ?? 0
-                    let width = total > 0 ? geo.size.width * Double(mins) / total : 0
+                    let width = total > 0 ? usable * Double(mins) / total : 0
                     let claimedWidth = mins > 0 ? width * Double(claimed) / Double(mins) : 0
                     // Split only when there IS an asserted share. An unedited night renders the
                     // single solid rectangle it always did, with no Canvas in the tree.
