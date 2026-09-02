@@ -227,6 +227,79 @@ final class FR04RaisedPrimaryFloorTests: XCTestCase {
         XCTAssertEqual(BulkSleep.motionSource(recs), .primary)
     }
 
+    // MARK: - the shape the FIELD archive actually has
+
+    /// 🟢 THE SHIPPED FIXTURE ABOVE IS NOT THE FIELD SHAPE, and the difference is the whole bug.
+    /// `raisedFloorStillEpoch` draws all five sub-samples INDEPENDENTLY, so a "still" epoch spans
+    /// 1…86 within itself. On the real FR04.011 archive (715 worn epochs, one night plus the
+    /// preceding day) the ring's OWN motionless epochs are nearly FLAT inside the epoch — median
+    /// intra-epoch spread **1 count**, p90 **6** — so `motionResolvesStillness` fires on **78 %** of
+    /// them and `primaryFloorIsRaised` rejected the real archive while accepting the fixture.
+    ///
+    /// What the field channel really does is hold a flat pedestal whose LEVEL wanders (per-epoch
+    /// minimum p10 1 / p50 40 / p90 93 across the night), far faster and further than the ~30-min
+    /// `motionAboveLocalFloor` window can track. This fixture reproduces THAT: flat within an epoch,
+    /// wandering between epochs. It must select the magnitude channel, and it must do so at BOTH the
+    /// scopes production evaluates `motionSource` at — the night slice and the whole archive union.
+    private func wanderingPedestalNight(includeDay: Bool) -> [BulkRecord] {
+        var c: UInt32 = 0x0c60_0000
+        var out: [BulkRecord] = []
+        if includeDay {
+            // ~14 h of an ordinary awake day, which is what `latestNightRecords` hands `motionSource`
+            // out of the 30 h archive union. It must not change the verdict.
+            for _ in 0..<336 { out.append(awakeEpoch(c)); c += step }
+        }
+        for _ in 0..<12 { out.append(awakeEpoch(c)); c += step }
+        // The observed FR04.011 plateau levels (the commit's own clusters), held for a few epochs
+        // at a time and then stepped — flat inside an epoch, wandering between them.
+        let plateaus = [1, 17, 41, 45, 49, 53, 71, 84, 85, 86]
+        var level = 45
+        for i in 0..<180 {
+            if i % 4 == 0 { level = plateaus[next(plateaus.count)] }
+            let primary = (0..<5).map { _ in UInt8(max(0, level + next(3) - 1)) }
+            let still = record(c, hr: 52, hrv: UInt8(38 + next(14)),
+                               primary: primary, magnitudes: [0, 0, 0, 0, 0], sleepVitals: true)
+            out.append(i % 30 == 17 ? turnEpoch(c) : still); c += step
+        }
+        for _ in 0..<12 { out.append(awakeEpoch(c)); c += step }
+        return out
+    }
+
+    func testWanderingPedestalFixtureMatchesTheFieldStatistics() {
+        let worn = wanderingPedestalNight(includeDay: false).filter { $0.layout != .idle }
+        let quiet = worn.filter(\.activityMagnitudesAreZero)
+        let stillShare = Double(quiet.filter(\.motionResolvesStillness).count) / Double(quiet.count)
+        XCTAssertGreaterThan(stillShare, BulkSleep.degenerateMaxQuietStillFraction,
+                             "fixture sanity: like the field archive, the ring's motionless epochs are "
+                             + "FLAT inside the epoch — so the intra-epoch proxy the branch shipped with "
+                             + "says `still` and would reject this channel outright")
+        XCTAssertGreaterThanOrEqual(BulkSleep.medianQuietMinimum(quiet), 16)
+        XCTAssertFalse(BulkSleep.primaryMotionIsDegenerate(worn))
+    }
+
+    func testWanderingPedestalSelectsTheMagnitudeChannelAtEveryScope() {
+        for includeDay in [false, true] {
+            let recs = wanderingPedestalNight(includeDay: includeDay)
+            XCTAssertTrue(BulkSleep.primaryFloorIsRaised(recs.filter { $0.layout != .idle }),
+                          "includeDay=\(includeDay): the de-floored stillness conjunct must see through "
+                          + "a flat-but-wandering pedestal")
+            XCTAssertEqual(BulkSleep.motionSource(recs), .activityMagnitudes,
+                           "includeDay=\(includeDay): the verdict must not depend on how much daytime "
+                           + "happens to be in the archive union — that is the scope-dependence the "
+                           + "removed share-of-worn conjunct introduced")
+        }
+    }
+
+    func testWanderingPedestalNightStages() throws {
+        let recs = wanderingPedestalNight(includeDay: true)
+        let segments = BulkSleep.stagedSegments(from: BulkSleep.latestNightRecords(from: recs))
+        XCTAssertFalse(segments.isEmpty,
+                       "the reported failure: `noStagedSegments` on every drain while HR/HRV/RR/SpO2 "
+                       + "decoded all night")
+        let block = try XCTUnwrap(BulkSleep.mainSleep(from: recs))
+        XCTAssertGreaterThan(block.duration, 5 * 3600)
+    }
+
     /// The nibble packing the fixture writes is the one `activityMagnitudes` reads. If this ever
     /// drifts, every magnitude assertion above becomes vacuous.
     func testFixtureNibblePackingRoundTrips() {
