@@ -855,6 +855,19 @@ struct LocalStore {
         return descriptor
     }
 
+    /// Naps whose EFFECTIVE window could land in `from..<to`. The stored `start` is the unique key
+    /// and an edit can move the effective window off it (`editedStart`), so the predicate has to be
+    /// loose on the raw `start` — it is widened by a day at each end and the caller filters on
+    /// `effectiveStart`/`effectiveEnd`. Over-fetching one day either side is cheap (naps are rare);
+    /// a tight predicate on `start` would silently drop an edited nap.
+    nonisolated static func napsDescriptor(from: Date, to: Date) -> FetchDescriptor<StoredNap> {
+        let lo = from.addingTimeInterval(-86_400)
+        let hi = to.addingTimeInterval(86_400)
+        return FetchDescriptor<StoredNap>(
+            predicate: #Predicate { $0.start >= lo && $0.start < hi },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
+    }
+
     nonisolated static func recentDailiesDescriptor(limit: Int) -> FetchDescriptor<StoredDaily> {
         var descriptor = FetchDescriptor<StoredDaily>(
             sortBy: [SortDescriptor(\.day, order: .reverse)])

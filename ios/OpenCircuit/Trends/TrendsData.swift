@@ -18,6 +18,11 @@ import OpenCircuitKit
 struct TrendsData {
     var points: [TrendsEngine.DailyPoint] = []
     var recentRows: [RecentMetricRow] = []
+    /// Per-day goal-ring completion, oldest→newest — the history behind the Goals card's four rings.
+    /// DERIVED from `points` + the current goals; nothing new is stored (see `GoalHistory`).
+    var goalDays: [GoalHistory.Day] = []
+    /// Streak / met-count roll-up over `goalDays`.
+    var goalSummary: GoalHistory.Summary = GoalHistory.summarize([], now: Date())
 
     static let lookbackDays = 14
 
@@ -46,6 +51,9 @@ struct TrendsData {
     }
     struct TempRow: Sendable { let time: Date; let celsius: Double }
     struct StepRow: Sendable { let start: Date; let end: Date; let delta: Int }
+    /// A nap's EFFECTIVE (post-edit) window + its asleep minutes — the same window the Goals card
+    /// folds into today's Sleep ring.
+    struct NapRow: Sendable { let start: Date; let end: Date; let asleepMin: Int }
 
     struct Inputs: Sendable {
         var summaryByNight: [Date: SleepRow]
@@ -53,7 +61,9 @@ struct TrendsData {
         var hr, hrv, spo2, rr: [QuantitySample]
         var temps: [TempRow]
         var stepDeltas: [StepRow]
+        var naps: [NapRow]
         var profile: UserProfile
+        var goals: GoalHistory.Goals
         var tempUnitRaw: String
     }
 
@@ -81,12 +91,17 @@ struct TrendsData {
     /// the exception, and should save first rather than reach back onto the main actor.
     static func loadAsync(container: ModelContainer, tempUnitRaw: String) async -> TrendsData {
         let profile = await MainActor.run { HealthKitWriter.storedUserProfile() }
+        // Goals live in UserDefaults, which `@AppStorage` also binds on the main actor; snapshot
+        // them here alongside the profile so the detached work touches nothing main-isolated.
+        let goals = await MainActor.run { GoalHistory.Goals.fromDefaults() }
         let inputs = await Task.detached {
-            fetchInputs(container: container, profile: profile, tempUnitRaw: tempUnitRaw)
+            fetchInputs(container: container, profile: profile, goals: goals, tempUnitRaw: tempUnitRaw)
         }.value
         let points = await Task.detached { computePoints(inputs) }.value
+        let goalDays = await Task.detached { computeGoalDays(inputs, points: points) }.value
         let recentRows = await buildRecentMetricRows(inputs)
-        return TrendsData(points: points, recentRows: recentRows)
+        return TrendsData(points: points, recentRows: recentRows,
+                          goalDays: goalDays, goalSummary: GoalHistory.summarize(goalDays, now: Date()))
     }
 
     /// Off-main fetch + extraction into the `Sendable` `Inputs` snapshot.
@@ -96,6 +111,7 @@ struct TrendsData {
     /// diverge into fetching different row sets.
     nonisolated private static func fetchInputs(container: ModelContainer,
                                                 profile: UserProfile,
+                                                goals: GoalHistory.Goals,
                                                 tempUnitRaw: String) -> Inputs {
         let context = ModelContext(container)
         let cal = Calendar.current
@@ -123,11 +139,17 @@ struct TrendsData {
         let stepDeltas = ((try? context.fetch(
             LocalStore.stepSamplesDescriptor(from: lookbackStart, to: now))) ?? [])
             .map { StepRow(start: $0.start, end: $0.end, delta: $0.delta) }
+        // Naps are needed only by the goal-ring history: the Goals card folds them into the daily
+        // sleep total (RingConn `sleepNapAvgTimeLength` parity), so the historical Sleep ring has to
+        // fold them too or a nap day would silently score lower in the strip than it did on the day.
+        let naps = ((try? context.fetch(
+            LocalStore.napsDescriptor(from: lookbackStart, to: now))) ?? [])
+            .map { NapRow(start: $0.effectiveStart, end: $0.effectiveEnd, asleepMin: $0.asleepMin) }
         return Inputs(summaryByNight: summaryByNight, stepsByDay: stepsByDay,
                       hr: samples(.heartRate), hrv: samples(.hrvSDNN),
                       spo2: samples(.spo2), rr: samples(.respiratoryRate),
-                      temps: temps, stepDeltas: stepDeltas,
-                      profile: profile, tempUnitRaw: tempUnitRaw)
+                      temps: temps, stepDeltas: stepDeltas, naps: naps,
+                      profile: profile, goals: goals, tempUnitRaw: tempUnitRaw)
     }
 
     /// Pure, off-main per-day rollup — the heavy loop (Calories.dailyEstimate × up to 14 days).
@@ -173,6 +195,15 @@ struct TrendsData {
                                          profile: i.profile, sleepWindow: window,
                                          stepWindows: dayStepWindows, dayStart: day)
                 : nil
+            // 🟢 ELEVATED MINUTES ARE HR-DERIVED, so with no retained HR the estimate returns a
+            // real-looking `0.0` rather than "unknown". Left as 0 it scores a hard MISS, breaks the
+            // goal-ring streak, and contradicts the history card's own promise that a metric with no
+            // retained data is never counted as missed. It is also exactly the shape of the
+            // sport-mode strand — the ring records ZERO epochs while steps stay current — so a
+            // firmware strand would render as a run of solid 0% rings blaming the wearer.
+            // `activeKcal` keeps its steps-only fallback, which is a genuine estimate; elevated
+            // minutes have no such fallback.
+            let hasHR = !dayHRSamples.isEmpty
 
             return TrendsEngine.DailyPoint(
                 date:          day,
@@ -194,9 +225,62 @@ struct TrendsData {
                 dayRRAvg:      avg(i.rr, in: dayWindow),
                 activeEnergyKcal: activityEstimate?.activeKcal,
                 distanceM:        daySteps.map { DistanceEstimate.meters(steps: $0) },
-                exerciseMin:      activityEstimate?.elevatedMinutes
+                exerciseMin:      hasHR ? activityEstimate?.elevatedMinutes : nil
             )
         }
+    }
+
+    // MARK: Goal-ring history
+
+    /// Per-day goal-ring completion, derived from the SAME `DailyPoint`s the charts use plus the
+    /// stored naps — no new persistence (see `GoalHistory`'s header for why deriving is the correct
+    /// design here, and for the two honesty caveats the UI surfaces).
+    ///
+    /// SLEEP ATTRIBUTION — the one place this deliberately differs from `DailyPoint`:
+    /// `DailyPoint.sleepMinutes` is keyed on the night's BEDTIME day (`StoredSleepSummary.night`),
+    /// which is what the Sleep Duration chart wants. The Sleep RING is a different question — the
+    /// Goals card credits "last night" to the day you WOKE UP on (`MissedNight.endedToday`) — so
+    /// `GoalHistory.sleepCreditByDay` re-keys each night onto `MissedNight.nightWakeReference`'s day
+    /// and folds in that day's non-overlapping naps, exactly as `GoalsCardView` does for today.
+    /// Using the chart's bedtime keying here would put a night's ring one day to the LEFT of the
+    /// ring the user actually saw that morning.
+    nonisolated private static func computeGoalDays(_ i: Inputs,
+                                                    points: [TrendsEngine.DailyPoint]) -> [GoalHistory.Day] {
+        let cal = Calendar.current
+
+        // Wake-day attribution + the nap fold-in are the subtle part, so they live in the Kit
+        // (`GoalHistory.sleepCreditByDay`) where `swift test` covers them; this is only the
+        // row → value-type mapping.
+        let sleepCreditByDay = GoalHistory.sleepCreditByDay(
+            nights: i.summaryByNight.values.map { row in
+                let hasClock = row.inBedEnd > row.inBedStart
+                return GoalHistory.NightSleep(
+                    nightKey: cal.startOfDay(for: row.night),
+                    inBedStart: hasClock ? row.inBedStart : nil,
+                    inBedEnd: hasClock ? row.inBedEnd : nil,
+                    asleepMinutes: row.asleepMin)
+            },
+            naps: i.naps.map {
+                GoalHistory.NapSleep(start: $0.start, end: $0.end, asleepMinutes: $0.asleepMin)
+            },
+            calendar: cal)
+
+        // A day can carry a sleep credit without appearing in `points` (the night is keyed to the
+        // previous day there), so union both sets rather than iterating `points` alone.
+        var byDay: [Date: TrendsEngine.DailyPoint] = [:]
+        for p in points { byDay[cal.startOfDay(for: p.date)] = p }
+        let allDays = Set(byDay.keys).union(sleepCreditByDay.keys)
+
+        let inputs = allDays.map { day -> GoalHistory.DayInput in
+            let p = byDay[day]
+            return GoalHistory.DayInput(
+                date: day,
+                steps: p?.steps,
+                activeKcal: p?.activeEnergyKcal,
+                activityMinutes: p?.exerciseMin,
+                sleepMinutes: sleepCreditByDay[day])
+        }
+        return GoalHistory.build(days: inputs, goals: i.goals, calendar: cal)
     }
 
     // MARK: Recent readings
