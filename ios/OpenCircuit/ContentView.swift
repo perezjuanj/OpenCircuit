@@ -493,9 +493,17 @@ struct ContentView: View {
                     // ended up in my Apple Health … but I didn't see it in Open Circuit".
                     RecentWorkoutsCard(reloadToken: workoutHistoryToken)
                     card { GoalsCardView() }
+                    // The same four rings, for the days BEFORE today. Derived from the shared trends
+                    // cache — no extra fetch, no new stored column (see `GoalHistory`).
+                    if !trends.goalDays.isEmpty {
+                        OCSectionHeader("Goal Rings History", systemImage: "circle.dashed",
+                                        tint: Theme.steps)
+                        GoalRingsHistorySection(days: trends.goalDays, summary: trends.goalSummary)
+                    }
                     caloriesCard
                     if !trends.points.isEmpty {
                         OCSectionHeader("Activity Trends", systemImage: "chart.bar.fill", tint: Theme.steps)
+                        GoalRingsTrendsSection(days: trends.goalDays)
                         ActivityTrendsSection(points: trends.points, distUnitRaw: distUnitRaw)
                     }
                 }

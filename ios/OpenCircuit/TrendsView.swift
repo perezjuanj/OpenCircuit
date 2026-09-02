@@ -88,7 +88,8 @@ struct TrendsView: View {
     private var availableMetricsNote: some View {
         HStack(spacing: 6) {
             Image(systemName: "info.circle").foregroundStyle(.secondary)
-            Text("All-day vitals use every worn epoch. Tap a day below for a time-of-day breakdown.")
+            Text("All-day vitals use every worn epoch. Each day shows its four goal rings — tap for "
+                 + "a time-of-day breakdown.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -96,15 +97,27 @@ struct TrendsView: View {
     }
 
     /// Tap a day to drill into its time-of-day breakdown (`DayDetailView`).
+    ///
+    /// Each chip carries that day's four goal rings (`GoalRingsGlyph`), so the historical picker
+    /// shows goal completion at a glance instead of a bare date. The rings are looked up from the
+    /// SAME `TrendsData` load — a day with no scored rings (or a store predating the rollups) simply
+    /// renders the date chip it always did, never an invented empty ring set.
     private var dayPicker: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        let goalsByDay = Dictionary(data.goalDays.map { ($0.date, $0) },
+                                    uniquingKeysWith: { _, latest in latest })
+        return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(data.points.reversed(), id: \.date) { p in
                     Button { selectedDay = p.date } label: {
-                        Text(p.date, format: .dateTime.weekday(.abbreviated).day())
-                            .font(.caption.weight(.medium))
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(Capsule().fill(Theme.cardBackground))
+                        VStack(spacing: 4) {
+                            if let day = goalsByDay[Calendar.current.startOfDay(for: p.date)] {
+                                GoalRingsGlyph(day: day, size: 28, lineWidth: 3.5, spacing: 1.2)
+                            }
+                            Text(p.date, format: .dateTime.weekday(.abbreviated).day())
+                                .font(.caption.weight(.medium))
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 14).fill(Theme.cardBackground))
                     }
                     .buttonStyle(.plain)
                 }
