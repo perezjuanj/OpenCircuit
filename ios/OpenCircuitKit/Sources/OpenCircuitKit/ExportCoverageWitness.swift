@@ -123,6 +123,44 @@ public enum ExportCoverageWitness {
         public let lastMeasurementBeforeStart: Date?
         /// Earliest heart-rate instant strictly AFTER `inBedEnd`, from store ∪ archive.
         public let firstMeasurementAfterEnd: Date?
+        /// EVERY heart-rate instant strictly after `inBedEnd` this probe could reach, so the wake
+        /// verdict can walk the run rather than take one step (`WakeProvenance.resumeRunMaxSeconds`).
+        ///
+        /// ⚠️ THIS IS **NOT** MONOTONE, and an earlier version of this comment claimed it was.
+        /// The claim "adding a witness can only FILL a gap, never open one" is true of the single
+        /// INSTANTS above, where each candidate is compared against the edge. It is false of a
+        /// SERIES walked pairwise:
+        ///
+        ///     classify(measurementsAfter: [+30])        → .witnessed
+        ///     classify(measurementsAfter: [+30, +400])  → .stoppedThenResumed(370)
+        ///
+        /// One extra real record, nothing removed, and a hole appears — because the walk measures
+        /// the space BETWEEN consecutive records, and 370 s of it is two dropped 150 s epochs, which
+        /// is exactly what `continuousToleranceSeconds` exists to absorb at the edge.
+        ///
+        /// ⚠️ AND THE FIRST ATTEMPT TO RESTATE THAT WAS ALSO FALSE — twice. It claimed "a walk that
+        /// runs out of records returns `.witnessed`" (an EMPTY reach returns `.unknown`, which
+        /// `assess` treats differently: `.durationLikelyHigh` is gated on `.witnessed`) and "a
+        /// poorer archive is never louder than a richer one". Measured counterexample through the
+        /// public `assess`, with the union in place:
+        ///
+        ///     rich [+30 s, +3620 s] → stoppedThenResumed(3590) → reasons []      (silent)
+        ///     poor [+3620 s]        → stoppedThenResumed(3620) → noRecordingAfterWake  (fires)
+        ///
+        /// Dropping one real record straddles `materialGapSeconds`, so the POORER input is the loud
+        /// one. Reachable two ways: `SleepCardView` passes an empty archive whenever the ring
+        /// identifier is empty, and `EpochArchive.merge` prunes OLDEST-first (`EpochArchive.swift:41`),
+        /// so the +30 s epoch is dropped before the +4 h resume and the reported gap GROWS as the
+        /// archive ages.
+        ///
+        /// What is actually true, and all the safety argument may rest on:
+        ///   • a PREFIX-truncated reach cannot produce a LARGER stop — the walk over a prefix
+        ///     returns the same stop, or `.witnessed`, or (at zero records) `.unknown`;
+        ///   • losing a NON-first record can grow a reported gap, so a poorer archive CAN be louder;
+        ///   • `SleepConfidence.assess` unions this with `firstMeasurementAfterEnd`, which keeps the
+        ///     two documented-as-independent inputs from disagreeing about the FIRST instant — it
+        ///     does not and cannot close the interior-record case above.
+        public let measurementsAfterEnd: [Date]
         /// Oldest heart-rate instant we hold at all, from store ∪ archive. Feeds the retention
         /// guards in `BedtimeProvenance.classify` / `WakeProvenance.classify` — see the note on
         /// `edges(archives:…)` for why unioning it cannot weaken them.
@@ -144,6 +182,7 @@ public enum ExportCoverageWitness {
                                      inBedEnd: inBedEnd,
                                      lastMeasurementBeforeStart: lastMeasurementBeforeStart,
                                      firstMeasurementAfterEnd: firstMeasurementAfterEnd,
+                                     measurementsAfterEnd: measurementsAfterEnd,
                                      earliestRetainedMeasurement: earliestRetainedMeasurement)
         }
 
@@ -221,10 +260,15 @@ public enum ExportCoverageWitness {
             .compactMap { $0 }.min()
         let earliest = [storedEarliestRetained, inReach.min()].compactMap { $0 }.min()
 
+        let afterEnd = Set(inReach.filter { $0 > inBedEnd }
+                            + [storedFirstAfterEnd].compactMap { $0 }.filter { $0 > inBedEnd })
+            .sorted()
+
         return Edges(inBedStart: inBedStart,
                      inBedEnd: inBedEnd,
                      lastMeasurementBeforeStart: last,
                      firstMeasurementAfterEnd: first,
+                     measurementsAfterEnd: afterEnd,
                      earliestRetainedMeasurement: earliest,
                      archiveEpochsInReach: inReach.count,
                      archiveMovedAnEdge: last != storedLastBeforeStart

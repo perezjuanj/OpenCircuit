@@ -53,11 +53,17 @@ extension SleepConfidence {
 
         /// Detected opening edge of the night — `SleepStaging` segments' min start.
         public let inBedStart: Date
-        /// Detected closing edge of the night — `SleepStaging` segments' max end. This is also the
-        /// instant the card prints as the wake time, and the instant the copy names when it reports
-        /// a gap; on 21 of 21 corpus nights it sits within one 150 s epoch of a real record (max
-        /// 145 s), so naming it rather than the raw record keeps the caveat and the headline from
-        /// disagreeing by a minute.
+        /// Detected closing edge of the night — `SleepStaging` segments' max end, and the instant
+        /// the card prints as the wake time. On 21 of 21 corpus nights it sits within one 150 s
+        /// epoch of a real record (max 145 s).
+        ///
+        /// ⚠️ IT IS NO LONGER NECESSARILY THE INSTANT THE CAVEAT NAMES. This doc used to say it was,
+        /// "so the caveat and the headline can't disagree by a minute" — `WakeProvenance.Stoppage`
+        /// deliberately broke that, because the walk can consume records before the hole. The
+        /// caveat's first instant may sit up to `WakeProvenance.continuousToleranceSeconds` AFTER
+        /// the printed wake, so a card can legitimately read "you woke at 1:46" above "Nothing was
+        /// recorded between 1:51 and 5:16". That is the honest rendering — the ring really was
+        /// recording until 1:51 — and the two times are allowed to differ.
         public let inBedEnd: Date
 
         /// Newest measurement strictly BEFORE `inBedStart`, or nil.
@@ -65,7 +71,20 @@ extension SleepConfidence {
         public let lastMeasurementBeforeStart: Date?
         /// Oldest measurement strictly AFTER `inBedEnd`, or nil.
         /// `LocalStore.earliestSample(kind: .heartRate, after: inBedEnd)`.
+        ///
+        /// ⚠️ KEPT for the callers that genuinely hold only one instant (`ExportCoverageWitness`
+        /// rebuilding a night from an export). It is the DEFEATABLE input: one record inside the
+        /// continuity tolerance buys a `.witnessed` no matter what follows — see
+        /// `WakeProvenance.resumeRunMaxSeconds`. Prefer `measurementsAfterEnd`.
         public let firstMeasurementAfterEnd: Date?
+        /// Measurements after `inBedEnd`, enough of them to walk the run that starts there.
+        /// `LocalStore.samples(kind: .heartRate, after: inBedEnd, limit:)`.
+        ///
+        /// Empty is a legal, meaningful value — "we hold nothing after the edge" — and it makes the
+        /// walk fall back to `firstMeasurementAfterEnd`, i.e. exactly the shipped single-step rule.
+        /// The parameter is REQUIRED for the same reason `earliestRetainedMeasurement` is: a default
+        /// would let a caller keep the defeatable behaviour without ever deciding to.
+        public let measurementsAfterEnd: [Date]
         /// Oldest measurement retained at all, or nil on an empty store.
         /// `LocalStore.earliestSample(kind: .heartRate)` — tells "the ring recorded nothing" from
         /// "retention no longer reaches back that far".
@@ -75,11 +94,13 @@ extension SleepConfidence {
                     inBedEnd: Date,
                     lastMeasurementBeforeStart: Date?,
                     firstMeasurementAfterEnd: Date?,
+                    measurementsAfterEnd: [Date],
                     earliestRetainedMeasurement: Date?) {
             self.inBedStart = inBedStart
             self.inBedEnd = inBedEnd
             self.lastMeasurementBeforeStart = lastMeasurementBeforeStart
             self.firstMeasurementAfterEnd = firstMeasurementAfterEnd
+            self.measurementsAfterEnd = measurementsAfterEnd
             self.earliestRetainedMeasurement = earliestRetainedMeasurement
         }
     }
@@ -104,16 +125,19 @@ extension SleepConfidence {
         /// Nothing was recorded for `silentFor` seconds after the night's trailing edge. The
         /// reported duration reads LOW by an unknown amount BOUNDED BY (not equal to) that gap.
         ///
-        /// `from` is `Coverage.inBedEnd` — the same instant the card prints as the wake time.
+        /// `from` is the LAST MEASUREMENT BEFORE THE SILENCE — usually `Coverage.inBedEnd`, but
+        /// later than it whenever the ring kept recording briefly past the staged wake (see
+        /// `WakeProvenance.Stoppage`). Invariant the copy depends on:
+        /// **`from + silentFor` == the instant recording resumed.**
         case noRecordingAfterWake(from: Date, silentFor: TimeInterval)
 
         /// Nothing was recorded for `silentFor` seconds before the night's leading edge, so the
         /// printed bedtime is where recording resumed, not where the user settled.
         ///
-        /// ⚠️ OVERLAPS A SHIPPED HINT. `SleepCardView.bedtimeProvenanceHint` already says this,
-        /// driven by `BedtimeProvenance` at its 300 s tolerance — a strictly WIDER band than the
-        /// `materialGapSeconds` used here (4 of 21 corpus nights vs 3 of 21). A caller adopting this
-        /// type must render one or the other, never both, or the same edge gets caveated twice.
+        /// ⚠️ 2026-09-01: the overlap this warned about is GONE. `SleepCardView.coverageHints` now
+        /// renders this reason and the separate `bedtimeProvenanceHint` (which said the same thing
+        /// at `BedtimeProvenance`'s wider 300 s tolerance — 4 of 21 corpus nights vs 3 of 21) was
+        /// deleted. A caller must still render this OR a hint of its own, never both.
         case noRecordingBeforeBedtime(until: Date, silentFor: TimeInterval)
 
         /// The legacy signal: a multi-hour night at implausibly high efficiency, i.e. still-but-awake
@@ -214,15 +238,29 @@ extension SleepConfidence {
             inBedStart: c.inBedStart,
             lastMeasurementBefore: c.lastMeasurementBeforeStart,
             earliestRetainedMeasurement: c.earliestRetainedMeasurement)
-        let wake = WakeProvenance.classify(
+        // The UNION of both inputs, never one or the other. Taking the series alone whenever it is
+        // non-empty made the two fields silently exclusive: a series missing the first record
+        // INVENTS a stop the single-step rule called `.witnessed`, and a series that stops early
+        // SILENCES one it reported. Both are reachable through the public `Coverage.init`, whose
+        // docs present the two fields as independent inputs — so the seam, not the caller, is what
+        // has to be safe. Adding the first instant back can only make the walk quieter.
+        let afterEnd = Set(c.measurementsAfterEnd
+                            + [c.firstMeasurementAfterEnd].compactMap { $0 }).sorted()
+        let stoppage = WakeProvenance.stoppage(
             inBedEnd: c.inBedEnd,
-            firstMeasurementAfter: c.firstMeasurementAfterEnd,
+            measurementsAfter: afterEnd,
             earliestRetainedMeasurement: c.earliestRetainedMeasurement)
+        let wake = stoppage.verdict
 
         var reasons: [Reason] = []
 
         if case .stoppedThenResumed(let gap) = wake, gap > materialGapSeconds {
-            reasons.append(.noRecordingAfterWake(from: c.inBedEnd, silentFor: gap))
+            // `stoppage.silenceBegan`, NOT `c.inBedEnd`: the walk can consume records before the
+            // hole, so the silence may begin AFTER the edge. Rendering it from the edge names two
+            // instants that never happened (see `WakeProvenance.Stoppage`). The invariant the copy
+            // relies on is `from + silentFor == the record that resumed`.
+            reasons.append(.noRecordingAfterWake(from: stoppage.silenceBegan ?? c.inBedEnd,
+                                                 silentFor: gap))
         }
         if case .resumedAfterGap(let gap) = bedtime, gap > materialGapSeconds {
             reasons.append(.noRecordingBeforeBedtime(until: c.inBedStart, silentFor: gap))

@@ -365,6 +365,7 @@ final class ExportCoverageWitnessTests: XCTestCase {
                        SleepConfidence.Coverage(inBedStart: start, inBedEnd: end,
                                                 lastMeasurementBeforeStart: before,
                                                 firstMeasurementAfterEnd: after,
+                                                measurementsAfterEnd: [after],
                                                 earliestRetainedMeasurement: earliest))
     }
 }

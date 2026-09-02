@@ -22,12 +22,16 @@ final class SleepConfidenceCoverageTests: XCTestCase {
 
     private func coverage(before: TimeInterval?,
                           after: TimeInterval?,
-                          earliestDaysBack: Double = 14) -> SleepConfidence.Coverage {
+                          earliestDaysBack: Double = 14,
+                          afterSeries: [TimeInterval] = []) -> SleepConfidence.Coverage {
         SleepConfidence.Coverage(
             inBedStart: start,
             inBedEnd: end,
             lastMeasurementBeforeStart: before.map { start.addingTimeInterval(-$0) },
             firstMeasurementAfterEnd: after.map { end.addingTimeInterval($0) },
+            // Empty by default: every test below this line predates the run walk and is about the
+            // single-step rule, which an empty series reproduces exactly.
+            measurementsAfterEnd: afterSeries.map { end.addingTimeInterval($0) },
             earliestRetainedMeasurement: start.addingTimeInterval(-earliestDaysBack * 86_400))
     }
 
@@ -278,6 +282,7 @@ final class SleepConfidenceCoverageTests: XCTestCase {
             lastMeasurementBeforeStart: nil,
             // …but the oldest surviving row sits 21 days AFTER this night ended.
             firstMeasurementAfterEnd: end.addingTimeInterval(21 * 86_400),
+            measurementsAfterEnd: [],
             earliestRetainedMeasurement: end.addingTimeInterval(21 * 86_400))
         let a = SleepConfidence.assess(asleep: mins(249), inBed: mins(253), coverage: pruned)
         XCTAssertEqual(a.wake, .unknown,
@@ -310,6 +315,7 @@ final class SleepConfidenceCoverageTests: XCTestCase {
             coverage: SleepConfidence.Coverage(inBedStart: start, inBedEnd: end,
                                                lastMeasurementBeforeStart: nil,
                                                firstMeasurementAfterEnd: end.addingTimeInterval(14_616),
+                                               measurementsAfterEnd: [],
                                                earliestRetainedMeasurement: nil))
         XCTAssertEqual(a.wake, .stoppedThenResumed(14_616))
         XCTAssertEqual(a.reasons, [.noRecordingAfterWake(from: end, silentFor: 14_616)])

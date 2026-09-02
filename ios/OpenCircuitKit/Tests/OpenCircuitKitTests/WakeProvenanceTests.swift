@@ -205,4 +205,210 @@ final class WakeProvenanceTests: XCTestCase {
                            "offset \(offset) must not produce a negative gap")
         }
     }
+
+    // MARK: The run walk (the one-epoch defeat)
+
+    /// 🟢 THE REGRESSION THIS WALK EXISTS FOR — tester `40CFFE2E`, Gen 2 Air FR04.009, night
+    /// 2026-09-01, taken from her own diagnostics export (`opencircuit-night-2026-09-01.json`).
+    /// Every instant below is read out of that file, not constructed:
+    ///
+    ///   * `sleep[0].inBedEnd`            = 2026-09-01T01:32:21Z  (the staged edge)
+    ///   * `epochArchive[0].lastEpoch`    = 2026-09-01T01:32:51Z  (+30 s — the LAST record there is)
+    ///   * first heart rate after it      = 2026-09-01T05:35:20.951Z
+    ///     (+14549.951 s from the ARCHIVE EPOCH — i.e. +14579.951 s from `inBedEnd`; the silence
+    ///     is measured from the last record before it, which is the whole point of `Stoppage`)
+    ///
+    /// She got up at 07:30 local. Four hours of her night are missing, and the export carries
+    /// `edgeProvenance.wakeVerdict: "witnessed"` — the single 30 s epoch was enough to end the
+    /// enquiry. (Her post-edit export re-probes from the +120 s recorded edge and reports the same
+    /// hole as `wakeGapSeconds: 14429.95`; the two differ only by where the probe starts.)
+    func testOneEpochOfDataDoesNotBuyAWitnessedVerdict() {
+        // 2026-09-01T01:32:21Z. ⚠️ The literal was 1_788_485_541 until a review decoded it as
+        // 2026-09-04 — three days out, under a header promising every instant was read from the
+        // export. The arithmetic below is all relative so the test still passed, which is exactly
+        // why a stated-provenance claim has to be checked rather than trusted.
+        let end = Date(timeIntervalSince1970: 1_788_226_341)
+        let resumed = end.addingTimeInterval(30)              // 01:32:51Z, the archive's last record
+        let morning = end.addingTimeInterval(30 + 14549.951)  // 05:35:20.951Z, a live heart rate
+
+        // What shipped before this change, from exactly these instants.
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               firstMeasurementAfter: resumed,
+                                               earliestRetainedMeasurement: deepRetention(before: end)),
+                       .witnessed,
+                       "precondition: the single-step rule is defeated by one epoch")
+
+        // What the walk says. Compared with a tolerance because the instants are reconstructed
+        // through `Date`'s binary seconds — asserting the literal would be testing Double, not this.
+        let walked = WakeProvenance.classify(inBedEnd: end,
+                                             measurementsAfter: [resumed, morning],
+                                             earliestRetainedMeasurement: deepRetention(before: end))
+        guard case .stoppedThenResumed(let gap) = walked else {
+            return XCTFail("expected a stop, got \(walked)")
+        }
+        XCTAssertEqual(gap, 14549.951, accuracy: 0.001)
+        XCTAssertTrue(WakeProvenance.isMaterial(walked))
+    }
+
+    /// The bound is what stops the walk turning an ordinary daytime disconnect into a hole in the
+    /// night. A ring worn through the morning emits every 150 s; the first real break here is 3 h
+    /// after the edge, long past `resumeRunMaxSeconds`, and must read `.witnessed`.
+    func testARunThatCarriesOnPastTheBoundStaysWitnessed() {
+        let end = stopped
+        var series: [Date] = []
+        var offset: TimeInterval = 150
+        while offset <= 3 * 3600 { series.append(t(offset)); offset += 150 }
+        series.append(t(3 * 3600 + 4 * 3600))  // a 4 h daytime disconnect, hours past the edge
+
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: series,
+                                               earliestRetainedMeasurement: deepRetention(before: end)),
+                       .witnessed)
+    }
+
+    /// A hole that begins just INSIDE the bound is still this night's; just outside it is not.
+    func testTheBoundIsTheHoleSTARTNotItsSize() {
+        let end = stopped
+        func verdict(runLength: TimeInterval) -> WakeProvenance.Verdict {
+            var series: [Date] = []
+            var offset: TimeInterval = 150
+            while offset <= runLength { series.append(t(offset)); offset += 150 }
+            series.append(t(runLength + 4 * 3600))
+            return WakeProvenance.classify(inBedEnd: end,
+                                           measurementsAfter: series,
+                                           earliestRetainedMeasurement: deepRetention(before: end),
+                                           resumeRunLimit: 600)
+        }
+        XCTAssertEqual(verdict(runLength: 600), .stoppedThenResumed(4 * 3600))
+        XCTAssertEqual(verdict(runLength: 750), .witnessed)
+    }
+
+    /// The kill switch must reproduce the shipped rule EXACTLY — that is what makes "default off"
+    /// a real rollback rather than a hope.
+    func testWalkKillSwitchReproducesSingleStep() {
+        let end = stopped
+        let series = [t(150), t(150 + 14429), t(150 + 14429 + 150)]
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: series,
+                                               earliestRetainedMeasurement: deepRetention(before: end),
+                                               resumeRunLimit: 0),
+                       WakeProvenance.classify(inBedEnd: end,
+                                               firstMeasurementAfter: series.first,
+                                               earliestRetainedMeasurement: deepRetention(before: end)))
+    }
+
+    /// Additive only: the walk may upgrade `.witnessed`, never touch the other two verdicts.
+    func testWalkNeverSilencesAStopAndNeverInventsOne() {
+        let end = stopped
+        // Already a stop at the first step — the walk must return it untouched, not re-measure.
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: [t(14616), t(14766)],
+                                               earliestRetainedMeasurement: deepRetention(before: end)),
+                       .stoppedThenResumed(14616))
+        // Nothing after the edge stays `.unknown`.
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: [],
+                                               earliestRetainedMeasurement: deepRetention(before: end)),
+                       .unknown)
+        // Retention no longer reaches the night — `.unknown` regardless of what the series holds.
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: [t(150), t(150 + 14429)],
+                                               earliestRetainedMeasurement: t(60)),
+                       .unknown)
+        // An unbroken run to the end of what we hold is not evidence of a stop.
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: [t(150), t(300), t(450)],
+                                               earliestRetainedMeasurement: deepRetention(before: end)),
+                       .witnessed)
+    }
+
+    /// Unsorted and duplicated input must not change the answer — the real caller reads a store.
+    func testWalkIsOrderAndDuplicateInsensitive() {
+        let end = stopped
+        let jumbled = [t(150 + 14429), t(150), t(150), t(150 + 14429)]
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: jumbled,
+                                               earliestRetainedMeasurement: deepRetention(before: end)),
+                       .stoppedThenResumed(14429))
+    }
+
+    /// The tester-night fixture literal must BE the night it claims to be. The previous literal was
+    /// three days out and nothing caught it, because every assertion around it is relative.
+    func testTesterNightFixtureLiteralIsTheInstantItClaims() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let end = Date(timeIntervalSince1970: 1_788_226_341)
+        XCTAssertEqual(cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: end),
+                       DateComponents(year: 2026, month: 9, day: 1,
+                                      hour: 1, minute: 32, second: 21))
+    }
+
+    /// 🟢 THE REGRESSION M1 — the walk must report WHERE the silence began, not just how long it
+    /// lasted. Under the single-step rule the silence always started at `inBedEnd`, so the card
+    /// could render `inBedEnd … inBedEnd + gap` and be exactly right. The walk can consume records
+    /// first, and rendering from the edge then names TWO instants that never happened.
+    ///
+    /// Review probe (shortened to fit `resumeRunMaxSeconds`, which the same review narrowed to the
+    /// 300 s continuity tolerance): in-bed end, heart rates at +60/+210 s, then the ring is off and
+    /// the stream resumes 3h 30m after that last record. Rendered from the edge the card would say
+    /// the silence began at the wake time; it began 3½ minutes later.
+    func testTheReportedSilenceStartsAtTheLastRecordNotTheEdge() {
+        let end = stopped
+        let run = [t(60), t(210)]
+        let resume = t(210 + 12_600)
+        let s = WakeProvenance.stoppage(inBedEnd: end,
+                                        measurementsAfter: run + [resume],
+                                        earliestRetainedMeasurement: deepRetention(before: end))
+        XCTAssertEqual(s.verdict, .stoppedThenResumed(12_600))
+        XCTAssertEqual(s.silenceBegan, t(210), "the silence began at the LAST record, not inBedEnd")
+        // The invariant the copy depends on.
+        guard case .stoppedThenResumed(let gap) = s.verdict, let from = s.silenceBegan else {
+            return XCTFail("expected a stop")
+        }
+        XCTAssertEqual(from.addingTimeInterval(gap), resume,
+                       "from + silentFor must be the instant recording resumed")
+    }
+
+    /// 🟢 THE NARROWED BOUND (review M3). A ring worn well past the staged wake and THEN removed is
+    /// the ordinary morning-charge routine, and it is the false-positive class the corpus cannot
+    /// measure — 0 of its 21 nights populate this shape. At the 300 s tolerance such a night is
+    /// `.witnessed` and silent, exactly as on master. This is a deliberate cost, not an oversight:
+    /// it is what buys back the unmeasured risk.
+    func testARingWornSeveralMinutesPastWakeThenRemovedStaysSilent() {
+        let end = stopped
+        let run = [t(60), t(210), t(360), t(510)]   // still recording 8.5 min past the edge
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: run + [t(510 + 12_600)],
+                                               earliestRetainedMeasurement: deepRetention(before: end)),
+                       .witnessed)
+    }
+
+    /// A hole beginning exactly at the edge still reports the edge — the single-step behaviour.
+    func testASilenceAtTheEdgeStillReportsTheEdge() {
+        let end = stopped
+        let s = WakeProvenance.stoppage(inBedEnd: end,
+                                        measurementsAfter: [t(14_616)],
+                                        earliestRetainedMeasurement: deepRetention(before: end))
+        XCTAssertEqual(s.verdict, .stoppedThenResumed(14_616))
+        XCTAssertEqual(s.silenceBegan, end)
+    }
+
+    /// ⚠️ PINS A DELIBERATE NON-MONOTONICITY (review M2). Adding a real record can OPEN a hole,
+    /// because the walk measures the space BETWEEN consecutive records. An earlier comment in
+    /// `ExportCoverageWitness` claimed the opposite as a safety invariant; it was false, and this
+    /// test exists so the true behaviour is stated rather than assumed.
+    func testAddingARecordCanOpenAHoleAndThatIsIntended() {
+        let end = stopped
+        let retention = deepRetention(before: end)
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: [t(30)],
+                                               earliestRetainedMeasurement: retention),
+                       .witnessed)
+        XCTAssertEqual(WakeProvenance.classify(inBedEnd: end,
+                                               measurementsAfter: [t(30), t(400)],
+                                               earliestRetainedMeasurement: retention),
+                       .stoppedThenResumed(370))
+    }
+
+    private func deepRetention(before d: Date) -> Date { d.addingTimeInterval(-30 * 86400) }
 }

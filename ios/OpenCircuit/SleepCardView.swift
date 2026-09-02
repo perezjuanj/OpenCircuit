@@ -35,13 +35,19 @@ struct SleepCardView: View {
     @Query private var storedSleep: [StoredSleepSummary]
     /// Today's auto-detected naps (#76), latest first.
     @Query private var todayNaps: [StoredNap]
-    /// Whether this night's leading edge was observed or is just where recording resumed (#198).
-    /// Held as @State and refreshed in `.task(id:)` — never read from the store inside `body`.
-    @State private var bedtimeProvenance: BedtimeProvenance.Verdict = .unknown
-    /// Trailing-edge provenance, resolved beside `bedtimeProvenance` in the same off-render-path
-    /// task. Read ONLY by `confidenceHint`, which must not claim a night ran LONG unless we actually
-    /// watched it end. `.unknown` is the safe default: it suppresses that claim.
-    @State private var wakeProvenance: WakeProvenance.Verdict = .unknown
+    /// What this night's two edges and its duration honestly support (#198), resolved in the same
+    /// off-render-path `.task(id:)` — never read from the store inside `body`.
+    ///
+    /// Replaces the two separate verdict properties this card used to hold. They were rendered by
+    /// two independently-guarded hint builders, which is how a night could be told its duration
+    /// "may read a little high" while its own trailing edge said four hours were missing. One
+    /// assessment, one ordered reason list, one place that decides what is said.
+    /// nil until the task has run; nil renders nothing.
+    ///
+    /// Carries the night it was resolved FOR, for the reason `AssertedStages` does: `.task(id:)`
+    /// restarts only AFTER the render that observed the new key, so without the tag one frame paints
+    /// the previous night's instants under the current night's heading.
+    @State private var coverage: (nightKey: Date, assessment: SleepConfidence.Assessment)?
     /// The asserted share of the displayed night's stage minutes (#export-honesty). nil until the
     /// off-render-path task has resolved it, and on every night that has none — which is every
     /// unedited night, so the bar and legend are byte-identical to before for almost all of them.
@@ -134,10 +140,25 @@ struct SleepCardView: View {
 
     /// `.task(id:)` key for the edge-provenance refresh — both in-bed edges, so a wake-only Edit
     /// re-runs it. A struct rather than a tuple because `.task(id:)` needs `Equatable`.
+    ///
+    /// ⚠️ IT CARRIES THE DURATION TOTALS TOO, since 2026-09-01. The task now resolves a whole
+    /// `SleepConfidence.Assessment`, which is a function of `summary.totalAsleep` / `summary.inBed`
+    /// as well as the edges — and `StageProvenanceKey` below exists precisely because "a re-stage
+    /// can rewrite the timeline without moving either edge". On the edges alone, a re-stage that
+    /// reclassifies interior awake→light, or a live→stored swap, would leave the caveat stale.
+    /// The old `confidenceHint` was immune by accident: it read `SleepConfidence.classify` inline
+    /// in `body`, so it could never be stale.
     private struct EdgeKey: Equatable {
         let start: Date?
         let end: Date?
-        init(_ night: Night?) { start = night?.inBedStart; end = night?.inBedEnd }
+        let asleep: TimeInterval?
+        let inBed: TimeInterval?
+        init(_ night: Night?) {
+            start = night?.inBedStart
+            end = night?.inBedEnd
+            asleep = night?.summary.totalAsleep
+            inBed = night?.summary.inBed
+        }
     }
 
     /// One night resolved for display, from either the live staging or the persisted rollup.
@@ -511,19 +532,21 @@ struct SleepCardView: View {
     /// The caption rows under the footer, as ONE ViewBuilder child — `content` is already at the
     /// 10-child limit — and, more importantly, as the ONE place their precedence is stated.
     ///
-    /// AT MOST TWO ROWS EVER RENDER, which is exactly the ceiling before this line existed:
-    /// `captureHint` and `bedtimeProvenanceHint` are already mutually exclusive (the latter tests
-    /// `!isLikelyTruncated`), as are `captureHint` and `confidenceHint`, so the pre-existing maximum
-    /// was {bedtime, confidence}. `editedNightNotice` displaces BOTH of those, so the new maximum is
-    /// {capture, edited}. Three stacked caveats about one night is its own defect.
+    /// AT MOST TWO ROWS EVER RENDER. `coverageHints` replaced `bedtimeProvenanceHint` and
+    /// `confidenceHint` (2026-09-01) and carries their mutual exclusion forward: it suppresses BOTH
+    /// the front-edge reason and the duration note on a truncated night, so `captureHint` can never
+    /// stack with either, and `assess` already makes an acquisition reason and the duration note
+    /// mutually exclusive — leaving {back edge, front edge} as the coverage maximum.
+    /// `editedNightNotice` displaces all of them, so the overall maximum is {capture, edited}.
+    /// Three stacked caveats about one night is its own defect.
     ///
     /// WHY IT DISPLACES THEM, rather than sitting alongside:
     ///
-    /// - `bedtimeProvenanceHint` ends "tap Edit to correct it" / "Tap Edit if it's wrong". On a night
+    /// - the front-edge caveat ends "tap Edit to correct it" / "Tap Edit if it's wrong". On a night
     ///   the wearer has ALREADY edited that is not a caveat, it is the app failing to notice they did
     ///   the thing it is asking for. The new line makes the same underlying statement — the ring
     ///   recorded nothing across part of this window — and credits the correction instead.
-    /// - `confidenceHint` says "very still night — duration may read a little high", attributing a
+    /// - the duration note says "very still night — duration may read a little high", attributing a
     ///   high efficiency to a sensor ceiling. On an asserted night `summary.efficiency` is inflated
     ///   by the FILL, not by stillness (it is `asleep / inBed` on the display basis, which is why
     ///   `SleepProvenanceBreakdown.efficiency` refuses to publish a ratio over uncovered ground). So
@@ -542,8 +565,7 @@ struct SleepCardView: View {
         if let editedNotice {
             hintRow(systemImage: "pencil", tint: .secondary, editedNotice)
         } else {
-            bedtimeProvenanceHint(night)
-            confidenceHint(night)
+            coverageHints(night)
         }
     }
 
@@ -581,41 +603,54 @@ struct SleepCardView: View {
                                            mirrorsSleepToHealth: mirrorsSleepToHealth)
     }
 
-    /// Honest caveat when last night read implausibly high efficiency (near-zero detected wake over a
-    /// full night). The ring senses wake only from motion + HR elevation, so lying-still-but-awake at a
-    /// near-sleep heart rate (reading in bed, resting before rising) is invisible to it and gets absorbed
-    /// into light sleep — a hardware ceiling shared with the official RingConn app (see `SleepConfidence`).
-    /// We can't recover the lost wake, but we can stop presenting the inflated duration as gospel. Shown
-    /// only on a multi-hour night above a clearly-implausible efficiency, so it informs without nagging.
+    /// The night's caveats, rendered from ONE `SleepConfidence.Assessment` in its own order:
+    /// trailing edge, then leading edge, then the duration note.
+    ///
+    /// ⚠️ THIS IS THE CARD BRANCH THAT WAS PARKED (`feat/sleep-coverage-card`, a9f249c, 2026-08-19)
+    /// on the stated grounds that "that card fires on a SUSPECTED data gap whose false-positive rate
+    /// is unknown". What is known, measured over the 21 staged corpus nights by
+    /// `SleepCoverageMeasureTests`: it moves "some caveat" from 7/21 to 8/21 — ONE extra night, not
+    /// a flood — newly caveats `R2_2026-08-17` and `R2_2026-08-18` (the two nights understated by
+    /// 246 min, which nothing shipped says a word about), drops the 21.4-min pre-bedtime gap on
+    /// `R3_2026-08-09`, and takes the labelled cross-tab from TP 0 / FP 2 to TP 3 / FP 0.
+    /// ⚠️ THAT "FP 0" IS OUT OF **ONE** GOOD LABELLED NIGHT. It is not a rate, and the original
+    /// concern is therefore reduced, not answered.
+    ///
+    /// ⚠️ `!isLikelyTruncated` GUARDS TWO REASONS, NOT ONE. The deleted `bedtimeProvenanceHint`
+    /// carried it for its own stated reason — "suppressed when `captureHint` already fired: a
+    /// truncated night is the same class of statement … two stacked caveats about the same edge read
+    /// as nagging". Applying it only to the duration note let `captureHint` ("Synced only from
+    /// 01:12") and `.noRecordingBeforeBedtime` ("01:12 is when the ring started recording again")
+    /// render together about the SAME edge, and with both acquisition reasons firing the card could
+    /// show THREE rows — breaking the two-row ceiling `hints(_:)` above states as an invariant.
+    /// `contiguous` really is the duration note's alone: it is an efficiency-artifact test.
     @ViewBuilder
-    private func confidenceHint(_ night: Night) -> some View {
-        // Only meaningful on a CONTIGUOUS, fully-captured night. Skip a truncated night (under-captured,
-        // the opposite problem — see isLikelyTruncated) and a FRAGMENTED night, where data gaps make the
-        // SUMMED in-bed (and thus efficiency) an artifact rather than a sign of stillness: if the
-        // wall-clock in-bed span far exceeds the summed in-bed, there are gaps, so don't judge efficiency.
-        let contiguous: Bool = {
-            guard let s = night.inBedStart, let e = night.inBedEnd, night.summary.inBed > 0 else { return true }
-            return e.timeIntervalSince(s) <= night.summary.inBed * 1.15
-        }()
-        // 🟢 AND the trailing edge must be WITNESSED. `isLikelyTruncated` above only tests the
-        // LEADING edge (a late onset vs a scheduled bedtime) and only when the wearer enabled a
-        // manual schedule, so it is structurally blind to a night that stops early — which is the
-        // shape this hint gets exactly backwards.
-        //
-        // THE CASE (Gen 2 Air FR04.009, night 2026-08-25/26, build 48): the record stream ended at
-        // 02:47:30 against a real 06:46 wake, so the night was missing ~4 h — and the ONLY caption
-        // the card showed her said "duration may read a little high". Her export carries the
-        // evidence: `wakeVerdict: "unknown"` next to `reasons: ["durationLikelyHigh"]`.
-        //
-        // `.unknown` must suppress it just as `.stoppedThenResumed` does: a duration-reads-HIGH claim
-        // asserts the measured window IS the whole night, and only a witnessed edge establishes that
-        // ("we did not look" must never read as "we watched" — `WakeProvenance.Verdict.unknown`).
-        // Coverage inside the detected window cannot substitute: it is 0.976–1.049 on 21 of 21
-        // corpus nights, vacuous by construction because the window is DEFINED by the records.
-        if contiguous, !isLikelyTruncated(night), wakeProvenance == .witnessed,
-           SleepConfidence.classify(night.summary) == .durationLikelyHigh {
-            hintRow(systemImage: "info.circle", tint: .secondary,
-                    "Very still night — duration may read a little high. The ring can't sense motionless wakefulness (no movement, near-sleep heart rate), so quiet time awake in bed is counted as light sleep.")
+    private func coverageHints(_ night: Night) -> some View {
+        // The tag, not just the value: a stale assessment from the previous night must not be
+        // painted under this one while the refresh task is still in flight.
+        if let resolved = coverage, resolved.nightKey == night.nightKey {
+            let assessment = resolved.assessment
+            // Only meaningful on a CONTIGUOUS night: if the wall-clock in-bed span far exceeds the
+            // summed in-bed there are gaps, so efficiency is an artifact rather than stillness.
+            let contiguous: Bool = {
+                guard let s = night.inBedStart, let e = night.inBedEnd, night.summary.inBed > 0
+                else { return true }
+                return e.timeIntervalSince(s) <= night.summary.inBed * 1.15
+            }()
+            let truncated = isLikelyTruncated(night)
+            let rows = SleepConfidence.hints(assessment, clock: Self.clock).filter { hint in
+                switch hint.reason {
+                case .durationLikelyHigh:        return contiguous && !truncated
+                case .noRecordingBeforeBedtime:  return !truncated
+                case .noRecordingAfterWake:      return true
+                }
+            }
+            // `Hint.reason` is Hashable and `assess` emits at most one of each case, so it is a
+            // stable identity — unlike a positional offset, which reshuffles every row when the
+            // list shrinks.
+            ForEach(rows, id: \.reason) { hint in
+                hintRow(systemImage: hint.systemImage, tint: .secondary, hint.text)
+            }
         }
     }
 
@@ -677,8 +712,8 @@ struct SleepCardView: View {
     ///
     /// ⚠️ Stated as what the verdict DRIVES, not as what she saw. This function probes the window
     /// the card PRINTS (edit-aware) while the export probes the RECORDED one, so on an edited night
-    /// the two edges are not the same instant; and `bedtimeProvenanceHint` suppresses itself when
-    /// `isLikelyTruncated` fires. What is established is the probe's defect class, not that this
+    /// the two edges are not the same instant; and `coverageHints` suppresses the front-edge reason
+    /// when `isLikelyTruncated` fires. What is established is the probe's defect class, not that this
     /// exact sentence rendered on her phone.
     ///
     /// So the two instants are unioned with this ring's ~30 h epoch archive, exactly as the export's
@@ -698,8 +733,7 @@ struct SleepCardView: View {
         // Resolved ONCE: `night` re-stages `liveSegments` and re-reads the stored rollup on every
         // access, and this function needs both of its clock times.
         guard let resolved = night, let start = resolved.inBedStart else {
-            bedtimeProvenance = .unknown
-            wakeProvenance = .unknown
+            coverage = nil
             return
         }
         let store = LocalStore(modelContext)
@@ -724,14 +758,16 @@ struct SleepCardView: View {
             storedEarliestRetained: earliest?.start,
             inBedStart: start,
             inBedEnd: end)
-        bedtimeProvenance = BedtimeProvenance.classify(
-            inBedStart: start,
-            lastMeasurementBefore: edges.lastMeasurementBeforeStart,
-            earliestRetainedMeasurement: edges.earliestRetainedMeasurement)
-        wakeProvenance = WakeProvenance.classify(
-            inBedEnd: end,
-            firstMeasurementAfter: edges.firstMeasurementAfterEnd,
-            earliestRetainedMeasurement: edges.earliestRetainedMeasurement)
+        // ONE assessment for both edges and the duration note. `edges.coverage` carries the run
+        // after the trailing edge, not just its first instant — `edges` already unions the store
+        // with the epoch archive, and it was that union's single 30 s epoch that bought a
+        // `.witnessed` on the night this changed (see `WakeProvenance.resumeRunMaxSeconds`).
+        //
+        // `assess` also enforces the mutual exclusion the two old hint builders could not: an
+        // acquisition reason suppresses the duration-reads-high note, because "your duration may
+        // read a little HIGH" on a night that lost four hours is the inverse of the truth.
+        coverage = (resolved.nightKey,
+                    SleepConfidence.assess(resolved.summary, coverage: edges.coverage))
     }
 
     // MARK: Stage provenance (the hatched share of the bar)
@@ -795,36 +831,6 @@ struct SleepCardView: View {
         let out = (light: mins(a.light, cap: m.light), deep: mins(a.deep, cap: m.deep),
                    rem: mins(a.rem, cap: m.rem), awake: mins(a.awake, cap: m.awake))
         return (out.light + out.deep + out.rem + out.awake) > 0 ? out : nil
-    }
-
-    /// Say plainly when the printed bedtime is where DATA starts rather than where the user settled.
-    ///
-    /// Suppressed when `captureHint` already fired: a truncated night is the same class of statement
-    /// ("synced only from X") and two stacked caveats about the same edge read as nagging.
-    ///
-    /// ⚠️ The copy names no CAUSE. Charging, taking the ring off and a BLE dropout are
-    /// indistinguishable from the persisted stream, and there are n = 0 bedtime labels in the corpus
-    /// — so it reports the observation (nothing was recorded before this) and points at the one
-    /// thing the user can actually do about it: correct it with Edit (#176), which is also the
-    /// supervised label this whole area lacks.
-    @ViewBuilder
-    private func bedtimeProvenanceHint(_ night: Night) -> some View {
-        if let start = night.inBedStart, !isLikelyTruncated(night),
-           BedtimeProvenance.needsQualification(bedtimeProvenance) {
-            switch bedtimeProvenance {
-            case .resumedAfterGap(let gap):
-                hintRow(systemImage: "bed.double", tint: .secondary,
-                        "\(Self.clock(start)) is when the ring started recording again, not when you settled — it recorded nothing for \(Self.approximateDuration(gap)) before that. If you were already in bed, tap Edit to correct it.")
-            case .noPriorMeasurement:
-                hintRow(systemImage: "bed.double", tint: .secondary,
-                        "\(Self.clock(start)) is where this night's recording begins — there's nothing before it, so we can't tell whether you were already in bed. Tap Edit if it's wrong.")
-            case .witnessed, .unknown:
-                // `.unknown` stays SILENT: we could not judge, and a caveat we can't support is its
-                // own kind of dishonesty. It simply doesn't earn the unqualified claim either — the
-                // card just prints the time without asserting it was observed.
-                EmptyView()
-            }
-        }
     }
 
     /// A gap rendered at the precision the measurement supports — whole minutes under an hour, then

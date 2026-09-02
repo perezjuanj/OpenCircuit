@@ -112,6 +112,7 @@ final class ExportSchemaV3Tests: XCTestCase {
                 inBedStart: t0, inBedEnd: t1,
                 lastMeasurementBeforeStart: t0.addingTimeInterval(-100),
                 firstMeasurementAfterEnd: t1.addingTimeInterval(4 * 3600),
+                measurementsAfterEnd: [],
                 earliestRetainedMeasurement: t0.addingTimeInterval(-7 * 86_400)))
         return ExportEngine.SleepEdgeProvenanceRow(windowStart: t0, windowEnd: t1,
                                                    assessment: assessment)
