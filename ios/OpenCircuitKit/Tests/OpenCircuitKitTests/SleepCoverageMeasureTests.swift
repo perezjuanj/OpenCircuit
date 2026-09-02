@@ -242,7 +242,11 @@ final class SleepCoverageMeasureTests: XCTestCase {
             if !isTruncated, case .resumedAfterGap = a.bedtime { cardBedtime.append(row.id) }
         }
         let cardToday = Set(cardDuration).union(cardBedtime)
-        print("\nCARD TODAY (shipped guards re-run, not assumed):")
+        // ⚠️ 2026-09-01: THE CARD NO LONGER WORKS THIS WAY. `SleepCardView.coverageHints` now
+        // renders `assess().reasons` through one path, so the rows below are the RETIRED two-hint
+        // card, kept as the comparison baseline this change was argued from — not a description of
+        // what ships. The line that matches the shipped card is the `assess().reasons` one.
+        print("\nCARD BEFORE 2026-09-01 (the retired two-hint card, re-run for comparison):")
         print("  confidenceHint (pre wake-gate) : \(cardDurationPreGate.count)/\(rows.count)  [\(cardDurationPreGate.joined(separator: ", "))]")
         print("  confidenceHint fires        : \(cardDuration.count)/\(rows.count)  [\(cardDuration.joined(separator: ", "))]")
         print("    …suppressed by wake != witnessed : "
@@ -250,14 +254,16 @@ final class SleepCoverageMeasureTests: XCTestCase {
         print("  bedtimeProvenanceHint fires : \(cardBedtime.count)/\(rows.count)  [\(cardBedtime.sorted().joined(separator: ", "))]")
         print("  SleepCaptureCoverage == .likelyTruncated : \(truncated.count)/\(rows.count)")
         print("  contiguity guard fails      : \(nonContiguous.count)/\(rows.count)")
-        print("  ⇒ SOME caveat today         : \(cardToday.count)/\(rows.count)")
-        print("  ⇒ SOME caveat if the card renders assess().reasons instead : \(after.count)/\(rows.count)")
+        print("  ⇒ SOME caveat, retired card : \(cardToday.count)/\(rows.count)")
+        print("  ⇒ SOME caveat, SHIPPED card (renders assess().reasons) : \(after.count)/\(rows.count)")
         let doubled = Set(rows.filter {
             let a = assess($0, cut: WakeProvenance.materialGapSeconds)
             return a.reasons.contains { if case .noRecordingBeforeBedtime = $0 { return true } else { return false } }
         }.map(\.id)).intersection(cardBedtime)
-        print("  ⚠️ nights where the front-edge reason DOUBLES the shipped bedtime hint if both are"
-              + " rendered: \(doubled.count)  [\(doubled.sorted().joined(separator: ", "))]")
+        // Was a hazard while BOTH could render; the shipped card has one path, so this is now a
+        // regression tripwire — it must stay at 0 doubled rows on the shipped path.
+        print("  ⚠️ nights the retired bedtime hint would DOUBLE the front-edge reason: "
+              + "\(doubled.count)  [\(doubled.sorted().joined(separator: ", "))]")
 
         // ---- labelled cross-tab
         print("\n--- TABLE 3: the labelled nights (BAD = worst edge error >= \(Int(Self.badEdgeMinutes)) min)")
