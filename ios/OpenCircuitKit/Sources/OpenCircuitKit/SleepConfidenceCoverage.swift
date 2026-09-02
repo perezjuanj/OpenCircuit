@@ -53,11 +53,17 @@ extension SleepConfidence {
 
         /// Detected opening edge of the night — `SleepStaging` segments' min start.
         public let inBedStart: Date
-        /// Detected closing edge of the night — `SleepStaging` segments' max end. This is also the
-        /// instant the card prints as the wake time, and the instant the copy names when it reports
-        /// a gap; on 21 of 21 corpus nights it sits within one 150 s epoch of a real record (max
-        /// 145 s), so naming it rather than the raw record keeps the caveat and the headline from
-        /// disagreeing by a minute.
+        /// Detected closing edge of the night — `SleepStaging` segments' max end, and the instant
+        /// the card prints as the wake time. On 21 of 21 corpus nights it sits within one 150 s
+        /// epoch of a real record (max 145 s).
+        ///
+        /// ⚠️ IT IS NO LONGER NECESSARILY THE INSTANT THE CAVEAT NAMES. This doc used to say it was,
+        /// "so the caveat and the headline can't disagree by a minute" — `WakeProvenance.Stoppage`
+        /// deliberately broke that, because the walk can consume records before the hole. The
+        /// caveat's first instant may sit up to `WakeProvenance.continuousToleranceSeconds` AFTER
+        /// the printed wake, so a card can legitimately read "you woke at 1:46" above "Nothing was
+        /// recorded between 1:51 and 5:16". That is the honest rendering — the ring really was
+        /// recording until 1:51 — and the two times are allowed to differ.
         public let inBedEnd: Date
 
         /// Newest measurement strictly BEFORE `inBedStart`, or nil.

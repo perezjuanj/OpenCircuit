@@ -102,7 +102,9 @@ public enum WakeProvenance: Equatable, Sendable {
     ///
     /// ⚠️ NOTE WHERE THE DEFEATING RECORD CAME FROM — `ExportCoverageWitness`'s archive union,
     /// whose whole purpose is to make reported gaps SHRINK because a store-only probe over-reports
-    /// them (#198). It is monotone and it is right to keep, but it means the single-step rule can be
+    /// them (#198). It is monotone for the single INSTANTS it picks — NOT for the series, see
+    /// `ExportCoverageWitness.Edges.measurementsAfterEnd` — and it is right to keep, but it means
+    /// the single-step rule can be
     /// defeated by the one epoch the union exists to contribute. The walk is what makes the union
     /// safe: filling a gap can no longer end the enquiry.
     ///
@@ -118,7 +120,7 @@ public enum WakeProvenance: Equatable, Sendable {
     /// ⚠️ IT IS THE CONTINUITY TOLERANCE, DELIBERATELY — NOT A NEW NUMBER. It was 600 s until a
     /// review pointed out the thing that matters here: **the corpus contains ZERO nights of the
     /// shape this walk acts on** (a record inside the bound, then a material hole — 0 of 21; the
-    /// other 21 either break at 0.0 min, which the single-step rule already caught, or run unbroken
+    /// other 21 all either break at 0.0 min, which the single-step rule already caught, or run unbroken
     /// past every candidate bound). So "TABLE 1 is byte-identical" says the change is INERT on the
     /// corpus; it says nothing about its false-positive rate, and a rule of three puts the 95 %
     /// upper bound around 14 % of nights. A free parameter chosen on n = 1 against an unpopulated
@@ -242,9 +244,12 @@ public enum WakeProvenance: Equatable, Sendable {
     /// gap it measures runs between two POST-EDGE records and `inBedEnd + gap` names an instant that
     /// never happened — both endpoints wrong, by up to `resumeRunLimit`.
     ///
-    /// Measured on the review's probe: in-bed end 01:46, records at +60/+210/+360/+510 s, stream
-    /// resumes 05:16. The card said "Nothing was recorded between 01:46 and 05:08". It was not
-    /// silent at 01:46 (the ring ran another 8.5 min) and it resumed at 05:16, not 05:08.
+    /// Measured on the review's probe: in-bed end 01:46, records at +60/+210 s, stream resumes
+    /// 05:16. Rendered from the edge the card says the silence began at 01:46 and ended at 05:12:30;
+    /// it began at 01:49:30 and ended at 05:16. Both endpoints wrong.
+    /// ⚠️ The probe originally ran to +510 s. At the shipped `resumeRunMaxSeconds` that input is
+    /// `.witnessed` and silent — see `testARingWornSeveralMinutesPastWakeThenRemovedStaysSilent` —
+    /// so the example is stated at a length the shipped bound can actually reach.
     ///
     /// `silenceBegan` restores the invariant **`silenceBegan + gap == the record that resumed`**.
     /// It is nil for every verdict that names no hole.

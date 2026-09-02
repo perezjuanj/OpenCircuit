@@ -43,7 +43,11 @@ struct SleepCardView: View {
     /// "may read a little high" while its own trailing edge said four hours were missing. One
     /// assessment, one ordered reason list, one place that decides what is said.
     /// nil until the task has run; nil renders nothing.
-    @State private var coverage: SleepConfidence.Assessment?
+    ///
+    /// Carries the night it was resolved FOR, for the reason `AssertedStages` does: `.task(id:)`
+    /// restarts only AFTER the render that observed the new key, so without the tag one frame paints
+    /// the previous night's instants under the current night's heading.
+    @State private var coverage: (nightKey: Date, assessment: SleepConfidence.Assessment)?
     /// The asserted share of the displayed night's stage minutes (#export-honesty). nil until the
     /// off-render-path task has resolved it, and on every night that has none — which is every
     /// unedited night, so the bar and legend are byte-identical to before for almost all of them.
@@ -622,7 +626,10 @@ struct SleepCardView: View {
     /// `contiguous` really is the duration note's alone: it is an efficiency-artifact test.
     @ViewBuilder
     private func coverageHints(_ night: Night) -> some View {
-        if let assessment = coverage {
+        // The tag, not just the value: a stale assessment from the previous night must not be
+        // painted under this one while the refresh task is still in flight.
+        if let resolved = coverage, resolved.nightKey == night.nightKey {
+            let assessment = resolved.assessment
             // Only meaningful on a CONTIGUOUS night: if the wall-clock in-bed span far exceeds the
             // summed in-bed there are gaps, so efficiency is an artifact rather than stillness.
             let contiguous: Bool = {
@@ -759,7 +766,8 @@ struct SleepCardView: View {
         // `assess` also enforces the mutual exclusion the two old hint builders could not: an
         // acquisition reason suppresses the duration-reads-high note, because "your duration may
         // read a little HIGH" on a night that lost four hours is the inverse of the truth.
-        coverage = SleepConfidence.assess(resolved.summary, coverage: edges.coverage)
+        coverage = (resolved.nightKey,
+                    SleepConfidence.assess(resolved.summary, coverage: edges.coverage))
     }
 
     // MARK: Stage provenance (the hatched share of the bar)

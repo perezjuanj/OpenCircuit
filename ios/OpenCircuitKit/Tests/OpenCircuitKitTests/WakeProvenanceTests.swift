@@ -332,6 +332,17 @@ final class WakeProvenanceTests: XCTestCase {
                        .stoppedThenResumed(14429))
     }
 
+    /// The tester-night fixture literal must BE the night it claims to be. The previous literal was
+    /// three days out and nothing caught it, because every assertion around it is relative.
+    func testTesterNightFixtureLiteralIsTheInstantItClaims() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let end = Date(timeIntervalSince1970: 1_788_226_341)
+        XCTAssertEqual(cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: end),
+                       DateComponents(year: 2026, month: 9, day: 1,
+                                      hour: 1, minute: 32, second: 21))
+    }
+
     /// 🟢 THE REGRESSION M1 — the walk must report WHERE the silence began, not just how long it
     /// lasted. Under the single-step rule the silence always started at `inBedEnd`, so the card
     /// could render `inBedEnd … inBedEnd + gap` and be exactly right. The walk can consume records
