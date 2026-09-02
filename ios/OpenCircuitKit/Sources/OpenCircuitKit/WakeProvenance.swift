@@ -89,6 +89,44 @@ public enum WakeProvenance: Equatable, Sendable {
     /// `.infinity` is the kill switch — no acquisition reason is ever emitted.
     public static let materialGapSeconds: TimeInterval = 60 * 60
 
+    /// How far past the in-bed end a material hole may BEGIN and still be part of this night.
+    ///
+    /// ⚠️ THIS EXISTS BECAUSE THE ONE-RECORD LOOKAHEAD BELOW IS DEFEATABLE BY A SINGLE EPOCH, and
+    /// that is not hypothetical — it is the tester night that prompted it. `40CFFE2E` (Gen 2 Air,
+    /// FR04.009), night 2026-09-01, read out of her own diagnostics export: in-bed end 01:32:21Z,
+    /// the epoch archive's LAST record at 01:32:51Z (**30 s** — well inside
+    /// `continuousToleranceSeconds`), then NOTHING for 14549.95 s until a live heart rate at
+    /// 05:35:20Z. She got up at 07:30 local. The two-argument `classify` answers `.witnessed` on
+    /// that night: the most reassuring verdict this type can give, on a night missing four hours,
+    /// and her export carries it as `wakeVerdict: "witnessed"`.
+    ///
+    /// ⚠️ NOTE WHERE THE DEFEATING RECORD CAME FROM — `ExportCoverageWitness`'s archive union,
+    /// whose whole purpose is to make reported gaps SHRINK because a store-only probe over-reports
+    /// them (#198). It is monotone and it is right to keep, but it means the single-step rule can be
+    /// defeated by the one epoch the union exists to contribute. The walk is what makes the union
+    /// safe: filling a gap can no longer end the enquiry.
+    ///
+    /// The corpus's own two 246-minute nights
+    /// (`R2_2026-08-17`, `R2_2026-08-18`) are caught only because their holes begin EXACTLY at the
+    /// in-bed end; move either hole a single 30 s epoch later and they go silent too.
+    ///
+    /// So the lookahead walks the CONTINUOUS RUN that starts at the in-bed end instead of taking
+    /// one step, and this bounds how long that walk may last. A bound is required: a ring worn
+    /// through the day keeps emitting at the 150 s cadence, so an unbounded walk would eventually
+    /// find some ordinary daytime disconnect and report it as a hole in the night.
+    ///
+    /// ⚠️ NOT FITTED, AND CHOSEN ON n = 1. The only measured hole-start offset is the 30 s above.
+    /// The corpus cannot narrow it: on all 21 staged nights the run that starts at the in-bed end
+    /// is either one record long or unbroken past every candidate bound, so **every value in
+    /// [30 s, 1 h] scores identically there** — TABLE 1 of `SleepCoverageMeasureTests` is
+    /// byte-identical with the walk on and off. 600 s is 20× the observed offset and still far below
+    /// the ~4 h holes this is for; it is a judgement, not a measurement, and the sweep is one line
+    /// (`resumeRunLimit:`).
+    ///
+    /// `0` is the KILL SWITCH — the walk never runs and the array overload reproduces the
+    /// two-argument one exactly, which `testWalkKillSwitchReproducesSingleStep` asserts.
+    public static let resumeRunMaxSeconds: TimeInterval = 600
+
     /// Classify the trailing edge of a night's in-bed window.
     ///
     /// - Parameters:
@@ -163,6 +201,46 @@ public enum WakeProvenance: Equatable, Sendable {
         guard next > inBedEnd else { return .unknown }
         let gap = next.timeIntervalSince(inBedEnd)
         return gap <= continuousToleranceSeconds ? .witnessed : .stoppedThenResumed(gap)
+    }
+
+    /// Classify the trailing edge against the WHOLE run of measurements that follows it.
+    ///
+    /// Strictly additive over the two-argument version: it returns that verdict unchanged except
+    /// when it is `.witnessed`, which it may upgrade to `.stoppedThenResumed`. It can never silence
+    /// a stop, never invent an `.unknown`, and never flag a night the single-step rule already
+    /// cleared for any reason other than a real hole beginning within `resumeRunLimit` of the edge.
+    ///
+    /// - Parameters:
+    ///   - measurementsAfter: wrist measurements after `inBedEnd`, same HR-only discipline as the
+    ///     two-argument version. Order and duplicates do not matter — it sorts and filters. Entries
+    ///     at or before `inBedEnd` are dropped rather than allowed to compute a negative gap.
+    ///   - resumeRunLimit: how far past `inBedEnd` a hole may BEGIN. `0` disables the walk.
+    public static func classify(inBedEnd: Date,
+                                measurementsAfter: [Date],
+                                earliestRetainedMeasurement: Date?,
+                                resumeRunLimit: TimeInterval = resumeRunMaxSeconds) -> Verdict {
+        let ordered = measurementsAfter.filter { $0 > inBedEnd }.sorted()
+        let base = classify(inBedEnd: inBedEnd,
+                            firstMeasurementAfter: ordered.first,
+                            earliestRetainedMeasurement: earliestRetainedMeasurement)
+        // Only a `.witnessed` can be wrong in the direction this walk exists to fix. A
+        // `.stoppedThenResumed` already names a hole and an `.unknown` already says we cannot tell;
+        // re-deciding either from the same rows could only make the verdict less honest.
+        guard case .witnessed = base, resumeRunLimit > 0 else { return base }
+
+        var previous = inBedEnd
+        for m in ordered {
+            let gap = m.timeIntervalSince(previous)
+            if gap > continuousToleranceSeconds { return .stoppedThenResumed(gap) }
+            previous = m
+            // The run carried on well past the edge, so the night genuinely ended while the ring
+            // was still measuring. Anything later is daytime, not this night.
+            if previous.timeIntervalSince(inBedEnd) > resumeRunLimit { return .witnessed }
+        }
+        // The run reached the end of what we hold without breaking. Unchanged from `base` on
+        // purpose: "our archive stops here" is the `.unknown` story, but the single-step rule
+        // already called this `.witnessed` and this function must not silence or re-label it.
+        return .witnessed
     }
 
     /// Whether a verdict is worth putting in front of the user.

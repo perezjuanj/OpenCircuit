@@ -123,6 +123,14 @@ public enum ExportCoverageWitness {
         public let lastMeasurementBeforeStart: Date?
         /// Earliest heart-rate instant strictly AFTER `inBedEnd`, from store ∪ archive.
         public let firstMeasurementAfterEnd: Date?
+        /// EVERY heart-rate instant strictly after `inBedEnd` this probe could reach, so the wake
+        /// verdict can walk the run rather than take one step (`WakeProvenance.resumeRunMaxSeconds`).
+        ///
+        /// Monotone in the SAFE direction, by the same argument as the instants above: adding a
+        /// witness can only FILL a gap, never open one, so a richer archive can only make this
+        /// quieter. A probe whose reach is truncated shortly after the edge therefore degrades to
+        /// `.witnessed` — the shipped answer — and never manufactures a hole.
+        public let measurementsAfterEnd: [Date]
         /// Oldest heart-rate instant we hold at all, from store ∪ archive. Feeds the retention
         /// guards in `BedtimeProvenance.classify` / `WakeProvenance.classify` — see the note on
         /// `edges(archives:…)` for why unioning it cannot weaken them.
@@ -144,6 +152,7 @@ public enum ExportCoverageWitness {
                                      inBedEnd: inBedEnd,
                                      lastMeasurementBeforeStart: lastMeasurementBeforeStart,
                                      firstMeasurementAfterEnd: firstMeasurementAfterEnd,
+                                     measurementsAfterEnd: measurementsAfterEnd,
                                      earliestRetainedMeasurement: earliestRetainedMeasurement)
         }
 
@@ -221,10 +230,15 @@ public enum ExportCoverageWitness {
             .compactMap { $0 }.min()
         let earliest = [storedEarliestRetained, inReach.min()].compactMap { $0 }.min()
 
+        let afterEnd = Set(inReach.filter { $0 > inBedEnd }
+                            + [storedFirstAfterEnd].compactMap { $0 }.filter { $0 > inBedEnd })
+            .sorted()
+
         return Edges(inBedStart: inBedStart,
                      inBedEnd: inBedEnd,
                      lastMeasurementBeforeStart: last,
                      firstMeasurementAfterEnd: first,
+                     measurementsAfterEnd: afterEnd,
                      earliestRetainedMeasurement: earliest,
                      archiveEpochsInReach: inReach.count,
                      archiveMovedAnEdge: last != storedLastBeforeStart

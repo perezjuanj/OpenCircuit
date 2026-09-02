@@ -126,6 +126,10 @@ final class SleepCoverageMeasureTests: XCTestCase {
                 inBedEnd: end,
                 lastMeasurementBeforeStart: usableBefore,
                 firstMeasurementAfterEnd: usableAfter,
+                // The run that starts at the in-bed end, withheld past the horizon like the single
+                // instant is. Empty when the edge is withheld, which reproduces the shipped rule.
+                measurementsAfterEnd: usableAfter == nil ? []
+                    : own.filter { $0 > end && $0.timeIntervalSince(end) <= Self.horizon },
                 // Withheld together with the predecessor: an undeterminable leading edge must read
                 // `.unknown`, not `.noPriorMeasurement` (which the horizon would otherwise fake).
                 earliestRetainedMeasurement: usableBefore == nil ? nil : own.first)

@@ -65,7 +65,20 @@ extension SleepConfidence {
         public let lastMeasurementBeforeStart: Date?
         /// Oldest measurement strictly AFTER `inBedEnd`, or nil.
         /// `LocalStore.earliestSample(kind: .heartRate, after: inBedEnd)`.
+        ///
+        /// ⚠️ KEPT for the callers that genuinely hold only one instant (`ExportCoverageWitness`
+        /// rebuilding a night from an export). It is the DEFEATABLE input: one record inside the
+        /// continuity tolerance buys a `.witnessed` no matter what follows — see
+        /// `WakeProvenance.resumeRunMaxSeconds`. Prefer `measurementsAfterEnd`.
         public let firstMeasurementAfterEnd: Date?
+        /// Measurements after `inBedEnd`, enough of them to walk the run that starts there.
+        /// `LocalStore.samples(kind: .heartRate, after: inBedEnd, limit:)`.
+        ///
+        /// Empty is a legal, meaningful value — "we hold nothing after the edge" — and it makes the
+        /// walk fall back to `firstMeasurementAfterEnd`, i.e. exactly the shipped single-step rule.
+        /// The parameter is REQUIRED for the same reason `earliestRetainedMeasurement` is: a default
+        /// would let a caller keep the defeatable behaviour without ever deciding to.
+        public let measurementsAfterEnd: [Date]
         /// Oldest measurement retained at all, or nil on an empty store.
         /// `LocalStore.earliestSample(kind: .heartRate)` — tells "the ring recorded nothing" from
         /// "retention no longer reaches back that far".
@@ -75,11 +88,13 @@ extension SleepConfidence {
                     inBedEnd: Date,
                     lastMeasurementBeforeStart: Date?,
                     firstMeasurementAfterEnd: Date?,
+                    measurementsAfterEnd: [Date],
                     earliestRetainedMeasurement: Date?) {
             self.inBedStart = inBedStart
             self.inBedEnd = inBedEnd
             self.lastMeasurementBeforeStart = lastMeasurementBeforeStart
             self.firstMeasurementAfterEnd = firstMeasurementAfterEnd
+            self.measurementsAfterEnd = measurementsAfterEnd
             self.earliestRetainedMeasurement = earliestRetainedMeasurement
         }
     }
@@ -214,9 +229,14 @@ extension SleepConfidence {
             inBedStart: c.inBedStart,
             lastMeasurementBefore: c.lastMeasurementBeforeStart,
             earliestRetainedMeasurement: c.earliestRetainedMeasurement)
+        // The series when we have one, the single instant when we do not. Both go through the walk
+        // so there is ONE path to reason about; with an empty series it degenerates to the
+        // single-step rule by construction (`WakeProvenance.classify(measurementsAfter:)`).
         let wake = WakeProvenance.classify(
             inBedEnd: c.inBedEnd,
-            firstMeasurementAfter: c.firstMeasurementAfterEnd,
+            measurementsAfter: c.measurementsAfterEnd.isEmpty
+                ? [c.firstMeasurementAfterEnd].compactMap { $0 }
+                : c.measurementsAfterEnd,
             earliestRetainedMeasurement: c.earliestRetainedMeasurement)
 
         var reasons: [Reason] = []

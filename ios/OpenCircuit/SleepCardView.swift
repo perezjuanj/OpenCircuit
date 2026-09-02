@@ -728,9 +728,12 @@ struct SleepCardView: View {
             inBedStart: start,
             lastMeasurementBefore: edges.lastMeasurementBeforeStart,
             earliestRetainedMeasurement: edges.earliestRetainedMeasurement)
+        // The whole run after the edge, not just its first instant. `edges` already unions the store
+        // with the epoch archive, and it was that union's single 30 s epoch that bought a
+        // `.witnessed` on the night this changed (see `WakeProvenance.resumeRunMaxSeconds`).
         wakeProvenance = WakeProvenance.classify(
             inBedEnd: end,
-            firstMeasurementAfter: edges.firstMeasurementAfterEnd,
+            measurementsAfter: edges.measurementsAfterEnd,
             earliestRetainedMeasurement: edges.earliestRetainedMeasurement)
     }
 
