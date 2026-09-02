@@ -589,6 +589,41 @@ baseline (still/asleep) and spike at arousals/turns — the per-epoch **stillnes
 Phase 5 `SleepDetection` needs (likely the IMU stream; no separate `0x47` accel needed).
 Baseline `01` = "still", not "unworn".
 
+🟡 **…on the firmware that HAS a baseline. Three shapes of `[10:15]` are now known, and two of
+them cannot express stillness at all** — `BulkSleep.motionSource` picks the run's channel from the
+run's own distribution, never from a device or firmware string:
+
+| shape | `[10:15]` while motionless | seen on | detector reads |
+|---|---|---|---|
+| baseline | `01` (Gen 2), `0f`=15 (Gen 3), or a drifting `16→24→39` plateau — **constant within the epoch**, so a rolling local floor cancels it at any level | Gen 2 / Gen 3 | `[10:15]` (unchanged) |
+| fixed template | a two-level intra-epoch **step** (slots 0–1 ≈ 27.6, slots 2–4 ≈ 34.9 on *every* epoch) ± 2 noise; survives de-flooring because the step is *inside* one epoch | Gen 2 Air, **FR04.009** | `[15:20]` intensity tail |
+| **raised floor** | a pedestal that is **flat *within* an epoch** (median intra-epoch spread **1 count** on motionless epochs) but whose **level wanders between epochs**, 1 → 126 across the night — further and faster than the ~30-min rolling local floor can track, so de-flooring does *not* cancel it; no slot ordering is phase-locked, so it is not a template either | Gen 2 Air, **FR04.011** | `[15:23)` decoded magnitudes |
+
+The **raised-floor** case is new. 🟡 Measured on **one device, two nights, 715 worn epochs**: the
+primary byte takes value `1` on only 356 of 3575 sub-samples and otherwise clusters around 17,
+41–53, 71 and 84–86 *during obviously motionless sleep*; per-night medians ≈ 75–95 with the
+per-night 25th percentile at 54 on one night and 1 on the other.
+
+🟢 **The variation is BETWEEN epochs, not within one** — an earlier revision of this note had that
+backwards. All five sub-samples are *exactly* equal on only ≈ 8 % of epochs, but they are *nearly*
+equal on nearly all of them: median intra-epoch spread **1 count**, p90 **6**, over the ring's own
+motionless epochs. So `motionResolvesStillness`, which asks whether the five sit within
+`motionStillThreshold` of one another, **does** fire — on **78 %** of quiet epochs — and it is
+wrong to do so, because the channel it is blessing cannot arbitrate stillness. Nor does the minimum
+"never return to `01`": the per-epoch minimum runs p10 **1** / p50 **40** / p90 **93**. What breaks
+de-flooring is the *rate* the pedestal's level drifts at, not a floor stuck permanently off `01` —
+after `motionAboveLocalFloor` only **32 %** of quiet epochs read still (the detector needs ≥ 70 %).
+`motionIsPlaceholder` and the FR04.009 gate (`slotOrderConsistency`) do correctly refuse it. On
+device the symptom is a total staging failure: every history drain ends
+`nightRowOutcome = noStagedSegments` with 0 staged segments while HR/HRV/RR/SpO₂ record all night.
+
+🟡 The **decoded** `[15:23)` magnitudes are clean on the same records: the per-epoch magnitude sum
+is exactly **0 for the median night epoch** (p50 = 0, p90 ≈ 700–800), rises to 100–450 at postural
+turns and above 1000 at the final wake, and its hourly profile tracks the HR/HRV dynamics. Note
+this is the *layout-correct* channel (five 12-bit magnitudes, above), **not** the byte-aligned
+`[15:20]` window the two older fallbacks use — the raised-floor branch is gated on and reads from
+`activityMagnitudes` / `activityMagnitudesAreZero` throughout.
+
 > **Sleep stages (Awake/Light/Deep/REM) are not stored per-epoch** — no stage label byte
 > found. The ring streams raw HR/HRV/SpO2/motion and the **app computes** the hypnogram,
 > matching openwhoop's approach and our Phase 5 plan: compute stages in Swift from these

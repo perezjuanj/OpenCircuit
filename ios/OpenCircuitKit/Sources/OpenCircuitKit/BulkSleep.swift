@@ -408,28 +408,18 @@ public enum BulkSleep {
     /// (charging data reads as still too).
     public static func motionTimeline(from records: [BulkRecord],
                                       epoch: Int = Command.syncEpoch) -> [MotionSample] {
-        let source = motionSource(records)
-        let fallbackMagnitudes: [Float]
-        let useIntensityFallback: Bool
-        if case .intensityTail(let degenerate) = source {
-            useIntensityFallback = true
-            fallbackMagnitudes = motionIntensityFallbackMagnitudes(records, degenerate: degenerate)
-        } else {
-            useIntensityFallback = false
-            fallbackMagnitudes = []
-        }
+        let fallbackMagnitudes = secondaryChannelMagnitudes(records)
         var out: [MotionSample] = []
         out.reserveCapacity(records.count * 5)
         for (recordIndex, r) in records.enumerated() {
             let base = r.date(epoch: epoch)
-            // The intensity tail is an epoch-level fallback, not five independently-timed samples.
-            // Repeat its derived light/active magnitude over the epoch's five 30-second slots so the
-            // detector retains its canonical cadence without inventing sub-epoch timing.
+            // Either secondary channel is an epoch-level fallback, not five independently-timed
+            // samples. Repeat its derived light/active magnitude over the epoch's five 30-second
+            // slots so the detector retains its canonical cadence without inventing sub-epoch timing.
             for k in 0 ..< 5 {
                 out.append(MotionSample(time: base.addingTimeInterval(Double(k) * 30),
-                                        movement: useIntensityFallback
-                                            ? fallbackMagnitudes[recordIndex]
-                                            : Float(r.raw[10 + k])))
+                                        movement: fallbackMagnitudes?[recordIndex]
+                                            ?? Float(r.raw[10 + k])))
             }
         }
         return out
@@ -444,6 +434,9 @@ public enum BulkSleep {
         /// `[15:20]`. `degenerate == false` is the original 2026-07-12 constant-filler shape;
         /// `degenerate == true` is the FR04.009 non-expressive-primary shape (#184).
         case intensityTail(degenerate: Bool)
+        /// `[15:23)` decoded as five 12-bit `activityMagnitudes` — the FR04.011 raised-floor shape.
+        /// A THIRD channel, not a third reason to read the second one: see `primaryFloorIsRaised`.
+        case activityMagnitudes
     }
 
     /// Pick the motion channel for a run. The primary `[10:15]` channel is unusable in TWO
@@ -454,10 +447,16 @@ public enum BulkSleep {
     ///     variation is a fixed intra-epoch template rather than movement (`primaryMotionIsDegenerate`).
     ///     🟢 FR04.009 (#184): a fixed two-level step (slots 0–1 ≈ 27.6, slots 2–4 ≈ 34.9 on EVERY
     ///     epoch) plus ±2 noise, which no cross-sample rolling floor can cancel.
-    /// The two are mutually exclusive by construction: a constant run has zero intra-epoch spread, so
-    /// it always `motionResolvesStillness` and can never be degenerate. Either way the run must ALSO
-    /// show at least two non-zero tail epochs, exactly as before, so a genuinely motionless archive
-    /// keeps the primary path.
+    ///   • RAISED FLOOR — the channel varies freely (so it is NOT the #184 fixed template) but never
+    ///     returns to the `01` baseline, so its "movement" is a pedestal the rolling floor cannot
+    ///     remove either (`primaryFloorIsRaised`). 🟡 FR04.011 on a Gen 2 Air; this one falls
+    ///     through to the DECODED `activityMagnitudes`, not to the byte-aligned tail.
+    /// The first two are mutually exclusive by construction: a constant run has zero intra-epoch
+    /// spread, so it always `motionResolvesStillness` and can never be degenerate. Either way the run
+    /// must ALSO show at least two non-zero tail epochs, exactly as before, so a genuinely motionless
+    /// archive keeps the primary path. The RAISED FLOOR reason is evaluated only after both have
+    /// declined, and carries the same "the channel must actually carry movement" conjunct against the
+    /// channel it selects — so no input that reached a verdict before it existed changes verdict.
     ///
     /// ⚠️ `constantFiller` IS DEAD CODE, AND WIDENING IT IS A MEASURED TRAP (#195 / #190). The
     /// all-or-nothing quantifier fires on **0 of the 18 sources** in the local corpus while the
@@ -482,10 +481,21 @@ public enum BulkSleep {
         guard worn.count >= 4 else { return .primary }
         let constantFiller = !worn.contains(where: { !$0.motionIsPlaceholder })
         let degenerate = constantFiller ? false : primaryMotionIsDegenerate(worn)
-        guard constantFiller || degenerate else { return .primary }
-        guard worn.lazy.filter({ $0.motionIntensityTail.contains(where: { $0 > 0 }) }).prefix(2).count == 2
+        if constantFiller || degenerate {
+            guard worn.lazy.filter({ $0.motionIntensityTail.contains(where: { $0 > 0 }) }).prefix(2).count == 2
+            else { return .primary }
+            return .intensityTail(degenerate: degenerate)
+        }
+        // Third rejection reason, third channel (FR04.011). Checked LAST so every input that reached
+        // a verdict before this change reaches the SAME verdict: the two tail branches are decided
+        // first and return unchanged, and a run that satisfies neither used to fall straight through
+        // to `.primary`.
+        guard primaryFloorIsRaised(worn) else { return .primary }
+        // The same "the channel must actually carry movement" conjunct the tail branches apply,
+        // asked of the channel we are about to switch TO.
+        guard worn.lazy.filter({ !$0.activityMagnitudesAreZero }).prefix(2).count == 2
         else { return .primary }
-        return .intensityTail(degenerate: degenerate)
+        return .activityMagnitudes
     }
 
     /// True when this run reads motion off the `[15:20]` intensity tail instead of `[10:15]`.
@@ -552,6 +562,118 @@ public enum BulkSleep {
         let stillCount = quiet.filter(\.motionResolvesStillness).count
         guard Double(stillCount) < Double(quiet.count) * degenerateMaxQuietStillFraction else { return false }
         return slotOrderConsistency(quiet) >= degenerateMinSlotOrderFraction
+    }
+
+    // MARK: - Raised primary floor (FR04.011)
+
+    /// Whether the primary `[10:15]` channel reads STILL on each epoch of `run` after the SAME
+    /// rolling local floor `SleepDetection.detectFromMotion` subtracts before classifying — one
+    /// verdict per input epoch, in order.
+    ///
+    /// 🟢 THIS IS WHY IT EXISTS. `motionResolvesStillness` asks only whether an epoch's five
+    /// sub-samples sit within `motionStillThreshold` of ONE ANOTHER, on the argument that "a flat
+    /// plateau at any level cancels" against the rolling floor. That argument holds only while the
+    /// plateau's LEVEL is stable across the floor's own ~30-min window. On FR04.011 it is not: the
+    /// pedestal is flat inside an epoch (median intra-epoch spread 1 count on the ring's own
+    /// motionless epochs) yet wanders between 1 and 126 across the night, so the p10 floor sits far
+    /// below the current level and the residual survives de-flooring. The intra-epoch proxy scores
+    /// that channel 71 % "still" while the de-floored channel detection actually consumes scores it
+    /// 32 %. Predicting `detect()` therefore requires measuring what `detect()` reads.
+    ///
+    /// The per-epoch share threshold is `ActivityPeriod.gravityStillFraction` — the share `detect()`
+    /// itself requires of its rolling window — reused rather than restated so this predicate and the
+    /// detector it predicts cannot drift apart. NO new constant.
+    ///
+    /// Reads `raw[10..<15]` directly rather than going through `motionTimeline`, which would
+    /// re-enter `motionSource` and recurse.
+    static func primaryChannelIsStillAfterFloor(_ run: [BulkRecord],
+                                                epoch: Int = Command.syncEpoch) -> [Bool] {
+        var timeline: [MotionSample] = []
+        timeline.reserveCapacity(run.count * 5)
+        for r in run {
+            let base = r.date(epoch: epoch)
+            for k in 0 ..< 5 {
+                timeline.append(MotionSample(time: base.addingTimeInterval(Double(k) * 30),
+                                             movement: Float(r.raw[10 + k])))
+            }
+        }
+        let residual = ActivityPeriod.motionAboveLocalFloor(timeline)
+        return run.indices.map { i in
+            let still = residual[(i * 5) ..< (i * 5 + 5)]
+                .filter { $0 < ActivityPeriod.motionStillThreshold }.count
+            return Float(still) / 5 >= ActivityPeriod.gravityStillFraction
+        }
+    }
+
+    /// Minimum MEDIAN per-epoch minimum sub-sample on the primary channel before its floor counts as
+    /// "off the `01` baseline". The statistic is the median over quiet epochs of `min(raw[10..<15])`
+    /// — the quietest 30 s of a 150 s epoch the ring itself says had no movement, which on a healthy
+    /// channel IS the baseline.
+    ///
+    /// 🟡 MEASURED on ONE device (Gen 2 Air, FR04.011, two nights, 715 worn epochs): per-night median
+    /// 75–95 with the per-night 25th percentile at 54 and 1. Every healthy shape in this file's own
+    /// fixtures sits at its placeholder level and is excluded by the stillness conjunct below long
+    /// before this number binds (Gen-2 `01`, Gen-3 `0f` = 15, Gen-3's drifted `16→24→39`), so 16 is
+    /// chosen to clear the highest documented healthy placeholder (15) by one count and to sit far
+    /// below the observed FR04.011 population. It is NOT a fitted separation — one device, two
+    /// nights. Widen only against a second capture of this firmware family.
+    static let raisedFloorMinMedianQuietMinimum = 16
+
+    /// True when the primary `[10:15]` channel varies freely yet never comes back to baseline, so
+    /// every epoch carries a pedestal of phantom "movement" (#184's sibling failure, FR04.011).
+    ///
+    /// Same method as `primaryMotionIsDegenerate` — condition on the ring's OWN "nothing moved"
+    /// verdict and ask whether the primary channel agrees — with two deliberate differences:
+    ///   (1) the verdict is `activityMagnitudesAreZero`, the LAYOUT-CORRECT decode of `[15:23)`,
+    ///       not the byte-aligned `[15:20]` window. This branch reads its motion off the decoded
+    ///       magnitudes, so it must be gated on the same numbers it will consume; and
+    ///   (2) the "the residual is instrumentation, not movement" proof is a RAISED, WANDERING FLOOR
+    ///       rather than a fixed intra-epoch template. Their ordering is not phase-locked, so
+    ///       `slotOrderConsistency` correctly refuses it — and 🟢 on the ring's OWN motionless
+    ///       epochs the five sub-samples are nearly EQUAL (median intra-epoch spread 1 count), so
+    ///       this is not a wide-spread channel either. What it is instead is a pedestal whose LEVEL
+    ///       wanders 1 → 126 across the night, i.e. faster and further than the ~30-min rolling
+    ///       floor can track. That is the whole failure, and it is invisible to any predicate that
+    ///       looks at one epoch at a time.
+    ///
+    /// Gates (in order): there must be an hour of ring-verified motionless time to judge
+    /// (`degenerateMinQuietEpochs`, the #184 sibling's own quorum, which doubles as the "is the
+    /// substitute channel any good?" test — those epochs ARE the magnitude channel saying "nothing
+    /// moved"); the primary must REFUSE to read still where the ring says nothing moved
+    /// (`degenerateMaxQuietStillFraction`, shared with #184 — this is what keeps every flat or
+    /// drifting placeholder night on the primary path, since such a channel de-floors to zero); and
+    /// only then, the floor test.
+    ///
+    /// 🟢 THE STILLNESS CONJUNCT IS MEASURED THROUGH THE ROLLING FLOOR
+    /// (`primaryChannelIsStillAfterFloor`), NOT through the intra-epoch `motionResolvesStillness`
+    /// proxy this branch shipped with. See that function for the measurement; the short form is that
+    /// the proxy answers a question about ONE epoch while the failure lives in the drift BETWEEN
+    /// epochs, and on the real FR04.011 archive it scores the unusable channel 71 % still.
+    ///
+    /// ⚠️ THERE IS NO SHARE-OF-WORN CONJUNCT, deliberately. The `raisedFloorMinZeroMagnitudeFraction`
+    /// this branch shipped with (≥ 40 % of worn epochs motionless) was measured on NIGHT epochs but
+    /// evaluated wherever `motionSource` is called — and `latestNightRecords` calls it on the whole
+    /// 30 h `EpochArchive` union, ~22 h of which is an awake day. 🟢 On the real archive it reads
+    /// 0.278 over the union and 0.567 over the night alone, so the gate opened or stayed shut
+    /// depending on how much daytime had drained: the "the answer depends on when you synced" class
+    /// this file exists to remove. An absolute quorum is scope-stable; a share of the window is not.
+    static func primaryFloorIsRaised(_ worn: [BulkRecord]) -> Bool {
+        let stillAfterFloor = primaryChannelIsStillAfterFloor(worn)
+        let quietIndices = worn.indices.filter { worn[$0].activityMagnitudesAreZero }
+        guard quietIndices.count >= degenerateMinQuietEpochs else { return false }
+        let stillCount = quietIndices.filter { stillAfterFloor[$0] }.count
+        guard Double(stillCount) < Double(quietIndices.count) * degenerateMaxQuietStillFraction
+        else { return false }
+        return medianQuietMinimum(quietIndices.map { worn[$0] }) >= raisedFloorMinMedianQuietMinimum
+    }
+
+    /// Median over `epochs` of each epoch's SMALLEST `[10:15]` sub-sample. `epochs` is non-empty
+    /// (the caller guarantees it); the even-count case takes the lower of the two central values,
+    /// which biases the statistic DOWN, i.e. toward keeping the primary channel.
+    static func medianQuietMinimum(_ epochs: [BulkRecord]) -> Int {
+        let mins = epochs.map { Int($0.raw[10..<15].min() ?? 0) }.sorted()
+        guard !mins.isEmpty else { return 0 }
+        return mins[(mins.count - 1) / 2]
     }
 
     // MARK: - HRV pooling gate (#185 regression)
@@ -667,12 +789,27 @@ public enum BulkSleep {
     /// The staging model subtracts its rolling local floor afterward, exactly as on primary motion.
     static func motionMagnitudes(from records: [BulkRecord],
                                  absoluteActiveCut: Int = motionIntensityActiveCut) -> [Float] {
-        if case .intensityTail(let degenerate) = motionSource(records) {
-            return motionIntensityFallbackMagnitudes(records, degenerate: degenerate,
-                                                     absoluteActiveCut: absoluteActiveCut)
+        if let secondary = secondaryChannelMagnitudes(records, absoluteActiveCut: absoluteActiveCut) {
+            return secondary
         }
         return records.map { record in
             Float(record.motion.reduce(0) { $0 + Int($1) })
+        }
+    }
+
+    /// The per-epoch magnitudes of whichever SECONDARY channel this run selected, or `nil` when the
+    /// run stays on the primary `[10:15]` one. Single point of dispatch so `motionTimeline` and
+    /// `motionMagnitudes` cannot drift apart on which channel a run reads.
+    static func secondaryChannelMagnitudes(_ records: [BulkRecord],
+                                           absoluteActiveCut: Int = motionIntensityActiveCut) -> [Float]? {
+        switch motionSource(records) {
+        case .primary:
+            return nil
+        case .intensityTail(let degenerate):
+            return motionIntensityFallbackMagnitudes(records, degenerate: degenerate,
+                                                     absoluteActiveCut: absoluteActiveCut)
+        case .activityMagnitudes:
+            return activityMagnitudeFallbackMagnitudes(records)
         }
     }
 
@@ -763,6 +900,35 @@ public enum BulkSleep {
         return sums.map { magnitude in
             guard magnitude > 0 else { return 0 }
             return magnitude >= activeCut ? 16 : 1
+        }
+    }
+
+    /// The light/active seam for the DECODED magnitude channel, in `Σ activityMagnitudes` units.
+    /// Absolute for the same reason `motionIntensityActiveCut` is (#197): a per-night rank makes the
+    /// threshold a function of how much history has drained, and forces a fixed share of every
+    /// night to be "movement".
+    ///
+    /// 🟡 IT IS AN OBSERVED QUANTILE, NOT A FITTED THRESHOLD, and must not be described as one. On
+    /// the two FR04.011 nights this branch exists for, the per-epoch magnitude sum is EXACTLY 0 for
+    /// the median night epoch (p50 = 0) and p90 ≈ 700–800; postural turns land at 100–450 and the
+    /// final wake exceeds 1000. 700 is that p90 — the level above which ~10 % of the night's epochs
+    /// sit, which is where "several brief awakenings" lives — and the still population is at zero,
+    /// so the seam is nowhere near it. Two nights, ONE device. #197 records why a real number needs
+    /// supervised labels and why this project does not have them yet; nothing here changes that.
+    /// The 0-versus-positive split does the load-bearing work regardless of this constant: a still
+    /// epoch maps to `0` and a stir to `1`, both below `ActivityPeriod.motionStillThreshold`.
+    static let activityMagnitudeActiveCut = 700
+
+    /// Map the decoded `[15:23)` magnitudes onto the same `0 / 1 / 16` alphabet the intensity-tail
+    /// fallback emits, so detection and staging consume one scale whichever channel a run picked.
+    static func activityMagnitudeFallbackMagnitudes(
+        _ records: [BulkRecord],
+        absoluteActiveCut: Int = activityMagnitudeActiveCut
+    ) -> [Float] {
+        records.map { record in
+            let sum = record.activityMagnitudes.reduce(0, +)
+            guard sum > 0 else { return 0 }
+            return sum >= absoluteActiveCut ? 16 : 1
         }
     }
 
