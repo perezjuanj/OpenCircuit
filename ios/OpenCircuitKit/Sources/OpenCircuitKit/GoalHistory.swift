@@ -258,6 +258,9 @@ public enum GoalHistory {
                                         naps: [NapSleep],
                                         calendar: Calendar = .current) -> [Date: Int] {
         var credit: [Date: Int] = [:]
+        // Keyed by WAKE day, so a lookup by the nap's own start day misses the night it belongs to
+        // (a 23:30 nap sits inside a night credited to the NEXT day). Kept as a flat list and
+        // tested by overlap against all of them — the count is at most a handful per window.
         var creditedNight: [Date: DateInterval] = [:]
 
         for night in nights where night.asleepMinutes > 0 {
@@ -279,9 +282,17 @@ public enum GoalHistory {
         }
 
         for nap in naps where nap.asleepMinutes > 0 {
-            let day = calendar.startOfDay(for: nap.start)
-            if let night = creditedNight[day], nap.start < night.end && nap.end > night.start { continue }
-            credit[day, default: 0] += nap.asleepMinutes
+            // Overlap against EVERY credited night, not just `creditedNight[startOfDay(nap.start)]`.
+            // 🟢 The bug that was: a night 23:00→07:00 is credited to the wake day, so a manual
+            // 23:30–00:30 nap INSIDE it looked up an empty slot on the previous day and was credited
+            // again — a phantom Sleep ring on a day whose minutes already belong to the next day's
+            // night. Moving the same nap 60 min later (00:30–01:30) excluded it correctly, so the
+            // handling of identical sleep flipped on which side of midnight it started.
+            let insideACreditedNight = creditedNight.values.contains {
+                nap.start < $0.end && nap.end > $0.start
+            }
+            if insideACreditedNight { continue }
+            credit[calendar.startOfDay(for: nap.start), default: 0] += nap.asleepMinutes
         }
         return credit
     }
@@ -299,8 +310,19 @@ public enum GoalHistory {
         public let dataCounts: [Ring: Int]
         /// Consecutive all-closed days ending at the most recent FINISHED day. A still-running
         /// today extends the streak when it has already closed all four, and never breaks it.
+        ///
+        /// ⚠️ A streak is only CURRENT if it reaches today or yesterday. Without that test a run
+        /// that ended days ago reads as live: rows for Aug 10–11 only, opened on Aug 20, reported
+        /// `2` and the card rendered a green "2 days streak" nine days after it stopped. Reachable
+        /// on any phone left away from the ring, a stranded recorder, or an app not opened.
         public let currentStreak: Int
-        /// Longest all-closed run anywhere in the window (finished days only).
+        /// Longest all-closed run anywhere in the window.
+        ///
+        /// ⚠️ Admits a still-partial TODAY that has already closed all four — the same rule
+        /// `currentStreak` uses, so the two streak numbers agree. `daysAllClosed` deliberately does
+        /// NOT: it counts completed days. The doc used to say "finished days only" here, which the
+        /// code never did, and the three numbers could read "2 days streak · 1 day all 4 closed ·
+        /// 2 best streak" on the same screen.
         public let longestStreak: Int
 
         public init(daysWithData: Int, daysAllClosed: Int, metCounts: [Ring: Int],
@@ -323,8 +345,12 @@ public enum GoalHistory {
     ///   • a PARTIAL day (today) that hasn't closed everything yet is skipped rather than counted
     ///     as a break, so the streak doesn't visibly reset every midnight;
     ///   • a gap in the calendar (a day absent from the window entirely) also breaks the streak —
-    ///     consecutive means consecutive days, not consecutive rows.
-    public static func summarize(_ days: [Day], calendar: Calendar = .current) -> Summary {
+    ///     consecutive means consecutive days, not consecutive rows;
+    ///   • and a run that does not reach today or yesterday is not CURRENT — see `currentStreak`.
+    ///
+    /// - Parameter now: the wall clock the streak's currency is judged against. Required rather than
+    ///   defaulted so a caller cannot silently reinstate the stale-streak bug by omission.
+    public static func summarize(_ days: [Day], now: Date, calendar: Calendar = .current) -> Summary {
         var metCounts: [Ring: Int] = [:]
         var dataCounts: [Ring: Int] = [:]
         var daysWithData = 0
@@ -338,6 +364,11 @@ public enum GoalHistory {
 
         // Longest run, scanning oldest→newest. Calendar adjacency is required: a missing day is a
         // break even though the array has no row for it.
+        //
+        // A partial day is admitted ONLY when it has already closed all four — the same rule
+        // `currentStreak` uses below, so the two streak numbers and `daysAllClosed` cannot disagree
+        // on screen about what today counts as. (`daysAllClosed` still counts finished days only;
+        // that is a count of completed days, not of streak membership, and its label says so.)
         var longest = 0, run = 0
         var previous: Date?
         for day in days where !day.isPartial || day.closedAll {
@@ -362,6 +393,16 @@ public enum GoalHistory {
             guard day.closedAll else { break }
             current += 1
             expected = day.date
+        }
+        // …and it is only a CURRENT streak if it actually reaches now. `expected` holds the OLDEST
+        // day in the run, so the newest counted day is the first one the walk took; recompute from
+        // the newest qualifying row rather than tracking it separately.
+        if current > 0 {
+            let newestCounted = days.reversed().first { !($0.isPartial && !$0.closedAll) }?.date
+            let daysSince = newestCounted.flatMap {
+                calendar.dateComponents([.day], from: $0, to: calendar.startOfDay(for: now)).day
+            }
+            if let daysSince, daysSince > 1 { current = 0 }
         }
 
         return Summary(daysWithData: daysWithData, daysAllClosed: daysAllClosed,

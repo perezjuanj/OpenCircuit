@@ -22,7 +22,7 @@ struct TrendsData {
     /// DERIVED from `points` + the current goals; nothing new is stored (see `GoalHistory`).
     var goalDays: [GoalHistory.Day] = []
     /// Streak / met-count roll-up over `goalDays`.
-    var goalSummary: GoalHistory.Summary = GoalHistory.summarize([])
+    var goalSummary: GoalHistory.Summary = GoalHistory.summarize([], now: Date())
 
     static let lookbackDays = 14
 
@@ -101,7 +101,7 @@ struct TrendsData {
         let goalDays = await Task.detached { computeGoalDays(inputs, points: points) }.value
         let recentRows = await buildRecentMetricRows(inputs)
         return TrendsData(points: points, recentRows: recentRows,
-                          goalDays: goalDays, goalSummary: GoalHistory.summarize(goalDays))
+                          goalDays: goalDays, goalSummary: GoalHistory.summarize(goalDays, now: Date()))
     }
 
     /// Off-main fetch + extraction into the `Sendable` `Inputs` snapshot.
@@ -195,6 +195,15 @@ struct TrendsData {
                                          profile: i.profile, sleepWindow: window,
                                          stepWindows: dayStepWindows, dayStart: day)
                 : nil
+            // 🟢 ELEVATED MINUTES ARE HR-DERIVED, so with no retained HR the estimate returns a
+            // real-looking `0.0` rather than "unknown". Left as 0 it scores a hard MISS, breaks the
+            // goal-ring streak, and contradicts the history card's own promise that a metric with no
+            // retained data is never counted as missed. It is also exactly the shape of the
+            // sport-mode strand — the ring records ZERO epochs while steps stay current — so a
+            // firmware strand would render as a run of solid 0% rings blaming the wearer.
+            // `activeKcal` keeps its steps-only fallback, which is a genuine estimate; elevated
+            // minutes have no such fallback.
+            let hasHR = !dayHRSamples.isEmpty
 
             return TrendsEngine.DailyPoint(
                 date:          day,
@@ -216,7 +225,7 @@ struct TrendsData {
                 dayRRAvg:      avg(i.rr, in: dayWindow),
                 activeEnergyKcal: activityEstimate?.activeKcal,
                 distanceM:        daySteps.map { DistanceEstimate.meters(steps: $0) },
-                exerciseMin:      activityEstimate?.elevatedMinutes
+                exerciseMin:      hasHR ? activityEstimate?.elevatedMinutes : nil
             )
         }
     }

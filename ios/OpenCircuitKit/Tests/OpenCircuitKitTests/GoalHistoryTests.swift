@@ -109,7 +109,8 @@ final class GoalHistoryTests: XCTestCase {
     func testPartialDayIsNotCountedAsAClosedDay() {
         let s = GoalHistory.summarize(GoalHistory.build(
             days: [fullDay("2026-08-17"), fullDay("2026-08-18")],
-            goals: goals, now: day("2026-08-18"), calendar: cal), calendar: cal)
+            goals: goals, now: day("2026-08-18"), calendar: cal),
+            now: day("2026-08-18"), calendar: cal)
         // Both closed, but the 18th is today → only the finished 17th counts in daysAllClosed.
         XCTAssertEqual(s.daysAllClosed, 1)
     }
@@ -117,9 +118,11 @@ final class GoalHistoryTests: XCTestCase {
     // MARK: - Summary + streaks
 
     func testStreakCountsConsecutiveAllClosedDays() {
+        // `now` is the day after the newest row: the run reaches yesterday, so it is CURRENT.
+        let now = day("2026-08-18")
         let s = GoalHistory.summarize(GoalHistory.build(
             days: [fullDay("2026-08-15"), fullDay("2026-08-16"), fullDay("2026-08-17")],
-            goals: goals, now: day("2026-08-20"), calendar: cal), calendar: cal)
+            goals: goals, now: now, calendar: cal), now: now, calendar: cal)
         XCTAssertEqual(s.currentStreak, 3)
         XCTAssertEqual(s.longestStreak, 3)
         XCTAssertEqual(s.daysAllClosed, 3)
@@ -131,17 +134,18 @@ final class GoalHistoryTests: XCTestCase {
             days: [fullDay("2026-08-15"), fullDay("2026-08-16"),
                    GoalHistory.DayInput(date: day("2026-08-17"), steps: 10),   // missed
                    fullDay("2026-08-18")],
-            goals: goals, now: day("2026-08-20"), calendar: cal)
-        let s = GoalHistory.summarize(days, calendar: cal)
+            goals: goals, now: day("2026-08-19"), calendar: cal)
+        let s = GoalHistory.summarize(days, now: day("2026-08-19"), calendar: cal)
         XCTAssertEqual(s.currentStreak, 1)
         XCTAssertEqual(s.longestStreak, 2)
     }
 
     func testACalendarGapBreaksTheStreakEvenThoughTheRowsAreAdjacent() {
         // 08-16 is absent from the window entirely — consecutive means consecutive DAYS.
+        let now = day("2026-08-18")
         let s = GoalHistory.summarize(GoalHistory.build(
             days: [fullDay("2026-08-15"), fullDay("2026-08-17")],
-            goals: goals, now: day("2026-08-20"), calendar: cal), calendar: cal)
+            goals: goals, now: now, calendar: cal), now: now, calendar: cal)
         XCTAssertEqual(s.currentStreak, 1)
         XCTAssertEqual(s.longestStreak, 1)
     }
@@ -152,7 +156,7 @@ final class GoalHistoryTests: XCTestCase {
             days: [fullDay("2026-08-16"), fullDay("2026-08-17"),
                    GoalHistory.DayInput(date: day("2026-08-18"), steps: 200)],
             goals: goals, now: day("2026-08-18").addingTimeInterval(3_600 * 9), calendar: cal),
-            calendar: cal)
+            now: day("2026-08-18").addingTimeInterval(3_600 * 9), calendar: cal)
         XCTAssertEqual(s.currentStreak, 2)
     }
 
@@ -160,7 +164,7 @@ final class GoalHistoryTests: XCTestCase {
         let s = GoalHistory.summarize(GoalHistory.build(
             days: [fullDay("2026-08-16"), fullDay("2026-08-17"), fullDay("2026-08-18")],
             goals: goals, now: day("2026-08-18").addingTimeInterval(3_600 * 20), calendar: cal),
-            calendar: cal)
+            now: day("2026-08-18").addingTimeInterval(3_600 * 20), calendar: cal)
         XCTAssertEqual(s.currentStreak, 3)
     }
 
@@ -170,9 +174,53 @@ final class GoalHistoryTests: XCTestCase {
             days: [fullDay("2026-08-15"),
                    GoalHistory.DayInput(date: day("2026-08-16")),   // nothing retained
                    fullDay("2026-08-17")],
-            goals: goals, now: day("2026-08-20"), calendar: cal), calendar: cal)
+            goals: goals, now: day("2026-08-18"), calendar: cal),
+            now: day("2026-08-18"), calendar: cal)
         XCTAssertEqual(s.currentStreak, 1)
         XCTAssertEqual(s.daysWithData, 2)
+    }
+
+    /// 🟢 THE REGRESSION M4 — a run that ended days ago is not a CURRENT streak.
+    /// Before the `now` parameter, rows for 08-15…08-17 opened on 08-20 reported `currentStreak = 3`
+    /// and the card rendered a green "3 days streak" three days after it stopped. Reachable on any
+    /// phone left away from the ring, a stranded recorder, or an app simply not opened.
+    func testAStreakThatDoesNotReachTodayOrYesterdayIsNotCurrent() {
+        let built = GoalHistory.build(
+            days: [fullDay("2026-08-15"), fullDay("2026-08-16"), fullDay("2026-08-17")],
+            goals: goals, now: day("2026-08-20"), calendar: cal)
+        XCTAssertEqual(GoalHistory.summarize(built, now: day("2026-08-20"), calendar: cal).currentStreak, 0)
+        // …but the LONGEST streak is a historical fact and must survive.
+        XCTAssertEqual(GoalHistory.summarize(built, now: day("2026-08-20"), calendar: cal).longestStreak, 3)
+        // Yesterday still counts as current.
+        XCTAssertEqual(GoalHistory.summarize(built, now: day("2026-08-18"), calendar: cal).currentStreak, 3)
+    }
+
+    /// 🟢 THE REGRESSION M1 — a nap starting before midnight INSIDE a night credited to the next
+    /// day escaped the double-count guard, because the guard was looked up on the nap's own start
+    /// day while nights are keyed by WAKE day. Identical sleep was handled oppositely depending on
+    /// which side of midnight the nap began.
+    func testANapInsideACreditedNightIsExcludedEvenAcrossMidnight() {
+        let night = GoalHistory.NightSleep(
+            nightKey: day("2026-08-17"),
+            inBedStart: day("2026-08-16").addingTimeInterval(23 * 3_600),
+            inBedEnd: day("2026-08-17").addingTimeInterval(7 * 3_600),
+            asleepMinutes: 400)
+        func credit(napStartHour: Double) -> [Date: Int] {
+            let start = day("2026-08-16").addingTimeInterval(napStartHour * 3_600)
+            return GoalHistory.sleepCreditByDay(
+                nights: [night],
+                naps: [GoalHistory.NapSleep(start: start,
+                                            end: start.addingTimeInterval(3_600),
+                                            asleepMinutes: 55)],
+                calendar: cal)
+        }
+        // 23:30 on the 16th — inside the night credited to the 17th. Must NOT create a 16th ring.
+        XCTAssertEqual(credit(napStartHour: 23.5), [day("2026-08-17"): 400])
+        // The same nap 60 min later is on the other side of midnight and was already handled.
+        XCTAssertEqual(credit(napStartHour: 24.5), [day("2026-08-17"): 400])
+        // A genuine afternoon nap on the 16th still counts.
+        XCTAssertEqual(credit(napStartHour: 14),
+                       [day("2026-08-17"): 400, day("2026-08-16"): 55])
     }
 
     func testPerRingCountsSeparateMetFromMeasured() {
@@ -180,7 +228,7 @@ final class GoalHistoryTests: XCTestCase {
             days: [GoalHistory.DayInput(date: day("2026-08-17"), steps: 20_000, sleepMinutes: 100),
                    GoalHistory.DayInput(date: day("2026-08-18"), steps: 100)],
             goals: goals, now: day("2026-08-20"), calendar: cal)
-        let s = GoalHistory.summarize(days, calendar: cal)
+        let s = GoalHistory.summarize(days, now: day("2026-08-20"), calendar: cal)
         XCTAssertEqual(s.dataCounts[.steps], 2)
         XCTAssertEqual(s.metCounts[.steps], 1)
         XCTAssertEqual(s.dataCounts[.sleepMinutes], 1)   // measured once
@@ -200,7 +248,7 @@ final class GoalHistoryTests: XCTestCase {
     }
 
     func testEmptyWindowSummarisesToZeroes() {
-        let s = GoalHistory.summarize([], calendar: cal)
+        let s = GoalHistory.summarize([], now: day("2026-08-20"), calendar: cal)
         XCTAssertEqual(s.daysWithData, 0)
         XCTAssertEqual(s.currentStreak, 0)
         XCTAssertEqual(s.longestStreak, 0)

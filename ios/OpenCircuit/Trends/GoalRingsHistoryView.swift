@@ -295,13 +295,17 @@ struct GoalRingsTrendsSection: View {
     var body: some View {
         let finished = days.filter { !$0.isPartial }
         VStack(spacing: 12) {
+            // ⚠️ `MetricChartCard` labels whatever `avg` it is handed as "7d avg" (a hardcoded
+            // string). Every other caller feeds it `TrendsEngine.rollingAverages`, i.e. the last
+            // SEVEN points. Averaging the whole up-to-14-day window here would print a 14-day mean
+            // under a 7-day label — a number that is not the number it claims to be.
             MetricChartCard(title: "Goals Closed", unit: "of 4", color: .green,
                 data: finished.filter(\.hasData).map { ($0.date, Double($0.ringsMet)) },
-                avg: average(finished.filter(\.hasData).map { Double($0.ringsMet) }),
+                avg: average(finished.filter(\.hasData).suffix(7).map { Double($0.ringsMet) }),
                 formatAvg: { String(format: "%.1f", $0) }, clampsToData: false)
             MetricChartCard(title: "Goal Attainment", unit: "%", color: Theme.accent,
                 data: finished.compactMap { d in d.attainment.map { (d.date, $0 * 100) } },
-                avg: average(finished.compactMap { $0.attainment }).map { $0 * 100 },
+                avg: average(finished.compactMap { $0.attainment }.suffix(7)).map { $0 * 100 },
                 clampsToData: false)
         }
     }
