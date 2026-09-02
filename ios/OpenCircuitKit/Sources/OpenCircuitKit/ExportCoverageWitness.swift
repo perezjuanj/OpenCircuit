@@ -126,10 +126,23 @@ public enum ExportCoverageWitness {
         /// EVERY heart-rate instant strictly after `inBedEnd` this probe could reach, so the wake
         /// verdict can walk the run rather than take one step (`WakeProvenance.resumeRunMaxSeconds`).
         ///
-        /// Monotone in the SAFE direction, by the same argument as the instants above: adding a
-        /// witness can only FILL a gap, never open one, so a richer archive can only make this
-        /// quieter. A probe whose reach is truncated shortly after the edge therefore degrades to
-        /// `.witnessed` — the shipped answer — and never manufactures a hole.
+        /// ⚠️ THIS IS **NOT** MONOTONE, and an earlier version of this comment claimed it was.
+        /// The claim "adding a witness can only FILL a gap, never open one" is true of the single
+        /// INSTANTS above, where each candidate is compared against the edge. It is false of a
+        /// SERIES walked pairwise:
+        ///
+        ///     classify(measurementsAfter: [+30])        → .witnessed
+        ///     classify(measurementsAfter: [+30, +400])  → .stoppedThenResumed(370)
+        ///
+        /// One extra real record, nothing removed, and a hole appears — because the walk measures
+        /// the space BETWEEN consecutive records, and 370 s of it is two dropped 150 s epochs, which
+        /// is exactly what `continuousToleranceSeconds` exists to absorb at the edge.
+        ///
+        /// What IS true, and what the safety argument now rests on: a truncated reach can only
+        /// SHORTEN the walk, and a walk that runs out of records returns `.witnessed` — the shipped
+        /// answer. So a poorer archive is never louder than a richer one; a richer one may be
+        /// louder than a poorer one. `SleepConfidence.assess` unions this with
+        /// `firstMeasurementAfterEnd` so the two inputs cannot disagree about the first instant.
         public let measurementsAfterEnd: [Date]
         /// Oldest heart-rate instant we hold at all, from store ∪ archive. Feeds the retention
         /// guards in `BedtimeProvenance.classify` / `WakeProvenance.classify` — see the note on

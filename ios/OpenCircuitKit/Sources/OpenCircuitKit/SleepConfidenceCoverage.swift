@@ -119,16 +119,19 @@ extension SleepConfidence {
         /// Nothing was recorded for `silentFor` seconds after the night's trailing edge. The
         /// reported duration reads LOW by an unknown amount BOUNDED BY (not equal to) that gap.
         ///
-        /// `from` is `Coverage.inBedEnd` — the same instant the card prints as the wake time.
+        /// `from` is the LAST MEASUREMENT BEFORE THE SILENCE — usually `Coverage.inBedEnd`, but
+        /// later than it whenever the ring kept recording briefly past the staged wake (see
+        /// `WakeProvenance.Stoppage`). Invariant the copy depends on:
+        /// **`from + silentFor` == the instant recording resumed.**
         case noRecordingAfterWake(from: Date, silentFor: TimeInterval)
 
         /// Nothing was recorded for `silentFor` seconds before the night's leading edge, so the
         /// printed bedtime is where recording resumed, not where the user settled.
         ///
-        /// ⚠️ OVERLAPS A SHIPPED HINT. `SleepCardView.bedtimeProvenanceHint` already says this,
-        /// driven by `BedtimeProvenance` at its 300 s tolerance — a strictly WIDER band than the
-        /// `materialGapSeconds` used here (4 of 21 corpus nights vs 3 of 21). A caller adopting this
-        /// type must render one or the other, never both, or the same edge gets caveated twice.
+        /// ⚠️ 2026-09-01: the overlap this warned about is GONE. `SleepCardView.coverageHints` now
+        /// renders this reason and the separate `bedtimeProvenanceHint` (which said the same thing
+        /// at `BedtimeProvenance`'s wider 300 s tolerance — 4 of 21 corpus nights vs 3 of 21) was
+        /// deleted. A caller must still render this OR a hint of its own, never both.
         case noRecordingBeforeBedtime(until: Date, silentFor: TimeInterval)
 
         /// The legacy signal: a multi-hour night at implausibly high efficiency, i.e. still-but-awake
@@ -229,20 +232,29 @@ extension SleepConfidence {
             inBedStart: c.inBedStart,
             lastMeasurementBefore: c.lastMeasurementBeforeStart,
             earliestRetainedMeasurement: c.earliestRetainedMeasurement)
-        // The series when we have one, the single instant when we do not. Both go through the walk
-        // so there is ONE path to reason about; with an empty series it degenerates to the
-        // single-step rule by construction (`WakeProvenance.classify(measurementsAfter:)`).
-        let wake = WakeProvenance.classify(
+        // The UNION of both inputs, never one or the other. Taking the series alone whenever it is
+        // non-empty made the two fields silently exclusive: a series missing the first record
+        // INVENTS a stop the single-step rule called `.witnessed`, and a series that stops early
+        // SILENCES one it reported. Both are reachable through the public `Coverage.init`, whose
+        // docs present the two fields as independent inputs — so the seam, not the caller, is what
+        // has to be safe. Adding the first instant back can only make the walk quieter.
+        let afterEnd = Set(c.measurementsAfterEnd
+                            + [c.firstMeasurementAfterEnd].compactMap { $0 }).sorted()
+        let stoppage = WakeProvenance.stoppage(
             inBedEnd: c.inBedEnd,
-            measurementsAfter: c.measurementsAfterEnd.isEmpty
-                ? [c.firstMeasurementAfterEnd].compactMap { $0 }
-                : c.measurementsAfterEnd,
+            measurementsAfter: afterEnd,
             earliestRetainedMeasurement: c.earliestRetainedMeasurement)
+        let wake = stoppage.verdict
 
         var reasons: [Reason] = []
 
         if case .stoppedThenResumed(let gap) = wake, gap > materialGapSeconds {
-            reasons.append(.noRecordingAfterWake(from: c.inBedEnd, silentFor: gap))
+            // `stoppage.silenceBegan`, NOT `c.inBedEnd`: the walk can consume records before the
+            // hole, so the silence may begin AFTER the edge. Rendering it from the edge names two
+            // instants that never happened (see `WakeProvenance.Stoppage`). The invariant the copy
+            // relies on is `from + silentFor == the record that resumed`.
+            reasons.append(.noRecordingAfterWake(from: stoppage.silenceBegan ?? c.inBedEnd,
+                                                 silentFor: gap))
         }
         if case .resumedAfterGap(let gap) = bedtime, gap > materialGapSeconds {
             reasons.append(.noRecordingBeforeBedtime(until: c.inBedStart, silentFor: gap))

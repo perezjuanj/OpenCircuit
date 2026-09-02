@@ -115,17 +115,26 @@ public enum WakeProvenance: Equatable, Sendable {
     /// through the day keeps emitting at the 150 s cadence, so an unbounded walk would eventually
     /// find some ordinary daytime disconnect and report it as a hole in the night.
     ///
-    /// ⚠️ NOT FITTED, AND CHOSEN ON n = 1. The only measured hole-start offset is the 30 s above.
-    /// The corpus cannot narrow it: on all 21 staged nights the run that starts at the in-bed end
-    /// is either one record long or unbroken past every candidate bound, so **every value in
-    /// [30 s, 1 h] scores identically there** — TABLE 1 of `SleepCoverageMeasureTests` is
-    /// byte-identical with the walk on and off. 600 s is 20× the observed offset and still far below
-    /// the ~4 h holes this is for; it is a judgement, not a measurement, and the sweep is one line
-    /// (`resumeRunLimit:`).
+    /// ⚠️ IT IS THE CONTINUITY TOLERANCE, DELIBERATELY — NOT A NEW NUMBER. It was 600 s until a
+    /// review pointed out the thing that matters here: **the corpus contains ZERO nights of the
+    /// shape this walk acts on** (a record inside the bound, then a material hole — 0 of 21; the
+    /// other 21 either break at 0.0 min, which the single-step rule already caught, or run unbroken
+    /// past every candidate bound). So "TABLE 1 is byte-identical" says the change is INERT on the
+    /// corpus; it says nothing about its false-positive rate, and a rule of three puts the 95 %
+    /// upper bound around 14 % of nights. A free parameter chosen on n = 1 against an unpopulated
+    /// input class is the worst kind, so the parameter is gone: this now aliases
+    /// `continuousToleranceSeconds`, which has its own independent justification (two 150 s epochs,
+    /// enough to absorb a single dropped or unparsed one) and is the same constant the walk already
+    /// uses to decide what "continuous" means. One tolerance, one meaning.
+    ///
+    /// What that costs: a ring worn more than ~5 min past the staged wake and then removed is
+    /// `.witnessed` and silent, exactly as on master. That is the ordinary morning-charge routine,
+    /// and it is the false-positive class the review named. What it keeps: the tester night's hole
+    /// begins **30 s** past the edge, so it still fires.
     ///
     /// `0` is the KILL SWITCH — the walk never runs and the array overload reproduces the
     /// two-argument one exactly, which `testWalkKillSwitchReproducesSingleStep` asserts.
-    public static let resumeRunMaxSeconds: TimeInterval = 600
+    public static var resumeRunMaxSeconds: TimeInterval { continuousToleranceSeconds }
 
     /// Classify the trailing edge of a night's in-bed window.
     ///
@@ -219,6 +228,43 @@ public enum WakeProvenance: Equatable, Sendable {
                                 measurementsAfter: [Date],
                                 earliestRetainedMeasurement: Date?,
                                 resumeRunLimit: TimeInterval = resumeRunMaxSeconds) -> Verdict {
+        stoppage(inBedEnd: inBedEnd,
+                 measurementsAfter: measurementsAfter,
+                 earliestRetainedMeasurement: earliestRetainedMeasurement,
+                 resumeRunLimit: resumeRunLimit).verdict
+    }
+
+    /// A verdict together with the instant its silence BEGAN — the last measurement before the hole.
+    ///
+    /// ⚠️ THIS TYPE EXISTS BECAUSE THE WALK BROKE AN INVARIANT THE SINGLE-STEP RULE HELD FOR FREE.
+    /// Under one step the silence always began at `inBedEnd`, so a caller could render the hole as
+    /// `inBedEnd … inBedEnd + gap` and be exactly right. The walk can consume records first, so the
+    /// gap it measures runs between two POST-EDGE records and `inBedEnd + gap` names an instant that
+    /// never happened — both endpoints wrong, by up to `resumeRunLimit`.
+    ///
+    /// Measured on the review's probe: in-bed end 01:46, records at +60/+210/+360/+510 s, stream
+    /// resumes 05:16. The card said "Nothing was recorded between 01:46 and 05:08". It was not
+    /// silent at 01:46 (the ring ran another 8.5 min) and it resumed at 05:16, not 05:08.
+    ///
+    /// `silenceBegan` restores the invariant **`silenceBegan + gap == the record that resumed`**.
+    /// It is nil for every verdict that names no hole.
+    public struct Stoppage: Equatable, Sendable {
+        public let verdict: Verdict
+        /// Last measurement before the silence, or `inBedEnd` when the silence starts at the edge.
+        /// nil unless `verdict` is `.stoppedThenResumed`.
+        public let silenceBegan: Date?
+
+        public init(verdict: Verdict, silenceBegan: Date?) {
+            self.verdict = verdict
+            self.silenceBegan = silenceBegan
+        }
+    }
+
+    /// The walk, reporting WHERE the silence began as well as how long it lasted.
+    public static func stoppage(inBedEnd: Date,
+                                measurementsAfter: [Date],
+                                earliestRetainedMeasurement: Date?,
+                                resumeRunLimit: TimeInterval = resumeRunMaxSeconds) -> Stoppage {
         let ordered = measurementsAfter.filter { $0 > inBedEnd }.sorted()
         let base = classify(inBedEnd: inBedEnd,
                             firstMeasurementAfter: ordered.first,
@@ -226,21 +272,31 @@ public enum WakeProvenance: Equatable, Sendable {
         // Only a `.witnessed` can be wrong in the direction this walk exists to fix. A
         // `.stoppedThenResumed` already names a hole and an `.unknown` already says we cannot tell;
         // re-deciding either from the same rows could only make the verdict less honest.
-        guard case .witnessed = base, resumeRunLimit > 0 else { return base }
+        guard case .witnessed = base, resumeRunLimit > 0 else {
+            // The single-step rule's hole, when it has one, begins at the edge by construction.
+            if case .stoppedThenResumed = base {
+                return Stoppage(verdict: base, silenceBegan: inBedEnd)
+            }
+            return Stoppage(verdict: base, silenceBegan: nil)
+        }
 
         var previous = inBedEnd
         for m in ordered {
             let gap = m.timeIntervalSince(previous)
-            if gap > continuousToleranceSeconds { return .stoppedThenResumed(gap) }
+            if gap > continuousToleranceSeconds {
+                return Stoppage(verdict: .stoppedThenResumed(gap), silenceBegan: previous)
+            }
             previous = m
             // The run carried on well past the edge, so the night genuinely ended while the ring
             // was still measuring. Anything later is daytime, not this night.
-            if previous.timeIntervalSince(inBedEnd) > resumeRunLimit { return .witnessed }
+            if previous.timeIntervalSince(inBedEnd) > resumeRunLimit {
+                return Stoppage(verdict: .witnessed, silenceBegan: nil)
+            }
         }
         // The run reached the end of what we hold without breaking. Unchanged from `base` on
         // purpose: "our archive stops here" is the `.unknown` story, but the single-step rule
         // already called this `.witnessed` and this function must not silence or re-label it.
-        return .witnessed
+        return Stoppage(verdict: .witnessed, silenceBegan: nil)
     }
 
     /// Whether a verdict is worth putting in front of the user.

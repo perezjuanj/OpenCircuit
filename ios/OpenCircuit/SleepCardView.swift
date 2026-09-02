@@ -136,10 +136,25 @@ struct SleepCardView: View {
 
     /// `.task(id:)` key for the edge-provenance refresh — both in-bed edges, so a wake-only Edit
     /// re-runs it. A struct rather than a tuple because `.task(id:)` needs `Equatable`.
+    ///
+    /// ⚠️ IT CARRIES THE DURATION TOTALS TOO, since 2026-09-01. The task now resolves a whole
+    /// `SleepConfidence.Assessment`, which is a function of `summary.totalAsleep` / `summary.inBed`
+    /// as well as the edges — and `StageProvenanceKey` below exists precisely because "a re-stage
+    /// can rewrite the timeline without moving either edge". On the edges alone, a re-stage that
+    /// reclassifies interior awake→light, or a live→stored swap, would leave the caveat stale.
+    /// The old `confidenceHint` was immune by accident: it read `SleepConfidence.classify` inline
+    /// in `body`, so it could never be stale.
     private struct EdgeKey: Equatable {
         let start: Date?
         let end: Date?
-        init(_ night: Night?) { start = night?.inBedStart; end = night?.inBedEnd }
+        let asleep: TimeInterval?
+        let inBed: TimeInterval?
+        init(_ night: Night?) {
+            start = night?.inBedStart
+            end = night?.inBedEnd
+            asleep = night?.summary.totalAsleep
+            inBed = night?.summary.inBed
+        }
     }
 
     /// One night resolved for display, from either the live staging or the persisted rollup.
@@ -513,19 +528,21 @@ struct SleepCardView: View {
     /// The caption rows under the footer, as ONE ViewBuilder child — `content` is already at the
     /// 10-child limit — and, more importantly, as the ONE place their precedence is stated.
     ///
-    /// AT MOST TWO ROWS EVER RENDER, which is exactly the ceiling before this line existed:
-    /// `captureHint` and `bedtimeProvenanceHint` are already mutually exclusive (the latter tests
-    /// `!isLikelyTruncated`), as are `captureHint` and `confidenceHint`, so the pre-existing maximum
-    /// was {bedtime, confidence}. `editedNightNotice` displaces BOTH of those, so the new maximum is
-    /// {capture, edited}. Three stacked caveats about one night is its own defect.
+    /// AT MOST TWO ROWS EVER RENDER. `coverageHints` replaced `bedtimeProvenanceHint` and
+    /// `confidenceHint` (2026-09-01) and carries their mutual exclusion forward: it suppresses BOTH
+    /// the front-edge reason and the duration note on a truncated night, so `captureHint` can never
+    /// stack with either, and `assess` already makes an acquisition reason and the duration note
+    /// mutually exclusive — leaving {back edge, front edge} as the coverage maximum.
+    /// `editedNightNotice` displaces all of them, so the overall maximum is {capture, edited}.
+    /// Three stacked caveats about one night is its own defect.
     ///
     /// WHY IT DISPLACES THEM, rather than sitting alongside:
     ///
-    /// - `bedtimeProvenanceHint` ends "tap Edit to correct it" / "Tap Edit if it's wrong". On a night
+    /// - the front-edge caveat ends "tap Edit to correct it" / "Tap Edit if it's wrong". On a night
     ///   the wearer has ALREADY edited that is not a caveat, it is the app failing to notice they did
     ///   the thing it is asking for. The new line makes the same underlying statement — the ring
     ///   recorded nothing across part of this window — and credits the correction instead.
-    /// - `confidenceHint` says "very still night — duration may read a little high", attributing a
+    /// - the duration note says "very still night — duration may read a little high", attributing a
     ///   high efficiency to a sensor ceiling. On an asserted night `summary.efficiency` is inflated
     ///   by the FILL, not by stillness (it is `asleep / inBed` on the display basis, which is why
     ///   `SleepProvenanceBreakdown.efficiency` refuses to publish a ratio over uncovered ground). So
@@ -595,9 +612,14 @@ struct SleepCardView: View {
     /// ⚠️ THAT "FP 0" IS OUT OF **ONE** GOOD LABELLED NIGHT. It is not a rate, and the original
     /// concern is therefore reduced, not answered.
     ///
-    /// The two shipped guards stay, applied ONLY to the duration note they were written for: a
-    /// fragmented night's summed in-bed makes efficiency an artifact, and a truncated night is the
-    /// opposite problem. The acquisition caveats need neither — they report a measured silence.
+    /// ⚠️ `!isLikelyTruncated` GUARDS TWO REASONS, NOT ONE. The deleted `bedtimeProvenanceHint`
+    /// carried it for its own stated reason — "suppressed when `captureHint` already fired: a
+    /// truncated night is the same class of statement … two stacked caveats about the same edge read
+    /// as nagging". Applying it only to the duration note let `captureHint` ("Synced only from
+    /// 01:12") and `.noRecordingBeforeBedtime` ("01:12 is when the ring started recording again")
+    /// render together about the SAME edge, and with both acquisition reasons firing the card could
+    /// show THREE rows — breaking the two-row ceiling `hints(_:)` above states as an invariant.
+    /// `contiguous` really is the duration note's alone: it is an efficiency-artifact test.
     @ViewBuilder
     private func coverageHints(_ night: Night) -> some View {
         if let assessment = coverage {
@@ -609,15 +631,18 @@ struct SleepCardView: View {
                 return e.timeIntervalSince(s) <= night.summary.inBed * 1.15
             }()
             let truncated = isLikelyTruncated(night)
-            ForEach(Array(SleepConfidence.hints(assessment, clock: Self.clock).enumerated()),
-                    id: \.offset) { _, hint in
-                if hint.reason == .durationLikelyHigh {
-                    if contiguous, !truncated {
-                        hintRow(systemImage: hint.systemImage, tint: .secondary, hint.text)
-                    }
-                } else {
-                    hintRow(systemImage: hint.systemImage, tint: .secondary, hint.text)
+            let rows = SleepConfidence.hints(assessment, clock: Self.clock).filter { hint in
+                switch hint.reason {
+                case .durationLikelyHigh:        return contiguous && !truncated
+                case .noRecordingBeforeBedtime:  return !truncated
+                case .noRecordingAfterWake:      return true
                 }
+            }
+            // `Hint.reason` is Hashable and `assess` emits at most one of each case, so it is a
+            // stable identity — unlike a positional offset, which reshuffles every row when the
+            // list shrinks.
+            ForEach(rows, id: \.reason) { hint in
+                hintRow(systemImage: hint.systemImage, tint: .secondary, hint.text)
             }
         }
     }
@@ -680,8 +705,8 @@ struct SleepCardView: View {
     ///
     /// ⚠️ Stated as what the verdict DRIVES, not as what she saw. This function probes the window
     /// the card PRINTS (edit-aware) while the export probes the RECORDED one, so on an edited night
-    /// the two edges are not the same instant; and `bedtimeProvenanceHint` suppresses itself when
-    /// `isLikelyTruncated` fires. What is established is the probe's defect class, not that this
+    /// the two edges are not the same instant; and `coverageHints` suppresses the front-edge reason
+    /// when `isLikelyTruncated` fires. What is established is the probe's defect class, not that this
     /// exact sentence rendered on her phone.
     ///
     /// So the two instants are unioned with this ring's ~30 h epoch archive, exactly as the export's
