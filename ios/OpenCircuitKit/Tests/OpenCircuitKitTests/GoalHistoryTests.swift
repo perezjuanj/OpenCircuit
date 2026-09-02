@@ -223,6 +223,14 @@ final class GoalHistoryTests: XCTestCase {
                        [day("2026-08-17"): 400, day("2026-08-16"): 55])
     }
 
+    /// A row dated in the FUTURE (ring or phone clock skew) is not a current streak either —
+    /// `daysSince` goes negative and a bare `> 1` test let it through.
+    func testAFutureDatedRowIsNotACurrentStreak() {
+        let built = GoalHistory.build(days: [fullDay("2026-08-25")],
+                                      goals: goals, now: day("2026-08-20"), calendar: cal)
+        XCTAssertEqual(GoalHistory.summarize(built, now: day("2026-08-20"), calendar: cal).currentStreak, 0)
+    }
+
     func testPerRingCountsSeparateMetFromMeasured() {
         let days = GoalHistory.build(
             days: [GoalHistory.DayInput(date: day("2026-08-17"), steps: 20_000, sleepMinutes: 100),

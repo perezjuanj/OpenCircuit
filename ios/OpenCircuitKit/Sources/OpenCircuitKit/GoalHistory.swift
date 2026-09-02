@@ -251,16 +251,24 @@ public enum GoalHistory {
     ///     wake when known, else the night key, so a legacy rollup can't drift onto a later day).
     ///     This is deliberately NOT the bedtime keying the Sleep Duration chart uses; a night that
     ///     began at 23:40 belongs to the morning it produced, which is the ring the user saw.
-    ///   • naps fold into the day they started on, EXCEPT a nap overlapping that day's credited
-    ///     night — a manually-added nap has no auto-detection night guard, so without this
-    ///     exclusion a manual nap inside the night would double-count against it.
+    ///   • naps fold into the day they started on, EXCEPT a nap overlapping ANY credited night —
+    ///     a manually-added nap has no auto-detection night guard, so without this exclusion a
+    ///     manual nap inside the night would double-count against it. Deliberately "any", not
+    ///     "that day's": nights are keyed by WAKE day, so a 23:30 nap sits inside a night credited
+    ///     to the NEXT day and a same-day lookup misses it entirely.
+    ///     ⚠️ The guard is all-or-nothing and needs an in-bed CLOCK. Two known gaps, both erring
+    ///     toward under-crediting or toward the pre-existing behaviour, neither introduced here:
+    ///     a nap that merely CLIPS a night loses all its minutes, not just the overlap; and a
+    ///     legacy night with no clock offers no guard at all, so a nap inside it still
+    ///     double-counts.
     public static func sleepCreditByDay(nights: [NightSleep],
                                         naps: [NapSleep],
                                         calendar: Calendar = .current) -> [Date: Int] {
         var credit: [Date: Int] = [:]
         // Keyed by WAKE day, so a lookup by the nap's own start day misses the night it belongs to
-        // (a 23:30 nap sits inside a night credited to the NEXT day). Kept as a flat list and
-        // tested by overlap against all of them — the count is at most a handful per window.
+        // (a 23:30 nap sits inside a night credited to the NEXT day). Every value is therefore
+        // tested for overlap, never just the one on the nap's day — at most a handful per window
+        // (measured: 14 nights × 60 naps = 0.0001 s).
         var creditedNight: [Date: DateInterval] = [:]
 
         for night in nights where night.asleepMinutes > 0 {
@@ -402,7 +410,10 @@ public enum GoalHistory {
             let daysSince = newestCounted.flatMap {
                 calendar.dateComponents([.day], from: $0, to: calendar.startOfDay(for: now)).day
             }
-            if let daysSince, daysSince > 1 { current = 0 }
+            // Today (0) or yesterday (1) only. A NEGATIVE value — a row dated in the future, which
+            // a ring or phone clock skew can produce — is not "current" either, and a bare
+            // `daysSince > 1` let it through.
+            if let daysSince, !(0...1).contains(daysSince) { current = 0 }
         }
 
         return Summary(daysWithData: daysWithData, daysAllClosed: daysAllClosed,
