@@ -783,7 +783,10 @@ fell **31.4→26.6 °C**; against that ground truth:
   69 %, state `0x03` idle, skin temp 31.2/31.1 °C, 3883 mV, `[17]=0xff` not in case), further
   evidence that Gen 3 reuses the Gen 2 descriptor byte-for-byte. So the claim to retire is not
   "descriptors need a session" but the **cadence**: "~30–60 s" is unreliable here, and a client
-  must tolerate 65 s+ of silence rather than treat it as a fault. **Consequence for tooling:** any battery,
+  must tolerate 65 s+ of silence rather than treat it as a fault. **Fourth datapoint 2026-09-02** (`bp_collect.py`, same ring, fresh
+  connection, again no sync-open): **no descriptor**, so across four sessions it is 1 of 4. Rules
+  out "a sync session is required" as the *whole* story in the other direction too — the one
+  success also had none. **Consequence for tooling:** any battery,
   skin-temp or state-byte read must treat "no descriptor" as an expected outcome and say so,
   never silently skip a safety check that depends on it.
 
@@ -1120,6 +1123,43 @@ was dropped; the complete assessment is recoverable from a snoop.
 
 **`0x13` for comparison (already known, `stream_ppg_13.py`):** 160 B, 25 samples x 3 x int16 BE,
 **25.8 Hz**, 146/146 XOR-valid. It streams *concurrently* with `0x12` in mode 5.
+
+**CONFIRMED FROM OUR OWN CLIENT — mode 5 is not app-only 🟢 (2026-09-02, Gen 3 tester run,
+`bp_collect.py`).** Everything above was read out of an app-driven snoop; this is the first time
+`06 05 00` was sent by our code to a real ring. It worked on the first attempt: **451 dense +
+46 slow frames, 4 510 samples, 45.0 s, 100.3 Hz, 0 bad checksums**, and the stop was confirmed on
+attempt 1. Pulse cross-validated **two independent ways** — band-limited DFT `ch0` **75.6 bpm
+(SNR 15.6)**, and time-domain beat intervals on the same channel **74.2 bpm** (median IBI 808 ms,
+47 accepted beats) — with `ch0`/`ch1` both showing the fundamental at **1.25 Hz plus 2nd and 3rd
+harmonics (2.50 / 3.70 Hz)**, which a filter artefact does not produce. The frame layout, the
+start/stop pair, the settling ramp and the push-only behaviour above all replicate against a
+non-snoop transport.
+
+**`ch2` is a ~19.6 Hz carrier, NOT a third PPG channel — 🟢 in both captures.** The table above
+recorded `ch2` as "small-DC, not pulsatile" from the app-driven capture. A wideband spectrum
+(0.2–49 Hz) now says what it actually is:
+
+| capture | `ch2` DC | `ch2` peak | vs its own noise floor |
+|---|---|---|---|
+| app-driven, FR05.011 attempt 3 | 2 726 | **19.55 Hz** (+ 39.15 Hz 2nd harmonic) | 26× |
+| our client, 2026-09-02 | 12 376 | **19.65 Hz** (+ 39.25/41.40 Hz) | **4 285×** |
+
+Same carrier in both, so this is the hardware, **not** something our start sequence caused (the
+tool sends the app's `29 00 00` pre-read before `06 05 00`). Its absolute amplitude is not
+stable — ~4.5× the DC and ~165× the relative strength between the two sessions — so it is a
+gain/drive property, not a measurement. `ch3` shows no spectral structure in either capture
+(top peak 4–6× median), consistent with the ambient/dark-current reading.
+
+⚠️ **Tooling landmine:** 19.6 Hz aliases into any narrow HR search band as a *large* peak.
+Graded on `ch2`, this run reports **127.8 bpm at SNR 138** — a confident, entirely false GOOD.
+`bp_collect.py` grades on `ch0`/`ch1` only, deliberately. **Never add `ch2` to a pulse estimate.**
+
+**Live-link capture is lossy where a snoop is not 🟡.** The reference snoop had **0 sequence
+gaps in 902 frames**; this live macOS/CoreBluetooth run had **2 gaps in 451**. The frames that do
+arrive are intact (XOR-valid), and 2 lost frames = 20 samples out of 4 510 is irrelevant to an
+HR or a pulse-morphology average. It is **not** irrelevant to beat-to-beat HRV: the CSV timebase
+is reconstructed as `sample_idx / fs`, so a dropped frame silently shortens the record instead of
+leaving a hole. If `0x12` is ever used for beat-to-beat work, mark the gaps in the CSV first.
 
 **Rate caveat 🟡:** attempts 1 and 3 both ran **100.6/100.7 Hz**. Attempt 2 measured 27.6 Hz —
 but the BLE link dropped and re-authenticated mid-measurement in that window (a fresh `01 00 00`

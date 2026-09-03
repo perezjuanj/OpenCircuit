@@ -375,6 +375,10 @@ def analyse_and_write(s, out_stem, seconds):
     fs = (len(rows) / span) if span > 0 else 0.0
     gaps = sum(1 for a, b in zip(seqs, seqs[1:]) if (b - a) % 65536 != 1)
 
+    # ch0/ch1 ONLY, and this is not an oversight. ch2 carries a ~19.6 Hz carrier (measured in
+    # BOTH an app-driven and a client-driven capture, PROTOCOL.md §5.10) which aliases into the
+    # 0.7-3.0 Hz search band as a large peak: on the 2026-09-02 tester run, grading ch2 reports
+    # 127.8 bpm at SNR 138 — a confident, completely false GOOD. ch3 is ambient/dark-current.
     ch0 = [r[0] for r in rows]
     ch1 = [r[1] for r in rows]
     bpm0, snr0 = pulse_estimate(ch0, fs) if fs > 1 else (None, None)
