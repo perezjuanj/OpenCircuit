@@ -16,6 +16,16 @@ public enum HistoryChannelOutcome: String, Codable, Sendable {
     /// says WE never asked (a connectivity problem, and the ring is exonerated). A tester export
     /// showing 27 all-day `noAck`s looked like a ring-side channel limit; it was a flaky link.
     case linkDown
+    /// The channel was still waiting on the ring (no ACK, no pages) when OUR OWN session was torn
+    /// down — a BLE reconnect replaced it mid-wait. Split out of `.noAck` (2026-09-04) for the same
+    /// reason `.linkDown` was: the two mean opposite things. `.noAck` says a LIVE link sat idle and
+    /// the ring never answered; this says the question was still in flight when we stopped listening
+    /// for our own reasons, so the ring is exonerated and no protocol signal should be inferred. A
+    /// tester export dominated by "session replaced — no drain ran" with `all-day`/`sport` `noAck`
+    /// on nearly every cycle (while `sleep`, going first in the foreground plan, occasionally won the
+    /// race) looked like the ring refusing those channels; it was session churn cutting them off
+    /// before their turn. See `HistoryDrainPlan.resuming` for how this is used to recover.
+    case cancelled
 
     /// Safe to re-stage/persist sleep from this channel.
     public var allowsSleepCommit: Bool { self == .complete }
@@ -95,8 +105,14 @@ public struct HistoryChannelTrace: Equatable, Codable, Sendable {
         if page47Count > 0 { return .ppgOnly }
         if sawSyncAck { return .empty }
         // Ordered AFTER every "we heard something" branch: if pages or an ACK arrived, the link
-        // plainly worked and a stale write-failure flag must not override real evidence.
+        // plainly worked and a stale write-failure flag (or a cancellation that landed just after)
+        // must not override real evidence.
         if openWriteFailed == true { return .linkDown }
+        // Ordered AFTER `.linkDown`: `openWriteFailed` is only ever paired with `.linkUnusable`
+        // (never `.cancelled`, see `RingSession.drainChannel`), so this never shadows it — it only
+        // catches the case `.linkDown` doesn't: the write succeeded and we were genuinely waiting
+        // on the ring when OUR OWN session teardown cancelled the wait.
+        if exitReason == .cancelled { return .cancelled }
         return .noAck
     }
 }
