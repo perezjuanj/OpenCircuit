@@ -252,4 +252,35 @@ final class HistorySyncAssessmentTests: XCTestCase {
         XCTAssertEqual(HistoryChannelOutcome.sportOnly.rawValue, "sportOnly")
         XCTAssertEqual(HistoryChannelExitReason.linkUnusable.rawValue, "linkUnusable")
     }
+
+    // MARK: .cancelled — interrupted by OUR OWN session teardown, not a ring-side signal
+
+    func testCancelledMidWaitIsNotMisreportedAsNoAck() {
+        // A BLE session replacement cancels whatever channel is mid-wait. Before this outcome had
+        // no `.cancelled` branch, so a channel cut off before any ring response fell through to
+        // `.noAck` — indistinguishable from a live link the ring genuinely never answered on. That
+        // conflation is exactly what let session-churn starvation misdiagnose as "the ring stayed
+        // silent" (2026-09-04 tester export: `all-day`/`sport` `noAck` on nearly every cycle, only
+        // `sleep` — first in the foreground plan — occasionally winning the race).
+        var trace = HistoryChannelTrace(label: "all-day", channel: 0x03)
+        trace.exitReason = .cancelled
+        XCTAssertEqual(trace.outcome, .cancelled)
+        XCTAssertFalse(trace.outcome.allowsSleepCommit)
+    }
+
+    func testRealEvidenceOutranksACancelledExitReason() {
+        // If pages or an ACK arrived before the cancellation landed, that's real evidence the
+        // cancel must not erase — same precedence rule as the `.linkDown` write-failure flag.
+        var acked = HistoryChannelTrace(label: "all-day", channel: 0x03)
+        acked.sawSyncAck = true
+        acked.exitReason = .cancelled
+        XCTAssertEqual(acked.outcome, .empty)
+
+        var paged = HistoryChannelTrace(label: "sleep", channel: 0x00)
+        paged.page4CCount = 2
+        paged.endMarkerCount = 1
+        paged.exitReason = .cancelled
+        XCTAssertEqual(paged.outcome, .complete)
+        XCTAssertTrue(paged.outcome.allowsSleepCommit)
+    }
 }

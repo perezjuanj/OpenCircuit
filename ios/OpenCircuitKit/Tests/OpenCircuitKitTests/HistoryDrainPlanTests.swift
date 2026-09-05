@@ -107,6 +107,31 @@ final class HistoryDrainPlanTests: XCTestCase {
         XCTAssertEqual(HistoryDrainPlan.sportStep.channel, Command.syncChannelSport)
     }
 
+    // MARK: resuming — one-shot resume for a channel cut off by session replacement (#reconnect)
+
+    func testResumingMovesTheHintedStepToTheFront() {
+        let base = [HistoryDrainPlan.sleepStep, HistoryDrainPlan.allDayStep, HistoryDrainPlan.sportStep]
+        let resumed = HistoryDrainPlan.resuming(HistoryDrainPlan.allDayStep, in: base)
+        XCTAssertEqual(labels(resumed), ["all-day", "sleep", "sport"])
+    }
+
+    func testResumingIsANoOpWhenTheHintedStepIsAlreadyFirst() {
+        let base = [HistoryDrainPlan.sleepStep, HistoryDrainPlan.allDayStep]
+        XCTAssertEqual(labels(HistoryDrainPlan.resuming(HistoryDrainPlan.sleepStep, in: base)),
+                       ["sleep", "all-day"])
+    }
+
+    func testResumingIsANoOpWhenTheHintedStepIsNotInThePlan() {
+        // The allDayOnly workout prime's plan is `[allDayStep]` only — a stale sleep/sport hint
+        // left over from a churn that happened to land during the prime must not inject a channel
+        // the prime deliberately excludes (#119).
+        let primePlan = [HistoryDrainPlan.allDayStep]
+        XCTAssertEqual(labels(HistoryDrainPlan.resuming(HistoryDrainPlan.sleepStep, in: primePlan)),
+                       ["all-day"])
+        XCTAssertEqual(labels(HistoryDrainPlan.resuming(HistoryDrainPlan.sportStep, in: primePlan)),
+                       ["all-day"])
+    }
+
     /// PARITY: re-implements the exact inline logic this type replaced and compares over the whole
     /// input space, so the extraction cannot silently drift from shipped behaviour.
     func testMatchesTheReplacedInlineLogicForEveryInput() {

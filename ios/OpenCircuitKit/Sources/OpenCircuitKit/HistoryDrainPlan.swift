@@ -117,4 +117,28 @@ public enum HistoryDrainPlan {
         if !inBackground, sportEnabled { steps.append(sportStep) }
         return steps
     }
+
+    /// Move `step` to the front of `plan` when present, so a channel that was still waiting on the
+    /// ring when a BLE reconnect tore down the session gets first crack on the very next attempt
+    /// instead of being re-queued behind whatever already won that race (2026-09-04: a session-churn
+    /// investigation found `all-day`/`sport` starved almost every cycle, behind `sleep`, which always
+    /// goes first in the foreground plan and so had first claim on each connection window before the
+    /// next churn cut in).
+    ///
+    /// ⚠️ THIS IS NOT THE REORDER HEURISTIC REJECTED ABOVE. That one inferred "starvation" from
+    /// aggregate outcome history recomputed every pass, and was killed because the signal was
+    /// polluted by a user-cancelled `syncTask` and by the `allDayOnly` prime, and because it thrashed.
+    /// This is a single, first-hand fact — `RingSession.interruptedDrainChannel` reads which channel
+    /// THIS session's OWN teardown cut off, synchronously, before anything is cancelled — applied
+    /// ONCE per replacement session and then discarded regardless of outcome, not accumulated or
+    /// recomputed. It cannot fire for a user Measure-cancel (that cancels `syncTask` in place, without
+    /// going through `RingScanner.teardownSession()`), and a stale hint against a plan that excludes
+    /// it (e.g. the `allDayOnly` prime's `[allDayStep]`) is simply a no-op — `#119` is untouched.
+    public static func resuming(_ step: Step, in plan: [Step]) -> [Step] {
+        guard let index = plan.firstIndex(of: step), index != 0 else { return plan }
+        var reordered = plan
+        reordered.remove(at: index)
+        reordered.insert(step, at: 0)
+        return reordered
+    }
 }
