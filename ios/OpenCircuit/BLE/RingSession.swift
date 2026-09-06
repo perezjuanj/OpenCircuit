@@ -423,6 +423,22 @@ final class RingSession: NSObject {
     private var activeDrainTrace: HistoryChannelTrace?
     private var historySyncTrigger = "foreground"
 
+    /// One-shot resume hint (#reconnect): `RingScanner.teardownSession()` reads
+    /// `interruptedDrainChannel` off the OLD session before tearing it down and hands it to this
+    /// replacement session. The next `performHistoryDrain` moves that channel to the front of its
+    /// plan — see `HistoryDrainPlan.resuming` — then clears this, win or lose, so it never becomes a
+    /// standing reorder. `nil` on an ordinary reconnect that didn't interrupt anything.
+    var resumeChannelHint: HistoryDrainPlan.Step?
+
+    /// The channel actively mid-wait (open sent, no `0x82`/pages yet, or streaming but unfinished)
+    /// right now — read by `RingScanner.teardownSession()` BEFORE it cancels `syncTask`, so this
+    /// reflects the true in-flight channel rather than whatever `drainChannel`'s cancellation branch
+    /// races to record. `nil` when no drain is running or the drain hasn't opened a channel yet.
+    var interruptedDrainChannel: HistoryDrainPlan.Step? {
+        guard syncTask != nil, let trace = activeDrainTrace else { return nil }
+        return HistoryDrainPlan.Step(channel: trace.channel, label: trace.label)
+    }
+
     private var bulkRecords: [BulkRecord] = []
     private var bulkFinalized = false    // captured pages already committed (sleep/vitals) — stop-time safety net skips re-commit
     private var didRestageFromArchive = false   // once-per-session: surface retained-but-unstaged archive epochs (#119)
@@ -3580,13 +3596,20 @@ final class RingSession: NSObject {
         // live on channel 0x02 — `HistoryDrainPlan` appends it foreground-only and last: it is not
         // worth spending a bounded background wake on workout review data, and the official two-day
         // retention window means the next foreground open is sufficient.
-        let plan = HistoryDrainPlan.steps(
+        var plan = HistoryDrainPlan.steps(
             inBackground: inBackground,
             allDayOnly: allDayOnly,
             sportEnabled: automaticWorkoutDetectionEnabled,
             now: Date(),
             nightWindowEnd: nightWindow?.end,
             morningCatchUpWindow: Self.morningCatchUpWindow)
+        // Consume the resume hint ONCE, win or lose (#reconnect) — a channel that lost the race
+        // against the last session replacement gets first crack this pass; see
+        // `HistoryDrainPlan.resuming` for why this differs from the rejected standing reorder above.
+        if let hint = resumeChannelHint {
+            resumeChannelHint = nil
+            plan = HistoryDrainPlan.resuming(hint, in: plan)
+        }
         for step in plan {
             if Task.isCancelled { break }
             await drainChannel(channel: step.channel, label: step.label)
