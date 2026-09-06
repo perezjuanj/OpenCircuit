@@ -217,7 +217,7 @@ struct VitalsTableView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             measurableRow("Heart Rate", value: hrText, mode: .hr, active: hrActive,
-                          time: hrActive && session?.liveHR == nil
+                          time: hrActive && settledLiveHR == nil
                               ? (session?.livePreparing == true ? "preparing…" : "measuring…")
                               : timeFor(.heartRate, live: hrLive))
             divider
@@ -347,13 +347,27 @@ struct VitalsTableView: View {
 
     // MARK: value formatting (live user reads override stored values)
 
+    /// The user-facing live HR: a SETTLED window, never the newest frame.
+    ///
+    /// ⚠️ `session.liveHR` is whichever poll frame arrived last, and one read legitimately spans a
+    /// wide band — the repo's only real capture (FR02.018, `RingKitVerify.realHRFrames`) locks on
+    /// 82, 84, 88, 90, 91, 66, 61 inside a SINGLE measurement. Rendering the last frame therefore
+    /// showed 61 there, which is how a tester got an "abnormally low" reading off a healthy ring.
+    /// `LiveHR.settled` takes the median of the last `settleSampleCount` locked frames instead.
+    /// Nil until the window fills, so the row keeps saying "measuring…" rather than showing a
+    /// number it cannot stand behind. See `LiveHR.settleSampleCount` for why 5.
+    private var settledLiveHR: Int? {
+        guard let session else { return nil }
+        return LiveHR.settled(session.liveHRTrend)
+    }
+
     /// HR/SpO2 count as "live" only for user-initiated reads whose frames are still fresh.
     /// Auto-measure/workout cycles persist their samples through the existing owner paths.
-    private var hrLive: Bool { hrActive && session?.liveHR != nil && !liveStale }
+    private var hrLive: Bool { hrActive && settledLiveHR != nil && !liveStale }
     private var spo2Live: Bool { spo2Active && session?.liveSpO2 != nil && !liveStale }
 
     private var hrText: String {
-        if hrLive, let hr = session?.liveHR { return "\(hr) bpm" }
+        if hrLive, let hr = settledLiveHR { return "\(hr) bpm" }
         return valueText(.heartRate) { "\(Int($0)) bpm" }
     }
     private var spo2Text: String {

@@ -33,6 +33,42 @@ public enum LiveHR {
         return hr
     }
 
+    // MARK: - Settling a user-facing reading
+
+    /// Locked frames required before a live HR is shown or persisted as a finished reading.
+    ///
+    /// 🟢 MEASURED, from the only real poll capture the repo holds (FR02.018, `RingKitVerify`'s
+    /// `realHRFrames`): ONE user read yields the locked sequence 82, 84, 88, 90, 91, 66, 61 — a
+    /// 30 bpm spread inside a single measurement, after the warm-up sentinel (8) is filtered. A
+    /// display that renders whichever frame happened to arrive last is therefore a coin flip
+    /// across that spread in BOTH directions, which is what a tester saw as an "abnormally low"
+    /// manual reading. The problem is not a warm-up ramp — the first locked frame there is 82 —
+    /// it is that one frame was ever treated as the answer.
+    ///
+    /// 5 is chosen from the poll cadence, not fitted: `startLiveMonitoring` polls every 2 s, so
+    /// 5 frames is ~10 s of measurement — reachable inside a normal read (the real capture holds
+    /// 7 locked frames) — and a 5-sample median has a 2-sample breakdown point, so a single
+    /// sensor dropout cannot move it. `RingSession.liveHRTrend` retains 12, so the window always
+    /// fits.
+    ///
+    /// ⚠️ This matters far more on Gen 2 Air (FR04) than on Gen 2. Measured over the committed
+    /// corpus, the share of epochs whose HR byte falls outside `validBPM` is 0.0–0.5 % on three
+    /// FR02.018 captures against 0.4–6.7 % on three FR04.009 captures — roughly a 10× higher
+    /// PPG-failure rate — so an Air user is correspondingly likelier to catch a bad frame.
+    public static let settleSampleCount = 5
+
+    /// The settled HR for a user-facing read: the median of the last `settleSampleCount` locked
+    /// frames, or nil while fewer than that have arrived (the caller should still say "measuring…").
+    ///
+    /// The median, not the mean: it discards a symmetric pair of outliers outright rather than
+    /// averaging them in, so one dropout frame and one spike frame both fall out of the answer.
+    /// Pass `RingSession.liveHRTrend`, which holds only values that already passed `decodeLocked`.
+    public static func settled(_ trend: [Int]) -> Int? {
+        guard trend.count >= settleSampleCount else { return nil }
+        let window = trend.suffix(settleSampleCount).sorted()
+        return window[window.count / 2]
+    }
+
     /// SpO2 % from a long SpO2-mode frame `15 01 … <spo2> …` (byte[14]), or nil. 🟡
     /// Note: single-window measurement, not multi-sample ground-truthed — render with
     /// "est." caveat in UI to indicate lower confidence (#59).

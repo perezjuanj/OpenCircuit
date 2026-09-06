@@ -1511,9 +1511,44 @@ struct ContentView: View {
 
     // MARK: Vitals dashboard (persisted — always visible)
 
+    /// Says so when the RING has stopped recording — the failure a tester had to infer by reading
+    /// timestamps, because skin temperature is LIVE-only and kept updating while every
+    /// history-borne metric sat frozen hours back (HR 4 h, HRV 12 h, RR 12 h, each at a different
+    /// moment because each rides a different subset of epochs). `RecorderStall` deliberately
+    /// distinguishes "we haven't drained" from "the ring recorded nothing", and only the latter is
+    /// rendered — a stale head we cannot explain stays silent rather than blaming the ring.
+    @ViewBuilder
+    private var recorderStallNotice: some View {
+        if case .stalled(let since) = recorderStallVerdict {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Your ring has recorded nothing since \(since, format: .dateTime.hour().minute())")
+                        .font(.caption.weight(.semibold))
+                    Text("The link is fine — these readings are the last ones the ring saved. Taking it off and putting it back on usually restarts recording.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.bottom, 8)
+        }
+    }
+
+    /// Evidence for `recorderStallNotice`, read from the per-ring archive store the drain path
+    /// writes (`noteCompletedEpochDrain`). Both inputs are persisted, so the verdict survives the
+    /// reconnects a stalled ring tends to produce.
+    private var recorderStallVerdict: RecorderStall.Verdict {
+        guard let session else { return .recording }
+        let evidence = session.recorderStallEvidence
+        return RecorderStall.verdict(newestEpochAt: evidence.headAt,
+                                     completedDrainsSinceHeadMoved: evidence.unmovedDrains,
+                                     isCharging: session.charging || session.inferredCharging)
+    }
+
     private var vitalsCard: some View {
         card {
             Text("VITALS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            recorderStallNotice
             VitalsTableView(session: session)
             Text("Home shows the latest recorded readings and when they were recorded. Heart-rate and SpO₂ also support on-demand reads while the ring link is ready.")
                 .font(.caption2)
