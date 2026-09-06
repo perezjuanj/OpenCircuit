@@ -423,11 +423,17 @@ final class RingSession: NSObject {
     private var activeDrainTrace: HistoryChannelTrace?
     private var historySyncTrigger = "foreground"
 
-    /// One-shot resume hint (#reconnect): `RingScanner.teardownSession()` reads
-    /// `interruptedDrainChannel` off the OLD session before tearing it down and hands it to this
-    /// replacement session. The next `performHistoryDrain` moves that channel to the front of its
-    /// plan — see `HistoryDrainPlan.resuming` — then clears this, win or lose, so it never becomes a
-    /// standing reorder. `nil` on an ordinary reconnect that didn't interrupt anything.
+    /// One-shot resume hint (#reconnect): `RingScanner.teardownSession(capturingResumeHint:)` reads
+    /// `interruptedDrainChannel` off the OLD session before tearing it down and — if the teardown was
+    /// genuine session churn, and the hint still matches this ring and is inside its TTL — hands it to
+    /// this replacement session. The next `performHistoryDrain` passes it to `HistoryDrainPlan.steps`,
+    /// which moves that channel to the front of the plan ONLY in the plain foreground case, then
+    /// clears this win or lose so it never becomes a standing reorder. `nil` on an ordinary reconnect
+    /// that didn't interrupt anything, and on every teardown that wasn't churn.
+    ///
+    /// ⚠️ Do NOT apply this to a plan yourself. `HistoryDrainPlan.steps` owns the gate: the background
+    /// all-day-first order (`39f3e43`) and the morning catch-up's sleep-first order are device-observed
+    /// decisions, and applying the hint on top of either inverts them inside a ~30 s BGTask window.
     var resumeChannelHint: HistoryDrainPlan.Step?
 
     /// The channel actively mid-wait (open sent, no `0x82`/pages yet, or streaming but unfinished)
@@ -3596,20 +3602,23 @@ final class RingSession: NSObject {
         // live on channel 0x02 — `HistoryDrainPlan` appends it foreground-only and last: it is not
         // worth spending a bounded background wake on workout review data, and the official two-day
         // retention window means the next foreground open is sufficient.
-        var plan = HistoryDrainPlan.steps(
+        //
+        // Consume the resume hint ONCE, win or lose (#reconnect) — a channel that lost the race
+        // against the last session replacement gets first crack this pass. It is handed to
+        // `steps(…)` rather than applied to its result, because `steps` is where the gate lives:
+        // the hint may reorder ONLY the plain foreground plan, never the background all-day-first
+        // order or the morning catch-up. See `HistoryDrainPlan.resuming` for the four guards that
+        // separate this from the standing reorder heuristic rejected above.
+        let hint = resumeChannelHint
+        resumeChannelHint = nil
+        let plan = HistoryDrainPlan.steps(
             inBackground: inBackground,
             allDayOnly: allDayOnly,
             sportEnabled: automaticWorkoutDetectionEnabled,
             now: Date(),
             nightWindowEnd: nightWindow?.end,
-            morningCatchUpWindow: Self.morningCatchUpWindow)
-        // Consume the resume hint ONCE, win or lose (#reconnect) — a channel that lost the race
-        // against the last session replacement gets first crack this pass; see
-        // `HistoryDrainPlan.resuming` for why this differs from the rejected standing reorder above.
-        if let hint = resumeChannelHint {
-            resumeChannelHint = nil
-            plan = HistoryDrainPlan.resuming(hint, in: plan)
-        }
+            morningCatchUpWindow: Self.morningCatchUpWindow,
+            resumeHint: hint)
         for step in plan {
             if Task.isCancelled { break }
             await drainChannel(channel: step.channel, label: step.label)

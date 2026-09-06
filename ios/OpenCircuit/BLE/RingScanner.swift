@@ -59,7 +59,21 @@ final class RingScanner: NSObject {
     /// session eventually replaces it (#reconnect) — that gap can be a same-tick reconnect
     /// (`didConnect`/`willRestoreState`) or, after a real drop, the far side of a backoff retry.
     /// Read and cleared the moment a new session is created; see `RingSession.resumeChannelHint`.
-    private var pendingDrainResume: HistoryDrainPlan.Step?
+    ///
+    /// ⚠️ Two guards keep this from becoming a standing, drifting reorder input — both added
+    /// 2026-09-05 after review found the original had NEITHER:
+    ///
+    ///   • CAPTURE SITE. Every `teardownSession(reason:)` caller must name WHY it is tearing down,
+    ///     and `HistoryDrainPlan.TeardownReason.capturesResumeHint` — a pure, unit-tested table —
+    ///     decides. Only `.linkDropped` and `.sessionReplaced` capture. `.switchingRing`,
+    ///     `.userDisconnected` and `.backgroundReadEnded` CLEAR it instead, so a deliberate user
+    ///     action can never leave a hint standing and ring A's hint is never even offered to ring B.
+    ///   • IDENTITY + TTL. It is a `HistoryDrainPlan.ResumeHint`, stamped with the peripheral it came
+    ///     from and the instant of capture, and refused on consumption if either fails to match
+    ///     (`ResumeHint.step(forPeripheral:at:)`, TTL 120 s). Previously it was a bare `Step` cleared
+    ///     only when a new session was created, so it could survive indefinitely and land on a
+    ///     different ring days later.
+    private var pendingDrainResume: HistoryDrainPlan.ResumeHint?
 
     /// LAZY (#142): created only when Bluetooth is actually needed (first connect / saved-ring
     /// restore), NOT at app launch. Allocating a `CBCentralManager` is what triggers the iOS
@@ -364,7 +378,10 @@ final class RingScanner: NSObject {
         // identity guards in didDisconnect/didFailToConnect ignore the old ring's late callbacks.
         if let current = target, current.identifier != id {
             central?.cancelPeripheralConnection(current)
-            teardownSession()
+            // NOT churn: this is a switch to a DIFFERENT ring. `teardownSession` therefore drops any
+            // pending resume hint rather than capturing one — the old ring's interrupted channel says
+            // nothing about the new ring, and the identity guard would refuse it anyway (#reconnect).
+            teardownSession(reason: .switchingRing)
         }
         wantConnection = true
         target = peripheral
@@ -447,15 +464,38 @@ final class RingScanner: NSObject {
     /// Called everywhere `session` is replaced or dropped — before assigning a new session in
     /// `didConnect`/`willRestoreState`, and on disconnect — so a stale session's keepalive/
     /// auto-measure/sync loops can never keep writing to the peripheral behind a newer one.
-    private func teardownSession() {
+    ///
+    /// `reason` (#reconnect) is the CAPTURE-SITE guard on `pendingDrainResume`. It has NO default —
+    /// every caller must name why it is tearing down, so a new call site has to think about whether
+    /// its teardown is genuine session churn. The capture/clear/keep decision itself lives in the
+    /// pure, unit-tested `HistoryDrainPlan.ResumeHint.afterTeardown(_:inFlight:peripheralID:at:standing:)`,
+    /// not here — including the subtle case where a capturing teardown with nothing in flight must
+    /// KEEP the standing hint (the ordinary reconnect captures at `didDisconnect`, then tears down
+    /// again at `didConnect` with `session` already nil).
+    private func teardownSession(reason: HistoryDrainPlan.TeardownReason) {
         session?.stopLiveMonitoring()
         // Read BEFORE `invalidate()` cancels `syncTask` (#reconnect): cancellation is cooperative —
         // `drainChannel` only notices it on its next check, asynchronously — so this is the last
         // point at which `activeDrainTrace` reliably reflects the channel that was actually in
         // flight, rather than racing whatever `drainChannel`'s own cancellation branch records.
-        pendingDrainResume = session?.interruptedDrainChannel
+        pendingDrainResume = HistoryDrainPlan.ResumeHint.afterTeardown(
+            reason,
+            inFlight: session?.interruptedDrainChannel,
+            peripheralID: target?.identifier,
+            at: Date(),
+            standing: pendingDrainResume)
         session?.invalidate()
         session = nil
+    }
+
+    /// Take the pending resume hint if it still applies to `peripheral` right now, clearing it either
+    /// way (it is one-shot: consumed once per replacement session, win or lose). Refuses a hint
+    /// captured from a DIFFERENT ring and one older than `ResumeHint.timeToLive` — the decision itself
+    /// lives in the pure, unit-tested `HistoryDrainPlan.ResumeHint`, since this class cannot be.
+    private func consumeDrainResumeHint(for peripheral: CBPeripheral) -> HistoryDrainPlan.Step? {
+        guard let pending = pendingDrainResume else { return nil }
+        pendingDrainResume = nil
+        return pending.step(forPeripheral: peripheral.identifier, at: Date())
     }
 
     /// Cancel any in-flight reconnect backoff and clear the calm state (#35). Used on a fresh
@@ -566,7 +606,9 @@ final class RingScanner: NSObject {
                 central?.cancelPeripheralConnection(target)
             }
         }
-        teardownSession()         // cancel all of the session's tasks, not just the live poll (#42)
+        // NOT churn: a deliberate user stop. No hint is captured and any standing one is dropped —
+        // "I'm done with this ring" must not leave a reorder queued for a future connect (#reconnect).
+        teardownSession(reason: .userDisconnected)   // cancel all of the session's tasks, not just the live poll (#42)
         target = nil
         state = .idle
     }
@@ -593,7 +635,10 @@ final class RingScanner: NSObject {
     /// no-scan pending connect-by-identifier so reconnection stays armed across the next
     /// suspension. (Reviewer MAJOR fix.)
     private func endBackgroundReadRearming() {
-        teardownSession()   // stopLiveMonitoring + cancel keepalive/auto-measure/sync tasks (#42)
+        // NOT churn: the bounded read reached its own end, it was not cut off. No hint is captured
+        // (#reconnect) — the next wake plans its own order, and in the BACKGROUND a hint would be a
+        // no-op regardless (`HistoryDrainPlan.steps` gates it to the foreground plan).
+        teardownSession(reason: .backgroundReadEnded)   // stopLiveMonitoring + cancel keepalive/auto-measure/sync tasks (#42)
         // CB calls are UB before powered-on — guard them, same as stop()/disconnect() (API MISUSE
         // otherwise: this runs at the end of a background read, exactly when the radio's power
         // state is most likely to be in flux).
@@ -830,10 +875,9 @@ extension RingScanner: CBCentralManagerDelegate {
                 // Tear down any session that already exists (e.g. a later `didConnect` racing this
                 // restore) before replacing it, so its tasks don't keep writing to the peripheral
                 // behind the new session (#42).
-                self.teardownSession()
+                self.teardownSession(reason: .sessionReplaced)
                 let restored = RingSession(peripheral: peripheral, localStore: self.localStore)
-                restored.resumeChannelHint = self.pendingDrainResume
-                self.pendingDrainResume = nil
+                restored.resumeChannelHint = self.consumeDrainResumeHint(for: peripheral)
                 self.session = restored
             case .connecting:
                 // Pending connect still in flight; `didConnect` will complete it.
@@ -913,10 +957,9 @@ extension RingScanner: CBCentralManagerDelegate {
             self.state = .connected(peripheral.name ?? "RingConn")
             // Tear down any prior session before replacing it so its keepalive/auto-measure/sync
             // tasks can't keep driving the same peripheral behind the new session (#42).
-            self.teardownSession()
+            self.teardownSession(reason: .sessionReplaced)
             let newSession = RingSession(peripheral: peripheral, localStore: self.localStore)
-            newSession.resumeChannelHint = self.pendingDrainResume
-            self.pendingDrainResume = nil
+            newSession.resumeChannelHint = self.consumeDrainResumeHint(for: peripheral)
             self.session = newSession
             self.armConnectStabilityReset()
             // Reconnect-resume (#reconnect): a mid-workout BLE drop tore down the old session and its
@@ -952,7 +995,10 @@ extension RingScanner: CBCentralManagerDelegate {
             // the old ring (which would bounce us back and leak the new link). (#multi-ring)
             guard peripheral.identifier == self.target?.identifier else { return }
             self.connectStableTask?.cancel(); self.connectStableTask = nil
-            self.teardownSession()   // cancel ALL of the session's tasks, persisting last reading (#42)
+            // CAPTURES the resume hint (#reconnect): this is the genuine churn path — the link
+            // dropped under a possibly mid-flight drain, and auto-reconnect below will bring up a
+            // replacement session on this same ring that should finish what was cut off.
+            self.teardownSession(reason: .linkDropped)   // cancel ALL of the session's tasks, persisting last reading (#42)
             // Auto-reconnect: CoreBluetooth's connect has no timeout — it reconnects (using the
             // persisted bond) the moment the ring wakes/comes back in range, so the user never has
             // to re-pair or open the official app again. But we no longer re-issue it IMMEDIATELY:
