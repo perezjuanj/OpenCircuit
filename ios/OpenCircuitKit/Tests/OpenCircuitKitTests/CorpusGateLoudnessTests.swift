@@ -305,6 +305,7 @@ final class CorpusGateLoudnessTests: XCTestCase {
             "SleepProvenanceFixtureProbe.swift": 1, // fixture-geometry scaffold
             "SleepEditedNightNoticeCorpusTests.swift": 1, // how often the card's notice appears
             "SleepMonotonicityTests.swift": 1,    // the growing-archive collapse sweep
+            "FR04MotionChannelMeasureTests.swift": 1, // motion-channel census + the cut sweep (#211)
         ]
         let gateCall = "SleepReplay" + ".requireCorpus("
         var found: [String: Int] = [:]
@@ -352,11 +353,16 @@ final class CorpusGateLoudnessTests: XCTestCase {
             oc + "_PROVENANCE_CORPUS", // SleepProvenanceCorpusTests + its fixture scaffold
             oc + "_NOTICE_CORPUS",     // SleepEditedNightNoticeCorpusTests
             oc + "_MONOTONICITY_CORPUS", // SleepStagingMonotonicityTests — the growing-archive sweep
+            oc + "_MOTION_CORPUS",    // FR04MotionChannelMeasureTests — the motion-channel census
+                                      // and the activityMagnitudeActiveCut sweep (#211)
             oc + "_BASELINE_OUT",     // …and where that emitter writes its TSV. NOT a corpus: an
                                       // output path, legitimately Optional, read raw.
             oc + "_GATE_SELFTEST",    // this file's own injected variable; never a real corpus
             oc + "_PROBE_OUT",        // SleepAbsorbProbeTests' output path. NOT a corpus, same shape
                                       // as _BASELINE_OUT: an output path, legitimately Optional.
+            oc + "_MOTION_CUT",       // SleepBaselineTests' CANDIDATE motion-channel override (#211).
+                                      // NOT a corpus, same shape as _ABSORB_CUT: unset means
+                                      // "measure the shipped default", which is a real measurement.
             oc + "_ABSORB_CUT",       // SleepAbsorbProbeTests' CANDIDATE cut override. NOT a corpus:
                                       // unset means "measure the shipped default", which is a real
                                       // measurement, not a skipped one.

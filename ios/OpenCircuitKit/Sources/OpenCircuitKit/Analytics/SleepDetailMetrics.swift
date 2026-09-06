@@ -74,11 +74,12 @@ public enum SleepDetailMetrics {
     public static func movement(records: [BulkRecord],
                                 in window: DateInterval? = nil,
                                 activeThreshold: Int? = nil,
-                                epoch: Int = Command.syncEpoch) -> [MovementEpoch] {
+                                epoch: Int = Command.syncEpoch,
+                                motionPolicy: BulkSleep.MotionChannelPolicy = .default) -> [MovementEpoch] {
         let scoped = records
             .sorted { $0.counter < $1.counter }
             .filter { r in window.map { $0.contains(r.date(epoch: epoch)) } ?? true }
-        let source = BulkSleep.motionSource(scoped)
+        let source = BulkSleep.motionSource(scoped, policy: motionPolicy)
         let mags = scoped.map { record -> Int in
             switch source {
             case .primary: return epochMotionEnergy(record)

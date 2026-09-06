@@ -1,26 +1,46 @@
 import XCTest
 @testable import OpenCircuitKit
 
-/// Regression coverage for the RingConn Gen 2 Air on FW **FR04.011** — the sibling of #184's
-/// FR04.009 shape, and a DIFFERENT failure that the #184 gate correctly refuses.
+/// Regression coverage for the RingConn **Gen 2 Air / FR04 family** raised-floor shape — the sibling
+/// of #184's non-expressive shape, and a DIFFERENT failure that the #184 gate correctly refuses.
 ///
-/// On this firmware the primary `[10:15]` channel never returns to the `01` baseline: its counts
-/// wander in the 40–90 band with the occasional `1`, and — unlike FR04.009 — they wander FREELY.
-/// The five sub-samples of one epoch usually differ (so `motionIsPlaceholder` never fires), their
-/// spread is far wider than `motionStillThreshold` (so `motionResolvesStillness` never fires), and
-/// no slot pair keeps a fixed ordering (so `slotOrderConsistency` correctly reports "this is not an
-/// instrumentation template" and `primaryMotionIsDegenerate` returns false). The run therefore kept
-/// `.primary`, whose permanent pedestal of phantom movement swamps `detect()`: every drain ended
-/// `noStagedSegments` with zero staged segments while HR/HRV/RR/SpO2 recorded all night.
+/// On this shape the primary `[10:15]` channel never returns to the `01` baseline: it holds a
+/// pedestal whose LEVEL wanders across the night, faster and further than the ~30-min
+/// `ActivityPeriod.motionAboveLocalFloor` window can track, so the residual survives de-flooring and
+/// the phantom movement swamps `detect()`: every drain ended `noStagedSegments` with zero staged
+/// segments while HR/HRV/RR/SpO2 recorded all night. The five sub-samples usually differ (so
+/// `motionIsPlaceholder` never fires) and no slot pair keeps a fixed ordering (so
+/// `slotOrderConsistency` reports "not an instrumentation template" and `primaryMotionIsDegenerate`
+/// returns false). The decoded `[15:23)` magnitudes (#195) are clean on the same records, so
+/// `motionSource` gains a third, floor-based rejection reason.
 ///
-/// The decoded `[15:23)` magnitudes (#195) are clean on the same records — exactly 0 for the median
-/// night epoch — so the fix widens `motionSource` with a third, floor-based rejection reason.
+/// ⚠️ THE FIRST REVISION'S PREMISE IS REFUTED AND THIS HEADER USED TO CARRY IT. It said the five
+/// sub-samples' "spread is far wider than `motionStillThreshold`, so `motionResolvesStillness` never
+/// fires". Commit `c4fcb08` disproved that: on the real archive the ring's own motionless epochs are
+/// nearly FLAT inside the epoch, the intra-epoch predicate fires on most of them, and the failure
+/// lives in the drift BETWEEN epochs — which is why the gate is `primaryChannelIsStillAfterFloor`,
+/// not `motionResolvesStillness`. `testWanderingPedestalFixtureMatchesTheFieldStatistics` pins
+/// exactly that, and `testFixtureReproducesTheFieldShape` below asserts the REFUTED shape on the
+/// first fixture — keep the two apart when reading.
+///
+/// ⚠️ AND IT IS NOT FR04.011-SPECIFIC. Both Gen 2 Air nights in `desktop/captures/corpus-harness-v1`
+/// are FR04.009 and both carry the raised pedestal (`BulkSleep.raisedFloorMinMedianQuietMinimum`
+/// holds the census). The firmware string is not the discriminator and no constant here separates
+/// the two versions.
+///
+/// ⚠️ THE CHANNEL SHIPS OFF. `BulkSleep.activityMagnitudeChannelEnabled` is `false`, so every test
+/// below that expects `.activityMagnitudes` passes an explicit `magnitudeChannelEnabled: true`
+/// policy. `testMagnitudeChannelIsOffByDefault` pins the default.
 ///
 /// All data here is SYNTHETIC — it reproduces the failure SHAPE, not a person's night. No captured
 /// health data is committed (CLAUDE.md).
 final class FR04RaisedPrimaryFloorTests: XCTestCase {
 
     private let step = UInt32(BulkRecord.epochSeconds)
+
+    /// The channel under test is behind a kill switch that ships OFF, so every expectation of
+    /// `.activityMagnitudes` has to ask for it explicitly.
+    private let on = BulkSleep.MotionChannelPolicy(magnitudeChannelEnabled: true)
 
     /// Deterministic small noise — NOT `random`, so the suite never flakes.
     private var seed: UInt64 = 0x2545_F491_4F6C_DD1D
@@ -128,14 +148,14 @@ final class FR04RaisedPrimaryFloorTests: XCTestCase {
     func testRaisedFloorSelectsTheDecodedMagnitudeChannel() {
         let recs = fr04_011Night()
         XCTAssertTrue(BulkSleep.primaryFloorIsRaised(recs.filter { $0.layout != .idle }))
-        XCTAssertEqual(BulkSleep.motionSource(recs), .activityMagnitudes)
+        XCTAssertEqual(BulkSleep.motionSource(recs, policy: on), .activityMagnitudes)
     }
 
     /// The `0 / 1 / 16` alphabet the tail fallback emits, on the decoded channel: still → 0,
     /// a turn → 1 (light), the morning → 16 (active).
     func testMagnitudeChannelMapsStillTurnAndWakeOntoTheSharedScale() {
         let recs = fr04_011Night()
-        let mags = BulkSleep.motionMagnitudes(from: recs)
+        let mags = BulkSleep.motionMagnitudes(from: recs, policy: on)
 
         XCTAssertEqual(mags[0], 16, "the morning/evening epochs exceed the seam")
         XCTAssertEqual(mags[12 + 17], 1, "a 200-unit postural turn is light movement, not an awakening")
@@ -147,18 +167,19 @@ final class FR04RaisedPrimaryFloorTests: XCTestCase {
     func testRaisedFloorNightStagesWithPlausibleOnsetAndEfficiency() throws {
         let recs = fr04_011Night()
 
-        let segments = BulkSleep.stagedSegments(from: BulkSleep.latestNightRecords(from: recs))
+        let segments = BulkSleep.stagedSegments(
+            from: BulkSleep.latestNightRecords(from: recs, motionPolicy: on), motionPolicy: on)
         XCTAssertFalse(segments.isEmpty,
                        "the reported failure: every drain ended `noStagedSegments` with 0 staged "
                        + "segments on an archive whose vitals decoded all night")
 
-        let block = try XCTUnwrap(BulkSleep.mainSleep(from: recs))
+        let block = try XCTUnwrap(BulkSleep.mainSleep(from: recs, motionPolicy: on))
         let firstStill = recs[12].date(epoch: Command.syncEpoch)
         XCTAssertLessThan(abs(block.start.timeIntervalSince(firstStill)), 45 * 60,
                           "onset lands within minutes of the still stretch, not hours into it")
         XCTAssertGreaterThan(block.duration, 5 * 3600)
 
-        let minutes = SleepStaging.summary(SleepStaging.classify(from: recs)).minutes
+        let minutes = SleepStaging.summary(SleepStaging.classify(from: recs, motionPolicy: on)).minutes
         XCTAssertGreaterThan(minutes.inBed, 0)
         let efficiency = Double(minutes.asleep) / Double(minutes.inBed)
         XCTAssertGreaterThan(efficiency, 0.70, "a night of measured stillness is not mostly awake")
@@ -283,7 +304,7 @@ final class FR04RaisedPrimaryFloorTests: XCTestCase {
             XCTAssertTrue(BulkSleep.primaryFloorIsRaised(recs.filter { $0.layout != .idle }),
                           "includeDay=\(includeDay): the de-floored stillness conjunct must see through "
                           + "a flat-but-wandering pedestal")
-            XCTAssertEqual(BulkSleep.motionSource(recs), .activityMagnitudes,
+            XCTAssertEqual(BulkSleep.motionSource(recs, policy: on), .activityMagnitudes,
                            "includeDay=\(includeDay): the verdict must not depend on how much daytime "
                            + "happens to be in the archive union — that is the scope-dependence the "
                            + "removed share-of-worn conjunct introduced")
@@ -292,12 +313,108 @@ final class FR04RaisedPrimaryFloorTests: XCTestCase {
 
     func testWanderingPedestalNightStages() throws {
         let recs = wanderingPedestalNight(includeDay: true)
-        let segments = BulkSleep.stagedSegments(from: BulkSleep.latestNightRecords(from: recs))
+        let segments = BulkSleep.stagedSegments(
+            from: BulkSleep.latestNightRecords(from: recs, motionPolicy: on), motionPolicy: on)
         XCTAssertFalse(segments.isEmpty,
                        "the reported failure: `noStagedSegments` on every drain while HR/HRV/RR/SpO2 "
                        + "decoded all night")
-        let block = try XCTUnwrap(BulkSleep.mainSleep(from: recs))
+        let block = try XCTUnwrap(BulkSleep.mainSleep(from: recs, motionPolicy: on))
         XCTAssertGreaterThan(block.duration, 5 * 3600)
+    }
+
+    // MARK: - the kill switch
+
+    /// THE DEFAULT IS THE PRE-#211 BEHAVIOUR. #211 shipped this channel unconditionally; it is now
+    /// behind `activityMagnitudeChannelEnabled`, which is `false`. On the very archive shape the
+    /// branch was written for, the shipped default must still choose `.primary` and must still
+    /// produce exactly what the primary channel produced — otherwise "default off" is a claim, not
+    /// a fact. (The corpus-wide version of this is the `baseline.tsv` sha256 quoted on the flag.)
+    func testMagnitudeChannelIsOffByDefault() {
+        XCTAssertFalse(BulkSleep.activityMagnitudeChannelEnabled,
+                       "the channel must ship OFF until a LABELLED Gen 2 Air night exists to "
+                       + "adjudicate it — see the flag's doc comment")
+        XCTAssertEqual(BulkSleep.MotionChannelPolicy.default.magnitudeChannelEnabled, false)
+
+        for recs in [fr04_011Night(), wanderingPedestalNight(includeDay: true)] {
+            XCTAssertEqual(BulkSleep.motionSource(recs), .primary,
+                           "the raised-floor shape must stay on the primary channel at the default")
+            // Byte-identity, not just the verdict: the magnitudes the detector and the stager
+            // consume have to be the primary channel's, sample for sample.
+            XCTAssertNil(BulkSleep.secondaryChannelMagnitudes(recs),
+                         "a `nil` secondary is what `motionTimeline` uses to fall back to raw "
+                         + "`[10:15]`; anything else means the default is reading another channel")
+        }
+    }
+
+    // MARK: - the Gen-3 drifting plateau this branch must NOT claim
+
+    /// 🟢 THE GAP THIS FILLS. `Gen3MotionFloorTests` cannot cover the exclusion: every fixture there
+    /// writes all five motion bytes EQUAL, so those runs are `motionIsPlaceholder` on every epoch,
+    /// short-circuit at `constantFiller`, and never reach the raised-floor branch at all. Nothing
+    /// pinned that a Gen-3-shaped NON-constant drifting plateau stays on `.primary`.
+    ///
+    /// The shape (🟢 FR05.008 capture 2026-06-23, via `Gen3MotionFloorTests`): a still Gen-3 ring
+    /// idles at ~15–16 and STEPS to ~24 and ~39 as sleeping posture changes. Here each plateau is
+    /// held for 40 epochs (100 min) — long relative to the 30-min `motionAboveLocalFloor` window, so
+    /// the floor tracks it and the residual de-floors to ~0 — and the five sub-samples differ by at
+    /// most one count, so the run is not a constant filler.
+    ///
+    /// It must stay on `.primary`, and the interesting part is WHY: its `medianQuietMinimum` clears
+    /// `raisedFloorMinMedianQuietMinimum` outright, so the floor test alone would accept it. What
+    /// refuses it is the de-floored stillness conjunct — the same conjunct that refuses
+    /// `testerB-2026-08-18` in the real corpus. That is the invariant worth pinning: a floor being
+    /// HIGH is not the failure; a floor that WANDERS is.
+    private func gen3DriftingPlateauNight() -> [BulkRecord] {
+        var c: UInt32 = 0x0c60_0000
+        var out: [BulkRecord] = []
+        for _ in 0..<12 { out.append(awakeEpoch(c)); c += step }
+        var i = 0
+        for level in [16, 16, 24, 39, 39] {          // 5 x 40 epochs = 200 epochs ~ 8.3 h
+            for _ in 0..<40 {
+                // Two distinct values per epoch (so never a constant run), one count apart (so the
+                // plateau de-floors to still), with the parity rotating so no slot ordering is
+                // phase-locked.
+                let primary = (0..<5).map { k in UInt8(level + ((k + i) % 2)) }
+                out.append(record(c, hr: 52, hrv: UInt8(38 + next(14)), primary: primary,
+                                  magnitudes: [0, 0, 0, 0, 0], sleepVitals: true))
+                c += step; i += 1
+            }
+        }
+        for _ in 0..<12 { out.append(awakeEpoch(c)); c += step }
+        return out
+    }
+
+    func testGen3DriftingPlateauStaysOnPrimaryEvenWithTheChannelEnabled() {
+        let recs = gen3DriftingPlateauNight()
+        let worn = recs.filter { $0.layout != .idle }
+        let quiet = worn.filter(\.activityMagnitudesAreZero)
+
+        // Fixture sanity: this is NOT the constant-filler shape, so it really does reach the branch.
+        XCTAssertFalse(worn.allSatisfy(\.motionIsPlaceholder),
+                       "fixture sanity: an all-equal run short-circuits at `constantFiller` and "
+                       + "never reaches the raised-floor branch — that is exactly the hole "
+                       + "`Gen3MotionFloorTests` leaves")
+        XCTAssertFalse(BulkSleep.primaryMotionIsDegenerate(worn))
+        XCTAssertGreaterThanOrEqual(quiet.count, BulkSleep.degenerateMinQuietEpochs,
+                                    "fixture sanity: the quorum must be met, or the branch declines "
+                                    + "for the wrong reason and this test asserts nothing")
+        XCTAssertGreaterThanOrEqual(BulkSleep.medianQuietMinimum(quiet),
+                                    BulkSleep.raisedFloorMinMedianQuietMinimum,
+                                    "fixture sanity: the floor test on its own ACCEPTS a Gen-3 "
+                                    + "plateau — so the exclusion below is the stillness conjunct's "
+                                    + "doing, which is the point of the test")
+
+        let stillAfterFloor = BulkSleep.primaryChannelIsStillAfterFloor(worn)
+        let stillShare = Double(worn.indices.filter { worn[$0].activityMagnitudesAreZero
+                                                      && stillAfterFloor[$0] }.count)
+            / Double(quiet.count)
+        XCTAssertGreaterThanOrEqual(stillShare, BulkSleep.degenerateMaxQuietStillFraction,
+                                    "a plateau held longer than the floor window de-floors to still")
+        XCTAssertFalse(BulkSleep.primaryFloorIsRaised(worn))
+        XCTAssertEqual(BulkSleep.motionSource(recs, policy: on), .primary,
+                       "a drifting-but-trackable Gen-3 floor is a WORKING channel; claiming it "
+                       + "would swap a good channel for a coarser one on every Gen-3 night")
+        XCTAssertEqual(BulkSleep.motionSource(recs), .primary)
     }
 
     /// The nibble packing the fixture writes is the one `activityMagnitudes` reads. If this ever

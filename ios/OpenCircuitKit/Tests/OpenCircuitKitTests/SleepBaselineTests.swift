@@ -109,6 +109,16 @@ final class SleepBaselineTests: XCTestCase {
         // the emitted TSV is then byte-identical (proven: sha256 of the master-generated baseline).
         let absorbCut = (ProcessInfo.processInfo.environment["OC_SLEEP_ABSORB_CUT"]).flatMap(Double.init)
             ?? BulkSleep.observedGapAbsorbCoverageCut
+        // CANDIDATE A/B, second axis (#211). UNSET = the shipped `MotionChannelPolicy.default`, i.e.
+        // the decoded-magnitude motion channel OFF, which is what makes the emitted TSV comparable
+        // to every pre-#211 scoreboard. Set to an Int to turn the channel ON at that
+        // `activityMagnitudeActiveCut`, which is how the flag-ON delta table is produced. Like
+        // `OC_SLEEP_ABSORB_CUT` this is NOT a corpus variable: unset means "measure the shipped
+        // default", a real measurement rather than a skipped one.
+        let motionPolicy = (ProcessInfo.processInfo.environment["OC_SLEEP_MOTION_CUT"])
+            .flatMap(Int.init)
+            .map { BulkSleep.MotionChannelPolicy(magnitudeChannelEnabled: true, magnitudeActiveCut: $0) }
+            ?? .default
 
         // --- raw manifest, for the census columns SleepReplay's model does not carry
         let manifestURL = dir.appendingPathComponent("manifest.json")
@@ -190,7 +200,8 @@ final class SleepBaselineTests: XCTestCase {
             if n.recordsFile.isEmpty {
                 status = "summaryOnly"; summaryOnly += 1
             } else {
-                do { r = try SleepReplay.measure(n, in: dir, observedGapCoverageCut: absorbCut); replayed += 1 }
+                do { r = try SleepReplay.measure(n, in: dir, observedGapCoverageCut: absorbCut,
+                                                 motionPolicy: motionPolicy); replayed += 1 }
                 catch { status = "loadFailed"; failed += 1; failures.append("\(n.id): \(error)") }
             }
 
@@ -259,6 +270,12 @@ final class SleepBaselineTests: XCTestCase {
         print("\n=== SLEEP BASELINE — observedGapAbsorbCoverageCut = \(absorbCut)"
               + (absorbCut == BulkSleep.observedGapAbsorbCoverageCut ? " (shipped default)" : " (CANDIDATE)")
               + ", corpus \(dir.path)")
+        // Same reasoning as the line above, for the #211 axis: a scoreboard that does not say which
+        // MOTION CHANNEL produced it cannot be compared to another one.
+        print("=== motion channel = "
+              + (motionPolicy.magnitudeChannelEnabled
+                 ? "activityMagnitudes @ cut \(motionPolicy.magnitudeActiveCut) (CANDIDATE)"
+                 : "shipped default (decoded-magnitude channel OFF)"))
         print("=== \(nights.count) manifest rows: \(replayed) replayed, \(summaryOnly) summary-only, "
               + "\(failed) load failures")
         print("=== wrote \(lines.count - 1) rows x \(columns.count) columns -> \(outPath)")

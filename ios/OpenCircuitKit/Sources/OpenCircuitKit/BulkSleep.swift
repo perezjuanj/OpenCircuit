@@ -324,7 +324,16 @@ public struct BulkRecord: Equatable {
     /// The layout-correct counterpart of `motionIntensityTailIsZero`: every one of the five 12-bit
     /// magnitudes is zero. 🟢 MEASURED: 1697 of 5648 corpus records (30.0 %), against the byte-
     /// aligned predicate's 1950 (34.5 %) — the 253-record difference is the 13.0 % the old window
-    /// cannot see. Deliberately NOT wired into any existing analytic (see `motionIntensityTailIsZero`).
+    /// cannot see.
+    ///
+    /// ⚠️ IT IS WIRED IN NOW, BEHIND A FLAG. Until #211 this said "deliberately NOT wired into any
+    /// existing analytic"; that is no longer true. `primaryFloorIsRaised` reads it as the run's
+    /// "nothing moved" verdict and `activityMagnitudeFallbackMagnitudes` reads it as that channel's
+    /// zero — but BOTH sit behind `MotionChannelPolicy.magnitudeChannelEnabled`, which ships
+    /// **false**, so at the shipped default nothing consumes this property and the corpus scoreboard
+    /// is byte-identical to before. Do NOT read that flag's existence as a licence to consume this
+    /// property elsewhere. (Contrast `motionIntensityTailIsZero`, which is knowingly 13 % wrong and
+    /// must not be redefined.)
     var activityMagnitudesAreZero: Bool { activityMagnitudes.allSatisfy { $0 == 0 } }
 
     /// Confidence / signal quality, `[6]` (🟢 named, PROTOCOL.md §5.3 — range ~0...12,
@@ -407,8 +416,9 @@ public enum BulkSleep {
     /// rejects the primary channel for this run; callers should scope `records` to a worn period
     /// (charging data reads as still too).
     public static func motionTimeline(from records: [BulkRecord],
-                                      epoch: Int = Command.syncEpoch) -> [MotionSample] {
-        let fallbackMagnitudes = secondaryChannelMagnitudes(records)
+                                      epoch: Int = Command.syncEpoch,
+                                      policy: MotionChannelPolicy = .default) -> [MotionSample] {
+        let fallbackMagnitudes = secondaryChannelMagnitudes(records, policy: policy)
         var out: [MotionSample] = []
         out.reserveCapacity(records.count * 5)
         for (recordIndex, r) in records.enumerated() {
@@ -434,10 +444,70 @@ public enum BulkSleep {
         /// `[15:20]`. `degenerate == false` is the original 2026-07-12 constant-filler shape;
         /// `degenerate == true` is the FR04.009 non-expressive-primary shape (#184).
         case intensityTail(degenerate: Bool)
-        /// `[15:23)` decoded as five 12-bit `activityMagnitudes` — the FR04.011 raised-floor shape.
+        /// `[15:23)` decoded as five 12-bit `activityMagnitudes` — the FR04 raised-floor shape.
         /// A THIRD channel, not a third reason to read the second one: see `primaryFloorIsRaised`.
+        /// Reachable ONLY when `MotionChannelPolicy.magnitudeChannelEnabled` is true, which is NOT
+        /// the shipped default.
         case activityMagnitudes
     }
+
+    /// Which secondary motion channels `motionSource` may select for a run, and where the decoded
+    /// magnitude channel's light/active seam sits. One value threaded through the whole motion path
+    /// (`motionTimeline`, `motionMagnitudes`, `latestNightRecords`, `SleepStaging.classify`,
+    /// `SleepDetailMetrics`) so detection and staging can never read different channels.
+    ///
+    /// ⚠️ `.default` IS THE PRODUCT'S BEHAVIOUR. Nothing in the app constructs any other value; the
+    /// non-default constructor exists for the replay harness and this Kit's tests. See
+    /// `activityMagnitudeChannelEnabled` for why the magnitude channel ships off.
+    public struct MotionChannelPolicy: Equatable, Sendable {
+        /// May a run fall through to the DECODED `[15:23)` magnitude channel when its primary
+        /// channel is a raised, wandering pedestal? `false` ⇒ `motionSource` never returns
+        /// `.activityMagnitudes` and every input is byte-identical to pre-#211.
+        public let magnitudeChannelEnabled: Bool
+        /// Σ `activityMagnitudes` at or above which an epoch on that channel is ACTIVE rather than
+        /// light. Only read when `magnitudeChannelEnabled`.
+        public let magnitudeActiveCut: Int
+
+        /// Deliberately INTERNAL. The app target has no reason to build a non-default policy, and
+        /// `activityMagnitudeActiveCut` is internal for the same reason `motionIntensityActiveCut`
+        /// is: a seam nobody outside this module gets to move.
+        init(magnitudeChannelEnabled: Bool = BulkSleep.activityMagnitudeChannelEnabled,
+             magnitudeActiveCut: Int = BulkSleep.activityMagnitudeActiveCut) {
+            self.magnitudeChannelEnabled = magnitudeChannelEnabled
+            self.magnitudeActiveCut = magnitudeActiveCut
+        }
+
+        /// The shipped policy: magnitude channel OFF.
+        public static let `default` = MotionChannelPolicy()
+    }
+
+    /// THE KILL SWITCH for the decoded-magnitude motion channel (#211 / FR04 raised floor).
+    ///
+    /// 🟡 IT SHIPS **false**, WHICH IS A DELIBERATE REVERT OF A BEHAVIOUR THAT ALREADY MERGED.
+    /// #211 (`af6c400`) landed this channel unconditionally; this flag puts it back behind a switch
+    /// and restores pre-#211 staging as the default. The reason is evidentiary, not technical: the
+    /// channel swap is a staging change whose only corpus evidence is two Gen 2 Air nights, NEITHER
+    /// of which carries a sleep label — so nothing in this repo can adjudicate whether the new wake
+    /// time is closer to the truth than the old one. What IS measured is only the negative half: on
+    /// `NYair-2026-08-16` the primary channel is a wandering pedestal that `motionAboveLocalFloor`
+    /// cannot remove. The sleep-staging campaign's promotion rule
+    /// (`.claude/skills/opencircuit-sleep-staging-campaign`, PROMOTION PROTOCOL step 1) is that a
+    /// re-channelled staging path does not become the default without a held-out win against
+    /// labels. There are no labels. So it ships off, and flipping it on is the deliverable of a
+    /// LABELLED Gen 2 Air night, not of another argument.
+    ///
+    /// 🟢 MEASURED BLAST RADIUS on the 5-night committed corpus `desktop/captures/corpus-harness-v1`
+    /// (`OC_SLEEP_BASELINE_CORPUS=… swift test --filter SleepBaselineTests`), sha256 of the emitted
+    /// `baseline.tsv`:
+    ///
+    ///     pre-#211 master (`467b82b`)          4f439702b05c18e50cafbbf226160151fb77a6b0bf7e6cb31e9f8c94a575d4f2
+    ///     post-#211 master (`3ef1838`)         0c96c66c8b8dee06db934dd58b9df56bf404ed071a13902e27a9bb99a40087d9
+    ///     this file, flag false                4f439702b05c18e50cafbbf226160151fb77a6b0bf7e6cb31e9f8c94a575d4f2
+    ///
+    /// i.e. the default is byte-identical to the last scoreboard that predates the change. With the
+    /// flag ON exactly one of the five nights moves (`NYair-2026-08-16`: detWake 09:13:23 → 10:31:53,
+    /// detAsleepMin 247 → 263 at the current cut); see `activityMagnitudeActiveCut` for the sweep.
+    public static let activityMagnitudeChannelEnabled = false
 
     /// Pick the motion channel for a run. The primary `[10:15]` channel is unusable in TWO
     /// structurally distinct ways, and either one falls through to the `[15:20]` intensity tail:
@@ -449,14 +519,33 @@ public enum BulkSleep {
     ///     epoch) plus ±2 noise, which no cross-sample rolling floor can cancel.
     ///   • RAISED FLOOR — the channel varies freely (so it is NOT the #184 fixed template) but never
     ///     returns to the `01` baseline, so its "movement" is a pedestal the rolling floor cannot
-    ///     remove either (`primaryFloorIsRaised`). 🟡 FR04.011 on a Gen 2 Air; this one falls
-    ///     through to the DECODED `activityMagnitudes`, not to the byte-aligned tail.
+    ///     remove either (`primaryFloorIsRaised`). 🟡 the **Gen 2 Air / FR04 family** — first seen on
+    ///     FR04.011 and present on FR04.009 too (below); this one falls through to the DECODED
+    ///     `activityMagnitudes`, not to the byte-aligned tail. Gated by
+    ///     `MotionChannelPolicy.magnitudeChannelEnabled`, which ships OFF.
     /// The first two are mutually exclusive by construction: a constant run has zero intra-epoch
     /// spread, so it always `motionResolvesStillness` and can never be degenerate. Either way the run
     /// must ALSO show at least two non-zero tail epochs, exactly as before, so a genuinely motionless
     /// archive keeps the primary path. The RAISED FLOOR reason is evaluated only after both have
     /// declined, and carries the same "the channel must actually carry movement" conjunct against the
-    /// channel it selects — so no input that reached a verdict before it existed changes verdict.
+    /// channel it selects.
+    ///
+    /// ⚠️ IT IS **NOT** VERDICT-PRESERVING, AND THE EARLIER CLAIM THAT IT WAS IS FALSE. This branch
+    /// shipped saying "no input that reached a verdict before it existed changes verdict" / "every
+    /// input … reaches the SAME verdict". Ordering the new reason LAST makes it verdict-preserving
+    /// for runs that already took a secondary channel — it does not make it verdict-preserving at
+    /// all, because a run that used to fall through to `.primary` is exactly what it is designed to
+    /// catch — and that is what shipped in #211 with this comment on it. 🟢 MEASURED with the flag ON
+    /// over `desktop/captures/corpus-harness-v1` (5 nights, 3 rings, 2 firmwares):
+    /// `NYair-2026-08-16` (Gen 2 Air, FR04.009) flips `.primary` → `.activityMagnitudes` and its
+    /// staged night moves by over an hour; the other four nights are byte-identical. The per-night
+    /// numbers are in `activityMagnitudeActiveCut`, and the corpus scoreboard hashes that bound the
+    /// whole change are in `activityMagnitudeChannelEnabled`.
+    ///
+    /// ⚠️ THIS IS A GEN 2 AIR / FR04 FAMILY TRAIT, NOT AN FR04.011 ONE, and the first revision of
+    /// this branch claimed otherwise. The per-night census is in `raisedFloorMinMedianQuietMinimum`;
+    /// its point is that BOTH FR04.009 corpus nights sit on a raised pedestal, so that constant
+    /// cannot and does not separate FR04.011 from FR04.009 — they are the same data shape.
     ///
     /// ⚠️ `constantFiller` IS DEAD CODE, AND WIDENING IT IS A MEASURED TRAP (#195 / #190). The
     /// all-or-nothing quantifier fires on **0 of the 18 sources** in the local corpus while the
@@ -476,7 +565,8 @@ public enum BulkSleep {
     /// (rank-based `magnitude >= positive[p80] ? 16 : 1`, end-to-end −158/−212/−265 min and one
     /// night reduced to zero). Fixing this needs an ABSOLUTE-floor tail→magnitude mapping fitted
     /// against real labels first; the gate is the second half of that job, not the first.
-    static func motionSource(_ records: [BulkRecord]) -> MotionSource {
+    static func motionSource(_ records: [BulkRecord],
+                             policy: MotionChannelPolicy = .default) -> MotionSource {
         let worn = records.filter { $0.layout != .idle }
         guard worn.count >= 4 else { return .primary }
         let constantFiller = !worn.contains(where: { !$0.motionIsPlaceholder })
@@ -486,10 +576,12 @@ public enum BulkSleep {
             else { return .primary }
             return .intensityTail(degenerate: degenerate)
         }
-        // Third rejection reason, third channel (FR04.011). Checked LAST so every input that reached
-        // a verdict before this change reaches the SAME verdict: the two tail branches are decided
-        // first and return unchanged, and a run that satisfies neither used to fall straight through
-        // to `.primary`.
+        // Third rejection reason, third channel (FR04 raised floor). Ordered LAST so the two tail
+        // branches are decided first and return exactly what they always did. That ordering does NOT
+        // make the change verdict-preserving overall — a run that satisfied neither tail branch used
+        // to fall straight through to `.primary`, and catching some of those is the entire point.
+        // What keeps the shipped build byte-identical is the flag, not the ordering.
+        guard policy.magnitudeChannelEnabled else { return .primary }
         guard primaryFloorIsRaised(worn) else { return .primary }
         // The same "the channel must actually carry movement" conjunct the tail branches apply,
         // asked of the channel we are about to switch TO.
@@ -570,15 +662,23 @@ public enum BulkSleep {
     /// rolling local floor `SleepDetection.detectFromMotion` subtracts before classifying — one
     /// verdict per input epoch, in order.
     ///
-    /// 🟢 THIS IS WHY IT EXISTS. `motionResolvesStillness` asks only whether an epoch's five
+    /// 🟡 THIS IS WHY IT EXISTS. `motionResolvesStillness` asks only whether an epoch's five
     /// sub-samples sit within `motionStillThreshold` of ONE ANOTHER, on the argument that "a flat
     /// plateau at any level cancels" against the rolling floor. That argument holds only while the
-    /// plateau's LEVEL is stable across the floor's own ~30-min window. On FR04.011 it is not: the
-    /// pedestal is flat inside an epoch (median intra-epoch spread 1 count on the ring's own
-    /// motionless epochs) yet wanders between 1 and 126 across the night, so the p10 floor sits far
-    /// below the current level and the residual survives de-flooring. The intra-epoch proxy scores
-    /// that channel 71 % "still" while the de-floored channel detection actually consumes scores it
-    /// 32 %. Predicting `detect()` therefore requires measuring what `detect()` reads.
+    /// plateau's LEVEL is stable across the floor's own ~30-min window. On the FR04 raised-floor
+    /// shape it is not: the pedestal is flat inside an epoch yet its level wanders across the night,
+    /// so the p10 floor sits below the current level and the residual survives de-flooring. The two
+    /// predicates therefore disagree, and predicting `detect()` requires measuring what `detect()`
+    /// reads.
+    ///
+    /// ⚠️ THE TWO PERCENTAGES THIS COMMENT USED TO CARRY ARE WITHDRAWN. It said the intra-epoch
+    /// proxy scores the channel "71 %" still against the de-floored "32 %", while the PR body,
+    /// commit message and PROTOCOL.md said **78 %** for what reads as the same quantity. They came
+    /// from a private FR04.011 archive that is not in the committed corpus, so neither figure can be
+    /// re-derived here and there is no way to tell which (if either) was right. Rather than pick one
+    /// by preference, both are dropped. The reproducible version of the same disagreement is
+    /// measured by `FR04MotionChannelMeasureTests` over `desktop/captures/corpus-harness-v1` and
+    /// printed per night; re-run it rather than quoting a number from memory.
     ///
     /// The per-epoch share threshold is `ActivityPeriod.gravityStillFraction` — the share `detect()`
     /// itself requires of its rolling window — reused rather than restated so this predicate and the
@@ -610,13 +710,33 @@ public enum BulkSleep {
     /// — the quietest 30 s of a 150 s epoch the ring itself says had no movement, which on a healthy
     /// channel IS the baseline.
     ///
-    /// 🟡 MEASURED on ONE device (Gen 2 Air, FR04.011, two nights, 715 worn epochs): per-night median
-    /// 75–95 with the per-night 25th percentile at 54 and 1. Every healthy shape in this file's own
-    /// fixtures sits at its placeholder level and is excluded by the stillness conjunct below long
-    /// before this number binds (Gen-2 `01`, Gen-3 `0f` = 15, Gen-3's drifted `16→24→39`), so 16 is
-    /// chosen to clear the highest documented healthy placeholder (15) by one count and to sit far
-    /// below the observed FR04.011 population. It is NOT a fitted separation — one device, two
-    /// nights. Widen only against a second capture of this firmware family.
+    /// 🔴 IT IS NOT A FIRMWARE SEPARATOR, AND IT WAS ORIGINALLY DESCRIBED AS ONE. 16 was chosen to
+    /// clear the highest documented healthy placeholder (Gen-3's `0f` = 15) by one count, on a
+    /// private FR04.011 archive. It does **not** distinguish FR04.011 from FR04.009: the raised
+    /// pedestal is a Gen 2 Air / FR04 FAMILY trait. 🟢 MEASURED over the committed corpus
+    /// `desktop/captures/corpus-harness-v1` (5 nights, 3 rings, 2 firmwares) — reproduce with
+    /// `FR04MotionChannelMeasureTests.testMotionChannelCensus`:
+    ///
+    ///     night                ring       fw        placeholder  medMin  quiet  floorStill  source(on)
+    ///     juan-2026-08-13      Gen 2      FR02.018     64.1 %        1    281      98.2 %   primary
+    ///     juan-2026-08-15      Gen 2      FR02.018     55.0 %        1    117      99.1 %   primary
+    ///     juan-2026-08-19      Gen 2      FR02.018     71.8 %        1    125     100.0 %   primary
+    ///     testerB-2026-08-18   Gen 2 Air  FR04.009     36.4 %       21    131      99.2 %   primary
+    ///     NYair-2026-08-16     Gen 2 Air  FR04.009      4.5 %       38    178      34.3 %   activityMagnitudes
+    ///
+    /// (`medMin` is exactly this statistic — the median over the run's magnitude-quiet epochs of
+    /// `min(raw[10..<15])`. Over ALL worn epochs rather than the quiet ones the same census reads
+    /// 15 / 1 / 1 / 37 / 46, which is where the "Gen 2 idles at 1, Gen 3 at 15" framing comes from;
+    /// don't mix the two statistics up, they differ by up to 14 counts.)
+    ///
+    /// TWO THINGS THIS TABLE SETTLES. First, BOTH FR04.009 nights carry a raised pedestal (21 and
+    /// 38), so no threshold on this statistic can make the branch "FR04.011-only". Second, this
+    /// constant is NOT what keeps healthy channels on `.primary` — `testerB-2026-08-18` clears it
+    /// comfortably (21 ≥ 16) and is still rejected, by the `degenerateMaxQuietStillFraction`
+    /// conjunct: 99.2 % of its magnitude-quiet epochs de-floor to still, because a flat pedestal
+    /// cancels against the rolling floor at ANY level. Only `NYair-2026-08-16`, whose pedestal
+    /// WANDERS (34.3 % still after de-flooring), is selected. Widen or narrow this number only
+    /// against a labelled capture of the family — there is none.
     static let raisedFloorMinMedianQuietMinimum = 16
 
     /// True when the primary `[10:15]` channel varies freely yet never comes back to baseline, so
@@ -646,9 +766,9 @@ public enum BulkSleep {
     ///
     /// 🟢 THE STILLNESS CONJUNCT IS MEASURED THROUGH THE ROLLING FLOOR
     /// (`primaryChannelIsStillAfterFloor`), NOT through the intra-epoch `motionResolvesStillness`
-    /// proxy this branch shipped with. See that function for the measurement; the short form is that
-    /// the proxy answers a question about ONE epoch while the failure lives in the drift BETWEEN
-    /// epochs, and on the real FR04.011 archive it scores the unusable channel 71 % still.
+    /// proxy this branch shipped with. The short form is that the proxy answers a question about ONE
+    /// epoch while the failure lives in the drift BETWEEN epochs. (The percentages that used to be
+    /// quoted here are withdrawn — see `primaryChannelIsStillAfterFloor`.)
     ///
     /// ⚠️ THERE IS NO SHARE-OF-WORN CONJUNCT, deliberately. The `raisedFloorMinZeroMagnitudeFraction`
     /// this branch shipped with (≥ 40 % of worn epochs motionless) was measured on NIGHT epochs but
@@ -658,9 +778,14 @@ public enum BulkSleep {
     /// depending on how much daytime had drained: the "the answer depends on when you synced" class
     /// this file exists to remove. An absolute quorum is scope-stable; a share of the window is not.
     static func primaryFloorIsRaised(_ worn: [BulkRecord]) -> Bool {
-        let stillAfterFloor = primaryChannelIsStillAfterFloor(worn)
+        // ORDER IS PERFORMANCE, and it used to contradict the doc above. `motionSource` is on the
+        // hot path (every `motionTimeline`, every `motionMagnitudes`, once per staging pass), and
+        // `primaryChannelIsStillAfterFloor` is an O(n·w) rolling-percentile pass over 5n samples.
+        // It ran BEFORE the cheap quorum test, so every run paid for it even when the quorum was
+        // never going to be met. The quorum is a count over a Bool property — do that first.
         let quietIndices = worn.indices.filter { worn[$0].activityMagnitudesAreZero }
         guard quietIndices.count >= degenerateMinQuietEpochs else { return false }
+        let stillAfterFloor = primaryChannelIsStillAfterFloor(worn)
         let stillCount = quietIndices.filter { stillAfterFloor[$0] }.count
         guard Double(stillCount) < Double(quietIndices.count) * degenerateMaxQuietStillFraction
         else { return false }
@@ -788,8 +913,10 @@ public enum BulkSleep {
     /// One magnitude per epoch using the same run-level signal selection as `motionTimeline`.
     /// The staging model subtracts its rolling local floor afterward, exactly as on primary motion.
     static func motionMagnitudes(from records: [BulkRecord],
-                                 absoluteActiveCut: Int = motionIntensityActiveCut) -> [Float] {
-        if let secondary = secondaryChannelMagnitudes(records, absoluteActiveCut: absoluteActiveCut) {
+                                 absoluteActiveCut: Int = motionIntensityActiveCut,
+                                 policy: MotionChannelPolicy = .default) -> [Float] {
+        if let secondary = secondaryChannelMagnitudes(records, absoluteActiveCut: absoluteActiveCut,
+                                                      policy: policy) {
             return secondary
         }
         return records.map { record in
@@ -801,15 +928,17 @@ public enum BulkSleep {
     /// run stays on the primary `[10:15]` one. Single point of dispatch so `motionTimeline` and
     /// `motionMagnitudes` cannot drift apart on which channel a run reads.
     static func secondaryChannelMagnitudes(_ records: [BulkRecord],
-                                           absoluteActiveCut: Int = motionIntensityActiveCut) -> [Float]? {
-        switch motionSource(records) {
+                                           absoluteActiveCut: Int = motionIntensityActiveCut,
+                                           policy: MotionChannelPolicy = .default) -> [Float]? {
+        switch motionSource(records, policy: policy) {
         case .primary:
             return nil
         case .intensityTail(let degenerate):
             return motionIntensityFallbackMagnitudes(records, degenerate: degenerate,
                                                      absoluteActiveCut: absoluteActiveCut)
         case .activityMagnitudes:
-            return activityMagnitudeFallbackMagnitudes(records)
+            return activityMagnitudeFallbackMagnitudes(records,
+                                                       absoluteActiveCut: policy.magnitudeActiveCut)
         }
     }
 
@@ -908,16 +1037,53 @@ public enum BulkSleep {
     /// threshold a function of how much history has drained, and forces a fixed share of every
     /// night to be "movement".
     ///
-    /// 🟡 IT IS AN OBSERVED QUANTILE, NOT A FITTED THRESHOLD, and must not be described as one. On
-    /// the two FR04.011 nights this branch exists for, the per-epoch magnitude sum is EXACTLY 0 for
-    /// the median night epoch (p50 = 0) and p90 ≈ 700–800; postural turns land at 100–450 and the
-    /// final wake exceeds 1000. 700 is that p90 — the level above which ~10 % of the night's epochs
-    /// sit, which is where "several brief awakenings" lives — and the still population is at zero,
-    /// so the seam is nowhere near it. Two nights, ONE device. #197 records why a real number needs
-    /// supervised labels and why this project does not have them yet; nothing here changes that.
-    /// The 0-versus-positive split does the load-bearing work regardless of this constant: a still
-    /// epoch maps to `0` and a stir to `1`, both below `ActivityPeriod.motionStillThreshold`.
-    static let activityMagnitudeActiveCut = 700
+    /// 🟡 250 IS THE CENTRE OF A MEASURED FLAT REGION, NOT A FITTED THRESHOLD, and must not be
+    /// described as one. It replaces the 700 this branch shipped with, whose stated basis — "700 is
+    /// the two FR04.011 nights' p90" — does not survive re-measurement:
+    ///
+    ///   • ⚠️ THE p90 WAS SCOPE-DEPENDENT. `motionSource` is evaluated wherever it is called, and
+    ///     `latestNightRecords` calls it on the whole ~30 h `EpochArchive` union. 🟢 On
+    ///     `NYair-2026-08-16` the Σ-magnitude p90 is **657** over the master-detected in-bed window
+    ///     but **8432** over the file's worn epochs. Justifying an absolute seam by a quantile of a
+    ///     window it is not applied to is the same class of error #197 removed.
+    ///   • ⚠️ THE BYTE-LEVEL WALK BEHIND IT COMPARED THE WRONG STATISTIC. The values quoted for the
+    ///     09:21–10:04 movement cluster (513 / 170 / 474 / 193 / 350 / 456 / 134, first ≥ 700 at
+    ///     10:31) are MAX-per-epoch. This constant thresholds the Σ. 🟢 The Σ for the same epochs is
+    ///     930 / 333 / 879 / 193 / 528 / 724 / 134, so at 700 three of that cluster already fire —
+    ///     the cut was never suppressing it whole.
+    ///
+    /// 🟢 WHAT WAS ACTUALLY MEASURED. The full response curve of this constant over the committed
+    /// corpus `desktop/captures/corpus-harness-v1`, flag ON, 19 values from 1 to 2000 — reproduce
+    /// with `FR04MotionChannelMeasureTests.testSweepActivityMagnitudeActiveCut`. Exactly ONE night
+    /// (`NYair-2026-08-16`) is on this channel at all, so the whole curve is n = 1 and UNLABELLED:
+    ///
+    ///     cut      1    25    50    75  |100   125   150  [200   250   300]  350   400   500   600
+    ///     wake  10:13 10:13 10:13 10:29 |10:31 10:31 10:31 10:31 10:31 10:31 10:31 10:31 10:31 10:31
+    ///     aslp    239   249   249   250 | 255   258   260   263   263   263   348   350   360   365
+    ///
+    ///     cut    700   900  1100  1500  2000        (flag OFF, for reference: wake 09:13, aslp 247)
+    ///     wake  10:31 10:44 10:44 10:44 10:49
+    ///     aslp    373   403   408   410   415
+    ///
+    /// The detected wake is flat at 10:31:53 across **100–700** (10:13 below it, 10:44+ above), and
+    /// the staged asleep minutes are flat at 263 across **200–300** before stepping at 350. 250 is
+    /// the centre of that 200–300 interval — the one region over which BOTH reported quantities are
+    /// invariant — so it is the value furthest from either edge of the only plateau this corpus can
+    /// show. 🟢 The whole scoreboard is byte-identical at 225 and at 250, which is what "plateau"
+    /// means here. That is the entire argument: a plateau centre, not an accuracy result. (#197
+    /// separately reports a "flat from 150 to 300" optimum with a best Youden J of 0.441 while
+    /// discussing byte-sum AND decoded-magnitude variants of the same seam; its text does not make
+    /// clear which of the two that interval belongs to, so it is noted as corroboration and is NOT
+    /// the basis for this number.)
+    ///
+    /// 🔴 IT IS NOT VALIDATED AS MORE ACCURATE THAN 700, AND NEITHER IS 700. Neither Gen 2 Air night
+    /// carries a sleep label, so nothing here can adjudicate a wake time. 🟢 What the sweep DOES show
+    /// is that this constant is second-order: across a 2000× range the wake moves 36 min, while the
+    /// channel swap alone moves it 09:13 → 10:13+. The 0-versus-positive split carries the load — a
+    /// still epoch maps to `0` and a stir to `1`, both below `ActivityPeriod.motionStillThreshold`.
+    /// Which is also why the honest place to spend the next effort is a labelled Air night, not this
+    /// number.
+    static let activityMagnitudeActiveCut = 250
 
     /// Map the decoded `[15:23)` magnitudes onto the same `0 / 1 / 16` alphabet the intensity-tail
     /// fallback emits, so detection and staging consume one scale whichever channel a run picked.
@@ -975,9 +1141,11 @@ public enum BulkSleep {
     public static func mainSleep(from records: [BulkRecord],
                                  within hint: DateInterval? = nil,
                                  temperatures: [TemperatureSample] = [],
-                                 epoch: Int = Command.syncEpoch) -> ActivityPeriod? {
+                                 epoch: Int = Command.syncEpoch,
+                                 motionPolicy: MotionChannelPolicy = .default) -> ActivityPeriod? {
         let scoped = Self.records(records, within: hint, epoch: epoch)
-        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch),
+        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: scoped, epoch: epoch,
+                                                                     policy: motionPolicy),
                                                       temperatureSamples: temperatures,
                                                       heartRateSamples: heartRateTimeline(from: scoped, epoch: epoch),
                                                       sleepVitalTimes: sleepVitalTimeline(from: scoped, epoch: epoch))
@@ -1127,11 +1295,13 @@ public enum BulkSleep {
                                           epoch: Int = Command.syncEpoch,
                                           morningContinuationGap: TimeInterval = morningContinuationMaxGap,
                                           observedGapCoverageCut: Double = observedGapAbsorbCoverageCut,
-                                          declinedBridgeMayReanchor: Bool = declinedBridgeMayReanchor) -> [BulkRecord] {
+                                          declinedBridgeMayReanchor: Bool = declinedBridgeMayReanchor,
+                                          motionPolicy: MotionChannelPolicy = .default) -> [BulkRecord] {
         // Motion detection needs a time-ordered timeline; sort defensively so the helper is correct
         // for any caller, not only the pre-sorted EpochArchive union.
         let records = records.sorted { $0.counter < $1.counter }
-        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: records, epoch: epoch),
+        let periods = ActivityPeriod.detectFromMotion(motionTimeline(from: records, epoch: epoch,
+                                                                     policy: motionPolicy),
                                                       temperatureSamples: temperatures,
                                                       heartRateSamples: heartRateTimeline(from: records, epoch: epoch),
                                                       sleepVitalTimes: sleepVitalTimeline(from: records, epoch: epoch))
@@ -1463,9 +1633,10 @@ public enum BulkSleep {
     public static func stagedSegments(from records: [BulkRecord],
                                       within hint: DateInterval? = nil,
                                       epoch: Int = Command.syncEpoch,
-                                      baseline: SleepStaging.PersonalBaseline? = nil) -> [SleepSegment] {
+                                      baseline: SleepStaging.PersonalBaseline? = nil,
+                                      motionPolicy: MotionChannelPolicy = .default) -> [SleepSegment] {
         SleepStaging.classify(from: Self.records(records, within: hint, epoch: epoch),
-                              epoch: epoch, baseline: baseline)
+                              epoch: epoch, baseline: baseline, motionPolicy: motionPolicy)
     }
 
     /// HR / HRV / SpO2 / RR samples from worn epochs, with device timestamps. Iterates ALL records

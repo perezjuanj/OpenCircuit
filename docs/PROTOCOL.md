@@ -597,7 +597,7 @@ run's own distribution, never from a device or firmware string:
 |---|---|---|---|
 | baseline | `01` (Gen 2), `0f`=15 (Gen 3), or a drifting `16→24→39` plateau — **constant within the epoch**, so a rolling local floor cancels it at any level | Gen 2 / Gen 3 | `[10:15]` (unchanged) |
 | fixed template | a two-level intra-epoch **step** (slots 0–1 ≈ 27.6, slots 2–4 ≈ 34.9 on *every* epoch) ± 2 noise; survives de-flooring because the step is *inside* one epoch | Gen 2 Air, **FR04.009** | `[15:20]` intensity tail |
-| **raised floor** | a pedestal that is **flat *within* an epoch** (median intra-epoch spread **1 count** on motionless epochs) but whose **level wanders between epochs**, 1 → 126 across the night — further and faster than the ~30-min rolling local floor can track, so de-flooring does *not* cancel it; no slot ordering is phase-locked, so it is not a template either | Gen 2 Air, **FR04.011** | `[15:23)` decoded magnitudes |
+| **raised floor** | a pedestal that is **flat *within* an epoch** but whose **level wanders between epochs** — further and faster than the ~30-min rolling local floor can track, so de-flooring does *not* cancel it; no slot ordering is phase-locked, so it is not a template either | Gen 2 Air, **FR04 family** (first reported on FR04.011; 🟢 also present on FR04.009 — see below) | `[10:15]` today; `[15:23)` decoded magnitudes only when the kill switch is flipped on |
 
 The **raised-floor** case is new. 🟡 Measured on **one device, two nights, 715 worn epochs**: the
 primary byte takes value `1` on only 356 of 3575 sub-samples and otherwise clusters around 17,
@@ -605,24 +605,61 @@ primary byte takes value `1` on only 356 of 3575 sub-samples and otherwise clust
 per-night 25th percentile at 54 on one night and 1 on the other.
 
 🟢 **The variation is BETWEEN epochs, not within one** — an earlier revision of this note had that
-backwards. All five sub-samples are *exactly* equal on only ≈ 8 % of epochs, but they are *nearly*
-equal on nearly all of them: median intra-epoch spread **1 count**, p90 **6**, over the ring's own
-motionless epochs. So `motionResolvesStillness`, which asks whether the five sit within
-`motionStillThreshold` of one another, **does** fire — on **78 %** of quiet epochs — and it is
-wrong to do so, because the channel it is blessing cannot arbitrate stillness. Nor does the minimum
-"never return to `01`": the per-epoch minimum runs p10 **1** / p50 **40** / p90 **93**. What breaks
-de-flooring is the *rate* the pedestal's level drifts at, not a floor stuck permanently off `01` —
-after `motionAboveLocalFloor` only **32 %** of quiet epochs read still (the detector needs ≥ 70 %).
-`motionIsPlaceholder` and the FR04.009 gate (`slotOrderConsistency`) do correctly refuse it. On
-device the symptom is a total staging failure: every history drain ends
-`nightRowOutcome = noStagedSegments` with 0 staged segments while HR/HRV/RR/SpO₂ record all night.
+backwards. The five sub-samples are *nearly* equal on nearly all motionless epochs, so
+`motionResolvesStillness`, which asks whether the five sit within `motionStillThreshold` of one
+another, **does** fire — and it is wrong to do so, because the channel it is blessing cannot
+arbitrate stillness. Nor does the minimum "never return to `01`". What breaks de-flooring is the
+*rate* the pedestal's level drifts at, not a floor stuck permanently off `01`, so the predicate that
+has to gate the fallback is `primaryChannelIsStillAfterFloor` (measured through
+`motionAboveLocalFloor`), never the intra-epoch proxy. `motionIsPlaceholder` and the FR04.009 gate
+(`slotOrderConsistency`) do correctly refuse it. On device the symptom is a total staging failure:
+every history drain ends `nightRowOutcome = noStagedSegments` with 0 staged segments while
+HR/HRV/RR/SpO₂ record all night.
+
+⚠️ **Two figures this paragraph used to carry are WITHDRAWN, and so is the FR04.011-only scoping.**
+It quoted the intra-epoch proxy firing on **78 %** of quiet epochs against **32 %** after
+de-flooring, while `BulkSleep.primaryChannelIsStillAfterFloor` quoted **71 %** for what reads as the
+same quantity. Both came from a private FR04.011 archive that is not in any committed corpus, so
+neither can be re-derived and there is no way to tell which was right; both are dropped rather than
+one being picked by preference. 🟢 The reproducible version, over the committed corpus
+`desktop/captures/corpus-harness-v1` (5 nights, 3 rings; `swift test --filter
+FR04MotionChannelMeasureTests`), measuring the two predicates on each run's magnitude-quiet epochs:
+
+| night | ring | fw | placeholder | median per-epoch min | intra-epoch still | still after de-flooring |
+|---|---|---|---|---|---|---|
+| juan-2026-08-13 | Gen 2 | FR02.018 | 64.1 % | 1 | 100.0 % | 98.2 % |
+| juan-2026-08-15 | Gen 2 | FR02.018 | 55.0 % | 1 | 100.0 % | 99.1 % |
+| juan-2026-08-19 | Gen 2 | FR02.018 | 71.8 % | 1 | 100.0 % | 100.0 % |
+| testerB-2026-08-18 | Gen 2 Air | **FR04.009** | 36.4 % | 21 | 100.0 % | 99.2 % |
+| NYair-2026-08-16 | Gen 2 Air | **FR04.009** | 4.5 % | 38 | 61.8 % | **34.3 %** |
+
+Both Gen 2 Air nights sit on a raised pedestal (median per-epoch minimum 21 and 38 against 1 for
+every Gen-2 night), so **the raised floor is a Gen 2 Air / FR04 FAMILY trait and no threshold on
+that statistic makes it FR04.011-specific.** What separates the two Air nights is whether the
+pedestal WANDERS: `testerB`'s is flat enough that 99.2 % of its quiet epochs still de-floor to
+still, and only `NYair` (34.3 %, against the detector's ≥ 70 % requirement) is unusable.
 
 🟡 The **decoded** `[15:23)` magnitudes are clean on the same records: the per-epoch magnitude sum
-is exactly **0 for the median night epoch** (p50 = 0, p90 ≈ 700–800), rises to 100–450 at postural
-turns and above 1000 at the final wake, and its hourly profile tracks the HR/HRV dynamics. Note
+is exactly **0 for the median night epoch** and its hourly profile tracks the HR/HRV dynamics. Note
 this is the *layout-correct* channel (five 12-bit magnitudes, above), **not** the byte-aligned
 `[15:20]` window the two older fallbacks use — the raised-floor branch is gated on and reads from
 `activityMagnitudes` / `activityMagnitudesAreZero` throughout.
+
+⚠️ **THE "p90 ≈ 700–800" THAT USED TO APPEAR HERE IS SCOPE-DEPENDENT AND IS WITHDRAWN as a basis
+for any threshold.** `motionSource` is evaluated wherever it is called, and `latestNightRecords`
+calls it on the whole ~30 h `EpochArchive` union, not on the night. 🟢 On `NYair-2026-08-16` the
+Σ-magnitude p90 is **657** over the detected in-bed window but **8432** over the file's worn
+epochs; pooled over all five corpus nights' worn epochs, 31.4 % of records are exactly zero and the
+positive population runs p10 142 / p25 566 / p50 1891 / p90 7317. A quantile of a window the seam
+is not applied to cannot justify the seam — that is the same class of error #197 removed for
+`motionIntensityActiveCut`. `BulkSleep.activityMagnitudeActiveCut` now carries the measured
+response curve instead.
+
+⚠️ **AND THE CHANNEL IS NOT LIVE.** #211 merged this fallback unconditionally; it now sits behind
+`BulkSleep.activityMagnitudeChannelEnabled`, which ships **false**, because neither Gen 2 Air night
+in the corpus carries a sleep label and so nothing can adjudicate whether the wake time it produces
+is closer to the truth. On the shipped default a raised-floor run still reads `[10:15]`. Flipping
+it on moves exactly one of the five corpus nights (`NYair-2026-08-16`, detWake 09:13 → 10:31).
 
 > **Sleep stages (Awake/Light/Deep/REM) are not stored per-epoch** — no stage label byte
 > found. The ring streams raw HR/HRV/SpO2/motion and the **app computes** the hypnogram,
