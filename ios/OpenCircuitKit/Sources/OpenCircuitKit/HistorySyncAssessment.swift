@@ -51,7 +51,15 @@ public enum HistoryChannelOutcome: String, Codable, Sendable {
     /// tester export dominated by "session replaced — no drain ran" with `all-day`/`sport` `noAck`
     /// on nearly every cycle (while `sleep`, going first in the foreground plan, occasionally won the
     /// race) looked like the ring refusing those channels; it was session churn cutting them off
-    /// before their turn. See `HistoryDrainPlan.resuming` for how this is used to recover.
+    /// before their turn.
+    ///
+    /// The recovery this enables is deliberately NARROW and is not driven from this outcome at all:
+    /// `RingScanner` records the channel its OWN teardown cut off (only on the genuine reconnect
+    /// paths, stamped with the ring and the moment) and hands it to the replacement session as a
+    /// one-shot `HistoryDrainPlan.ResumeHint`, which `HistoryDrainPlan.steps` promotes to the front of
+    /// the plan in the FOREGROUND case only. `HistoryDrainPlan.resuming` documents the four guards.
+    /// Nothing aggregates `.cancelled` across passes — this case exists to stop tester diagnostics
+    /// blaming the ring, not to feed a reorder heuristic.
     case cancelled
 
     /// Safe to re-stage/persist sleep from this channel.
