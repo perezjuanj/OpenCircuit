@@ -414,6 +414,14 @@ final class RingSession: NSObject {
     /// `finalizeSync` flips `syncing` at the tail, so an observer watching `syncing` go false sees
     /// exactly this drain's traces (#188).
     var lastDrainTraces: [HistoryChannelTrace] { drainTraces }
+
+    /// The two persisted facts `RecorderStall.verdict` needs for THIS ring — see
+    /// `noteDrainForStallEvidence`. Exposed here rather than letting the UI rebuild an
+    /// `EpochArchiveStore`, so the per-ring namespacing stays in one place and `peripheral` stays
+    /// private.
+    var recorderStallEvidence: (headAt: Date?, unmovedDrains: Int) {
+        (epochArchiveStore.archiveHeadAt, epochArchiveStore.unmovedCompletedDrains)
+    }
     /// Records the last drain ADOPTED from the unattributed buffer. Deliberately excluded from
     /// `HistoryChannelTrace.recordsAdded` (which must stay an honest measure of what a drain pulled
     /// off the wire), so the activity log reads it separately (#188). Distinct from the live
@@ -3343,7 +3351,12 @@ final class RingSession: NSObject {
         // real lock's capture time is when it was measured, never a wrong "now".)
         let cycleStart = monitoringStartedAt ?? .distantPast
         var last: [QuantitySample] = []
-        if let hr = liveHR, let at = liveHRAt, at >= cycleStart {
+        // SETTLED, not the last frame (`LiveHR.settled`). What gets persisted must be the same
+        // number the user was shown, and for the same reason: one read's locked frames span a wide
+        // band, so the final frame is not the measurement. A read that never reached a full window
+        // persists NOTHING rather than a value we would not display — a half-measured read is not a
+        // reading, and writing one would push it into Health and out-rank real synced history.
+        if let hr = LiveHR.settled(liveHRTrend), let at = liveHRAt, at >= cycleStart {
             last.append(QuantitySample(kind: .heartRate, start: at, value: Double(hr)))
         }
         if let spo2 = liveSpO2, let at = liveSpO2At, at >= cycleStart {
@@ -4378,7 +4391,34 @@ final class RingSession: NSObject {
             source: "history-drain",
             detail: "trigger=\(historySyncTrigger) label=\(trace.label) outcome=\(outcome) ack=\(trace.sawSyncAck) 4c=\(trace.page4CCount) 4cBad=\(corruptPage4CCount) 47=\(trace.page47Count) 4d=\(trace.page4DCount ?? 0) sport=\(trace.sportSampleCount ?? 0) 50=\(trace.endMarkerCount) added=\(trace.recordsAdded)"
         )
+        noteDrainForStallEvidence(trace)
         activeDrainTrace = nil
+    }
+
+    /// Feed `RecorderStall` one drain's worth of evidence. READ-ONLY with respect to the ring:
+    /// this runs after the trace is sealed and touches no ack, no cursor and no resume pointer.
+    ///
+    /// Only drains that COULD have moved the epoch head count. Two filters, both load-bearing:
+    ///   • CHANNEL — the sport channel (`0x02`) streams `0x4d` and never a `0x4c`, so `added` is
+    ///     STRUCTURALLY 0 there (see the `history-drain` comment above). Counting sport drains
+    ///     would manufacture a stall on every healthy workout sync.
+    ///   • OUTCOME — only `.complete` and `.empty`, the two that mean the ring ANSWERED and the
+    ///     channel ran to its end. `.linkDown`/`.cancelled`/`.noAck` mean we never got an answer,
+    ///     and counting them would blame the ring for our own flaky link — the exact confusion
+    ///     `.linkDown` and `.cancelled` were split out of `.noAck` to prevent.
+    ///
+    /// The head passed in includes anything THIS drain just captured, so a drain that pulled new
+    /// epochs resets the counter rather than incrementing it.
+    private func noteDrainForStallEvidence(_ trace: HistoryChannelTrace) {
+        guard trace.label == HistoryDrainPlan.sleepStep.label
+                || trace.label == HistoryDrainPlan.allDayStep.label else { return }
+        switch trace.outcome {
+        case .complete, .empty: break
+        default: return
+        }
+        let captured = bulkRecords.map { $0.date(epoch: Command.syncEpoch) }.max()
+        let known = epochArchiveStore.archiveHeadAt
+        epochArchiveStore.noteCompletedEpochDrain(headAt: [captured, known].compactMap { $0 }.max())
     }
 
     private func updateActiveDrainTrace(bytes: [UInt8]) {

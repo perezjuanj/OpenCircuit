@@ -22,6 +22,10 @@ struct EpochArchiveStore {
     /// Counters banked to the archive WITHOUT their vitals samples being persisted. See
     /// `loadUnpersistedCounters`.
     private let unpersistedKey: String
+    /// Newest epoch we have ever held for this ring, and how many completed drains have failed to
+    /// move it. See `noteCompletedEpochDrain`.
+    private let archiveHeadKey: String
+    private let unmovedDrainsKey: String
 
     /// `namespace` scopes the keys to a single ring (its CoreBluetooth identifier) so two rings'
     /// epoch archives can't collide on the UInt32 epoch counter (which would corrupt overnight
@@ -36,6 +40,8 @@ struct EpochArchiveStore {
         self.pendingStagedSleepKey = "sleep.pendingStagedSegments\(suffix)"
         self.hrvPoolingKey = "sleep.hrvPoolingVerdict\(suffix)"
         self.unpersistedKey = "sleep.unpersistedEpochCounters\(suffix)"
+        self.archiveHeadKey = "sleep.archiveHeadAt\(suffix)"
+        self.unmovedDrainsKey = "sleep.unmovedCompletedDrains\(suffix)"
     }
 
     // MARK: Banked-but-unpersisted ledger (#188 follow-up)
@@ -122,6 +128,43 @@ struct EpochArchiveStore {
     /// Stamp a completed drain (foreground, background, or periodic).
     func recordDrain(at now: Date = Date()) {
         defaults.set(now.timeIntervalSince1970, forKey: lastDrainKey)
+    }
+
+    // MARK: Recorder-stall evidence (RecorderStall.verdict)
+    //
+    // The two facts `RecorderStall` needs, and NOTHING inferred. Both are per-ring (namespaced) and
+    // must SURVIVE session teardown: a stall is measured across reconnects, and a session-scoped
+    // counter would reset to 0 on every link flap — which is exactly when a stalled ring is most
+    // likely to be re-drained.
+
+    /// Newest epoch timestamp ever held for this ring. Monotonic: the head only advances.
+    var archiveHeadAt: Date? {
+        let t = defaults.double(forKey: archiveHeadKey)
+        return t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
+
+    /// Completed drains that have left `archiveHeadAt` unmoved. Feeds
+    /// `RecorderStall.verdict(completedDrainsSinceHeadMoved:)`.
+    var unmovedCompletedDrains: Int { defaults.integer(forKey: unmovedDrainsKey) }
+
+    /// Record one drain that COULD have advanced the epoch head — i.e. the ring answered and the
+    /// channel ran to its end on a channel that carries `0x4c`. The caller owns that filtering;
+    /// this only compares heads.
+    ///
+    /// ⚠️ Pass the head INCLUDING anything this drain just captured. If the head advanced the
+    /// counter resets, because the ring demonstrably is recording. A nil or older head increments:
+    /// that is the "asked, answered, produced nothing new" event the stall verdict counts.
+    func noteCompletedEpochDrain(headAt newHead: Date?) {
+        guard let newHead else {
+            defaults.set(unmovedCompletedDrains + 1, forKey: unmovedDrainsKey)
+            return
+        }
+        if let known = archiveHeadAt, newHead <= known {
+            defaults.set(unmovedCompletedDrains + 1, forKey: unmovedDrainsKey)
+        } else {
+            defaults.set(newHead.timeIntervalSince1970, forKey: archiveHeadKey)
+            defaults.set(0, forKey: unmovedDrainsKey)
+        }
     }
 
     // MARK: Pending sleep segment persistence
