@@ -34,6 +34,7 @@ Health** — no cloud, no subscription.
 | `docs/PROTOCOL.md` | Living protocol spec (the Phase 1 deliverable) |
 | `docs/REVERSE_ENGINEERING.md` | Capture + decode workflow |
 | `docs/RUNBOOK_OVERNIGHT_TEMP.md` | **Overnight capture for skin temp / sleep stages / HRV (#7,#9,#12)** |
+| `docs/RUNBOOK_AIR_SLEEP_LABELS.md` | **Get self-reported bed/wake labels from the two Gen 2 Air testers.** Every Air capture we hold is UNLABELLED, so no Air staging change can be adjudicated — only shown to have moved. The load-bearing instruction is "write it down BEFORE opening the app" (otherwise it is another echo label) |
 | `docs/RUNBOOK_SLEEP_GROUNDTRUTH.md` | **Capture RingConn's computed hypnogram (`sleepPhases`) via mitmproxy → fit our staging to it** |
 | `docs/RUNBOOK_OSA_APNEA.md` | **OSA sleep-apnea (#91) — capture cracked (start `05 22 01`, dense PPG `0x48`), decode→AHI parked; forward plan** |
 | `desktop/bp_collect.py` | **Drives `06 05 00` mode 5 and records the 100 Hz 4-ch raw PPG (`0x12`) + a paired cuff reading.** stdlib+bleak only (no numpy). ⚠️ `06 00 00` is sent from a `finally` on EVERY exit — mode 5 is INVISIBLE in the descriptor state byte (stays idle `0x02`/`0x03`, unlike sport mode's `0x06`), so a stranded stream can't be detected from telemetry. Does NOT open a sync session, to avoid draining the user's history. `--replay <btsnoop>` decodes offline |
