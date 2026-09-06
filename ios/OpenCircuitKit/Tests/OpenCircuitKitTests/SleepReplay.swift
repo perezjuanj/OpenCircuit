@@ -472,7 +472,8 @@ enum SleepReplay {
                       temperatures: [TemperatureSample] = [],
                       deepHRBaseline: Double? = nil,
                       tuning: SleepStaging.Tuning = .default,
-                      observedGapCoverageCut: Double = BulkSleep.observedGapAbsorbCoverageCut)
+                      observedGapCoverageCut: Double = BulkSleep.observedGapAbsorbCoverageCut,
+                      motionPolicy: BulkSleep.MotionChannelPolicy = .default)
         -> (segments: [SleepSegment], union: [BulkRecord], nightRecords: [BulkRecord]) {
 
         // RingSession :3619 — epochArchiveStore.merge() IS EpochArchive.merge(existing:incoming:).
@@ -482,14 +483,16 @@ enum SleepReplay {
 
         // RingSession :3620
         let nightRecords = BulkSleep.latestNightRecords(from: union, temperatures: temperatures,
-                                                        observedGapCoverageCut: observedGapCoverageCut)
+                                                        observedGapCoverageCut: observedGapCoverageCut,
+                                                        motionPolicy: motionPolicy)
 
         // RingSession :1580-1582
         let baseline = deepHRBaseline.map { SleepStaging.PersonalBaseline(deepSleepHR: $0) }
         let segs = SleepStaging.classify(from: nightRecords,
                                          temperatures: temperatures,
                                          tuning: tuning,
-                                         baseline: baseline)
+                                         baseline: baseline,
+                                         motionPolicy: motionPolicy)
 
         // RingSession :1588-1614 — the overnight envelope gate.
         let inBeds = segs.filter { $0.stage == .inBed }
@@ -515,7 +518,8 @@ enum SleepReplay {
                         temperaturesOverride: [TemperatureSample]? = nil,
                         deepHRBaselineOverride: Double?? = nil,
                         tuning: SleepStaging.Tuning = .default,
-                        observedGapCoverageCut: Double = BulkSleep.observedGapAbsorbCoverageCut)
+                        observedGapCoverageCut: Double = BulkSleep.observedGapAbsorbCoverageCut,
+                        motionPolicy: BulkSleep.MotionChannelPolicy = .default)
         throws -> ReplayResult {
         let records = try loadRecords(night, in: dir)
         let temps = temperaturesOverride
@@ -526,7 +530,8 @@ enum SleepReplay {
         return try withTimeZone(night.timeZone, at: anchor) {
             let staged = stage(records: records, temperatures: temps,
                                deepHRBaseline: baseline, tuning: tuning,
-                               observedGapCoverageCut: observedGapCoverageCut)
+                               observedGapCoverageCut: observedGapCoverageCut,
+                               motionPolicy: motionPolicy)
             let segs = staged.segments
             let summary = SleepStaging.summary(segs)              // RingSession :1876
             let sleep = SleepStaging.sleepWindow(segs)            // RingSession :1892

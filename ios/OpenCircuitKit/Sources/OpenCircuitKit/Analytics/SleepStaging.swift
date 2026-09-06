@@ -551,15 +551,17 @@ public enum SleepStaging {
                                 temperatures: [TemperatureSample] = [],
                                 epoch: Int = Command.syncEpoch,
                                 tuning: Tuning = .default,
-                                baseline: PersonalBaseline? = nil) -> [SleepSegment] {
+                                baseline: PersonalBaseline? = nil,
+                                motionPolicy: BulkSleep.MotionChannelPolicy = .default) -> [SleepSegment] {
         let temps = tuning.stagedWearGate ? temperatures : []
         let frags = BulkSleep.contiguousFragments(records)
         let staged: [SleepSegment] = frags.count > 1
             ? frags.flatMap { classifyContiguous(from: $0, temperatures: temps, epoch: epoch,
-                                                 tuning: tuning, baseline: baseline) }
+                                                 tuning: tuning, baseline: baseline,
+                                                 motionPolicy: motionPolicy) }
                    .sorted { $0.start < $1.start }
             : classifyContiguous(from: records, temperatures: temps, epoch: epoch,
-                                 tuning: tuning, baseline: baseline)
+                                 tuning: tuning, baseline: baseline, motionPolicy: motionPolicy)
         // Re-open the in-bed envelope over a MEASURED pre-onset awake-in-bed lead-in the still-block
         // missed (the "inBed == asleep / 100 % efficiency" fix). Runs over the FULL record set so it
         // sees a lead-in that a data gap split into a discarded fragment. No-op when the knob is 0.
@@ -655,13 +657,15 @@ public enum SleepStaging {
                                            temperatures: [TemperatureSample] = [],
                                            epoch: Int = Command.syncEpoch,
                                            tuning: Tuning = .default,
-                                           baseline: PersonalBaseline? = nil) -> [SleepSegment] {
+                                           baseline: PersonalBaseline? = nil,
+                                           motionPolicy: BulkSleep.MotionChannelPolicy = .default) -> [SleepSegment] {
         // `temperatures:` is the #41 wear gate, and `mainSleep` is the ONLY place it acts — an
         // off-wrist/charging block is reclassified out of sleep there. Dropping the argument here
         // (pre-#194) is what made the staged hypnogram disagree with both the coarse segments and
         // the night scoping, which pass it. Empty ⇒ motion-only, unchanged.
         guard let block = BulkSleep.mainSleep(from: records, temperatures: temperatures,
-                                              epoch: epoch) else { return [] }
+                                              epoch: epoch,
+                                              motionPolicy: motionPolicy) else { return [] }
 
         // Epochs inside the in-bed window, forward-filling HR/HRV across dropped reads.
         let inBlock = records
@@ -687,7 +691,7 @@ public enum SleepStaging {
         // Some real nights carry a constant filler in `[10:15]` for every epoch while the record's
         // intensity half still contains movement. Select that fallback only for the structurally
         // degenerate run; normal primary-motion nights remain byte-identical.
-        let rawMotion = BulkSleep.motionMagnitudes(from: inBlock)
+        let rawMotion = BulkSleep.motionMagnitudes(from: inBlock, policy: motionPolicy)
         let floor = ActivityPeriod.rollingLowPercentile(rawMotion, times: times,
                         windowSeconds: ActivityPeriod.motionFloorWindowSecondsStaging,
                         percentile: ActivityPeriod.motionFloorPercentile)

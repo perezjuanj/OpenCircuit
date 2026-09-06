@@ -55,6 +55,12 @@ final class RingScanner: NSObject {
     /// callback slot, not observed view state.
     @ObservationIgnored var onSessionReplaced: ((RingSession) -> Void)?
 
+    /// Carries `interruptedDrainChannel` from a torn-down session across the gap to whichever
+    /// session eventually replaces it (#reconnect) — that gap can be a same-tick reconnect
+    /// (`didConnect`/`willRestoreState`) or, after a real drop, the far side of a backoff retry.
+    /// Read and cleared the moment a new session is created; see `RingSession.resumeChannelHint`.
+    private var pendingDrainResume: HistoryDrainPlan.Step?
+
     /// LAZY (#142): created only when Bluetooth is actually needed (first connect / saved-ring
     /// restore), NOT at app launch. Allocating a `CBCentralManager` is what triggers the iOS
     /// Bluetooth permission prompt, so eager creation in `init()` fired the prompt before onboarding
@@ -443,6 +449,11 @@ final class RingScanner: NSObject {
     /// auto-measure/sync loops can never keep writing to the peripheral behind a newer one.
     private func teardownSession() {
         session?.stopLiveMonitoring()
+        // Read BEFORE `invalidate()` cancels `syncTask` (#reconnect): cancellation is cooperative —
+        // `drainChannel` only notices it on its next check, asynchronously — so this is the last
+        // point at which `activeDrainTrace` reliably reflects the channel that was actually in
+        // flight, rather than racing whatever `drainChannel`'s own cancellation branch records.
+        pendingDrainResume = session?.interruptedDrainChannel
         session?.invalidate()
         session = nil
     }
@@ -820,7 +831,10 @@ extension RingScanner: CBCentralManagerDelegate {
                 // restore) before replacing it, so its tasks don't keep writing to the peripheral
                 // behind the new session (#42).
                 self.teardownSession()
-                self.session = RingSession(peripheral: peripheral, localStore: self.localStore)
+                let restored = RingSession(peripheral: peripheral, localStore: self.localStore)
+                restored.resumeChannelHint = self.pendingDrainResume
+                self.pendingDrainResume = nil
+                self.session = restored
             case .connecting:
                 // Pending connect still in flight; `didConnect` will complete it.
                 self.state = .connecting(peripheral.name ?? "RingConn")
@@ -901,6 +915,8 @@ extension RingScanner: CBCentralManagerDelegate {
             // tasks can't keep driving the same peripheral behind the new session (#42).
             self.teardownSession()
             let newSession = RingSession(peripheral: peripheral, localStore: self.localStore)
+            newSession.resumeChannelHint = self.pendingDrainResume
+            self.pendingDrainResume = nil
             self.session = newSession
             self.armConnectStabilityReset()
             // Reconnect-resume (#reconnect): a mid-workout BLE drop tore down the old session and its
