@@ -3,8 +3,9 @@
 // (`TrendsData.todayStrain`), on the 0…21 scale `Strain` computes; the gauge is the readiness card's
 // own dial (`ReadinessRing`), filled to the score's share of 21.
 //
-// Laid out like the other tiles — label + time, large value with a small unit, a line of words, a
-// bottom line — with the gauge where their sparkline sits. It has no usual range and no "vs usual":
+// Laid out row for row like the other tiles — label + time, large value with a small unit, a line of
+// words, the 34 pt chart slot, a bottom line — with the gauge in their sparkline's slot, so the tile is
+// the same height as its neighbours. It has no usual range and no "vs usual":
 // today's strain is a running total that only grows until midnight, so comparing it with whole past
 // days would read every morning as "below usual". Tapping it explains strain (a sheet).
 //
@@ -62,7 +63,6 @@ struct StrainTileView: View {
     let reading: DailyStrain.Reading?
 
     @ScaledMetric(relativeTo: .title) private var valueSize: CGFloat = 30
-    @ScaledMetric(relativeTo: .title) private var gaugeSize: CGFloat = 58
 
     private var valueText: String? { StrainTileText.value(reading) }
 
@@ -79,32 +79,29 @@ struct StrainTileView: View {
                     Text(fresh).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                 }
             }
-            HStack(alignment: .center, spacing: 8) {
-                VStack(alignment: .leading, spacing: 6) {
-                    // Large value, small unit (the scale's top, as the stress tile shows "/ 100").
-                    HStack(alignment: .firstTextBaseline, spacing: 3) {
-                        Text(valueText ?? "—")
-                            .font(.system(size: valueSize, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(valueText == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
-                            .contentTransition(.numericText())
-                            .lineLimit(1).minimumScaleFactor(0.6)
-                        if valueText != nil {
-                            Text("/ 21").font(.footnote.weight(.medium)).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                    }
-                    Text(StrainTileText.bandLine(reading) ?? " ")
-                        .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
-                        .lineLimit(1).minimumScaleFactor(0.8)
+            // Large value, small unit (the scale's top, as the stress tile shows "/ 100").
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text(valueText ?? "—")
+                    .font(.system(size: valueSize, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(valueText == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
+                    .contentTransition(.numericText())
+                    .lineLimit(1).minimumScaleFactor(0.6)
+                if valueText != nil {
+                    Text("/ 21").font(.footnote.weight(.medium)).foregroundStyle(.secondary).lineLimit(1)
                 }
-                Spacer(minLength: 0)
-                // The readiness card's dial, filled to the score's share of 21; track only without one.
-                ReadinessRing(progress: reading?.gaugeFraction, tint: Theme.energy, lineWidth: 6) {
-                    EmptyView()
-                }
-                .frame(width: gaugeSize, height: gaugeSize)
-                .accessibilityHidden(true)
             }
+            Text(StrainTileText.bandLine(reading) ?? " ")
+                .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                .lineLimit(1).minimumScaleFactor(0.8)
+            // The readiness card's dial, filled to the score's share of 21 (track only without one).
+            // It sits in the sparkline's 34 pt slot, so the tile is the same height as its neighbours.
+            ReadinessRing(progress: reading?.gaugeFraction, tint: Theme.energy, lineWidth: 5) {
+                EmptyView()
+            }
+            .frame(width: 34, height: 34)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityHidden(true)
             Text(StrainTileText.status(reading))
                 .font(.caption2).foregroundStyle(.secondary)
                 .lineLimit(2).fixedSize(horizontal: false, vertical: true)
