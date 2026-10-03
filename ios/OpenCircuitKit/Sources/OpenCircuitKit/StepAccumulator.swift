@@ -76,7 +76,76 @@ public struct StepUpdate: Equatable, Sendable {
     }
 }
 
+/// The last raw reading the app persisted per ring (`RingSession` keeps it in UserDefaults across
+/// sessions). Every field is `nil` before the first reading on this device.
+public struct StepBaseline: Equatable, Sendable {
+    /// Last raw `[4:6]` counter.
+    public let raw: Int?
+    /// Start of the calendar day `raw` was observed on.
+    public let day: Date?
+    /// When `raw` arrived; the window start for the next same-day credit.
+    public let sampleAt: Date?
+
+    public init(raw: Int?, day: Date?, sampleAt: Date?) {
+        self.raw = raw
+        self.day = day
+        self.sampleAt = sampleAt
+    }
+}
+
+/// Everything one descriptor step reading means for the app, minus the I/O (#199).
+public struct StepReading: Equatable, Sendable {
+    /// The fold against the baseline.
+    public let update: StepUpdate
+    /// The sample is on a different calendar day from the baseline. Always `false` with no baseline.
+    public let dayChanged: Bool
+    /// Window start for the `StoredStepSample` carrying `update.deltaToAdd`, or `nil` when there is
+    /// nothing to credit. Non-nil exactly when the caller must write a sample.
+    public let windowStart: Date?
+    /// What to persist as the next reading's baseline. Written on every reading, credited or not.
+    public let nextBaseline: StepBaseline
+
+    public init(update: StepUpdate, dayChanged: Bool, windowStart: Date?, nextBaseline: StepBaseline) {
+        self.update = update
+        self.dayChanged = dayChanged
+        self.windowStart = windowStart
+        self.nextBaseline = nextBaseline
+    }
+}
+
 public enum StepAccumulator {
+    /// Fold one descriptor step reading against the persisted baseline: the delta to credit, the
+    /// window to stamp it with, and the baseline to persist for the next reading.
+    ///
+    /// This is the wiring `RingSession` used to do inline (#199): the day-change test, choosing
+    /// `nil` as the previous sample on a rollover, and what to persist afterwards. Inline, deleting
+    /// any of it left the whole suite green (mutation M16 in #192). `RingSession` now only reads
+    /// the baseline, calls this, writes the sample when `windowStart` is non-nil, and persists
+    /// `nextBaseline`.
+    ///
+    /// - Parameters:
+    ///   - newRaw: the counter just observed (`DeviceStatus.steps`).
+    ///   - sampleDate: when the descriptor arrived.
+    ///   - baseline: the last persisted reading.
+    public static func read(newRaw: Int,
+                            sampleDate: Date,
+                            baseline: StepBaseline,
+                            calendar: Calendar = .current) -> StepReading {
+        let sampleDay = calendar.startOfDay(for: sampleDate)
+        let dayChanged = baseline.raw != nil && baseline.day != sampleDay
+        let folded = Self.update(previousRaw: baseline.raw, newRaw: newRaw, dayChanged: dayChanged)
+        let start = folded.deltaToAdd > 0
+            ? Self.windowStart(sampleDate: sampleDate,
+                          previousSampleAt: dayChanged ? nil : baseline.sampleAt,
+                          dayStart: sampleDay,
+                          calendar: calendar)
+            : nil
+        return StepReading(update: folded,
+                           dayChanged: dayChanged,
+                           windowStart: start,
+                           nextBaseline: StepBaseline(raw: newRaw, day: sampleDay, sampleAt: sampleDate))
+    }
+
     /// Length of the ring's step bucket 🟢 — steps in `[4:6]` are cleared every 15 wall-clock
     /// minutes (`:00`/`:15`/`:30`/`:45`). See the header for the 268-roll derivation.
     public static let bucketSeconds: TimeInterval = 15 * 60

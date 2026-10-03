@@ -152,6 +152,34 @@ final class SleepStagingWearGateTests: XCTestCase {
                        "every fragment must be gated, not just a single-fragment night")
     }
 
+    // MARK: - The ring's entry point (#199)
+
+    /// `RingSession.overnightStagedSegments` stages through `classifyRingNight`, whose
+    /// `wearTemperatures:` has no default, so dropping it at the call site no longer compiles. This
+    /// pins the other half: the entry point must FORWARD the samples. Drop `temperatures:` inside
+    /// `classifyRingNight` and the cold block below is staged as a night again.
+    func testRingNightEntryPointForwardsTheWearTemperatures() {
+        let recs = stillNight()
+        XCTAssertGreaterThan(asleepMinutes(SleepStaging.classifyRingNight(from: recs,
+                                                                          wearTemperatures: [],
+                                                                          baseline: nil)), 120,
+                             "fixture must stage as a real night with no temperature evidence")
+        XCTAssertEqual(asleepMinutes(SleepStaging.classifyRingNight(from: recs,
+                                                                    wearTemperatures: temps(over: recs, celsius: 20),
+                                                                    baseline: nil)), 0,
+                       "the ring's hypnogram must honour the wear gate")
+    }
+
+    /// …and it must be `classify` with those samples, nothing more, on a worn night and with a
+    /// personal baseline in hand.
+    func testRingNightEntryPointIsClassifyWithTheSamples() {
+        let recs = stillNight()
+        let warm = temps(over: recs, celsius: 34)
+        let baseline = SleepStaging.PersonalBaseline(deepSleepHR: 51)
+        XCTAssertEqual(SleepStaging.classifyRingNight(from: recs, wearTemperatures: warm, baseline: baseline),
+                       SleepStaging.classify(from: recs, temperatures: warm, baseline: baseline))
+    }
+
     // MARK: - The kill switch
 
     /// `stagedWearGate = false` restores the pre-#194 behaviour byte-identically, even with cold

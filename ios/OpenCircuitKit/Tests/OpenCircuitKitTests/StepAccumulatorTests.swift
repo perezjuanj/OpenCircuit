@@ -290,4 +290,84 @@ final class StepAccumulatorTests: XCTestCase {
             XCTAssertLessThanOrEqual(start, sample)
         }
     }
+
+    // MARK: - One reading against the persisted baseline (#199)
+    //
+    // `read` is the wiring `RingSession` used to do inline, where deleting it left the suite green
+    // (#192 mutation M16): the day test, the rollover's nil previous sample, and the baseline to
+    // persist next.
+
+    private func baseline(_ raw: Int?, at hhmmss: String?) -> StepBaseline {
+        guard let raw, let hhmmss else { return StepBaseline(raw: nil, day: nil, sampleAt: nil) }
+        let at = date(hhmmss)
+        return StepBaseline(raw: raw, day: calendar("America/New_York").startOfDay(for: at), sampleAt: at)
+    }
+
+    func testReadClimbingWithinTheDayCreditsTheIncrementFromThePreviousReading() {
+        let cal = calendar("America/New_York")
+        let r = StepAccumulator.read(newRaw: 150, sampleDate: date("17:12:22"),
+                                     baseline: baseline(100, at: "17:11:41"), calendar: cal)
+        XCTAssertFalse(r.dayChanged)
+        XCTAssertEqual(r.update, StepUpdate(deltaToAdd: 50, isReset: false))
+        XCTAssertEqual(r.windowStart, date("17:11:41"))
+    }
+
+    func testReadFlatReadingWritesNoSampleButStillMovesTheBaseline() {
+        let cal = calendar("America/New_York")
+        let r = StepAccumulator.read(newRaw: 100, sampleDate: date("17:12:22"),
+                                     baseline: baseline(100, at: "17:11:41"), calendar: cal)
+        XCTAssertEqual(r.update.deltaToAdd, 0)
+        XCTAssertNil(r.windowStart, "nothing to credit ⇒ no sample to write")
+        XCTAssertEqual(r.nextBaseline,
+                       StepBaseline(raw: 100, day: date("00:00:00"), sampleAt: date("17:12:22")),
+                       "the next window must start from this reading, not the older one")
+    }
+
+    func testReadAcrossMidnightCreditsWholeAndIgnoresYesterdaysSampleTime() {
+        // Yesterday 23:58 at 400, today 00:20 at 30. Same-day logic would see a drop and still credit
+        // 30, but the window must not reach back to yesterday's sample: it starts at today's bucket.
+        let cal = calendar("America/New_York")
+        let yesterday = date("23:58:00").addingTimeInterval(-86_400)
+        let prior = StepBaseline(raw: 400, day: cal.startOfDay(for: yesterday), sampleAt: yesterday)
+        let r = StepAccumulator.read(newRaw: 30, sampleDate: date("00:20:00"), baseline: prior, calendar: cal)
+        XCTAssertTrue(r.dayChanged)
+        XCTAssertEqual(r.update.deltaToAdd, 30)
+        XCTAssertEqual(r.windowStart, date("00:15:00"))
+        XCTAssertEqual(r.nextBaseline.day, date("00:00:00"))
+    }
+
+    func testReadRolloverDoesNotUseYesterdaysSampleEvenWhenItWouldFitTheWindow() {
+        // A day change with a previous sample a minute before midnight: passing it through would be
+        // clamped by `windowStart` anyway, so pin `dayChanged` itself with a counter that climbs past
+        // yesterday's (a same-day fold would credit only the increment).
+        let cal = calendar("America/New_York")
+        let yesterday = date("23:59:30").addingTimeInterval(-86_400)
+        let prior = StepBaseline(raw: 10, day: cal.startOfDay(for: yesterday), sampleAt: yesterday)
+        let r = StepAccumulator.read(newRaw: 40, sampleDate: date("00:00:40"), baseline: prior, calendar: cal)
+        XCTAssertTrue(r.dayChanged)
+        XCTAssertEqual(r.update.deltaToAdd, 40, "a new day credits the bucket whole, not 40 − 10")
+        XCTAssertEqual(r.windowStart, date("00:00:00"))
+    }
+
+    func testReadWithNoBaselineCreditsTheBucketSoFarAndIsNotADayChange() {
+        let cal = calendar("America/New_York")
+        let r = StepAccumulator.read(newRaw: 48, sampleDate: date("21:43:32"),
+                                     baseline: baseline(nil, at: nil), calendar: cal)
+        XCTAssertFalse(r.dayChanged)
+        XCTAssertEqual(r.update, StepUpdate(deltaToAdd: 48, isReset: false))
+        XCTAssertEqual(r.windowStart, date("21:30:00"))
+        XCTAssertEqual(r.nextBaseline,
+                       StepBaseline(raw: 48, day: date("00:00:00"), sampleAt: date("21:43:32")))
+    }
+
+    func testReadBucketRollSameDayFloorsAStalePreviousReading() {
+        // A reconnect after three hours: the counter dropped (a new bucket), and the window is the
+        // current bucket, not the old reading.
+        let cal = calendar("America/New_York")
+        let r = StepAccumulator.read(newRaw: 58, sampleDate: date("17:40:00"),
+                                     baseline: baseline(83, at: "14:31:00"), calendar: cal)
+        XCTAssertFalse(r.dayChanged)
+        XCTAssertEqual(r.update, StepUpdate(deltaToAdd: 58, isReset: true))
+        XCTAssertEqual(r.windowStart, date("17:30:00"))
+    }
 }

@@ -568,6 +568,20 @@ public enum SleepStaging {
         return applyBedtimeWiden(staged, records: records, epoch: epoch, tuning: tuning)
     }
 
+    /// The ring's overnight hypnogram: `classify` with the wear gate's samples REQUIRED (#199).
+    ///
+    /// `classify` defaults `temperatures:` to `[]`, so at a call site the gate's input is a line
+    /// that can be deleted while everything still compiles, and the suite stayed green when it was
+    /// (#194). `RingSession.overnightStagedSegments` calls this instead: deleting the argument there
+    /// is a compile error, and the forwarding below is pinned by `SleepStagingWearGateTests`.
+    /// Pass the night's raw skin-temp samples INCLUDING the cold/charging ones; empty means
+    /// motion-only, as in `classify`.
+    public static func classifyRingNight(from records: [BulkRecord],
+                                         wearTemperatures: [TemperatureSample],
+                                         baseline: PersonalBaseline?) -> [SleepSegment] {
+        classify(from: records, temperatures: wearTemperatures, baseline: baseline)
+    }
+
     /// Extend the in-bed envelope back over a MEASURED awake-in-bed lead-in that the motion still-block
     /// missed — a moving/reading-in-bed stretch before onset — so a fast-onset night stops reporting a
     /// phantom 100 % efficiency. Guarantees (each verified by a test):

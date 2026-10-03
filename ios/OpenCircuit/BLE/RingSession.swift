@@ -1705,10 +1705,11 @@ final class RingSession: NSObject {
         // to forward, so the STAGED hypnogram was the one path where an off-wrist/charging block
         // could still be staged as sleep (#194). With no hint and the default epoch the two
         // spellings are otherwise the same call. The samples are re-read here rather than passed
-        // in so no future call site can forget them again.
-        let segs = SleepStaging.classify(from: records,
-                                         temperatures: wearTemperatureSamples(),
-                                         baseline: personalSleepBaseline(from: records))
+        // in so no future call site can forget them again. `classifyRingNight` takes them as a
+        // REQUIRED argument, so deleting it is a compile error rather than a green suite (#199).
+        let segs = SleepStaging.classifyRingNight(from: records,
+                                                  wearTemperatures: wearTemperatureSamples(),
+                                                  baseline: personalSleepBaseline(from: records))
         // A stitched night carries one `inBed` segment PER fragment (sorted by start), so gate on the
         // WHOLE-NIGHT envelope — earliest onset to latest wake — not just the first fragment. Testing
         // `first(where: .inBed)` would judge the night by its earliest fragment's midpoint and wrongly
@@ -2262,25 +2263,21 @@ final class RingSession: NSObject {
     private var lastRawStepsDayKey: String { "steps.lastRawDay.\(deviceKey)" }   // Date: start-of-day it was observed
     private var lastStepSampleAtKey: String { "steps.lastSampleAt.\(deviceKey)" } // Date: wall-clock of that reading
 
-    /// Last raw counter we recorded, or nil if we've never seen one (first run / cleared). Stored
-    /// as an object so a legitimate 0 reading is distinguishable from "unset".
-    private var persistedLastRawSteps: Int? {
-        UserDefaults.standard.object(forKey: lastRawStepsKey) as? Int
+    /// The last raw reading we recorded, per ring: the raw counter (read as an object so a
+    /// legitimate 0 is distinguishable from "unset"), the start-of-day it was observed on (for
+    /// midnight-rollover detection), and its wall-clock time, which is the window START for the
+    /// NEXT timestamped step delta (#steps-history) so a steady stream of same-day descriptor
+    /// reads produces narrow, accurately-timed snapshots. All nil before the first reading.
+    private var persistedStepBaseline: StepBaseline {
+        let d = UserDefaults.standard
+        return StepBaseline(raw: d.object(forKey: lastRawStepsKey) as? Int,
+                            day: d.object(forKey: lastRawStepsDayKey) as? Date,
+                            sampleAt: d.object(forKey: lastStepSampleAtKey) as? Date)
     }
-    /// Start-of-day the persisted raw counter was observed (for midnight-rollover detection).
-    private var persistedLastRawStepsDay: Date? {
-        UserDefaults.standard.object(forKey: lastRawStepsDayKey) as? Date
-    }
-    /// Wall-clock time of that same last reading — the window START for the NEXT timestamped
-    /// step delta (#steps-history), so a steady stream of same-day descriptor reads produces
-    /// narrow, accurately-timed snapshots instead of crediting steps to the whole elapsed day.
-    private var persistedLastStepSampleAt: Date? {
-        UserDefaults.standard.object(forKey: lastStepSampleAtKey) as? Date
-    }
-    private func persistStepRawState(raw: Int, day: Date, sampleAt: Date) {
-        UserDefaults.standard.set(raw, forKey: lastRawStepsKey)
-        UserDefaults.standard.set(day, forKey: lastRawStepsDayKey)
-        UserDefaults.standard.set(sampleAt, forKey: lastStepSampleAtKey)
+    private func persistStepBaseline(_ b: StepBaseline) {
+        UserDefaults.standard.set(b.raw, forKey: lastRawStepsKey)
+        UserDefaults.standard.set(b.day, forKey: lastRawStepsDayKey)
+        UserDefaults.standard.set(b.sampleAt, forKey: lastStepSampleAtKey)
     }
 
     /// Start (or switch) live monitoring in a single mode. Guarantees only one metric
@@ -4952,10 +4949,15 @@ extension RingSession: CBPeripheralDelegate {
                 // picks the correct day for the row/persist + display re-read, but it cannot back-date
                 // steps actually taken at 23:59 onto the prior day (no per-step timestamps on the wire).
                 let sampleDate = self.lastFrameAt ?? Date()
-                let sampleDay = Calendar.current.startOfDay(for: sampleDate)
-                let previousRaw = self.persistedLastRawSteps
-                let dayChanged = previousRaw != nil && self.persistedLastRawStepsDay != sampleDay
-                let update = StepAccumulator.update(previousRaw: previousRaw, newRaw: v, dayChanged: dayChanged)
+                // The day test, the rollover's nil previous sample and the next baseline all live in
+                // the tested `StepAccumulator.read` (#199). What stays here, and is reviewed by eye
+                // only (the app suite cannot host a CoreBluetooth wiring test): the store write when
+                // `windowStart` is non-nil, and persisting `nextBaseline`.
+                let baseline = self.persistedStepBaseline
+                let reading = StepAccumulator.read(newRaw: v, sampleDate: sampleDate, baseline: baseline)
+                let previousRaw = baseline.raw
+                let dayChanged = reading.dayChanged
+                let update = reading.update
                 if update.isReset {
                     // The ring's quarter-hour bucket rolled. EXPECTED and frequent (~24×/day
                     // measured) — it used to be logged at .notice as an anomalous "handoff/reboot/
@@ -4964,7 +4966,7 @@ extension RingSession: CBPeripheralDelegate {
                     // from a roll on the wire, so there is nothing louder to say.
                     ringLog.debug("steps: bucket rolled \(previousRaw ?? -1)→\(v) — counting \(v) as the new quarter-hour")
                 }
-                if update.deltaToAdd > 0 {
+                if let windowStart = reading.windowStart {
                     // Window this delta to when it was actually observed (#steps-history): from
                     // the LAST same-day reading we saw, so a steady ~30-60s descriptor poll yields
                     // narrow, accurately-timed snapshots. FLOORED to the sample's own quarter-hour
@@ -4973,10 +4975,6 @@ extension RingSession: CBPeripheralDelegate {
                     // used to stamp local midnight — must not smear it backwards. Measured: 22 of
                     // 989 credits (5.3% of all step mass) were smeared, six across 11–22 hours.
                     // StepAccumulator.windowStart also does the ordering/day clamping.
-                    let windowStart = StepAccumulator.windowStart(
-                        sampleDate: sampleDate,
-                        previousSampleAt: dayChanged ? nil : self.persistedLastStepSampleAt,
-                        dayStart: sampleDay)
                     try? localStore?.addDailySteps(update.deltaToAdd, day: sampleDate, windowStart: windowStart)
                     // Record activity time for the sedentary reminder (#84).
                     UserDefaults.standard.set(sampleDate.timeIntervalSince1970,
@@ -5011,7 +5009,7 @@ extension RingSession: CBPeripheralDelegate {
                 self.steps = dailyStepsTotal
                 // Persist the raw counter + its day + this reading's timestamp for the NEXT
                 // reading (cross-session, #34 / #steps-history).
-                self.persistStepRawState(raw: v, day: sampleDay, sampleAt: sampleDate)
+                self.persistStepBaseline(reading.nextBaseline)
             }
             // Skin temperature rides the same 0x10/0x87 descriptor (§5.4). It streams live
             // (~30–60 s) and is NOT in the sleep sync, so the connected UI should reflect it
