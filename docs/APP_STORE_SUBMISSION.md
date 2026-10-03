@@ -27,10 +27,6 @@ archive and upload mechanics; this file covers review.
 - **Blood Pressure no longer requested from HealthKit in Release.** Only the Debug
   calibration flow writes BP, so asking store users for it would be a request for data
   the app never uses (guideline 2.5.1). Already-granted TestFlight installs are unaffected.
-- **Indoor workout keep-alive hidden in Release.** It ran a location session purely to
-  keep the app alive during indoor workouts, which guideline 2.5.4 does not allow for the
-  `location` background mode. Outdoor workouts still record a GPS route as before. A
-  stored opt-in from an earlier TestFlight build is ignored in Release.
 - **Ring debug card hidden in Release until unlocked.** Profile showed every ring user a
   "Debug — last sync & frame" card with raw hex and an "RE tool" probe. Debug builds still
   show it; store and TestFlight builds show it after **7 taps on the version line** at the
@@ -90,9 +86,13 @@ workout start on the phone.
 > - bluetooth-central: the wearable syncs its stored history when it reconnects, so
 >   Apple Health stays current without opening the app.
 > - fetch / processing: scheduled background syncs (BGTaskScheduler) for the same purpose.
-> - location: used only while the user is recording an outdoor workout, to map the GPS
->   route written to Apple Health as an HKWorkoutRoute. It is never used outside a
->   workout, and only When In Use permission is requested.
+> - location: used only while the user is recording a workout. Outdoor workouts map the
+>   GPS route written to Apple Health as an HKWorkoutRoute. For indoor workouts there is an
+>   opt-in setting, off by default (Profile ▸ Settings ▸ Workouts ▸ "Keep tracking when
+>   screen is off"), that keeps a low-accuracy location session running so heart-rate
+>   recording from the wearable continues while the phone is locked; no location is
+>   stored, and the setting explains the blue indicator and battery cost. Location is
+>   never used outside a workout, and only When In Use permission is requested.
 >
 > HealthKit: the app writes heart rate, HRV, SpO₂, temperature, respiratory rate, sleep,
 > steps, energy, workouts, menstrual flow and headache logs, and reads back the same
@@ -104,6 +104,11 @@ workout start on the phone.
 
 ## 4. Guideline risks still open (owner judgement)
 
+- **Indoor keep-alive (2.5.4)**: kept by owner decision (2026-10-03). Guideline 2.5.4
+  allows the `location` background mode for location features, and the indoor option
+  uses it only to stay awake. It is opt-in and justified in the review notes; if review
+  rejects it, hide the Profile ▸ Workouts toggle in Release and stop both readers of
+  `workout.indoorKeepAlive` (`WorkoutSessionManager`, `StrapWorkoutRecorder`) from honouring it.
 - **Hardware dependence (2.1 / 4.2)**: without a demo video the reviewer cannot exercise
   the app. The video is the mitigation.
 - **Helio Strap key (2.1)**: pairing needs a key extracted with a computer

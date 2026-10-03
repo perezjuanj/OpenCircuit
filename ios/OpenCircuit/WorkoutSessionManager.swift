@@ -141,27 +141,6 @@ final class WorkoutSessionManager: NSObject {
     /// shows the blue location indicator. Shared key with `UserProfileSettingsView`.
     static let indoorKeepAliveEnabledKey = "workout.indoorKeepAlive"
 
-    /// Whether this build offers the indoor keep-alive at all. DEBUG only: App Review guideline 2.5.4
-    /// allows the `location` background mode for location features, and an indoor workout records no
-    /// location, so a store build must not run a location session just to stay alive. Outdoor routes
-    /// are unaffected. A stored `true` from an earlier TestFlight build is ignored in Release.
-    nonisolated static var indoorKeepAliveOffered: Bool {
-        #if DEBUG
-        return true
-        #else
-        return false
-        #endif
-    }
-
-    /// The user's opt-in, honoured only where the feature is offered (`indoorKeepAliveOffered`).
-    nonisolated static var indoorKeepAliveEnabled: Bool {
-        #if DEBUG
-        return UserDefaults.standard.bool(forKey: indoorKeepAliveEnabledKey)
-        #else
-        return false
-        #endif
-    }
-
     // MARK: - Durable "workout in progress" flag (T6)
 
     /// UserDefaults key for the durable "a workout is in progress" flag. `nonisolated` so the
@@ -400,7 +379,7 @@ final class WorkoutSessionManager: NSObject {
         // keep ticking under lock — the only sanctioned keep-alive for our request/response ring.
         if selectedSport.isOutdoor {
             startLocation(purpose: .route)
-        } else if Self.indoorKeepAliveEnabled {
+        } else if UserDefaults.standard.bool(forKey: Self.indoorKeepAliveEnabledKey) {
             startLocation(purpose: .keepAlive)
         }
 

@@ -264,7 +264,9 @@ final class StrapWorkoutRecorder {
          location: any WorkoutLocationTracking,
          liveActivity: WorkoutLiveActivityController?,
          profile: @escaping @MainActor () -> UserProfile = { HealthKitWriter.storedUserProfile() },
-         indoorKeepAlive: @escaping () -> Bool = { WorkoutSessionManager.indoorKeepAliveEnabled },
+         indoorKeepAlive: @escaping () -> Bool = {
+             UserDefaults.standard.bool(forKey: WorkoutSessionManager.indoorKeepAliveEnabledKey)
+         },
          orphanStop: StrapWorkoutOrphanStop = StrapWorkoutOrphanStop(),
          vo2: (any StrapVO2MaxProviding)? = nil,
          clock: @escaping () -> Date = Date.init,

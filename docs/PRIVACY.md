@@ -30,8 +30,10 @@ what the app does and does not do with your data.
 - **Your Helio Strap's pairing key**, which you enter once. It is stored in the
   iOS Keychain on your device and is only ever sent to your own strap.
 - **Bluetooth** is used to connect to your wearable. **Location** is used **only
-  during an active outdoor workout** to map your route; it is never used at any other
-  time and routes are not uploaded.
+  during an active workout**: to map outdoor routes, and, if you turn on "Keep
+  tracking when screen is off", to keep indoor workouts recording while your phone is
+  locked (no location is stored then). It is never used at any other time and routes
+  are not uploaded.
 - **Notifications** (if you allow them) are scheduled on your device for the health
   alerts and reminders you turn on.
 

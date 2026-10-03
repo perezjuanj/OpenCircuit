@@ -583,17 +583,13 @@ struct UserProfileSettingsView: View {
             }
 
             // MARK: Workouts
-            // Hidden in store builds (`indoorKeepAliveOffered`): a location session used only to stay
-            // alive is the background-mode misuse App Review rejects under guideline 2.5.4.
-            if WorkoutSessionManager.indoorKeepAliveOffered {
-                Section("Workouts") {
-                    Toggle("Keep tracking when screen is off", isOn: $indoorKeepAlive)
-                    Text("For indoor workouts (strength, yoga), keep recording heart rate while your "
-                         + "phone is locked. Uses location to stay active, so the blue location "
-                         + "indicator shows and battery use is higher — no location is stored. Outdoor "
-                         + "workouts always keep tracking via GPS.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+            Section("Workouts") {
+                Toggle("Keep tracking when screen is off", isOn: $indoorKeepAlive)
+                Text("For indoor workouts (strength, yoga), keep recording heart rate while your "
+                     + "phone is locked. Uses location to stay active, so the blue location "
+                     + "indicator shows and battery use is higher — no location is stored. Outdoor "
+                     + "workouts always keep tracking via GPS.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             // MARK: Units (#83)
