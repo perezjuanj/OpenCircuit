@@ -83,8 +83,12 @@ targets:
         # generates this Info.plist, so these MUST live here, not be hand-edited into the plist.
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
-        # Export compliance: only crypto is SM3 hashing for ring auth (exempt) → declare no
-        # non-exempt encryption, so TestFlight uploads skip the manual compliance prompt.
+        # Export compliance → declare no non-exempt encryption, so uploads skip the manual prompt.
+        # The app's crypto: SM3 hashing for ring auth, and AES-128 + B-163 ECDH for the Helio
+        # Strap's pairing and its encrypted BLE messages (ZeppKit). All of it only authenticates to
+        # and talks with the user's own wearable; the app's primary function is health tracking,
+        # not information security or communications, which is the basis for the exemption.
+        # Owner to confirm in App Store Connect (docs/APP_STORE_SUBMISSION.md §Export compliance).
         ITSAppUsesNonExemptEncryption: false
         # Diagnostics export (Device Info ▸ Diagnostics): expose the app's Documents dir over
         # iTunes/Finder file sharing + the Files app, so tester logs can be pulled off-device.
@@ -96,7 +100,7 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
         # HealthKit auth strings (Phase 4) — required or the app crashes on request. Shown verbatim
         # in the iOS permission dialogs, so they use the user-facing name "OpenCircuit".
-        NSHealthShareUsageDescription: "OpenCircuit reads health metrics from your ring or strap to display them. If you turn on background syncing for the strap, it also reads your iPhone's step count, only to know when to sync."
+        NSHealthShareUsageDescription: "OpenCircuit reads your Apple Health data, such as sleep, heart rate, and activity, to show your trends and baselines alongside your ring's or strap's readings. If you turn on background syncing for the strap, it also reads your iPhone's step count, only to know when to sync."
         NSHealthUpdateUsageDescription: "OpenCircuit writes your ring's or strap's metrics into Apple Health."
         # Live Activities (workout modal): required for the app to start an ActivityKit Live Activity
         # showing live workout time / calories / heart rate on the Lock Screen + Dynamic Island.

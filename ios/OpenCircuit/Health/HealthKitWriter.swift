@@ -146,8 +146,15 @@ final class HealthKitWriter {
         // right after the user revoked Health access in the Health app (the #119 auth-recovery
         // path re-requests). Saving the HKCorrelation itself needs no correlation-level grant;
         // it is authorized through systolic + diastolic.
+        //
+        // DEBUG only (App Store readiness): the one writer of these types is the developer-only
+        // calibration flow (`writeBPEstimate`), which Release does not ship. Asking a store user to
+        // share Blood Pressure the app never writes is a HealthKit review rejection (guideline
+        // 2.5.1: request only the data the app uses). Revisit if BP ever ships to users.
+        #if DEBUG
         set.insert(Self.systolicType)
         set.insert(Self.diastolicType)
+        #endif
         return set
     }
 

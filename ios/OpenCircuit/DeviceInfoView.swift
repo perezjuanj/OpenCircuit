@@ -150,7 +150,7 @@ struct DeviceInfoView: View {
             Section {
                 if sleepApneaUnavailable {
                     HStack {
-                        Label("Sleep apnea assessment", systemImage: "lungs.fill")
+                        Label("Overnight blood-oxygen check", systemImage: "lungs.fill")
                         Spacer()
                         Text("Not offered on this model")
                     }
@@ -161,19 +161,19 @@ struct DeviceInfoView: View {
                         get: { session?.osaAssessmentArmed ?? false },
                         set: { session?.setOSAAssessment(armed: $0) }
                     )) {
-                        Label("Sleep apnea assessment", systemImage: "lungs.fill")
+                        Label("Overnight blood-oxygen check", systemImage: "lungs.fill")
                     }
                     .disabled(session?.ready != true)
                 }
                 osaBurstProvenanceRow()
             } header: {
-                Text("Sleep apnea (experimental)")
+                Text("Overnight blood oxygen (experimental)")
             } footer: {
                 if sleepApneaUnavailable {
-                    Text("RingConn doesn't list the sleep-apnea assessment for the Gen 2 Air, so "
+                    Text("RingConn doesn't list this overnight blood-oxygen check for the Gen 2 Air, so "
                          + "OpenCircuit doesn't offer the switch on this ring. That's about the "
                          + "feature, not the sensor — a Gen 2 Air has been seen recording a full "
-                         + "night of the dense blood-oxygen data this assessment reads, and when "
+                         + "night of the dense blood-oxygen data this check reads, and when "
                          + "that happens OpenCircuit decodes it and the results appear on the Sleep "
                          + "card just like on any other model. Your ring's blood oxygen, heart rate, "
                          + "and sleep tracking all work normally.")
@@ -181,7 +181,8 @@ struct DeviceInfoView: View {
                     Text("Turn this on before bed and wear the ring overnight — it records a dense "
                          + "blood-oxygen reading. Open the app in the morning to sync, and the results appear "
                          + "on the Sleep card. Charge the ring above ~30% first so it lasts the night. This is "
-                         + "an experimental estimate, not a medical diagnosis.")
+                         + "an experimental wellness estimate, not a medical diagnosis, and it can't tell you whether "
+                         + "you have sleep apnea.")
                 }
             }
 

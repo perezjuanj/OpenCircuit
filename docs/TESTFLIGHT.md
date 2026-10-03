@@ -1,11 +1,15 @@
 # TestFlight — shipping OpenCircuit to external testers
 
+> For the full App Store submission (privacy label, review notes, screenshots), see
+> `docs/APP_STORE_SUBMISSION.md`.
+
 Path from source → TestFlight. The dev-signed install (`devicectl`) is a *different* flow; this
 one produces a **Release archive uploaded to App Store Connect (ASC)**.
 
 ## 0. Project state (already done in-repo)
-- App icon: `ios/OpenCircuit/Assets.xcassets/AppIcon.appiconset` (1024px, no alpha).
-- `ITSAppUsesNonExemptEncryption = false` — only crypto is SM3 auth hashing (exempt); skips the
+- App icon: `ios/OpenCircuit/AppIcon.icon` (Icon Composer bundle; needs Xcode 26 to build).
+- `ITSAppUsesNonExemptEncryption = false` — SM3 ring-auth hashing plus the Helio Strap's AES/ECDH
+  link crypto, all ancillary to a health app (see `docs/APP_STORE_SUBMISSION.md`); skips the
   per-upload export-compliance prompt.
 - `PrivacyInfo.xcprivacy` — no tracking, no off-device data collection (local-first), declares
   the one required-reason API (UserDefaults / CA92.1).

@@ -45,7 +45,7 @@
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>OpenCircuit connects to your RingConn ring or Amazfit Helio Strap over Bluetooth Low Energy.</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>OpenCircuit reads health metrics from your ring or strap to display them. If you turn on background syncing for the strap, it also reads your iPhone's step count, only to know when to sync.</string>
+	<string>OpenCircuit reads your Apple Health data, such as sleep, heart rate, and activity, to show your trends and baselines alongside your ring's or strap's readings. If you turn on background syncing for the strap, it also reads your iPhone's step count, only to know when to sync.</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>OpenCircuit writes your ring's or strap's metrics into Apple Health.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

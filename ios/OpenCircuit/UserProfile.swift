@@ -371,6 +371,10 @@ struct UserProfileSettingsView: View {
                 }
             }
 
+#if DEBUG
+            // App Store readiness: the calibration server is the same developer-only BP tool the Today
+            // card already hides in Release (#152). It uploads raw PPG to an arbitrary URL and writes
+            // unvalidated BP estimates to Apple Health, neither of which a store build may offer.
             Section("Calibration server") {
                 TextField("Base URL", text: $calibrationBaseURL)
                     .textInputAutocapitalization(.never)
@@ -386,6 +390,7 @@ struct UserProfileSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+#endif
 
             Section("Sleep schedule") {
                 Toggle("Use manual sleep schedule", isOn: $sleepEnabled)
@@ -578,13 +583,17 @@ struct UserProfileSettingsView: View {
             }
 
             // MARK: Workouts
-            Section("Workouts") {
-                Toggle("Keep tracking when screen is off", isOn: $indoorKeepAlive)
-                Text("For indoor workouts (strength, yoga), keep recording heart rate while your "
-                     + "phone is locked. Uses location to stay active, so the blue location "
-                     + "indicator shows and battery use is higher — no location is stored. Outdoor "
-                     + "workouts always keep tracking via GPS.")
-                    .font(.caption).foregroundStyle(.secondary)
+            // Hidden in store builds (`indoorKeepAliveOffered`): a location session used only to stay
+            // alive is the background-mode misuse App Review rejects under guideline 2.5.4.
+            if WorkoutSessionManager.indoorKeepAliveOffered {
+                Section("Workouts") {
+                    Toggle("Keep tracking when screen is off", isOn: $indoorKeepAlive)
+                    Text("For indoor workouts (strength, yoga), keep recording heart rate while your "
+                         + "phone is locked. Uses location to stay active, so the blue location "
+                         + "indicator shows and battery use is higher — no location is stored. Outdoor "
+                         + "workouts always keep tracking via GPS.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
 
             // MARK: Units (#83)
