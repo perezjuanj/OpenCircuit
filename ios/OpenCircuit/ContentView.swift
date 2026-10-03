@@ -715,6 +715,9 @@ struct ContentView: View {
                 .accessibilityHidden(true)
             Text("OpenCircuit").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
             Text(Self.versionString).font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+            Text("Made with love").font(.caption).foregroundStyle(.secondary)
+            Link("StandardSoftware.io", destination: URL(string: "https://standardsoftware.io")!)
+                .font(.caption)
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 8)

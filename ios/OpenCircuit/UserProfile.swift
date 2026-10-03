@@ -621,13 +621,6 @@ struct UserProfileSettingsView: View {
             Section("About") {
                 LabeledContent("App", value: "OpenCircuit")
                 LabeledContent("Version", value: appVersion)
-                VStack(spacing: 2) {
-                    Text("Made with love")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Link("StandardSoftware.io", destination: URL(string: "https://standardsoftware.io")!)
-                        .font(.caption)
-                }
-                .frame(maxWidth: .infinity)
                 Button {
                     showOnboarding = true
                 } label: {
