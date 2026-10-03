@@ -92,6 +92,8 @@ struct ContentView: View {
     /// and any newly-added sections are appended in canonical order, so a saved order survives app
     /// updates. See `sectionOrder` / `moveSection`.
     @AppStorage("dashboard.sectionOrder") private var sectionOrderRaw = ""
+    // Release builds hide the ring RE surfaces until unlocked from the Profile footer (DeveloperTools).
+    @AppStorage(DeveloperTools.unlockedKey) private var developerToolsUnlocked = false
     /// First-run onboarding gate (#103): false until the user finishes/skips the welcome flow, then
     /// it never auto-shows again. Re-openable from the profile screen's About section.
     @AppStorage(OnboardingView.completedKey) private var onboardingCompleted = false
@@ -775,7 +777,8 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                     // Ring RE tools (last frame, activity-channel probe): ring only (#215).
-                    if ringActive { debugCard }
+                    // Store builds: hidden until unlocked from the version line below (DeveloperTools).
+                    if ringActive && DeveloperTools.isVisible(unlocked: developerToolsUnlocked) { debugCard }
                     brandFooter
                 }
                 .padding()
@@ -804,6 +807,13 @@ struct ContentView: View {
                 .accessibilityHidden(true)
             Text("OpenCircuit").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
             Text(Self.versionString).font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+                // Hidden switch for TestFlight testers: reveals (or hides again) the ring RE tools.
+                .onTapGesture(count: DeveloperTools.unlockTapCount) { developerToolsUnlocked.toggle() }
+            #if !DEBUG
+            if developerToolsUnlocked {
+                Text("Developer tools on").font(.caption2).foregroundStyle(.tertiary)
+            }
+            #endif
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 8)

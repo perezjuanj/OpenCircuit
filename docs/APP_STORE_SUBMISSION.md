@@ -31,6 +31,11 @@ archive and upload mechanics; this file covers review.
   keep the app alive during indoor workouts, which guideline 2.5.4 does not allow for the
   `location` background mode. Outdoor workouts still record a GPS route as before. A
   stored opt-in from an earlier TestFlight build is ignored in Release.
+- **Ring debug card hidden in Release until unlocked.** Profile showed every ring user a
+  "Debug — last sync & frame" card with raw hex and an "RE tool" probe. Debug builds still
+  show it; store and TestFlight builds show it after **7 taps on the version line** at the
+  bottom of Profile (7 more hide it). A TestFlight-only check can't be used, because App
+  Review runs builds with the same sandbox receipt. Tell TestFlight testers about the taps.
 - **"Sleep apnea assessment" renamed** to "Overnight blood-oxygen check", with copy that
   says it is a wellness estimate and can't tell you whether you have sleep apnea. The
   Sleep card already labels the result experimental and not a diagnosis. Naming a
