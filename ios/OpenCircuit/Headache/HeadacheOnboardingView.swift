@@ -78,13 +78,13 @@ struct HeadacheOnboardingView: View {
                 }
                 .padding(20)
             }
-            .navigationTitle("Headache signals")
+            .navigationTitle("Headache Signals")
             .navigationBarTitleDisplayMode(.inline)
             .safeAreaInset(edge: .bottom) {
                 Button {
                     dismiss()
                 } label: {
-                    Text("Start logging")
+                    Text("Start Logging")
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 4)

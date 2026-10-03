@@ -102,9 +102,7 @@ struct VitalsStatusCardView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding()
-        .background(RoundedRectangle(cornerRadius: Theme.cardCornerRadius).fill(Color(.secondarySystemGroupedBackground)))
+        .ocCardSurface()
         .task {
             guard healthBaselineReport == nil else { return }
             healthBaselineReport = try? await healthBaselineReader.loadReport(lookbackDays: Self.historyDays)

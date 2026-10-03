@@ -25,7 +25,7 @@ struct StrapPAIInfoSheet: View {
                     ForEach(Self.bullets, id: \.self) { Text($0).font(.subheadline) }
                 }
             }
-            .navigationTitle("What PAI is")
+            .navigationTitle("About PAI")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

@@ -138,7 +138,7 @@ struct OnboardingView: View {
     }
 
     private var chooseWearable: some View {
-        page(title: "Your wearable") {
+        page(title: "Your Wearable") {
             headerIcon(Image(keyline: .bluetooth), tint: Theme.accent)
         } content: {
             Text("Which one do you wear? Pick one to see its first steps.")
@@ -152,7 +152,7 @@ struct OnboardingView: View {
     }
 
     private var gettingStarted: some View {
-        page(title: "Getting started") {
+        page(title: "Getting Started") {
             headerIcon(Image(systemName: "1.circle"), tint: .indigo)
         } content: {
             if let note = flow.switchNote(for: pick) {
@@ -185,7 +185,7 @@ struct OnboardingView: View {
     }
 
     private var disclaimer: some View {
-        page(title: "Good to know") {
+        page(title: "Good to Know") {
             headerIcon(Image(systemName: "info.circle"), tint: .orange)
         } content: {
             // The same constant as the About-section disclaimer in UserProfileSettingsView.

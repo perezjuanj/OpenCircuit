@@ -43,7 +43,7 @@ struct FindMyRingView: View {
             lightButton
 
             Text("Distance is a rough Bluetooth estimate — walls, your hand, and how the ring is "
-                 + "turned all affect it. Use “Light up ring” to spot it once you're close.")
+                 + "turned all affect it. Use “Light Up Ring” to spot it once you're close.")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
@@ -73,13 +73,16 @@ struct FindMyRingView: View {
         }
         .frame(width: 200, height: 200)
         .padding(.vertical, 8)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Signal strength")
+        .accessibilityValue("\(Int((fraction * 100).rounded())) percent")
     }
 
     private var lightButton: some View {
         Button {
             session?.setFindRingLight(on: !lightOn)
         } label: {
-            Label(lightOn ? "Turn off light" : "Light up ring",
+            Label(lightOn ? "Turn Off Light" : "Light Up Ring",
                   systemImage: lightOn ? "lightbulb.slash.fill" : "lightbulb.fill")
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6)

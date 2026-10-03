@@ -195,7 +195,7 @@ struct RecentWorkoutsCard: View {
                 // Only ever renders what Health actually holds — a workout with no HR and no energy
                 // shows its duration alone rather than a fabricated "0".
                 if let kcal = item.activeKcal {
-                    Text("\(Int(kcal.rounded())) cal").font(.caption2).foregroundStyle(.secondary)
+                    Text("\(Int(kcal.rounded())) kcal").font(.caption2).foregroundStyle(.secondary)
                 } else if let bpm = item.avgHR {
                     Text("\(bpm) bpm").font(.caption2).foregroundStyle(.secondary)
                 }

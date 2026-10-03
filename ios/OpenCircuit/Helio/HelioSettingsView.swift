@@ -404,7 +404,7 @@ struct HelioAlertsView: View {
     var body: some View {
         HelioSettingsList(connection: connection, group: ZeppConfig.healthGroup, settings: ZeppSetting.alerts,
                           header: HelioSettingsCopy.alertsHeader, footer: HelioSettingsCopy.savedOnStrap)
-            .navigationTitle("Health alerts")
+            .navigationTitle("Health Alerts")
             .navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -417,7 +417,7 @@ struct HelioWorkoutDetectionView: View {
         HelioSettingsList(connection: connection, group: ZeppConfig.workoutGroup, settings: ZeppSetting.workoutDetection,
                           header: HelioSettingsCopy.workoutHeader,
                           footer: HelioSettingsCopy.savedOnStrap + " " + HelioSettingsCopy.workoutSwitchNote)
-            .navigationTitle("Workout detection")
+            .navigationTitle("Workout Detection")
             .navigationBarTitleDisplayMode(.inline)
     }
 }

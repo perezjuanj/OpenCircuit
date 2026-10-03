@@ -46,13 +46,13 @@ struct HealthKitHistoryInspector {
                     MetricCoverage(title: "Skin temperature", nightsWithData: 0,
                                    minimumBaselineNights: Self.minimumBaselineNights,
                                    supportsCurrentBaseline: true),
-                    MetricCoverage(title: "Sleep HR", nightsWithData: 0,
+                    MetricCoverage(title: "Sleep heart rate", nightsWithData: 0,
                                    minimumBaselineNights: Self.minimumBaselineNights,
                                    supportsCurrentBaseline: false),
                     MetricCoverage(title: "Sleep HRV", nightsWithData: 0,
                                    minimumBaselineNights: Self.minimumBaselineNights,
                                    supportsCurrentBaseline: true),
-                    MetricCoverage(title: "Sleep SpO2", nightsWithData: 0,
+                    MetricCoverage(title: "Sleep SpO₂", nightsWithData: 0,
                                    minimumBaselineNights: Self.minimumBaselineNights,
                                    supportsCurrentBaseline: true),
                     MetricCoverage(title: "Sleep respiratory rate", nightsWithData: 0,
@@ -106,13 +106,13 @@ struct HealthKitHistoryInspector {
                 MetricCoverage(title: "Skin temperature", nightsWithData: tempNights,
                                minimumBaselineNights: Self.minimumBaselineNights,
                                supportsCurrentBaseline: true),
-                MetricCoverage(title: "Sleep HR", nightsWithData: hrNights,
+                MetricCoverage(title: "Sleep heart rate", nightsWithData: hrNights,
                                minimumBaselineNights: Self.minimumBaselineNights,
                                supportsCurrentBaseline: false),
                 MetricCoverage(title: "Sleep HRV", nightsWithData: hrvNights,
                                minimumBaselineNights: Self.minimumBaselineNights,
                                supportsCurrentBaseline: true),
-                MetricCoverage(title: "Sleep SpO2", nightsWithData: spo2Nights,
+                MetricCoverage(title: "Sleep SpO₂", nightsWithData: spo2Nights,
                                minimumBaselineNights: Self.minimumBaselineNights,
                                supportsCurrentBaseline: true),
                 MetricCoverage(title: "Sleep respiratory rate", nightsWithData: rrNights,
@@ -127,7 +127,7 @@ struct HealthKitHistoryInspector {
         "Apple Health history can now help Vitals Status baseline-building for skin temperature, overnight HRV and overnight SpO₂.",
         "Apple Health history still can't rebuild OpenCircuit's stage-estimated sleep architecture.",
         "Sleep Score, movement, resting-stage HR and per-stage HR still require your wearable's own overnight data.",
-        "This check is read-only and does not import Apple Health samples into the local store."
+        "This check only reads Apple Health. It doesn't copy anything into OpenCircuit."
     ]
 
     private func fetchNightWindows(from start: Date, to end: Date) async throws -> [NightWindow] {

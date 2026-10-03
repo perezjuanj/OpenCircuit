@@ -56,7 +56,7 @@ final class OnboardingFlowTests: XCTestCase {
         XCTAssertEqual(flow(.ringConn, ring: true, key: true).finish(for: .helioStrap), .setUpStrap,
                        "a key but the ring chosen: the switch is still to make")
         XCTAssertEqual(flow(.helioStrap).finish(for: .helioStrap), .setUpStrap, "the strap chosen but its key forgotten")
-        XCTAssertEqual(OnboardingFlow.Finish.setUpStrap.title, "Set up the strap")
+        XCTAssertEqual(OnboardingFlow.Finish.setUpStrap.title, "Set Up Strap")
     }
 
     func testTheStrapPickedAndSetUpGetsStarted() {
@@ -77,7 +77,7 @@ final class OnboardingFlowTests: XCTestCase {
     func testSetUpLaterAppearsOnlyWhereTheLastPageEndsOnTheStrapsSetup() {
         let fresh = flow()
         XCTAssertEqual(fresh.secondary(on: .finish, pick: .helioStrap), .setUpLater)
-        XCTAssertEqual(OnboardingFlow.Secondary.setUpLater.title, "Set up later")
+        XCTAssertEqual(OnboardingFlow.Secondary.setUpLater.title, "Set Up Later")
         XCTAssertEqual(flow(.ringConn, ring: true, key: true).secondary(on: .finish, pick: .helioStrap), .setUpLater)
         XCTAssertNil(fresh.secondary(on: .finish, pick: .ringConn), "Get Started already finishes")
         XCTAssertNil(fresh.secondary(on: .finish, pick: nil))

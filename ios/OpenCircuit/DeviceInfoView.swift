@@ -53,8 +53,8 @@ struct DeviceInfoView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Firmware version differs from tested build")
                                 .font(.subheadline.weight(.medium))
-                            Text("This app was reverse-engineered on \(FirmwareInfo.pinnedVersion). "
-                                 + "The ring may still work, but some sensor offsets could differ. "
+                            Text("OpenCircuit was tested with firmware \(FirmwareInfo.pinnedVersion). "
+                                 + "The ring may still work, but some readings could differ. "
                                  + "If you see unexpected readings, check for app updates.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
@@ -66,7 +66,7 @@ struct DeviceInfoView: View {
             Section("Firmware") {
                 infoRow("Version",    value: info.version)
                 infoRow("Generation", value: info.generation.rawValue)
-                infoRow("Pinned build", value: FirmwareInfo.pinnedVersion)
+                infoRow("Tested firmware", value: FirmwareInfo.pinnedVersion)
             }
 
             Section("Hardware") {
@@ -77,9 +77,7 @@ struct DeviceInfoView: View {
 
             Section("Connectivity") {
                 infoRow("MAC address", value: info.mac)
-                Text("The MAC address is read from the Device Information Service "
-                     + "(DIS 0x2A23 System ID). CoreBluetooth hides the live MAC on iOS; "
-                     + "this is the only way to recover it without Bluetooth scanning permissions.")
+                Text("Read from the ring itself. iOS doesn't otherwise show a Bluetooth device's address.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -210,7 +208,7 @@ struct DeviceInfoView: View {
                 Button {
                     showRingPicker = true
                 } label: {
-                    Label("Connect a different ring", systemImage: "arrow.left.arrow.right")
+                    Label("Connect a Different Ring", systemImage: "arrow.left.arrow.right")
                 }
             } footer: {
                 Text("Shows other nearby rings so you can switch. Each ring's data merges into one "
@@ -230,7 +228,7 @@ struct DeviceInfoView: View {
                     }
                 } footer: {
                     Text("Stops automatically reconnecting and drops the current link. The ring stays "
-                         + "in your list, so you can reconnect with one tap from “Connect a different ring.”")
+                         + "in your list, so you can reconnect with one tap from “Connect a Different Ring.”")
                 }
             }
 
@@ -244,7 +242,7 @@ struct DeviceInfoView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("OpenCircuit will stop reconnecting to this ring. It stays in your list for a one-tap "
-                 + "reconnect from “Connect a different ring.”")
+                 + "reconnect from “Connect a Different Ring.”")
         }
         .confirmationDialog("Turn on airplane mode?", isPresented: $showAirplaneConfirm,
                             titleVisibility: .visible) {
@@ -519,7 +517,7 @@ private struct RingPickerSheet: View {
                          + "connected to another app. Switching keeps both rings' data in one timeline.")
                 }
             }
-            .navigationTitle("Choose a ring")
+            .navigationTitle("Choose a Ring")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

@@ -42,7 +42,7 @@ struct OnboardingFlow: Equatable {
         var title: String {
             switch self {
             case .getStarted: return "Get Started"
-            case .setUpStrap: return "Set up the strap"
+            case .setUpStrap: return "Set Up Strap"
             }
         }
     }
@@ -57,7 +57,7 @@ struct OnboardingFlow: Equatable {
         var title: String {
             switch self {
             case .skip: return "Skip"
-            case .setUpLater: return "Set up later"
+            case .setUpLater: return "Set Up Later"
             }
         }
     }

@@ -148,7 +148,7 @@ struct StrainInfoSheet: View {
                     }
                 }
             }
-            .navigationTitle("What strain is")
+            .navigationTitle("About Strain")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

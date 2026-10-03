@@ -54,12 +54,12 @@ struct ActivityLogView: View {
         var out: [String] = []
         if session?.firmwareInfo.hasFirmwareMismatch == true {
             out.append("Ring firmware (\(session?.firmwareInfo.version ?? "?")) differs from the "
-                       + "tested build (\(FirmwareInfo.pinnedVersion)). Sensor byte offsets could differ.")
+                       + "tested version (\(FirmwareInfo.pinnedVersion)). Some readings could differ.")
         }
         for anomaly in session?.lastSyncAnomalies ?? [] {
             switch anomaly {
             case .allZeroHRWhileWorn:
-                out.append("Last sync had worn epochs but no valid heart rate decoded — possible format drift.")
+                out.append("The last sync had wear time but no usable heart rate. If this keeps happening, export diagnostics.")
             case .skinTempOutOfPhysicalRange:
                 out.append("Recent skin-temperature readings were outside a plausible range for a sustained run.")
             }
@@ -80,7 +80,7 @@ struct ActivityLogView: View {
             }
 
             if !decodeWarnings.isEmpty {
-                Section("Decode health") {
+                Section("Data Checks") {
                     ForEach(decodeWarnings, id: \.self) { warning in
                         HStack(alignment: .top, spacing: 10) {
                             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -132,13 +132,14 @@ struct ActivityLogView: View {
                 }
             }
         }
-        .navigationTitle("Background activity")
+        .navigationTitle("Background Activity")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button { prepareShare() } label: {
                     Image(systemName: "square.and.arrow.up")
                 }
+                .accessibilityLabel("Export log")
             }
         }
         .sheet(isPresented: $showShare) {

@@ -122,7 +122,7 @@ struct ExportView: View {
                 LabeledContent("Save to", value: folderName ?? "Share sheet")
                 Button("Choose folder…") { showFolderImporter = true }
                 if folderName != nil {
-                    Button("Use share sheet instead", role: .destructive) {
+                    Button("Use share sheet instead") {
                         ExportDestination.forget()
                         folderName = nil
                         statusMessage = nil

@@ -39,7 +39,7 @@ struct HelioAlarmsView: View {
                     Text(footer(editor))
                 }
                 if editor.canEdit, !editor.freeSlots.isEmpty {
-                    Section { Button("Add an alarm") { adding = true } }
+                    Section { Button("Add Alarm") { adding = true } }
                 }
             } else if case .unreadable? = editor?.list {
                 Section {
@@ -61,12 +61,12 @@ struct HelioAlarmsView: View {
             }
         }
         .sheet(item: $editing) { edit in
-            HelioAlarmEditorSheet(title: "Edit alarm", initial: edit.alarm) { edited in
+            HelioAlarmEditorSheet(title: "Edit Alarm", initial: edit.alarm) { edited in
                 session?.replaceAlarm(edited)
             }
         }
         .sheet(isPresented: $adding) {
-            HelioAlarmEditorSheet(title: "New alarm", initial: ZeppAlarm(slot: 0, hour: 7, minute: 0, days: .weekdays)) { new in
+            HelioAlarmEditorSheet(title: "New Alarm", initial: ZeppAlarm(slot: 0, hour: 7, minute: 0, days: .weekdays)) { new in
                 session?.addAlarm(hour: new.hour, minute: new.minute, days: new.days)
             }
         }

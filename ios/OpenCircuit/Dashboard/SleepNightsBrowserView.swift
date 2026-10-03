@@ -66,7 +66,7 @@ struct SleepNightsBrowserView: View {
             .containerRelativeFrame(.horizontal)
         }
         .background(Theme.pageBackground)
-        .navigationTitle("Past nights")
+        .navigationTitle("Past Nights")
         .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -149,7 +149,7 @@ private struct NightDetail: View {
                 } else {
                     SleepHypnogramChart(segments: segs)
                     if segs.contains(where: { $0.provenance != .measured }) {
-                        Text("Faded blocks are time you entered when editing this night, not something the ring measured.")
+                        Text("Faded blocks are time you entered when editing this night, not something your device measured.")
                             .font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }

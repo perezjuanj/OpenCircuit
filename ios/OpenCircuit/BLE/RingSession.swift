@@ -4547,7 +4547,7 @@ final class RingSession: NSObject {
             print("[OC] sync FINALIZE records=0 (ring empty)")
             syncStatus = steps != nil
                 ? "Up to date — last night is likely already in the vitals dashboard. The ring clears history after each sync, so nothing new to fetch."
-                : "No data received — is the ring bonded/awake?"
+                : "No data received — make sure the ring is on your finger and nearby."
             recordHistorySyncEvidence(nightRow: nil)
         } else {
             commitDrainedRecords()
@@ -4566,11 +4566,11 @@ final class RingSession: NSObject {
             // and suppressing it would also have to suppress the `.noAck`-derived half of the same
             // case, which is a real fault. Cosmetic either way — nothing reads `syncStatus`.
             if let sleepOutcome, sleepOutcome != .complete, sleepOutcome != .empty {
-                syncStatus = "Partial sync — sleep channel \(sleepOutcome.rawValue); raw data kept for retry"
+                syncStatus = "Partial sync — the rest will be fetched next time"
             } else if wireRecords > 0 {
-                syncStatus = "Synced \(wireRecords) epochs"
+                syncStatus = "Synced"
             } else {
-                syncStatus = "Up to date — recovered \(self.rehydratedCounters.count) stored epochs"
+                syncStatus = "Up to date"
             }
         }
         syncing = false

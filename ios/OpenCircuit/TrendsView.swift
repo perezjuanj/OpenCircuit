@@ -90,7 +90,7 @@ struct TrendsView: View {
     private var availableMetricsNote: some View {
         HStack(spacing: 6) {
             Image(systemName: "info.circle").foregroundStyle(.secondary)
-            Text("All-day vitals use every worn epoch. Each day shows its four goal rings — tap for "
+            Text("All-day vitals use all the time you wore your device. Each day shows its four goal rings — tap for "
                  + "a time-of-day breakdown.")
                 .font(.caption2).foregroundStyle(.secondary)
         }

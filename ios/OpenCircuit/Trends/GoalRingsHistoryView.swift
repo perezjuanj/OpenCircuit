@@ -134,7 +134,7 @@ struct GoalRingsHistorySection: View {
             streakRow
             strip
             if let day = selectedDay { breakdown(day) }
-            Text("Rings are scored against your CURRENT goals (weekday/weekend split follows each "
+            Text("Rings are scored against your current goals (weekday/weekend split follows each "
                  + "day's own date) — earlier goal settings were never stored, so changing a goal "
                  + "re-scores this history. A dashed ring means that metric has no retained data "
                  + "for that day; it is not counted as a missed goal. Active calories and elevated-"

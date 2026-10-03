@@ -132,7 +132,7 @@ struct WellnessBalanceCardView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 Image(systemName: "heart.circle.fill").foregroundStyle(.pink)
-                Text("READINESS").font(.caption.weight(.semibold)).tracking(1.2).foregroundStyle(.secondary)
+                Text("READINESS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             }
             // Ring beside the details; stacked at accessibility text sizes so nothing truncates.
             let layout = dynamicTypeSize.isAccessibilitySize

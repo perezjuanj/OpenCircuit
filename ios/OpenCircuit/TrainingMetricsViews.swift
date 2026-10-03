@@ -40,7 +40,7 @@ struct WorkoutTrainingMetricsSection: View {
                   value: load.map { "\(Int($0.rounded()))" } ?? "--",
                   caption: load == nil
                       ? "No heart rate was recorded, so this workout has no training load."
-                      : "Edwards TRIMP: minutes in each heart-rate zone times the zone number (1 to 5). Minutes without a heart-rate reading add nothing.")
+                      : "Minutes in each heart-rate zone times the zone number (1 to 5). Minutes without a heart-rate reading add nothing.")
     }
 
     @ViewBuilder

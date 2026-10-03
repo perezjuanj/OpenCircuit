@@ -5,7 +5,7 @@ struct HistoricalHealthCheckView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Found \(report.nightsFound) Apple Health sleep nights in the last \(report.lookbackDays) days.")
+            Text("Found \(report.nightsFound) nights of sleep in Apple Health from the last \(report.lookbackDays) days.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

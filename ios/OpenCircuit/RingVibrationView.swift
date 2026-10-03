@@ -109,7 +109,7 @@ struct RingVibrationView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(day.label)
-                    .accessibilityValue(on ? "on" : "off")
+                    .accessibilityAddTraits(on ? .isSelected : [])
                 }
             }
             .padding(.vertical, 2)
@@ -180,7 +180,7 @@ struct RingVibrationView: View {
                 testFailed = failure != nil
                 testMessage = failure ?? "Sent. You should feel the ring buzz now."
             } label: {
-                Label("Buzz the ring now", systemImage: "waveform")
+                Label("Buzz Ring Now", systemImage: "waveform")
             }
             .disabled(session?.ready != true)
             if let testMessage {

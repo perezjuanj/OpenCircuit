@@ -106,8 +106,8 @@ struct HelioSetupView: View {
                             connection.connect()
                         }
                     }
-                    Button("Replace key") { editingKey = true; keyText = "" }
-                    Button("Forget key", role: .destructive) { confirmForget = true }
+                    Button("Replace Key") { editingKey = true; keyText = "" }
+                    Button("Forget Key", role: .destructive) { confirmForget = true }
                 } else {
                     SecureField("32 characters, 0–9 and a–f", text: $keyText)
                         .textInputAutocapitalization(.never)
@@ -151,7 +151,7 @@ struct HelioSetupView: View {
         .navigationTitle("Amazfit Helio Strap")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("Forget the key?", isPresented: $confirmForget, titleVisibility: .visible) {
-            Button("Forget key", role: .destructive) {
+            Button("Forget Key", role: .destructive) {
                 HelioKeyStore.shared.forget()
                 refreshKeyState()
                 if choice.isHelio { connection.reconnectNow() }

@@ -167,7 +167,7 @@ struct WorkoutView: View {
             // Best-effort HR note (#45)
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "info.circle").foregroundStyle(.secondary)
-                Text("Live heart rate during workouts is best-effort (on-demand polling, no background refresh). HR gaps will be shown honestly — data is never fabricated.")
+                Text("Live heart rate is best-effort. Any gaps are shown as gaps — nothing is filled in.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(10)
@@ -247,7 +247,7 @@ struct WorkoutView: View {
 
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "info.circle").foregroundStyle(.secondary)
-                    Text("Activity type is a suggestion from cadence, not a decoded firmware label. No GPS route is available for a workout recognized after it ended.")
+                    Text("The activity type is suggested from your step rate, so check it before saving. No GPS route is available for a workout recognized after it ended.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -400,7 +400,7 @@ struct WorkoutView: View {
             }
 
             // #45 disclaimer
-            Text("Live HR is best-effort (polling, no background refresh). Gaps are shown honestly.")
+            Text("Live heart rate is best-effort; gaps are shown as gaps.")
                 .font(.caption2).foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
@@ -489,7 +489,7 @@ struct WorkoutView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     if summary.hrSampleCount < 30 {
                         noteRow(icon: "exclamationmark.triangle", color: .orange,
-                                text: "Few HR readings captured (\(summary.hrSampleCount)). Live HR polling is best-effort — the ring may have missed updates.")
+                                text: "Few HR readings captured (\(summary.hrSampleCount)). Live heart rate is best-effort — the ring may have missed updates.")
                     }
                     if summary.estimatedActiveKcal != nil {
                         // Label the ACTUAL source: an HR-based energy estimate when HR was captured,
@@ -505,7 +505,7 @@ struct WorkoutView: View {
                                 text: "GPS route captured and saved to Apple Health.")
                     } else if summary.sport.isOutdoor {
                         noteRow(icon: "location.slash", color: .secondary,
-                                text: "No GPS route (location permission not granted or denied).")
+                                text: "No GPS route — location access is off for OpenCircuit.")
                     }
                     noteRow(icon: "checkmark.circle", color: .green,
                             text: "Workout saved to Apple Health.")

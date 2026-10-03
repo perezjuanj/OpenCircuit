@@ -479,10 +479,7 @@ struct SleepCardView: View {
                 emptyState
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding()
-        .background(RoundedRectangle(cornerRadius: Theme.cardCornerRadius)
-            .fill(Color(.secondarySystemGroupedBackground)))
+        .ocCardSurface()
         // Bedtime provenance (#198). Recomputed off the render path — two fetchLimit-1 reads, but
         // `body` runs on every @Query invalidation and a store read there is how #14's black-screen
         // launch happened. Keyed on the edge itself, so it re-runs only when the night changes.

@@ -213,6 +213,7 @@ struct CycleCalendarView: View {
                 } label: {
                     Image(systemName: "chevron.left")
                 }
+                .accessibilityLabel("Previous month")
                 Spacer()
                 Text(monthTitle).font(.headline)
                 Spacer()
@@ -221,6 +222,7 @@ struct CycleCalendarView: View {
                 } label: {
                     Image(systemName: "chevron.right")
                 }
+                .accessibilityLabel("Next month")
             }
 
             // Day-of-week header
@@ -244,9 +246,7 @@ struct CycleCalendarView: View {
 
             legendRow
         }
-        .padding()
-        .background(RoundedRectangle(cornerRadius: 16)
-            .fill(Color(.secondarySystemGroupedBackground)))
+        .ocCardSurface()
     }
 
     private func dayTile(_ date: Date) -> some View {
@@ -323,7 +323,7 @@ struct CycleCalendarView: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 6) {
                     Image(systemName: "chart.xyaxis.line").foregroundStyle(.purple)
-                    Text("CYCLE PREDICTION (ESTIMATE)")
+                    Text("CYCLE PREDICTION")
                         .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 }
 
@@ -350,12 +350,10 @@ struct CycleCalendarView: View {
                         .fill(Color.orange.opacity(0.1)))
                 }
 
-                Text("Based on \(Int(p.avgCycleLengthDays.rounded()))-day average from \(predictorEntries.count) logged period(s).")
+                Text("Based on \(Int(p.avgCycleLengthDays.rounded()))-day average from \(predictorEntries.count) logged period\(predictorEntries.count == 1 ? "" : "s").")
                     .font(.caption2).foregroundStyle(.secondary)
             }
-            .padding()
-            .background(RoundedRectangle(cornerRadius: 16)
-                .fill(Color(.secondarySystemGroupedBackground)))
+            .ocCardSurface()
         } else {
             noPredictionCard
         }
@@ -368,9 +366,7 @@ struct CycleCalendarView: View {
                 .font(.subheadline).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding()
-        .background(RoundedRectangle(cornerRadius: 16)
-            .fill(Color(.secondarySystemGroupedBackground)))
+        .ocCardSurface()
     }
 
     private func predictionRow(_ label: String, value: String, note: String) -> some View {
@@ -403,9 +399,7 @@ struct CycleCalendarView: View {
                     periodRow(entry)
                 }
             }
-            .padding()
-            .background(RoundedRectangle(cornerRadius: 16)
-                .fill(Color(.secondarySystemGroupedBackground)))
+            .ocCardSurface()
         }
     }
 
@@ -474,6 +468,7 @@ struct CycleCalendarView: View {
             } label: {
                 Image(systemName: "pencil").foregroundStyle(.secondary)
             }
+            .accessibilityLabel("Edit period")
             // Delete button — also removes the previously-written Apple Health sample(s) so a
             // deleted period doesn't leave an orphaned menstrual-flow entry in Health.
             Button(role: .destructive) {
@@ -485,6 +480,7 @@ struct CycleCalendarView: View {
             } label: {
                 Image(systemName: "trash").foregroundStyle(.red.opacity(0.8))
             }
+            .accessibilityLabel("Delete period")
         }
         .padding(.vertical, 2)
     }

@@ -441,13 +441,13 @@ struct ContentView: View {
                 }
             }
             // Crash-orphan recovery: a workout the previous process was running when it died.
-            .alert("Interrupted workout", isPresented: Binding(
+            .alert("Interrupted Workout", isPresented: Binding(
                 get: { recoverableWorkout != nil },
                 set: { if !$0 { recoverableWorkout = nil } })
             ) {
                 Button("Save to Health") { saveRecoverableWorkout() }
                 Button("Discard", role: .destructive) { discardRecoverableWorkout() }
-                Button("Not now", role: .cancel) { recoverableWorkout = nil }
+                Button("Not Now", role: .cancel) { recoverableWorkout = nil }
             } message: {
                 if let recoverableWorkout { Text(recoveryMessage(recoverableWorkout)) }
             }
@@ -769,7 +769,7 @@ struct ContentView: View {
                                 Spacer()
                                 Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
                             }
-                            Text("Sync history, background-task runs, and the Health-write log")
+                            Text("Sync history and Apple Health activity")
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                     }
@@ -1575,7 +1575,7 @@ struct ContentView: View {
                     // reconnect has stalled, relabel it "Stop reconnecting" to match the calmer status.
                     HStack {
                         Spacer()
-                        Button(scanner.reconnectStalled ? "Stop reconnecting" : "Cancel") {
+                        Button(scanner.reconnectStalled ? "Stop Reconnecting" : "Cancel") {
                             scanner.forgetActiveRing()
                         }.font(.subheadline)
                     }
@@ -1591,11 +1591,11 @@ struct ContentView: View {
         }
         // iOS exposes no programmatic Bluetooth toggle, so the "Turn on Bluetooth" control explains
         // where to enable it and (optionally) deep-links to Settings, rather than doing nothing (#134).
-        .alert("Bluetooth is off", isPresented: $showBluetoothOffAlert) {
+        .alert("Bluetooth Is Off", isPresented: $showBluetoothOffAlert) {
             Button("Open Settings") { openURL(Self.settingsURL) }
             Button("OK", role: .cancel) {}
         } message: {
-            Text("Turn Bluetooth on in Control Center or Settings, then tap Scan & connect.")
+            Text("Turn Bluetooth on in Control Center or Settings, then tap Scan & Connect.")
         }
     }
 
@@ -1615,7 +1615,7 @@ struct ContentView: View {
             Button {
                 showBluetoothOffAlert = true
             } label: {
-                Label("Turn on Bluetooth", systemImage: "dot.radiowaves.left.and.right")
+                Label("Turn On Bluetooth", systemImage: "dot.radiowaves.left.and.right")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -1628,7 +1628,7 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                Text("OpenCircuit needs Bluetooth to find your ring. Enable it in Settings ▸ OpenCircuit ▸ Bluetooth, then come back and tap Scan & connect.")
+                Text("OpenCircuit needs Bluetooth to find your ring. Enable it in Settings ▸ OpenCircuit ▸ Bluetooth, then come back and tap Scan & Connect.")
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1641,7 +1641,7 @@ struct ContentView: View {
         Button {
             scanner.start()
         } label: {
-            Label("Scan & connect", systemImage: "dot.radiowaves.left.and.right")
+            Label("Scan & Connect", systemImage: "dot.radiowaves.left.and.right")
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
@@ -1657,7 +1657,7 @@ struct ContentView: View {
             Text("No ring found").font(.subheadline.weight(.medium))
             VStack(alignment: .leading, spacing: 4) {
                 noRingHint("Take the ring out of its charging case and put it on.")
-                noRingHint("Close the official RingConn app — it can hold the Bluetooth connection (only one app can pull the ring).")
+                noRingHint("Close the official RingConn app — it can hold the Bluetooth connection (only one app can connect to the ring at a time).")
                 noRingHint("Keep the ring within a few feet of your phone.")
                 if scanner.hasSavedRing {
                     noRingHint("A ring you’ve paired before reconnects automatically once it’s back in range.")
@@ -1666,7 +1666,7 @@ struct ContentView: View {
             Button {
                 scanner.start()
             } label: {
-                Label("Search again", systemImage: "arrow.clockwise")
+                Label("Search Again", systemImage: "arrow.clockwise")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -1756,7 +1756,7 @@ struct ContentView: View {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Ring isn't streaming").font(.subheadline.weight(.medium))
-                Text("Connected, but the ring hasn't sent data yet. Check that it's on your finger and off the charger, and fully close the official RingConn app if it's running — only one app can pull the ring at a time. This often clears on the next reconnect.")
+                Text("Connected, but the ring hasn't sent data yet. Check that it's on your finger and off the charger, and fully close the official RingConn app if it's running — only one app can connect to the ring at a time. This often clears on the next reconnect.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -1776,7 +1776,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Text(onCharger
                  ? "Ring is on the charger — auto-measure paused"
-                 : "Ring looks off-wrist (estimated) — auto-measure paused")
+                 : "Ring may not be on your finger — auto-measure paused")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1952,7 +1952,7 @@ struct ContentView: View {
                     Label("\(count) workout\(count == 1 ? "" : "s") ready to review", systemImage: "sparkles")
                         .font(.subheadline.weight(.semibold)).foregroundStyle(.blue)
                 } else {
-                    Text("Record a workout with HR zones + GPS route (outdoor)")
+                    Text("Record a workout with heart-rate zones and an outdoor GPS route")
                         .font(.subheadline).foregroundStyle(.secondary)
                 }
             }
@@ -2041,7 +2041,7 @@ struct ContentView: View {
             HStack(spacing: 16) {
                 freshnessStat("Last sync", lastSyncAt)
                 Divider().frame(height: 30)
-                freshnessStat("Health write", lastHealthWriteAt)
+                freshnessStat("Saved to Health", lastHealthWriteAt)
                 Spacer()
                 Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
             }
@@ -2052,7 +2052,7 @@ struct ContentView: View {
     private func freshnessStat(_ label: String, _ date: Date?) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label).font(.caption2).foregroundStyle(.secondary)
-            Text(date.map { Self.rel.localizedString(for: $0, relativeTo: Date()) } ?? "never")
+            Text(date.map { Self.rel.localizedString(for: $0, relativeTo: Date()) } ?? "Never")
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(date == nil ? .secondary : .primary)
         }
@@ -2061,7 +2061,7 @@ struct ContentView: View {
     private var syncCard: some View {
         card {
             HStack {
-                Text("History & sleep").font(.headline)
+                Text("History & Sleep").font(.headline)
                 Spacer()
                 if session?.syncing == true { ProgressView() }
             }
@@ -2072,7 +2072,7 @@ struct ContentView: View {
             Button {
                 session?.syncHistory(manual: true)   // user-initiated: drains both channels (0x00 sleep + 0x03 all-day), bypasses overnight-quiet gate
             } label: {
-                Label(session?.syncing == true ? "Syncing…" : "Sync from ring",
+                Label(session?.syncing == true ? "Syncing…" : "Sync from Ring",
                       systemImage: "arrow.triangle.2.circlepath")
                     .frame(maxWidth: .infinity)
             }
@@ -2142,7 +2142,7 @@ struct ContentView: View {
 #endif
 
             if session?.monitoring == true {
-                Text("Stop live HR/SpO₂ before syncing.").font(.caption2).foregroundStyle(.secondary)
+                Text("Stop the live reading before syncing.").font(.caption2).foregroundStyle(.secondary)
             }
 #if DEBUG
             // #152: the calibration/BP block is a developer tool — it talks to the localhost desktop
@@ -2350,8 +2350,7 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .disabled(!HealthKitWriter.isAvailable)
             if healthUnavailable {
-                Text("This build can't write to Apple Health — that needs the TestFlight build. "
-                     + "(Free side-loaded builds can't use HealthKit.) OpenCircuit still works "
+                Text("Apple Health isn't available on this device or build. OpenCircuit still works "
                      + "as a local dashboard.")
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -2576,7 +2575,7 @@ struct ContentView: View {
                     observability.recordHealthWrite()
                     refreshObservability()
                     lastWrite = "Synced to Health: \(r.samples) samples"
-                        + (r.sleepSegments > 0 ? ", \(r.sleepSegments) sleep segs" : "")
+                        + (r.sleepSegments > 0 ? ", \(r.sleepSegments) sleep segments" : "")
                         + (r.steps > 0 ? ", \(r.steps) steps" : "")
                 }
             }
@@ -2620,13 +2619,13 @@ struct ContentView: View {
                     + (r.naps > 0 ? " naps=\(r.naps)" : "")
                 print("[OC] healthKit WROTE \(summary)")
                 lastWrite = "Synced to Health: \(r.samples) samples"
-                    + (r.sleepSegments > 0 ? ", \(r.sleepSegments) sleep segs" : "")
+                    + (r.sleepSegments > 0 ? ", \(r.sleepSegments) sleep segments" : "")
                     + (r.steps > 0 ? ", \(r.steps) steps" : "")
                     + (r.distanceM > 0 ? ", \(Int(r.distanceM.rounded()))m est." : "")
                     + (r.restingDays > 0 ? ", \(r.restingDays) resting HR" : "")
-                    + (r.passiveHours > 0 ? ", \(r.passiveHours)h basal" : "")
+                    + (r.passiveHours > 0 ? ", \(r.passiveHours)h resting energy" : "")
                     + (r.activeKcal > 0 ? ", \(Int(r.activeKcal.rounded())) active kcal" : "")
-                    + (r.exerciseMinutes > 0 ? ", \(Int(r.exerciseMinutes.rounded()))min exercise est." : "")
+                    + (r.exerciseMinutes > 0 ? ", \(Int(r.exerciseMinutes.rounded())) min exercise (est.)" : "")
                     + (r.naps > 0 ? ", \(r.naps) nap\(r.naps == 1 ? "" : "s")" : "")
             } else {
                 print("[OC] healthKit flush: nothing new to write (authorized=\(health.isShareAuthorized))")
@@ -2862,10 +2861,10 @@ struct CaloriesCardView: View {
                     .monospacedDigit().contentTransition(.numericText())
                 Text("kcal today").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
             }
-            Text("resting \(Int(restingToday.rounded())) · active est. \(Int(cachedActiveKcal.rounded()))")
+            Text("Resting \(Int(restingToday.rounded())) · Active (est.) \(Int(cachedActiveKcal.rounded()))")
                 .font(.caption).foregroundStyle(.secondary)
             // "max HR" here is the 220-age zone/calorie reference, NOT an observed peak.
-            Text("BMR \(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day · est. max HR \(maxHR) bpm (220-age)")
+            Text("BMR \(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day · est. max HR \(maxHR) bpm (220 − age)")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

@@ -18,13 +18,13 @@ struct SleepFocusSyncSetupView: View {
                         .foregroundStyle(.indigo)
                 }
                 Text("After this one-time setup, turning off Sleep Focus starts a short history "
-                     + "sync from your device and Apple Health flush. Your other automatic syncs continue "
+                     + "sync from your device and saves it to Apple Health. Your other automatic syncs continue "
                      + "to work as before.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Set up once") {
+            Section("Set Up Once") {
                 setupStep(
                     number: 1,
                     title: "Open iOS Settings",

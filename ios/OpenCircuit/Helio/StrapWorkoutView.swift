@@ -297,7 +297,7 @@ struct StrapWorkoutView: View {
                     if summary.hasRoute {
                         noteRow("location.fill", .blue, saved ? "GPS route captured and saved to Apple Health." : "GPS route captured.")
                     } else if summary.sport.isOutdoor {
-                        noteRow("location.slash", .secondary, "No GPS route (location permission not granted or denied).")
+                        noteRow("location.slash", .secondary, "No GPS route — location access is off for OpenCircuit.")
                     }
                     if saved {
                         noteRow("checkmark.circle", .green, "Workout saved to Apple Health.")
@@ -416,7 +416,7 @@ struct StrapWorkoutHooks: ViewModifier {
                     }
                 }
                 Button("Discard", role: .destructive) { recorder.discardRecovered() }
-                Button("Not now", role: .cancel) { recorder.postponeRecovered() }
+                Button("Not Now", role: .cancel) { recorder.postponeRecovered() }
             } message: {
                 if let recovered = recorder.recoverable { Text(Self.message(recovered)) }
             }

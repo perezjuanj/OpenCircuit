@@ -86,8 +86,8 @@ struct HelioDeviceInfoView: View {
                 if let warnings = session?.recordingWarnings, !warnings.isEmpty {
                     ForEach(warnings, id: \.self) { Text($0).font(.caption).foregroundStyle(.orange) }
                 }
-                NavigationLink("Health alerts") { HelioAlertsView(connection: connection) }
-                NavigationLink("Workout detection") { HelioWorkoutDetectionView(connection: connection) }
+                NavigationLink("Health Alerts") { HelioAlertsView(connection: connection) }
+                NavigationLink("Workout Detection") { HelioWorkoutDetectionView(connection: connection) }
             } header: {
                 Text("Strap settings")
             } footer: {

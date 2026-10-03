@@ -160,7 +160,7 @@ struct HeadacheCardView: View {
                 pendingOnset = nil          // a plain log opens on NOW, never on the prompt's day
                 showLogSheet = true
             } label: {
-                Label("Log a headache", systemImage: "plus.circle.fill")
+                Label("Log a Headache", systemImage: "plus.circle.fill")
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
             }
@@ -273,14 +273,14 @@ struct HeadacheCardView: View {
                     .font(.caption).foregroundStyle(.secondary)
 
                 HStack(spacing: 12) {
-                    Button("Log it") {
+                    Button("Log It") {
                         pendingOnset = yesterdayPrefillOnset
                         showLogSheet = true
                     }
                     .buttonStyle(.borderless)
                     .accessibilityLabel("Log a headache for \(promptDayName)")
 
-                    Button("Nothing to log") {
+                    Button("Nothing to Log") {
                         promptDismissedDay = promptDayKey
                     }
                     .buttonStyle(.borderless)
@@ -429,7 +429,7 @@ struct HeadacheCardView: View {
     /// history either way — from our own button or from the dashboard's wrapper.
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            OCSectionHeader("Headache log", systemImage: "brain.head.profile",
+            OCSectionHeader("Headache Log", systemImage: "brain.head.profile",
                             tint: Theme.accent) {
                 Image(systemName: "chevron.right")
                     .font(.caption).foregroundStyle(.tertiary)
@@ -526,7 +526,7 @@ struct HeadacheImportControl: View {
                     .disabled(running)
 
                     if oneTimePrompt, outcome == nil {
-                        Button("Not now") { importPromptShown = true }
+                        Button("Not Now") { importPromptShown = true }
                             .buttonStyle(.borderless)
                             .foregroundStyle(.secondary)
                     }

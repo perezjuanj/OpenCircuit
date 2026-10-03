@@ -202,7 +202,7 @@ struct HeadacheLogSheet: View {
 
                 if let editing, let onDelete {
                     Section {
-                        Button("Delete this entry", role: .destructive) {
+                        Button("Delete Entry", role: .destructive) {
                             onDelete(editing.onset)
                             dismiss()
                         }

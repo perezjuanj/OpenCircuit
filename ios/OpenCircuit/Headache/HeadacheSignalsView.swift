@@ -131,7 +131,7 @@ struct HeadacheSignalsView: View {
                     editingEntry = nil
                     showLogSheet = true
                 } label: {
-                    Label("Log a headache", systemImage: "plus")
+                    Label("Log a Headache", systemImage: "plus")
                 }
             }
         }
@@ -297,9 +297,9 @@ struct HeadacheSignalsView: View {
     /// Three different facts, three different sentences: the night re-staged under the score, the
     /// score can no longer be reproduced at all, or it reproduces to a different number.
     private func driftLine(_ recorded: FrozenDay, reproduced: Int?) -> String {
-        let lead = "Recorded for today: index \(recorded.index). That frozen number is the one of record"
+        let lead = "Recorded for today: index \(recorded.index). That saved number is the official one"
         if recorded.restaged {
-            return "\(lead) — last night re-staged after it was taken, so everything else here is a fresh reading that no longer reproduces it."
+            return "\(lead) — last night's sleep stages were recalculated after it was saved, so everything else here is a fresh reading that no longer reproduces it."
         }
         if reproduced == nil {
             return "\(lead); it can no longer be reproduced from what is stored today, so the rest of this section describes today's data instead of that score."
@@ -413,7 +413,7 @@ struct HeadacheSignalsView: View {
                         .font(.caption2).foregroundStyle(.tertiary)
                 }
                 if feature == .perimenstrual {
-                    Text("Context, not a measurement: its weight is added on top of the eight measured signals rather than taken from them, it never counts toward the minimum number of measured signals, and no single signal may supply more than 35 % of a night's score.")
+                    Text("Context, not a measurement: its weight is added on top of the eight measured signals rather than taken from them, it never counts toward the minimum number of measured signals, and no single signal may supply more than 35% of a night's score.")
                         .font(.caption2).foregroundStyle(.tertiary)
                 }
             } else if let reason {
@@ -538,7 +538,7 @@ struct HeadacheSignalsView: View {
             // back on, and a button that pre-empts the 21-night floor would switch on an alert that
             // structurally cannot fire (`HeadacheSignals.band` has no percentile window yet).
             if !alertsLive, promotedOnDayKey != 0 {
-                Button("Turn morning alerts back on") {
+                Button("Turn Morning Alerts Back On") {
                     HeadacheEngine().resumeAlerts()
                 }
                 .buttonStyle(.borderless)
@@ -570,7 +570,7 @@ struct HeadacheSignalsView: View {
                     editingEntry = nil
                     showLogSheet = true
                 } label: {
-                    Label("Log a headache", systemImage: "plus.circle.fill")
+                    Label("Log a Headache", systemImage: "plus.circle.fill")
                         .font(.subheadline.weight(.semibold))
                 }
                 .buttonStyle(.borderless)
@@ -666,7 +666,7 @@ struct HeadacheSignalsView: View {
                     Text("Scored after this had already started, so it isn't evidence either way.")
                         .font(.caption2).foregroundStyle(.tertiary)
                 } else if day.restaged {
-                    Text("That night re-staged after the score was frozen, so this day is left out of any accuracy check.")
+                    Text("That night's sleep stages were recalculated after the score was saved, so this day is left out of any accuracy check.")
                         .font(.caption2).foregroundStyle(.tertiary)
                 }
             }
@@ -1270,7 +1270,7 @@ enum HeadacheMonitorCopy {
             out.append("\(count(m.excludedInProgress, "morning was", "mornings were")) scored while a headache was already under way. Those can't count either way — we didn't predict something that had already started.")
         }
         if m.excludedRestaged > 0 {
-            out.append("\(count(m.excludedRestaged, "morning", "mornings")) had the night re-staged after the score was frozen, so the score no longer describes the night that was kept.")
+            out.append("\(count(m.excludedRestaged, "morning", "mornings")) had their sleep stages recalculated after the score was saved, so the score no longer describes the night that was kept.")
         }
         if m.excludedUnresolved > 0 {
             out.append("\(count(m.excludedUnresolved, "scored morning is", "scored mornings are")) still too recent — the day after them isn't over yet.")
