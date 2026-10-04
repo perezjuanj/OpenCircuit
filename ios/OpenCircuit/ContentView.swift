@@ -43,7 +43,6 @@ struct ContentView: View {
     /// control (#134). iOS offers no programmatic BT toggle, so we explain + optionally deep-link
     /// to Settings rather than a silent no-op.
     @State private var showBluetoothOffAlert = false
-    @State private var showDebug = false
     @State private var showWorkout = false
     /// THE running workout, owned here for the app's whole lifetime and handed to `WorkoutView`.
     ///
@@ -425,7 +424,7 @@ struct ContentView: View {
             }
             // Probe/raw-capture share sheet — hoisted to the TabView so it presents regardless of which
             // tab triggered it (the DEBUG "Share raw history capture" button lives in the Today sync
-            // card, while the activity-probe share lives in the Profile debug card).
+            // card, while the activity probe now lives in Background Activity and uses that screen's own sheet).
             .sheet(isPresented: $showProbeShareSheet) {
                 if let url = probeExportURL { ShareActivityView(url: url) }
             }
@@ -776,9 +775,6 @@ struct ContentView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    // Ring RE tools (last frame, activity-channel probe): ring only (#215).
-                    // Store builds: hidden until unlocked from the version line below (DeveloperTools).
-                    if ringActive && DeveloperTools.isVisible(unlocked: developerToolsUnlocked) { debugCard }
                     brandFooter
                 }
                 .padding()
@@ -2470,66 +2466,6 @@ struct ContentView: View {
     }
 
     // MARK: Debug
-
-    private var debugCard: some View {
-        card {
-            DisclosureGroup(isExpanded: $showDebug) {
-                VStack(alignment: .leading, spacing: 12) {
-                    // Per-channel epochs from the last sync — `all-day N` with N>0 proves the 0x03
-                    // (daytime SpO₂/HR) channel is being drained, not just sleep (#99).
-                    if let drain = session?.lastDrainSummary {
-                        Text("Last sync — \(drain)")
-                            .font(.caption.monospaced().weight(.medium))
-                            .foregroundStyle(.primary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, 4)
-                        Divider()
-                    }
-                    Text(session?.lastFrame ?? "no frames yet")
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    activityProbeRow
-                }
-            } label: {
-                Text("Debug — last sync & frame").font(.subheadline.weight(.medium))
-            }
-        }
-        // (The $showProbeShareSheet sheet is hoisted to the TabView so it presents from any tab.)
-    }
-
-    /// RE tool (issue #93): sweep untried sync-open `byte[6]` channels looking for the
-    /// undecoded per-day activity/step history stream, then export every captured raw frame
-    /// for offline decoding (`desktop/decode_activity.py`). See `RingSession.probeActivityChannels`.
-    @ViewBuilder
-    private var activityProbeRow: some View {
-        Divider()
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Activity-channel probe (RE tool, #93)")
-                .font(.caption.weight(.medium))
-            Text("Looks for the per-day step/activity history stream. Take a walk first so there's "
-                 + "motion to find, then run this and share the capture for decoding.")
-                .font(.caption2).foregroundStyle(.secondary)
-            HStack {
-                Button(session?.probing == true ? "Probing…" : "Run probe") {
-                    session?.probeActivityChannels()
-                }
-                .font(.caption)
-                .disabled(session?.ready != true || session?.probing == true
-                          || session?.syncing == true || session?.monitoring == true)
-                if session?.probing == true { ProgressView().controlSize(.small) }
-                Spacer()
-                if let log = session?.rawCaptureLog, !log.isEmpty, session?.probing != true {
-                    Button("Share capture") { shareProbeCapture(log) }
-                        .font(.caption)
-                }
-            }
-            if let status = session?.probeStatus {
-                Text(status).font(.caption2).foregroundStyle(.secondary)
-            }
-        }
-    }
 
     /// Write the probe's captured raw frames to a temp file and present the share sheet — same
     /// pattern as `ExportView.runExport`, just for the RE capture instead of stored samples.

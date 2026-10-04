@@ -1,6 +1,7 @@
 import Foundation
 
-/// Whether the ring reverse-engineering surfaces (Profile's "Debug — last sync & frame" card and its
+/// Whether the ring reverse-engineering surfaces (the "Ring Debug" section at the bottom of
+/// Background Activity: last sync & frame and the
 /// activity-channel probe) are shown.
 ///
 /// App Store readiness: a store build must not greet every user, or App Review, with raw hex frames
