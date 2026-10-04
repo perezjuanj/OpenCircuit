@@ -33,6 +33,8 @@ struct ActivityLogView: View {
     @State private var refreshStatus: UIBackgroundRefreshStatus = .available
     @State private var period: LogPeriod = .week
     @State private var shareItem: URL?
+    // Release builds show the ring RE tools only once unlocked from Profile's version line.
+    @AppStorage(DeveloperTools.unlockedKey) private var developerToolsUnlocked = false
     @State private var showShare = false
 
     private var filteredRecords: [TaskRecord] {
@@ -129,6 +131,15 @@ struct ActivityLogView: View {
                     ForEach(filteredMetricRecords.reversed()) { record in
                         metricRecordRow(record)
                     }
+                }
+            }
+
+            // Ring RE tools (last frame, activity-channel probe): ring only, and hidden in store
+            // builds until unlocked (DeveloperTools). Moved here from the Profile tab.
+            if let session, DeveloperTools.isVisible(unlocked: developerToolsUnlocked) {
+                RingDebugToolsSection(session: session) { url in
+                    shareItem = url
+                    showShare = true
                 }
             }
         }

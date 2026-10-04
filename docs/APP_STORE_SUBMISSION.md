@@ -33,6 +33,8 @@ archive and upload mechanics; this file covers review.
   show it; store and TestFlight builds show it after **7 taps on the version line** at the
   bottom of Profile (7 more hide it). A TestFlight-only check can't be used, because App
   Review runs builds with the same sandbox receipt. Tell TestFlight testers about the taps.
+  Once unlocked, the tools appear as a "Ring Debug" section at the bottom of Profile ▸
+  Background Activity, not on Profile itself (UI sweep, owner decision 2026-10-03).
 - **"Sleep apnea assessment" renamed** to "Overnight blood-oxygen check", with copy that
   says it is a wellness estimate and can't tell you whether you have sleep apnea. The
   Sleep card already labels the result experimental and not a diagnosis. Naming a
@@ -148,7 +150,7 @@ Profile, Device Info and a workout start.
 
 - **Hidden diagnostics card (2.3.1)**: reachable in Release after 7 taps on Profile's
   version line, and disclosed in the review notes. Its "RE tool" row (`activityProbeRow`
-  in `ContentView.swift`) asks the ring for history on five channel numbers the official
+  in `Observability/RingDebugToolsSection.swift`) asks the ring for history on five channel numbers the official
   app never uses. To carry no risk, wrap that row in `#if DEBUG`; TestFlight testers then
   lose the probe but keep the rest of the card.
 - **Dead calibration code in Release**: `CalibrationSupport.swift` (HTTP client, default
