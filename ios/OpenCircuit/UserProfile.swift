@@ -318,8 +318,7 @@ struct UserProfileSettingsView: View {
                             Label("Connect Apple Health", systemImage: "heart.text.square")
                         }
                         if healthUnavailable {
-                            Text("This build can't write to Apple Health — that needs the TestFlight "
-                                 + "build. (Free side-loaded builds can't use HealthKit.) OpenCircuit "
+                            Text("Apple Health isn't available on this device or build. OpenCircuit "
                                  + "still works as a local dashboard.")
                                 .font(.caption).foregroundStyle(.secondary)
                         } else {
