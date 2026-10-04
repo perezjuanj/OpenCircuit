@@ -64,8 +64,10 @@ what the app does and does not do with your data.
   Devices**, or in the Health app.
 - Turn off Bluetooth, Location, or Notifications access anytime in **Settings ▸
   OpenCircuit**.
-- Delete the app to remove its local data and the Keychain key. Data already written
-  to Apple Health is managed in the Health app.
+- Delete the app to remove its local data. iOS keeps Keychain items after an app is
+  deleted, so to remove your Helio Strap key too, tap **Forget Key** in the strap's setup
+  screen (Device Info ▸ Replace or forget the key) before deleting the app. Data already
+  written to Apple Health is managed in the Health app.
 
 ## Not a medical device
 

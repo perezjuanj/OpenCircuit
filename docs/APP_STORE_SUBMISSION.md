@@ -14,10 +14,11 @@ archive and upload mechanics; this file covers review.
 | Entitlements | HealthKit + HealthKit background delivery. No iCloud, no push, no App Groups |
 | Background modes | `bluetooth-central`, `location`, `fetch`, `processing` (+ two BGTask ids). Each has a justification in §3 |
 | Privacy manifest | `ios/OpenCircuit/PrivacyInfo.xcprivacy`: no tracking, no collected data, UserDefaults `CA92.1`. No other required-reason API is used by app code (file size via `fileSizeKey` is not a required-reason API) |
+| Third-party code | Liveline (MIT, resolved 0.7.0) draws the live charts and ships its own privacy manifest. Its notice and Keyline Icons' are in `docs/THIRD_PARTY_NOTICES.md` |
 | Export compliance | `ITSAppUsesNonExemptEncryption = false` (see §5) |
 | App icon / launch | `AppIcon.icon` (Icon Composer, Xcode 26), `UILaunchScreen` with `LaunchLogo` + `LaunchBackground` |
 | Devices | iPhone + iPad (`TARGETED_DEVICE_FAMILY 1,2`), so ASC needs iPad screenshots too |
-| Developer tools | Reverse-engineering capture tools, the BP calibration flow, simulator demo data and test seams are all behind `#if DEBUG`. Release builds contain none of them |
+| Developer tools | The BP calibration screens and settings, the simulator demo data and the test seams are behind `#if DEBUG`. The calibration HTTP client (`CalibrationSupport.swift`, default URL `http://127.0.0.1:8765`) still compiles into Release, but its only presenter is a Debug-only button, so nothing in Release can reach it. The ring Debug card (last frame, "RE tool" probe) is in Release behind the 7-tap unlock, see §4 |
 
 ### Changed for the store build (this branch)
 
@@ -42,9 +43,11 @@ archive and upload mechanics; this file covers review.
   steps read for background sync, period and headache logs, notifications, diagnostics
   export and Files visibility.
 
-**Needs a Mac build before merge.** None of the Swift changes have been compiled. Build
-Release for a device, run `OpenCircuitTests`, and check Profile, Device Info and a
-workout start on the phone.
+**Verification (2026-10-03).** The Swift changes were built and tested on a Mac as one tree
+with the other PRs merged that day (#268, #270, #271): the Kit suite, the full
+`OpenCircuitTests` suite and the migration gate pass, and a Release build for the iOS
+Simulator succeeds. Still to do on a phone with a ring or strap, in the TestFlight build:
+Profile, Device Info and a workout start.
 
 ## 2. App Store Connect checklist (owner)
 
@@ -52,27 +55,44 @@ workout start on the phone.
 2. **App record**: bundle id above, name "OpenCircuit" (must not include RingConn or
    Amazfit), primary category **Health & Fitness**, SKU.
 3. **URLs**: Privacy Policy
-   `https://github.com/perezjuanj/OpenCircuit/blob/master/docs/PRIVACY.md` (merge this
-   branch first so it is current). Support URL
+   `https://github.com/perezjuanj/OpenCircuit/blob/master/docs/PRIVACY.md` (master carries
+   the current policy once this change is merged). Support URL
    `https://github.com/perezjuanj/OpenCircuit/issues` or a page on standardsoftware.io.
 4. **App Privacy label**: "Data Not Collected". True as long as nothing leaves the
    device without the user choosing to share a file.
-5. **Age rating**: answer "Medical/Treatment Information: Infrequent/Mild"; no other
-   content flags.
-6. **Description**: name Apple Health explicitly (HealthKit apps must say so), say
+5. **Age rating**: claim no medical or treatment information (the app gives no diagnosis,
+   treatment or medication guidance) and do claim health or wellness topics, with no
+   other content flags. Apple's age-rating table puts that at 9+. Claiming "infrequent"
+   medical or treatment information moves the rating to 13+, and "frequent" to 16+.
+6. **Regulated medical device status**: required because the category is Health &
+   Fitness. Declare **No** for the EU/EEA, UK and US. The app is not FDA-cleared,
+   CE-marked or registered, and says it is not a medical device.
+7. **EU Digital Services Act trader status**: ASC asks once per account, even if the app
+   is not sold in the EU. Decide whether you act as a trader (for business purposes). If
+   yes, the address, phone number and email you give are shown on the product page in the
+   EU, so use business contact details.
+8. **Description**: name Apple Health explicitly (HealthKit apps must say so), say
    "works with RingConn Gen 2/Gen 3 rings and the Amazfit Helio Strap", add "not
    affiliated with RingConn or Zepp Health", and "not a medical device". No words like
    diagnose, detect, apnea, blood pressure, or medical-grade.
-7. **Screenshots**: iPhone 6.9" and iPad 13" sets. Use real data, no RingConn or Zepp
-   logos.
-8. **Review notes and demo video**: the reviewer has no ring or strap, so attach a short
-   screen recording of pairing, a sync, the Today screen and the Apple Health
-   permission sheet, and paste the notes in §3.
-9. **Export compliance**: confirm the answer in §5 when ASC asks.
-10. **Build**: bump `CURRENT_PROJECT_VERSION`, archive Release with Xcode 26, upload,
+9. **Screenshots**: iPhone 6.9" (1320 x 2868) and iPad 13" (2064 x 2752) sets. Demo data
+   from a Debug simulator build (`-OCDemoData`) is fine, or use your own; no RingConn or
+   Zepp logos.
+10. **Review notes and demo video**: the reviewer has no ring or strap, so attach a short
+    screen recording of pairing, a sync, the Today screen and the Apple Health
+    permission sheet, and paste the notes in §3.
+11. **Export compliance**: confirm the answer in §5 when ASC asks.
+12. **Build**: bump `CURRENT_PROJECT_VERSION`, archive Release with Xcode 26, upload,
     then test that exact build from TestFlight on a phone before submitting.
-11. **Xcode privacy report**: in Organizer, right-click the archive ▸ Generate Privacy
+13. **Xcode privacy report**: in Organizer, right-click the archive ▸ Generate Privacy
     Report, and confirm the Liveline package adds no undeclared required-reason API.
+    Checked on 2026-10-03: Liveline 0.7.0 ships its own `PrivacyInfo.xcprivacy`, its
+    sources use no network or required-reason API, and the Release binary imports no
+    `stat`-family symbol. Still run the report on the real archive.
+14. **Accessibility Nutrition Labels** (optional for now; Apple says they become
+    mandatory over time): claim only what you have tested on a phone, among VoiceOver,
+    Larger Text, Dark Interface, Differentiate Without Color Alone, Sufficient Contrast and
+    Reduced Motion.
 
 ## 3. Review notes (paste into ASC)
 
@@ -101,6 +121,11 @@ workout start on the phone.
 >
 > The app is not a medical device and shows that disclaimer in onboarding, in Profile,
 > and next to every alert and experimental estimate.
+>
+> Seven taps on the version line at the bottom of Profile reveal a diagnostics card (the
+> last sync frame and a protocol probe that asks the ring for history on test channels).
+> It is there for our own TestFlight debugging and collects or sends nothing off the
+> device.
 
 ## 4. Guideline risks still open (owner judgement)
 
@@ -121,11 +146,29 @@ workout start on the phone.
 - **Diagnostics in Files**: `UIFileSharingEnabled` exposes exported files in the Files
   app. That is user-initiated and covered by the privacy policy.
 
+- **Hidden diagnostics card (2.3.1)**: reachable in Release after 7 taps on Profile's
+  version line, and disclosed in the review notes. Its "RE tool" row (`activityProbeRow`
+  in `ContentView.swift`) asks the ring for history on five channel numbers the official
+  app never uses. To carry no risk, wrap that row in `#if DEBUG`; TestFlight testers then
+  lose the probe but keep the rest of the card.
+- **Dead calibration code in Release**: `CalibrationSupport.swift` (HTTP client, default
+  `http://127.0.0.1:8765`) compiles into Release with no way to reach it, so the binary
+  contains `URLSession` calls although the app makes no network request. Wrap the file's
+  types in `#if DEBUG` in a follow-up if a review asks.
+
 ## 5. Export compliance
 
-The app uses SM3 hashing to authenticate to the ring, and AES-128 plus B-163 ECDH to pair
-with and talk to the Helio Strap over Bluetooth. All of it only authenticates to and
-exchanges data with the user's own wearable, and the app's primary function is health
-tracking, not information security or communications. On that basis the plist declares
-no non-exempt encryption. This is not legal advice: if unsure, answer ASC's questions as
-"uses standard encryption, exempt", or file the annual self-classification report.
+What the binary contains: AES-128 through CommonCrypto (`ZeppAES`), NIST B-163 elliptic-curve
+Diffie-Hellman implemented in the app (`B163.swift`, a port of the public-domain
+tiny-ECDH-c, because CryptoKit has no binary curves), and SM3 for the ring's challenge
+response (`RingAuth`). All three are published standards; none is proprietary. They only
+authenticate to and exchange data with the user's own wearable, and the app's primary
+function is health tracking, not information security, communications or storage. On that
+basis the plist declares `ITSAppUsesNonExemptEncryption = false`.
+
+Apple's export-compliance page lists apps using standard algorithms or the OS's crypto
+among those that need a determination, and says you carry the liability for claiming an
+exemption inaccurately. So this is the owner's declaration, not legal advice: read BIS's
+encryption guidance once, and if you disagree with the basis above, answer ASC's
+questionnaire instead of relying on the plist key (and file the annual self-classification
+report if it says so).
