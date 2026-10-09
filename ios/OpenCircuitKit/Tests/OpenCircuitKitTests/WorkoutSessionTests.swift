@@ -336,8 +336,9 @@ final class WorkoutSessionTests: XCTestCase {
         )
         XCTAssertEqual(summary.avgHR, 101)
         XCTAssertNotNil(summary.estimatedActiveKcal, "sparse HR must still estimate calories, not '--'")
-        // Keytel (male, 75 kg, 35 y, 101 bpm) ≈ 7.3 kcal/min × 5.08 min ≈ 37 kcal — a sane, honest number.
-        XCTAssertEqual(summary.estimatedActiveKcal ?? 0, 37, accuracy: 4)
+        // Keytel (male, 75 kg, 35 y, 101 bpm) ≈ 7.31 kcal/min gross, minus 1.18 resting = 6.14 active
+        // × 5.08 min ≈ 31 kcal — a sane, honest number.
+        XCTAssertEqual(summary.estimatedActiveKcal ?? 0, 31, accuracy: 4)
         // Held zone attribution: the total tracks the real elapsed time (~305 s), NOT the ~60 s the old
         // per-span sum gave (30 readings × the 2 s stamp) — the 0:50-for-a-5:05-ride bug.
         XCTAssertEqual(summary.zoneBreakdown.totalZoneSeconds, 305, accuracy: 15)

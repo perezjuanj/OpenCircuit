@@ -6,6 +6,8 @@ import XCTest
 /// Every time, reading and step count here is synthetic and rounded. The "master" literals were
 /// measured on 63e2796 (before the gate existed) with these exact fixtures. Pinning them with the
 /// gate OFF proves the switch restores today's numbers to the last digit, not just "about the same".
+/// Since decision 67 every Keytel price is net of resting energy, so each pinned literal is the 63e2796
+/// value minus (elevated minutes × 1623.75 / 1440), this profile's resting kcal per minute.
 final class MotionCorroborationGateTests: XCTestCase {
 
     private let profile = UserProfile(age: 35, weightKg: 70, heightCm: 175, sex: .male)  // maxHR 185, bar 92
@@ -60,31 +62,38 @@ final class MotionCorroborationGateTests: XCTestCase {
 
     // MARK: The switch
 
-    func testTheGateShipsOff() {
-        XCTAssertFalse(ExerciseMinutes.motionCorroborationEnabled,
-                       "default OFF until validated on real days, see the switch's doc comment")
-        XCTAssertNil(ExerciseMinutes.effectiveMotionEvidence(.init()))
+    func testTheGateShipsOn() {
+        XCTAssertTrue(ExerciseMinutes.motionCorroborationEnabled,
+                      "ON since decision 67: validated on real days, see the switch's doc comment")
+        XCTAssertNotNil(ExerciseMinutes.effectiveMotionEvidence(.init()))
+        XCTAssertNil(ExerciseMinutes.effectiveMotionEvidence(.init(), corroborate: false),
+                     "off is still reachable for side-by-side pricing")
         XCTAssertNotNil(ExerciseMinutes.effectiveMotionEvidence(.init(), corroborate: true),
                         "on with empty evidence is NOT 'no gate': nothing corroborates")
     }
 
-    func testTheDefaultIsTheOffPath() {
-        // Every production call site relies on the default. It must be the off path exactly.
+    func testTheDefaultIsTheOnPath() {
+        // Every production call site relies on the default. It must be the on path exactly: a seated
+        // caffeine hour prices nothing, and a walk keeps all of it.
         let e = Calories.dailyEstimate(hrSamples: caffeine, steps: 0, profile: profile,
                                        stepWindows: [], dayStart: day)
-        XCTAssertEqual(e, attributed(caffeine, steps: 0, windows: [], gate: false))
-        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: caffeine, maxHR: 185), 60.0)
+        XCTAssertEqual(e, attributed(caffeine, steps: 0, windows: [], gate: true))
+        XCTAssertEqual(e.activeKcal, 0)
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: caffeine, maxHR: 185), 0)
+        let w = Calories.dailyEstimate(hrSamples: walk, steps: 3200, profile: profile,
+                                       stepWindows: walkStrapSteps, dayStart: day)
+        XCTAssertEqual(w, attributed(walk, steps: 3200, windows: walkStrapSteps, gate: false))
     }
 
     // MARK: Fixture 1 — elevated HR, zero motion (caffeine / stress)
 
     func testCaffeineShapeGateOffPricesExactlyAsBeforeTheGate() {
         let a = attributed(caffeine, steps: 0, windows: [], gate: false)
-        XCTAssertEqual(a.activeKcal, 451.6089866156788)
+        XCTAssertEqual(a.activeKcal, 383.9527366156789)
         XCTAssertEqual(a.elevatedMinutes, 60.0)
         XCTAssertEqual(a.buckets.count, 4)
         let l = legacy(caffeine, steps: 0, gate: false)
-        XCTAssertEqual(l.activeKcal, 451.6089866156789)
+        XCTAssertEqual(l.activeKcal, 383.9527366156788)
         XCTAssertEqual(l.elevatedMinutes, 60.0)
         XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: caffeine, maxHR: 185, corroborateMotion: false), 60.0)
     }
@@ -104,7 +113,7 @@ final class MotionCorroborationGateTests: XCTestCase {
         // A trip to the kettle: 30 steps in the 14:15 quarter, 2 spm.
         let kettle = [StepWindow(start: at(14, 15), end: at(14, 30), delta: 30)]
         let off = attributed(caffeine, steps: 30, windows: kettle, gate: false)
-        XCTAssertEqual(off.activeKcal, 451.6089866156788, "measured on 63e2796")
+        XCTAssertEqual(off.activeKcal, 383.9527366156789, "63e2796 value net of resting")
         XCTAssertEqual(off.elevatedMinutes, 60.0)
         let on = attributed(caffeine, steps: 30, windows: kettle, gate: true)
         XCTAssertEqual(on.elevatedMinutes, 0)
@@ -131,7 +140,7 @@ final class MotionCorroborationGateTests: XCTestCase {
     func testWalkShapeIsUnchangedByTheGateOnTheStrapsMinuteSteps() {
         let off = attributed(walk, steps: 3200, windows: walkStrapSteps, gate: false)
         let on = attributed(walk, steps: 3200, windows: walkStrapSteps, gate: true)
-        XCTAssertEqual(off.activeKcal, 254.6824627151052, "measured on 63e2796")
+        XCTAssertEqual(off.activeKcal, 220.8543377151052, "63e2796 value net of resting")
         XCTAssertEqual(off.elevatedMinutes, 30.0)
         XCTAssertEqual(on, off, "same kcal, same minutes, same buckets")
     }
@@ -139,7 +148,7 @@ final class MotionCorroborationGateTests: XCTestCase {
     func testWalkShapeIsUnchangedByTheGateOnTheRingsQuarterBuckets() {
         let off = attributed(walk, steps: 3200, windows: walkRingSteps, gate: false)
         let on = attributed(walk, steps: 3200, windows: walkRingSteps, gate: true)
-        XCTAssertEqual(off.activeKcal, 254.6824627151052, "measured on 63e2796")
+        XCTAssertEqual(off.activeKcal, 220.8543377151052, "63e2796 value net of resting")
         XCTAssertEqual(off.elevatedMinutes, 30.0)
         XCTAssertEqual(on, off)
     }
@@ -147,7 +156,7 @@ final class MotionCorroborationGateTests: XCTestCase {
     func testWalkShapeIsUnchangedByTheGateOnTheLegacyPath() {
         let off = legacy(walk, steps: 3200, windows: walkStrapSteps, gate: false)
         let on = legacy(walk, steps: 3200, windows: walkStrapSteps, gate: true)
-        XCTAssertEqual(off.activeKcal, 252.94646271510518, "measured on 63e2796")
+        XCTAssertEqual(off.activeKcal, 219.11833771510518, "63e2796 value net of resting")
         XCTAssertEqual(off.elevatedMinutes, 30.0)
         XCTAssertEqual(on, off)
     }

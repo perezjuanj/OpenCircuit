@@ -1,6 +1,9 @@
 import XCTest
 @testable import OpenCircuitKit
 
+/// These fixtures are HR-only (no steps), and they pin HR-threshold and attribution mechanics, so every
+/// call prices with the #281 motion gate OFF (`corroborateMotion: false`). The gate itself, which is
+/// on in production, is pinned in `MotionCorroborationGateTests`.
 final class ExerciseMinutesTests: XCTestCase {
 
     private let t0 = Date(timeIntervalSince1970: 0)
@@ -142,18 +145,18 @@ final class ExerciseMinutesTests: XCTestCase {
         }
         XCTAssertNil(ExerciseMinutes.restingBaseline(early), "under the span guard")
         XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: early, maxHR: 185,
-                                                deriveRestingHR: true), 40, accuracy: 1e-9)
+                                                deriveRestingHR: true, corroborateMotion: false), 40, accuracy: 1e-9)
 
         // The same walk, once enough quiet time has accrued to read the resting pulse.
         let late = early + (0 ..< 24).map {
             HRSample(bpm: 62, start: ringOn.addingTimeInterval(2.5 * 3600 + Double($0) * 150))
         }
         XCTAssertEqual(ExerciseMinutes.restingBaseline(late)!, 62, accuracy: 1e-9)
-        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: late, maxHR: 185, deriveRestingHR: true),
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: late, maxHR: 185, deriveRestingHR: true, corroborateMotion: false),
                        0, accuracy: 1e-9,
                        "95 bpm is not 40% of the way from 62 to 185 — correct, but it is a STEP DOWN")
         // With the shipped default there is no boundary and no step at all.
-        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: late, maxHR: 185), 40, accuracy: 1e-9)
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: late, maxHR: 185, corroborateMotion: false), 40, accuracy: 1e-9)
     }
 
     // MARK: The reported symptom — the ring filling from ordinary morning activity
@@ -173,19 +176,19 @@ final class ExerciseMinutesTests: XCTestCase {
         let window = DateInterval(start: t0, end: sleepEnd)
 
         let old = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 185,
-                                           sleepWindow: window, deriveRestingHR: false)
+                                           sleepWindow: window, deriveRestingHR: false, corroborateMotion: false)
         XCTAssertEqual(old, 40, accuracy: 1e-9,
                        "the old absolute 92-bpm bar filled a 30-min goal from this alone")
 
         let new = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 185, sleepWindow: window,
-                                           deriveRestingHR: true)
+                                           deriveRestingHR: true, corroborateMotion: false)
         XCTAssertEqual(new, 0, accuracy: 1e-9,
                        "96 bpm is 22 bpm above a 72-bpm rest — not moderate exertion")
 
         // ⚠️ AND THAT IS WHY THE MODEL IS SHIPPED OFF. Zero is the correct answer to "was this
         // MODERATE INTENSITY", and the wrong answer to "how much Apple Exercise Time was this",
         // which counts a brisk walk. With the shipped default the day still reads 40 minutes.
-        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: samples, maxHR: 185, sleepWindow: window),
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: samples, maxHR: 185, sleepWindow: window, corroborateMotion: false),
                        old, accuracy: 1e-9,
                        "shipped default must reproduce the pre-HRR model exactly")
     }
@@ -202,7 +205,7 @@ final class ExerciseMinutesTests: XCTestCase {
         }
         let minutes = ExerciseMinutes.estimate(
             hrSamples: samples, maxHR: 185,
-            sleepWindow: DateInterval(start: t0, end: sleepEnd))
+            sleepWindow: DateInterval(start: t0, end: sleepEnd), corroborateMotion: false)
         XCTAssertEqual(minutes, 30, accuracy: 1e-9)
     }
 
@@ -222,7 +225,7 @@ final class ExerciseMinutesTests: XCTestCase {
         XCTAssertNotNil(derived)
         let thresh = ExerciseMinutes.threshold(maxHR: 185, restingHR: derived)
         let pieces = ExerciseMinutes.elevatedPieces(hrSamples: samples, maxHR: 185,
-                                                    sleepWindow: DateInterval(start: t0, end: sleepEnd))
+                                                    sleepWindow: DateInterval(start: t0, end: sleepEnd), corroborateMotion: false)
         XCTAssertFalse(pieces.isEmpty)
         for p in pieces {
             XCTAssertGreaterThanOrEqual(p.bpm, thresh,
@@ -233,14 +236,14 @@ final class ExerciseMinutesTests: XCTestCase {
     // MARK: Empty / below threshold
 
     func testNoSamplesReturnsZero() {
-        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: [], maxHR: 180), 0)
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: [], maxHR: 180, corroborateMotion: false), 0)
     }
 
     func testAllBelowThresholdReturnsZero() {
         let samples = [60, 70, 80].map { bpm in
             HRSample(bpm: bpm, start: t0, end: t0)
         }
-        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: samples, maxHR: 180), 0)
+        XCTAssertEqual(ExerciseMinutes.estimate(hrSamples: samples, maxHR: 180, corroborateMotion: false), 0)
     }
 
     // MARK: Basic elevated estimate
@@ -250,7 +253,7 @@ final class ExerciseMinutesTests: XCTestCase {
         // credited a full 2.5-min epoch — a lone spot read isn't evidence of exercise (#82 fix).
         let s = HRSample(bpm: 100, start: t0, end: t0)
         let minutes = ExerciseMinutes.estimate(hrSamples: [s], maxHR: 180,
-                                               epochSeconds: 150)
+                                               epochSeconds: 150, corroborateMotion: false)
         XCTAssertEqual(minutes, 0, accuracy: 0.01)
     }
 
@@ -258,7 +261,7 @@ final class ExerciseMinutesTests: XCTestCase {
         // An isolated point read gets the caller-supplied small width, not a full epoch.
         let s = HRSample(bpm: 100, start: t0, end: t0)
         let minutes = ExerciseMinutes.estimate(hrSamples: [s], maxHR: 180,
-                                               epochSeconds: 150, pointSampleWidth: 30)
+                                               epochSeconds: 150, pointSampleWidth: 30, corroborateMotion: false)
         XCTAssertEqual(minutes, 0.5, accuracy: 0.01)   // 30 s
     }
 
@@ -268,7 +271,7 @@ final class ExerciseMinutesTests: XCTestCase {
         let samples = [0, 150].map { offset in
             HRSample(bpm: 100, start: t0.addingTimeInterval(Double(offset)), end: t0.addingTimeInterval(Double(offset)))
         }
-        let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 180, epochSeconds: epoch)
+        let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 180, epochSeconds: epoch, corroborateMotion: false)
         // [0,150) + [150,300) → merged [0,300] = 5 min
         XCTAssertEqual(minutes, 5.0, accuracy: 0.01)
     }
@@ -280,7 +283,7 @@ final class ExerciseMinutesTests: XCTestCase {
         let samples = [0, 150, 300].map { offset in
             HRSample(bpm: 100, start: t0.addingTimeInterval(Double(offset)), end: t0.addingTimeInterval(Double(offset)))
         }
-        let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 180, epochSeconds: epoch)
+        let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 180, epochSeconds: epoch, corroborateMotion: false)
         // intervals: [0,150), [150,300), [300,450) → merged: [0, 450] = 7.5 min
         XCTAssertEqual(minutes, 7.5, accuracy: 0.01)
     }
@@ -293,7 +296,7 @@ final class ExerciseMinutesTests: XCTestCase {
             [base, base + 150].map { HRSample(bpm: 100, start: t0.addingTimeInterval($0), end: t0.addingTimeInterval($0)) }
         }
         let samples = run(at: 0) + run(at: 1200)
-        let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 180, epochSeconds: epoch)
+        let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 180, epochSeconds: epoch, corroborateMotion: false)
         // Two separate [x, x+300] runs = 5 min + 5 min = 10 min
         XCTAssertEqual(minutes, 10.0, accuracy: 0.01)
     }
@@ -302,7 +305,7 @@ final class ExerciseMinutesTests: XCTestCase {
         // A sample spanning 5 minutes — its real duration should be used, not epochSeconds
         let end = t0.addingTimeInterval(5 * 60)
         let s = HRSample(bpm: 100, start: t0, end: end)
-        let minutes = ExerciseMinutes.estimate(hrSamples: [s], maxHR: 180, epochSeconds: 150)
+        let minutes = ExerciseMinutes.estimate(hrSamples: [s], maxHR: 180, epochSeconds: 150, corroborateMotion: false)
         XCTAssertEqual(minutes, 5.0, accuracy: 0.01)
     }
 
@@ -318,7 +321,7 @@ final class ExerciseMinutesTests: XCTestCase {
         let awake = [7200.0, 7350.0].map { HRSample(bpm: 100, start: t0.addingTimeInterval($0), end: t0.addingTimeInterval($0)) }
 
         let minutes = ExerciseMinutes.estimate(hrSamples: sleeping + awake, maxHR: 180,
-                                               sleepWindow: sleep, epochSeconds: epoch)
+                                               sleepWindow: sleep, epochSeconds: epoch, corroborateMotion: false)
         // Only the awake run counted: [7200,7500] = 5 min
         XCTAssertEqual(minutes, 5.0, accuracy: 0.01)
     }
@@ -327,7 +330,7 @@ final class ExerciseMinutesTests: XCTestCase {
         let epoch: TimeInterval = 150
         let samples = [0.0, 150.0].map { HRSample(bpm: 100, start: t0.addingTimeInterval($0), end: t0.addingTimeInterval($0)) }
         let minutes = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 180,
-                                               sleepWindow: nil, epochSeconds: epoch)
+                                               sleepWindow: nil, epochSeconds: epoch, corroborateMotion: false)
         XCTAssertEqual(minutes, 5.0, accuracy: 0.01)
     }
 
@@ -341,7 +344,7 @@ final class ExerciseMinutesTests: XCTestCase {
         let s2 = HRSample(bpm: 110,
                           start: t0.addingTimeInterval(200), // overlaps
                           end: t0.addingTimeInterval(600))   // extends to 10 min
-        let minutes = ExerciseMinutes.estimate(hrSamples: [s1, s2], maxHR: 180, epochSeconds: 150)
+        let minutes = ExerciseMinutes.estimate(hrSamples: [s1, s2], maxHR: 180, epochSeconds: 150, corroborateMotion: false)
         // Merged: [0, 600s] = 10 min
         XCTAssertEqual(minutes, 10.0, accuracy: 0.01)
     }
