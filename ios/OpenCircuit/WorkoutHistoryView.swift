@@ -38,8 +38,74 @@ struct WorkoutHistoryReader {
         let activeKcal: Double?
         let distanceMeters: Double?
         let avgHR: Int?
+        /// The detail screen's extras (#293), each nil / empty when the workout doesn't carry it.
+        var walkRunMeters: Double? = nil
+        var maxHR: Int? = nil
+        var pauses: [DateInterval] = []
+        var deviceName: String? = nil
+        var deviceManufacturer: String? = nil
 
         var duration: TimeInterval { end.timeIntervalSince(start) }
+        var pausedSeconds: TimeInterval { pauses.reduce(0) { $0 + $1.duration } }
+        var movingSeconds: TimeInterval { max(0, duration - pausedSeconds) }
+
+        init(id: UUID, activityType: HKWorkoutActivityType, start: Date, end: Date,
+             activeKcal: Double?, distanceMeters: Double?, avgHR: Int?,
+             walkRunMeters: Double? = nil, maxHR: Int? = nil, pauses: [DateInterval] = [],
+             deviceName: String? = nil, deviceManufacturer: String? = nil) {
+            self.id = id
+            self.activityType = activityType
+            self.start = start
+            self.end = end
+            self.activeKcal = activeKcal
+            self.distanceMeters = distanceMeters
+            self.avgHR = avgHR
+            self.walkRunMeters = walkRunMeters
+            self.maxHR = maxHR
+            self.pauses = pauses
+            self.deviceName = deviceName
+            self.deviceManufacturer = deviceManufacturer
+        }
+
+        init(_ w: HKWorkout) {
+            // `statistics(for:)` reads the totals the HKWorkoutBuilder banked when the workout was
+            // saved; nil when that quantity was never added (e.g. no HR locked, indoor → no route).
+            let kcal = w.statistics(for: HKQuantityType(.activeEnergyBurned))?
+                .sumQuantity()?.doubleValue(for: .kilocalorie())
+            let footDistance = w.statistics(for: HKQuantityType(.distanceWalkingRunning))?
+                .sumQuantity()?.doubleValue(for: .meter())
+            let cycleDistance = w.statistics(for: HKQuantityType(.distanceCycling))?
+                .sumQuantity()?.doubleValue(for: .meter())
+            let bpmUnit = HKUnit.count().unitDivided(by: .minute())
+            let hr = w.statistics(for: HKQuantityType(.heartRate))
+            let bpm = hr?.averageQuantity()?.doubleValue(for: bpmUnit)
+            let maxBPM = hr?.maximumQuantity()?.doubleValue(for: bpmUnit)
+            let markers: [WorkoutPauseMarker] = (w.workoutEvents ?? []).compactMap { event in
+                switch event.type {
+                case .pause: return .pause(event.dateInterval.start)
+                case .resume: return .resume(event.dateInterval.start)
+                default: return nil
+                }
+            }
+            self.init(id: w.uuid,
+                      activityType: w.workoutActivityType,
+                      start: w.startDate,
+                      end: w.endDate,
+                      activeKcal: kcal,
+                      distanceMeters: footDistance ?? cycleDistance,
+                      avgHR: bpm.map { Int($0.rounded()) },
+                      walkRunMeters: footDistance,
+                      maxHR: maxBPM.map { Int($0.rounded()) },
+                      pauses: WorkoutDetailContent.pauses(markers, end: w.endDate),
+                      deviceName: w.device?.name,
+                      deviceManufacturer: w.device?.manufacturer)
+        }
+
+        /// What a deletion needs, read from the workout's own totals (see `WorkoutDeleter`).
+        var deletionTarget: WorkoutDeleter.Target {
+            WorkoutDeleter.Target(id: id, start: start, end: end,
+                                  activeKcal: activeKcal, walkRunMeters: walkRunMeters)
+        }
     }
 
     // READ AUTHORIZATION — NOT REQUESTED, AND NOT NEEDED.
@@ -69,11 +135,22 @@ struct WorkoutHistoryReader {
     /// (unavailable / denied / query error) — an empty list is honest here, and the card says
     /// "nothing yet" rather than inventing a placeholder row.
     func recentWorkouts(limit: Int) async -> [Item] {
+        await workouts(startingBefore: nil, limit: limit)
+    }
+
+    /// One page of the full history (#293): up to `limit` of our workouts that started before
+    /// `cursor` (all of them when nil), newest first. Paged by date rather than by offset, so a
+    /// workout saved or deleted while the list is open can't shift a page.
+    func workouts(startingBefore cursor: Date?, limit: Int) async -> [Item] {
         guard HKHealthStore.isHealthDataAvailable() else { return [] }
+        var predicates = [HKQuery.predicateForObjects(from: .default())]
+        if let cursor {
+            predicates.append(NSPredicate(format: "%K < %@", HKPredicateKeyPathStartDate, cursor as NSDate))
+        }
         let workouts: [HKWorkout] = await withCheckedContinuation { cont in
             let query = HKSampleQuery(
                 sampleType: HKWorkoutType.workoutType(),
-                predicate: HKQuery.predicateForObjects(from: .default()),
+                predicate: NSCompoundPredicate(andPredicateWithSubpredicates: predicates),
                 limit: limit,
                 sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate,
                                                    ascending: false)]
@@ -82,26 +159,7 @@ struct WorkoutHistoryReader {
             }
             store.execute(query)
         }
-        return workouts.map { w in
-            // `statistics(for:)` reads the totals the HKWorkoutBuilder banked when the workout was
-            // saved; nil when that quantity was never added (e.g. no HR locked, indoor → no route).
-            let kcal = w.statistics(for: HKQuantityType(.activeEnergyBurned))?
-                .sumQuantity()?.doubleValue(for: .kilocalorie())
-            let footDistance = w.statistics(for: HKQuantityType(.distanceWalkingRunning))?
-                .sumQuantity()?.doubleValue(for: .meter())
-            let cycleDistance = w.statistics(for: HKQuantityType(.distanceCycling))?
-                .sumQuantity()?.doubleValue(for: .meter())
-            let bpm = w.statistics(for: HKQuantityType(.heartRate))?
-                .averageQuantity()?
-                .doubleValue(for: HKUnit.count().unitDivided(by: .minute()))
-            return Item(id: w.uuid,
-                        activityType: w.workoutActivityType,
-                        start: w.startDate,
-                        end: w.endDate,
-                        activeKcal: kcal,
-                        distanceMeters: footDistance ?? cycleDistance,
-                        avgHR: bpm.map { Int($0.rounded()) })
-        }
+        return workouts.map(Item.init)
     }
 }
 
@@ -142,12 +200,16 @@ enum WorkoutActivityDisplay {
 
 /// "Recent workouts" on the Activity tab. Loads on appear and whenever `reloadToken` changes (the
 /// workout sheet closing bumps it), so a workout the user just finished shows up without a relaunch.
+/// Each row opens the workout's detail screen, and "See All" the full history (#293).
 struct RecentWorkoutsCard: View {
     /// Bumped by the owner after a workout ends, to re-query Health.
     var reloadToken: Int = 0
     /// How many rows to show. Small on purpose: this is a "did my workout save?" reassurance
-    /// surface, not a history browser.
+    /// surface; the full history is behind "See All".
     var limit: Int = 5
+    /// Called after a workout is deleted from the detail screen or the full list, so the owner bumps
+    /// `reloadToken` (this card, and the weekly load line under it, re-query Health).
+    var onWorkoutsChanged: () -> Void = {}
 
     @AppStorage("units.distance") private var distUnitRaw = DistanceUnit.localeDefault.rawValue
     private var distanceUnit: DistanceUnit { DistanceUnit(rawValue: distUnitRaw) ?? .metric }
@@ -169,24 +231,54 @@ struct RecentWorkoutsCard: View {
                 WeeklyTrainingLoadLine(reloadToken: reloadToken)
                 VStack(spacing: 10) {
                     ForEach(items) { item in
-                        row(item)
-                        if item.id != items.last?.id { Divider() }
+                        DetailLink {
+                            WorkoutDetailView(item: item, onDeleted: { _ in onWorkoutsChanged() })
+                        } label: {
+                            WorkoutHistoryRow(item: item, distanceUnit: distanceUnit, showsChevron: true)
+                        }
+                        .buttonStyle(.plain)
+                        Divider()
                     }
+                    DetailLink {
+                        WorkoutHistoryListView(onWorkoutsChanged: onWorkoutsChanged)
+                    } label: {
+                        HStack {
+                            Text("See All Workouts").font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
         .task(id: reloadToken) { await load() }
     }
 
-    @ViewBuilder
-    private func row(_ item: WorkoutHistoryReader.Item) -> some View {
+    private func load() async {
+        let reader = WorkoutHistoryReader()
+        items = await reader.recentWorkouts(limit: limit)
+        loaded = true
+    }
+}
+
+// MARK: - Row
+
+/// One workout as a row: on the card and in the full history.
+struct WorkoutHistoryRow: View {
+    let item: WorkoutHistoryReader.Item
+    let distanceUnit: DistanceUnit
+    var showsChevron = false
+
+    var body: some View {
         HStack(spacing: 12) {
             Image(systemName: WorkoutActivityDisplay.symbol(item.activityType))
                 .font(.title3).foregroundStyle(Theme.steps).frame(width: 26)
             VStack(alignment: .leading, spacing: 2) {
                 Text(WorkoutActivityDisplay.name(item.activityType))
                     .font(.subheadline.weight(.semibold))
-                Text(subtitle(item)).font(.caption2).foregroundStyle(.secondary)
+                Text(subtitle).font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
@@ -200,10 +292,14 @@ struct RecentWorkoutsCard: View {
                     Text("\(bpm) bpm").font(.caption2).foregroundStyle(.secondary)
                 }
             }
+            if showsChevron {
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+            }
         }
+        .contentShape(Rectangle())
     }
 
-    private func subtitle(_ item: WorkoutHistoryReader.Item) -> String {
+    private var subtitle: String {
         let df = DateFormatter()
         df.dateStyle = Calendar.current.isDateInToday(item.start) ? .none : .medium
         df.timeStyle = .short
@@ -219,11 +315,5 @@ struct RecentWorkoutsCard: View {
         let h = t / 3600, m = (t % 3600) / 60, s = t % 60
         if h > 0 { return String(format: "%dh %02dm", h, m) }
         return String(format: "%dm %02ds", m, s)
-    }
-
-    private func load() async {
-        let reader = WorkoutHistoryReader()
-        items = await reader.recentWorkouts(limit: limit)
-        loaded = true
     }
 }

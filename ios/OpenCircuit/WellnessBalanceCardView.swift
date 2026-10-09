@@ -133,8 +133,10 @@ struct WellnessBalanceCardView: View {
         "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
         + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(latestSleep.first?.sleepScore ?? 0)|"
         + "\(latestSleep.first?.stressScore ?? 0)|\(sleepCredited ? 1 : 0)|"
-        + "\(stepsGoal)|\(Int(actMinGoal))|\(Int(activeKcalGoal))"
+        + "\(stepsGoal)|\(Int(actMinGoal))|\(Int(activeKcalGoal))|\(workoutCreditsRevision)"
     }
+    /// Bumped when a deleted workout's credited span is undone (#293), so readiness recomputes.
+    @AppStorage(HealthKitWriter.workoutCreditsRevisionKey) private var workoutCreditsRevision = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
