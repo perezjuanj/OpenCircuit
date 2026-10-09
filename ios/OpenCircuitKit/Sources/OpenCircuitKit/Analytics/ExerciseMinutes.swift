@@ -104,7 +104,7 @@ public enum ExerciseMinutes {
     /// WHY IT IS ON (#281, decision 67). It shipped off until checked against real days. Three
     /// days from the owner's own ring were priced side by side. Ungated, two ordinary full days with
     /// ~5,300 steps and no workout read ~2,200-2,330 active kcal from 325-342 "elevated" minutes,
-    /// mostly seated stretches just over the 93 bpm bar. Gated, they read ~330-410 kcal from 40-53
+    /// mostly seated stretches just over the half-of-max-HR bar. Gated, they read ~330-410 kcal from 40-53
     /// minutes, and each morning walk kept its energy. That matches how motion-aware wearables
     /// (Apple Watch, Garmin, Fitbit) count active energy. Known costs, each of which is a real day
     /// getting LESS than it did with the gate off:
