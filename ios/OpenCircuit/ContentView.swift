@@ -1064,8 +1064,8 @@ struct ContentView: View {
             return
         case .discard(let refusal):
             // Nothing defensible to save (no observed span, a future-dated snapshot from a clock
-            // that moved backwards, or a workout the user deleted). Drop it silently — asking the user about a workout we could
-            // not describe would be worse than saying nothing.
+            // that moved backwards, or a workout the user deleted). Drop it silently — asking the
+            // user about a workout we could not describe would be worse than saying nothing.
             ringLog.notice("workout: discarding orphaned session snapshot (\(refusal.rawValue, privacy: .public))")
             WorkoutSessionManager.clearSessionSnapshot()
         case .offer(let recovered):
