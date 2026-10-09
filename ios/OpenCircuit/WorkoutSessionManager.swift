@@ -228,6 +228,14 @@ final class WorkoutSessionManager: NSObject {
         UserDefaults.standard.removeObject(forKey: sessionSnapshotKey)
     }
 
+    /// What the launch should do about `snapshot`: `WorkoutSessionRecovery.decide`, with a span the
+    /// user deleted from the workout history (#293) refused rather than offered back.
+    nonisolated static func recoveryDecision(snapshot: WorkoutSessionSnapshot?,
+                                             tombstones: WorkoutTombstones = WorkoutTombstones(),
+                                             now: Date = Date()) -> WorkoutRecoveryDecision {
+        tombstones.filter(WorkoutSessionRecovery.decide(snapshot: snapshot, now: now))
+    }
+
     /// Write down what this session looks like RIGHT NOW, stamping `lastAliveAt` with the current
     /// clock — the instant a later launch is allowed to call the workout's end. Called at start and
     /// on the session's ~10 s heartbeat, so a crash costs at most one heartbeat of duration (an

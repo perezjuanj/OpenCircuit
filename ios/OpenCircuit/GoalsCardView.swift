@@ -102,8 +102,10 @@ struct GoalsCardView: View {
     /// unrelated re-render.
     private var goalsInputsKey: String {
         "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(effectiveWeightKg)|"
-        + "\(heightCm)|\(sexRaw)|\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)"
+        + "\(heightCm)|\(sexRaw)|\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(workoutCreditsRevision)"
     }
+    /// Bumped when a deleted workout's credited span is undone (#293), so the goals recompute.
+    @AppStorage(HealthKitWriter.workoutCreditsRevisionKey) private var workoutCreditsRevision = 0
 
     // MARK: Computed values
 

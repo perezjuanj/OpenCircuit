@@ -3236,13 +3236,24 @@ final class RingSession: NSObject {
         }
     }
 
+    /// Every span the detection inbox must not offer: bouts already saved or dismissed, the running
+    /// manual workout, and workouts the user deleted from the history screen (#293). The deleted ones
+    /// are listed separately from the resolved spans because a save made while the ring session was
+    /// gone never reached `resolveAutomaticWorkoutCandidate`.
+    static func suppressedAutomaticWorkoutSpans(resolved: [CursorSpan], manual: [CursorSpan],
+                                                tombstones: WorkoutTombstones) -> [CursorSpan] {
+        resolved + manual + tombstones.cursorSpans
+    }
+
     /// Merge retransmitted sport pages, retain the official app's two-day review window, rebuild
     /// retroactive candidates, and persist across reconnects. Prefer the duplicate that has valid HR.
     private func mergeHistoricalSportSamples(_ incoming: [HistoricalSportFrame.Sample]) {
         let rebuilt = AutomaticWorkoutInbox.rebuild(
             existing: historicalSportSamples,
             incoming: incoming,
-            resolvedSpans: resolvedAutomaticWorkoutSpans + activeManualWorkoutSpans()
+            resolvedSpans: Self.suppressedAutomaticWorkoutSpans(resolved: resolvedAutomaticWorkoutSpans,
+                                                                manual: activeManualWorkoutSpans(),
+                                                                tombstones: WorkoutTombstones())
         )
         historicalSportSamples = rebuilt.samples
         automaticWorkoutCandidates = rebuilt.candidates

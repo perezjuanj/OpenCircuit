@@ -1446,8 +1446,8 @@ final class HealthKitWriter {
     static let activeBucketKcalKey = "hk.activeEnergy.bucketKcal"
     static let activeCarryKey = "hk.activeEnergy.carryKcal"
     static let activeBucketSeedDayKey = "hk.activeEnergy.bucketSeedDay"
-    private static let activeWorkoutCreditedKey = "hk.activeEnergy.workoutCreditedKcal"
-    private static let activeWorkoutCreditedDayKey = "hk.activeEnergy.workoutCreditedDay"
+    static let activeWorkoutCreditedKey = "hk.activeEnergy.workoutCreditedKcal"
+    static let activeWorkoutCreditedDayKey = "hk.activeEnergy.workoutCreditedDay"
     /// Total active kcal this app has actually SAVED to HealthKit today. Distinct from the bucket
     /// marks, which say only where energy sits: this is the day-total backstop that makes any
     /// bucket relocation incapable of re-paying kcal Health already holds.
@@ -1471,8 +1471,8 @@ final class HealthKitWriter {
     static let workoutWalkRunDistanceMetersKey = "hk.workoutWalkRunDistance.meters"
     static let workoutActiveKcalDayKey         = "hk.workoutActiveKcal.day"
     static let workoutActiveKcalKey            = "hk.workoutActiveKcal.kcal"
-    private static let estimateGPSCreditedDayKey    = "hk.distanceEstimate.gpsCreditedDay"
-    private static let estimateGPSCreditedMetersKey = "hk.distanceEstimate.gpsCreditedMeters"
+    static let estimateGPSCreditedDayKey    = "hk.distanceEstimate.gpsCreditedDay"
+    static let estimateGPSCreditedMetersKey = "hk.distanceEstimate.gpsCreditedMeters"
 
     /// Record foot-based workout GPS distance (meters) written to .distanceWalkingRunning today,
     /// so the daily steps×stride estimate can net it out and avoid double counting. Day-keyed.
@@ -1504,8 +1504,8 @@ final class HealthKitWriter {
         defaults.set(prior + kcal, forKey: workoutActiveKcalKey)
     }
 
-    private static let workoutCreditedSpansDayKey = "hk.workoutCreditedSpans.day"
-    private static let workoutCreditedSpansKey    = "hk.workoutCreditedSpans.spans"
+    static let workoutCreditedSpansDayKey = "hk.workoutCreditedSpans.day"
+    static let workoutCreditedSpansKey    = "hk.workoutCreditedSpans.spans"
 
     /// Record `[start, end]` of a workout whose active energy was just credited via
     /// `recordWorkoutActiveKcal`, so the #281 motion gate can exempt it even when the workout left
@@ -1544,6 +1544,86 @@ final class HealthKitWriter {
             return DateInterval(start: Date(timeIntervalSince1970: pair[0]),
                                 end: Date(timeIntervalSince1970: pair[1]))
         }
+    }
+
+    // MARK: Undoing a deleted workout's credits (#293)
+    //
+    // The three record functions above bank a workout's kcal, span and walk/run GPS distance for
+    // TODAY. When the user deletes that workout from the history screen, the day's estimates must
+    // stop netting it out. Each helper below reverses exactly one record function, touches only
+    // today's slot (a stale or past-day slot is left alone: those credits already expired with
+    // their day), and returns whether it changed anything.
+    //
+    // A credit the active-energy flush already CONSUMED stays consumed: the daily samples Health
+    // holds were written net of it, and re-paying them is the flush's job, not this one's (see the
+    // #293 report). The consumed mark is lowered with the credit so the remaining credit stays
+    // coherent (credit − consumed = what is still owed), and so a later workout today is netted
+    // rather than hidden behind a consumed mark larger than the credit.
+
+    /// Bumped whenever a deleted workout's credits are undone, so the dashboard's cached estimates
+    /// (which key their recompute on their own inputs) recompute with the new credits.
+    static let workoutCreditsRevisionKey = "hk.workoutCredits.revision"
+
+    /// Reverse `recordWorkoutActiveKcal(kcal, day:)` for a workout that ended `day`.
+    @discardableResult
+    static func undoWorkoutActiveKcal(_ kcal: Double, day: Date, now: Date = Date(),
+                                      _ defaults: UserDefaults = .standard) -> Bool {
+        guard kcal > 0 else { return false }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        guard cal.startOfDay(for: day) == today else { return false }
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutActiveKcalDayKey))
+        guard cal.startOfDay(for: storedDay) == today else { return false }
+        let credit = defaults.double(forKey: workoutActiveKcalKey)
+        guard credit > 0 else { return false }
+        defaults.set(max(0, credit - kcal), forKey: workoutActiveKcalKey)
+
+        let consumedDay = Date(timeIntervalSince1970: defaults.double(forKey: activeWorkoutCreditedDayKey))
+        if cal.startOfDay(for: consumedDay) == today {
+            let consumed = defaults.double(forKey: activeWorkoutCreditedKey)
+            defaults.set(max(0, consumed - kcal), forKey: activeWorkoutCreditedKey)
+        }
+        return true
+    }
+
+    /// Reverse `recordWorkoutCreditedSpan(start:end:)`: drop today's span matching `[start, end]`
+    /// (to the second; HealthKit round-trips dates through its own storage).
+    @discardableResult
+    static func removeWorkoutCreditedSpan(start: Date, end: Date, now: Date = Date(),
+                                          _ defaults: UserDefaults = .standard) -> Bool {
+        let cal = Calendar.current
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutCreditedSpansDayKey))
+        guard cal.startOfDay(for: storedDay) == cal.startOfDay(for: now) else { return false }
+        let spans = defaults.array(forKey: workoutCreditedSpansKey) as? [[Double]] ?? []
+        let s = start.timeIntervalSince1970, e = end.timeIntervalSince1970
+        guard let index = spans.firstIndex(where: {
+            $0.count == 2 && abs($0[0] - s) < 1 && abs($0[1] - e) < 1
+        }) else { return false }
+        var kept = spans
+        kept.remove(at: index)
+        defaults.set(kept, forKey: workoutCreditedSpansKey)
+        return true
+    }
+
+    /// Reverse `recordWorkoutWalkRunDistance(meters)` for a workout whose GPS distance was banked today.
+    @discardableResult
+    static func undoWorkoutWalkRunDistance(_ meters: Double, now: Date = Date(),
+                                           _ defaults: UserDefaults = .standard) -> Bool {
+        guard meters > 0 else { return false }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutWalkRunDistanceDayKey))
+        guard cal.startOfDay(for: storedDay) == today else { return false }
+        let total = defaults.double(forKey: workoutWalkRunDistanceMetersKey)
+        guard total > 0 else { return false }
+        defaults.set(max(0, total - meters), forKey: workoutWalkRunDistanceMetersKey)
+
+        let creditedDay = Date(timeIntervalSince1970: defaults.double(forKey: estimateGPSCreditedDayKey))
+        if cal.startOfDay(for: creditedDay) == today {
+            let credited = defaults.double(forKey: estimateGPSCreditedMetersKey)
+            defaults.set(max(0, credited - meters), forKey: estimateGPSCreditedMetersKey)
+        }
+        return true
     }
 
     private static func workoutActiveKcalCredited(day today: Date,

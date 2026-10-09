@@ -688,7 +688,8 @@ struct ContentView: View {
                     // model, no schema version). Before this a finished workout was visible exactly
                     // once — on the summary screen — which is the other half of the tester's "it
                     // ended up in my Apple Health … but I didn't see it in Open Circuit".
-                    RecentWorkoutsCard(reloadToken: workoutHistoryToken)
+                    RecentWorkoutsCard(reloadToken: workoutHistoryToken,
+                                       onWorkoutsChanged: { workoutHistoryToken += 1 })
                     card { GoalsCardView() }
                     // The same four rings, for the days BEFORE today. Derived from the shared trends
                     // cache — no extra fetch, no new stored column (see `GoalHistory`).
@@ -1058,13 +1059,13 @@ struct ContentView: View {
         if case .idle = workoutManager.recordingState {} else { return }
         guard session?.workoutHolding != true else { return }
 
-        switch WorkoutSessionRecovery.decide(snapshot: WorkoutSessionManager.persistedSessionSnapshot) {
+        switch WorkoutSessionManager.recoveryDecision(snapshot: WorkoutSessionManager.persistedSessionSnapshot) {
         case .nothingToRecover:
             return
         case .discard(let refusal):
-            // Nothing defensible to save (no observed span, or a future-dated snapshot from a clock
-            // that moved backwards). Drop it silently — asking the user about a workout we could
-            // not describe would be worse than saying nothing.
+            // Nothing defensible to save (no observed span, a future-dated snapshot from a clock
+            // that moved backwards, or a workout the user deleted). Drop it silently — asking the
+            // user about a workout we could not describe would be worse than saying nothing.
             ringLog.notice("workout: discarding orphaned session snapshot (\(refusal.rawValue, privacy: .public))")
             WorkoutSessionManager.clearSessionSnapshot()
         case .offer(let recovered):
@@ -2810,8 +2811,10 @@ struct CaloriesCardView: View {
     private var caloriesInputsKey: String {
         "\(hrSamples.count)|\(todayDaily.first?.steps ?? 0)|\(recentStepSamples.count)|"
         + "\(age)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
-        + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)"
+        + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(workoutCreditsRevision)"
     }
+    /// Bumped when a deleted workout's credited span is undone (#293), so the estimate recomputes.
+    @AppStorage(HealthKitWriter.workoutCreditsRevisionKey) private var workoutCreditsRevision = 0
 
     private var profile: UserProfile {
         UserProfile(age: age, weightKg: max(effectiveWeightKg, 1), heightCm: max(heightCm, 1),

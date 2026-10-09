@@ -139,6 +139,9 @@ final class StrapWorkoutRecorderTests: XCTestCase {
         let store: FakeHRStore
     }
 
+    /// Deleted workouts (#293), in a defaults suite of this test's own.
+    private let tombstones = WorkoutTombstones(UserDefaults(suiteName: "strap-workout-tombstones-\(UUID().uuidString)")!)
+
     private func makeRig(source: @escaping @MainActor () -> (any StrapWorkoutHeartRateSource)?,
                          journal: MemoryJournal? = nil, store: FakeHRStore? = nil,
                          vo2: FakeVO2? = nil) -> Rig {
@@ -150,6 +153,7 @@ final class StrapWorkoutRecorderTests: XCTestCase {
         let recorder = StrapWorkoutRecorder(source: source, health: health, journal: journal, hrStore: { store },
                                             location: location, liveActivity: nil, profile: { profile },
                                             indoorKeepAlive: { false }, orphanStop: orphanStop, vo2: vo2,
+                                            tombstones: tombstones,
                                             clock: { [unowned self] in self.now }, autoTick: false, managesIdleTimer: false)
         return Rig(recorder: recorder, health: health, journal: journal, location: location, store: store)
     }
@@ -437,6 +441,38 @@ final class StrapWorkoutRecorderTests: XCTestCase {
         let third = makeRig(source: { source }, journal: journal)
         third.recorder.resolveOrphan()
         XCTAssertNil(third.recorder.recoverable)
+    }
+
+    /// #293: an interrupted workout over a stretch the user deleted from the history is dropped, never
+    /// offered back (the running journal and a parked one alike).
+    func testAnInterruptedWorkoutOverADeletedWorkoutIsNotOfferedBack() async throws {
+        let journal = MemoryJournal()
+        let source = makeSource()
+        do {
+            let first = makeRig(source: { source }, journal: journal)
+            first.recorder.start()
+            await stream(first, source, from: 0, to: 120, bpm: 140)
+        }
+        now = at(4000)
+        let probe = makeRig(source: { source }, journal: journal)
+        probe.recorder.resolveOrphan()
+        let offered = try XCTUnwrap(probe.recorder.recoverable, "offered before the delete")
+        probe.recorder.postponeRecovered()
+        let interrupted = try XCTUnwrap(journal.journal)
+
+        tombstones.record(start: offered.ledger.start, end: offered.end)
+        let relaunch = makeRig(source: { source }, journal: journal)
+        relaunch.recorder.resolveOrphan()
+        XCTAssertNil(relaunch.recorder.recoverable)
+        XCTAssertNil(journal.journal, "the running journal is dropped")
+        XCTAssertEqual(relaunch.health.writes.count, 0)
+
+        // The same, parked aside by a later workout's start.
+        journal.parked = [StrapWorkoutParked(journal: interrupted, samples: offered.samples)]
+        let again = makeRig(source: { source }, journal: journal)
+        again.recorder.resolveOrphan()
+        XCTAssertNil(again.recorder.recoverable)
+        XCTAssertTrue(journal.parked.isEmpty, "a parked one is dropped too")
     }
 
     func testDiscardAndNotNow() async throws {

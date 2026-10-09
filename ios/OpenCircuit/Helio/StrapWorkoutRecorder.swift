@@ -245,6 +245,8 @@ final class StrapWorkoutRecorder {
     @ObservationIgnored private let indoorKeepAlive: () -> Bool
     @ObservationIgnored private let orphanStop: StrapWorkoutOrphanStop
     @ObservationIgnored private let vo2: (any StrapVO2MaxProviding)?
+    /// Workouts deleted from the history screen (#293): never offered back after a kill.
+    @ObservationIgnored private let tombstones: WorkoutTombstones
 
     // MARK: Session state
 
@@ -272,6 +274,7 @@ final class StrapWorkoutRecorder {
          },
          orphanStop: StrapWorkoutOrphanStop = StrapWorkoutOrphanStop(),
          vo2: (any StrapVO2MaxProviding)? = nil,
+         tombstones: WorkoutTombstones = WorkoutTombstones(),
          clock: @escaping () -> Date = Date.init,
          autoTick: Bool = true,
          managesIdleTimer: Bool = true) {
@@ -285,6 +288,7 @@ final class StrapWorkoutRecorder {
         self.indoorKeepAlive = indoorKeepAlive
         self.orphanStop = orphanStop
         self.vo2 = vo2
+        self.tombstones = tombstones
         self.clock = clock
         self.autoTick = autoTick
         self.managesIdleTimer = managesIdleTimer
@@ -621,7 +625,7 @@ final class StrapWorkoutRecorder {
             // Review-238 SF2: whatever the answer (Save, Discard, Not now, or a refusal below), the dead
             // process's stream is owed one `04 00`, sent at the strap's next authenticated `ready`.
             orphanStop.owed = true
-            switch StrapWorkoutRecovery.decide(journal: running, samples: journal.loadSamples(), now: now) {
+            switch tombstones.filter(StrapWorkoutRecovery.decide(journal: running, samples: journal.loadSamples(), now: now)) {
             case .nothingToRecover:
                 break
             case .discard(let refusal):
@@ -634,11 +638,12 @@ final class StrapWorkoutRecorder {
             }
         }
         if recoverable == nil {
-            // A workout set aside by a new one's start after "Not now"; one with no defensible span is dropped.
+            // A workout set aside by a new one's start after "Not now"; one with no defensible span, or one
+            // the user has since deleted from the history (#293), is dropped.
             var parked = journal.loadParked()
             let before = parked.count
             while let first = parked.first {
-                if case .offer(let recovered) = StrapWorkoutRecovery.decide(journal: first.journal, samples: first.samples, now: now) {
+                if case .offer(let recovered) = tombstones.filter(StrapWorkoutRecovery.decide(journal: first.journal, samples: first.samples, now: now)) {
                     helioLog.notice("helio: offering a postponed interrupted workout back")
                     recoverable = recovered
                     recoverableSlot = .parked(0)

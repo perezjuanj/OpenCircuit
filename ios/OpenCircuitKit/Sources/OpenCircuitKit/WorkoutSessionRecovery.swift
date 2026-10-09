@@ -129,6 +129,9 @@ public enum WorkoutRecoveryRefusal: String, Equatable, Sendable {
     /// that moved backwards (or a corrupt blob) — refuse it rather than write a future-dated
     /// workout into Apple Health, where it cannot be reasoned about afterwards.
     case endsInTheFuture
+    /// The span overlaps a workout the user deleted from the history screen (#293): offering it back
+    /// would undo their decision. Applied by the app, which owns the record of deletions.
+    case deletedByUser
 }
 
 /// What a launch should do about a persisted snapshot.
