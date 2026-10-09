@@ -168,11 +168,10 @@ enum SharedScreenCopy {
     static func goalsFootnote(_ device: ActiveDeviceChoice) -> String {
         let base = "\u{B9} Activity Score is an on-device estimate — the weighted attainment of your step, "
             + "active-calorie & elevated-HR goals, not your device app's own number. Elevated HR counts time "
-            + "spent at least 40% of the way from your resting heart rate up to your age-estimated maximum, so "
-            + "the bar moves with your resting pulse instead of being the same number for everyone; on a day "
-            + "with too little data to read your resting pulse it falls back to half your age-estimated "
-            + "maximum. Active calories and elevated-HR minutes use those same qualifying periods; steps remain "
-            + "the calorie fallback. Elevated HR is not detected workout duration."
+            + "at or above half your age-estimated maximum heart rate while you are moving (steps around it, "
+            + "or a recorded workout), so a raised pulse while sitting still doesn't count. Active calories "
+            + "use those same periods and count only energy above resting, which goes to Health as Resting "
+            + "Energy; steps remain the calorie fallback. Elevated HR is not detected workout duration."
         return device.activityScoreAccuracyNote.map { base + " " + $0 } ?? base
     }
 

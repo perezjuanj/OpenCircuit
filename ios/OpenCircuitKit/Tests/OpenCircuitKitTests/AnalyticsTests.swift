@@ -186,7 +186,7 @@ final class AnalyticsTests: XCTestCase {
             hrSamples: samples,
             steps: 0,
             profile: profile
-        )
+        , corroborateMotion: false)
         let expectedKcal = Calories.workoutActiveKcal(
             avgHR: 100,
             durationSeconds: 10 * 60,
@@ -201,7 +201,7 @@ final class AnalyticsTests: XCTestCase {
     func testDailyEstimateFallsBackToStepsWithoutQualifyingHR() {
         let profile = UserProfile(age: 33, weightKg: 72.5, heightCm: 170, sex: .male)
         let low = HRSample(bpm: 70, start: Date(timeIntervalSince1970: 0))
-        let result = Calories.dailyEstimate(hrSamples: [low], steps: 5_000, profile: profile)
+        let result = Calories.dailyEstimate(hrSamples: [low], steps: 5_000, profile: profile, corroborateMotion: false)
 
         XCTAssertEqual(result.elevatedMinutes, 0)
         XCTAssertEqual(result.activeKcal,

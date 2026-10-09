@@ -502,10 +502,25 @@ public enum Calories {
     /// Keytel 2005 energy expenditure (kJ·min⁻¹), W = body mass kg, A = age years:
     ///   men:   −55.0969 + 0.6309·HR + 0.1988·W + 0.2017·A
     ///   women: −20.4022 + 0.4472·HR − 0.1263·W + 0.0740·A
-    /// kcal = kJ / 4.184. The per-minute rate is clamped to ≥ 0 (a very low HR yields a negative raw
-    /// rate). Returns 0 for a non-positive HR or duration.
+    /// kcal = kJ / 4.184.
+    ///
+    /// NET OF RESTING ENERGY. Keytel predicts GROSS expenditure: everything burned in that minute,
+    /// resting metabolism included. Apple Health's Active Energy is energy ABOVE resting, and this app
+    /// already writes the resting part every hour as Resting Energy (`basalKcalPerHour`). Writing the
+    /// gross figure as active therefore counted the same resting kcal twice, once in each type, and
+    /// Health's Total summed both. So the per-minute rate here is Keytel minus the profile's resting
+    /// rate (`bmrKcalPerDay / 1440`), clamped to ≥ 0. At low heart rates the net rate is near zero,
+    /// so a raw rate that is negative or just above rest gives 0. Returns 0 for a non-positive HR or
+    /// duration.
     public static func workoutActiveKcal(avgHR: Int, durationSeconds: Double, profile: UserProfile) -> Double {
         guard avgHR > 0, durationSeconds > 0 else { return 0 }
+        let net = keytelGrossKcalPerMinute(avgHR: avgHR, profile: profile) - restingKcalPerMinute(profile: profile)
+        return max(0, net) * (durationSeconds / 60.0)
+    }
+
+    /// The raw Keytel (2005) gross rate in kcal/min, before resting energy is taken off. Can be
+    /// negative at very low HR. Exposed so the formula itself stays pinned by tests.
+    public static func keytelGrossKcalPerMinute(avgHR: Int, profile: UserProfile) -> Double {
         let hr = Double(avgHR)
         let w = profile.weightKg
         let a = Double(profile.age)
@@ -514,7 +529,11 @@ public enum Calories {
         case .male:   kJPerMin = -55.0969 + 0.6309 * hr + 0.1988 * w + 0.2017 * a
         case .female: kJPerMin = -20.4022 + 0.4472 * hr - 0.1263 * w + 0.0740 * a
         }
-        let kcalPerMin = max(0, kJPerMin / 4.184)
-        return kcalPerMin * (durationSeconds / 60.0)
+        return kJPerMin / 4.184
+    }
+
+    /// Resting energy per minute, from the same Mifflin-St Jeor BMR the hourly Resting Energy writes use.
+    public static func restingKcalPerMinute(profile: UserProfile) -> Double {
+        bmrKcalPerDay(profile: profile) / 1440.0
     }
 }

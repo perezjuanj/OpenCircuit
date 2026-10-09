@@ -101,11 +101,13 @@ public enum ExerciseMinutes {
     /// and its HR chart, and its steps (if any) still earn walking energy in `Calories`. Only the
     /// Keytel channel and the exercise minutes leave it out.
     ///
-    /// WHY IT SHIPS OFF. Every rule in it is argued from physiology and from the shape of the data we
-    /// store, but none has been checked against real days, and this file has twice shipped a model
-    /// that was self-consistent under `swift test` and wrong on a phone. Apple Health SUMS active
-    /// energy: a wrong write can't be taken back. Known costs, each of which is a real day getting
-    /// LESS than it gets now:
+    /// WHY IT IS ON (#281, decision 67). It shipped off until checked against real days. Three
+    /// days from the owner's own ring were priced side by side. Ungated, two ordinary full days with
+    /// ~5,300 steps and no workout read ~2,200-2,330 active kcal from 325-342 "elevated" minutes,
+    /// mostly seated stretches just over the half-of-max-HR bar. Gated, they read ~330-410 kcal from 40-53
+    /// minutes, and each morning walk kept its energy. That matches how motion-aware wearables
+    /// (Apple Watch, Garmin, Fitbit) count active energy. Known costs, each of which is a real day
+    /// getting LESS than it did with the gate off:
     ///   • Unrecorded exercise that is not walking (cycling, rowing, weights, swimming) produces few
     ///     or no steps. It keeps its HR energy only if the ring flagged it as an activity session or
     ///     the wearer recorded it as a workout.
@@ -118,10 +120,9 @@ public enum ExerciseMinutes {
     ///   • A day whose step rows predate per-snapshot step history has no step windows. With the gate
     ///     on, its HR channel reads 0 and the day falls back to step energy only.
     ///
-    /// Before turning this on: run a few real days per device both ways (`corroborateMotion:` exists
-    /// so a day can be priced side by side), and check that a day with a known walk keeps it and a
-    /// day with a known seated elevated stretch loses it.
-    public static let motionCorroborationEnabled = false
+    /// Recording non-walking exercise as a workout keeps all of it (recorded workouts are always
+    /// corroborated). `corroborateMotion:` still lets a day be priced both ways side by side.
+    public static let motionCorroborationEnabled = true
 
     /// Minimum step cadence, in steps per minute AVERAGED over a reading's corroboration window,
     /// that counts as motion.

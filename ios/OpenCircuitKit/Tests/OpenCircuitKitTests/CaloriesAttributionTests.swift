@@ -8,6 +8,10 @@ import XCTest
 /// `max(hrKcal, stepKcal)` over two WHOLE-DAY snapshots — once the last elevated-HR bout ends
 /// `hrKcal` is exactly constant, and the step channel needs ~27-40k steps to overtake it, so the
 /// day total froze and `flushActiveCalories` computed a delta of 0.000 on every later flush.
+///
+/// These fixtures are HR-only (no steps), and they pin HR-threshold and attribution mechanics, so every
+/// call prices with the #281 motion gate OFF (`corroborateMotion: false`). The gate itself, which is
+/// on in production, is pinned in `MotionCorroborationGateTests`.
 final class CaloriesAttributionTests: XCTestCase {
 
     private let profile = UserProfile(age: 35, weightKg: 72, heightCm: 178, sex: .male)
@@ -38,9 +42,9 @@ final class CaloriesAttributionTests: XCTestCase {
         let windows = [steps(2_000, fromHour: 8, minutes: 20),      // during the bout
                        steps(2_100, fromHour: 15, minutes: 25)]     // the walk home, HR ~88
 
-        let legacy = Calories.dailyEstimate(hrSamples: hr, steps: 4_100, profile: profile)
+        let legacy = Calories.dailyEstimate(hrSamples: hr, steps: 4_100, profile: profile, corroborateMotion: false)
         let attributed = Calories.dailyEstimate(hrSamples: hr, steps: 4_100, profile: profile,
-                                                stepWindows: windows, dayStart: day)
+                                                stepWindows: windows, dayStart: day, corroborateMotion: false)
 
         // Legacy: the afternoon is worth zero, so the day total is just the morning bout.
         XCTAssertEqual(legacy.activeKcal,
@@ -64,16 +68,16 @@ final class CaloriesAttributionTests: XCTestCase {
         let windows = [steps(3_000, fromHour: 8, minutes: 30)]
 
         let before = Calories.dailyEstimate(hrSamples: morning, steps: 3_000, profile: profile,
-                                            stepWindows: windows, dayStart: day)
+                                            stepWindows: windows, dayStart: day, corroborateMotion: false)
         let after = Calories.dailyEstimate(hrSamples: morning + spots, steps: 3_000,
                                            profile: profile,
-                                           stepWindows: windows, dayStart: day)
+                                           stepWindows: windows, dayStart: day, corroborateMotion: false)
         XCTAssertGreaterThanOrEqual(after.activeKcal, before.activeKcal - 0.000_001)
 
         // …and the legacy path is the thing that regresses, which is why this fix exists.
-        let legacyBefore = Calories.dailyEstimate(hrSamples: morning, steps: 3_000, profile: profile)
+        let legacyBefore = Calories.dailyEstimate(hrSamples: morning, steps: 3_000, profile: profile, corroborateMotion: false)
         let legacyAfter = Calories.dailyEstimate(hrSamples: morning + spots, steps: 3_000,
-                                                 profile: profile)
+                                                 profile: profile, corroborateMotion: false)
         XCTAssertLessThan(legacyAfter.activeKcal, legacyBefore.activeKcal)
     }
 
@@ -85,7 +89,7 @@ final class CaloriesAttributionTests: XCTestCase {
                        steps(4_200, fromHour: 12, minutes: 90),
                        steps(1_500, fromHour: 18, minutes: 15)]
         let e = Calories.dailyEstimate(hrSamples: hr, steps: 7_500, profile: profile,
-                                       stepWindows: windows, dayStart: day)
+                                       stepWindows: windows, dayStart: day, corroborateMotion: false)
         XCTAssertEqual(e.buckets.reduce(0) { $0 + $1.activeKcal }, e.activeKcal, accuracy: 1e-9)
     }
 
@@ -100,7 +104,7 @@ final class CaloriesAttributionTests: XCTestCase {
         let widths: [TimeInterval] = [5 * 60, 10 * 60, 15 * 60, 30 * 60, 60 * 60]
         let totals = widths.map { w in
             Calories.dailyEstimate(hrSamples: hr, steps: 6_600, profile: profile,
-                                   stepWindows: windows, dayStart: day, bucketSeconds: w).activeKcal
+                                   stepWindows: windows, dayStart: day, bucketSeconds: w, corroborateMotion: false).activeKcal
         }
         for total in totals.dropFirst() {
             XCTAssertEqual(total, totals[0], accuracy: 1e-6)
@@ -111,7 +115,7 @@ final class CaloriesAttributionTests: XCTestCase {
         let hr = bout(fromHour: 6, minutes: 10, bpm: 120)
         let windows = [steps(3_000, fromHour: 6, minutes: 200)]
         let e = Calories.dailyEstimate(hrSamples: hr, steps: 3_000, profile: profile,
-                                       stepWindows: windows, dayStart: day)
+                                       stepWindows: windows, dayStart: day, corroborateMotion: false)
         XCTAssertFalse(e.buckets.isEmpty)
         for (a, b) in zip(e.buckets, e.buckets.dropFirst()) {
             XCTAssertLessThanOrEqual(a.end, b.start)
@@ -126,7 +130,7 @@ final class CaloriesAttributionTests: XCTestCase {
         let hr = bout(fromHour: 10, minutes: 20, bpm: 125)
         let windows = [steps(2_200, fromHour: 10, minutes: 20)]   // entirely inside the bout
         let e = Calories.dailyEstimate(hrSamples: hr, steps: 2_200, profile: profile,
-                                       stepWindows: windows, dayStart: day)
+                                       stepWindows: windows, dayStart: day, corroborateMotion: false)
 
         let hrOnly = Calories.workoutActiveKcal(avgHR: 125, durationSeconds: 20 * 60,
                                                 profile: profile)
@@ -141,7 +145,7 @@ final class CaloriesAttributionTests: XCTestCase {
         let hr = bout(fromHour: 10, minutes: 5, bpm: 93)          // barely over the gate
         let windows = [steps(4_000, fromHour: 10, minutes: 5)]    // a lot of walking, 5 min
         let e = Calories.dailyEstimate(hrSamples: hr, steps: 4_000, profile: profile,
-                                       stepWindows: windows, dayStart: day)
+                                       stepWindows: windows, dayStart: day, corroborateMotion: false)
 
         let hrOnly = Calories.workoutActiveKcal(avgHR: 93, durationSeconds: 5 * 60, profile: profile)
         let stepOnly = Calories.activeKcalFromSteps(steps: 4_000, profile: profile)
@@ -155,8 +159,8 @@ final class CaloriesAttributionTests: XCTestCase {
         let hr = bout(fromHour: 8, minutes: 20, bpm: 118)
         let windows = [steps(2_000, fromHour: 8, minutes: 20)]
         let e = Calories.dailyEstimate(hrSamples: hr, steps: 2_000, profile: profile,
-                                       stepWindows: windows)
-        let legacy = Calories.legacyDailyEstimate(hrSamples: hr, steps: 2_000, profile: profile)
+                                       stepWindows: windows, corroborateMotion: false)
+        let legacy = Calories.legacyDailyEstimate(hrSamples: hr, steps: 2_000, profile: profile, corroborateMotion: false)
         XCTAssertTrue(e.buckets.isEmpty)
         XCTAssertEqual(e.activeKcal, legacy.activeKcal, accuracy: 1e-9)
     }
@@ -166,8 +170,8 @@ final class CaloriesAttributionTests: XCTestCase {
     func testDegradesToLegacyWhenStepsExistWithoutWindows() {
         let hr = bout(fromHour: 8, minutes: 20, bpm: 118)
         let e = Calories.dailyEstimate(hrSamples: hr, steps: 9_000, profile: profile,
-                                       stepWindows: [], dayStart: day)
-        let legacy = Calories.legacyDailyEstimate(hrSamples: hr, steps: 9_000, profile: profile)
+                                       stepWindows: [], dayStart: day, corroborateMotion: false)
+        let legacy = Calories.legacyDailyEstimate(hrSamples: hr, steps: 9_000, profile: profile, corroborateMotion: false)
         XCTAssertTrue(e.buckets.isEmpty)
         XCTAssertEqual(e.activeKcal, legacy.activeKcal, accuracy: 1e-9)
     }
@@ -178,7 +182,7 @@ final class CaloriesAttributionTests: XCTestCase {
         let low = [HRSample(bpm: 70, start: at(9))]
         let windows = [steps(5_000, fromHour: 9, minutes: 240)]
         let e = Calories.dailyEstimate(hrSamples: low, steps: 5_000, profile: profile,
-                                       stepWindows: windows, dayStart: day)
+                                       stepWindows: windows, dayStart: day, corroborateMotion: false)
         XCTAssertEqual(e.elevatedMinutes, 0)
         XCTAssertEqual(e.activeKcal,
                        Calories.activeKcalFromSteps(steps: 5_000, profile: profile),
@@ -193,7 +197,7 @@ final class CaloriesAttributionTests: XCTestCase {
         // 999 steps (odd, to expose Int truncation) over 2 hours = 8 fifteen-minute buckets.
         let windows = [steps(999, fromHour: 9, minutes: 120)]
         let e = Calories.dailyEstimate(hrSamples: [], steps: 999, profile: profile,
-                                       stepWindows: windows, dayStart: day)
+                                       stepWindows: windows, dayStart: day, corroborateMotion: false)
         XCTAssertEqual(e.activeKcal,
                        Calories.activeKcalFromSteps(steps: 999, profile: profile),
                        accuracy: 1e-9)
@@ -205,7 +209,7 @@ final class CaloriesAttributionTests: XCTestCase {
     func testUnplacedStepsAreCreditedAtTheEarliestActivityNotMidnight() {
         let windows = [steps(1_000, fromHour: 16, minutes: 30)]
         let e = Calories.dailyEstimate(hrSamples: [], steps: 3_000, profile: profile,
-                                       stepWindows: windows, dayStart: day)
+                                       stepWindows: windows, dayStart: day, corroborateMotion: false)
         XCTAssertEqual(e.activeKcal,
                        Calories.activeKcalFromSteps(steps: 3_000, profile: profile),
                        accuracy: 1e-9)
@@ -218,7 +222,7 @@ final class CaloriesAttributionTests: XCTestCase {
     func testWindowStraddlingMidnightPlacesOnlyItsInDayShare() {
         let straddling = StepWindow(start: at(-1), end: at(1), delta: 600)  // half before midnight
         let e = Calories.dailyEstimate(hrSamples: [], steps: 300, profile: profile,
-                                       stepWindows: [straddling], dayStart: day)
+                                       stepWindows: [straddling], dayStart: day, corroborateMotion: false)
         XCTAssertEqual(e.activeKcal,
                        Calories.activeKcalFromSteps(steps: 300, profile: profile),
                        accuracy: 0.01)
@@ -230,7 +234,7 @@ final class CaloriesAttributionTests: XCTestCase {
     func testDailyStepScalarRemainsAuthoritativeOverTheSnapshots() {
         let straddling = StepWindow(start: at(-1), end: at(1), delta: 600)
         let e = Calories.dailyEstimate(hrSamples: [], steps: 600, profile: profile,
-                                       stepWindows: [straddling], dayStart: day)
+                                       stepWindows: [straddling], dayStart: day, corroborateMotion: false)
         XCTAssertEqual(e.activeKcal,
                        Calories.activeKcalFromSteps(steps: 600, profile: profile),
                        accuracy: 0.01)
@@ -240,7 +244,7 @@ final class CaloriesAttributionTests: XCTestCase {
         let asleep = bout(fromHour: 2, minutes: 20, bpm: 120)
         let sleep = DateInterval(start: at(0), end: at(6))
         let e = Calories.dailyEstimate(hrSamples: asleep, steps: 0, profile: profile,
-                                       sleepWindow: sleep, dayStart: day)
+                                       sleepWindow: sleep, dayStart: day, corroborateMotion: false)
         XCTAssertEqual(e.elevatedMinutes, 0)
         XCTAssertEqual(e.activeKcal, 0, accuracy: 1e-9)
     }
@@ -248,6 +252,10 @@ final class CaloriesAttributionTests: XCTestCase {
 
 /// `ExerciseMinutes.elevatedPieces` — the per-slice decomposition `estimate` is now defined on.
 /// The Apple Exercise ring reads `estimate`, so the anti-drift invariant here is load-bearing.
+///
+/// These fixtures are HR-only (no steps), and they pin HR-threshold and attribution mechanics, so every
+/// call prices with the #281 motion gate OFF (`corroborateMotion: false`). The gate itself, which is
+/// on in production, is pinned in `MotionCorroborationGateTests`.
 final class ElevatedPiecesTests: XCTestCase {
 
     private let day = Date(timeIntervalSince1970: 1_753_660_800)
@@ -270,8 +278,8 @@ final class ElevatedPiecesTests: XCTestCase {
              HRSample(bpm: 145, start: at(0), end: at(600))],
         ]
         for samples in cases {
-            let pieces = ExerciseMinutes.elevatedPieces(hrSamples: samples, maxHR: 185)
-            let scalar = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 185)
+            let pieces = ExerciseMinutes.elevatedPieces(hrSamples: samples, maxHR: 185, corroborateMotion: false)
+            let scalar = ExerciseMinutes.estimate(hrSamples: samples, maxHR: 185, corroborateMotion: false)
             XCTAssertEqual(pieces.reduce(0) { $0 + $1.seconds } / 60.0, scalar, accuracy: 1e-9)
         }
     }
@@ -280,7 +288,7 @@ final class ElevatedPiecesTests: XCTestCase {
         let samples = [HRSample(bpm: 140, start: at(0), end: at(600)),
                        HRSample(bpm: 100, start: at(300), end: at(900)),
                        HRSample(bpm: 130, start: at(1_800), end: at(2_000))]
-        let pieces = ExerciseMinutes.elevatedPieces(hrSamples: samples, maxHR: 185)
+        let pieces = ExerciseMinutes.elevatedPieces(hrSamples: samples, maxHR: 185, corroborateMotion: false)
         for (a, b) in zip(pieces, pieces.dropFirst()) {
             XCTAssertLessThanOrEqual(a.end, b.start)
         }
@@ -291,13 +299,13 @@ final class ElevatedPiecesTests: XCTestCase {
 
     func testIsolatedPointSampleStillEarnsNoTime() {
         let pieces = ExerciseMinutes.elevatedPieces(
-            hrSamples: [HRSample(bpm: 150, start: at(0))], maxHR: 185)
+            hrSamples: [HRSample(bpm: 150, start: at(0))], maxHR: 185, corroborateMotion: false)
         XCTAssertEqual(pieces.reduce(0) { $0 + $1.seconds }, 0)
     }
 
     func testConsecutivePointSamplesEachEarnAnEpoch() {
         let samples = (0 ..< 3).map { HRSample(bpm: 120, start: at(Double($0) * 150)) }
-        let pieces = ExerciseMinutes.elevatedPieces(hrSamples: samples, maxHR: 185)
+        let pieces = ExerciseMinutes.elevatedPieces(hrSamples: samples, maxHR: 185, corroborateMotion: false)
         XCTAssertEqual(pieces.reduce(0) { $0 + $1.seconds }, 450, accuracy: 1e-9)
         XCTAssertEqual(pieces.map(\.bpm), [120, 120, 120])
     }
