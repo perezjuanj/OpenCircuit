@@ -2,9 +2,13 @@
 //
 // Order, and why:
 //   1. the samples OpenCircuit saved WITH the workout that only describe it: its active energy (an
-//      estimate), its GPS distance and its route. Heart rate and steps are measurements and stay.
-//      They go first because `predicateForObjects(from:)` needs the workout to still exist.
-//   2. the `HKWorkout`.
+//      estimate), its GPS distance and its route, in ONE `delete` call so they go together or not at
+//      all. Heart rate and steps are measurements and stay. They go first because
+//      `predicateForObjects(from:)` needs the workout to still exist.
+//   2. the `HKWorkout`. HealthKit doesn't document whether deleting a workout also removes the
+//      samples its builder associated with it. So the heart-rate and step samples saved with it are
+//      read first, and any that are missing afterwards (looked up by UUID, so nothing still present is
+//      ever written twice) are saved again as standalone copies.
 //   3. only once both deletes succeeded: the tombstone (`WorkoutTombstones`) and, for a workout that
 //      ended today, the app-local credits that net it out of today's estimates.
 // If any HealthKit delete fails, step 3 never runs and the screen says what is left. Nothing local
@@ -21,8 +25,9 @@ import OpenCircuitKit
 protocol WorkoutHealthDeleting: AnyObject {
     /// Delete the active-energy, distance and route samples saved with workout `id` (our source only).
     func deleteOwnedSamples(ofWorkout id: UUID) async throws
-    /// Delete workout `id`. Succeeds when it is already gone.
-    func deleteWorkout(_ id: UUID) async throws
+    /// Delete workout `id`. Succeeds when it is already gone. Returns how many of the heart-rate and
+    /// step samples saved with it HealthKit removed and could NOT be saved back (0 when all are kept).
+    func deleteWorkout(_ id: UUID) async throws -> Int
 }
 
 @MainActor
@@ -41,16 +46,32 @@ struct WorkoutDeleter {
 
     enum Outcome: Equatable {
         case deleted
-        /// Nothing was removed from Apple Health (or only some of the samples were).
+        /// The workout is gone, but HealthKit removed this many heart-rate or step readings with it and
+        /// they could not be saved back.
+        case deletedLosingReadings(Int)
+        /// Apple Health removed none of the workout's own samples (they are deleted in one call).
         case samplesNotDeleted
         /// The samples are gone but the workout itself is still in Apple Health.
         case workoutNotDeleted
 
-        /// What the screen says when a delete did not finish. nil when it did.
+        /// Whether the workout is gone from Apple Health (the screens drop the row).
+        var removedWorkout: Bool {
+            switch self {
+            case .deleted, .deletedLosingReadings: return true
+            case .samplesNotDeleted, .workoutNotDeleted: return false
+            }
+        }
+
+        /// The alert title that goes with `failureMessage`.
+        var failureTitle: String { removedWorkout ? "Workout deleted" : "Workout not fully deleted" }
+
+        /// What the screen says when a delete did not finish cleanly. nil when it did.
         var failureMessage: String? {
             switch self {
             case .deleted:
                 return nil
+            case .deletedLosingReadings(let n):
+                return "The workout was deleted, but Apple Health also removed \(n) heart-rate or step \(n == 1 ? "reading" : "readings") saved with it, and they couldn't be saved back. They are still in OpenCircuit."
             case .samplesNotDeleted:
                 return "Apple Health did not remove this workout's calories, distance or route, so the workout was kept. Check that OpenCircuit can still write workouts in the Health app, then try again."
             case .workoutNotDeleted:
@@ -60,9 +81,10 @@ struct WorkoutDeleter {
     }
 
     static let confirmationTitle = "Delete this workout?"
-    /// Names what goes and what stays. Heart rate is a measurement, not part of the workout's
-    /// estimate, so it is kept (in the app and, see the #293 report, in Apple Health).
-    static let confirmationMessage = "This removes the workout from OpenCircuit and Apple Health, together with the calorie estimate, distance and route saved with it. Heart-rate readings are kept. This can't be undone."
+    /// Names what goes and what stays. Heart rate and steps are measurements, not part of the
+    /// workout's estimate, so they are kept: in the app, and in Apple Health (put back by
+    /// `HealthKitWorkoutStore.deleteWorkout` if deleting the workout took them).
+    static let confirmationMessage = "This removes the workout from OpenCircuit and Apple Health, together with the calorie estimate, distance and route saved with it. Heart-rate readings and steps are kept. This can't be undone."
 
     let health: any WorkoutHealthDeleting
     var tombstones = WorkoutTombstones()
@@ -71,7 +93,8 @@ struct WorkoutDeleter {
 
     func delete(_ target: Target) async -> Outcome {
         do { try await health.deleteOwnedSamples(ofWorkout: target.id) } catch { return .samplesNotDeleted }
-        do { try await health.deleteWorkout(target.id) } catch { return .workoutNotDeleted }
+        let lostReadings: Int
+        do { lostReadings = try await health.deleteWorkout(target.id) } catch { return .workoutNotDeleted }
 
         let now = now()
         tombstones.record(start: target.start, end: target.end, deletedAt: now)
@@ -92,7 +115,7 @@ struct WorkoutDeleter {
                 defaults.set(defaults.integer(forKey: key) + 1, forKey: key)
             }
         }
-        return .deleted
+        return lostReadings > 0 ? .deletedLosingReadings(lostReadings) : .deleted
     }
 }
 
@@ -106,6 +129,12 @@ final class HealthKitWorkoutStore: WorkoutHealthDeleting {
     private let store = HKHealthStore()
 
     /// The samples saved with a workout that only describe it, and are deleted with it.
+    /// Measurements saved with a workout. Never deleted, and put back if deleting the workout took them.
+    static let keptSampleTypes: [HKQuantityType] = [
+        HKQuantityType(.heartRate),
+        HKQuantityType(.stepCount),
+    ]
+
     static let ownedSampleTypes: [HKSampleType] = [
         HKQuantityType(.activeEnergyBurned),
         HKQuantityType(.distanceWalkingRunning),
@@ -125,17 +154,53 @@ final class HealthKitWorkoutStore: WorkoutHealthDeleting {
 
     func deleteOwnedSamples(ofWorkout id: UUID) async throws {
         guard let workout = try await workout(id) else { return }
+        var owned: [HKSample] = []
         for type in Self.ownedSampleTypes {
-            let owned = try await samples(of: type, predicate: Self.savedWith(workout))
-            // Only types that hold something: deleting a type the app never wrote (no route share
-            // grant, say) would fail for nothing.
-            if !owned.isEmpty { try await store.delete(owned) }
+            owned += try await samples(of: type, predicate: Self.savedWith(workout))
+        }
+        // One call, so a failure leaves all of them in place rather than some. Skipped when empty:
+        // deleting nothing (no route share grant, say) would fail for nothing.
+        if !owned.isEmpty { try await store.delete(owned) }
+    }
+
+    func deleteWorkout(_ id: UUID) async throws -> Int {
+        guard let workout = try await workout(id) else { return 0 }
+        var kept: [HKQuantitySample] = []
+        for type in Self.keptSampleTypes {
+            kept += try await samples(of: type, predicate: Self.savedWith(workout))
+                .compactMap { $0 as? HKQuantitySample }
+        }
+        try await store.delete(workout)
+        guard !kept.isEmpty else { return 0 }
+        // Look the kept samples up again by UUID. A lookup that fails counts as "still there": a
+        // copy saved over an original that still exists would double the steps.
+        var present = Set<UUID>()
+        for type in Self.keptSampleTypes {
+            let ids = kept.filter { $0.quantityType == type }.map(\.uuid)
+            guard !ids.isEmpty else { continue }
+            guard let found = try? await samples(of: type, predicate: HKQuery.predicateForObjects(with: Set(ids))) else {
+                present.formUnion(ids)
+                continue
+            }
+            present.formUnion(found.map(\.uuid))
+        }
+        let missing = Self.removedWithWorkout(kept: kept.map(\.uuid), stillPresent: present)
+        guard !missing.isEmpty else { return 0 }
+        let copies = kept.filter { missing.contains($0.uuid) }.map {
+            HKQuantitySample(type: $0.quantityType, quantity: $0.quantity, start: $0.startDate, end: $0.endDate,
+                             device: $0.device, metadata: $0.metadata)
+        }
+        do {
+            try await store.save(copies)
+            return 0
+        } catch {
+            return copies.count
         }
     }
 
-    func deleteWorkout(_ id: UUID) async throws {
-        guard let workout = try await workout(id) else { return }
-        try await store.delete(workout)
+    /// The kept samples HealthKit removed along with the workout: those not found again by UUID.
+    nonisolated static func removedWithWorkout(kept: [UUID], stillPresent: Set<UUID>) -> Set<UUID> {
+        Set(kept).subtracting(stillPresent)
     }
 
     /// The heart rate saved with the workout (through its builder): our source, inside its window.
@@ -171,10 +236,15 @@ final class HealthKitWorkoutStore: WorkoutHealthDeleting {
         return coordinates
     }
 
-    private static func savedWith(_ workout: HKWorkout) -> NSPredicate {
+    /// Samples saved with `workout` by this app. Association AND source, never a time window: a
+    /// window would also catch the daily energy flush and any other workout's samples.
+    /// `ourSource` is injectable only because `HKSource.default()` can't be built in an unsigned test host.
+    static func savedWith(_ workout: HKWorkout,
+                          ourSource: @autoclosure () -> NSPredicate = HKQuery.predicateForObjects(from: .default()))
+        -> NSPredicate {
         NSCompoundPredicate(andPredicateWithSubpredicates: [
             HKQuery.predicateForObjects(from: workout),
-            HKQuery.predicateForObjects(from: .default()),
+            ourSource(),
         ])
     }
 

@@ -138,14 +138,15 @@ struct WorkoutHistoryReader {
         await workouts(startingBefore: nil, limit: limit)
     }
 
-    /// One page of the full history (#293): up to `limit` of our workouts that started before
-    /// `cursor` (all of them when nil), newest first. Paged by date rather than by offset, so a
+    /// One page of the full history (#293): up to `limit` of our workouts that started at or before
+    /// `cursor` (all of them when nil), newest first. At-or-before, so a workout sharing the previous
+    /// page's last start instant isn't skipped; `appendPage` drops the repeats by UUID. Paged by date rather than by offset, so a
     /// workout saved or deleted while the list is open can't shift a page.
     func workouts(startingBefore cursor: Date?, limit: Int) async -> [Item] {
         guard HKHealthStore.isHealthDataAvailable() else { return [] }
         var predicates = [HKQuery.predicateForObjects(from: .default())]
         if let cursor {
-            predicates.append(NSPredicate(format: "%K < %@", HKPredicateKeyPathStartDate, cursor as NSDate))
+            predicates.append(NSPredicate(format: "%K <= %@", HKPredicateKeyPathStartDate, cursor as NSDate))
         }
         let workouts: [HKWorkout] = await withCheckedContinuation { cont in
             let query = HKSampleQuery(

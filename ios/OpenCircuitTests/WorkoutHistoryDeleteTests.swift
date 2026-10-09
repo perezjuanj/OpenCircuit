@@ -119,14 +119,17 @@ final class WorkoutCreditUndoTests: XCTestCase {
 private final class FakeWorkoutHealth: WorkoutHealthDeleting {
     var failSamples = false
     var failWorkout = false
+    /// Kept readings HealthKit "removed" with the workout and that could not be saved back.
+    var lostReadings = 0
     private(set) var calls: [String] = []
     func deleteOwnedSamples(ofWorkout id: UUID) async throws {
         calls.append("samples")
         if failSamples { throw CocoaError(.featureUnsupported) }
     }
-    func deleteWorkout(_ id: UUID) async throws {
+    func deleteWorkout(_ id: UUID) async throws -> Int {
         calls.append("workout")
         if failWorkout { throw CocoaError(.featureUnsupported) }
+        return lostReadings
     }
 }
 
@@ -234,7 +237,74 @@ final class WorkoutDeleterTests: XCTestCase {
         for removed in ["workout", "calorie estimate", "distance", "route", "Apple Health"] {
             XCTAssertTrue(message.contains(removed), "names \(removed)")
         }
-        XCTAssertTrue(message.contains("Heart-rate readings are kept"))
+        XCTAssertTrue(message.contains("Heart-rate readings and steps are kept"))
+    }
+
+    func testReadingsThatCouldNotBePutBackStillCountAsADeleteButAreReported() async {
+        creditAsTheWritePathDoes(walk)
+        health.lostReadings = 3
+        let outcome = await deleter.delete(walk)
+        XCTAssertEqual(outcome, .deletedLosingReadings(3))
+        XCTAssertTrue(outcome.removedWorkout, "the workout is gone, so the row goes")
+        XCTAssertEqual(outcome.failureTitle, "Workout deleted")
+        XCTAssertTrue(outcome.failureMessage?.contains("3 heart-rate or step readings") ?? false)
+        XCTAssertTrue(tombstones.suppresses(start: walk.start, end: walk.end))
+        XCTAssertEqual(defaults.double(forKey: HealthKitWriter.workoutActiveKcalKey), 0, accuracy: 1e-9)
+    }
+
+    func testFailedDeletesKeepTheRowAndSaySo() {
+        for outcome in [WorkoutDeleter.Outcome.samplesNotDeleted, .workoutNotDeleted] {
+            XCTAssertFalse(outcome.removedWorkout)
+            XCTAssertEqual(outcome.failureTitle, "Workout not fully deleted")
+        }
+        XCTAssertTrue(WorkoutDeleter.Outcome.samplesNotDeleted.failureMessage?.contains("did not remove") ?? false)
+        XCTAssertTrue(WorkoutDeleter.Outcome.deleted.removedWorkout)
+        XCTAssertNil(WorkoutDeleter.Outcome.deleted.failureMessage)
+    }
+}
+
+// MARK: - What the HealthKit layer deletes (review-293 SF2)
+
+@MainActor
+final class WorkoutHealthDeleteScopeTests: XCTestCase {
+    func testTheWorkoutsOwnSamplesIncludeTheRouteAndNeverAMeasurement() {
+        let owned = HealthKitWorkoutStore.ownedSampleTypes
+        XCTAssertTrue(owned.contains(HKSeriesType.workoutRoute()), "the route goes with the workout")
+        XCTAssertTrue(owned.contains(HKQuantityType(.activeEnergyBurned)))
+        XCTAssertTrue(owned.contains(HKQuantityType(.distanceWalkingRunning)))
+        XCTAssertTrue(owned.contains(HKQuantityType(.distanceCycling)))
+        XCTAssertEqual(owned.count, 4)
+        for kept in HealthKitWorkoutStore.keptSampleTypes {
+            XCTAssertFalse(owned.contains(kept), "\(kept) is a measurement and is never deleted")
+        }
+        XCTAssertEqual(Set(HealthKitWorkoutStore.keptSampleTypes),
+                       [HKQuantityType(.heartRate), HKQuantityType(.stepCount)])
+    }
+
+    func testSamplesAreMatchedByWorkoutAndSourceNeverByTime() {
+        let start = Date(timeIntervalSince1970: 1_758_369_600)
+        let workout = HKWorkout(activityType: .walking, start: start, end: start.addingTimeInterval(1_800))
+        // Stand-in for the source predicate: `HKSource.default()` can't be built in an unsigned test host.
+        let ourSource = NSPredicate(format: "sourceStandIn == 1")
+        let predicate = HealthKitWorkoutStore.savedWith(workout, ourSource: ourSource)
+        guard let compound = predicate as? NSCompoundPredicate else { return XCTFail("compound expected") }
+        XCTAssertEqual(compound.compoundPredicateType, .and)
+        let expected = [HKQuery.predicateForObjects(from: workout), ourSource]
+        XCTAssertEqual(compound.subpredicates.count, 2)
+        for (got, want) in zip(compound.subpredicates.compactMap { $0 as? NSPredicate }, expected) {
+            XCTAssertEqual(got.predicateFormat, want.predicateFormat)
+        }
+        XCTAssertFalse(predicate.predicateFormat.contains(HKPredicateKeyPathStartDate),
+                       "a time window would also catch the daily energy flush and other workouts")
+        XCTAssertFalse(predicate.predicateFormat.contains(HKPredicateKeyPathEndDate))
+    }
+
+    func testOnlyReadingsNotFoundAgainAreSavedBack() {
+        let a = UUID(), b = UUID(), c = UUID()
+        XCTAssertEqual(HealthKitWorkoutStore.removedWithWorkout(kept: [a, b, c], stillPresent: [a, b, c]), [],
+                       "HealthKit kept them: nothing is written twice")
+        XCTAssertEqual(HealthKitWorkoutStore.removedWithWorkout(kept: [a, b, c], stillPresent: []), [a, b, c])
+        XCTAssertEqual(HealthKitWorkoutStore.removedWithWorkout(kept: [a, b, c], stillPresent: [b]), [a, c])
     }
 }
 
@@ -435,5 +505,18 @@ final class WorkoutDetailContentTests: XCTestCase {
         XCTAssertEqual(result.items.count, 4, "a repeat of a held workout is not added twice")
         XCTAssertTrue(result.reachedEnd)
         XCTAssertEqual(result.items.map(\.start), result.items.map(\.start).sorted(by: >))
+    }
+
+    /// Two workouts sharing the page boundary's start instant: the next page (queried at-or-before
+    /// the cursor) repeats the held one and brings the other, which must not be skipped.
+    func testAWorkoutSharingTheBoundaryStartIsNotSkipped() {
+        let boundary = at(-120)
+        let first = [item(start: at(0)), item(start: at(-60)), item(start: boundary)]
+        var result = WorkoutDetailContent.appendPage(first, to: [], pageSize: 3)
+        let twin = item(start: boundary)
+        result = WorkoutDetailContent.appendPage([first[2], twin, item(start: at(-500))], to: result.items, pageSize: 3)
+        XCTAssertTrue(result.items.contains { $0.id == twin.id })
+        XCTAssertEqual(result.items.count, 5)
+        XCTAssertFalse(result.reachedEnd, "a full page that brought something new is not the end")
     }
 }

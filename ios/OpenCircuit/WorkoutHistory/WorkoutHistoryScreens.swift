@@ -30,6 +30,7 @@ struct WorkoutHistoryListView: View {
     @State private var pendingDelete: WorkoutHistoryReader.Item?
     @State private var deleting = false
     @State private var failure: String?
+    @State private var failureTitle = "Workout not fully deleted"
 
     var body: some View {
         List {
@@ -70,7 +71,7 @@ struct WorkoutHistoryListView: View {
         } message: { _ in
             Text(WorkoutDeleter.confirmationMessage)
         }
-        .alert("Workout not fully deleted",
+        .alert(failureTitle,
                isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -93,10 +94,10 @@ struct WorkoutHistoryListView: View {
         deleting = true
         defer { deleting = false }
         let outcome = await WorkoutDeleter(health: HealthKitWorkoutStore()).delete(item.deletionTarget)
+        if outcome.removedWorkout { removed(item.id) }
         if let message = outcome.failureMessage {
+            failureTitle = outcome.failureTitle
             failure = message
-        } else {
-            removed(item.id)
         }
     }
 
@@ -126,6 +127,7 @@ struct WorkoutDetailView: View {
     @State private var confirming = false
     @State private var deleting = false
     @State private var failure: String?
+    @State private var failureTitle = "Workout not fully deleted"
     @State private var deleted = false
 
     private var age: Int { HealthKitWriter.storedUserProfile().age }
@@ -163,7 +165,7 @@ struct WorkoutDetailView: View {
         } message: {
             Text(WorkoutDeleter.confirmationMessage)
         }
-        .alert("Workout not fully deleted",
+        .alert(failureTitle,
                isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -288,12 +290,16 @@ struct WorkoutDetailView: View {
         deleting = true
         defer { deleting = false }
         let outcome = await WorkoutDeleter(health: HealthKitWorkoutStore()).delete(item.deletionTarget)
+        if outcome.removedWorkout {
+            deleted = true
+            onDeleted(item.id)
+        }
         if let message = outcome.failureMessage {
+            // Stay on screen so the alert can be read; a deleted workout shows its "was deleted" state.
+            failureTitle = outcome.failureTitle
             failure = message
             return
         }
-        deleted = true
-        onDeleted(item.id)
         dismiss()
     }
 }
