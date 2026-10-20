@@ -54,6 +54,74 @@ struct DashboardReadKey: Equatable {
     let bound: Date
 }
 
+/// One card's off-main read (decision 75b): at most one in flight, and a version move never throws
+/// away a read that is under way. A card asks on every key change; a request while a read runs only
+/// marks the card dirty, the running read publishes when it lands, and then exactly one more read
+/// runs for the newest request. So a save stream faster than one read (the Health flush's saves right
+/// after a sync, a live reading) can't starve the card, and a burst never stacks background fetches.
+///
+/// A new window bound (the day moved) is the one thing that cancels: the old window's rows are wrong
+/// for the new day, and a read for the old bound is never published, so no older read can land over
+/// a newer one.
+@Observable
+@MainActor
+final class DashboardReadLoader<Value: Sendable> {
+    /// The last published read; nil until the first lands.
+    private(set) var value: Value?
+    /// The signal version the published read was asked for (tests).
+    @ObservationIgnored private(set) var publishedVersion: Int?
+
+    typealias Read = @Sendable (ModelContainer) async -> Value?
+
+    @ObservationIgnored private let name: String
+    @ObservationIgnored private var bound: Date?
+    @ObservationIgnored private var generation = 0
+    @ObservationIgnored private var inFlight: Task<Void, Never>?
+    @ObservationIgnored private var dirty: (key: DashboardReadKey, container: ModelContainer, read: Read)?
+
+    init(_ name: String) { self.name = name }
+
+    var isReading: Bool { inFlight != nil }
+
+    func request(_ key: DashboardReadKey, container: ModelContainer, read: @escaping Read) {
+        if key.bound != bound {
+            bound = key.bound
+            generation &+= 1
+            inFlight?.cancel()
+            inFlight = nil
+            dirty = nil
+        }
+        guard inFlight == nil else {
+            dirty = (key, container, read)
+            return
+        }
+        start(key, container: container, read: read)
+    }
+
+    private func start(_ key: DashboardReadKey, container: ModelContainer, read: @escaping Read) {
+        let generation = generation
+        #if DEBUG
+        DashboardReads.fetchThreadLog.note(readStarted: name, in: container)
+        #endif
+        inFlight = Task { @MainActor [weak self] in
+            let result = await read(container)
+            guard let self, generation == self.generation else { return }
+            self.inFlight = nil
+            if let result {
+                self.value = result
+                self.publishedVersion = key.version
+                #if DEBUG
+                DashboardReads.fetchThreadLog.note(published: self.name, version: key.version, in: container)
+                #endif
+            }
+            if let next = self.dirty {
+                self.dirty = nil
+                self.start(next.key, container: next.container, read: next.read)
+            }
+        }
+    }
+}
+
 /// A row stamped with the device that recorded it and when, so the decision-29 ownership filter
 /// reads stored rows and their snapshots alike.
 protocol DeviceTimedRow {
@@ -179,6 +247,10 @@ enum DashboardReads {
     /// not started yet doesn't fetch at all. A failed fetch reads as empty, as a `@Query` does.
     private static func read<T: Sendable>(_ container: ModelContainer,
                                           _ body: @escaping @Sendable (ModelContext) throws -> T) async -> T? {
+        #if DEBUG
+        let delay = fetchThreadLog.readDelay
+        if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+        #endif
         let task = Task.detached(priority: .userInitiated) { () -> T? in
             guard !Task.isCancelled else { return nil }
             return try? body(ModelContext(container))
@@ -206,6 +278,35 @@ enum DashboardReads {
         private var onMain = 0
         private var offMain = 0
         private var todayActivityDays: [(container: ObjectIdentifier, day: Date)] = []
+        private var reads: [(container: ObjectIdentifier, name: String, version: Int?)] = []
+        private var delay: TimeInterval = 0
+
+        /// Tests only: how long every read waits before it fetches, to make a read slower than a save
+        /// stream on a small store.
+        var readDelay: TimeInterval {
+            get { lock.lock(); defer { lock.unlock() }; return delay }
+            set { lock.lock(); delay = newValue; lock.unlock() }
+        }
+
+        func note(readStarted name: String, in container: ModelContainer) {
+            lock.lock(); defer { lock.unlock() }
+            reads.append((ObjectIdentifier(container), name, nil))
+        }
+
+        func note(published name: String, version: Int, in container: ModelContainer) {
+            lock.lock(); defer { lock.unlock() }
+            reads.append((ObjectIdentifier(container), name, version))
+        }
+
+        /// For `name`'s loaders on `container` since the last call: how many reads started, and the
+        /// versions published, in order. Then forgets that container's entries.
+        func takeReads(_ name: String, of container: ModelContainer) -> (started: Int, published: [Int]) {
+            lock.lock(); defer { lock.unlock() }
+            let id = ObjectIdentifier(container)
+            let mine = reads.filter { $0.container == id && $0.name == name }
+            reads.removeAll { $0.container == id }
+            return (mine.filter { $0.version == nil }.count, mine.compactMap(\.version))
+        }
 
         func note(onMainThread: Bool) {
             lock.lock(); defer { lock.unlock() }

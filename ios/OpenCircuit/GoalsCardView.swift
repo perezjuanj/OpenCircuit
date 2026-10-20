@@ -68,7 +68,8 @@ private struct GoalsCardBody: View {
     /// the same number. Both are read off the main thread (`DashboardReads.todayActivity`, decision
     /// 75a); as `@Query`s they re-fetched on the main thread on every store save. nil until the first
     /// read lands.
-    @State private var activity: DashboardReads.TodayActivity?
+    @State private var activityLoader = DashboardReadLoader<DashboardReads.TodayActivity>("goals")
+    private var activity: DashboardReads.TodayActivity? { activityLoader.value }
     @Environment(\.modelContext) private var modelContext
     @Environment(\.storeRefreshSignal) private var injectedRefresh
     private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
@@ -246,8 +247,10 @@ private struct GoalsCardBody: View {
         // HR, no upper-hour cap, so this card matches CaloriesCardView and doesn't lag up to 59 min
         // behind it), again whenever the store-change signal moves, and mapped on the detached task.
         .task(id: DashboardReadKey(version: refresh.version, bound: dayStart)) {
-            if let read = await DashboardReads.todayActivity(container: modelContext.container, dayStart: dayStart) {
-                activity = read
+            let dayStart = dayStart
+            activityLoader.request(DashboardReadKey(version: refresh.version, bound: dayStart),
+                                   container: modelContext.container) {
+                await DashboardReads.todayActivity(container: $0, dayStart: dayStart)
             }
         }
         .task(id: goalsInputsKey) {

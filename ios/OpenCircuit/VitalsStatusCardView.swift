@@ -13,7 +13,8 @@ struct VitalsStatusCardView: View {
     /// ~32 days of readings — enough to fill the 30-day baseline window plus today. Read off the main
     /// thread (`DashboardReads.vitalsHistory`, decision 75a): as three `@Query`s they re-fetched about
     /// 36 k rows on the main thread on every store save. nil until the first read lands.
-    @State private var history: DashboardReads.VitalsHistory?
+    @State private var historyLoader = DashboardReadLoader<DashboardReads.VitalsHistory>("vitals")
+    private var history: DashboardReads.VitalsHistory? { historyLoader.value }
     /// The start of the 32-day window, fixed when the view is built (as the `@Query` predicate was).
     private let since: Date
     @Environment(\.modelContext) private var modelContext
@@ -112,8 +113,10 @@ struct VitalsStatusCardView: View {
         // store-change signal moves (throttled while a sync runs), and the ownership filter and the
         // maps run on the detached task with the math.
         .task(id: DashboardReadKey(version: refresh.version, bound: since)) {
-            if let read = await DashboardReads.vitalsHistory(container: modelContext.container, since: since) {
-                history = read
+            let since = since
+            historyLoader.request(DashboardReadKey(version: refresh.version, bound: since),
+                                  container: modelContext.container) {
+                await DashboardReads.vitalsHistory(container: $0, since: since)
             }
         }
         .task(id: reportInputsKey) {

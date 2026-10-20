@@ -298,11 +298,11 @@ final class StoreRefreshSignalTests: XCTestCase {
     /// A strap sync stuck on a round the strap never answers (as in `HelioSessionTests`): in progress
     /// until something ends it.
     private func stuckStrapSync(_ store: LocalStore, _ s: StoreRefreshSignal,
-                                _ connection: SessionHolder<HelioSession>) async -> StrapRig {
+                                _ connection: SessionHolder<HelioSession>, follow: Bool = true) async -> StrapRig {
         let device = sStrap()
         device.announcedLengths[.autoStress] = 4 << 20
         device.unansweredAckTypes = [.autoStress]
-        s.followSyncs { connection.session?.syncing == true }
+        if follow { s.followSyncs { connection.session?.syncing == true } }
         let rig = connectStrap(device, store: store, autoSync: true)
         connection.session = rig.session
         await settle()
@@ -375,6 +375,40 @@ final class StoreRefreshSignalTests: XCTestCase {
         await settle()
         XCTAssertFalse(s.syncActive)
         XCTAssertEqual(rec.reasons.filter { $0 != .save }, [.syncEnd])
+    }
+
+    // MARK: Production wiring
+
+    /// The default sync source is the active wearable's session (`ActiveWearable.session`), here a real
+    /// strap session behind an injected `ActiveWearable`, as `HelioConnection` holds it.
+    func testTheDefaultSyncSourceIsTheActiveWearablesSession() async throws {
+        let store = try makeStore()
+        let (s, rec) = signal(store, interval: 60)
+        let connection = SessionHolder<HelioSession>()
+        s.followSyncs(ActiveWearable(session: { connection.session }))
+        let rig = await stuckStrapSync(store, s, connection, follow: false)
+        XCTAssertTrue(s.syncActive, "the active session's sync was seen")
+        rec.reasons = []
+        rig.session.linkLost()
+        connection.session = nil
+        await settle()
+        XCTAssertFalse(s.syncActive)
+        XCTAssertEqual(rec.reasons.filter { $0 != .save }, [.syncEnd])
+    }
+
+    /// `AppDelegate` starts the shared signal at launch (the test host launched the app): it follows
+    /// syncs, and a save anywhere moves it.
+    func testTheAppStartsTheSharedSignalAtLaunch() throws {
+        let shared = StoreRefreshSignal.shared
+        XCTAssertTrue(shared.isFollowingSyncs, "launch did not start following syncs")
+        let store = try makeStore()
+        let before = shared.version
+        try save(store)
+        if shared.syncActive {
+            XCTAssertGreaterThanOrEqual(shared.version, before)
+        } else {
+            XCTAssertEqual(shared.version, before + 1, "launch did not start following saves")
+        }
     }
 
     // MARK: Breadcrumb (decision 75d ii)

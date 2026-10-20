@@ -68,14 +68,21 @@ final class StoreRefreshSignal {
     }
 
     /// Follows whether the active wearable's session is syncing, foreground or background: the ring's
-    /// `RingSession.syncing`, the strap's `HelioSession.syncing`. A sync ends when that reads false,
-    /// whether the session finished, failed, was cancelled, or went away with its link.
-    func followSyncs(_ isSyncing: @escaping @MainActor () -> Bool = {
-        ActiveWearable.activeDeviceSession()?.syncing == true
-    }) {
+    /// `RingSession.syncing`, the strap's `HelioSession.syncing` (`ActiveWearable.session`, which reads
+    /// only the chosen device's driver). A sync ends when that reads false, whether the session
+    /// finished, failed, was cancelled, or went away with its link.
+    func followSyncs(_ wearable: ActiveWearable = .shared) {
+        followSyncs { wearable.session?.syncing == true }
+    }
+
+    /// `followSyncs` over any main-actor reading (tests).
+    func followSyncs(_ isSyncing: @escaping @MainActor () -> Bool) {
         syncMonitor = SyncActivityMonitor(isSyncing: isSyncing) { [weak self] in self?.setSyncActive($0) }
         syncMonitor?.start()
     }
+
+    /// Whether `followSyncs` has started (the launch wiring, tests).
+    var isFollowingSyncs: Bool { syncMonitor != nil }
 
     /// A save landed.
     func storeDidSave() {
@@ -143,6 +150,9 @@ final class SyncActivityMonitor {
             // Fires before the mutation; read again once it has landed.
             Task { @MainActor in self?.track() }
         }
+        // A sync that goes true → false → true within one main-actor turn is never seen ending: the
+        // trailing refresh its saves armed still lands within the interval, so no card goes stale;
+        // only the breadcrumb merges the two syncs into one line.
         guard now != last else { return }
         last = now
         onChange(now)

@@ -2808,7 +2808,8 @@ private struct CaloriesCardBody: View {
     /// active-calorie estimate and the two cards read the same today's-HR set; the step read is the
     /// same as `GoalsCardView`'s, so this card, the Goals rings and Apple Health can never disagree.
     /// nil until the first read lands.
-    @State private var activity: DashboardReads.TodayActivity?
+    @State private var activityLoader = DashboardReadLoader<DashboardReads.TodayActivity>("calories")
+    private var activity: DashboardReads.TodayActivity? { activityLoader.value }
     @Environment(\.modelContext) private var modelContext
     @Environment(\.storeRefreshSignal) private var injectedRefresh
     private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
@@ -2902,8 +2903,10 @@ private struct CaloriesCardBody: View {
         // Decision 75a/75b: today's HR and step rows are read off the main thread too, again whenever
         // the store-change signal moves, and mapped on the detached task.
         .task(id: DashboardReadKey(version: refresh.version, bound: dayStart)) {
-            if let read = await DashboardReads.todayActivity(container: modelContext.container, dayStart: dayStart) {
-                activity = read
+            let dayStart = dayStart
+            activityLoader.request(DashboardReadKey(version: refresh.version, bound: dayStart),
+                                   container: modelContext.container) {
+                await DashboardReads.todayActivity(container: $0, dayStart: dayStart)
             }
         }
         .task(id: caloriesInputsKey) {

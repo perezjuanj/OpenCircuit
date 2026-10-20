@@ -105,7 +105,8 @@ struct SleepCardView: View {
     /// Read off the main thread and held grouped by kind (`DashboardReads.sleepCardVitals`, decision
     /// 75a): as a `@Query` its ~3 days of minute rows were re-fetched on the main thread on every store
     /// save, and grouped again on every `body` pass. Empty until the first read lands.
-    @State private var recentVitalsByKind: [String: [OvernightAverages.Point]] = [:]
+    @State private var recentVitalsLoader = DashboardReadLoader<[String: [OvernightAverages.Point]]>("sleep")
+    private var recentVitalsByKind: [String: [OvernightAverages.Point]] { recentVitalsLoader.value ?? [:] }
     /// The start of the window, fixed when the view is built (as the `@Query` predicate was).
     private let vitalsLookback: Date
     @Environment(\.storeRefreshSignal) private var injectedRefresh
@@ -488,8 +489,10 @@ struct SleepCardView: View {
         // Decision 75a/75b: the overnight-average rows, read off the main thread whenever the
         // store-change signal moves.
         .task(id: DashboardReadKey(version: refresh.version, bound: vitalsLookback)) {
-            if let read = await DashboardReads.sleepCardVitals(container: modelContext.container, lookback: vitalsLookback) {
-                recentVitalsByKind = read
+            let lookback = vitalsLookback
+            recentVitalsLoader.request(DashboardReadKey(version: refresh.version, bound: lookback),
+                                       container: modelContext.container) {
+                await DashboardReads.sleepCardVitals(container: $0, lookback: lookback)
             }
         }
         // Stage provenance, on its own key and its own task. Deliberately NOT folded into `EdgeKey`:

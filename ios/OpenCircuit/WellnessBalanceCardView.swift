@@ -58,7 +58,8 @@ private struct WellnessBalanceCardBody: View {
     /// Today's HR and the per-snapshot step deltas — the same read as `GoalsCardView`'s. Readiness
     /// scores active kcal, so it must price the day exactly as the Goals rings and Apple Health do.
     /// Read off the main thread (decision 75a); nil until the first read lands.
-    @State private var activity: DashboardReads.TodayActivity?
+    @State private var activityLoader = DashboardReadLoader<DashboardReads.TodayActivity>("readiness")
+    private var activity: DashboardReads.TodayActivity? { activityLoader.value }
     @Environment(\.modelContext) private var modelContext
     @Environment(\.storeRefreshSignal) private var injectedRefresh
     private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
@@ -217,8 +218,10 @@ private struct WellnessBalanceCardBody: View {
         // Decision 75a/75b: today's HR and step rows are read off the main thread, again whenever the
         // store-change signal moves.
         .task(id: DashboardReadKey(version: refresh.version, bound: dayStart)) {
-            if let read = await DashboardReads.todayActivity(container: modelContext.container, dayStart: dayStart) {
-                activity = read
+            let dayStart = dayStart
+            activityLoader.request(DashboardReadKey(version: refresh.version, bound: dayStart),
+                                   container: modelContext.container) {
+                await DashboardReads.todayActivity(container: $0, dayStart: dayStart)
             }
         }
         .task(id: inputsKey) {
