@@ -61,26 +61,25 @@ private struct GoalsCardBody: View {
     // MARK: Data queries (bounded — no unbounded fetches)
     /// Today's step rollup.
     @Query private var todayDaily: [StoredDaily]
-    /// Today's HR samples for active-kcal + exercise-minutes estimates.
-    @Query private var todayHR: [StoredSample]
+    /// Today's HR samples for active-kcal + exercise-minutes estimates, and the per-snapshot step
+    /// deltas from yesterday's start, so active energy can be attributed to WHEN it was earned (a
+    /// snapshot straddling midnight still contributes its in-day share). The steps must stay in
+    /// lockstep with `HealthKitWriter.flushActiveCalories`: this card and Apple Health have to show
+    /// the same number. Both are read off the main thread (`DashboardReads.todayActivity`, decision
+    /// 75a); as `@Query`s they re-fetched on the main thread on every store save. nil until the first
+    /// read lands.
+    @State private var activity: DashboardReads.TodayActivity?
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.storeRefreshSignal) private var injectedRefresh
+    private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
     /// Most recent sleep summary for last-night's sleep duration + sleep window exclusion.
     @Query private var latestSleep: [StoredSleepSummary]
     /// Today's naps (#nap-parity) — folded into the daily sleep total, matching RingConn's
     /// sleepNapAvgTimeLength. Detected OUTSIDE the main night, so no double-count.
     @Query private var todayNaps: [StoredNap]
-    /// Per-snapshot step deltas, so active energy can be attributed to WHEN it was earned. Fetched
-    /// from yesterday so a snapshot straddling midnight still contributes its in-day share. Must
-    /// stay in lockstep with `HealthKitWriter.flushActiveCalories` — this card and Apple Health
-    /// have to show the same number.
-    @Query private var recentStepSamples: [StoredStepSample]
 
     init(dayStart: Date) {
         self.dayStart = dayStart
-        let stepsFrom = dayStart.addingTimeInterval(-86_400)
-
-        _recentStepSamples = Query(FetchDescriptor<StoredStepSample>(
-            predicate: #Predicate { $0.start >= stepsFrom },
-            sortBy: [SortDescriptor(\.start, order: .forward)]))
 
         _todayNaps = Query(FetchDescriptor<StoredNap>(
             predicate: #Predicate { $0.start >= dayStart },
@@ -89,11 +88,6 @@ private struct GoalsCardBody: View {
         _todayDaily = Query(
             filter: #Predicate<StoredDaily> { $0.day == dayStart },
             sort: \.day)
-
-        // Count ALL of today's HR (no upper-hour cap) so this card matches CaloriesCardView and
-        // doesn't lag up to 59 min behind it — e.g. right after an on-demand measurement. The
-        // stable `dayStart` bounds keep the @Query descriptor stable.
-        _todayHR = Query(GoalsCardQueries.heartRate(dayStart: dayStart))
 
         var sleepDesc = FetchDescriptor<StoredSleepSummary>(
             sortBy: [SortDescriptor(\.night, order: .reverse)])
@@ -120,7 +114,7 @@ private struct GoalsCardBody: View {
     /// so they re-run on new data (HR count grows, steps, profile, or last night) and never on an
     /// unrelated re-render.
     private var goalsInputsKey: String {
-        "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(effectiveWeightKg)|"
+        "\(activity == nil ? "-" : "")\(activity?.heartRate.count ?? 0)|\(currentSteps)|\(activity?.steps.count ?? 0)|\(age)|\(effectiveWeightKg)|"
         + "\(heightCm)|\(sexRaw)|\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(workoutCreditsRevision)"
     }
     /// Bumped when a deleted workout's credited span is undone (#293), so the goals recompute.
@@ -247,22 +241,30 @@ private struct GoalsCardBody: View {
         // during the background scene-update snapshot, and the crash recurred. Snapshot the
         // SwiftData rows to Sendable value types HERE (main actor), then run the pure Kit math on
         // `Task.detached` and publish back. (Also maps `todayHR` ONCE instead of twice.)
+        //
+        // Decision 75a/75b: today's HR and step rows are read off the main thread too (ALL of today's
+        // HR, no upper-hour cap, so this card matches CaloriesCardView and doesn't lag up to 59 min
+        // behind it), again whenever the store-change signal moves, and mapped on the detached task.
+        .task(id: DashboardReadKey(version: refresh.version, bound: dayStart)) {
+            if let read = await DashboardReads.todayActivity(container: modelContext.container, dayStart: dayStart) {
+                activity = read
+            }
+        }
         .task(id: goalsInputsKey) {
-            let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+            guard let activity else { return }
             let steps = currentSteps
             let profile = profile
             let sleepWindow: DateInterval? = latestSleep.first.flatMap { s in
                 guard s.inBedStart > Date.distantPast, s.inBedEnd > s.inBedStart else { return nil }
                 return DateInterval(start: s.inBedStart, end: s.inBedEnd)
             }
-            let stepWindows = recentStepSamples.map {
-                StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
-            }
             // #281 motion gate (off by default): the ring's own activity sessions.
             let activityIntervals = RingActivityEventLedger.load().corroboratingIntervals(now: Date())
             let creditedWorkoutIntervals = HealthKitWriter.workoutCreditedSpans(day: dayStart)
             let result = await Task.detached { () -> Calories.DailyEstimate in
-                Calories.dailyEstimate(
+                let samples = activity.heartRate.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+                let stepWindows = activity.steps.map { StepWindow(start: $0.start, end: $0.end, delta: $0.delta) }
+                return Calories.dailyEstimate(
                     hrSamples: samples,
                     steps: steps,
                     profile: profile,

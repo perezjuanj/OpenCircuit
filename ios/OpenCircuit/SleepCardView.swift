@@ -101,7 +101,15 @@ struct SleepCardView: View {
     /// (value-positive + windowed) so it never scans all history (#32), the pattern the Vitals card's
     /// `recentTemp` set before #245 removed it. A night older than this window keeps its totals but omits the
     /// averages (its raw samples have aged out of the query window).
-    @Query private var recentVitals: [StoredSample]
+    ///
+    /// Read off the main thread and held grouped by kind (`DashboardReads.sleepCardVitals`, decision
+    /// 75a): as a `@Query` its ~3 days of minute rows were re-fetched on the main thread on every store
+    /// save, and grouped again on every `body` pass. Empty until the first read lands.
+    @State private var recentVitalsByKind: [String: [OvernightAverages.Point]] = [:]
+    /// The start of the window, fixed when the view is built (as the `@Query` predicate was).
+    private let vitalsLookback: Date
+    @Environment(\.storeRefreshSignal) private var injectedRefresh
+    private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
     /// Days of HR/HRV/SpO₂ history scanned before the precise night window is applied in memory.
     private static let vitalsWindowDays: TimeInterval = 3
 
@@ -134,16 +142,7 @@ struct SleepCardView: View {
         // Anchor the window to the start of the current hour so the descriptor stays stable across
         // rapid re-renders (re-fetching hourly or when data changes), not on every render.
         let hourStart = Calendar.current.dateInterval(of: .hour, for: Date())?.start ?? Date()
-        let lookback = hourStart.addingTimeInterval(-Self.vitalsWindowDays * 86_400)
-        let hr = MetricKind.heartRate.rawValue
-        let hrv = MetricKind.hrvSDNN.rawValue
-        let spo2 = MetricKind.spo2.rawValue
-        _recentVitals = Query(FetchDescriptor<StoredSample>(
-            predicate: #Predicate {
-                ($0.kindRaw == hr || $0.kindRaw == hrv || $0.kindRaw == spo2)
-                    && $0.start > lookback && $0.value > 0
-            },
-            sortBy: [SortDescriptor(\.start, order: .reverse)]))
+        vitalsLookback = hourStart.addingTimeInterval(-Self.vitalsWindowDays * 86_400)
     }
 
     /// `.task(id:)` key for the edge-provenance refresh — both in-bed edges, so a wake-only Edit
@@ -486,6 +485,13 @@ struct SleepCardView: View {
         // Keyed on BOTH edges: the same task now resolves the trailing edge too, and an Edit that
         // moves only the wake would otherwise leave `wakeProvenance` stale against the new window.
         .task(id: EdgeKey(night)) { await refreshBedtimeProvenance() }
+        // Decision 75a/75b: the overnight-average rows, read off the main thread whenever the
+        // store-change signal moves.
+        .task(id: DashboardReadKey(version: refresh.version, bound: vitalsLookback)) {
+            if let read = await DashboardReads.sleepCardVitals(container: modelContext.container, lookback: vitalsLookback) {
+                recentVitalsByKind = read
+            }
+        }
         // Stage provenance, on its own key and its own task. Deliberately NOT folded into `EdgeKey`:
         // that key and `refreshBedtimeProvenance` are pinned by the corpus harness, and a re-stage
         // can rewrite the timeline without moving either edge, so the two need different triggers.
@@ -1404,7 +1410,7 @@ struct SleepCardView: View {
     }
 
     /// Mean HR (bpm) / HRV (ms) / SpO₂ (%) over the night's in-bed window, from the bounded
-    /// `recentVitals` query narrowed in memory. nil when the window is unknown (a legacy rollup
+    /// `recentVitalsByKind` read narrowed in memory. nil when the window is unknown (a legacy rollup
     /// with no clock times) or no samples fall inside it (e.g. a night older than the query
     /// window). SpO₂ is stored 0…1 and surfaced as a whole percent.
     private func overnightAverages(_ night: Night) -> (hr: Int?, hrv: Int?, spo2: Int?)? {
@@ -1412,11 +1418,8 @@ struct SleepCardView: View {
         // Shared overnight-mean helper — the SAME computation the Vitals HRV/RR rows use, so the
         // two surfaces can't disagree (HRV "86 in Vitals vs 64 in Sleep" was a point-vs-mean clash).
         let window = DateInterval(start: start, end: end)
-        // One pass over the query (this runs in `body`, over ~3 days of minute rows), not one per kind.
-        var pointsByKind: [String: [OvernightAverages.Point]] = [:]
-        for row in recentVitals {
-            pointsByKind[row.kindRaw, default: []].append(OvernightAverages.Point(value: row.value, start: row.start))
-        }
+        // The rows come grouped by kind from the off-main read, so `body` no longer walks them.
+        let pointsByKind = recentVitalsByKind
         func mean(_ kind: MetricKind) -> Double? {
             OvernightAverages.mean(pointsByKind[kind.rawValue] ?? [], window: window)
         }

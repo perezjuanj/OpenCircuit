@@ -54,11 +54,14 @@ private struct WellnessBalanceCardBody: View {
     @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
 
     @Query private var todayDaily: [StoredDaily]
-    @Query private var todayHR: [StoredSample]
     @Query private var latestSleep: [StoredSleepSummary]
-    /// Per-snapshot step deltas — see the same query in `GoalsCardView`. Readiness scores active
-    /// kcal, so it must price the day exactly as the Goals rings and Apple Health do.
-    @Query private var recentStepSamples: [StoredStepSample]
+    /// Today's HR and the per-snapshot step deltas — the same read as `GoalsCardView`'s. Readiness
+    /// scores active kcal, so it must price the day exactly as the Goals rings and Apple Health do.
+    /// Read off the main thread (decision 75a); nil until the first read lands.
+    @State private var activity: DashboardReads.TodayActivity?
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.storeRefreshSignal) private var injectedRefresh
+    private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
 
     /// Reports what the card ended up showing, so the Today synthesis line (#216) speaks about the
     /// SAME readiness instead of recomputing its own. Called after every recompute.
@@ -70,12 +73,7 @@ private struct WellnessBalanceCardBody: View {
     init(dayStart: Date, onReport: ((ReadinessReport) -> Void)?) {
         self.onReport = onReport
         self.dayStart = dayStart
-        let stepsFrom = dayStart.addingTimeInterval(-86_400)
-        _recentStepSamples = Query(FetchDescriptor<StoredStepSample>(
-            predicate: #Predicate { $0.start >= stepsFrom },
-            sortBy: [SortDescriptor(\.start, order: .forward)]))
         _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
-        _todayHR = Query(GoalsCardQueries.heartRate(dayStart: dayStart))
         var sleepDesc = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
         sleepDesc.fetchLimit = 1
         _latestSleep = Query(sleepDesc)
@@ -144,7 +142,7 @@ private struct WellnessBalanceCardBody: View {
 
     /// Recompute identity — changes only when an input to readiness changes.
     private var inputsKey: String {
-        "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
+        "\(activity == nil ? "-" : "")\(activity?.heartRate.count ?? 0)|\(currentSteps)|\(activity?.steps.count ?? 0)|\(age)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
         + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(latestSleep.first?.sleepScore ?? 0)|"
         + "\(latestSleep.first?.stressScore ?? 0)|\(sleepCredited ? 1 : 0)|"
         + "\(stepsGoal)|\(Int(actMinGoal))|\(Int(activeKcalGoal))|\(workoutCreditsRevision)"
@@ -216,10 +214,17 @@ private struct WellnessBalanceCardBody: View {
             "Readiness, estimate, \($0.score) out of 100, \(tierLabel($0.tier)). \(breakdown($0))"
             + (isLowConfidence($0) ? ". Based on last night's sleep alone" : "")
         } ?? emptyStateAccessibilityLabel)
+        // Decision 75a/75b: today's HR and step rows are read off the main thread, again whenever the
+        // store-change signal moves.
+        .task(id: DashboardReadKey(version: refresh.version, bound: dayStart)) {
+            if let read = await DashboardReads.todayActivity(container: modelContext.container, dayStart: dayStart) {
+                activity = read
+            }
+        }
         .task(id: inputsKey) {
+            guard let rows = activity else { return }
             // Snapshot SwiftData rows to Sendable value types on the main actor, run the O(n) activity
             // math off-main, then compose the readiness on the way back.
-            let samples = todayHR.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
             let steps = currentSteps
             let profile = profile
             let sleepWindow: DateInterval? = latestSleep.first.flatMap { s in
@@ -232,14 +237,13 @@ private struct WellnessBalanceCardBody: View {
             let minGoal = actMinGoal
             let kcalGoal = activeKcalGoal
 
-            let stepWindows = recentStepSamples.map {
-                StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
-            }
             // #281 motion gate (off by default): the ring's own activity sessions.
             let activityIntervals = RingActivityEventLedger.load().corroboratingIntervals(now: Date())
             let creditedWorkoutIntervals = HealthKitWriter.workoutCreditedSpans(day: dayStart)
 
             let activity = await Task.detached { () -> ActivityScore.Result in
+                let samples = rows.heartRate.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+                let stepWindows = rows.steps.map { StepWindow(start: $0.start, end: $0.end, delta: $0.delta) }
                 let estimate = Calories.dailyEstimate(
                     hrSamples: samples,
                     steps: steps,

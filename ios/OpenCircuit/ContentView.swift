@@ -2801,30 +2801,26 @@ private struct CaloriesCardBody: View {
     @AppStorage("userProfile.heightCm") private var heightCm = 170.0
     @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
 
-    /// Today's HR samples (for the active-calorie TRIMP estimate). Predicate-limited to
-    /// heart rate since start-of-day so the fetch stays small.
-    @Query private var hrSamples: [StoredSample]
+    /// Today's HR samples (for the active-calorie TRIMP estimate) and the per-snapshot step deltas
+    /// (the time-attributed active-energy estimate), read off the main thread
+    /// (`DashboardReads.todayActivity`, decision 75a). The HR read matches GoalsCardView's exactly:
+    /// the same one-day window AND the `value > 0` guard, so a stray 0-bpm sample can't skew the
+    /// active-calorie estimate and the two cards read the same today's-HR set; the step read is the
+    /// same as `GoalsCardView`'s, so this card, the Goals rings and Apple Health can never disagree.
+    /// nil until the first read lands.
+    @State private var activity: DashboardReads.TodayActivity?
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.storeRefreshSignal) private var injectedRefresh
+    private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
     /// Today's step rollup — drives the step/distance active-calorie fallback when HR is sparse.
     @Query private var todayDaily: [StoredDaily]
     /// Latest sleep window, excluded from elevated-HR activity just like the Goals card.
     @Query private var latestSleep: [StoredSleepSummary]
-    /// Per-snapshot step deltas — see the same query in `GoalsCardView`. Required for the
-    /// time-attributed active-energy estimate, and kept identical here so this card, the Goals
-    /// rings and Apple Health can never disagree.
-    @Query private var recentStepSamples: [StoredStepSample]
 
     init(dayStart: Date, onSetUpProfile: @escaping () -> Void, onShowEstimateInfo: @escaping () -> Void) {
         self.dayStart = dayStart
         self.onSetUpProfile = onSetUpProfile
         self.onShowEstimateInfo = onShowEstimateInfo
-        let stepsFrom = dayStart.addingTimeInterval(-86_400)
-        _recentStepSamples = Query(
-            filter: #Predicate<StoredStepSample> { $0.start >= stepsFrom },
-            sort: \.start)
-        // Match GoalsCardView's HR query exactly: same one-day window AND the `value > 0`
-        // guard, so a stray 0-bpm sample can't skew the active-calorie estimate and the two cards
-        // read the same today's-HR set.
-        _hrSamples = Query(GoalsCardQueries.heartRate(dayStart: dayStart))
         _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
         var sleepDesc = FetchDescriptor<StoredSleepSummary>(
             sortBy: [SortDescriptor(\.night, order: .reverse)])
@@ -2840,7 +2836,7 @@ private struct CaloriesCardBody: View {
     @State private var cachedActiveKcal: Double = 0
     /// Identity for the recompute `.task` — the HR count, today's steps, and the profile inputs.
     private var caloriesInputsKey: String {
-        "\(hrSamples.count)|\(todayDaily.first?.steps ?? 0)|\(recentStepSamples.count)|"
+        "\(activity == nil ? "-" : "")\(activity?.heartRate.count ?? 0)|\(todayDaily.first?.steps ?? 0)|\(activity?.steps.count ?? 0)|"
         + "\(age)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
         + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(workoutCreditsRevision)"
     }
@@ -2902,23 +2898,30 @@ private struct CaloriesCardBody: View {
         // onto the main thread during the background scene-update snapshot, and the crash recurred.
         // Snapshot the SwiftData rows to Sendable value types HERE (main actor), then run the pure
         // Kit math on `Task.detached` and publish the result back.
+        //
+        // Decision 75a/75b: today's HR and step rows are read off the main thread too, again whenever
+        // the store-change signal moves, and mapped on the detached task.
+        .task(id: DashboardReadKey(version: refresh.version, bound: dayStart)) {
+            if let read = await DashboardReads.todayActivity(container: modelContext.container, dayStart: dayStart) {
+                activity = read
+            }
+        }
         .task(id: caloriesInputsKey) {
-            let samples = hrSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+            guard let activity else { return }
             let steps = todayDaily.first?.steps ?? 0
             let profile = profile
             let sleepWindow: DateInterval? = latestSleep.first.flatMap { s in
                 guard s.inBedStart > Date.distantPast, s.inBedEnd > s.inBedStart else { return nil }
                 return DateInterval(start: s.inBedStart, end: s.inBedEnd)
             }
-            let stepWindows = recentStepSamples.map {
-                StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
-            }
             let dayStart = Calendar.current.startOfDay(for: Date())
             // #281 motion gate (off by default): the ring's own activity sessions.
             let activityIntervals = RingActivityEventLedger.load().corroboratingIntervals(now: Date())
             let creditedWorkoutIntervals = HealthKitWriter.workoutCreditedSpans(day: dayStart)
             cachedActiveKcal = await Task.detached {
-                Calories.dailyEstimate(
+                let samples = activity.heartRate.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+                let stepWindows = activity.steps.map { StepWindow(start: $0.start, end: $0.end, delta: $0.delta) }
+                return Calories.dailyEstimate(
                     hrSamples: samples,
                     steps: steps,
                     profile: profile,
