@@ -104,11 +104,14 @@ final class SyncSaveMainThreadBenchmarkTests: XCTestCase {
         return todayEnd
     }
 
-    private func todayCards(_ container: ModelContainer) -> some View {
+    /// How many times the Vitals Status card recomputed its report (once per new set of rows).
+    private final class Updates { var vitals = 0 }
+
+    private func todayCards(_ container: ModelContainer, _ updates: Updates) -> some View {
         List {
             Group {
                 OCCard { WellnessBalanceCardView() }
-                VitalsStatusCardView()
+                VitalsStatusCardView(onReport: { _ in updates.vitals += 1 })
                 OCCard { CaloriesCardView() }
                 OCCard { GoalsCardView() }
                 SleepCardView()
@@ -127,12 +130,16 @@ final class SyncSaveMainThreadBenchmarkTests: XCTestCase {
         var longestMS: [Int] = []
         var endBusyMS = 0
         var endLongestMS = 0
+        /// Vitals Status updates during the 20 saves, and in the 3 s after the last one.
+        var vitalsUpdatesDuring = 0
+        var vitalsUpdatesAfter = 0
 
         func line() -> String {
             let avgBusy = busyMS.isEmpty ? 0 : Double(busyMS.reduce(0, +)) / Double(busyMS.count)
             let avgSave = saveMS.isEmpty ? 0 : saveMS.reduce(0, +) / Double(saveMS.count)
-            return String(format: "BENCH | %@ | save call avg %.0f ms | busy per save avg %.0f ms, max %d ms | longest stall %d ms | after the sync: busy %d ms, longest %d ms",
-                          name, avgSave, avgBusy, busyMS.max() ?? 0, longestMS.max() ?? 0, endBusyMS, endLongestMS)
+            return String(format: "BENCH | %@ | save call avg %.0f ms | busy per save avg %.0f ms, max %d ms | longest stall %d ms | 3 s after the last save: busy %d ms, longest %d ms | Vitals Status updates: %d during, %d after",
+                          name, avgSave, avgBusy, busyMS.max() ?? 0, longestMS.max() ?? 0, endBusyMS, endLongestMS,
+                          vitalsUpdatesDuring, vitalsUpdatesAfter)
         }
     }
 
@@ -141,7 +148,8 @@ final class SyncSaveMainThreadBenchmarkTests: XCTestCase {
         let store = LocalStore(c.mainContext)
         let now = Date()
         var next = try seed(store, now: now)
-        let vc = UIHostingController(rootView: cards ? AnyView(todayCards(c)) : AnyView(Color.clear.modelContainer(c)))
+        let updates = Updates()
+        let vc = UIHostingController(rootView: cards ? AnyView(todayCards(c, updates)) : AnyView(Color.clear.modelContainer(c)))
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 3_000))
         window.rootViewController = vc
         if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene { window.windowScene = scene }
@@ -151,6 +159,7 @@ final class SyncSaveMainThreadBenchmarkTests: XCTestCase {
         settle(probe)   // first fetches and reports land before anything is measured
 
         var row = Row(name: name)
+        updates.vitals = 0
         if duringSync { SyncHooks.begin() }
         probe.start()
         for _ in 0..<Self.saves {
@@ -168,14 +177,14 @@ final class SyncSaveMainThreadBenchmarkTests: XCTestCase {
             row.busyMS.append(r.busyMS)
             row.longestMS.append(r.longestMS)
         }
-        if duringSync {
-            _ = probe.take()
-            SyncHooks.end()
-            pump(3)
-            let r = probe.take()
-            row.endBusyMS = r.busyMS
-            row.endLongestMS = r.longestMS
-        }
+        row.vitalsUpdatesDuring = updates.vitals
+        _ = probe.take()
+        if duringSync { SyncHooks.end() }
+        pump(3)
+        let tail = probe.take()
+        row.endBusyMS = tail.busyMS
+        row.endLongestMS = tail.longestMS
+        row.vitalsUpdatesAfter = updates.vitals - row.vitalsUpdatesDuring
         probe.stop()
         window.isHidden = true
         window.rootViewController = nil
@@ -209,6 +218,11 @@ final class SyncSaveMainThreadBenchmarkTests: XCTestCase {
         print(during.line())
         print(outside.line())
         print(bare.line())
+        // Like for like: outside a sync the card has to keep up with the saves, and it must land the
+        // last one; during a sync it must land the sync's data once it ends.
+        XCTAssertGreaterThan(outside.vitalsUpdatesDuring, 0, "outside a sync the Vitals card never updated during the saves")
+        XCTAssertGreaterThan(outside.vitalsUpdatesDuring + outside.vitalsUpdatesAfter, 0)
+        XCTAssertGreaterThan(during.vitalsUpdatesAfter, 0, "the Vitals card didn't update after the sync ended")
         print("BENCH-RAW | during busy \(during.busyMS) longest \(during.longestMS)")
         print("BENCH-RAW | outside busy \(outside.busyMS) longest \(outside.longestMS)")
     }
