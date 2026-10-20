@@ -10,10 +10,16 @@ import OpenCircuitKit
 /// hardcoded "healthy" ranges, no fabricated values). It's an on-device estimate, labeled as such,
 /// and carries the medical disclaimer. Empty until enough nights/days of history accrue.
 struct VitalsStatusCardView: View {
-    /// ~32 days of readings — enough to fill the 30-day baseline window plus today.
-    @Query private var hrSamples: [StoredSample]
-    @Query private var spo2Samples: [StoredSample]
-    @Query private var hrvSamples: [StoredSample]
+    /// ~32 days of readings — enough to fill the 30-day baseline window plus today. Read off the main
+    /// thread (`DashboardReads.vitalsHistory`, decision 75a): as three `@Query`s they re-fetched about
+    /// 36 k rows on the main thread on every store save. nil until the first read lands.
+    @State private var historyLoader = DashboardReadLoader<DashboardReads.VitalsHistory>("vitals")
+    private var history: DashboardReads.VitalsHistory? { historyLoader.value }
+    /// The start of the 32-day window, fixed when the view is built (as the `@Query` predicate was).
+    private let since: Date
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.storeRefreshSignal) private var injectedRefresh
+    private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
     /// Trailing nights for the canonical skin-temp baseline/offset (#69).
     @Query private var sleepNights: [StoredSleepSummary]
     /// Decision 29: the Apple Health fallback keeps to the current device once a switch is on record.
@@ -34,7 +40,7 @@ struct VitalsStatusCardView: View {
     /// Identity for the recompute `.task`: changes only when an input that affects the report changes,
     /// so the analysis re-runs on new data (not on every unrelated re-render).
     private var reportInputsKey: String {
-        "\(hrSamples.count)|\(spo2Samples.count)|\(hrvSamples.count)|"
+        "\(history == nil ? "-" : "")\(history?.heartRate.count ?? 0)|\(history?.spo2.count ?? 0)|\(history?.hrv.count ?? 0)|"
         + "\(sleepNights.first?.night.timeIntervalSince1970 ?? 0)|\(healthBaselineReport == nil ? 0 : 1)"
     }
 
@@ -49,20 +55,8 @@ struct VitalsStatusCardView: View {
 
     init(onReport: ((VitalsBaseline.Report?) -> Void)? = nil) {
         self.onReport = onReport
-        let since = Calendar.current.startOfDay(for: Date())
+        since = Calendar.current.startOfDay(for: Date())
             .addingTimeInterval(-Double(Self.historyDays) * 86_400)
-        let hr = MetricKind.heartRate.rawValue
-        let spo2 = MetricKind.spo2.rawValue
-        let hrv = MetricKind.hrvSDNN.rawValue
-        _hrSamples = Query(FetchDescriptor<StoredSample>(
-            predicate: #Predicate { $0.kindRaw == hr && $0.start >= since && $0.value > 0 },
-            sortBy: [SortDescriptor(\.start, order: .forward)]))
-        _spo2Samples = Query(FetchDescriptor<StoredSample>(
-            predicate: #Predicate { $0.kindRaw == spo2 && $0.start >= since && $0.value > 0 },
-            sortBy: [SortDescriptor(\.start, order: .forward)]))
-        _hrvSamples = Query(FetchDescriptor<StoredSample>(
-            predicate: #Predicate { $0.kindRaw == hrv && $0.start >= since && $0.value > 0 },
-            sortBy: [SortDescriptor(\.start, order: .forward)]))
         var nights = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
         nights.fetchLimit = 40
         _sleepNights = Query(nights)
@@ -114,24 +108,36 @@ struct VitalsStatusCardView: View {
         // thread during the background scene-update snapshot, and the watchdog crash recurred. Snapshot
         // the SwiftData rows + the Health fallback to Sendable value types HERE (main actor), then run
         // the pure OpenCircuitKit math on `Task.detached` and publish the result back.
+        //
+        // Decision 75a/75b: the rows themselves are read off the main thread too, again whenever the
+        // store-change signal moves (throttled while a sync runs), and the ownership filter and the
+        // maps run on the detached task with the math.
+        .task(id: DashboardReadKey(version: refresh.version, bound: since)) {
+            let since = since
+            historyLoader.request(DashboardReadKey(version: refresh.version, bound: since),
+                                  container: modelContext.container) {
+                await DashboardReads.vitalsHistory(container: $0, since: since)
+            }
+        }
         .task(id: reportInputsKey) {
+            guard let history else { return }
             // Decision 29: "today" is the current device's, so its readings and nights are the only
             // baseline (a new device shows "Building your baseline"). Every row with an empty log.
-            let own = Self.currentDeviceRows(samples: [hrSamples, spo2Samples, hrvSamples], nights: sleepNights,
-                                             log: LocalStore.ownershipLog())
-            let hr = own.samples[0].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-            let spo2 = own.samples[1].map { (start: $0.start, value: $0.value) }
-            let hrv = own.samples[2].map { (start: $0.start, value: $0.value) }
-            let nights = own.nights.map { (night: $0.night, skinTempC: $0.skinTempC,
-                                           inBedStart: $0.inBedStart, inBedEnd: $0.inBedEnd) }
+            let log = LocalStore.ownershipLog()
+            let nights = Self.ownNights(sleepNights, log: log)
+                .map { (night: $0.night, skinTempC: $0.skinTempC, inBedStart: $0.inBedStart, inBedEnd: $0.inBedEnd) }
             let fbRestingHR = healthBaselineReport?.restingHR.map { (day: $0.day, value: $0.value) }
             let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
             let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
             let fbSkinTempOffsetC = healthBaselineReport?.skinTempOffsetC
             report = await Task.detached {
-                Self.computeReport(hr: hr, spo2: spo2, hrv: hrv, nights: nights,
-                                   fallbackRestingHR: fbRestingHR, fallbackSpO2: fbSpO2,
-                                   fallbackHRV: fbHRV, fallbackSkinTempOffsetC: fbSkinTempOffsetC)
+                let own = Self.ownSamples([history.heartRate, history.spo2, history.hrv], log: log)
+                let hr = own[0].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+                let spo2 = own[1].map { (start: $0.start, value: $0.value) }
+                let hrv = own[2].map { (start: $0.start, value: $0.value) }
+                return Self.computeReport(hr: hr, spo2: spo2, hrv: hrv, nights: nights,
+                                          fallbackRestingHR: fbRestingHR, fallbackSpO2: fbSpO2,
+                                          fallbackHRV: fbHRV, fallbackSkinTempOffsetC: fbSkinTempOffsetC)
             }.value
             onReport?(report)
         }
@@ -141,14 +147,25 @@ struct VitalsStatusCardView: View {
 
     /// Decision 29: the rows the current device measured in its own time, and its own nights. The rows
     /// unchanged with an empty log.
-    static func currentDeviceRows(samples: [[StoredSample]], nights: [StoredSleepSummary],
-                                  log: DeviceOwnershipLog) -> (samples: [[StoredSample]], nights: [StoredSleepSummary]) {
-        guard !log.isEmpty else { return (samples, nights) }
+    static func currentDeviceRows<Row: DeviceTimedRow>(samples: [[Row]], nights: [StoredSleepSummary],
+                                                       log: DeviceOwnershipLog) -> (samples: [[Row]], nights: [StoredSleepSummary]) {
+        (ownSamples(samples, log: log), ownNights(nights, log: log))
+    }
+
+    /// The samples half of `currentDeviceRows`, for the detached task (decision 75a).
+    nonisolated static func ownSamples<Row: DeviceTimedRow>(_ samples: [[Row]], log: DeviceOwnershipLog) -> [[Row]] {
+        guard !log.isEmpty else { return samples }
         let device = log.currentFamily
-        return (samples.map { rows in
-                    rows.filter { log.isOwn(recordedBy: SyncDeviceID(rawValue: $0.deviceID), at: $0.start, by: device) }
-                },
-                nights.filter { log.owner(ofNightFrom: $0.inBedStart, to: $0.inBedEnd) == device })
+        return samples.map { rows in
+            rows.filter { log.isOwn(recordedBy: SyncDeviceID(rawValue: $0.deviceID), at: $0.start, by: device) }
+        }
+    }
+
+    /// The nights half of `currentDeviceRows`.
+    static func ownNights(_ nights: [StoredSleepSummary], log: DeviceOwnershipLog) -> [StoredSleepSummary] {
+        guard !log.isEmpty else { return nights }
+        let device = log.currentFamily
+        return nights.filter { log.owner(ofNightFrom: $0.inBedStart, to: $0.inBedEnd) == device }
     }
 
     /// The Vitals Status report for the latest day, or nil until at least one vital has enough

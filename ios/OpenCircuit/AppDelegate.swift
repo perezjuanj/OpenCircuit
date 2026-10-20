@@ -119,6 +119,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                 RingScanner.shared.reconnectKnownPeripheral()
             }
         }
+        // Decision 75b: the dashboard's off-main reads refresh on one coalesced store-change signal,
+        // throttled while the active wearable syncs (foreground or background) and flushed when it
+        // stops. After the wiring above, so a returning user's driver already exists; reading the
+        // active session never touches the other device's driver (decision 1).
+        MainActor.assumeIsolated {
+            StoreRefreshSignal.shared.observeSaves()
+            StoreRefreshSignal.shared.followSyncs()
+        }
         // Bootstrap the BGTask chain AT LAUNCH (#119). Registration alone launches nothing — a
         // request must be SUBMITTED, and until build 17 the only initial submission point was
         // `applicationDidEnterBackground` below, which iOS never delivers to a scene-based
