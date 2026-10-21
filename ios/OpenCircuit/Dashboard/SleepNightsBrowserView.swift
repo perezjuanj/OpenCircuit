@@ -63,7 +63,7 @@ struct SleepNightsBrowserView: View {
                 }
             }
             .padding(16)
-            .containerRelativeFrame(.horizontal)
+            .pinnedToViewportWhenCompact()
         }
         .background(Theme.pageBackground)
         .navigationTitle("Past Nights")

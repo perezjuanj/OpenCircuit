@@ -218,6 +218,14 @@ struct ContentView: View {
         .tint(Theme.accent)
 #if DEBUG && targetEnvironment(simulator)
         .modifier(DemoScreenModifier())   // screenshot harness (#216); inert without -OCDemoData
+        .onAppear {
+            // `-OCDemoTab today|sleep|activity|trends|profile`: open on that tab, so a screenshot
+            // matrix (iPhone Duo poses) needs no UI automation. Simulator + DEBUG only.
+            guard DemoData.isRequested, let raw = UserDefaults.standard.string(forKey: "OCDemoTab") else { return }
+            let tabs: [String: Tab] = ["today": .today, "sleep": .sleep, "activity": .activity,
+                                       "trends": .trends, "profile": .profile]
+            if let tab = tabs[raw] { selectedTab = tab }
+        }
 #endif
             // Shared trends cache: load once, then refresh on foreground return and after each sync.
             // Every hook goes through `TrendsRefreshPolicy` — at a cold launch `.task` and
@@ -671,7 +679,7 @@ struct ContentView: View {
                 // a ~77pt drag. No subview is actually over-wide — every row measured at or under its
                 // 329.33pt proposal (widest: 329.33 `hints`, 308.00 `stageLegend`) — so there is
                 // nothing to narrow; the content simply has to be told it is exactly viewport-width.
-                .containerRelativeFrame(.horizontal)
+                .pinnedToViewportWhenCompact()
             }
             .background(Theme.pageBackground)
             .navigationTitle("Sleep")

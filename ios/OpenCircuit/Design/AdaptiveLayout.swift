@@ -100,6 +100,33 @@ struct SplitTab<Primary: View, EmptyDetail: View>: View {
     }
 }
 
+// MARK: - Viewport pin (compact only)
+
+private struct PinnedToViewportWhenCompact: ViewModifier {
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    func body(content: Content) -> some View {
+        if sizeClass == .regular {
+            // Wide: this view lives in a split-view column. `containerRelativeFrame` would size it
+            // against the WHOLE window instead of the column, so a detail pane overran its column
+            // and was clipped (the Sleep tab on an unfolded foldable / iPad). The column already
+            // proposes the right width.
+            content
+        } else {
+            content.containerRelativeFrame(.horizontal)
+        }
+    }
+}
+
+extension View {
+    /// Pins a vertical `ScrollView`'s content to exactly the viewport width, so fractional-point
+    /// rounding can never let it pan sideways (see the Sleep tab, commit 87d2911). Compact width
+    /// only: in a wide split-view column the pin is skipped, because it resolves against the window.
+    func pinnedToViewportWhenCompact() -> some View {
+        modifier(PinnedToViewportWhenCompact())
+    }
+}
+
 // MARK: - Tab bar
 
 extension View {
