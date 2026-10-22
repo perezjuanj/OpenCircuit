@@ -60,71 +60,7 @@ final class HealthAlertCopyTests: XCTestCase {
         XCTAssertFalse(body.contains("at at"))
     }
 
-    // MARK: Every alert fits an expanded notification
-
-    /// iOS shows about six lines of a notification and cuts the rest: build 86's illness alert lost
-    /// its caveat and the whole disclaimer on a real phone (~49 characters a line there). Budget: the
-    /// EXACT posted body (`postedBody`, copy + disclaimer) of every vital alert, at its worst-case
-    /// inputs, wraps to at most 5 lines at 42 characters, leaving room for narrower phones.
-    static let lineWidth = 42
-    static let maxLines = 5
-
-    /// Greedy word wrap, the way a label lays out plain text (each "\n" starts a new line).
-    static func wrappedLines(_ text: String, width: Int = lineWidth) -> Int {
-        text.components(separatedBy: "\n").reduce(0) { total, paragraph in
-            var lines = 1, current = 0
-            for word in paragraph.split(separator: " ") {
-                let needed = current == 0 ? word.count : current + 1 + word.count
-                if needed > width && current > 0 { lines += 1; current = word.count } else { current = needed }
-            }
-            return total + lines
-        }
-    }
-
-    func testTheWrapCounterCountsLikeALabel() {
-        XCTAssertEqual(Self.wrappedLines("abc def", width: 7), 1)
-        XCTAssertEqual(Self.wrappedLines("abc defg", width: 7), 2)
-        XCTAssertEqual(Self.wrappedLines("abc\ndef", width: 42), 2)
-    }
-
-    /// Every body this alert can post, at its longest.
-    private func worstCaseBodies(_ n: HealthNotification) -> [String] {
-        let cal = Calendar(identifier: .gregorian)
-        let now = cal.date(from: DateComponents(year: 2026, month: 8, day: 12, hour: 9))!
-        let older = cal.date(from: DateComponents(year: 2026, month: 8, day: 9, hour: 23, minute: 59))!
-        switch n {
-        case .headacheSigns:
-            let f = HeadacheSignals.Feature.allCases
-            var picks: [[HeadacheSignals.Feature]] = [[]] + f.map { [$0] }
-            for a in f { for b in f where b != a { picks.append([a, b]); picks.append([a, b, a]) } }
-            return picks.map { HealthNotificationCenter.copy(for: n, hit: nil, signals: $0).body }
-        case .illnessSigns:
-            let prior = (0..<5).map {
-                IllnessSignals.NightVitals(night: Date(timeIntervalSince1970: Double($0) * 86_400),
-                                           restingHR: 52, hrv: 80, respiratoryRate: 13)
-            }
-            let tonight = IllnessSignals.NightVitals(night: Date(timeIntervalSince1970: 9 * 86_400),
-                                                     restingHR: 99, hrv: 11, respiratoryRate: 23.75)
-            let all = IllnessSignals.assess(tonight: tonight, prior: prior, skinTempOffsetC: 3.45)
-            XCTAssertEqual(all.signals.count, 4)
-            return TemperatureUnit.allCases.map {
-                HealthNotificationCenter.copy(for: n, hit: nil, illness: all, tempUnit: $0).body
-            } + [HealthNotificationCenter.copy(for: n, hit: nil).body]
-        default:
-            let hit = HealthAlertHit(notification: n, value: 199, time: older)
-            return [HealthNotificationCenter.copy(for: n, hit: hit, now: now, calendar: cal).body]
-        }
-    }
-
-    func testEveryAlertFitsAnExpandedNotification() {
-        for n in HealthNotification.allCases {
-            for body in worstCaseBodies(n) {
-                let posted = HealthNotificationCenter.postedBody(for: n, copy: body)
-                XCTAssertLessThanOrEqual(Self.wrappedLines(posted), Self.maxLines,
-                                         "\(n.rawValue) is \(Self.wrappedLines(posted)) lines: \(posted)")
-            }
-        }
-    }
+    // The length rule for every notification lives in `AllNotificationsFitTests` (`NotificationBudget`).
 
     /// The body-vital alerts still carry the disclaimer, on its own line, after the copy.
     func testVitalAlertsStillCarryTheDisclaimer() {

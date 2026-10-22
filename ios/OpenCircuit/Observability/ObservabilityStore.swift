@@ -256,27 +256,35 @@ struct LocalAlertCenter {
 
     private func post(_ alert: SyncAlert) async {
         let content = UNMutableNotificationContent()
+        let copy = Self.copy(for: alert)
+        content.title = copy.title
+        content.body = copy.body
+        // One pending request per condition (stable id) — re-posting just refreshes it.
+        let request = UNNotificationRequest(identifier: "obs.alert.\(alert.rawValue)",
+                                            content: content, trigger: nil)
+        try? await center.add(request)
+    }
+
+    /// Each silent-failure alert's text, pure so `AllNotificationsFitTests` can hold it to
+    /// `NotificationBudget` (every notification must read in full when pressed and held).
+    static func copy(for alert: SyncAlert) -> (title: String, body: String) {
         switch alert {
         case .notSynced:
-            content.title = "Not synced lately"
-            content.body = "OpenCircuit hasn't synced your device in a while. Open the app to refresh, and check Settings ▸ General ▸ Background App Refresh."
+            return ("Not synced lately",
+                    "OpenCircuit hasn't synced your device in a while. Open the app to refresh, and check Settings ▸ General ▸ Background App Refresh.")
         case .lowBattery:
-            content.title = "Ring battery low"
-            content.body = "Your RingConn battery is low — charge it soon to keep tracking."
+            return ("Ring battery low",
+                    "Your RingConn battery is low — charge it soon to keep tracking.")
         case .healthAuthLost:
-            content.title = "Apple Health access off"
-            content.body = "OpenCircuit can no longer write to Apple Health. Re-enable it in Settings ▸ Health ▸ Data Access & Devices."
+            return ("Apple Health access off",
+                    "OpenCircuit can no longer write to Apple Health. Re-enable it in Settings ▸ Health ▸ Data Access & Devices.")
         case .notRecording:
             // Names the SYMPTOM the wearer can verify (nothing new for hours) and the ONE action
             // that clears the proven cause, without asserting a cause we cannot confirm from here —
             // the ring's mode is not queryable. Deliberately concrete about what is being lost:
             // "not recording" is abstract, "heart rate and sleep" is not.
-            content.title = "Ring isn't recording"
-            content.body = "Your ring is connected but hasn't stored any heart rate or sleep data for several hours. Start a workout and stop it again — that usually clears it."
+            return ("Ring isn't recording",
+                    "Your ring is connected but hasn't stored any heart rate or sleep data for several hours. Start a workout and stop it again — that usually clears it.")
         }
-        // One pending request per condition (stable id) — re-posting just refreshes it.
-        let request = UNNotificationRequest(identifier: "obs.alert.\(alert.rawValue)",
-                                            content: content, trigger: nil)
-        try? await center.add(request)
     }
 }

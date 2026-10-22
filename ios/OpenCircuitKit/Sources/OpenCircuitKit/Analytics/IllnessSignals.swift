@@ -214,7 +214,7 @@ public enum IllnessSignals {
     /// SHORT ON PURPOSE: iOS shows about six lines of an expanded notification and cuts the rest, so
     /// the first version (a full sentence per vital, ~300 characters before the disclaimer) lost its
     /// own caveat on a real phone. Compact "vital +delta" items keep the numbers and the caveat
-    /// inside the budget `HealthAlertCopyTests.testEveryVitalAlertFitsAnExpandedNotification` pins.
+    /// inside `NotificationBudget` (pinned by `AllNotificationsFitTests`).
     /// `tempUnit` is the wearer's display unit; the skin-temperature delta follows it.
     public static func copy(for assessment: Assessment,
                             tempUnit: TemperatureUnit = .celsius) -> (title: String, body: String) {

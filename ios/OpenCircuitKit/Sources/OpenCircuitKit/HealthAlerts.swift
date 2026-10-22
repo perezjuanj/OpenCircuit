@@ -929,7 +929,7 @@ public enum HeadacheSignsNotifications {
         let title = allDaytime ? "Your recent signals stood out" : "Last night was unusual for you"
         // Tail kept short (was "That is what we measured — it is not a forecast."): the longest
         // mixed-timeframe pair plus the disclaimer wrapped past the expanded-notification budget
-        // `HealthAlertCopyTests.testEveryAlertFitsAnExpandedNotification` pins. Same claim.
+        // `NotificationBudget` sets (`AllNotificationsFitTests`). Same claim.
         return (title,
                 subject + " (estimate). A measurement, not a forecast.")
     }
