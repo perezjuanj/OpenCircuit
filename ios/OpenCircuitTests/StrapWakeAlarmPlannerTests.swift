@@ -346,12 +346,15 @@ final class StrapWakeAlarmPlannerTests: XCTestCase {
 
     // MARK: the one provider
 
-    func testTheProviderStillListsTheThreeExistingShortcutsAndAddsTheThreeNewOnes() {
+    /// Every App Shortcut, in order: the three from before #260, its three wearable actions, and Start
+    /// Workout (the one-type-per-run workout shortcut).
+    func testTheProviderListsEveryShortcutInOrder() {
         let shortcuts = OpenCircuitAppShortcuts.appShortcuts
-        XCTAssertEqual(shortcuts.count, 6)
+        XCTAssertEqual(shortcuts.count, 7)
         let described = shortcuts.map { Self.describe($0) }
         let expected = ["LogHeadacheIntent", "LogHeadacheYesterdayIntent", "ExportRingDataIntent",
-                        "VibrateWearableIntent", "SetWakeAlarmOnWearableIntent", "ClearWakeAlarmOnWearableIntent"]
+                        "VibrateWearableIntent", "SetWakeAlarmOnWearableIntent", "ClearWakeAlarmOnWearableIntent",
+                        "StartWorkoutIntent"]
         for (index, name) in expected.enumerated() {
             XCTAssertTrue(described[index].contains(name), "shortcut \(index) is \(name)")
         }

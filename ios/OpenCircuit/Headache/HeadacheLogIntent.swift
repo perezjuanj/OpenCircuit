@@ -415,5 +415,18 @@ struct OpenCircuitAppShortcuts: AppShortcutsProvider {
             ],
             shortTitle: "Clear Wake Alarm on Wearable",
             systemImageName: "alarm")
+
+        // Start a workout of a chosen type (WorkoutShortcutIntent.swift). The parameterised phrases
+        // give Siri and Spotlight one ready-made shortcut per type; the plain ones ask for the type.
+        AppShortcut(
+            intent: StartWorkoutIntent(),
+            phrases: [
+                "Start a \(\.$workoutType) workout in \(.applicationName)",
+                "Start \(\.$workoutType) in \(.applicationName)",
+                "Start a workout in \(.applicationName)",
+                "Start a workout with \(.applicationName)",
+            ],
+            shortTitle: "Start Workout",
+            systemImageName: "figure.run")
     }
 }
