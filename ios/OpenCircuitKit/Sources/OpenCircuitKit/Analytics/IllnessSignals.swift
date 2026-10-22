@@ -210,32 +210,32 @@ public enum IllnessSignals {
 
     /// The notification text. Reports WHAT MOVED and by how much, offers the common non-illness
     /// explanations, and never names a disease. The shared medical disclaimer is appended by the app.
-    public static func copy(for assessment: Assessment) -> (title: String, body: String) {
-        let parts = assessment.readings.filter(\.isElevated).map(phrase)
-        let list: String
-        switch parts.count {
-        case 0: list = "several overnight vitals moved"
-        case 1: list = parts[0]
-        case 2: list = parts[0] + " and " + parts[1]
-        default: list = parts.dropLast().joined(separator: ", ") + " and " + parts[parts.count - 1]
-        }
+    ///
+    /// SHORT ON PURPOSE: iOS shows about six lines of an expanded notification and cuts the rest, so
+    /// the first version (a full sentence per vital, ~300 characters before the disclaimer) lost its
+    /// own caveat on a real phone. Compact "vital +delta" items keep the numbers and the caveat
+    /// inside `NotificationBudget` (pinned by `AllNotificationsFitTests`).
+    /// `tempUnit` is the wearer's display unit; the skin-temperature delta follows it.
+    public static func copy(for assessment: Assessment,
+                            tempUnit: TemperatureUnit = .celsius) -> (title: String, body: String) {
+        let parts = assessment.readings.filter(\.isElevated).map { phrase($0, tempUnit: tempUnit) }
+        let list = parts.isEmpty ? "several overnight vitals moved" : parts.joined(separator: ", ")
         return ("Possible illness signs",
-                "Last night your " + list + " compared with your usual. This pattern often shows up "
-                + "early in a cold or other infection, though alcohol, a late meal, a hot room or hard "
-                + "training can cause it too (estimate).")
+                "Vs your usual: " + list + ". Alcohol, a late meal or a hot room can do this too (estimate).")
     }
 
-    static func phrase(_ r: Reading) -> String {
+    static func phrase(_ r: Reading, tempUnit: TemperatureUnit = .celsius) -> String {
         switch r.signal {
         case .skinTempRise:
-            return "skin temperature was " + String(format: "%.1f", r.delta) + " °C higher"
+            return "skin temp +" + String(format: "%.1f", tempUnit.convertDelta(fromCelsius: r.delta))
+                + " " + tempUnit.symbol
         case .restingHRRise:
-            return "sleeping heart rate was " + String(Int(r.delta.rounded())) + " bpm higher"
+            return "sleeping HR +" + String(Int(r.delta.rounded())) + " bpm"
         case .hrvDrop:
             let pct = r.baseline.map { $0 > 0 ? Int((-r.delta / $0 * 100).rounded()) : 0 } ?? 0
-            return "HRV was " + String(pct) + "% lower"
+            return "HRV \u{2212}" + String(pct) + "%"
         case .respiratoryRateRise:
-            return "breathing rate was " + String(format: "%.1f", r.delta) + " breaths/min higher"
+            return "breathing +" + String(format: "%.1f", r.delta) + "/min"
         }
     }
 }

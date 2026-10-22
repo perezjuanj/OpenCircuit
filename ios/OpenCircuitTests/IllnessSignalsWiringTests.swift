@@ -108,7 +108,7 @@ final class IllnessSignalsWiringTests: XCTestCase {
                        [.illnessSigns])
         let copy = HealthNotificationCenter.copy(for: .illnessSigns, hit: nil, illness: illness.assessment)
         XCTAssertEqual(copy.title, "Possible illness signs")
-        XCTAssertTrue(copy.body.contains("sleeping heart rate was 8 bpm higher"), copy.body)
+        XCTAssertTrue(copy.body.contains("sleeping HR +8 bpm"), copy.body)
     }
 
     func testAnOrdinaryNightIsQuietAndCachedUntilRestaged() async throws {

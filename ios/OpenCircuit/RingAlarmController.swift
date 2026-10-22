@@ -68,6 +68,8 @@ final class RingAlarmController {
 
     /// Identifier for the OS-scheduled backup alert.
     private static let notificationID = "alarm.ring.backup"
+    /// The backup alert's text (held to `NotificationBudget` by `AllNotificationsFitTests`).
+    nonisolated static let backupCopy = (title: "Alarm", body: "Time to wake up.")
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -323,8 +325,8 @@ final class RingAlarmController {
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
             guard granted else { return }
             let content = UNMutableNotificationContent()
-            content.title = "Alarm"
-            content.body = "Time to wake up."
+            content.title = Self.backupCopy.title
+            content.body = Self.backupCopy.body
             content.sound = .default
             for trigger in triggers {
                 center.add(UNNotificationRequest(

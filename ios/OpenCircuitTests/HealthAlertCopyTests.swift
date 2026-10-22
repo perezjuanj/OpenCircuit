@@ -59,4 +59,28 @@ final class HealthAlertCopyTests: XCTestCase {
         XCTAssertTrue(body.contains(" on "), "an older reading must name its day; got: \(body)")
         XCTAssertFalse(body.contains("at at"))
     }
+
+    // The length rule for every notification lives in `AllNotificationsFitTests` (`NotificationBudget`).
+
+    /// The body-vital alerts still carry the disclaimer, on its own line, after the copy.
+    func testVitalAlertsStillCarryTheDisclaimer() {
+        for n in [HealthNotification.highHR, .lowSpO2, .elevatedHRInactive, .skinTempRise, .fever,
+                  .illnessSigns, .headacheSigns] {
+            XCTAssertEqual(HealthNotificationCenter.postedBody(for: n, copy: "Body."),
+                           "Body.\nNot a medical device or a diagnosis.", n.rawValue)
+        }
+        XCTAssertEqual(HealthNotificationCenter.postedBody(for: .bedtimeReminder, copy: "Body."), "Body.")
+    }
+
+    func testTheIllnessCopyFollowsTheProfileTemperatureUnit() {
+        let suite = "HealthAlertCopyTests.units"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(TemperatureUnit.fahrenheit.rawValue, forKey: "units.temperature")
+        XCTAssertEqual(HealthNotificationCenter.displayTempUnit(defaults), .fahrenheit)
+        defaults.set(TemperatureUnit.celsius.rawValue, forKey: "units.temperature")
+        XCTAssertEqual(HealthNotificationCenter.displayTempUnit(defaults), .celsius)
+        defaults.removeObject(forKey: "units.temperature")
+        XCTAssertEqual(HealthNotificationCenter.displayTempUnit(defaults), .localeDefault)
+    }
 }

@@ -1065,9 +1065,10 @@ struct HealthNotificationCenter {
                       signals: [HeadacheSignals.Feature] = [],
                       illness: IllnessSignals.Assessment? = nil) async {
         let content = UNMutableNotificationContent()
-        let copy = Self.copy(for: n, hit: hit, signals: signals, illness: illness)
+        let copy = Self.copy(for: n, hit: hit, signals: signals, illness: illness,
+                             tempUnit: Self.displayTempUnit())
         content.title = copy.title
-        content.body = Self.appendsDisclaimer(n) ? copy.body + "\n\n" + Self.disclaimer : copy.body
+        content.body = Self.postedBody(for: n, copy: copy.body)
         content.sound = .default
         // Carry the category ONLY for #183, so the notification lands in the category AppDelegate
         // registered — which deliberately declares NO ACTIONS (see the label-bias note there).
@@ -1090,9 +1091,24 @@ struct HealthNotificationCenter {
 
     /// The medical-disclaimer line carried on EVERY health/fever notification, per the APK
     /// (pp.txt:45929 / 46204): "Note: This product is not a medical device …".
-    static let disclaimer =
-        "Note: OpenCircuit is not a medical device. These reminders are based on your device's sensor "
-        + "data only and are not a diagnosis. If you feel unwell, consult a qualified medical professional."
+    ///
+    /// One short line, not the full paragraph: iOS shows about six lines of an expanded notification
+    /// and cuts the rest, and the 190-character version (plus a blank line) pushed the alert's own
+    /// text off the end on a real phone. The full wording still lives where there is room for it:
+    /// `DeviceCopy.alertsDisclaimer` under the alert switches in Profile, and onboarding.
+    static let disclaimer = "Not a medical device or a diagnosis."
+
+    /// The exact text `post` hands to iOS: the copy, then the disclaimer on its own line for the
+    /// body-vital alerts. One function so the length budget test measures what really ships.
+    static func postedBody(for n: HealthNotification, copy body: String) -> String {
+        appendsDisclaimer(n) ? body + "\n" + disclaimer : body
+    }
+
+    /// The wearer's temperature display unit (the Profile setting every chart reads).
+    static func displayTempUnit(_ defaults: UserDefaults = .standard) -> TemperatureUnit {
+        defaults.string(forKey: "units.temperature").flatMap(TemperatureUnit.init(rawValue:))
+            ?? .localeDefault
+    }
 
     /// When a reading was taken, worded so it can never be mistaken for a different day.
     ///
@@ -1128,6 +1144,7 @@ struct HealthNotificationCenter {
     static func copy(for n: HealthNotification, hit: HealthAlertHit?,
                      signals: [HeadacheSignals.Feature] = [],
                      illness: IllnessSignals.Assessment? = nil,
+                     tempUnit: TemperatureUnit = .celsius,
                      now: Date = Date(),
                      calendar: Calendar = .current) -> (title: String, body: String) {
         // Carries its own preposition — see `whenPhrase`. Never prefix it with " at ".
@@ -1152,7 +1169,7 @@ struct HealthNotificationCenter {
             let threshold = HealthAlertDefaults.thresholds().elevatedHRBpm
             return ("Elevated heart rate while inactive",
                     "Your heart rate stayed above your \(threshold) bpm threshold "
-                    + "for over 10 minutes while you were inactive. This can indicate a change in how you feel.")
+                    + "for over 10 minutes while you were inactive.")
         case .skinTempRise:
             return ("Skin temperature elevated",
                     "Your overnight skin temperature is well above your personal baseline (estimate).")
@@ -1167,8 +1184,8 @@ struct HealthNotificationCenter {
                     "Your overnight skin temperature fell sharply versus the previous night (estimate).")
         case .fever:
             return ("Possible fever signs",
-                    "Your skin temperature and heart rate are both elevated above your baseline, "
-                    + "which can accompany suspected fever symptoms (estimate).")
+                    "Your skin temperature and heart rate are both above your usual, "
+                    + "which can come with a fever (estimate).")
         // #84 reminders — no medical disclaimer appended (they're lifestyle reminders)
         case .sedentaryReminder:
             return ("Move reminder",
@@ -1193,10 +1210,10 @@ struct HealthNotificationCenter {
         // Possible illness signs — copy lives in the Kit (`IllnessSignals.copy`, CLI-tested): what
         // moved and by how much, the common non-illness causes, never a named disease.
         case .illnessSigns:
-            return illness.map(IllnessSignals.copy(for:))
+            return illness.map { IllnessSignals.copy(for: $0, tempUnit: tempUnit) }
                 ?? ("Possible illness signs",
-                    "Several of your overnight vitals moved away from your usual, a pattern that often "
-                    + "shows up early in a cold or other infection (estimate).")
+                    "Several overnight vitals moved away from your usual. Alcohol, a late meal or a "
+                    + "hot room can do this too (estimate).")
         }
     }
 }

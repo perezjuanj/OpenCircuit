@@ -3353,26 +3353,11 @@ final class RingSession: NSObject {
             return true
         }
 
-        let minutes = max(Int(candidate.duration / 60), 1)
-        // "about 1093 minutes" for a multi-hour bout is unreadable; switch to h/min at 90 min.
-        let durationText = minutes >= 90
-            ? "\(minutes / 60)h \(minutes % 60)m"
-            : "\(minutes) minutes"
-        // Time-only copy made a Saturday bout read as "today" (its pruned start was exactly
-        // now − 48 h, so it always looked one minute old). Include the date when it isn't today,
-        // matching the Workouts inbox subtitle.
-        let time = Calendar.current.isDateInToday(candidate.start)
-            ? candidate.start.formatted(date: .omitted, time: .shortened)
-            : candidate.start.formatted(date: .abbreviated, time: .shortened)
-        let kind: String
-        switch candidate.suggestedKind {
-        case .walking: kind = "walk"
-        case .running: kind = "run"
-        case nil: kind = "workout"
-        }
+        let copy = Self.workoutDetectedCopy(kind: candidate.suggestedKind, duration: candidate.duration,
+                                            start: candidate.start)
         let content = UNMutableNotificationContent()
-        content.title = "Possible \(kind) detected"
-        content.body = "Your ring detected about \(durationText) starting at \(time). Open Workouts to review it."
+        content.title = copy.title
+        content.body = copy.body
         content.sound = .default
         let cursor = candidate.samples.first?.cursor ?? 0
         let identifier = "workout.detected.\(peripheral.identifier.uuidString).\(cursor)"
@@ -3384,6 +3369,37 @@ final class RingSession: NSObject {
         } catch {
             return false
         }
+    }
+
+    /// The detected-workout notification's text, pure so `AllNotificationsFitTests` can hold it to
+    /// `NotificationBudget`. `now`/`calendar` are injectable for the same reason.
+    nonisolated static func workoutDetectedCopy(kind suggested: AutomaticWorkoutDetector.SuggestedKind?,
+                                                duration: TimeInterval, start: Date, now: Date = Date(),
+                                                calendar: Calendar = .current) -> (title: String, body: String) {
+        let minutes = max(Int(duration / 60), 1)
+        // "about 1093 minutes" for a multi-hour bout is unreadable; switch to h/min at 90 min.
+        let durationText = minutes >= 90
+            ? "\(minutes / 60)h \(minutes % 60)m"
+            : "\(minutes) minutes"
+        // Time-only copy made a Saturday bout read as "today" (its pruned start was exactly
+        // now − 48 h, so it always looked one minute old). Include the date when it isn't today,
+        // matching the Workouts inbox subtitle.
+        let time = calendar.isDate(start, inSameDayAs: now)
+            ? start.formatted(date: .omitted, time: .shortened)
+            : start.formatted(date: .abbreviated, time: .shortened)
+        let kind: String
+        switch suggested {
+        case .walking: kind = "walk"
+        case .running: kind = "run"
+        case nil: kind = "workout"
+        }
+        return ("Possible \(kind) detected",
+                "Your ring detected about \(durationText) starting at \(time). Open Workouts to review it.")
+    }
+
+    /// The morning sleep notification's text (held to `NotificationBudget` too).
+    nonisolated static func morningSummaryCopy(asleepMin: Int) -> (title: String, body: String) {
+        ("Last night", "\(asleepMin / 60) h \(asleepMin % 60) min asleep — synced from your ring.")
     }
 
     /// The running manual workout's window as a cursor span (start → now), or nothing.
@@ -4032,8 +4048,9 @@ final class RingSession: NSObject {
             return
         }
         let content = UNMutableNotificationContent()
-        content.title = "Last night"
-        content.body = "\(summary.asleepMin / 60) h \(summary.asleepMin % 60) min asleep — synced from your ring."
+        let copy = Self.morningSummaryCopy(asleepMin: summary.asleepMin)
+        content.title = copy.title
+        content.body = copy.body
         try? await center.add(UNNotificationRequest(identifier: "morning.summary",
                                                     content: content, trigger: nil))
         defaults.set(nightKey, forKey: Self.lastNotifiedNightKey)
