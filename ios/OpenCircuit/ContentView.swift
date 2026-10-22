@@ -258,9 +258,8 @@ struct ContentView: View {
                     Task { await loadTrends(.syncFinished) }
                 }))
             // The strap's workout (#227): its sheet, the interrupted-workout offer, the landing pass.
-            .modifier(StrapWorkoutHooks(recorder: strapWorkouts, session: helioSession, ringManager: workoutManager,
-                                        show: $showStrapWorkout,
-                                        onWorkoutsChanged: { workoutHistoryToken += 1 }))
+            // …and "Start Workout" from Shortcuts / Siri / the Action button (WorkoutShortcutIntent.swift).
+            .modifier(workoutHooks)
             // Feed / reset the liveline live-vitals buffer as on-demand readings arrive.
             .onChange(of: session?.liveHR) { _, hr in
                 if session?.monitoring == true, session?.liveMode == .hr, let hr { appendLive(Double(hr)) }
@@ -1027,6 +1026,110 @@ struct ContentView: View {
     /// Either "Interrupted workout" alert (the ring's or the strap's) still waiting for an answer.
     private var workoutRecoveryAlertShowing: Bool {
         recoverableWorkout != nil || strapWorkouts.recoverable != nil
+    }
+
+    // MARK: - Start Workout shortcut
+
+    /// The strap workout's hooks and the shortcut's, as ONE modifier built outside `body`: the body's
+    /// chain is at the edge of what the type checker solves in time, and a second `.modifier` there
+    /// (or one more statement in the cover's `onDismiss`) tipped it over.
+    private var workoutHooks: some ViewModifier {
+        StrapWorkoutHooks(recorder: strapWorkouts, session: helioSession, ringManager: workoutManager,
+                          show: $showStrapWorkout,
+                          onWorkoutsChanged: { workoutHistoryToken += 1 })
+            .concat(workoutShortcutHooks)
+    }
+
+    /// The shortcut's triggers (`WorkoutShortcutHooks`).
+    private var workoutShortcutHooks: WorkoutShortcutHooks {
+        WorkoutShortcutHooks(
+            inbox: .shared,
+            onboardingCompleted: onboardingCompleted,
+            deviceReady: workoutShortcutDeviceReady,
+            recoveryAlertShowing: workoutRecoveryAlertShowing,
+            sheetOpen: showWorkout || showStrapWorkout,
+            selectedSport: ringActive ? workoutManager.selectedSport : strapWorkouts.selectedSport,
+            apply: { applyWorkoutShortcut() })
+    }
+
+    /// The chosen device can start a workout this moment: each Start button's own rule (the ring
+    /// connected, not syncing and not holding the link, T1; the strap authenticated and streaming).
+    /// A finished summary or an error screen still on the recorder counts as startable, because the
+    /// shortcut clears it first (`prepareShortcutWorkout`).
+    private var workoutShortcutDeviceReady: Bool {
+        if ringActive {
+            guard let session, session.ready, !session.syncing, !session.workoutHolding else { return false }
+            switch workoutManager.recordingState {
+            case .idle, .finished, .error: return true
+            case .starting, .active, .finishing: return false
+            }
+        }
+        guard let strap = helioSession, strap.ready, strap.canStreamHeartRate, !strap.syncing else { return false }
+        switch strapWorkouts.state {
+        case .idle, .finished, .error: return true
+        case .active, .finishing: return false
+        }
+    }
+
+    /// Apply a waiting "Start Workout" shortcut request (`WorkoutShortcutStart` decides what).
+    @MainActor
+    private func applyWorkoutShortcut() {
+        let inbox = WorkoutShortcutInbox.shared
+        guard let request = inbox.pending else { return }
+        let device: WorkoutShortcutStart.Device = ringActive ? .ring : .strap
+        let context = WorkoutShortcutStart.Context(
+            device: device,
+            onboardingCompleted: UserDefaults.standard.bool(forKey: OnboardingView.completedKey),
+            recoveryAlertShowing: workoutRecoveryAlertShowing,
+            ringRecording: workoutIsRecording,
+            strapRecording: strapWorkouts.isRecording,
+            deviceReady: workoutShortcutDeviceReady)
+        switch WorkoutShortcutStart.decide(request, context: context, now: Date()) {
+        case .hold:
+            return
+        case .showRunning(let running):
+            inbox.clear()
+            openWorkoutSheet(running.linkTarget)
+        case .start(let device, let sport):
+            inbox.clear()
+            guard prepareShortcutWorkout(sport, on: device) else { return }
+            switch device {
+            case .ring:
+                guard let session else { return }
+                workoutManager.start(session: session, store: LocalStore(modelContext))
+            case .strap:
+                strapWorkouts.start()
+            }
+            openWorkoutSheet(device.linkTarget)
+        case .waitForDevice(let device, let sport):
+            _ = prepareShortcutWorkout(sport, on: device)
+            openWorkoutSheet(device.linkTarget)
+        case .giveUp(let device, let sport):
+            inbox.clear()
+            _ = prepareShortcutWorkout(sport, on: device)
+            openWorkoutSheet(device.linkTarget)
+        }
+    }
+
+    /// Clear a finished summary or an error screen from the device's recorder and select `sport` on
+    /// it. Only an idle recorder's type is ever changed: a workout still being written to Health
+    /// (`.finishing`) keeps its own. False when the recorder isn't idle afterwards.
+    @MainActor
+    private func prepareShortcutWorkout(_ sport: WorkoutSportType, on device: WorkoutShortcutStart.Device) -> Bool {
+        switch device {
+        case .ring:
+            switch workoutManager.recordingState {
+            case .finished, .error: workoutManager.reset()
+            default: break
+            }
+            guard case .idle = workoutManager.recordingState else { return false }
+            workoutManager.selectedSport = sport
+        case .strap:
+            strapWorkouts.reset()   // acts on a finished summary or an error only
+            guard strapWorkouts.state == .idle else { return false }
+            strapWorkouts.selectedSport = sport
+        }
+        return true
     }
 
     /// Open the sheet a link held under the onboarding cover asked for (#258), once nothing is in

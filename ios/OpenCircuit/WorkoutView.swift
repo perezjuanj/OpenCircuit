@@ -204,6 +204,12 @@ struct WorkoutView: View {
             .disabled(session == nil || session?.ready != true
                       || session?.syncing == true || session?.workoutHolding == true)
 
+            if let pending = WorkoutShortcutInbox.shared.pending, pending.sport == manager.selectedSport {
+                Label("Your shortcut starts this workout as soon as the ring is ready. Close this to cancel.",
+                      systemImage: "bolt.fill")
+                    .font(.caption).foregroundStyle(.blue)
+                    .multilineTextAlignment(.center)
+            }
             if session == nil || session?.ready != true {
                 Text("Connect to the ring before starting a workout.")
                     .font(.caption2).foregroundStyle(.secondary)

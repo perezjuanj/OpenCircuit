@@ -91,6 +91,12 @@ struct StrapWorkoutView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .disabled(!recorder.canStart(session))
+                if let pending = WorkoutShortcutInbox.shared.pending, pending.sport == recorder.selectedSport {
+                    Label("Your shortcut starts this workout as soon as the strap is ready. Close this to cancel.",
+                          systemImage: "bolt.fill")
+                        .font(.caption).foregroundStyle(.blue)
+                        .multilineTextAlignment(.center)
+                }
                 if let reason = startBlockedReason {
                     Text(reason).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 }
