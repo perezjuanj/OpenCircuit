@@ -43,6 +43,10 @@ public enum HealthNotification: String, CaseIterable, Codable, Sendable {
     // rawValue keeps the persisted `alerts.health.lastFired` / `alerts.health.lastNight` ledger keys
     // stable. Pinned by `HealthNotificationOrderTests`.
     case headacheSigns     = "headache.signs"
+    // Possible-illness signs (`IllnessSignals`): two or more overnight vitals moved the way they do
+    // early in an infection. Appended after #183 under the same rule (append, explicit rawValue).
+    // A per-NIGHT alert in the temp family: `TempFeverNotifications.notificationSet` holds it.
+    case illnessSigns      = "illness.signs"
 }
 
 // MARK: - Quiet hours (shared DND window)
@@ -633,6 +637,7 @@ public enum TempFeverNotifications {
     /// the disclaimer logic) stays in lock-step; adding a skin-temp case means adding it here once.
     public static let notificationSet: Set<HealthNotification> = [
         .skinTempRise, .skinTempDrop, .skinTempFluctuationRise, .skinTempFluctuationDrop, .fever,
+        .illnessSigns,
     ]
 
     /// Timezone-stable `yyyymmdd` day key for a night's start-of-day. Used as the per-night ledger
@@ -647,14 +652,23 @@ public enum TempFeverNotifications {
     /// Map the four `SkinTempBaseline` anomaly flags (#69) + the suspected-fever flag (#72) to the
     /// notifications they should raise. Pure flag→notification routing; the de-dupe/DND gate and
     /// posting happen in the shared app-side center. (#85)
+    ///
+    /// `illness` (`IllnessSignals`): when it is suspected and fever is NOT, `.illnessSigns` is added
+    /// and replaces the plain skin-temperature RISE alerts whenever its own copy already names the
+    /// temperature rise, so one night doesn't send "skin temperature jumped" and "possible illness
+    /// signs" back to back. Fever wins over it: fever is the more specific, more actionable alert.
     public static func notifications(flags: SkinTempBaseline.AnomalyFlags,
-                                     feverSuspected: Bool) -> [HealthNotification] {
+                                     feverSuspected: Bool,
+                                     illness: IllnessSignals.Assessment? = nil) -> [HealthNotification] {
+        let illnessFires = !feverSuspected && (illness?.isSuspected ?? false)
+        let illnessNamesTemp = illnessFires && (illness?.signals.contains(.skinTempRise) ?? false)
         var out: [HealthNotification] = []
-        if flags.abnormalRise { out.append(.skinTempRise) }
+        if flags.abnormalRise && !illnessNamesTemp { out.append(.skinTempRise) }
         if flags.abnormalDrop { out.append(.skinTempDrop) }
-        if flags.fluctuationRise { out.append(.skinTempFluctuationRise) }
+        if flags.fluctuationRise && !illnessNamesTemp { out.append(.skinTempFluctuationRise) }
         if flags.fluctuationDrop { out.append(.skinTempFluctuationDrop) }
         if feverSuspected { out.append(.fever) }
+        if illnessFires { out.append(.illnessSigns) }
         return out
     }
 

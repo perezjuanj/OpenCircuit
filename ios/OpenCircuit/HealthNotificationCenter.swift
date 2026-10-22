@@ -243,6 +243,11 @@ struct HealthNotificationCenter {
         } else {
             series = []
         }
+        // Possible illness signs: its month of overnight rows is also read off the main actor, here,
+        // before the synchronous stretch below. Only with the temp/fever alerts on (same toggle).
+        let illness: IllnessNight? = HealthAlertDefaults.tempFeverEnabledValue()
+            ? await illnessNight(store: localStore, lastNotifiedNight: store.lastNotifiedNight())
+            : nil
 
         // The night-level candidates (#85, #183). The instant ones (#73) are decided at the gate, in
         // `decideAndClaim`, from the series gathered below.
@@ -341,7 +346,7 @@ struct HealthNotificationCenter {
         // computed yet (see the #183 branch, which needs it for its own suppression).
         var feverSuspected: Bool?
         if HealthAlertDefaults.tempFeverEnabledValue() {
-            let temp = tempFeverCandidates(store: localStore, restingHRDaily: series)
+            let temp = tempFeverCandidates(store: localStore, restingHRDaily: series, illness: illness)
             feverSuspected = temp.fever
             if let night = temp.night {
                 let key = TempFeverNotifications.dayKey(for: night)
@@ -402,7 +407,9 @@ struct HealthNotificationCenter {
             // exactly, so a recomputed key would silently mark nothing.
             if let headacheRowDay { try? localStore.markRiskAlerted(day: headacheRowDay) }
         }
-        for n in fire { await post(n, hit: routed.hits[n], signals: headacheSignals) }
+        for n in fire {
+            await post(n, hit: routed.hits[n], signals: headacheSignals, illness: illness?.assessment)
+        }
     }
 
     /// The synchronous heart of `evaluate`: decide the instant alerts (#73) under the live rule, route
@@ -474,21 +481,105 @@ struct HealthNotificationCenter {
     /// computation for its own fever suppression instead of assembling a second skin-temp report
     /// off a second 40-night fetch. One owner for "is this a fever morning", so the fever alert and
     /// the suppression it drives can never disagree.
+    ///
+    /// `illness` is this pass's `illnessNight` read (nil when it didn't run or found nothing). It
+    /// only ever ADDS `.illnessSigns` for the same latest night, and may stand in for a temp alert
+    /// its own copy already names (`TempFeverNotifications.notifications`). With no usable
+    /// temperature the illness check still runs on heart rate, HRV and breathing rate.
     func tempFeverCandidates(store: LocalStore,
-                                     restingHRDaily: [RestingHR.DailyValue])
+                             restingHRDaily: [RestingHR.DailyValue],
+                             illness: IllnessNight? = nil)
         -> (candidates: [HealthNotification], night: Date?, fever: Bool) {
         guard let temp = skinTempReport(store: store) else {
             // No usable overnight temperature ⇒ no temp offset ⇒ `VitalsBaseline.suspectedFever`
             // would return false anyway (it requires one). Reporting `false` here is that same
             // answer, not a substituted value.
+            if let illness, illness.assessment.isSuspected {
+                return ([.illnessSigns], illness.night, false)
+            }
             return ([], nil, false)
         }
         let report = temp.report
 
         // Fever: resting-HR baseline vs today + the canonical temp offset (#72 owns the logic).
         let fever = suspectedFever(tempOffsetC: report.offsetC, restingHRDaily: restingHRDaily)
-        let notifs = TempFeverNotifications.notifications(flags: report.flags, feverSuspected: fever)
+        let sameNight = illness.flatMap { $0.night == temp.tonightDay ? $0.assessment : nil }
+        let notifs = TempFeverNotifications.notifications(flags: report.flags, feverSuspected: fever,
+                                                          illness: sameNight)
         return (notifs, temp.tonightDay, fever)
+    }
+
+    // MARK: - Possible illness signs (IllnessSignals)
+
+    /// The latest night's illness assessment, keyed by its start-of-day night.
+    struct IllnessNight: Equatable {
+        let night: Date
+        let assessment: IllnessSignals.Assessment
+    }
+
+    /// `"<night day key>|<summary updatedAt>"` of the last latest-night judged NOT suspected, so a
+    /// quiet night isn't re-read on every pass of the day. A re-staged night changes `updatedAt` and
+    /// is judged again. A suspected night is never cached: it is re-read until it has been posted
+    /// (then the per-night ledger stops it), so a quiet-hours hold can't lose its copy.
+    static let illnessQuietNightKey = "alerts.illness.quietNight"
+
+    /// Judge the latest night with `IllnessSignals`. Main-actor reads (latest night, its device's
+    /// prior nights, the canonical skin-temp offset) happen here; the ~month of HR, HRV and
+    /// respiratory-rate rows is read OFF the main actor on a fresh `ModelContext` (the #305 pattern
+    /// `restingHRDailySeries` uses), and only value types come back.
+    ///
+    /// nil when: there is no staged latest night; it was already notified (`lastNotifiedNight`); it
+    /// was already judged quiet at this `updatedAt`; or the latest night belongs to a device other
+    /// than the current one (decision 29: `recentOwnSamples` returns the CURRENT device's rows).
+    func illnessNight(store: LocalStore,
+                      lastNotifiedNight: [HealthNotification: Int],
+                      defaults: UserDefaults = .standard) async -> IllnessNight? {
+        guard let latest = try? store.latestSleepSummary(),
+              latest.asleepMin > 0, latest.inBedEnd > latest.inBedStart else { return nil }
+        let cal = Calendar.current
+        let tonightDay = cal.startOfDay(for: latest.night)
+        let key = TempFeverNotifications.dayKey(for: tonightDay)
+        if let last = lastNotifiedNight[.illnessSigns], last >= key { return nil }
+        let stamp = "\(key)|\(latest.updatedAt.timeIntervalSince1970)"
+        if defaults.string(forKey: Self.illnessQuietNightKey) == stamp { return nil }
+
+        let log = LocalStore.ownershipLog()
+        if !log.isEmpty, log.owner(ofNightFrom: latest.inBedStart, to: latest.inBedEnd) != log.currentFamily {
+            return nil
+        }
+        let windows = LocalStore.sameDevice((try? store.recentSleepSummaries(limit: 40)) ?? [], as: latest)
+            .filter { $0.asleepMin > 0 && $0.inBedEnd > $0.inBedStart }
+            .sorted { $0.inBedStart > $1.inBedStart }
+            .prefix(IllnessSignals.Config().maxPriorNights + 1)
+            .map { IllnessSignals.NightWindow(night: cal.startOfDay(for: $0.night),
+                                              start: $0.inBedStart, end: $0.inBedEnd) }
+        guard let since = windows.map(\.start).min() else { return nil }
+        let offset = skinTempReport(store: store)?.report.offsetC
+
+        let vitals = await Self.illnessNightVitals(container: store.container, since: since,
+                                                   windows: Array(windows), log: log)
+        guard let tonight = vitals.first(where: { $0.night == tonightDay }) else { return nil }
+        let assessment = IllnessSignals.assess(tonight: tonight,
+                                               prior: vitals.filter { $0.night < tonightDay },
+                                               skinTempOffsetC: offset)
+        if !assessment.isSuspected { defaults.set(stamp, forKey: Self.illnessQuietNightKey) }
+        return IllnessNight(night: tonightDay, assessment: assessment)
+    }
+
+    /// The off-main read for `illnessNight`: the current device's own HR, HRV and respiratory-rate
+    /// rows since the oldest window, reduced to per-night means. `async` with the detached task
+    /// inside, like `restingHRDailySeries(container:since:log:)`, so it can't run on the main actor.
+    nonisolated static func illnessNightVitals(container: ModelContainer, since: Date,
+                                               windows: [IllnessSignals.NightWindow],
+                                               log: DeviceOwnershipLog) async -> [IllnessSignals.NightVitals] {
+        await Task.detached {
+            let context = ModelContext(container)
+            var samples: [QuantitySample] = []
+            for kind in [MetricKind.heartRate, .hrvSDNN, .respiratoryRate] {
+                samples += (try? LocalStore.recentOwnSamples(in: context, kind: kind, since: since, log: log)) ?? []
+            }
+            return IllnessSignals.nightlyVitals(samples: samples, windows: windows)
+        }.value
     }
 
     /// The latest night's skin-temp report against its own device's prior nights, or nil when the
@@ -959,7 +1050,8 @@ struct HealthNotificationCenter {
             return true
         case .sedentaryReminder, .wearReminder, .bedtimeReminder, .chargingComplete:
             return false
-        case .skinTempRise, .skinTempDrop, .skinTempFluctuationRise, .skinTempFluctuationDrop, .fever:
+        case .skinTempRise, .skinTempDrop, .skinTempFluctuationRise, .skinTempFluctuationDrop, .fever,
+             .illnessSigns:
             return TempFeverNotifications.notificationSet.contains(n)
         case .headacheSigns:
             // YES — it is built entirely from ring sensor readings, and it is the one alert a user is
@@ -970,9 +1062,10 @@ struct HealthNotificationCenter {
     }
 
     private func post(_ n: HealthNotification, hit: HealthAlertHit?,
-                      signals: [HeadacheSignals.Feature] = []) async {
+                      signals: [HeadacheSignals.Feature] = [],
+                      illness: IllnessSignals.Assessment? = nil) async {
         let content = UNMutableNotificationContent()
-        let copy = Self.copy(for: n, hit: hit, signals: signals)
+        let copy = Self.copy(for: n, hit: hit, signals: signals, illness: illness)
         content.title = copy.title
         content.body = Self.appendsDisclaimer(n) ? copy.body + "\n\n" + Self.disclaimer : copy.body
         content.sound = .default
@@ -1034,6 +1127,7 @@ struct HealthNotificationCenter {
     /// already ranked. Defaulted so every other call site (and `HealthAlertCopyTests`) is unchanged.
     static func copy(for n: HealthNotification, hit: HealthAlertHit?,
                      signals: [HeadacheSignals.Feature] = [],
+                     illness: IllnessSignals.Assessment? = nil,
                      now: Date = Date(),
                      calendar: Calendar = .current) -> (title: String, body: String) {
         // Carries its own preposition — see `whenPhrase`. Never prefix it with " at ".
@@ -1096,6 +1190,13 @@ struct HealthNotificationCenter {
         // reasoning and `HealthAlertsHeadacheTests` pins it.
         case .headacheSigns:
             return HeadacheSignsNotifications.copy(topSignals: signals)
+        // Possible illness signs — copy lives in the Kit (`IllnessSignals.copy`, CLI-tested): what
+        // moved and by how much, the common non-illness causes, never a named disease.
+        case .illnessSigns:
+            return illness.map(IllnessSignals.copy(for:))
+                ?? ("Possible illness signs",
+                    "Several of your overnight vitals moved away from your usual, a pattern that often "
+                    + "shows up early in a cold or other infection (estimate).")
         }
     }
 }

@@ -495,8 +495,12 @@ struct UserProfileSettingsView: View {
                      + "hour and a half. Older readings, such as ones that sync after a long gap, "
                      + "appear in your charts without an alert.")
                     .font(.caption).foregroundStyle(.secondary)
-                Toggle("Skin-temp & fever alerts", isOn: $tempFeverEnabled)
+                Toggle("Skin-temp, fever & illness alerts", isOn: $tempFeverEnabled)
                     .onChange(of: tempFeverEnabled) { _, on in escalateNotifAuth(enabled: on) }
+                Text("Illness signs alert when two or more of skin temperature, sleeping heart rate, "
+                     + "HRV and breathing rate move away from your usual overnight. A cold often "
+                     + "shows up this way before a fever does, if it ever does.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text(Self.medicalDisclaimer)
                     .font(.caption2).foregroundStyle(.secondary)
             }

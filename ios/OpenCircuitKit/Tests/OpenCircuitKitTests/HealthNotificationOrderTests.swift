@@ -51,6 +51,13 @@ final class HealthNotificationOrderTests: XCTestCase {
         XCTAssertEqual(HealthNotification.headacheSigns.rawValue, "headache.signs")
     }
 
+    func testIllnessSignsIsAppendedAfterHeadacheSigns() throws {
+        let headache = try XCTUnwrap(HealthNotification.allCases.firstIndex(of: .headacheSigns))
+        let illness = try XCTUnwrap(HealthNotification.allCases.firstIndex(of: .illnessSigns))
+        XCTAssertGreaterThan(illness, headache, "append new cases at the END")
+        XCTAssertEqual(HealthNotification.illnessSigns.rawValue, "illness.signs")
+    }
+
     /// The property the ordering actually protects: the gate emits survivors in declaration order
     /// regardless of the order the caller assembled its candidates in.
     func testGateFilterReturnsDeclarationOrderNotCallerOrder() {
