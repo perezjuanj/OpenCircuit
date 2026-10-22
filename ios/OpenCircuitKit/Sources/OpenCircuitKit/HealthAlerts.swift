@@ -894,7 +894,7 @@ public enum HeadacheSignsNotifications {
     /// The timeframe FOLLOWS the signals that were named rather than being a constant suffix. Two
     /// signals measured over the same period share one trailing phrase — the common all-nightly
     /// case, which keeps the compact sentence it always had; only a mixed pair pays the extra words
-    /// to spell both out. A notification body that wraps to four lines is its own failure.
+    /// to spell both out. A notification body that wraps past the expanded-notification budget is its own failure.
     ///
     /// Pinned by `HealthAlertsHeadacheTests.testCopyIsAMeasurementNeverAForecast`: no "headache",
     /// no percentage, no probability, no "risk"/"warning"/"likely"/"predict"/"will"; and by
@@ -927,8 +927,11 @@ public enum HeadacheSignsNotifications {
         // CONTRIBUTE, so a day can score entirely on the daytime term.
         let allDaytime = !topSignals.isEmpty && topSignals.allSatisfy { timeframe($0) != nightlyPhrase }
         let title = allDaytime ? "Your recent signals stood out" : "Last night was unusual for you"
+        // Tail kept short (was "That is what we measured — it is not a forecast."): the longest
+        // mixed-timeframe pair plus the disclaimer wrapped past the expanded-notification budget
+        // `HealthAlertCopyTests.testEveryAlertFitsAnExpandedNotification` pins. Same claim.
         return (title,
-                subject + " (estimate). That is what we measured — it is not a forecast.")
+                subject + " (estimate). A measurement, not a forecast.")
     }
 
     private static func sentenceCased(_ s: String) -> String {

@@ -177,9 +177,8 @@ final class IllnessSignalsTests: XCTestCase {
         let a = IllnessSignals.assess(tonight: realCold, prior: realPrior, skinTempOffsetC: 1.11, config: config)
         let copy = IllnessSignals.copy(for: a)
         XCTAssertEqual(copy.title, "Possible illness signs")
-        XCTAssertTrue(copy.body.contains("skin temperature was 1.1 °C higher, sleeping heart rate was 8 bpm "
-                                         + "higher and HRV was 24% lower"), copy.body)
-        XCTAssertTrue(copy.body.contains("alcohol"))
+        XCTAssertEqual(copy.body, "Vs your usual: skin temp +1.1 °C, sleeping HR +8 bpm, HRV \u{2212}24%. "
+                       + "Alcohol, a late meal or a hot room can do this too (estimate).")
         for banned in ["COVID", "flu", "diagnos", "you have", "you are sick"] {
             XCTAssertFalse(copy.body.localizedCaseInsensitiveContains(banned), banned)
         }
@@ -189,7 +188,15 @@ final class IllnessSignalsTests: XCTestCase {
         let a = IllnessSignals.assess(tonight: vitals(9, hr: 64, hrv: 60, rr: 15.5), prior: steadyPrior,
                                       skinTempOffsetC: nil)
         XCTAssertTrue(IllnessSignals.copy(for: a).body.hasPrefix(
-            "Last night your sleeping heart rate was 6 bpm higher and breathing rate was 1.5 breaths/min higher"))
+            "Vs your usual: sleeping HR +6 bpm, breathing +1.5/min. "))
+    }
+
+    /// The skin-temperature delta follows the wearer's unit: a 1.0 °C rise reads +1.8 °F.
+    func testCopyFollowsTheTemperatureUnit() {
+        let a = IllnessSignals.assess(tonight: vitals(9, hr: 64, hrv: 60, rr: 14), prior: steadyPrior,
+                                      skinTempOffsetC: 1.0)
+        XCTAssertTrue(IllnessSignals.copy(for: a, tempUnit: .fahrenheit).body.contains("skin temp +1.8 °F"))
+        XCTAssertTrue(IllnessSignals.copy(for: a).body.contains("skin temp +1.0 °C"))
     }
 
     // MARK: Routing (TempFeverNotifications)
