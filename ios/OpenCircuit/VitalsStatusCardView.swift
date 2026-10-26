@@ -125,7 +125,7 @@ struct VitalsStatusCardView: View {
             // baseline (a new device shows "Building your baseline"). Every row with an empty log.
             let log = LocalStore.ownershipLog()
             let nights = Self.ownNights(sleepNights, log: log)
-                .map { (night: $0.night, skinTempC: $0.skinTempC, inBedStart: $0.inBedStart, inBedEnd: $0.inBedEnd) }
+                .map(Self.reportNight)
             let fbRestingHR = healthBaselineReport?.restingHR.map { (day: $0.day, value: $0.value) }
             let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
             let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
@@ -159,6 +159,12 @@ struct VitalsStatusCardView: View {
         return samples.map { rows in
             rows.filter { log.isOwn(recordedBy: SyncDeviceID(rawValue: $0.deviceID), at: $0.start, by: device) }
         }
+    }
+
+    /// One stored night as `computeReport` reads it. Decision 77h: its sleep window, so a strap night's
+    /// in-bed lead-in is never averaged as overnight HRV.
+    static func reportNight(_ row: StoredSleepSummary) -> (night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date) {
+        (night: row.night, skinTempC: row.skinTempC, inBedStart: row.sleepWindowInBedStart, inBedEnd: row.inBedEnd)
     }
 
     /// The nights half of `currentDeviceRows`.

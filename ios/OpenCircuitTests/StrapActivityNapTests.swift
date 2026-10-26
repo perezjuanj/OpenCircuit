@@ -169,9 +169,13 @@ final class StrapActivityNapTests: XCTestCase {
 
     /// One strap sync at local hour `now` delivering each of `sessions` as a session record and the
     /// activity minutes `activity`, through the production path. The sync's result.
+    /// Decision 77 (merge of #330), a lead-in-free fixture: an "up" minute carries 30 steps (the wearer
+    /// is up and moving), so the night's in-bed lead-in, which ends at a minute with 10 steps or more,
+    /// never reaches past the last up minute before the record. `noHeartRateBefore`: minutes before that
+    /// local hour carry the strap's "no reading" heart-rate byte (a record that starts inside a doze).
     @discardableResult
     private func sync(_ sessions: [[(Double, Double, UInt8)]] = [lastNight], activity: [(Double, Double, UInt8)],
-                      at now: Double, store: LocalStore) throws -> HelioSyncResult {
+                      at now: Double, store: LocalStore, noHeartRateBefore: Double? = nil) throws -> HelioSyncResult {
         clock = hour(now)
         let device = FakeZeppDevice(authKey: ZeppHex.bytes(nKeyHex)!, privateKey: Array(UInt8(0x81)...UInt8(0x98)),
                                     random: Array(UInt8(0xf0)...UInt8(0xff)), writeLength: 244)
@@ -181,7 +185,10 @@ final class StrapActivityNapTests: XCTestCase {
         device.fetchData = [.sleepSession: (stamp(hour(0).timeIntervalSince1970 - 86_400), sessions.flatMap(sessionRecord))]
         if let first = activity.first {
             let bytes = activity.flatMap { span in
-                (0..<Int(((span.1 - span.0) * 60).rounded())).flatMap { _ in [span.2, 0x08, 0, 55, 0, 0, 0, 0] as [UInt8] }
+                (0..<Int(((span.1 - span.0) * 60).rounded())).flatMap { i -> [UInt8] in
+                    let worn = noHeartRateBefore.map { span.0 + Double(i) / 60 >= $0 - 1e-9 } ?? true
+                    return [span.2, 0x08, span.2 == upKind ? 30 : 0, worn ? 55 : 0, 0, 0, 0, 0]
+                }
             }
             device.fetchData[.activity] = (stamp(hour(first.0).timeIntervalSince1970), bytes)
         }
@@ -924,13 +931,15 @@ final class StrapActivityNapTests: XCTestCase {
             let asleep = shape.dozes + [(shape.fragStart, fragEnd)] + (at > resume ? [(resume, min(at, 31))] : [])
             var sessions = [lastNight]
             if let from = shape.recordFrom, at >= from { sessions.append(record(until: at)) }
-            try sync(sessions, activity: minutes(asleep: asleep, from: 12, until: at), at: at, store: store)
+            try sync(sessions, activity: minutes(asleep: asleep, from: 12, until: at), at: at, store: store,
+                     noHeartRateBefore: recordStart)
             try await flushNaps(store, health: &health, written: &written, at: at, "\(shape.label) at minute \(minute)")
             syncs += 1
             minute += 10
         }
         let asleep = shape.dozes + [(shape.fragStart, fragEnd), (resume, 31)]
-        try sync([lastNight, record(until: 31)], activity: minutes(asleep: asleep, from: 12, until: 32), at: 32, store: store)
+        try sync([lastNight, record(until: 31)], activity: minutes(asleep: asleep, from: 12, until: 32), at: 32, store: store,
+                 noHeartRateBefore: recordStart)
         syncs += 1
         let night = try XCTUnwrap(try nightWindows(store).last, shape.label)
         XCTAssertEqual(night.start, hour(recordStart), "\(shape.label): the record's night is stored")

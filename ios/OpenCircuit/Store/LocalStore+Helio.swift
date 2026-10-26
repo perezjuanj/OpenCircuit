@@ -167,13 +167,19 @@ extension LocalStore {
     /// window and, for an edited night, the edited one too. The main sleeps a strap nap is judged
     /// against (`HelioSleepSelection.naps(from:mainSleeps:now:)`), so a nap never sits in or beside a
     /// night either device keeps.
+    ///
+    /// Decision 77c: a strap night's recorded window is taken without its in-bed lead-in, so the
+    /// lead-in never changes which sleep is a nap (a night without one: its window, as before).
     func storedNightWindows(from start: Date, to end: Date) -> [DateInterval] {
         let lo = Calendar.current.date(byAdding: .day, value: -2, to: start) ?? start
         let hi = Calendar.current.date(byAdding: .day, value: 2, to: end) ?? end
         let rows = (try? sleepSummaries(from: lo, to: hi)) ?? []
         var windows: [DateInterval] = []
         for row in rows {
-            if row.inBedEnd > row.inBedStart { windows.append(DateInterval(start: row.inBedStart, end: row.inBedEnd)) }
+            if row.inBedEnd > row.inBedStart {
+                let window = DateInterval(start: row.inBedStart, end: row.inBedEnd)
+                windows.append(HelioSleepSelection.windowWithoutLeadIn(SleepHypnogramCodec.decode(row.hypnogramData), window: window))
+            }
             if row.isManuallyEdited, row.editedInBedEnd > row.editedInBedStart {
                 windows.append(DateInterval(start: row.editedInBedStart, end: row.editedInBedEnd))
             }
@@ -221,7 +227,16 @@ extension LocalStore {
     /// minutes (74b), so the night stored by a sync, the one handed to its flush and the one the 50b
     /// backstop rebuilds from the stored hypnogram are the same segments, whatever each sync fetched.
     /// A night with one fragment is returned as it is, and nothing is read.
+    ///
+    /// Decision 77b: a night stored with its in-bed lead-in keeps it. The fill is judged on the night
+    /// without it (the lead-in lies before the first fragment, so it is no gap), and the lead-in it was
+    /// stored with is put back, so the 50a hand-over and the 50b backstop rebuild the stored night.
     func helioAwakeFilled(_ segments: [SleepSegment], window: DateInterval, device: SyncDeviceID) -> [SleepSegment] {
+        if let lead = HelioSleepSelection.leadIn(in: segments) {
+            let base = HelioSleepSelection.windowWithoutLeadIn(segments, window: window)
+            let filled = helioAwakeFilled(HelioSleepSelection.withoutLeadIn(segments), window: base, device: device)
+            return HelioSleepSelection.withLeadIn(filled, window: base, from: lead.start)
+        }
         guard HelioSleepSelection.inBedSpans(of: segments, window: window).count > 1 else { return segments }
         let kindRaw = MetricKind.heartRate.rawValue
         let deviceID = device.rawValue
@@ -488,11 +503,26 @@ final class HelioStoreSink: HelioHistorySink {
         // only the strap's own sleeps).
         for staged in HelioSleepSelection.nightsToWrite(overnight, manuallyEdited: edited)
         where log.owner(ofNightFrom: staged.window.start, to: staged.window.end) == family
-            && !storedNights.contains(where: { $0.window == staged.window }) {
+            && !storedNights.contains(where: { $0.windowWithoutLeadIn == staged.window }) {
             // Decision 74 (#278): the awake time between the night's fragments, from the stored heart
             // rate (the activity round, which ingests it, runs before this sleep round). Inside the
             // window, so every window rule below judges the night exactly as before.
-            let night = store.helioAwakeFilled(staged, device: timeline)
+            let filled = store.helioAwakeFilled(staged, device: timeline)
+            // Decision 77 (#328): the in-bed lead-in before the first fragment, from the stored heart
+            // rate and steps (77b), judged after the stitch and the nap split (77c: `staged` is already
+            // stitched, and the sync's other sleeps, naps to be included, clamp it). It moves the
+            // window's start only. 77f: a night already in Apple Health is never rewritten for it.
+            // Written with this very lead-in, it passes as before; written without one (an earlier
+            // build, or before the heart rate was stored), it goes on WITHOUT a lead-in, exactly as
+            // before decision 77, so the card and Health keep agreeing; any other start-only
+            // difference is kept out below (28f, 58b). Only an extension (58b) takes its lead-in along.
+            // Decision 77j: the clamp also takes this sync's activity-block sleeps that may be naps (more
+            // than `napGap` before the night's sleep; a closer one is never a nap, 76b), so the lead-in
+            // stops at the end of a block nap `storeNaps` is about to judge, never swallowing it.
+            let blockNaps = join.aloneNights.map(\.window)
+                .filter { staged.window.start.timeIntervalSince($0.end) > HelioSleepSelection.napGap }
+            let withLeadIn = store.helioWithLeadIn(filled, sleeps: nights.map(\.window) + blockNaps, device: timeline)
+            var night = withLeadIn
             // Decision 28f stitches sessions 60 min or less apart into one night, and decision 71b
             // (#278) the overnight sleeps of one night key whatever the gap, so a night can grow after
             // it was written to Apple Health (back to bed after a mid-night awakening, after the Sleep
@@ -514,20 +544,25 @@ final class HelioStoreSink: HelioHistorySink {
             // nap, later part = the night in Health" stays split, nothing counted twice (71h, a known
             // gap; this build's own stitch never makes that split).
             var extending: DateInterval?
-            if let written = store.writtenNightSpan(for: night),
-               abs(written.start.timeIntervalSince(night.window.start)) > 1 || abs(written.end.timeIntervalSince(night.window.end)) > 1 {
-                guard LocalStore.strapNightExtends(night.window, written: written) else {
-                    if keptApartLogged.insert(night.window).inserted {
-                        helioLog.notice("helio: sleep \(Self.clockSpan(night.window, in: night.recordedTimeZone), privacy: .public) would change a night already in Apple Health (\(Self.clockSpan(written, in: night.recordedTimeZone), privacy: .public)) without extending it; the written night stands")
-                    }
-                    continue
+            if let written = store.writtenNightSpan(for: filled) {
+                if !Self.sameSpan(written, withLeadIn.window), Self.sameSpan(written, filled.window) {
+                    night = filled
                 }
-                extending = written
+                if !Self.sameSpan(written, night.window) {
+                    guard LocalStore.strapNightExtends(night.window, written: written) else {
+                        if keptApartLogged.insert(staged.window).inserted {
+                            helioLog.notice("helio: sleep \(Self.clockSpan(night.window, in: night.recordedTimeZone), privacy: .public) would change a night already in Apple Health (\(Self.clockSpan(written, in: night.recordedTimeZone), privacy: .public)) without extending it; the written night stands")
+                        }
+                        continue
+                    }
+                    extending = written
+                }
             }
             let before = (try? store.sleepSummaryOverlapping(start: night.window.start, end: night.window.end))
                 .map { DateInterval(start: $0.inBedStart, end: max($0.inBedStart, $0.inBedEnd)) }
             let outcome = try store.saveHelioNight(night, device: timeline)
-            nightOutcomes[night.window] = outcome
+            // Keyed by the stitched sleep's own window (what `storeNaps` looks up), never the lead-in's.
+            nightOutcomes[staged.window] = outcome
             if outcome == .inserted || outcome == .updated { storedNights.append(night) }
             // Decision 58b: one breadcrumb per accepted extension, when it changed the stored row (so
             // several for one night whose in-progress copies keep growing). Not for a kept-out night:
@@ -714,6 +749,11 @@ final class HelioStoreSink: HelioHistorySink {
         return (HelioSleepSelection.Night(segments: store.helioAwakeFilled(segments, window: window, device: timeline), window: window,
                                           strapScore: incoming.strapScore, recordedTimeZone: incoming.recordedTimeZone),
                 row.night)
+    }
+
+    /// Decision 58b's "the same span": both ends within 1 s (an identical window passes through).
+    private static func sameSpan(_ a: DateInterval, _ b: DateInterval) -> Bool {
+        abs(a.start.timeIntervalSince(b.start)) <= 1 && abs(a.end.timeIntervalSince(b.end)) <= 1
     }
 
     /// `HH:mm–HH:mm` in the recorded zone, for the 28c log line: when a session ran, no health value.

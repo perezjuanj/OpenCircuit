@@ -824,8 +824,12 @@ ends a stage at the next start can't produce an overlap. The record shows no lea
 start = first stage start), so the record's span is the in-bed envelope: a session's In Bed span
 is the union of its stage span and its record span when the record span is valid (it starts
 before it ends, overlaps the stage span, and the union is at most 20 h), else the stage span
-(`HelioSleepSelection.inBedSpan`). No lead-in is estimated. Promote to 🟢 after more nights
-show the same shape.
+(`HelioSleepSelection.inBedSpan`). The record itself carries no lead-in. Promote to 🟢 after
+more nights show the same shape.
+
+The app adds one (decision 77, #328; §21.6): an in-bed lead-in before a night's first in-bed start,
+estimated from the strap's own STORED heart rate and steps. It is OpenCircuit's estimate, not part
+of the record or of the record's span, and nothing above describes it.
 
 ---
 
@@ -2547,6 +2551,63 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   stored later gets the fill on its next re-delivery. Naps and the stitch never see the fill (it is
   added after both). The readers that judge sleep (temperature gate and verdict, overnight HRV) take
   the fragments' spans (`sleepSpans`), never a run.
+- **The in-bed lead-in before the night** (decision 77, #328): the record's in-bed span starts at its
+  own sleep start, about 5 minutes before the first stage, so time in bed read as almost no time
+  before sleep. When the night is stored, after the stitch, the nap split and the awake fill, the app
+  reaches back from the night's first in-bed start over the minutes where the store holds the strap's
+  own rows showing the wearer lying in bed: a heart-rate sample in the minute (holes of 5 minutes or
+  less bridged, as the fill does), fewer than 10 steps in the minute, and a heart rate no more than
+  15 bpm above the night's sleeping level (the median heart rate of the first 60 min from the first
+  sleep minute). It is at most 120 min long, and one under 5 min is not added. It never starts before
+  the end of the latest sleep before it (a stored night or nap of either device, or one of the sync's
+  own strap sleeps, a nap to be included) nor before the start of the strap's ownership (28). It is
+  one `.awake` and one `.inBed` segment over the same span, before the first fragment: time in bed
+  and awake time grow, asleep time doesn't, efficiency and the Sleep Score drop. **It is an estimate**,
+  not the record's span. The constants are provisional and live in one place
+  (`HelioInBedLeadIn`, ZeppKit); they are to be calibrated on a real store before they are trusted.
+  - **Naps and nearness** (decision 77j, at the merge with #329): the lead-in stops at the end of every
+    nap (stored, the sync's own session sleeps, and the sync's activity-block naps more than 60 min
+    before the night's sleep), and a nap that runs into the night's in-bed start leaves it no room.
+    Nearness is measured from the night's SLEEP, never its lead-in, on every path: the 60 min rule of
+    the nap judgement, 76l's prune when the night is stored (its overlap test included) and `saveNap`'s
+    overlap backstop. So a lead-in that ends at a nap's end never prunes it, and the nap or the night
+    may be stored first with one exception (next item). (A manual nap's add or edit, and the fences
+    that keep a nap's Health delete off a stored night, still use the whole in-bed window, lead-in
+    included: those are samples in Health.)
+  - **Known limit, not fixed in this PR:** a night stored BEFORE the sync that first sees a nap more
+    than 60 min before its sleep onset keeps the lead-in it was stored with while the night is not
+    re-delivered changed. The nap is stored (it is a real nap, §21.5), and the night's lead-in can lie
+    over it by up to the clamp difference: 30 min for a nap ending 90 min before onset, 59 min at 61
+    min, at most the 120 min cap. In Apple Health that is an `inBed` overlap and an `awake` sample over
+    the nap's asleep one; asleep time is not counted twice. The card shows the night in bed from the
+    lead-in start and the nap until its end. It converges when the night comes back changed enough
+    for the merge (`saveSleepSummary`) to replace it, for instance with more sleep. It is rare on the
+    production fetch: a session nap comes with any later sync of the night (the sleep round re-fetches
+    it), and the activity fetch starts at or before the last session night's end, so a block nap comes
+    in the same sync as the night.
+  - From the store, never a sync's fetched minutes, so every re-delivery derives the same lead-in
+    (the 73f/73i/74b lesson), and the 50a hand-over and 50b backstop rebuild the night with the
+    lead-in it was stored with.
+  - Not sleep: `sleepSpans` (temperature gate and verdict, overnight HRV), the night score's heart
+    rate and HRV, and the nap split's main sleeps (`storedNightWindows`) judge the night without it.
+    The night key is unchanged (it is the day the night ends on), also for a lead-in across midnight.
+  - Steps: the strap's step rows (`StoredStepSample`) carry no device column. They are the strap's by
+    ownership (28): both step writers keep a row wholly inside time their device owns, and the lead-in
+    never reads before the strap's ownership start.
+  - Forward-only in Apple Health: a night already written is never rewritten for its lead-in. Written
+    with the same lead-in, it passes as before; written without one (an earlier build, or before the
+    heart rate was stored), the night goes on without a lead-in, exactly as before, so the card and
+    Health agree; any other start-only difference is kept out (28f, 58b), store row included. A night
+    not yet written is written once with it, and an extension (58b) takes it along.
+  - Naps and the ring get none.
+  - The lead-in can lie over minutes the strap marked as sleep in its activity minutes that the app
+    did not keep (a standalone doze just before bed, decision 73c/73f); there it is labelled awake and
+    in bed, never asleep.
+  - Every reader that averages a night's vitals (the illness alert, Vitals Status, the Sleep card's
+    overnight averages, Trends, the headache HRV and bedtime regularity) reads the night's sleep window,
+    the in-bed window without the lead-in (decision 77h), so their baselines and alerts are as before.
+    A night an earlier build wrote without a lead-in that later extends at the end (58b) takes its
+    lead-in along in that one rewrite (77i); no start-only rewrite exists.
 - **Ownership**: a nap counts only when the strap owned all of it (no switch inside it).
 - **Under 20 minutes**: not stored; a `helio-link` breadcrumb notes it (step 4).
 - A stored strap nap within 60 min of a STRAP night stored later is removed by that night's store

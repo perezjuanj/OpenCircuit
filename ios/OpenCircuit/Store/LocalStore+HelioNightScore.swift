@@ -61,6 +61,10 @@ extension LocalStore {
                                device: SyncDeviceID) {
         let log = Self.ownershipLog()
         let family = DeviceOwnershipLog.Family(timeline: device)
+        // Decision 77d: the in-bed lead-in is no sleep. Every input below that is read over the night's
+        // time (heart rate, HRV, the night's key) takes the window without it, so they are the night's
+        // as before; only the segments carry it (time in bed and awake grow, efficiency drops).
+        let window = HelioSleepSelection.windowWithoutLeadIn(segments, window: window)
         guard family == .zeppOS,
               log.owner(ofNightFrom: window.start, to: window.end) == family else { return }
         let scores = StoredNightScore.scores(.init(
@@ -158,8 +162,9 @@ extension LocalStore {
 
         var scored: [Date] = []
         for row in targets {
-            let window = DateInterval(start: row.inBedStart, end: row.inBedEnd)
             let segments = SleepHypnogramCodec.decode(row.hypnogramData)
+            // Decision 77d: the save path's window, without the in-bed lead-in.
+            let window = HelioSleepSelection.windowWithoutLeadIn(segments, window: DateInterval(start: row.inBedStart, end: row.inBedEnd))
             // Decision 71i: the same in-bed spans the save path judges (one, the window, for a night
             // that wasn't joined or was stored before decision 70). Decision 74c: the sleep fragments'
             // spans, never an awake run of the fill.

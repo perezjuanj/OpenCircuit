@@ -1890,12 +1890,18 @@ extension StrapNightHealthTests {
     /// `wornThroughTheGap`: the fixture's activity minutes carry the strap's heart rate through the whole
     /// gap (02:00–05:30), so decision 74a fills exactly that gap with one awake run (74f(1)); otherwise
     /// the store holds no heart rate there and there is no run at all.
+    /// `leadIn` (decision 77, amended): the in-bed lead-in the fixture's stored heart rate gives the night
+    /// before its first fragment, or nil for none. The row's window starts there; everything else is
+    /// judged on the night without it.
     private func assertTheJoinedNightIsStored(_ store: LocalStore, _ label: String = "", wornThroughTheGap: Bool = false,
+                                              leadIn: DateInterval? = nil,
                                               file: StaticString = #filePath, line: UInt = #line) throws {
         let stored = try rows(store)
-        XCTAssertEqual(stored.map { DateInterval(start: $0.inBedStart, end: $0.inBedEnd) }, [joinedNight], label, file: file, line: line)
+        XCTAssertEqual(stored.map { DateInterval(start: $0.inBedStart, end: $0.inBedEnd) },
+                       [DateInterval(start: leadIn?.start ?? joinedNight.start, end: joinedNight.end)], label, file: file, line: line)
         XCTAssertEqual(stored.map(\.asleepMin), [270], label, file: file, line: line)
-        let segments = try storedHypnogram(store)
+        XCTAssertEqual(HelioSleepSelection.leadIn(in: try storedHypnogram(store)), leadIn, "\(label): the lead-in", file: file, line: line)
+        let segments = HelioSleepSelection.withoutLeadIn(try storedHypnogram(store))
         XCTAssertEqual(inBedSpans(segments), [DateInterval(start: hour(-1), end: hour(2)), DateInterval(start: hour(5.5), end: hour(7))],
                        label, file: file, line: line)
         // Decision 74f (ratified amendment): nothing in the gap but the awake fill of 74a, and that fill
@@ -2387,8 +2393,11 @@ extension StrapNightHealthTests {
     /// One strap sync at `now` delivering each of `sessions` as its own session record and the activity
     /// minutes `activity` (contiguous spans of local hours, each one kind), through the production path.
     /// `temperatureFrom`: skin temperature minutes from that local hour to `now`.
+    /// `noHeartRateBefore` (decision 77, merge of #329): minutes before that local hour carry the strap's
+    /// "no reading" heart-rate byte, so the night gets no in-bed lead-in from the stored heart rate.
     private func syncWithActivity(_ sessions: [[(Double, Double, UInt8)]], activity: [(Double, Double, UInt8)],
-                                  temperatureFrom: Double? = nil, at now: Date, store: LocalStore) throws -> HelioSyncResult {
+                                  temperatureFrom: Double? = nil, at now: Date, store: LocalStore,
+                                  noHeartRateBefore: Double? = nil) throws -> HelioSyncResult {
         clock = now
         let device = makeStrap(sessions[0])
         device.fetchData[.sleepSession] = (stamp(hour(0).timeIntervalSince1970 - 86_400), sessions.flatMap(session))
@@ -2398,7 +2407,10 @@ extension StrapNightHealthTests {
         }
         if let first = activity.first {
             let bytes = activity.flatMap { span in
-                (0..<Int(((span.1 - span.0) * 60).rounded())).flatMap { _ in [span.2, 0x08, 0, 55, 0, 0, 0, 0] as [UInt8] }
+                (0..<Int(((span.1 - span.0) * 60).rounded())).flatMap { i -> [UInt8] in
+                    let worn = noHeartRateBefore.map { span.0 + Double(i) / 60 >= $0 - 1e-9 } ?? true
+                    return [span.2, 0x08, 0, worn ? 55 : 0, 0, 0, 0, 0]
+                }
             }
             device.fetchData[.activity] = (stamp(hour(first.0).timeIntervalSince1970), bytes)
         }
@@ -2572,9 +2584,13 @@ extension StrapNightHealthTests {
             let activity: [(Double, Double, UInt8)] = [(-4, -3, asleepKind), (-3, -1, upKind), (-1, 7, asleepKind), (7, 13, upKind),
                                                         (13, 14, asleepKind), (14, 15, upKind)]
             let result = try syncWithActivity([wholeNight], activity: activity, at: hour(15), store: store)
-            XCTAssertEqual(result.nights.map(\.window), [DateInterval(start: hour(-1), end: hour(7))])
+            // Decision 77 (amended): every fixture minute carries the strap's heart rate (55 bpm, no steps),
+            // so the record gets the capped in-bed lead-in from the store. The night's own window is the record's.
+            let capped = DateInterval(start: hour(-1).addingTimeInterval(-HelioInBedLeadIn.maxLength), end: hour(-1))
+            XCTAssertEqual(result.nights.map(\.windowWithoutLeadIn), [DateInterval(start: hour(-1), end: hour(7))])
+            XCTAssertEqual(result.nights.map(\.leadIn), [capped])
             XCTAssertEqual(try rows(store).map { DateInterval(start: $0.inBedStart, end: $0.inBedEnd) },
-                           [DateInterval(start: hour(-1), end: hour(7))])
+                           [DateInterval(start: capped.start, end: hour(7))])
             XCTAssertEqual(try rows(store).map(\.asleepMin), [480], "nothing of either block in the night")
             XCTAssertEqual(try napRows(store), [DateInterval(start: hour(-4), end: hour(-3)), DateInterval(start: hour(13), end: hour(14))],
                            "both are naps (decision 76b: more than 60 min from the night, settled)")
@@ -2587,9 +2603,11 @@ extension StrapNightHealthTests {
             let nextNight: [(Double, Double, UInt8)] = [(23, 31, light)]
             let synced = try syncWithActivity([nextNight], activity: [(-1, 7, asleepKind), (7, 23, upKind), (23, 32, upKind)],
                                               at: hour(32), store: noRecord)
-            XCTAssertEqual(synced.nights.map(\.window), [DateInterval(start: hour(23), end: hour(31))])
+            // Decision 77 (amended): the capped lead-in from the stored heart rate, as above.
+            let cappedNext = hour(23).addingTimeInterval(-HelioInBedLeadIn.maxLength)
+            XCTAssertEqual(synced.nights.map(\.windowWithoutLeadIn), [DateInterval(start: hour(23), end: hour(31))])
             XCTAssertEqual(try rows(noRecord).map { DateInterval(start: $0.inBedStart, end: $0.inBedEnd) },
-                           [DateInterval(start: hour(23), end: hour(31))], "only the night with a record")
+                           [DateInterval(start: cappedNext, end: hour(31))], "only the night with a record")
             XCTAssertEqual(try napRows(noRecord), [])
             XCTAssertEqual(synced.sleepRound?.activityBlocksAlone, 1)
         }
@@ -2604,7 +2622,7 @@ extension StrapNightHealthTests {
             let store = try makeStore()
             let nextNight: [(Double, Double, UInt8)] = [(23, 31, light)]
             let synced = try syncWithActivity([nextNight], activity: [(-1, 6, asleepKind), (6, 23, upKind), (23, 32, upKind)],
-                                              at: hour(32), store: store)
+                                              at: hour(32), store: store, noHeartRateBefore: 23)
             XCTAssertEqual(try rows(store).map { DateInterval(start: $0.inBedStart, end: $0.inBedEnd) },
                            [DateInterval(start: hour(23), end: hour(31))], "no night for the block")
             XCTAssertEqual(try napRows(store), [], "no nap")
@@ -2690,11 +2708,18 @@ extension StrapNightHealthTests {
             let early: [(Double, Double, UInt8)] = [(-2, -1 - 20.0 / 60, asleepKind), (-1 - 20.0 / 60, -1, upKind),
                                                      (-1, 2, asleepKind), (2, 3, upKind)]
             let first = try syncWithActivity([sleepA], activity: early, at: hour(3), store: store)
-            XCTAssertEqual(first.nights.map(\.window), [sleepAWindow], "the doze doesn't join")
+            // Decision 77 (amended): the doze's and the following minutes' STORED heart rate (55 bpm, no
+            // steps, from 22:00) give A an in-bed lead-in from 22:00, awake and in bed, no sleep. It comes
+            // from the store, so the 08:00 sync, which fetches nothing before 02:00, derives the same one.
+            let leadIn = DateInterval(start: hour(-2), end: hour(-1))
+            let leadInA = DateInterval(start: leadIn.start, end: sleepAWindow.end)
+            let leadInJoined = DateInterval(start: leadIn.start, end: joinedNight.end)
+            XCTAssertEqual(first.nights.map(\.windowWithoutLeadIn), [sleepAWindow], "the doze doesn't join")
+            XCTAssertEqual(first.nights.map(\.leadIn), [leadIn])
             XCTAssertEqual(first.sleepRound?.activityBlocksAlone, 1)
             XCTAssertEqual(try napRows(store), [], "and is no nap")
             let firstWrite = try await strapFlush(first.nights.map(\.segments), at: hour(3), store: store)
-            XCTAssertEqual(firstWrite, [sleepAWindow])
+            XCTAssertEqual(firstWrite, [leadInA])
             XCTAssertEqual(store.helioFetchCursors(device: timeline)[.temperature] ?? hour(2), hour(2), "nothing moved it past the record")
             let before = try XCTUnwrap(try rows(store).first)
             let (key, beforeStart, beforeAsleep) = (before.night, before.inBedStart, before.asleepMin)
@@ -2702,15 +2727,15 @@ extension StrapNightHealthTests {
 
             let fromTwo: [(Double, Double, UInt8)] = [(2, 5.5, upKind), (5.5, 7, asleepKind), (7, 8, upKind)]
             let second = try syncWithActivity([sleepA], activity: fromTwo, at: hour(8), store: store)
-            XCTAssertEqual(second.nights.map(\.window), [joinedNight])
+            XCTAssertEqual(second.nights.map(\.window), [leadInJoined])
             let secondWrite = try await strapFlush(second.nights.map(\.segments), at: hour(8), store: store)
-            XCTAssertEqual(secondWrite, [joinedNight], "one extension")
+            XCTAssertEqual(secondWrite, [leadInJoined], "one extension")
             let after = try XCTUnwrap(try rows(store).first)
             XCTAssertLessThanOrEqual(after.inBedStart, beforeStart, "the written start stands")
             XCTAssertEqual(after.asleepMin, beforeAsleep + 90)
-            XCTAssertEqual(try mirrorSpan(store), joinedNight)
-            XCTAssertEqual(store.mirroredNight(night: key)?.spanStart, hour(-1))
-            try assertTheJoinedNightIsStored(store, wornThroughTheGap: true)
+            XCTAssertEqual(try mirrorSpan(store), leadInJoined)
+            XCTAssertEqual(store.mirroredNight(night: key)?.spanStart, hour(-2))
+            try assertTheJoinedNightIsStored(store, wornThroughTheGap: true, leadIn: leadIn)
         }
     }
 
@@ -2978,8 +3003,12 @@ extension StrapNightHealthTests {
             let store = try makeStore()
             try storeHeartRate(-2, 9, store: store)
             let withHR = try syncSessions([single], at: hour(8), store: store)
-            XCTAssertEqual(withHR.nights, plain.nights)
-            XCTAssertEqual(try XCTUnwrap(try rows(store).first).hypnogramData, try XCTUnwrap(try rows(reference).first).hypnogramData)
+            // Decision 77 (amended): the heart rate from 22:00 gives the night the in-bed lead-in 22:00–23:00.
+            // Without it the night is byte-identical: one fragment gets no awake fill.
+            XCTAssertEqual(withHR.nights.map(\.leadIn), [DateInterval(start: hour(-2), end: hour(-1))])
+            XCTAssertEqual(withHR.nights.map(\.withoutLeadIn), plain.nights)
+            XCTAssertEqual(HelioSleepSelection.withoutLeadIn(SleepHypnogramCodec.decode(try XCTUnwrap(try rows(store).first).hypnogramData)),
+                           SleepHypnogramCodec.decode(try XCTUnwrap(try rows(reference).first).hypnogramData))
             XCTAssertEqual(store.helioAwakeFilled(withHR.nights[0].segments, window: withHR.nights[0].window, device: timeline),
                            withHR.nights[0].segments)
         }
