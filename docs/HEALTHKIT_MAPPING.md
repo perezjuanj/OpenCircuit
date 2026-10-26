@@ -105,7 +105,12 @@ stores and writes what it measured for time it owned:
     that joins no night is a nap candidate like the sleeps above, through the same rule: 20 min or
     longer, more than 60 min from every main sleep, settled 60 min after its end (and not still
     going on, 73d), owned wholly by the strap. A block within 60 min after a night's last record
-    joins the night; one within 60 min before a record belongs to it and is no nap; one that is the
+    joins the night. One within 60 min before a night is no nap because a nap from a block waits
+    (unsettled) while the sync's activity minutes hold any sleep minute within 60 min after its end
+    (decision 76h): while the night's minutes are still going on and its record has not arrived yet,
+    the doze waits; once the record is stored, the doze lies within 60 min of it and belongs to it.
+    The cost of the wait: any sleep minute in that hour holds the nap, a short blip too, for as long
+    as a sync fetches it. One that is the
     00:00–08:00 main sleep of a night no stored night covers is stored nowhere (an activity-only
     night is out of scope) and counted (`mainOnlyBlocks`). The nap is a `StoredNap` like any strap
     nap (`saveHelioNap`): one `.inBed` envelope over the block, its sleep minutes as generic sleep

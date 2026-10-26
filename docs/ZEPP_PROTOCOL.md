@@ -2495,8 +2495,14 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   more than 60 min from every main sleep, and judged only 60 min after it ended. With the 20 min a
   block must wait before it is used at all (its last sleep minute 20 min before the sync's newest
   minute), a nap is stored by the first sync at least 60 min after it ended. A block within 60 min
-  after the night's last record still joins the night (a sleep-in, not a nap); one within 60 min
-  before a record belongs to that night under step 3 (no nap, and still no lead-in); one that is the
+  after the night's last record still joins the night (a sleep-in, not a nap). One within 60 min
+  before a night is no nap because a nap from a block is not settled while the sync's activity
+  minutes hold any kind-sleep minute within 60 min after its end (decision 76h, review-327 B1):
+  synced while the night's minutes are still going on (73d keeps them out of the blocks) and before
+  its record arrives, the doze waits; once the record is stored, the doze lies within 60 min of it
+  and belongs to it under step 3 (no nap, and still no lead-in). Known gap of that wait: a short
+  sleep blip within the hour after a nap holds it on every sync that fetches the blip, and the nap
+  is lost once the next night's record moves the activity re-fetch past it. One that is the
   00:00–08:00 main sleep of a night no stored night covers is stored nowhere and counted
   (`mainOnlyBlocks=N`). The nap's segments are the block's own: one `.inBed` envelope, its sleep
   minutes as generic sleep, an awake gap of up to 5 min left a gap; no score. Every sync re-derives
