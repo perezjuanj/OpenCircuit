@@ -323,3 +323,62 @@ final class HelioActivitySleepTests: XCTestCase {
         XCTAssertGreaterThan(checked, 500)
     }
 }
+
+// MARK: - Decision 76a: the blocks that stood alone are handed back
+
+extension HelioActivitySleepTests {
+    /// A block in place, as `activityBlocks` builds it.
+    private func placed(_ from: Int, _ to: Int) -> HelioSleepSelection.Night {
+        HelioSleepSelection.Night(segments: [SleepSegment(start: at(from), end: at(to), stage: .inBed),
+                                             SleepSegment(start: at(from), end: at(to), stage: HelioSleepSelection.activityBlockStage)],
+                                  window: span(from, to), strapScore: nil, recordedTimeZone: utcZone)
+    }
+
+    /// Every shape 73c/73f/73g/73i leaves alone comes back in `aloneNights`, exactly as built and oldest
+    /// first; a joined block never does, and the counts keep their meaning.
+    func testTheBlocksThatStandAloneAreHandedBackAndTheJoinedOnesAreNot() {
+        let night = session(1380, 1860)
+        let cases: [(String, [HelioSleepSelection.Night], [HelioSleepSelection.Night], [Int])] = [
+            ("a daytime block", [night], [placed(2220, 2280)], [0]),
+            ("an evening doze", [night], [placed(1200, 1260)], [0]),
+            ("no session record", [], [placed(1380, 1560), placed(1600, 1800)], [0, 1]),
+            ("a lead-in, then a later block that joins", [sleepA], [placed(1320, 1360), placed(1770, 1860)], [0]),
+            ("a lie-in that would cost the night", [night], [placed(1890, 2170)], [0]),
+            ("between two fragments, then one after", [session(1380, 1500), session(1590, 1740)],
+             [placed(1515, 1575), placed(1770, 1860)], [0]),
+            ("one that joins", [sleepA], [placed(1770, 1860)], []),
+        ]
+        for (label, sessions, blocks, aloneIndices) in cases {
+            let join = HelioSleepSelection.nights(sessions: sessions, activityBlocks: blocks)
+            XCTAssertEqual(join.aloneNights, aloneIndices.map { blocks[$0] }, label)
+            XCTAssertEqual(join.aloneBlocks, join.aloneNights.count, label)
+            XCTAssertEqual(join.joinedBlocks + join.aloneBlocks, blocks.count, label)
+        }
+        XCTAssertEqual(HelioSleepSelection.nights(sessions: [night], activityBlocks: []).aloneNights, [], "no blocks, none handed back")
+    }
+
+    /// Over the same grid of placements as the 73f/73g property: the handed-back blocks are exactly the
+    /// ones no night holds, and no handed-back block is part of any night.
+    func testTheHandedBackBlocksAreExactlyTheOnesNoNightHoldsOverAGridOfPlacements() {
+        let sessionSpots = [(1200, 1260), (1380, 1560), (1380, 1860), (1740, 1860), (1500, 1620), (2220, 2280), (1080, 1140)]
+        let blockSpots = [(1100, 1160), (1290, 1350), (1320, 1370), (1590, 1650), (1620, 1720), (1870, 1900),
+                          (1890, 2170), (2300, 2360), (1260, 1290), (1880, 2000)]
+        func overlap(_ a: (Int, Int), _ b: (Int, Int)) -> Bool { a.0 < b.1 && b.0 < a.1 }
+        var checked = 0
+        for s in sessionSpots.indices {
+            for (i, a) in blockSpots.enumerated() {
+                for b in blockSpots[i...] where !overlap(a, b) || a == b {
+                    let spots = a == b ? [a] : [a, b]
+                    guard !spots.contains(where: { overlap($0, sessionSpots[s]) }) else { continue }
+                    let blocks = spots.map { placed($0.0, $0.1) }
+                    let join = HelioSleepSelection.nights(sessions: [session(sessionSpots[s].0, sessionSpots[s].1)], activityBlocks: blocks)
+                    let held = blocks.filter { block in join.nights.contains { $0.segments.contains(block.segments[1]) } }
+                    XCTAssertEqual(join.aloneNights, blocks.filter { !held.contains($0) }, "\(sessionSpots[s]) \(spots)")
+                    XCTAssertEqual(join.aloneBlocks, join.aloneNights.count)
+                    checked += 1
+                }
+            }
+        }
+        XCTAssertGreaterThan(checked, 100)
+    }
+}
