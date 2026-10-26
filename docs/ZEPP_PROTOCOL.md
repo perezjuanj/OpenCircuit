@@ -2461,7 +2461,7 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   both, and the nights are stored before the naps are judged.
 - **Settling**: a nap is judged only once 60 min have passed since it ended, so a later session that
   would stitch onto it (28f) has had its chance. A night stored later still prunes an auto nap it
-  overlaps.
+  overlaps, and a strap night also the strap's auto naps within 60 min of it (decision 76l, below).
 - **One night, whatever the gap** (decision 71, #278): the stitch that runs before the nap split
   (`HelioSleepSelection.stitch`) also joins the overnight sleeps of one night key, judged on the
   night joined so far, as long as the joined night is no longer than 20 h. Neither part of such a
@@ -2476,9 +2476,9 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   `0x01` minutes (kind `0x78`) outside every staged session (§6.5) becomes an activity sleep block,
   owned per block, and goes into the same stitch as the session sleeps. A block is kept only when
   that stitch joins it into a night holding a session record (28f's 60 min or the overnight join
-  above). A block that would stand alone (a daytime sleep, an evening doze, a night with no record)
-  is neither a night nor a nap in v1: it is only counted (`activity blocks: joined=N alone=M` on the
-  sleep-round diagnostics line). A block that may still be going on (its last sleep minute less than
+  above). A block that stands alone (a daytime sleep, an evening doze, a night with no record) is
+  never a night; it is counted (`activity blocks: joined=N alone=M` on the sleep-round diagnostics
+  line) and, since decision 76, judged as a nap (next item). A block that may still be going on (its last sleep minute less than
   20 min before the sync's newest minute) is judged on the next sync. The temperature watermark, and
   with it the start of the activity re-fetch, stays at the end of the latest session night, so every
   sync sees each block after the record whole. **Only after the night's last record** (decisions
@@ -2491,6 +2491,55 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   while its sessions alone make an overnight sleep, goes back to the sessions' own night, and its
   blocks are counted alone (a lie-in after the record that ends past noon, for one). Known gap
   (decision 73j, quoted): "73j (known gap, documented, not fixed; 🔴 shape). A block already written after a night's last fragment can still be deleted if the strap later delivers a NEW `0x48` record for that night that starts after the block, because the block is then no longer after the last fragment. This needs a second record for one night, which the owner's strap has not been seen to write (decision 73's preamble). The general guard, "an extension must hold every in-bed span already written" (review-73b option b), changes 58b for every strap night. It is a follow-up, not part of this build."
+- **A nap from the activity minutes** (decision 76, #327): the strap writes one `0x48` record per
+  night (decision 73) and none for a daytime nap, which it leaves only as kind-`0x78` minutes. Build
+  88 diagnostics showed `naps: stored=0` with `alone=1` blocks on some syncs. A block that stands
+  alone (`HelioSleepSelection.ActivityJoin.aloneNights`, owned per block) is now a nap candidate in
+  the same `naps(from:mainSleeps:now:)` call as the session sleeps, unchanged: 20 min or longer,
+  more than 60 min from every main sleep, and judged only 60 min after it ended. With the 20 min a
+  block must wait before it is used at all (its last sleep minute 20 min before the sync's newest
+  minute), a nap is stored by the first sync at least 60 min after it ended. A block within 60 min
+  after the night's last record still joins the night (a sleep-in, not a nap). **The record
+  decides** (decision 76l, review-327c): when a strap night is stored (`saveHelioNight`), every auto
+  nap the strap owned all of whose window ends 60 min or less before the night's stored in-bed start,
+  starts 60 min or less after its in-bed end, or overlaps it, is pruned (§21.5's "more than 60 min
+  from every main sleep", applied after the fact). So whatever order the syncs ran in, once the
+  night's record is stored no strap auto nap lies within 60 min of it. A ring night, a ring nap (time
+  the ring owned), a nap the person added or edited, and a night saved by an edit never prune by
+  nearness; overlap prunes as before for any device. What a pruned nap wrote to Apple Health is
+  removed: inside the night by the night's own mirror (its union delete), outside it by the next nap
+  flush (#327 S1/S2: the nap's written span, one second clear of every stored night and nap, this
+  app's samples only; the span is kept until its delete succeeds and dropped 14 days after it ended).
+  **The hold** (decision 76j, now an optimisation that avoids a Health write followed by a delete): a
+  nap candidate that holds a block is judged against the chain of sleep that follows it, built the
+  way `stitch` builds a night: the sync's kind-sleep runs (up to 5 other minutes inside a run, the
+  rule `activityBlocks` uses, `sleepRuns`) from the one that starts within 60 min after the nap's end,
+  then each next run that starts within 60 min of the chain's end so far. The nap is held (counted
+  `unsettled`) while the chain's last run may still be going on (its last sleep minute less than 20
+  min before the sync's newest minute) or the chain ended less than 60 min before the newest minute.
+  A nap with no run starting within 60 min after it is not held. **The remaining cost**: a nap within
+  60 min of the coming night can still be stored, and written to Apple Health by the nap flush, by a
+  sync that runs before the night's record arrives, once the doze has settled (60 min after its end)
+  and the hold sees nothing after it: the sleep that follows starts more than 60 min after the doze
+  or after a first fragment (an awakening over 60 min; a first fragment under 20 min is no block and
+  doesn't join the doze), or it ended more than 60 min before the sync. The sync that delivers the
+  record prunes that nap, and the next nap flush removes its Health write: the nap is written and
+  removed again on the morning sync. Nothing is lost: the activity re-fetch starts at the last session
+  night's end at the latest. Proved by sweeps through the app, a sync every 10 min to 07:00 with no
+  record (and with the record delivered in progress from 23:00), then the morning's record: the
+  reviewer's grid of 32 nights (doze 20/40/90 min, first fragment 5/15/19/25 min, awakening
+  25/59/61/90/130 min, two dozes, records with an awake lead) for the 76l guarantee and Apple Health,
+  and six nights for the hold. One that is the
+  00:00–08:00 main sleep of a night no stored night covers is stored nowhere and counted
+  (`mainOnlyBlocks=N`). The nap's segments are the block's own: one `.inBed` envelope, its sleep
+  minutes as generic sleep, an awake gap of up to 5 min left a gap; no score. Every sync re-derives
+  the nap from the minutes it fetched, and the activity re-fetch starts at the last night's end, so
+  a nap after it is seen by every sync until the next night's record moves the watermark. A nap
+  holding a block that a stored auto nap at its start already covers is left as stored (a
+  re-derivation from fewer minutes never shrinks what Apple Health holds), and one whose start moved
+  overlaps the stored nap and is not stored. Not recovered: a nap from before the last night's end.
+  The diagnostics line gains `napsFromBlocks=N` and `mainOnlyBlocks=N` in its naps group, only when
+  non-zero. 🔴 until §10 item 29 checks a real nap.
 - **The awake time between fragments** (decision 74, #278): when the night is stored, each gap
   between two of its fragments is filled where the store holds the strap's own heart rate (its
   timeline, time it owns): those minutes are awake and in bed, merged into runs that bridge up to 5
@@ -2541,8 +2590,9 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
     lead-in along in that one rewrite (77i); no start-only rewrite exists.
 - **Ownership**: a nap counts only when the strap owned all of it (no switch inside it).
 - **Under 20 minutes**: not stored; a `helio-link` breadcrumb notes it (step 4).
-- A stored nap that a later sync finds within 60 min of a night (for instance the ring's night,
-  synced after the strap's nap) is not removed. Whether that ever happens on a real switch is open.
+- A stored strap nap within 60 min of a STRAP night stored later is removed by that night's store
+  (decision 76l). One within 60 min of the RING's night (synced after the strap's nap, on a switch)
+  is not: a ring night prunes by overlap only. Whether that ever happens on a real switch is open.
 
 ---
 

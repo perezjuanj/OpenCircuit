@@ -202,6 +202,15 @@ extension LocalStore {
         }
     }
 
+    /// Decision 76d: whether an auto-detected nap stored at `window.start` already covers `window` (its
+    /// end at or after `window.end`). A strap nap re-derived from activity minutes is then not saved
+    /// again: same window, nothing would change; a narrower one must not shrink what Health holds.
+    func autoNapCovers(_ window: DateInterval) -> Bool {
+        let start = window.start
+        let rows = (try? context.fetch(FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start == start }))) ?? []
+        return rows.contains { !$0.isManuallyAdded && !$0.isManuallyEdited && $0.end >= window.end }
+    }
+
     /// Store one of the strap's naps (#231) exactly as the ring's are (`saveNap`): keyed by its start,
     /// the strap's stages as its hypnogram, so Apple Health gets them as ordinary sleep (§21.5 step 5)
     /// on the next flush (`HealthKitWriter.flushNaps`), named after the strap.
@@ -289,6 +298,10 @@ final class HelioStoreSink: HelioHistorySink {
     private var napsStoredWindows: Set<DateInterval> = []
     private var napsUnsettledWindows: Set<DateInterval> = []
     private var napsTooShortWindows: Set<DateInterval> = []
+    /// Decision 76f: the naps stored this sync that hold a standalone activity block, and the blocks
+    /// taken as the provisional main sleep of a night no stored night covers (stored nowhere).
+    private var napsFromBlocksWindows: Set<DateInterval> = []
+    private var mainOnlyBlockWindows: Set<DateInterval> = []
     private var latestStress: HelioReading?
     private var latestPAI: HelioReading?
 
@@ -342,6 +355,8 @@ final class HelioStoreSink: HelioHistorySink {
         napsStoredWindows = []
         napsUnsettledWindows = []
         napsTooShortWindows = []
+        napsFromBlocksWindows = []
+        mainOnlyBlockWindows = []
         latestStress = nil
         latestPAI = nil
     }
@@ -411,13 +426,14 @@ final class HelioStoreSink: HelioHistorySink {
     /// Decision 73 (#278): this sync's activity sleep blocks (the strap's kind-sleep minutes outside every
     /// staged session) are stitched in like raw sleeps, each kept only when the strap owns its own window
     /// (71d), and a block is used only when it joins a night that holds a session (73c): one standing
-    /// alone never reaches `storeNights`, `storeNaps` or the temperature gate. With no activity minutes
-    /// (no activity round, or it failed) this is the sessions' stitch, as before.
+    /// alone never reaches `storeNights` or the temperature gate. `storeNaps` judges it as a nap
+    /// (decision 76, through `ownedSleep`'s `aloneNights`). With no activity minutes (no activity round,
+    /// or it failed) this is the sessions' stitch, as before.
     private func ownedNights(timeline: SyncDeviceID, now: Date) -> [HelioSleepSelection.Night] {
         ownedSleep(timeline: timeline, now: now).nights
     }
 
-    /// `ownedNights` with the decision-73c counts.
+    /// `ownedNights` with the decision-73c counts, and the owned blocks that stood alone (decision 76a).
     private func ownedSleep(timeline: SyncDeviceID, now: Date) -> HelioSleepSelection.ActivityJoin {
         let log = LocalStore.ownershipLog()
         let family = DeviceOwnershipLog.Family(timeline: timeline)
@@ -447,8 +463,13 @@ final class HelioStoreSink: HelioHistorySink {
     }
 
     private func storeNights(timeline: SyncDeviceID, now: Date) throws {
-        let nights = ownedNights(timeline: timeline, now: now)
-        guard let first = nights.first?.window.start, let last = nights.last?.window.end else { return }
+        let join = ownedSleep(timeline: timeline, now: now)
+        let nights = join.nights
+        guard let first = nights.first?.window.start, let last = nights.last?.window.end else {
+            // Decision 76b: a sync whose only owned sleep is in the activity minutes still judges it as a nap.
+            storeNaps([], overnight: [], blocks: join.aloneNights, timeline: timeline, now: now)
+            return
+        }
         let edited = store.manuallyEditedSleepWindows(from: first, to: last)
         // Decision 28a: a night belongs to the device chosen when it began (saveSleepSummary also refuses
         // one the ring already keeps; only nights stored here reach the Health hand-off).
@@ -556,7 +577,7 @@ final class HelioStoreSink: HelioHistorySink {
         }
         // #231: then the naps, judged against the nights as they are stored NOW, so a nap is never
         // chosen over a night (the nights above were stored first, and nothing here touches a night).
-        storeNaps(nights, overnight: overnight, timeline: timeline, now: now)
+        storeNaps(nights, overnight: overnight, blocks: join.aloneNights, timeline: timeline, now: now)
     }
 
     /// The outcomes that mean another night holds the sleep's key, so the sleep itself is no night: the
@@ -578,8 +599,20 @@ final class HelioStoreSink: HelioHistorySink {
     /// every main sleep, 20 min or longer, and settled. Only a nap the strap owned all of is stored
     /// (decision 28); `saveNap` refuses one overlapping a stored night, and a night stored later prunes
     /// an auto nap it overlaps, so a nap never displaces a night.
+    ///
+    /// Decision 76 (#327): `blocks` are this sync's owned activity sleep blocks that joined no night
+    /// (`ActivityJoin.aloneNights`, 76a). The strap writes no `0x48` record for a daytime nap, so its
+    /// kind-sleep minutes are the only trace of one. They are candidates like the sleeps above, through
+    /// the same `naps` call (76b): a block within 60 min of a stored night belongs to it, one taken as
+    /// the provisional main sleep of a night no stored night covers is stored nowhere (counted,
+    /// `mainOnlyBlocks`), and a nap that holds one is stored like any other (76c), but not while the
+    /// chain of sleep that follows it within 60 min may still go on or grow (76j,
+    /// `sleepFollowsWithinNapGap`): that may be the night, with no record yet to anchor it. Every sync re-derives
+    /// it from the minutes it fetched (76d), so a nap holding a block is not saved again when a stored
+    /// auto nap at its start already covers it: a re-derivation that saw fewer minutes must not shrink
+    /// a row Apple Health holds (`saveNap` would re-arm it, and the flush's clean delete what was written).
     private func storeNaps(_ sleeps: [HelioSleepSelection.Night], overnight: [HelioSleepSelection.Night],
-                           timeline: SyncDeviceID, now: Date) {
+                           blocks: [HelioSleepSelection.Night] = [], timeline: SyncDeviceID, now: Date) {
         let overnightWindows = Set(overnight.map(\.window))
         var candidates: [HelioSleepSelection.Night] = []
         var keptOutOfItsNight: [HelioSleepSelection.Night] = []   // review-224e S-2's case
@@ -590,8 +623,14 @@ final class HelioStoreSink: HelioHistorySink {
             }
             candidates.append(sleep)
         }
+        candidates += blocks
         guard let first = candidates.map(\.window.start).min(), let last = candidates.map(\.window.end).max() else { return }
         let split = HelioSleepSelection.naps(from: candidates, mainSleeps: store.storedNightWindows(from: first, to: last), now: now)
+        // The blocks a stitched sleep of the split holds (a stitched window is the union of its parts).
+        func heldBlocks(_ sleep: HelioSleepSelection.Night) -> [HelioSleepSelection.Night] {
+            blocks.filter { sleep.window.start <= $0.window.start && $0.window.end <= sleep.window.end }
+        }
+        for main in split.mainSleeps { mainOnlyBlockWindows.formUnion(heldBlocks(main).map(\.window)) }
         let log = LocalStore.ownershipLog()
         let family = DeviceOwnershipLog.Family(timeline: timeline)
         var storedAsNaps: Set<DateInterval> = []
@@ -599,6 +638,13 @@ final class HelioStoreSink: HelioHistorySink {
         napsTooShortWindows.formUnion(split.tooShort.map(\.window))
         for nap in split.naps {
             let span = Self.clockSpan(nap.window, in: nap.recordedTimeZone)
+            // Decision 76j (review-327 B1/B2): the chain of sleep that follows a nap holding a block may
+            // still become the night it lies within 60 min of, with no record yet: not settled, judged
+            // on a later sync.
+            if !heldBlocks(nap).isEmpty, HelioSleepSelection.sleepFollowsWithinNapGap(nap.window, in: activity) {
+                napsUnsettledWindows.insert(nap.window)
+                continue
+            }
             guard log.ownsWholly(family, from: nap.window.start, to: nap.window.end) else {
                 if napLogged.insert(nap.window).inserted {
                     helioLog.notice("helio: nap \(span, privacy: .public) is not wholly in the strap's time; not stored")
@@ -611,6 +657,9 @@ final class HelioStoreSink: HelioHistorySink {
                 }
                 continue
             }
+            let fromBlocks = !heldBlocks(nap).isEmpty
+            // Decision 76d: already stored by an earlier sync, at least as long: left exactly as it is.
+            if fromBlocks, store.autoNapCovers(nap.window) { continue }
             // Best effort: a nap that fails to save is judged again on the next sync (the strap keeps
             // its sessions, decision 8); it never fails the round, whose nights are already stored.
             do { try store.saveHelioNap(nap) } catch {
@@ -619,8 +668,9 @@ final class HelioStoreSink: HelioHistorySink {
             }
             storedAsNaps.insert(nap.window)
             napsStoredWindows.insert(nap.window)
+            if fromBlocks { napsFromBlocksWindows.insert(nap.window) }
             if napLogged.insert(nap.window).inserted {
-                helioLog.notice("helio: sleep session \(span, privacy: .public) stored as a nap")
+                helioLog.notice("helio: \(fromBlocks ? "activity sleep" : "sleep session", privacy: .public) \(span, privacy: .public) stored as a nap")
             }
         }
         for sleep in split.tooShort where napLogged.insert(sleep.window).inserted {
@@ -762,6 +812,8 @@ final class HelioStoreSink: HelioHistorySink {
         summary.napsStored = napsStoredWindows.count
         summary.napsUnsettled = napsUnsettledWindows.count
         summary.napsTooShort = napsTooShortWindows.count
+        summary.napsFromBlocks = napsFromBlocksWindows.count
+        summary.mainOnlyBlocks = mainOnlyBlockWindows.count
         if let oldest = staged.map(\.window.start).min() {
             let newestStoredEnd = store.storedNightWindows(from: oldest, to: now).map(\.end).max() ?? .distantPast
             summary.endsAfterNewestNight = Set(staged.filter { $0.window.end > newestStoredEnd }.map(\.window)).count

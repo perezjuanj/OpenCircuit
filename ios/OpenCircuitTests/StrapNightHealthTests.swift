@@ -2566,10 +2566,11 @@ extension StrapNightHealthTests {
         }
     }
 
-    /// Decision 73c: blocks that would stand alone are stored as nothing: an evening doze before the
-    /// night (20:00–21:00), a daytime sleep after it (13:00–14:00), and a night whose only record is the
-    /// night before (no record for tonight). No night row, no nap row; counted in the sleep-round line.
-    func testABlockThatWouldStandAloneIsStoredAsNoNightAndNoNap() async throws {
+    /// Decision 73c, amended by 76b (76g): blocks that would stand alone are never a night. An evening
+    /// doze before the night (20:00–21:00) and a daytime sleep after it (13:00–14:00), each more than
+    /// 60 min from the night, are naps. A night whose only record is the NEXT night's gets no night from
+    /// that record. Counted in the sleep-round line.
+    func testStandaloneBlocksAwayFromTheNightAreNapsAndTheNextNightsRecordMakesNoNightForTheFirst() async throws {
         try await inFixedZone {
             ownership.install(.strapOwnsAllTime)
             let store = try makeStore()
@@ -2585,7 +2586,8 @@ extension StrapNightHealthTests {
             XCTAssertEqual(try rows(store).map { DateInterval(start: $0.inBedStart, end: $0.inBedEnd) },
                            [DateInterval(start: capped.start, end: hour(7))])
             XCTAssertEqual(try rows(store).map(\.asleepMin), [480], "nothing of either block in the night")
-            XCTAssertEqual(try napRows(store), [], "no nap")
+            XCTAssertEqual(try napRows(store), [DateInterval(start: hour(-4), end: hour(-3)), DateInterval(start: hour(13), end: hour(14))],
+                           "both are naps (decision 76b: more than 60 min from the night, settled)")
             XCTAssertEqual(result.sleepRound?.activityBlocksJoined, 0)
             XCTAssertEqual(result.sleepRound?.activityBlocksAlone, 2)
             XCTAssertEqual(result.sleepRound?.text.hasSuffix("; activity blocks: joined=0 alone=2"), true, result.sleepRound?.text ?? "")
@@ -2602,6 +2604,25 @@ extension StrapNightHealthTests {
                            [DateInterval(start: cappedNext, end: hour(31))], "only the night with a record")
             XCTAssertEqual(try napRows(noRecord), [])
             XCTAssertEqual(synced.sleepRound?.activityBlocksAlone, 1)
+        }
+    }
+
+    /// Decision 76b (76g): a block inside the 00:00–08:00 main-sleep window of a night no stored night
+    /// covers (23:00–06:00, the strap's only record the next night's) is that night's provisional main
+    /// sleep: stored as nothing, neither night nor nap, and counted as main-only.
+    func testABlockThatIsTheMainSleepOfANightNoStoredNightCoversIsStoredAsNothing() async throws {
+        try await inFixedZone {
+            ownership.install(.strapOwnsAllTime)
+            let store = try makeStore()
+            let nextNight: [(Double, Double, UInt8)] = [(23, 31, light)]
+            let synced = try syncWithActivity([nextNight], activity: [(-1, 6, asleepKind), (6, 23, upKind), (23, 32, upKind)],
+                                              at: hour(32), store: store)
+            XCTAssertEqual(try rows(store).map { DateInterval(start: $0.inBedStart, end: $0.inBedEnd) },
+                           [DateInterval(start: hour(23), end: hour(31))], "no night for the block")
+            XCTAssertEqual(try napRows(store), [], "no nap")
+            XCTAssertEqual(synced.sleepRound?.activityBlocksAlone, 1)
+            XCTAssertEqual(synced.sleepRound?.mainOnlyBlocks, 1)
+            XCTAssertEqual(synced.sleepRound?.napsStored, 0)
         }
     }
 

@@ -5,9 +5,9 @@ import OpenCircuitKit
 
 /// Decision 73: the strap writes one `0x48` session record per night and leaves a later sleep of that
 /// night only in its per-minute activity data (`0x01` minutes of kind `0x78`, ZEPP_PROTOCOL.md §6.5,
-/// 🟡 one night). These turn those minutes into sleeps a session's night can join. v1 uses a block only
-/// when it joins a night built from a `0x48` session (73c); a block that would stand alone is counted,
-/// never stored.
+/// 🟡 one night). These turn those minutes into sleeps a session's night can join. A block is a night's
+/// part only when it joins a night built from a `0x48` session (73c); one that stands alone is handed
+/// back (`ActivityJoin.aloneNights`) for the store to judge as a nap (decision 76, #327).
 extension HelioSleepSelection {
 
     /// Decision 73a: non-sleep minutes inside a run, this many or fewer, are an awake gap of the block;
@@ -39,21 +39,7 @@ extension HelioSleepSelection {
     public static func activityBlocks(from minutes: [ZeppActivityMinute], sessions: [Night], now: Date) -> [Night] {
         guard let newest = minutes.map(\.time).max() else { return [] }
         let minute: TimeInterval = 60
-        let spans = sessions.flatMap(\.inBedSpans)
-        func inBed(_ t: Date) -> Bool { spans.contains { $0.start <= t && t < $0.end } }
-        let sleepTimes = Set(minutes.filter { $0.kind == ZeppActivityMinute.kindSleep }.map(\.time))
-            .filter { !inBed($0) }
-            .sorted()
-        var runs: [[Date]] = []
-        for t in sleepTimes {
-            if let previous = runs.last?.last,
-               t.timeIntervalSince(previous) <= TimeInterval(activityBlockMaxGapMinutes + 1) * minute,
-               !spans.contains(where: { $0.start < t && previous.addingTimeInterval(minute) < $0.end }) {
-                runs[runs.count - 1].append(t)
-            } else {
-                runs.append([t])
-            }
-        }
+        let runs = sleepRuns(in: minutes, outside: sessions.flatMap(\.inBedSpans))
         return runs.compactMap { run -> Night? in
             guard let first = run.first, let last = run.last else { return nil }
             let window = DateInterval(start: first, end: last.addingTimeInterval(minute))
@@ -74,6 +60,63 @@ extension HelioSleepSelection {
         }
     }
 
+    /// The kind-sleep minutes of `minutes` outside every span of `spans`, as runs, oldest first: each
+    /// run its minutes' times in order. Up to `activityBlockMaxGapMinutes` non-sleep (or missing)
+    /// minutes inside a run are an awake gap; more end it, and so does crossing a span. The one
+    /// run-forming rule of `activityBlocks` (73a) and the nap hold (76j), so the two agree to the minute.
+    static func sleepRuns(in minutes: [ZeppActivityMinute], outside spans: [DateInterval] = []) -> [[Date]] {
+        let minute: TimeInterval = 60
+        func inBed(_ t: Date) -> Bool { spans.contains { $0.start <= t && t < $0.end } }
+        let sleepTimes = Set(minutes.filter { $0.kind == ZeppActivityMinute.kindSleep }.map(\.time))
+            .filter { !inBed($0) }
+            .sorted()
+        var runs: [[Date]] = []
+        for t in sleepTimes {
+            if let previous = runs.last?.last,
+               t.timeIntervalSince(previous) <= TimeInterval(activityBlockMaxGapMinutes + 1) * minute,
+               !spans.contains(where: { $0.start < t && previous.addingTimeInterval(minute) < $0.end }) {
+                runs[runs.count - 1].append(t)
+            } else {
+                runs.append([t])
+            }
+        }
+        return runs
+    }
+
+    /// Decision 76j (review-327b B2, superseding the hold rules of 76h/76i): whether `nap`, a nap
+    /// candidate that holds an activity block, is held (not settled yet, judged again on a later sync)
+    /// by the sleep that follows it in `minutes` (one sync's fetched activity minutes).
+    ///
+    /// The sleep that follows is a CHAIN, built the way `stitch` builds a night: the kind-sleep runs
+    /// (`sleepRuns`, every fetched sleep minute from the nap's end on) that start within `napGap` after
+    /// the nap's end, then each next run that starts within `napGap` of the chain's end so far. The nap
+    /// is held while that chain may still become a night it lies within 60 min of: its last run may
+    /// still be going on (its last sleep minute less than `activityBlockSettleTime` before the newest
+    /// minute, 73d), OR the chain ended less than `napGap` before the newest minute (a next run could
+    /// still join it). The night's own minutes and its `0x48` record may still be on their way (the
+    /// strap lets the phone read a night in progress, and 73d keeps an unfinished run out of the
+    /// blocks), so nothing else anchors the nap to it (76e). A nap with no run starting within
+    /// `napGap` after it is never held. A chain over and older than `napGap` no longer holds: a run of
+    /// 20 min or more in it is a block the stitch and nap rules judge, and a lone blip lets the nap go.
+    /// Nothing is lost by holding: the activity re-fetch starts at the last session night's end at the
+    /// latest, so the sync that delivers the night's record still sees the nap's minutes and judges it.
+    /// Judged on the nap's end, so the blocks a nap holds never hold it.
+    public static func sleepFollowsWithinNapGap(_ nap: DateInterval, in minutes: [ZeppActivityMinute]) -> Bool {
+        guard let newest = minutes.map(\.time).max() else { return false }
+        let runs = sleepRuns(in: minutes.filter { $0.time >= nap.end })
+        var chainEnd = nap.end
+        var lastRunEnd: Date?
+        for run in runs {
+            guard let first = run.first, let last = run.last, first.timeIntervalSince(chainEnd) <= napGap else { break }
+            lastRunEnd = last
+            chainEnd = last.addingTimeInterval(60)
+        }
+        guard let lastSleepMinute = lastRunEnd else { return false }
+        let mayGoOn = newest.timeIntervalSince(lastSleepMinute) < activityBlockSettleTime
+        let mayBeJoined = newest.timeIntervalSince(chainEnd) < napGap
+        return mayGoOn || mayBeJoined
+    }
+
     /// What `nights(sessions:activityBlocks:)` made of a sync's sleeps.
     public struct ActivityJoin: Equatable {
         /// The nights, oldest first: `stitch` over the sessions and the blocks, keeping only the nights
@@ -81,14 +124,25 @@ extension HelioSleepSelection {
         public var nights: [Night]
         /// The blocks that joined a session's night (73c).
         public var joinedBlocks: Int
-        /// The blocks that would stand alone, used nowhere (73c).
+        /// The blocks that would stand alone, used in no night (73c).
         public var aloneBlocks: Int
+        /// Decision 76a: those `aloneBlocks` blocks themselves, oldest first, as `activityBlocks` built
+        /// them, for the store to judge as naps (`naps(from:mainSleeps:now:)`). No night holds one.
+        public var aloneNights: [Night]
+
+        public init(nights: [Night], joinedBlocks: Int, aloneBlocks: Int, aloneNights: [Night] = []) {
+            self.nights = nights
+            self.joinedBlocks = joinedBlocks
+            self.aloneBlocks = aloneBlocks
+            self.aloneNights = aloneNights
+        }
     }
 
     /// Decision 73c: the nights of a sync's (owned) session sleeps and (owned) activity blocks. They are
     /// stitched together by the one rule (`stitch`: 28f's 60 minutes, 71b's overnight sleeps of one
     /// night key), and a night is kept only when it holds a session; a block that stands alone, or with
-    /// other blocks only, is dropped. Without blocks this is `stitch(sessions)`, unchanged.
+    /// other blocks only, is in no night: it is counted and handed back in `aloneNights` (decision 76a).
+    /// Without blocks this is `stitch(sessions)`, unchanged.
     ///
     /// Decision 73f/73i: no lead-in, and nothing between fragments. A block is used only when it starts
     /// at or after the in-bed end of the LAST session of the night it joins; any other block is taken out
@@ -124,10 +178,10 @@ extension HelioSleepSelection {
             kept = withSession(stitch(sessions + used))
         }
         // 73g: a night its blocks would cost goes back to its sessions' own stitch.
-        var joined = 0
+        var joined: [Night] = []
         kept = kept.flatMap { night -> [Night] in
-            let held = used.filter { holds(night, $0) }.count
-            guard held > 0, !isOvernightSleep(night) || night.window.duration > maxNightLength else {
+            let held = used.filter { holds(night, $0) }
+            guard !held.isEmpty, !isOvernightSleep(night) || night.window.duration > maxNightLength else {
                 joined += held
                 return [night]
             }
@@ -138,6 +192,9 @@ extension HelioSleepSelection {
             }
             return alone
         }
-        return ActivityJoin(nights: kept, joinedBlocks: joined, aloneBlocks: blocks.count - joined)
+        // 76a: every block no kept night holds, in the order `activityBlocks` gave them.
+        let aloneNights = blocks.filter { block in !joined.contains(block) }
+        return ActivityJoin(nights: kept, joinedBlocks: joined.count, aloneBlocks: blocks.count - joined.count,
+                            aloneNights: aloneNights)
     }
 }
