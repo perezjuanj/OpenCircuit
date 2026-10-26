@@ -174,7 +174,8 @@ stores and writes what it measured for time it owned:
     not the record's own span.** Asleep time is unchanged; time in bed and awake time grow, so
     efficiency and the Sleep Score drop (a synthetic 8 h night with a 60 min lead-in: in bed 480 →
     540 min, efficiency 0.969 → 0.861, Sleep Score 83 → 71). The skin-temperature verdict, overnight
-    HRV, resting HR and the night key are those of the night without it. Every reader that averages a night's vitals (the illness alert, Vitals Status, the card's
+    HRV, resting HR and the night key are those of the night without it.
+    Every reader that averages a night's vitals (the illness alert, Vitals Status, the card's
     overnight averages, Trends, the headache HRV and bedtime regularity) reads the night's sleep window,
     the in-bed window without the lead-in (decision 77h, `StoredSleepSummary.sleepWindowStart`), so
     baselines and alerts are as before; a ring night, a night without a lead-in and an edited night
