@@ -771,7 +771,7 @@ final class HealthKitWriter {
     /// `healthWritten` flag — independent of the night's `.sleep` cursor — so naps and the night
     /// never collide. Best-effort: a failed save leaves the flag so it retries next flush.
     private func flushNaps(store: LocalStore) async -> Int {
-        await Self.cleanPrunedNaps(store: store, deleteStale: { await self.deleteStaleNapSleep($0, keeping: $1, current: $2) })
+        await Self.cleanPrunedNaps(store: store, now: Date(), delete: { await self.deletePrunedNapSleep($0) })
         guard let pending = try? store.pendingNaps(), !pending.isEmpty else { return 0 }
         var written = 0
         for nap in pending {
@@ -798,15 +798,32 @@ final class HealthKitWriter {
         return written
     }
 
-    /// #327 S1: delete this app's sleep samples a pruned strap nap wrote outside the night that pruned
-    /// it (`LocalStore.takePrunedNapHealthCleanSpans`: its written span, clear of every stored night and
-    /// nap). The same own-samples-only clean a re-detected nap uses (`deleteStaleNapSleep`, nothing
-    /// kept, no current window). Static with the effect passed in, like `mirrorNap`, so the spans are
-    /// testable without a live `HKHealthStore`. Nothing remembered: nothing done.
-    static func cleanPrunedNaps(store: LocalStore,
-                                deleteStale: (DateInterval, [String], Range<Date>) async -> Void) async {
-        for span in store.takePrunedNapHealthCleanSpans() {
-            await deleteStale(span, [], span.start ..< span.start)
+    /// #327 S1/S2: delete this app's sleep samples a pruned strap nap wrote outside the night that
+    /// pruned it (`LocalStore.prunedNapHealthCleanWork`: its written span, clear of every stored night
+    /// and nap). A span is forgotten only when every piece's delete succeeded; one that failed (a locked
+    /// phone, sharing turned off, a transient error) stays for the next flush, which recomputes its
+    /// pieces against the rows then. Static with the effect passed in, like `mirrorNap`, so the spans
+    /// are testable without a live `HKHealthStore`. Nothing remembered: nothing done.
+    static func cleanPrunedNaps(store: LocalStore, now: Date, delete: (DateInterval) async -> Bool) async {
+        for work in store.prunedNapHealthCleanWork(now: now) {
+            var cleaned = true
+            for piece in work.pieces {
+                if !(await delete(piece)) { cleaned = false }
+            }
+            if cleaned { store.forgetPrunedNapHealthSpan(work.span) }
+        }
+    }
+
+    /// #327 S2: `deleteStaleNapSleep`'s clean for a pruned nap's piece (this app's sleep samples that
+    /// overlap it; nothing kept, no current window), reporting whether the delete succeeded. Used only
+    /// by `cleanPrunedNaps`; the re-detected nap's clean is unchanged.
+    private func deletePrunedNapSleep(_ piece: DateInterval) async -> Bool {
+        let predicate = HKQuery.predicateForSamples(withStart: piece.start, end: piece.end, options: [])
+        do {
+            _ = try await store.deleteObjects(of: HKCategoryType(.sleepAnalysis), predicate: predicate)
+            return true
+        } catch {
+            return false
         }
     }
 
