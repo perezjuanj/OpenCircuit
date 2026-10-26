@@ -74,6 +74,19 @@ extension HelioSleepSelection {
         }
     }
 
+    /// Decision 76h (review-327 B1): whether `minutes` (one sync's fetched activity minutes) hold a
+    /// kind-sleep minute within `napGap` after the end of `nap`, a nap candidate that holds an activity
+    /// block. Such a nap is not settled yet, whether or not that later sleep is a usable block: the
+    /// night's own minutes may still be going on (73d keeps them out of `activityBlocks`) and its
+    /// `0x48` record not delivered, so nothing else says the nap lies within 60 min of a night (76e).
+    /// It is judged again on a later sync. Judged on the nap's end, so the blocks a nap holds never
+    /// hold it.
+    public static func sleepFollowsWithinNapGap(_ nap: DateInterval, in minutes: [ZeppActivityMinute]) -> Bool {
+        minutes.contains { minute in
+            minute.kind == ZeppActivityMinute.kindSleep && minute.time >= nap.end && minute.time.timeIntervalSince(nap.end) <= napGap
+        }
+    }
+
     /// What `nights(sessions:activityBlocks:)` made of a sync's sleeps.
     public struct ActivityJoin: Equatable {
         /// The nights, oldest first: `stitch` over the sessions and the blocks, keeping only the nights

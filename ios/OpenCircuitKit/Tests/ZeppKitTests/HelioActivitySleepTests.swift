@@ -382,3 +382,18 @@ extension HelioActivitySleepTests {
         XCTAssertGreaterThan(checked, 100)
     }
 }
+
+// MARK: - Decision 76h: a nap waits while sleep follows it within the hour
+
+extension HelioActivitySleepTests {
+    /// A kind-sleep minute from the nap's end up to 60 min after it holds the nap; one 61 min after,
+    /// a non-sleep minute, or a sleep minute inside or before the nap doesn't.
+    func testOnlyASleepMinuteWithinTheHourAfterTheNapHoldsIt() {
+        let nap = span(780, 840)
+        XCTAssertTrue(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: asleep(840, 841)), "right at the end")
+        XCTAssertTrue(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 900) + asleep(900, 901)), "60 min after")
+        XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 901) + asleep(901, 960)), "61 min after")
+        XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: asleep(700, 840) + up(840, 960)), "inside or before")
+        XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: []))
+    }
+}

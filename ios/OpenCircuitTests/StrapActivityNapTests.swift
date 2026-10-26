@@ -382,6 +382,105 @@ final class StrapActivityNapTests: XCTestCase {
         }
     }
 
+    // MARK: 76h (review-327 B1): a nap waits while sleep follows it within the hour
+
+    /// The review's repro: a doze 22:00–22:40, tonight's sleep minutes from 23:00. A sync at 23:50 sees
+    /// the night still going on (73d keeps its minutes out of the blocks) and no record yet: the doze
+    /// waits (unsettled), no nap. The morning sync stores the night, and the doze is 20 min before it:
+    /// no nap. Control: the same minutes with the morning sync only give no nap either.
+    func testADozeWithinAnHourBeforeTheNightIsNoNapWhenASyncRunsWhileTheNightGoesOn() throws {
+        try inFixedZone {
+            ownership.install(.strapOwnsAllTime)
+            let doze = (22.0, 22 + 40.0 / 60)
+            let store = try makeStore()
+            let during = try sync(activity: day(asleep: [doze, (23, 23 + 50.0 / 60)], until: 23 + 50.0 / 60),
+                                  at: 23 + 50.0 / 60, store: store)
+            XCTAssertEqual(try napWindows(store), [], "the night goes on within the hour after the doze")
+            XCTAssertEqual(during.sleepRound?.napsUnsettled, 1, "judged again later")
+            XCTAssertEqual(during.sleepRound?.napsFromBlocks, 0)
+
+            let morning = try sync([lastNight, [(23, 31, light)]], activity: day(asleep: [doze, (23, 31)], until: 31.5),
+                                   at: 31.5, store: store)
+            XCTAssertEqual(try nightWindows(store), [span(-1, 7), span(23, 31)])
+            XCTAssertEqual(try napWindows(store), [], "the doze belongs to the night")
+            XCTAssertEqual(morning.sleepRound?.napsFromBlocks, 0)
+
+            let control = try makeStore()
+            try sync([lastNight, [(23, 31, light)]], activity: day(asleep: [doze, (23, 31)], until: 31.5), at: 31.5, store: control)
+            XCTAssertEqual(try nightWindows(control), [span(-1, 7), span(23, 31)])
+            XCTAssertEqual(try napWindows(control), [])
+        }
+    }
+
+    /// The mirror shape: sleep still going on MORE than an hour after a nap doesn't hold it. A nap
+    /// 13:00–14:00 is stored by a 15:30 sync whose sleep minutes from 15:05 go on, and by a 22:30 sync
+    /// with the evening's sleep from 22:00 going on.
+    func testSleepGoingOnMoreThanAnHourAfterANapDoesNotHoldIt() throws {
+        for (label, later, at) in [("sleep from 15:05", 15 + 5.0 / 60, 15.5), ("the evening's sleep from 22:00", 22.0, 22.5)] {
+            try inFixedZone {
+                ownership.install(.strapOwnsAllTime)
+                let store = try makeStore()
+                let result = try sync(activity: day(asleep: [(13, 14), (later, at)], until: at), at: at, store: store)
+                XCTAssertEqual(try napWindows(store), [span(13, 14)], label)
+                XCTAssertEqual(result.sleepRound?.napsFromBlocks, 1, label)
+            }
+        }
+    }
+
+    /// A doze 20:00–20:40 with 90 min awake before the night's sleep minutes (from 22:10): a nap, even
+    /// while the night goes on; the morning's record (22:10–07:00) stores the night beside it.
+    func testADozeNinetyMinutesBeforeTheNightsSleepIsANap() throws {
+        try inFixedZone {
+            ownership.install(.strapOwnsAllTime)
+            let store = try makeStore()
+            let doze = (20.0, 20 + 40.0 / 60), onset = 22 + 10.0 / 60
+            let during = try sync(activity: day(asleep: [doze, (onset, 22.5)], until: 22.5), at: 22.5, store: store)
+            XCTAssertEqual(try napWindows(store), [span(doze.0, doze.1)])
+            XCTAssertEqual(during.sleepRound?.napsFromBlocks, 1)
+
+            try sync([lastNight, [(onset, 31, light)]], activity: day(asleep: [doze, (onset, 31)], until: 31.5), at: 31.5, store: store)
+            XCTAssertEqual(try nightWindows(store), [span(-1, 7), span(onset, 31)])
+            XCTAssertEqual(try napWindows(store), [span(doze.0, doze.1)], "the nap stays beside the night")
+        }
+    }
+
+    /// A nap held by sleep minutes that followed it within the hour (12:00–12:40, sleep from 13:20 still
+    /// going on at 13:45) is stored once a later sync has no sleep minute within the hour after it (the
+    /// strap's minutes for 13:20–13:45 now read awake). And when the sleep that followed finished as a
+    /// block (13:20–14:00), the two are one nap, stored once settled.
+    func testAHeldNapIsStoredOnceNoSleepFollowsItWithinTheHour() throws {
+        try inFixedZone {
+            ownership.install(.strapOwnsAllTime)
+            let doze = (12.0, 12 + 40.0 / 60)
+            let store = try makeStore()
+            let held = try sync(activity: day(asleep: [doze, (13 + 20.0 / 60, 13.75)], until: 13.75), at: 13.75, store: store)
+            XCTAssertEqual(try napWindows(store), [])
+            XCTAssertEqual(held.sleepRound?.napsUnsettled, 1)
+            let released = try sync(activity: day(asleep: [doze], until: 14.75), at: 14.75, store: store)
+            XCTAssertEqual(try napWindows(store), [span(doze.0, doze.1)])
+            XCTAssertEqual(released.sleepRound?.napsFromBlocks, 1)
+
+            let finished = try makeStore()
+            try sync(activity: day(asleep: [doze, (13 + 20.0 / 60, 14)], until: 15 + 10.0 / 60), at: 15 + 10.0 / 60, store: finished)
+            XCTAssertEqual(try napWindows(finished), [span(12, 14)], "one nap over both")
+        }
+    }
+
+    /// 76h as decided: ANY kind-sleep minute within the hour after the nap holds it, a blip under 20 min
+    /// too (13:00–14:00, then 14:30–14:40 asleep), on every sync that fetches that blip. Known gap, in
+    /// the report: once the next night's record moves the activity re-fetch past it, the nap is lost.
+    func testAShortSleepWithinTheHourAfterANapHoldsItWhileItIsFetched() throws {
+        try inFixedZone {
+            ownership.install(.strapOwnsAllTime)
+            let store = try makeStore()
+            for at in [16.0, 20] {
+                let result = try sync(activity: day(asleep: [(13, 14), (14.5, 14 + 40.0 / 60)], until: at), at: at, store: store)
+                XCTAssertEqual(try napWindows(store), [], "at \(at)")
+                XCTAssertEqual(result.sleepRound?.napsUnsettled, 1, "at \(at)")
+            }
+        }
+    }
+
     // MARK: 76d: re-derivation
 
     /// A nap in Apple Health, re-derived by later syncs from fewer minutes (the end, or a fetch that
