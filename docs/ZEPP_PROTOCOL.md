@@ -2510,6 +2510,11 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   removed: inside the night by the night's own mirror (its union delete), outside it by the next nap
   flush (#327 S1/S2: the nap's written span, one second clear of every stored night and nap, this
   app's samples only; the span is kept until its delete succeeds and dropped 14 days after it ended).
+  The prune is idempotent (decision 80b, #331 item 10): a nap's written span is scheduled only once
+  the prune's delete is saved, and the prune also runs when a re-delivery of a strap night is kept out
+  by the merge (`.keptFullerStoredNight`), judged on the STORED night's window and sleep, so a prune
+  whose save failed is retried by the next re-delivery the merge judges (an edited night, a refused
+  key collision and another device's night never retry). What the merge keeps is unchanged.
   **The hold** (decision 76j, now an optimisation that avoids a Health write followed by a delete): a
   nap candidate that holds a block is judged against the chain of sleep that follows it, built the
   way `stitch` builds a night: the sync's kind-sleep runs (up to 5 other minutes inside a run, the
@@ -2573,7 +2578,14 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
     overlap backstop. So a lead-in that ends at a nap's end never prunes it, and the nap or the night
     may be stored first with one exception (next item). (A manual nap's add or edit, and the fences
     that keep a nap's Health delete off a stored night, still use the whole in-bed window, lead-in
-    included: those are samples in Health.)
+    included: those are samples in Health.) Decision 80a (#331 item 7): the whole window stays the
+    fence for deletes, but a strap nap whose moved re-detection only TOUCHES it (zero overlap: the
+    lead-in starts where the nap ends) is rewritten, so the card's nap and Health agree; the clean of
+    its old write still ends one second clear of the lead-in and the night's `inBed`. A nap that
+    overlaps the lead-in by even one second is still not rewritten (its row is updated in place for
+    the same start, or left as written for a moved start, and Health keeps the old write); one that
+    overlaps the night's sleep is not stored at all (the backstop of 77j).
+    A ring nap that touches a ring night is still not rewritten.
   - **Known limit, not fixed in this PR:** a night stored BEFORE the sync that first sees a nap more
     than 60 min before its sleep onset keeps the lead-in it was stored with while the night is not
     re-delivered changed. The nap is stored (it is a real nap, §21.5), and the night's lead-in can lie
@@ -2667,3 +2679,6 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   #278); standalone ones are not stored.
 - 2026-10-18: §21.6: the awake time between a night's fragments is awake and in bed where the strap's
   own heart rate is stored (decision 74, #278); unworn minutes stay a gap. No tag was promoted.
+- 2026-10-26: §21.6: a strap nap that only touches its night's in-bed window is rewritten when it
+  moves (decision 80a), and the 76l prune is idempotent and retried on a kept-out re-delivery
+  (decision 80b; #331 items 7 and 10). No tag was promoted.

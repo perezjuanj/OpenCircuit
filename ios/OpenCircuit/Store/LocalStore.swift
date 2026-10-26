@@ -2130,6 +2130,16 @@ struct LocalStore {
                             + "clampWidened=[\(Self.stamp(w.inBedStart))..\(Self.stamp(w.inBedEnd))]")
                     try context.save()
                 }
+                // Decision 80b (#331 item 10): the 76l prune again, for the STORED strap night the merge
+                // keeps (its window and its sleep, never the incoming one's), so a prune whose save
+                // failed on an earlier store is retried by the next re-delivery the merge refuses. It
+                // prunes only what the store of that night would have pruned; the row is not touched.
+                if family == .zeppOS {
+                    pruneAutoNaps(overlapping: Self.sleepStartForNearness(
+                                      hypnogram: SleepHypnogramCodec.decode(existing.hypnogramData),
+                                      inBedStart: existing.inBedStart, inBedEnd: existing.inBedEnd),
+                                  existing.inBedEnd, night: existing.night, strapProximity: Self.strapNapProximity)
+                }
                 return .keptFullerStoredNight
             }
             // Only NOW — every early return above is behind us, so this reaches `context.save()`.
@@ -2234,11 +2244,17 @@ struct LocalStore {
     /// main sleep", applied once the night's record is stored, whatever order the syncs ran in (a nap
     /// stored by a sync that ran before the record, decision 76's hold being only an optimisation).
     /// Never a manual nap, never another device's nap; overlap alone prunes as before for any device.
+    ///
+    /// Decision 80b (#331 item 10): idempotent. The written spans are remembered only once the delete
+    /// is saved (UserDefaults has no rollback), so a save that failed leaves the nap and schedules
+    /// nothing, and the retry (a strap night's next re-delivery, `.keptFullerStoredNight` included)
+    /// schedules the span once.
     private func pruneAutoNaps(overlapping start: Date, _ end: Date, night: Date, strapProximity: TimeInterval = 0) {
         guard end > start else { return }
         let naps = (try? context.fetch(FetchDescriptor<StoredNap>())) ?? []
         let log = strapProximity > 0 ? Self.ownershipLog() : DeviceOwnershipLog(entries: [])
         var removed = 0
+        var writtenSpans: [DateInterval] = []
         for nap in naps where !nap.isManuallyAdded && !nap.isManuallyEdited {
             let lo = min(nap.start, nap.effectiveStart)
             let hi = max(nap.end, nap.effectiveEnd)
@@ -2248,12 +2264,13 @@ struct LocalStore {
                 && lo <= end.addingTimeInterval(strapProximity) && hi >= start.addingTimeInterval(-strapProximity)
                 && log.ownsWholly(.zeppOS, from: nap.effectiveStart, to: nap.effectiveEnd)
             guard overlaps || nearStrapNight else { continue }
-            rememberPrunedNapHealthSpan(nap)
+            if let span = prunedNapHealthSpan(nap) { writtenSpans.append(span) }
             context.delete(nap)
             removed += 1
         }
         guard removed > 0 else { return }
-        do { try context.save() } catch { context.rollback(); return }
+        do { try Self.pruneAutoNapsSave(context) } catch { context.rollback(); return }
+        for span in writtenSpans { rememberPrunedNapHealthSpan(span) }
         ObservabilityStore().recordMetricEvent(
             source: "nap-prune",
             detail: "night=\(Self.stamp(night)) removed=\(removed) span=[\(Self.stamp(start))..\(Self.stamp(end))]")
@@ -3311,9 +3328,17 @@ struct LocalStore {
         // gets the old in-place update, and a different start leaves the stored row as written (a
         // second row would put the nap in Health twice). Skipping deletes nothing and duplicates
         // nothing. A night stored AFTER the re-arm is kept out by `staleNapHealthSpan`, which clips.
+        // Decision 80a (#331 item 7): a STRAP nap that only touches a stored night (zero overlap: the
+        // lead-in starts where the nap ends) is rewritten, so the card's nap and Health agree; the clean
+        // of its old write (`staleNapHealthSpan`) still ends one second clear of the night, whose fence
+        // stays the whole in-bed window, touching included. One second of overlap still skips. The
+        // ring's naps are judged as before (touching skips).
+        let touchingSkips = family != .zeppOS
         if !mirrored.isEmpty,
            otherNapReaches(lo, hi, except: group)
-            || storedNightWindows(near: lo, hi).contains(where: { lo <= $0.end && hi >= $0.start }) {
+            || storedNightWindows(near: lo, hi).contains(where: {
+                touchingSkips ? lo <= $0.end && hi >= $0.start : lo < $0.end && hi > $0.start
+            }) {
             if let exact {
                 try saveNapInPlace(exact, end: end, asleepMin: asleepMin, isLongNap: isLongNap, segments: segments)
             }
@@ -3396,12 +3421,20 @@ struct LocalStore {
     /// next nap flush's clean (`HealthKitWriter.cleanPrunedNaps`). Seconds since 1970, `[start, end]`.
     static let prunedNapHealthSpansKey = "nap.prunedHealthSpans.v1"
 
-    /// #327 S1: remember the span a strap nap about to be pruned wrote to Apple Health (nothing when it
-    /// wrote nothing). Only a nap the strap owned all of, the rule a strap nap is stored and written
-    /// under; a ring nap is left exactly as before (a ring-only install records nothing).
-    private func rememberPrunedNapHealthSpan(_ nap: StoredNap) {
+    /// Decision 80b: the save of `pruneAutoNaps`' deletes. Replaceable only by tests (a save that fails).
+    static var pruneAutoNapsSave: @MainActor (ModelContext) throws -> Void = { try $0.save() }
+
+    /// #327 S1: the span a strap nap about to be pruned wrote to Apple Health (nil when it wrote
+    /// nothing). Only a nap the strap owned all of, the rule a strap nap is stored and written under; a
+    /// ring nap is left exactly as before (a ring-only install records nothing). Read before the delete.
+    private func prunedNapHealthSpan(_ nap: StoredNap) -> DateInterval? {
         guard let span = Self.napMirroredSpan(nap),
-              Self.ownershipLog().ownsWholly(.zeppOS, from: nap.effectiveStart, to: nap.effectiveEnd) else { return }
+              Self.ownershipLog().ownsWholly(.zeppOS, from: nap.effectiveStart, to: nap.effectiveEnd) else { return nil }
+        return span
+    }
+
+    /// #327 S1: remember `span` for the nap flush's clean. Decision 80b: only after the prune is saved.
+    private func rememberPrunedNapHealthSpan(_ span: DateInterval) {
         var spans = UserDefaults.standard.array(forKey: Self.prunedNapHealthSpansKey) as? [[Double]] ?? []
         spans.append([span.start.timeIntervalSince1970, span.end.timeIntervalSince1970])
         UserDefaults.standard.set(spans, forKey: Self.prunedNapHealthSpansKey)
