@@ -585,11 +585,15 @@ final class StrapActivityNapTests: XCTestCase {
         let naps: [DateInterval]
     }
 
-    /// Review-327b's proof: each scenario synced every 10 min from the doze's end + 60 min until 07:00,
-    /// with the activity minutes a strap would hold at that time and no record for tonight, then the
-    /// morning sync with the record. After EVERY sync the nap rows are exactly the scenario's: none
-    /// for a doze within 60 min (or chained within 60 min) of the night, the daytime nap from 15:00 on
-    /// and never removed, the doze 130 min before the night from the first sync on.
+    /// The 76j hold over sync times, for these six nights only: each synced every 10 min from the
+    /// doze's end + 60 min until 07:00, with the activity minutes a strap would hold at that time and no
+    /// record for tonight, then the morning sync with the record. After EVERY sync the nap rows are
+    /// exactly the scenario's: none for a doze whose following sleep chains within 60 min to the night
+    /// (a-d), the daytime nap from 15:00 on and never removed (e), the doze 130 min before the night
+    /// from the first sync on (f). It says nothing of a night whose sleep starts more than 60 min after
+    /// the doze or after a first fragment (an awakening over 60 min): there a sync before the record
+    /// can store the doze as a nap, and decision 76l prunes it when the record is stored (the
+    /// `testTheRecordPrunesEveryNapNearTheNight…` sweeps).
     func testNoSyncTimeStoresANapWithinTheHourOfTheNightThatFollows() throws {
         let awake: UInt8 = 0x07
         let scenarios = [
