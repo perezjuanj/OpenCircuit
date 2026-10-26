@@ -2571,20 +2571,25 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
     Nearness is measured from the night's SLEEP, never its lead-in, on every path: the 60 min rule of
     the nap judgement, 76l's prune when the night is stored (its overlap test included) and `saveNap`'s
     overlap backstop. So a lead-in that ends at a nap's end never prunes it, and the nap or the night
-    may be stored first with one exception (next item). (A manual nap's add or edit, and the fences
+    may be stored first, with one exception for a night already in Apple Health (next item). (A manual nap's add or edit, and the fences
     that keep a nap's Health delete off a stored night, still use the whole in-bed window, lead-in
     included: those are samples in Health.)
-  - **Known limit, not fixed in this PR:** a night stored BEFORE the sync that first sees a nap more
-    than 60 min before its sleep onset keeps the lead-in it was stored with while the night is not
-    re-delivered changed. The nap is stored (it is a real nap, §21.5), and the night's lead-in can lie
-    over it by up to the clamp difference: 30 min for a nap ending 90 min before onset, 59 min at 61
-    min, at most the 120 min cap. In Apple Health that is an `inBed` overlap and an `awake` sample over
-    the nap's asleep one; asleep time is not counted twice. The card shows the night in bed from the
-    lead-in start and the nap until its end. It converges when the night comes back changed enough
-    for the merge (`saveSleepSummary`) to replace it, for instance with more sleep. It is rare on the
-    production fetch: a session nap comes with any later sync of the night (the sleep round re-fetches
-    it), and the activity fetch starts at or before the last session night's end, so a block nap comes
-    in the same sync as the night.
+  - **A night stored before its nap** (decision 79e): a night stored BEFORE the sync that first sees a
+    nap more than 60 min before its sleep onset was stored with a lead-in over that nap. While the night
+    is NOT written to Apple Health, its next re-delivery with the same sleep window and a lead-in that
+    now starts later (stopped at the nap, 77c) replaces the stored copy instead of the merge keeping
+    the copy with more time in bed, so the lead-in stops at the nap. Any other re-delivery goes to the
+    merge as before.
+  - **Known limit, not fixed:** a night already WRITTEN to Apple Health keeps the lead-in it was written
+    with (77f, forward-only; there is no rewrite path). The nap is stored (it is a real nap, §21.5),
+    and the night's lead-in can lie over it by up to the clamp difference: 30 min for a nap ending 90
+    min before onset, 59 min at 61 min, at most the 120 min cap. In Apple Health that is an `inBed`
+    overlap and an `awake` sample over the nap's asleep one; asleep time is not counted twice. The card
+    shows the night in bed from the lead-in start and the nap until its end. It converges only when the
+    night comes back extended (58b). It is rare on the production fetch: a session nap comes with any
+    later sync of the night (the sleep round re-fetches it), the activity fetch starts at or before the
+    last session night's end, so a block nap comes in the same sync as the night, and a night reaches
+    Apple Health only after the settle margin.
   - From the store, never a sync's fetched minutes, so every re-delivery derives the same lead-in
     (the 73f/73i/74b lesson), and the 50a hand-over and 50b backstop rebuild the night with the
     lead-in it was stored with.
