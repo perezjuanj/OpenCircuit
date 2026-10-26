@@ -54,8 +54,8 @@ final class StrapLeadInSharedReadersTests: XCTestCase {
     private func wake(_ daysAgo: Int) -> Date { day(daysAgo).addingTimeInterval(7 * 3600) }
     private func leadInStart(_ daysAgo: Int) -> Date { day(daysAgo).addingTimeInterval(-2 * 3600) }
 
-    /// Nine strap nights (8 days ago … last night: past Vitals Status' 7-night baseline floor), each stored as the store path stores it (with or
-    /// without the 22:00–23:00 lead-in). In both stores the same readings: every 5 minutes, HR 58,
+    /// Nine strap nights (8 days ago … last night, past Vitals Status' 7-night baseline floor), each
+    /// stored as the store path stores it (with or without the 22:00–23:00 lead-in). In both stores the same readings: every 5 minutes, HR 58,
     /// HRV 60, breathing 14 asleep (last night: HR 66, HRV 42), and HR 70, HRV 35, breathing 18 in the
     /// hour before sleep, which a reader that averaged the lead-in would take in.
     private func fixture(leadIn: Bool) throws -> (container: ModelContainer, store: LocalStore) {
