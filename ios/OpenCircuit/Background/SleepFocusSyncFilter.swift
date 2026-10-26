@@ -91,16 +91,50 @@ enum SleepFocusDetection {
     /// `SetFocusFilterIntentError` has `notFound` and `missingParameterValue` (iOS 26 SDK); the header
     /// doesn't say which a Focus that is off gives, so both shapes count as not active: the filter
     /// with its default `focusIsActive == false`, and `notFound`. Any other error is `unknown`.
-    static func liveRead(kind: String = "") async -> Reading {
+    ///
+    /// Decision 78h: bounded by `readTimeout` (a slower read is `unknown`, "no answer in time"), and its
+    /// shape goes to the `defaults` given (S-2, N-5).
+    static func liveRead(kind: String = "", defaults: UserDefaults = .standard, timeout: TimeInterval = readTimeout,
+                         read: @escaping @Sendable () async -> (Reading, String) = { await rawRead() }) async -> Reading {
+        let (reading, shape) = await firstOf(read, orAfter: timeout, fallback: (.unknown, "no answer in time"))
+        noteShape(shape, kind: kind, defaults: defaults)
+        return reading
+    }
+
+    /// Decision 78h S-2: how long a wake waits for iOS's read.
+    static let readTimeout: TimeInterval = 2
+
+    /// One read of iOS's filter state and the shape it came back in (counts-only words).
+    static func rawRead() async -> (Reading, String) {
         do {
             let active = try await SleepFocusSyncFilter.current.focusIsActive
-            noteShape(active ? "on" : "off (default value)", kind: kind)
-            return reading(focusIsActive: active)
+            return (reading(focusIsActive: active), active ? "on" : "off (default value)")
         } catch {
-            let shape = (error as? SetFocusFilterIntentError) == .notFound
-                ? "off (notFound)" : "error \(String(describing: type(of: error)))"
-            noteShape(shape, kind: kind)
-            return reading(thrown: error)
+            return (reading(thrown: error), shape(thrown: error))
+        }
+    }
+
+    /// N-2: a `SetFocusFilterIntentError` by its case name; any other error by its type name only.
+    static func shape(thrown error: Error) -> String {
+        guard let focus = error as? SetFocusFilterIntentError else { return "error \(String(describing: type(of: error)))" }
+        switch focus {
+        case .notFound: return "off (notFound)"
+        case .missingParameterValue: return "error SetFocusFilterIntentError.missingParameterValue"
+        @unknown default: return "error SetFocusFilterIntentError (unknown case)"
+        }
+    }
+
+    /// `work`'s result, or `fallback` once `seconds` have passed, whichever comes first. A read that
+    /// never returns can't hold the wake: the caller goes on, and the late result is dropped.
+    static func firstOf<T: Sendable>(_ work: @escaping @Sendable () async -> T, orAfter seconds: TimeInterval,
+                                     fallback: T) async -> T {
+        await withCheckedContinuation { continuation in
+            let once = ResumeOnce(continuation)
+            Task { once.resume(await work()) }
+            Task {
+                try? await Task.sleep(for: .seconds(seconds))
+                once.resume(fallback)
+            }
         }
     }
 
@@ -129,12 +163,28 @@ enum SleepFocusDetection {
     @discardableResult
     static func check(kind: String, read: (() async -> Reading)? = nil,
                       defaults: UserDefaults = .standard) async -> Date? {
-        let reading = await (read ?? { await liveRead(kind: kind) })()
+        let reading = await (read ?? { await liveRead(kind: kind, defaults: defaults) })()
         return note(reading, at: Date(), kind: kind, defaults: defaults)
     }
 
+    /// 78h N-1: the read the app's coming to the front started, which its strap flush waits for, so the
+    /// foreground flush decides with whatever T it found.
+    @MainActor private static var foregroundCheck: Task<Void, Never>?
+
+    /// The app came to the front (strap chosen): read the filter now.
+    @MainActor static func startForegroundCheck() {
+        foregroundCheck = Task { await check(kind: "foreground") }
+    }
+
+    /// Before the foreground strap flush: the read started on coming to the front has finished (at
+    /// most `readTimeout`).
+    @MainActor static func awaitForegroundCheck() async {
+        await foregroundCheck?.value
+    }
+
     /// Decision 78f-1. Active: remember `now` as seen active. Not active, with a seen-active time in the
-    /// last 18 h that is newer than the persisted T: the Focus ended; persist T = `now`, forget the
+    /// last 18 h that is newer than the persisted T: the Focus ended; persist T = `now` as a DETECTED T
+    /// (decision 78g: it finalizes only nights that ended 10 min or more before it), forget the
     /// seen-active time and leave one `focus` line. Anything else changes nothing. Returns the new T.
     @discardableResult
     static func note(_ reading: Reading, at now: Date, kind: String, defaults: UserDefaults = .standard) -> Date? {
@@ -150,7 +200,7 @@ enum SleepFocusDetection {
             guard let seen = seenActive(defaults: defaults), now >= seen,
                   now.timeIntervalSince(seen) <= seenActiveWindow,
                   seen > (SleepFocusFinalization.persisted(defaults: defaults) ?? .distantPast) else { return nil }
-            SleepFocusFinalization.persist(now, defaults: defaults)
+            SleepFocusFinalization.persist(now, source: .detected, defaults: defaults)
             defaults.removeObject(forKey: seenActiveKey)
             ObservabilityStore(defaults).recordMetricEvent(
                 source: "focus", detail: "Sleep Focus end detected at a wake (filter not run by iOS), kind=\(kind)")
@@ -161,6 +211,37 @@ enum SleepFocusDetection {
     static func seenActive(defaults: UserDefaults = .standard) -> Date? {
         let t = defaults.double(forKey: seenActiveKey)
         return t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
+
+    /// 78h S-1: the strap bundle's fixed `Sleep Focus` line, from the persisted state (never a log row,
+    /// which ages out of the metric log): the last read's shape, how long ago the Focus was last seen
+    /// on, and how long ago T was with its source. Minutes only, no clock times.
+    static func bundleLine(now: Date, defaults: UserDefaults = .standard) -> String {
+        func age(_ date: Date?) -> String {
+            guard let date else { return "none" }
+            guard now >= date else { return "ahead of the clock" }
+            return "\(Int(now.timeIntervalSince(date) / 60)) min ago"
+        }
+        let t = SleepFocusFinalization.persisted(defaults: defaults)
+        let source = t == nil ? "" : " (\(SleepFocusFinalization.persistedSource(defaults: defaults).rawValue))"
+        return "Sleep Focus: last read \(defaults.string(forKey: lastShapeKey) ?? "none"); seen on \(age(seenActive(defaults: defaults)));"
+            + " Focus end \(age(t))\(source)"
+    }
+}
+
+/// Resumes a continuation once, from whichever of two tasks gets there first (`firstOf`).
+private final class ResumeOnce<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+
+    init(_ continuation: CheckedContinuation<T, Never>) { self.continuation = continuation }
+
+    func resume(_ value: T) {
+        lock.lock()
+        let waiting = continuation
+        continuation = nil
+        lock.unlock()
+        waiting?.resume(returning: value)
     }
 }
 

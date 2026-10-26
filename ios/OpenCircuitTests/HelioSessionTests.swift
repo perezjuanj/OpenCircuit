@@ -3133,10 +3133,11 @@ extension HelioBackgroundSyncTests {
 // MARK: - Decision 78f (#332): iOS didn't run the filter; the next wake notices the Focus end
 
 extension HelioBackgroundSyncTests {
-    /// Seen active overnight, read not active by the morning's background run: T is that run's read time,
-    /// and the same run's flush finalizes the night that ended 5 minutes earlier (past the margin and
-    /// 58a's hold, which would otherwise keep it back).
-    func testAFocusSeenActiveThenReadInactiveAtARunFinalizesTheNightInThatRun() async throws {
+    /// Seen active overnight, read not active by the morning's background run: T is that run's read time.
+    /// AMENDED BY DECISION 78g (review-333 B-1): a detected T finalizes only nights that ended 10 min or
+    /// more before the read, so the night that ended 5 minutes earlier is NOT finalized by it (it was,
+    /// under 78f's +10 min); it waits for the margin and 58a's hold. The twin below (15 minutes) is.
+    func testAFocusSeenActiveThenReadInactiveAtARunDoesNotFinalizeANightThatEndedFiveMinutesBefore() async throws {
         let store = try makeStore()
         let (focusDefaults, suite) = try focusSuite()
         defer { focusDefaults.removePersistentDomain(forName: suite) }
@@ -3153,7 +3154,7 @@ extension HelioBackgroundSyncTests {
         XCTAssertNil(SleepFocusDetection.seenActive(defaults: focusDefaults))
         XCTAssertFalse(SleepHealthGate.isSettled(latestSegmentEnd: nightEnd, now: readAt), "inside the margin")
         XCTAssertTrue(writer.lastStrapNights.contains { $0.night.map(\.end).max() == nightEnd })
-        XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [true], "written by the detecting run itself")
+        XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [false], "78g: ended under 10 min before the detecting read")
         XCTAssertEqual(ObservabilityStore(focusDefaults).metricRecords().filter { $0.source == "focus" }.map(\.detail),
                        ["Sleep Focus end detected at a wake (filter not run by iOS), kind=appRefresh"])
     }
@@ -3241,5 +3242,148 @@ extension HelioBackgroundSyncTests {
         SleepFocusFinalization.persist(detected.addingTimeInterval(-900), defaults: focusDefaults)
         XCTAssertEqual(SleepFocusFinalization.persisted(defaults: focusDefaults), detected, "never backwards")
         XCTAssertEqual(ObservabilityStore(focusDefaults).metricRecords().filter { $0.source == "focus" }.count, 1)
+    }
+}
+
+// MARK: - Decision 78g/78h (review-333): a detected T counts only nights that ended 10+ min before it
+
+extension HelioBackgroundSyncTests {
+    /// The twin of the amended test: the night ended 15 minutes before the detecting read (still inside
+    /// its 20-minute margin). The detecting run itself finalizes it.
+    func testAFocusSeenActiveThenReadInactiveAtARunFinalizesANightThatEndedFifteenMinutesBefore() async throws {
+        let store = try makeStore()
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        SleepFocusDetection.note(.active, at: nightEnd.addingTimeInterval(-4 * 3600), kind: "processing", defaults: focusDefaults)
+        clock = nightEnd.addingTimeInterval(15 * 60)
+        let readAt = clock
+        let writer = HealthKitWriter()
+        let run = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults, detect: { kind, now in
+            SleepFocusDetection.note(.inactive, at: now, kind: kind.rawValue, defaults: focusDefaults)
+        }).run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+        XCTAssertEqual(run.ending, .synced)
+        XCTAssertEqual(SleepFocusFinalization.persisted(defaults: focusDefaults), readAt)
+        XCTAssertEqual(SleepFocusFinalization.persistedSource(defaults: focusDefaults), .detected)
+        XCTAssertFalse(SleepHealthGate.isSettled(latestSegmentEnd: nightEnd, now: readAt), "inside the margin")
+        XCTAssertTrue(writer.lastStrapNights.contains { $0.night.map(\.end).max() == nightEnd })
+        XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [true], "written by the detecting run itself")
+    }
+
+    /// A false "not active" read in the middle of the night (Focus still on), at a run that reads an
+    /// in-progress record ending 3 minutes before it: not finalized, so it waits for the margin; a flush
+    /// soon after doesn't offer the stored copy (58a's hold); and the full night, delivered later, is
+    /// judged by the normal rules: nothing was written early for it to replace.
+    func testAFalseInactiveReadMidNightLeavesAnInProgressRecordBehindTheMarginAndTheHold() async throws {
+        let store = try makeStore()
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        SleepFocusDetection.note(.active, at: nightEnd.addingTimeInterval(-4 * 3600), kind: "processing", defaults: focusDefaults)
+        clock = nightEnd.addingTimeInterval(3 * 60)   // the record "ends" 3 min before the read: still in progress
+        let writer = HealthKitWriter()
+        _ = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults, detect: { kind, now in
+            SleepFocusDetection.note(.inactive, at: now, kind: kind.rawValue, defaults: focusDefaults)
+        }).run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+        XCTAssertEqual(SleepFocusFinalization.persistedSource(defaults: focusDefaults), .detected)
+        XCTAssertTrue(writer.lastStrapNights.contains { $0.night.map(\.end).max() == nightEnd })
+        XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [false], "behind the margin")
+        XCTAssertFalse(SleepHealthGate.isSettled(latestSegmentEnd: nightEnd, now: clock))
+
+        let timeline = try XCTUnwrap(link.strapTimeline)
+        let soon = HealthKitWriter()
+        _ = await HelioConnection.flushStrap(soon, store: store, timeline: timeline, nights: [],
+                                             now: nightEnd.addingTimeInterval(15 * 60), defaults: focusDefaults)
+        XCTAssertTrue(soon.lastStrapNights.isEmpty, "58a's hold keeps the stored in-progress copy back")
+
+        let fullNight = [SleepSegment(start: nightEnd.addingTimeInterval(-8 * 3600), end: nightEnd.addingTimeInterval(2 * 3600),
+                                      stage: .asleepCore)]
+        let later = HealthKitWriter()
+        _ = await HelioConnection.flushStrap(later, store: store, timeline: timeline, nights: [fullNight],
+                                             now: nightEnd.addingTimeInterval(2 * 3600 + 5 * 60), defaults: focusDefaults)
+        XCTAssertEqual(later.lastStrapNights.first.map(\.finalized), false, "the full night: the normal rules")
+    }
+
+    /// The rule per source: a `perform()` T finalizes up to 10 min after it, a detected T only 10 min or
+    /// more before it; with both (the in-memory `perform()` T and a persisted detected one), the union.
+    func testADetectedFocusEndFinalizesOnlyNightsThatEndedTenMinutesBeforeIt() {
+        let t = nightEnd
+        let detected = SleepFocusFinalization.nights(inMemory: nil, persisted: t, source: .detected, flushStartsAt: t.addingTimeInterval(60))
+        XCTAssertTrue(detected.finalizes(nightEndingAt: t.addingTimeInterval(-10 * 60)))
+        XCTAssertFalse(detected.finalizes(nightEndingAt: t.addingTimeInterval(-10 * 60 + 1)))
+        XCTAssertFalse(detected.finalizes(nightEndingAt: t.addingTimeInterval(-3 * 60)), "a record read in progress")
+        XCTAssertTrue(detected.fromPersisted)
+        let perform = SleepFocusFinalization.nights(inMemory: nil, persisted: t, source: .perform, flushStartsAt: t.addingTimeInterval(60))
+        XCTAssertTrue(perform.finalizes(nightEndingAt: t.addingTimeInterval(10 * 60)))
+        let both = SleepFocusFinalization.nights(inMemory: t.addingTimeInterval(-3600), persisted: t, source: .detected,
+                                                 flushStartsAt: t.addingTimeInterval(60))
+        XCTAssertEqual(both, SleepFocusFinalization.Nights(focusEnd: nil, fromPersisted: true, detectedEnd: t),
+                       "the in-memory T is 61 min old (decision 31's 30 min): the detected rule alone")
+        let union = SleepFocusFinalization.nights(inMemory: t.addingTimeInterval(-15 * 60), persisted: t, source: .detected,
+                                                  flushStartsAt: t.addingTimeInterval(60))
+        XCTAssertTrue(union.finalizes(nightEndingAt: t.addingTimeInterval(-10 * 60)), "the detected rule")
+        XCTAssertTrue(union.finalizes(nightEndingAt: t.addingTimeInterval(-5 * 60)), "the in-memory perform rule (T - 15 + 10)")
+        XCTAssertFalse(union.finalizes(nightEndingAt: t.addingTimeInterval(-5 * 60 + 1)))
+        XCTAssertEqual(SleepFocusFinalization.nights(inMemory: nil, persisted: t, source: .detected,
+                                                     flushStartsAt: t.addingTimeInterval(6 * 3600 + 1)), .none, "6 h")
+    }
+
+    func testThePersistedFocusEndKeepsItsSource() throws {
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        XCTAssertEqual(SleepFocusFinalization.persistedSource(defaults: focusDefaults), .perform, "none recorded: perform")
+        SleepFocusFinalization.persist(nightEnd, source: .detected, defaults: focusDefaults)
+        XCTAssertEqual(SleepFocusFinalization.persistedSource(defaults: focusDefaults), .detected)
+        SleepFocusFinalization.persist(nightEnd.addingTimeInterval(-60), defaults: focusDefaults)
+        XCTAssertEqual(SleepFocusFinalization.persistedSource(defaults: focusDefaults), .detected, "an older T changes nothing")
+        SleepFocusFinalization.persist(nightEnd.addingTimeInterval(60), defaults: focusDefaults)
+        XCTAssertEqual(SleepFocusFinalization.persistedSource(defaults: focusDefaults), .perform)
+    }
+
+    /// 78h S-2: a read slower than the timeout is `unknown`, and the wake goes on at once; N-5: its shape
+    /// goes to the defaults given.
+    func testASlowFocusReadIsUnknownAfterTheTimeout() async throws {
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        XCTAssertEqual(SleepFocusDetection.readTimeout, 2)
+        let started = Date()
+        let slow = await SleepFocusDetection.liveRead(kind: "appRefresh", defaults: focusDefaults, timeout: 0.1, read: {
+            try? await Task.sleep(for: .seconds(5))
+            return (.active, "on")
+        })
+        XCTAssertEqual(slow, .unknown)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+        let fast = await SleepFocusDetection.liveRead(kind: "appRefresh", defaults: focusDefaults, timeout: 0.1,
+                                                      read: { (.inactive, "off (notFound)") })
+        XCTAssertEqual(fast, .inactive)
+        XCTAssertEqual(ObservabilityStore(focusDefaults).metricRecords().filter { $0.source == "focus" }.map(\.detail),
+                       ["Sleep Focus read: no answer in time, kind=appRefresh", "Sleep Focus read: off (notFound), kind=appRefresh"])
+    }
+
+    /// 78h N-2: the error's case name, never a value.
+    func testTheReadShapeNamesTheFocusFilterErrorCase() {
+        struct Other: Error {}
+        XCTAssertEqual(SleepFocusDetection.shape(thrown: SetFocusFilterIntentError.notFound), "off (notFound)")
+        XCTAssertEqual(SleepFocusDetection.shape(thrown: SetFocusFilterIntentError.missingParameterValue),
+                       "error SetFocusFilterIntentError.missingParameterValue")
+        XCTAssertEqual(SleepFocusDetection.shape(thrown: Other()), "error Other")
+    }
+
+    /// 78h S-1: the strap bundle always prints the Sleep Focus state from what is persisted, even with
+    /// no `focus` row left in the log: minutes, the T's source, no clock times.
+    func testTheStrapBundlePrintsTheSleepFocusStateFromThePersistedState() throws {
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let now = nightEnd.addingTimeInterval(3 * 3600)
+        let empty = DiagnosticsReport.buildForStrap(firmware: nil, hardware: nil, observability: ObservabilityStore(focusDefaults),
+                                                    focusDefaults: focusDefaults, now: now)
+        XCTAssertTrue(empty.contains("  Sleep Focus: last read none; seen on none; Focus end none\n"), empty)
+        focusDefaults.set("off (notFound)", forKey: SleepFocusDetection.lastShapeKey)
+        SleepFocusDetection.note(.active, at: now.addingTimeInterval(-30 * 60), kind: "processing", defaults: focusDefaults)
+        SleepFocusFinalization.persist(now.addingTimeInterval(-125 * 60), source: .detected, defaults: focusDefaults)
+        XCTAssertTrue(ObservabilityStore(focusDefaults).metricRecords().isEmpty, "nothing in the log")
+        let bundle = DiagnosticsReport.buildForStrap(firmware: nil, hardware: nil, observability: ObservabilityStore(focusDefaults),
+                                                     focusDefaults: focusDefaults, now: now)
+        XCTAssertTrue(bundle.contains("  Sleep Focus: last read off (notFound); seen on 30 min ago; Focus end 125 min ago (detected)\n"), bundle)
     }
 }

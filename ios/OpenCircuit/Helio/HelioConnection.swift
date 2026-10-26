@@ -400,6 +400,7 @@ final class HelioConnection: NSObject {
         StrapNightRefresh.aim(nights: result.nights,
                               storedNightSettles: store.newestStrapNightSettles(timeline: timeline, now: now),
                               focusEndedAt: result.nightsFinalized, persistedFocusEnd: SleepFocusFinalization.persisted(),
+                              persistedSource: SleepFocusFinalization.persistedSource(),
                               flushStartedAt: flushStartedAt, afterWokeUp: false)
     }
 
@@ -442,12 +443,13 @@ final class HelioConnection: NSObject {
                            nights: [[SleepSegment]], focusEndedAt: Date? = nil,
                            now: Date = Date(), defaults: UserDefaults = .standard) async -> HealthKitWriter.FlushResult {
         let finalization = SleepFocusFinalization.nights(inMemory: focusEndedAt, persisted: SleepFocusFinalization.persisted(defaults: defaults),
+                                                         source: SleepFocusFinalization.persistedSource(defaults: defaults),
                                                          flushStartsAt: now)
         let flush = await writer.flushToHealth(store: store, device: timeline, mirroredKinds: HelioHealthPolicy.healthMirroredKinds(),
                                                strapNights: strapNights(nights, store: store, timeline: timeline, now: now,
                                                                         finalization: finalization),
                                                strapNightsFinalized: finalization)
-        if finalization.fromPersisted, flush.finalizedStrapNights > 0, let focusEnd = finalization.focusEnd {
+        if finalization.fromPersisted, flush.finalizedStrapNights > 0, let focusEnd = finalization.detectedEnd ?? finalization.focusEnd {
             SleepFocusFinalization.notePersistedWrite(focusEnd: focusEnd, flushStart: now, defaults: defaults)
         }
         return flush
