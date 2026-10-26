@@ -64,7 +64,7 @@ workout start.
 
 ## 2. App Store Connect checklist
 
-Status on 2026-10-04 (submitted to App Review, build 58). *Done* means it is set in the 1.0 draft (written through the App Store
+Status on 2026-10-26 (resubmitted to App Review with build 88; the build 58 submission sat in Waiting for Review for 21 days and was withdrawn). *Done* means it is set in the 1.0 draft (written through the App Store
 Connect API and read back). *Owner* means only the account holder can do it: a legal
 declaration, a setting that has no API, or something that needs a phone and a wearable.
 
@@ -143,12 +143,15 @@ declaration, a setting that has no API, or something that needs a phone and a we
     app bundles are listed in `docs/THIRD_PARTY_NOTICES.md`.
 17. **Copyright and release**: *done.* Copyright "2026 Standard Software Solutions", release after
     approval.
-18. **Submit for Review**: *done.* Submitted on 2026-10-04 at 16:33 UTC through the API
-    (`asc_submit_review.py`), build 58 with the demo video attached. App Store Connect reports the
-    version and the submission as Waiting for Review. Apple refused the first attempt until the
-    App Privacy answers were published (item 4); they were, and the submission went through a
-    minute later. Release is set to after approval. Withdraw with `canceled: true` on the review
-    submission if a late fix is needed.
+18. **Submit for Review**: *done.* Build 58 was submitted on 2026-10-04 and never left Waiting for
+    Review, so it was withdrawn on 2026-10-26 (`canceled: true`; the version showed
+    `DEVELOPER_REJECTED`, which is Apple's name for withdrawn) and the 1.0 version was resubmitted
+    through the API (`asc_submit_review.py --expect-build 88`) at 07:08 UTC: build 88 (master `976707f`),
+    same screenshots and demo video, review notes updated (§3: body-weight read, health alerts,
+    Live Activity, Shortcuts, Recovery HRV). The plist, entitlements, background modes and privacy
+    manifest are identical to build 58 (`git diff 2ceda5f origin/master` touches only the build number
+    in `ios/project.yml`); the archive has no `OCDemoData`, no Blood Pressure request and the same
+    export answer. Release is after approval. Withdraw with `canceled: true` on the review submission.
 
 ## 3. Review notes (as saved in ASC)
 
@@ -159,7 +162,9 @@ declaration, a setting that has no API, or something that needs a phone and a we
 > - fetch / processing: scheduled background syncs (BGTaskScheduler) for the same purpose.
 > - location: used only while the user is recording a workout. Outdoor workouts map the GPS route written to Apple Health as an HKWorkoutRoute. For indoor workouts there is an opt-in setting, off by default (Profile > Settings > Workouts > "Keep tracking when screen is off"), that keeps a low-accuracy location session running so heart-rate recording from the wearable continues while the phone is locked; no location is stored, and the setting explains the blue indicator and battery cost. Location is never used outside a workout, and only When In Use permission is requested.
 >
-> HealthKit: the app writes heart rate, HRV, SpO2, temperature, respiratory rate, sleep, steps, energy, workouts, menstrual flow and headache logs, and reads back the same types to show trends. HealthKit background delivery of the iPhone's step count is used only to time background syncs for the strap.
+> HealthKit: the app writes heart rate, HRV, SpO2, temperature, respiratory rate, sleep, steps, energy, workouts, menstrual flow and headache logs, and reads back the same types to show trends. HealthKit background delivery of the iPhone's step count is used only to time background syncs for the strap. It also reads the latest body weight from Apple Health (read-only, asked once, the first time the Calories card is shown) so calorie estimates use a current weight; the user can decline and enter weight in Profile instead.
+>
+> Changes since the recording: the build has been updated since the video was made. It adds wellness alerts that the user can switch off (Profile > Settings > Health alerts), including an alert when skin temperature, sleeping heart rate, HRV and breathing rate move away from the user's usual overnight values, worded as "possible illness signs" or "possible fever signs" with the line "Not a medical device or a diagnosis."; a workout Live Activity on the Lock Screen and Dynamic Island while a workout is recording; Shortcuts actions (start a workout, vibrate the wearable, set or clear a wake alarm, log a headache); and, on iOS 27 and later, the HRV value is also written to Apple Health's Recovery HRV type. Nothing in these features needs a network, an account, or any permission beyond those listed here.
 >
 > The app is not a medical device and shows that disclaimer in onboarding, in Profile, and next to every alert and experimental estimate.
 >
