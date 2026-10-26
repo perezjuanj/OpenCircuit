@@ -174,7 +174,10 @@ stores and writes what it measured for time it owned:
     not the record's own span.** Asleep time is unchanged; time in bed and awake time grow, so
     efficiency and the Sleep Score drop (a synthetic 8 h night with a 60 min lead-in: in bed 480 →
     540 min, efficiency 0.969 → 0.861, Sleep Score 83 → 71). The skin-temperature verdict, overnight
-    HRV, resting HR and the night key are those of the night without it.
+    HRV, resting HR and the night key are those of the night without it. Readers shared with the ring
+    that average vitals over the whole in-bed window (the illness alert, Vitals Status, the card's
+    overnight averages, Trends, the headache HRV feature) are unchanged (71i) and so include the
+    lead-in, as they include the ring's own pre-sleep time in bed.
     - Steps: `StoredStepSample` rows carry no device column; they are the strap's by ownership (28:
       each step writer keeps its rows wholly in time its device owns), and the lead-in never reads
       before the strap's ownership start.
