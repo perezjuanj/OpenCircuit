@@ -575,9 +575,9 @@ final class HelioStoreSink: HelioHistorySink {
     /// kind-sleep minutes are the only trace of one. They are candidates like the sleeps above, through
     /// the same `naps` call (76b): a block within 60 min of a stored night belongs to it, one taken as
     /// the provisional main sleep of a night no stored night covers is stored nowhere (counted,
-    /// `mainOnlyBlocks`), and a nap that holds one is stored like any other (76c), but not while a
-    /// sleep that may still be going on starts within 60 min after it (76h/76i): that may be the night,
-    /// with no record yet to anchor it. Every sync re-derives
+    /// `mainOnlyBlocks`), and a nap that holds one is stored like any other (76c), but not while the
+    /// chain of sleep that follows it within 60 min may still go on or grow (76j,
+    /// `sleepFollowsWithinNapGap`): that may be the night, with no record yet to anchor it. Every sync re-derives
     /// it from the minutes it fetched (76d), so a nap holding a block is not saved again when a stored
     /// auto nap at its start already covers it: a re-derivation that saw fewer minutes must not shrink
     /// a row Apple Health holds (`saveNap` would re-arm it, and the flush's clean delete what was written).
@@ -608,8 +608,9 @@ final class HelioStoreSink: HelioHistorySink {
         napsTooShortWindows.formUnion(split.tooShort.map(\.window))
         for nap in split.naps {
             let span = Self.clockSpan(nap.window, in: nap.recordedTimeZone)
-            // Decisions 76h/76i (review-327 B1): sleep still going on within 60 min after a nap holding a
-            // block may be the night's, with no record yet: not settled, judged on a later sync.
+            // Decision 76j (review-327 B1/B2): the chain of sleep that follows a nap holding a block may
+            // still become the night it lies within 60 min of, with no record yet: not settled, judged
+            // on a later sync.
             if !heldBlocks(nap).isEmpty, HelioSleepSelection.sleepFollowsWithinNapGap(nap.window, in: activity) {
                 napsUnsettledWindows.insert(nap.window)
                 continue

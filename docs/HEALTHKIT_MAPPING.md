@@ -105,16 +105,21 @@ stores and writes what it measured for time it owned:
     that joins no night is a nap candidate like the sleeps above, through the same rule: 20 min or
     longer, more than 60 min from every main sleep, settled 60 min after its end (and not still
     going on, 73d), owned wholly by the strap. A block within 60 min after a night's last record
-    joins the night. One within 60 min before a night is no nap because a nap from a block waits
-    (unsettled) while a sleep that may still be going on starts within 60 min after its end
-    (decisions 76h/76i: a run of kind-sleep minutes with one minute in that hour and its last minute
-    less than 20 min before the sync's newest minute): while the night's minutes are still going on
-    and its record has not arrived yet, the doze waits; once the record is stored, the doze lies
-    within 60 min of it and belongs to it. A finished run never holds the nap: one of 20 min or more
-    is a block the stitch joins to the nap, a shorter one is a blip. The cost: a sync that runs in a
-    night's awakening of over 20 min, before the record arrives, sees the doze and the night's first
-    part as one finished sleep and can store it as a nap; the night's record then prunes that nap
-    (it overlaps), and Health keeps whatever of the nap's write lies before the night. One that is the
+    joins the night. A nap from a block is HELD (unsettled, judged again later) by the chain of sleep
+    that follows it (decision 76j): the sync's kind-sleep runs (up to 5 other minutes inside a run,
+    as a block's) starting within 60 min after the nap's end, then each next run starting within 60
+    min of the chain's end so far. It is held while the chain's last run may still be going on (last
+    sleep minute under 20 min before the newest fetched minute) or the chain ended under 60 min before
+    the newest minute; not held when no run starts within 60 min after it, or once the chain is over
+    and more than 60 min old. The sync that delivers the night's record still fetches the doze (the
+    re-fetch starts at the last night's end), and then a doze within 60 min before the record belongs
+    to the night. Not covered: a doze, the night's first part ending before midnight, then an
+    awakening; a sync at least 60 min after that part ended, with no sleep started in that hour, and
+    before the record, stores doze + first part as one nap. The record's night overlaps it and prunes
+    it; what the nap wrote to Health inside the night goes with the night's own mirror, and what it
+    wrote outside the night is deleted by the next nap flush (#327 S1: `cleanPrunedNaps`, this app's
+    own samples in the pruned strap nap's written span, clear of every stored night and nap; a ring
+    nap is unchanged). One that is the
     00:00–08:00 main sleep of a night no stored night covers is stored nowhere (an activity-only
     night is out of scope) and counted (`mainOnlyBlocks`). The nap is a `StoredNap` like any strap
     nap (`saveHelioNap`): one `.inBed` envelope over the block, its sleep minutes as generic sleep
