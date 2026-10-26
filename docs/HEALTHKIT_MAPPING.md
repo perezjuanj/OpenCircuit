@@ -208,9 +208,16 @@ stores and writes what it measured for time it owned:
     not the record's own span.** Naps (decision 77j): the lead-in stops at the end of every nap (stored,
     or one the same sync is about to store, activity-block naps included), and nearness, the 60 min
     rule, 76l's prune and `saveNap`'s overlap backstop, is measured from the night's SLEEP, never its
-    lead-in; so the lead-in never prunes a nap, whatever order the nap and the night were stored in.
-    A manual nap's add or edit and the nap Health-delete fences still keep out of the whole in-bed
-    window. Asleep time is unchanged; time in bed and awake time grow, so
+    lead-in; so the lead-in never prunes a nap. A manual nap's add or edit and the nap Health-delete
+    fences still keep out of the whole in-bed window. Known limit, not fixed in this PR: a night
+    stored BEFORE the sync that first sees a nap more than 60 min before its sleep onset keeps its
+    lead-in until it is re-delivered changed enough for the merge to replace it, so the lead-in can lie
+    over that nap by up to the clamp difference (30 min for a nap ending 90 min before onset, 59 min at
+    61 min, at most the 120 min cap): in Health an `inBed` overlap and an `awake` sample over the nap's
+    asleep one, asleep time not counted twice; the card shows the night in bed from the lead-in start
+    and the nap until its end. Rare on the production fetch (a session nap comes with any later sync of
+    the night; the activity fetch starts at or before the last session night's end, so a block nap
+    comes with the night). ZEPP_PROTOCOL.md §21.6 has the details. Asleep time is unchanged; time in bed and awake time grow, so
     efficiency and the Sleep Score drop (a synthetic 8 h night with a 60 min lead-in: in bed 480 →
     540 min, efficiency 0.969 → 0.861, Sleep Score 83 → 71). The skin-temperature verdict, overnight
     HRV, resting HR and the night key are those of the night without it.

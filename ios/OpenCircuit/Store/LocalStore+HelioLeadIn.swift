@@ -70,6 +70,15 @@ extension LocalStore {
     /// is about to absorb and prune) leaves no room for a lead-in over it (77j: a lead-in never lies
     /// over a nap). A stored night that runs into `instant` is this night's own earlier copy and is
     /// not a sleep before it. `.distantPast` when none.
+    ///
+    /// Known limit, documented and not fixed in this PR (ZEPP_PROTOCOL.md §21.6): the clamp applies when
+    /// the night is derived. A night stored BEFORE the sync that first sees a nap more than 60 min before
+    /// its sleep onset keeps the lead-in it was stored with while it is not re-delivered changed (the
+    /// merge keeps the stored copy, which has more time in bed), so the lead-in can lie over that nap by
+    /// up to the clamp difference (at most the 120 min cap): in Health an `inBed` overlap and an `awake`
+    /// sample over the nap's asleep one, asleep time not counted twice. It converges when the night comes
+    /// back changed enough for the merge to replace it. Rare on the production fetch: a session nap comes
+    /// with any later sync of the night, and a block nap with the night's own activity round.
     func helioLatestSleepEnd(atOrBefore instant: Date, sleeps: [DateInterval] = []) -> Date {
         // Rows are keyed by the day they end on, naps by their start: two days back reaches every
         // sleep that can end within `maxLength` of `instant`.

@@ -3361,6 +3361,12 @@ struct LocalStore {
 
     /// Every stored night's recorded in-bed window, and the edited window of an edited night, near
     /// `[start, end]` (the same ±2 day reach as `overlapsStoredNight`).
+    ///
+    /// A Health-delete FENCE, not a nearness rule: `saveNap`'s rewrite skip, `staleNapHealthSpan`'s clip
+    /// and `prunedNapHealthCleanWork`'s cuts keep a nap's clean off every stored night. It stays the
+    /// WHOLE recorded window, a strap night's in-bed lead-in included (decision 77j): the lead-in IS in
+    /// Apple Health (its `inBed` and `awake` samples), so a fence narrowed to the sleep window would let a
+    /// stale nap clean delete them. Nearness (77j) uses the sleep window elsewhere.
     private func storedNightWindows(near start: Date, _ end: Date) -> [DateInterval] {
         let lo = Calendar.current.date(byAdding: .day, value: -2, to: start) ?? start
         let hi = Calendar.current.date(byAdding: .day, value: 2, to: end) ?? end
