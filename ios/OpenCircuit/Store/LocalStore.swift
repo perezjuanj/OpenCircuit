@@ -2246,9 +2246,9 @@ struct LocalStore {
     /// Never a manual nap, never another device's nap; overlap alone prunes as before for any device.
     ///
     /// Decision 80b (#331 item 10): idempotent. The written spans are remembered only once the delete
-    /// is saved (UserDefaults has no rollback), and a span already remembered is not added twice, so a
-    /// save that failed leaves the nap and schedules nothing, and the retry (a strap night's next
-    /// re-delivery, `.keptFullerStoredNight` included) schedules the span once.
+    /// is saved (UserDefaults has no rollback), so a save that failed leaves the nap and schedules
+    /// nothing, and the retry (a strap night's next re-delivery, `.keptFullerStoredNight` included)
+    /// schedules the span once.
     private func pruneAutoNaps(overlapping start: Date, _ end: Date, night: Date, strapProximity: TimeInterval = 0) {
         guard end > start else { return }
         let naps = (try? context.fetch(FetchDescriptor<StoredNap>())) ?? []
@@ -3433,13 +3433,11 @@ struct LocalStore {
         return span
     }
 
-    /// #327 S1, decision 80b: remember `span` for the nap flush's clean, once.
+    /// #327 S1: remember `span` for the nap flush's clean. Decision 80b: only after the prune is saved.
     private func rememberPrunedNapHealthSpan(_ span: DateInterval) {
-        var raw = UserDefaults.standard.array(forKey: Self.prunedNapHealthSpansKey) as? [[Double]] ?? []
-        let pair = [span.start.timeIntervalSince1970, span.end.timeIntervalSince1970]
-        guard !raw.contains(pair) else { return }
-        raw.append(pair)
-        UserDefaults.standard.set(raw, forKey: Self.prunedNapHealthSpansKey)
+        var spans = UserDefaults.standard.array(forKey: Self.prunedNapHealthSpansKey) as? [[Double]] ?? []
+        spans.append([span.start.timeIntervalSince1970, span.end.timeIntervalSince1970])
+        UserDefaults.standard.set(spans, forKey: Self.prunedNapHealthSpansKey)
     }
 
     /// #327 S1/S2: the remembered spans of pruned strap naps, each with the pieces the nap flush may

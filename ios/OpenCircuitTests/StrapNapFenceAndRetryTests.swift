@@ -311,7 +311,7 @@ final class StrapNapFenceAndRetryTests: XCTestCase {
         let store = try makeStore()
         let segments = [SleepSegment(start: hour(-2), end: hour(7), stage: .inBed),
                         SleepSegment(start: hour(-2), end: hour(7), stage: .asleepCore)]
-        var extras = SleepNightExtras()
+        var extras = LocalStore.SleepNightExtras()
         extras.hypnogram = segments
         try store.saveSleepSummary(SleepStaging.summary(segments), night: hour(0), inBedStart: hour(-2), inBedEnd: hour(7),
                                    sleepOnset: hour(-2), sleepWake: hour(7), extras: extras, device: .ringConn)
@@ -324,8 +324,9 @@ final class StrapNapFenceAndRetryTests: XCTestCase {
 
     // MARK: 80b and 80c, the retried prune
 
-    /// A nap written 20:30–21:20 (40 min before the night's sleep at 22:00). The night's first store
-    /// prunes it, but that save fails once: the nap stays and nothing is scheduled. The next re-delivery
+    /// A nap written 20:30–21:20 (40 min before the night's sleep at 22:00). The night's sync prunes it
+    /// (on the store and on the sync's end re-save), but every save of that prune fails during the sync:
+    /// the nap stays and nothing is scheduled. The next re-delivery
     /// is a copy the merge refuses (it ends 30 min earlier: `.keptFullerStoredNight`). It prunes the nap,
     /// schedules its written span once, and leaves the stored night exactly as it was; one more
     /// re-delivery schedules nothing twice. The clean (80c) is clipped clear of the night and its
@@ -337,14 +338,15 @@ final class StrapNapFenceAndRetryTests: XCTestCase {
         try store.saveNap(start: hour(-3.5), end: napEnd, asleepMin: 50, isLongNap: false, family: .zeppOS)
         try store.markNapWritten(start: hour(-3.5))
 
-        var failures = 1
+        var failing = true, failed = 0
         LocalStore.pruneAutoNapsSave = { context in
-            if failures > 0 { failures -= 1; throw PruneSaveFailed() }
+            if failing { failed += 1; throw PruneSaveFailed() }
             try context.save()
         }
         let first = try sync([nightRecord], at: 7.5, store: store)
+        failing = false
         XCTAssertEqual(first.sleepRound?.outcomes[.inserted], 1)
-        XCTAssertEqual(failures, 0, "the prune ran and its save failed")
+        XCTAssertGreaterThan(failed, 0, "the prune ran and its save failed")
         XCTAssertEqual(try naps(store), [DateInterval(start: hour(-3.5), end: napEnd)], "rolled back: the nap stays")
         XCTAssertEqual(scheduledCleans, [], "nothing scheduled for a prune that was not saved")
         let lead = try XCTUnwrap(try leadIn(store))
@@ -382,7 +384,7 @@ final class StrapNapFenceAndRetryTests: XCTestCase {
         XCTAssertEqual(scheduledCleans, [], "forgotten once its clean succeeded")
     }
 
-    /// The same failed prune, then a re-delivery identical to the stored night: the store takes it
+    /// The same failed prunes, then a re-delivery identical to the stored night: the store takes it
     /// (`.updated`, the merge's same-coverage rule), and its prune removes the nap and schedules its
     /// written span once.
     func testAPruneWhoseSaveFailedIsRetriedByAnIdenticalReDelivery() throws {
@@ -391,12 +393,14 @@ final class StrapNapFenceAndRetryTests: XCTestCase {
         let napEnd = hour(-2 - 40.0 / 60)
         try store.saveNap(start: hour(-3.5), end: napEnd, asleepMin: 50, isLongNap: false, family: .zeppOS)
         try store.markNapWritten(start: hour(-3.5))
-        var failures = 1
+        var failing = true, failed = 0
         LocalStore.pruneAutoNapsSave = { context in
-            if failures > 0 { failures -= 1; throw PruneSaveFailed() }
+            if failing { failed += 1; throw PruneSaveFailed() }
             try context.save()
         }
         try sync([nightRecord], at: 7.5, store: store)
+        failing = false
+        XCTAssertGreaterThan(failed, 0, "the prune ran and its save failed")
         XCTAssertEqual(try naps(store).count, 1, "rolled back: the nap stays")
         XCTAssertEqual(scheduledCleans, [])
 
