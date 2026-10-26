@@ -125,11 +125,13 @@ final class StrapActivityNapTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
+        UserDefaults.standard.removeObject(forKey: LocalStore.prunedNapHealthSpansKey)
         observabilitySuite = "StrapActivityNapTests.observability.\(UUID().uuidString)"
         observability = ObservabilityStore(UserDefaults(suiteName: observabilitySuite)!)
     }
 
     override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: LocalStore.prunedNapHealthSpansKey)
         UserDefaults().removePersistentDomain(forName: observabilitySuite)
         ownership.restore()
         containers.removeAll()
@@ -466,13 +468,17 @@ final class StrapActivityNapTests: XCTestCase {
         }
     }
 
-    /// Decision 76i (replaces round 2's pin of 76h as first decided): a finished blip under 20 min
-    /// within the hour after a nap (13:00–14:00, then 14:30–14:40 asleep) no longer holds it. The nap is
-    /// stored once settled, and once only, however many later syncs fetch the blip.
-    func testAFinishedShortSleepWithinTheHourAfterANapDoesNotHoldIt() throws {
+    /// Decision 76j (round 3's 76i version of this test let the nap go as soon as the blip had finished):
+    /// a finished blip under 20 min within the hour after a nap (13:00–14:00, then 14:30–14:40 asleep)
+    /// holds the nap until an hour after the blip ended, since a next run starting in that hour would
+    /// chain to it. Then the nap is stored, once only, however many later syncs fetch the blip.
+    func testAFinishedBlipWithinTheHourAfterANapLetsItGoAnHourAfterTheBlipEnded() throws {
         try inFixedZone {
             ownership.install(.strapOwnsAllTime)
             let store = try makeStore()
+            let held = try sync(activity: day(asleep: [(13, 14), (14.5, 14 + 40.0 / 60)], until: 15.5), at: 15.5, store: store)
+            XCTAssertEqual(try napWindows(store), [], "the blip ended under an hour ago")
+            XCTAssertEqual(held.sleepRound?.napsUnsettled, 1)
             var stored: [Int] = []
             for at in [16.0, 20] {
                 let result = try sync(activity: day(asleep: [(13, 14), (14.5, 14 + 40.0 / 60)], until: at), at: at, store: store)
@@ -483,37 +489,43 @@ final class StrapActivityNapTests: XCTestCase {
         }
     }
 
-    /// Decision 76i: a 10-min blip 30 min after a nap, finished (its last minute 30 min before the
-    /// newest), doesn't hold the nap on the first sync that finds the nap settled.
-    func testAFinishedTenMinuteBlipHalfAnHourAfterANapDoesNotHoldIt() throws {
+    /// Decision 76j (round 3's 76i version stored the nap at 15:10): a 10-min blip 30 min after a nap,
+    /// finished, still holds it at 15:10 (it ended 30 min before) and lets it go at 15:45.
+    func testAFinishedTenMinuteBlipHalfAnHourAfterANapHoldsItUntilAnHourAfterTheBlip() throws {
         try inFixedZone {
             ownership.install(.strapOwnsAllTime)
             let store = try makeStore()
-            let result = try sync(activity: day(asleep: [(13, 14), (14.5, 14 + 40.0 / 60)], until: 15 + 10.0 / 60),
-                                  at: 15 + 10.0 / 60, store: store)
+            let early = try sync(activity: day(asleep: [(13, 14), (14.5, 14 + 40.0 / 60)], until: 15 + 10.0 / 60),
+                                 at: 15 + 10.0 / 60, store: store)
+            XCTAssertEqual(try napWindows(store), [])
+            XCTAssertEqual(early.sleepRound?.napsUnsettled, 1)
+            let later = try sync(activity: day(asleep: [(13, 14), (14.5, 14 + 40.0 / 60)], until: 15.75), at: 15.75, store: store)
             XCTAssertEqual(try napWindows(store), [span(13, 14)])
-            XCTAssertEqual(result.sleepRound?.napsFromBlocks, 1)
-            XCTAssertEqual(result.sleepRound?.napsUnsettled, 0)
+            XCTAssertEqual(later.sleepRound?.napsFromBlocks, 1)
         }
     }
 
-    /// Decision 76i: a run still going on within the hour after a nap holds it, and a later sync where
-    /// that run has finished as a 10-min blip releases it. Two placements: 30 min after the nap (the
-    /// nap's own settle would also wait there), and 55 min after it, where the nap has settled and only
-    /// the hold keeps it waiting.
-    func testASleepStillGoingOnWithinTheHourHoldsTheNapUntilItHasFinishedAsABlip() throws {
+    /// Decision 76j: a run still going on within the hour after a nap holds it; once it has finished as
+    /// a 10-min blip it still holds it until an hour after the blip ended, then the nap is stored. Two
+    /// placements: 30 min after the nap, and 55 min after it (there the nap has settled and only the
+    /// hold keeps it waiting).
+    func testASleepStillGoingOnWithinTheHourHoldsTheNapUntilTheBlipItBecameIsAnHourOld() throws {
         for (label, blipStart) in [("30 min after", 14.5), ("55 min after", 14 + 55.0 / 60)] {
             try inFixedZone {
                 ownership.install(.strapOwnsAllTime)
                 let store = try makeStore()
-                let during = blipStart + 10.0 / 60
-                let held = try sync(activity: day(asleep: [(13, 14), (blipStart, during)], until: during), at: during, store: store)
+                let blipEnd = blipStart + 10.0 / 60
+                let held = try sync(activity: day(asleep: [(13, 14), (blipStart, blipEnd)], until: blipEnd), at: blipEnd, store: store)
                 XCTAssertEqual(try napWindows(store), [], "\(label): still going on")
                 XCTAssertEqual(held.sleepRound?.napsUnsettled, 1, label)
 
-                let later = max(during + 0.5, 15 + 5.0 / 60)
-                let released = try sync(activity: day(asleep: [(13, 14), (blipStart, during)], until: later), at: later, store: store)
-                XCTAssertEqual(try napWindows(store), [span(13, 14)], "\(label): finished as a blip")
+                let halfHour = blipEnd + 0.5
+                try sync(activity: day(asleep: [(13, 14), (blipStart, blipEnd)], until: halfHour), at: halfHour, store: store)
+                XCTAssertEqual(try napWindows(store), [], "\(label): finished, but under an hour ago")
+
+                let hourOld = blipEnd + 61.0 / 60
+                let released = try sync(activity: day(asleep: [(13, 14), (blipStart, blipEnd)], until: hourOld), at: hourOld, store: store)
+                XCTAssertEqual(try napWindows(store), [span(13, 14)], "\(label): the blip is an hour old")
                 XCTAssertEqual(released.sleepRound?.napsFromBlocks, 1, label)
             }
         }
@@ -538,7 +550,7 @@ final class StrapActivityNapTests: XCTestCase {
         }
     }
 
-    /// Decision 76i's cost, pinned: an evening doze (20:40–21:20) 40 min before a night that has a
+    /// Decision 76j's limit, pinned: an evening doze (20:40–21:20) 40 min before a night that has a
     /// 70-min awakening (asleep 22:00–23:20, awake to 00:30, asleep 00:30–07:00). A sync at 00:25, in the
     /// awakening and with no record yet, sees two finished blocks 40 min apart: stitched, they are one
     /// sleep (20:40–23:20), no main sleep (it ends before midnight), settled, and nothing goes on after
@@ -558,6 +570,139 @@ final class StrapActivityNapTests: XCTestCase {
             XCTAssertEqual(try nightWindows(store), [span(-1, 7), span(22, 31)])
             XCTAssertEqual(try napWindows(store), [], "pruned by the overlapping night")
         }
+    }
+
+    // MARK: 76j: the hold over every sync time (review-327b)
+
+    /// One night's sleep for the sweep: the day's sleep spans after last night, the night's `0x48`
+    /// record (delivered only by the morning sync), the first sync (the doze's end + 60 min), and the
+    /// naps that may exist after every sync from then on.
+    private struct SweepScenario {
+        let label: String
+        let asleep: [(Double, Double)]
+        let record: [(Double, Double, UInt8)]
+        let firstSync: Double
+        let naps: [DateInterval]
+    }
+
+    /// Review-327b's proof: each scenario synced every 10 min from the doze's end + 60 min until 07:00,
+    /// with the activity minutes a strap would hold at that time and no record for tonight, then the
+    /// morning sync with the record. After EVERY sync the nap rows are exactly the scenario's: none
+    /// for a doze within 60 min (or chained within 60 min) of the night, the daytime nap from 15:00 on
+    /// and never removed, the doze 130 min before the night from the first sync on.
+    func testNoSyncTimeStoresANapWithinTheHourOfTheNightThatFollows() throws {
+        let awake: UInt8 = 0x07
+        let scenarios = [
+            SweepScenario(label: "a: doze 22:00-22:40, sleep from 23:00", asleep: [(22, 22 + 40.0 / 60), (23, 31)],
+                          record: [(23, 31, light)], firstSync: 23 + 40.0 / 60, naps: []),
+            SweepScenario(label: "b: doze 20:40-21:20, a 15-min fragment 21:40, 30 min awake, asleep from 22:25",
+                          asleep: [(20 + 40.0 / 60, 21 + 20.0 / 60), (21 + 40.0 / 60, 21 + 55.0 / 60), (22 + 25.0 / 60, 31)],
+                          record: [(21 + 40.0 / 60, 21 + 55.0 / 60, light), (21 + 55.0 / 60, 22 + 25.0 / 60, awake), (22 + 25.0 / 60, 31, light)],
+                          firstSync: 22 + 20.0 / 60, naps: []),
+            SweepScenario(label: "c: doze 21:00-21:40, night from 22:20 with a 30-min awakening at 02:00",
+                          asleep: [(21, 21 + 40.0 / 60), (22 + 20.0 / 60, 26), (26.5, 31)],
+                          record: [(22 + 20.0 / 60, 26, light), (26, 26.5, awake), (26.5, 31, light)],
+                          firstSync: 22 + 40.0 / 60, naps: []),
+            SweepScenario(label: "d: doze 20:40-21:20, a 25-min first fragment at 22:00, 50 min awake, the rest",
+                          asleep: [(20 + 40.0 / 60, 21 + 20.0 / 60), (22, 22 + 25.0 / 60), (23 + 15.0 / 60, 31)],
+                          record: [(22, 22 + 25.0 / 60, light), (22 + 25.0 / 60, 23 + 15.0 / 60, awake), (23 + 15.0 / 60, 31, light)],
+                          firstSync: 22 + 20.0 / 60, naps: []),
+            SweepScenario(label: "e: a daytime nap 13:00-14:00, the night from 22:00", asleep: [(13, 14), (22, 31)],
+                          record: [(22, 31, light)], firstSync: 15, naps: [span(13, 14)]),
+            SweepScenario(label: "f: doze 20:40-21:20, the night from 23:30", asleep: [(20 + 40.0 / 60, 21 + 20.0 / 60), (23.5, 31)],
+                          record: [(23.5, 31, light)], firstSync: 22 + 20.0 / 60, naps: [span(20 + 40.0 / 60, 21 + 20.0 / 60)]),
+        ]
+        var syncs = 0
+        for scenario in scenarios {
+            try inFixedZone {
+                ownership.install(.strapOwnsAllTime)
+                let store = try makeStore()
+                let first = Int((scenario.firstSync * 60).rounded())
+                for minute in stride(from: first, through: 31 * 60, by: 10) {
+                    let at = Double(minute) / 60
+                    try sync(activity: day(asleep: scenario.asleep, until: at), at: at, store: store)
+                    XCTAssertEqual(try napWindows(store), scenario.naps, "\(scenario.label), sync at minute \(minute)")
+                    syncs += 1
+                }
+                try sync([lastNight, scenario.record], activity: day(asleep: scenario.asleep, until: 31.5), at: 31.5, store: store)
+                let night = span(scenario.record[0].0, scenario.record[scenario.record.count - 1].1)
+                XCTAssertEqual(try nightWindows(store), [span(-1, 7), night], "\(scenario.label): the morning stores the night")
+                XCTAssertEqual(try napWindows(store), scenario.naps, "\(scenario.label), the morning sync")
+            }
+        }
+        XCTAssertGreaterThan(syncs, 250)
+    }
+
+    // MARK: #327 S1: a pruned strap nap's Health write
+
+    /// The awakening shape: the doze and the night's first part stored as one nap at 00:25 and written to
+    /// Health (20:40–23:20); the morning's night (22:00–07:00) prunes it. The next nap flush cleans what
+    /// the nap wrote outside the night, once: 20:40 up to a second before the night, nothing inside it
+    /// (that is the night's own mirror's), and never a nap the person added (21:00–21:30).
+    func testAPrunedStrapNapsHealthWriteOutsideTheNightIsCleanedOnceAndSparesOtherSleep() async throws {
+        for withManualNap in [false, true] {
+            let saved = NSTimeZone.default
+            NSTimeZone.default = TimeZone(identifier: "America/New_York")!
+            defer { NSTimeZone.default = saved }
+            ownership.install(.strapOwnsAllTime)
+            let label = "manual nap: \(withManualNap)"
+            let doze = (20 + 40.0 / 60, 21 + 20.0 / 60), firstPart = (22.0, 23 + 20.0 / 60)
+            let store = try makeStore()
+            try sync(activity: day(asleep: [doze, firstPart], until: 24 + 25.0 / 60), at: 24 + 25.0 / 60, store: store)
+            let nap = span(doze.0, firstPart.1)
+            XCTAssertEqual(try napWindows(store), [nap], label)
+            try store.markNapWritten(start: nap.start)
+            if withManualNap { XCTAssertTrue(try store.addManualNap(start: hour(21), end: hour(21.5)), label) }
+
+            let record: [(Double, Double, UInt8)] = [(22, firstPart.1, light), (firstPart.1, 24.5, 0x07), (24.5, 31, light)]
+            try sync([lastNight, record], activity: day(asleep: [doze, firstPart, (24.5, 31)], until: 31.5), at: 31.5, store: store)
+            XCTAssertEqual(try napWindows(store), withManualNap ? [span(21, 21.5)] : [], "\(label): the strap nap is pruned")
+
+            var cleaned: [DateInterval] = []
+            await HealthKitWriter.cleanPrunedNaps(store: store, deleteStale: { span, keep, current in
+                cleaned.append(span)
+                XCTAssertEqual(keep, [])
+                XCTAssertTrue(current.isEmpty)
+            })
+            let second: TimeInterval = 1
+            let expected = withManualNap
+                ? [DateInterval(start: nap.start, end: hour(21).addingTimeInterval(-second)),
+                   DateInterval(start: hour(21.5).addingTimeInterval(second), end: hour(22).addingTimeInterval(-second))]
+                : [DateInterval(start: nap.start, end: hour(22).addingTimeInterval(-second))]
+            XCTAssertEqual(cleaned, expected, label)
+            var again: [DateInterval] = []
+            await HealthKitWriter.cleanPrunedNaps(store: store, deleteStale: { span, _, _ in again.append(span) })
+            XCTAssertEqual(again, [], "\(label): once")
+        }
+    }
+
+    /// A pruned strap nap that never reached Health leaves nothing to clean; a pruned RING nap keeps the
+    /// behaviour it had (nothing remembered, ring-only install).
+    func testAPrunedNapWithNoStrapHealthWriteLeavesNothingToClean() async throws {
+        let saved = NSTimeZone.default
+        NSTimeZone.default = TimeZone(identifier: "America/New_York")!
+        defer { NSTimeZone.default = saved }
+        ownership.install(.strapOwnsAllTime)
+        let doze = (20 + 40.0 / 60, 21 + 20.0 / 60), firstPart = (22.0, 23 + 20.0 / 60)
+        let store = try makeStore()
+        try sync(activity: day(asleep: [doze, firstPart], until: 24 + 25.0 / 60), at: 24 + 25.0 / 60, store: store)
+        let record: [(Double, Double, UInt8)] = [(22, firstPart.1, light), (firstPart.1, 24.5, 0x07), (24.5, 31, light)]
+        try sync([lastNight, record], activity: day(asleep: [doze, firstPart, (24.5, 31)], until: 31.5), at: 31.5, store: store)
+        XCTAssertEqual(try napWindows(store), [])
+        var cleaned: [DateInterval] = []
+        await HealthKitWriter.cleanPrunedNaps(store: store, deleteStale: { span, _, _ in cleaned.append(span) })
+        XCTAssertEqual(cleaned, [], "never written")
+
+        ownership.install(DeviceOwnershipLog(entries: []))
+        let ring = try makeStore()
+        try ring.saveNap(start: hour(20.5), end: hour(23), asleepMin: 150, isLongNap: false, family: .ringConn)
+        try ring.markNapWritten(start: hour(20.5))
+        let segments = [SleepSegment(start: hour(22), end: hour(31), stage: .inBed), SleepSegment(start: hour(22), end: hour(31), stage: .asleepCore)]
+        try ring.saveSleepSummary(SleepStaging.summary(segments), night: SleepNightKey.night(inBedStart: hour(22), inBedEnd: hour(31)),
+                                  inBedStart: hour(22), inBedEnd: hour(31))
+        XCTAssertEqual(try napWindows(ring), [], "the ring's night prunes the ring's nap")
+        await HealthKitWriter.cleanPrunedNaps(store: ring, deleteStale: { span, _, _ in cleaned.append(span) })
+        XCTAssertEqual(cleaned, [], "a ring nap: nothing remembered")
     }
 
     // MARK: 76d: re-derivation

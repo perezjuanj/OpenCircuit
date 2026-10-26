@@ -397,19 +397,32 @@ extension HelioActivitySleepTests {
         XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: []))
     }
 
-    /// Decision 76i: a following run holds the nap only while it may still be going on (its last sleep
-    /// minute less than 20 min before the newest minute); a finished one doesn't, whatever its length.
-    func testOnlyASleepStillGoingOnHoldsTheNap() {
+    /// Decision 76j (supersedes round 3's 76i cases): the sleep after the nap is a chain, runs joined
+    /// while each starts within 60 min of the chain's end. It holds the nap while its last run may still
+    /// be going on (last minute under 20 min before the newest) or it ended under 60 min before the
+    /// newest minute; a chain over and an hour old, or a first run more than an hour away, doesn't.
+    func testTheChainOfSleepAfterTheNapHoldsItUntilItIsOverAndAnHourOld() {
         let nap = span(780, 840)
-        XCTAssertTrue(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 880) + up(880, 899)),
-                      "a blip ending 19 min before the newest minute may still be going on")
-        XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 880) + up(880, 900)),
-                       "one ending 20 min before has finished")
-        XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 930) + up(930, 960)),
-                       "a finished hour of sleep doesn't hold it either (the stitch judges it)")
-        XCTAssertTrue(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 880) + up(880, 884) + asleep(884, 960)),
-                      "a run going on that started within the hour, across a short gap")
-        XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 880) + up(880, 920) + asleep(920, 960)),
-                       "the run going on started 80 min after; the one within the hour finished")
+        func held(_ minutes: [ZeppActivityMinute]) -> Bool { HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: minutes) }
+        XCTAssertTrue(held(up(840, 870) + asleep(870, 880) + up(880, 899)), "a blip that may still be going on")
+        XCTAssertTrue(held(up(840, 870) + asleep(870, 880) + up(880, 940)), "a finished blip that ended 59 min before the newest minute")
+        XCTAssertFalse(held(up(840, 870) + asleep(870, 880) + up(880, 941)), "a finished blip that ended 60 min before the newest minute")
+        XCTAssertFalse(held(up(840, 870) + asleep(870, 930) + up(930, 991)), "a finished hour of sleep, an hour old (the stitch judges it)")
+        XCTAssertTrue(held(up(840, 870) + asleep(870, 880) + up(880, 920) + asleep(920, 960)),
+                      "a run going on that starts 40 min after the blip: one chain")
+        XCTAssertTrue(held(up(840, 855) + asleep(855, 870) + up(870, 900) + asleep(900, 1000) + up(1000, 1010)),
+                      "review-327b B2: a 15-min fragment, 30 min awake, then the night (the fragment alone is finished)")
+        XCTAssertFalse(held(up(840, 870) + asleep(870, 880) + up(880, 941) + asleep(941, 960)),
+                       "the next run starts 61 min after the blip, and the blip is an hour old")
+        XCTAssertFalse(held(up(840, 901) + asleep(901, 960)), "the first run starts 61 min after the nap")
+        XCTAssertTrue(held(up(840, 870) + asleep(870, 880) + up(880, 884) + asleep(884, 960)), "a 4-min gap is inside one run")
+    }
+
+    /// `activityBlocks` and the hold form the same runs (73a/76j share `sleepRuns`).
+    func testTheHoldAndTheBlocksFormTheSameRuns() {
+        let minutes = asleep(870, 900) + up(900, 905) + asleep(905, 930) + up(930, 936) + asleep(936, 970) + up(970, 1000)
+        let runs = HelioSleepSelection.sleepRuns(in: minutes)
+        XCTAssertEqual(runs.map { DateInterval(start: $0.first!, end: $0.last!.addingTimeInterval(60)) }, [span(870, 930), span(936, 970)])
+        XCTAssertEqual(blocks(minutes, now: at(1000)).map(\.window), [span(870, 930), span(936, 970)])
     }
 }

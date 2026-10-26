@@ -39,21 +39,7 @@ extension HelioSleepSelection {
     public static func activityBlocks(from minutes: [ZeppActivityMinute], sessions: [Night], now: Date) -> [Night] {
         guard let newest = minutes.map(\.time).max() else { return [] }
         let minute: TimeInterval = 60
-        let spans = sessions.flatMap(\.inBedSpans)
-        func inBed(_ t: Date) -> Bool { spans.contains { $0.start <= t && t < $0.end } }
-        let sleepTimes = Set(minutes.filter { $0.kind == ZeppActivityMinute.kindSleep }.map(\.time))
-            .filter { !inBed($0) }
-            .sorted()
-        var runs: [[Date]] = []
-        for t in sleepTimes {
-            if let previous = runs.last?.last,
-               t.timeIntervalSince(previous) <= TimeInterval(activityBlockMaxGapMinutes + 1) * minute,
-               !spans.contains(where: { $0.start < t && previous.addingTimeInterval(minute) < $0.end }) {
-                runs[runs.count - 1].append(t)
-            } else {
-                runs.append([t])
-            }
-        }
+        let runs = sleepRuns(in: minutes, outside: sessions.flatMap(\.inBedSpans))
         return runs.compactMap { run -> Night? in
             guard let first = run.first, let last = run.last else { return nil }
             let window = DateInterval(start: first, end: last.addingTimeInterval(minute))
@@ -74,34 +60,61 @@ extension HelioSleepSelection {
         }
     }
 
-    /// Decisions 76h/76i (review-327 B1): whether `minutes` (one sync's fetched activity minutes) hold a
-    /// sleep that may still be going on within `napGap` after the end of `nap`, a nap candidate that
-    /// holds an activity block. Such a nap is not settled yet: the night's own minutes may still be
-    /// going on (73d keeps them out of `activityBlocks`) and its `0x48` record not delivered, so nothing
-    /// else says the nap lies within 60 min of a night (76e). It is judged again on a later sync.
-    ///
-    /// The kind-sleep minutes from the nap's end on form runs as in `activityBlocks` (up to
-    /// `activityBlockMaxGapMinutes` other minutes inside a run). A run holds the nap when one of its
-    /// minutes lies within `napGap` after the nap's end AND its last sleep minute is less than
-    /// `activityBlockSettleTime` before the newest minute (73d's "may still be going on"). A finished
-    /// run never holds it (76i): one of 20 min or more is a block the stitch and nap rules judge, and a
-    /// shorter one is a blip that would otherwise hold the nap until the re-fetch moved past it. Judged
-    /// on the nap's end, so the blocks a nap holds never hold it.
-    public static func sleepFollowsWithinNapGap(_ nap: DateInterval, in minutes: [ZeppActivityMinute]) -> Bool {
-        guard let newest = minutes.map(\.time).max() else { return false }
-        let sleepTimes = Set(minutes.filter { $0.kind == ZeppActivityMinute.kindSleep && $0.time >= nap.end }.map(\.time)).sorted()
+    /// The kind-sleep minutes of `minutes` outside every span of `spans`, as runs, oldest first: each
+    /// run its minutes' times in order. Up to `activityBlockMaxGapMinutes` non-sleep (or missing)
+    /// minutes inside a run are an awake gap; more end it, and so does crossing a span. The one
+    /// run-forming rule of `activityBlocks` (73a) and the nap hold (76j), so the two agree to the minute.
+    static func sleepRuns(in minutes: [ZeppActivityMinute], outside spans: [DateInterval] = []) -> [[Date]] {
+        let minute: TimeInterval = 60
+        func inBed(_ t: Date) -> Bool { spans.contains { $0.start <= t && t < $0.end } }
+        let sleepTimes = Set(minutes.filter { $0.kind == ZeppActivityMinute.kindSleep }.map(\.time))
+            .filter { !inBed($0) }
+            .sorted()
         var runs: [[Date]] = []
         for t in sleepTimes {
-            if let previous = runs.last?.last, t.timeIntervalSince(previous) <= TimeInterval(activityBlockMaxGapMinutes + 1) * 60 {
+            if let previous = runs.last?.last,
+               t.timeIntervalSince(previous) <= TimeInterval(activityBlockMaxGapMinutes + 1) * minute,
+               !spans.contains(where: { $0.start < t && previous.addingTimeInterval(minute) < $0.end }) {
                 runs[runs.count - 1].append(t)
             } else {
                 runs.append([t])
             }
         }
-        return runs.contains { run in
-            guard let first = run.first, let last = run.last else { return false }
-            return first.timeIntervalSince(nap.end) <= napGap && newest.timeIntervalSince(last) < activityBlockSettleTime
+        return runs
+    }
+
+    /// Decision 76j (review-327b B2, superseding the hold rules of 76h/76i): whether `nap`, a nap
+    /// candidate that holds an activity block, is held (not settled yet, judged again on a later sync)
+    /// by the sleep that follows it in `minutes` (one sync's fetched activity minutes).
+    ///
+    /// The sleep that follows is a CHAIN, built the way `stitch` builds a night: the kind-sleep runs
+    /// (`sleepRuns`, every fetched sleep minute from the nap's end on) that start within `napGap` after
+    /// the nap's end, then each next run that starts within `napGap` of the chain's end so far. The nap
+    /// is held while that chain may still become a night it lies within 60 min of: its last run may
+    /// still be going on (its last sleep minute less than `activityBlockSettleTime` before the newest
+    /// minute, 73d), OR the chain ended less than `napGap` before the newest minute (a next run could
+    /// still join it). The night's own minutes and its `0x48` record may still be on their way (the
+    /// strap lets the phone read a night in progress, and 73d keeps an unfinished run out of the
+    /// blocks), so nothing else anchors the nap to it (76e). A nap with no run starting within
+    /// `napGap` after it is never held. A chain over and older than `napGap` no longer holds: a run of
+    /// 20 min or more in it is a block the stitch and nap rules judge, and a lone blip lets the nap go.
+    /// Nothing is lost by holding: the activity re-fetch starts at the last session night's end at the
+    /// latest, so the sync that delivers the night's record still sees the nap's minutes and judges it.
+    /// Judged on the nap's end, so the blocks a nap holds never hold it.
+    public static func sleepFollowsWithinNapGap(_ nap: DateInterval, in minutes: [ZeppActivityMinute]) -> Bool {
+        guard let newest = minutes.map(\.time).max() else { return false }
+        let runs = sleepRuns(in: minutes.filter { $0.time >= nap.end })
+        var chainEnd = nap.end
+        var lastRunEnd: Date?
+        for run in runs {
+            guard let first = run.first, let last = run.last, first.timeIntervalSince(chainEnd) <= napGap else { break }
+            lastRunEnd = last
+            chainEnd = last.addingTimeInterval(60)
         }
+        guard let lastSleepMinute = lastRunEnd else { return false }
+        let mayGoOn = newest.timeIntervalSince(lastSleepMinute) < activityBlockSettleTime
+        let mayBeJoined = newest.timeIntervalSince(chainEnd) < napGap
+        return mayGoOn || mayBeJoined
     }
 
     /// What `nights(sessions:activityBlocks:)` made of a sync's sleeps.

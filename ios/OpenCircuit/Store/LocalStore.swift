@@ -2210,10 +2210,14 @@ struct LocalStore {
 
     /// Delete auto-detected (non-manual) naps whose effective window overlaps `[start, end]` — a
     /// stored night now covers that sleep. Best-effort: a fetch/save failure leaves the naps for the
-    /// next night write to prune. The pruned naps' Health samples are swept by the NEXT
-    /// `mirrorSettledNight` of this just-written night (its union-delete stops excluding windows
-    /// `healthWrittenNapWindows` no longer reports); the night was written one line above this call,
-    /// so that mirror is on the very next flush — the orphan window is one flush cycle, not open-ended.
+    /// next night write to prune. The pruned naps' Health samples INSIDE the night's span are swept by
+    /// the night's next `mirrorSettledNight` (its union delete stops excluding windows
+    /// `healthWrittenNapWindows` no longer reports). That delete reaches only the night's own span,
+    /// so a nap that started before the night (a doze stitched to the night's first part, #327) would
+    /// leave the samples it wrote before the night in Health with no row. For a strap nap, the
+    /// written span is remembered here (`rememberPrunedNapHealthSpan`), and the next nap flush deletes
+    /// this app's samples in it, clear of every stored night and nap (`takePrunedNapHealthCleanSpans`).
+    /// A ring nap keeps the behaviour it had.
     private func pruneAutoNaps(overlapping start: Date, _ end: Date, night: Date) {
         guard end > start else { return }
         let naps = (try? context.fetch(FetchDescriptor<StoredNap>())) ?? []
@@ -2222,6 +2226,7 @@ struct LocalStore {
             let lo = min(nap.start, nap.effectiveStart)
             let hi = max(nap.end, nap.effectiveEnd)
             guard hi > lo, lo < end, hi > start else { continue }
+            rememberPrunedNapHealthSpan(nap)
             context.delete(nap)
             removed += 1
         }
@@ -3346,6 +3351,72 @@ struct LocalStore {
             }
             return out
         }
+    }
+
+    // MARK: A pruned strap nap's Health write (#327 S1)
+
+    /// Standard-defaults key: the Health-written spans of strap naps a night pruned, waiting for the
+    /// next nap flush's clean (`HealthKitWriter.cleanPrunedNaps`). Seconds since 1970, `[start, end]`.
+    static let prunedNapHealthSpansKey = "nap.prunedHealthSpans.v1"
+
+    /// #327 S1: remember the span a strap nap about to be pruned wrote to Apple Health (nothing when it
+    /// wrote nothing). Only a nap the strap owned all of, the rule a strap nap is stored and written
+    /// under; a ring nap is left exactly as before (a ring-only install records nothing).
+    private func rememberPrunedNapHealthSpan(_ nap: StoredNap) {
+        guard let span = Self.napMirroredSpan(nap),
+              Self.ownershipLog().ownsWholly(.zeppOS, from: nap.effectiveStart, to: nap.effectiveEnd) else { return }
+        var spans = UserDefaults.standard.array(forKey: Self.prunedNapHealthSpansKey) as? [[Double]] ?? []
+        spans.append([span.start.timeIntervalSince1970, span.end.timeIntervalSince1970])
+        UserDefaults.standard.set(spans, forKey: Self.prunedNapHealthSpansKey)
+    }
+
+    /// #327 S1: the spans the nap flush may clean for the pruned strap naps, and forget them (taken
+    /// once; the clean is best-effort like every nap clean). Each remembered span minus, one second
+    /// clear on each side, every stored night near it (its recorded and edited window and what its
+    /// mirror record covers) and every stored nap (its window and what it wrote), so the delete never
+    /// reaches another night, another nap or the other device's sleep. Empty, and nothing fetched,
+    /// when no span is remembered.
+    func takePrunedNapHealthCleanSpans() -> [DateInterval] {
+        guard let raw = UserDefaults.standard.array(forKey: Self.prunedNapHealthSpansKey) as? [[Double]], !raw.isEmpty else { return [] }
+        UserDefaults.standard.removeObject(forKey: Self.prunedNapHealthSpansKey)
+        return raw.compactMap { pair -> DateInterval? in
+            guard pair.count == 2, pair[1] > pair[0] else { return nil }
+            return DateInterval(start: Date(timeIntervalSince1970: pair[0]), end: Date(timeIntervalSince1970: pair[1]))
+        }.flatMap { span -> [DateInterval] in
+            let lo = Calendar.current.date(byAdding: .day, value: -2, to: span.start) ?? span.start
+            let hi = Calendar.current.date(byAdding: .day, value: 2, to: span.end) ?? span.end
+            let nights = (try? context.fetch(FetchDescriptor<StoredSleepSummary>(
+                predicate: #Predicate { $0.night >= lo && $0.night <= hi }))) ?? []
+            var cuts = storedNightWindows(near: span.start, span.end)
+            cuts += nights.compactMap { row in
+                mirroredNight(night: row.night).flatMap { $0.spanEnd > $0.spanStart ? DateInterval(start: $0.spanStart, end: $0.spanEnd) : nil }
+            }
+            let napLo = span.start.addingTimeInterval(-86_400), napHi = span.end.addingTimeInterval(86_400)
+            let naps = (try? context.fetch(FetchDescriptor<StoredNap>(predicate: #Predicate { $0.start > napLo && $0.start < napHi }))) ?? []
+            for nap in naps {
+                let napStart = min(nap.start, nap.effectiveStart), napEnd = max(nap.end, nap.effectiveEnd)
+                if napEnd > napStart { cuts.append(DateInterval(start: napStart, end: napEnd)) }
+                if let written = Self.napMirroredSpan(nap) { cuts.append(written) }
+            }
+            return Self.subtracting(cuts, from: span)
+        }
+    }
+
+    /// `span` minus every one of `cuts`, each widened by one second on both sides (touching counts:
+    /// the Health clean's predicate is not strict at its edges). The pieces left, oldest first.
+    static func subtracting(_ cuts: [DateInterval], from span: DateInterval) -> [DateInterval] {
+        var pieces = [span]
+        for cut in cuts {
+            let lo = cut.start.addingTimeInterval(-1), hi = cut.end.addingTimeInterval(1)
+            pieces = pieces.flatMap { piece -> [DateInterval] in
+                guard lo < piece.end, hi > piece.start else { return [piece] }
+                var out: [DateInterval] = []
+                if lo > piece.start { out.append(DateInterval(start: piece.start, end: lo)) }
+                if hi < piece.end { out.append(DateInterval(start: hi, end: piece.end)) }
+                return out
+            }
+        }
+        return pieces
     }
 
     /// Whether a nap row outside `group` (its window, or what it wrote) touches `[start, end]`.

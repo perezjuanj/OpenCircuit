@@ -771,6 +771,7 @@ final class HealthKitWriter {
     /// `healthWritten` flag — independent of the night's `.sleep` cursor — so naps and the night
     /// never collide. Best-effort: a failed save leaves the flag so it retries next flush.
     private func flushNaps(store: LocalStore) async -> Int {
+        await Self.cleanPrunedNaps(store: store, deleteStale: { await self.deleteStaleNapSleep($0, keeping: $1, current: $2) })
         guard let pending = try? store.pendingNaps(), !pending.isEmpty else { return 0 }
         var written = 0
         for nap in pending {
@@ -795,6 +796,18 @@ final class HealthKitWriter {
             } catch { pendingFlushFailures.insert(.sleep); break }   // surface + stop; naps retry next flush
         }
         return written
+    }
+
+    /// #327 S1: delete this app's sleep samples a pruned strap nap wrote outside the night that pruned
+    /// it (`LocalStore.takePrunedNapHealthCleanSpans`: its written span, clear of every stored night and
+    /// nap). The same own-samples-only clean a re-detected nap uses (`deleteStaleNapSleep`, nothing
+    /// kept, no current window). Static with the effect passed in, like `mirrorNap`, so the spans are
+    /// testable without a live `HKHealthStore`. Nothing remembered: nothing done.
+    static func cleanPrunedNaps(store: LocalStore,
+                                deleteStale: (DateInterval, [String], Range<Date>) async -> Void) async {
+        for span in store.takePrunedNapHealthCleanSpans() {
+            await deleteStale(span, [], span.start ..< span.start)
+        }
     }
 
     /// One pending nap's mirror. Static with the two HealthKit effects passed in, so the order and
