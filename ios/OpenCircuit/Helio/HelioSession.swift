@@ -288,6 +288,11 @@ final class HelioSession: WearableSession {
     @ObservationIgnored private var tierZeroSubscribed = false
     /// The app is in the background: nothing is subscribed for display (§16.5), so Tier 0 waits.
     @ObservationIgnored var appInBackground = false
+    /// Decision 81b: this foreground's activation sync has been decided (started, or left alone by its
+    /// throttle), or the connection's own on-connect sync has been asked for. Live heart rate on open
+    /// waits for it, so it can never take the link ahead of the sync (a running stream would stop the
+    /// activation sync from starting: `HelioActivationSync`). Observed, so the auto-start re-asks.
+    private(set) var activationSyncSettled = false
     /// §16.5's fail-safes, each sent at most once per connection.
     @ObservationIgnored private var heartRateFailSafeSent = false
     @ObservationIgnored private var realtimeStepsOffSent = false
@@ -563,9 +568,15 @@ final class HelioSession: WearableSession {
     /// the workout's location session keeps the app alive, as the ring's does.
     func appDidEnterBackground() {
         appInBackground = true
+        activationSyncSettled = false
         stopFind()
         if liveHeartRateOwner != .workout { stopLiveHeartRate() }
         stopTierZero()
+    }
+
+    /// The activation sync has been decided for this foreground (decision 81b).
+    func activationSyncWasDecided() {
+        activationSyncSettled = true
     }
 
     /// Back in front: a keyless session listens for standard heart rate again (decision 7).
@@ -804,6 +815,7 @@ final class HelioSession: WearableSession {
         helioLog.notice("helio: ready (clock \(self.clockSet ? "set" : "NOT set", privacy: .public), controls: find \(self.controlCapabilities.isSupported(.findDevice), privacy: .public), alarms \(self.controlCapabilities.isSupported(.alarms), privacy: .public))")
         sendOwedOrphanStop()   // before any stream or sync (review-238 SF2)
         if autoSyncOnConnect { syncHistory(manual: false) }
+        if !appInBackground { activationSyncSettled = true }
     }
 
     private func handleMessage(_ message: ZeppMessage) {

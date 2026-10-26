@@ -111,6 +111,8 @@ struct HelioDeviceInfoView: View {
                 }
             }
 
+            AutoLiveHeartRateOnOpenRow(choice: .helioStrap)
+
             Section {
                 Toggle("Sync in the background more reliably", isOn: Binding(
                     get: { healthWake },
