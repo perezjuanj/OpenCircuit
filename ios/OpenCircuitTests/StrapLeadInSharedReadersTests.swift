@@ -54,14 +54,14 @@ final class StrapLeadInSharedReadersTests: XCTestCase {
     private func wake(_ daysAgo: Int) -> Date { day(daysAgo).addingTimeInterval(7 * 3600) }
     private func leadInStart(_ daysAgo: Int) -> Date { day(daysAgo).addingTimeInterval(-2 * 3600) }
 
-    /// Six strap nights (5 days ago … last night), each stored as the store path stores it (with or
+    /// Nine strap nights (8 days ago … last night: past Vitals Status' 7-night baseline floor), each stored as the store path stores it (with or
     /// without the 22:00–23:00 lead-in). In both stores the same readings: every 5 minutes, HR 58,
     /// HRV 60, breathing 14 asleep (last night: HR 66, HRV 42), and HR 70, HRV 35, breathing 18 in the
     /// hour before sleep, which a reader that averaged the lead-in would take in.
     private func fixture(leadIn: Bool) throws -> (container: ModelContainer, store: LocalStore) {
         let container = try makeContainer()
         let store = LocalStore(container.mainContext)
-        for k in 0...5 {
+        for k in 0...8 {
             let window = DateInterval(start: bed(k), end: wake(k))
             var segments = [SleepSegment(start: window.start, end: window.end, stage: .inBed),
                             SleepSegment(start: window.start, end: window.end, stage: .asleepCore)]
@@ -87,9 +87,9 @@ final class StrapLeadInSharedReadersTests: XCTestCase {
         }
         try store.context.save()
         let rows = try store.context.fetch(FetchDescriptor<StoredSleepSummary>())
-        XCTAssertEqual(rows.count, 6)
+        XCTAssertEqual(rows.count, 9)
         XCTAssertEqual(rows.compactMap { HelioSleepSelection.leadIn(in: SleepHypnogramCodec.decode($0.hypnogramData)) }.count,
-                       leadIn ? 6 : 0)
+                       leadIn ? 9 : 0)
         return (container, store)
     }
 
@@ -156,7 +156,8 @@ final class StrapLeadInSharedReadersTests: XCTestCase {
                                                       fallbackSkinTempOffsetC: nil)
         }
         let a = try report(fixture(leadIn: true).store), b = try report(fixture(leadIn: false).store)
-        XCTAssertNotNil(b)
+        let hrvSignal = try XCTUnwrap(b?.signals.first { $0.vital == .overnightHRV }, "last night's low HRV is judged")
+        XCTAssertNotNil(hrvSignal.baselineMean)
         XCTAssertEqual(a, b)
     }
 
