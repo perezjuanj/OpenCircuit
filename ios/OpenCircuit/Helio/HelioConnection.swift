@@ -377,6 +377,8 @@ final class HelioConnection: NSObject {
         observability.recordSyncOutcome(kind: kind, success: !result.interrupted && result.roundsFailed == 0,
                                         detail: "helio: \(result.roundsStored) round(s) stored, \(result.roundsFailed) failed, \(result.nights.count) night(s)")
         guard let store else { return }
+        // Decision 78f: a Sleep Focus end iOS didn't report is noticed here, before the flush decides.
+        await SleepFocusDetection.check(kind: kind == .foreground ? "foreground" : "postSync")
         let flushStart = Date()
         guard let flush = await healthFlush(timeline: timeline, store: store, nights: result.nights,
                                             identity: result.identity,

@@ -49,6 +49,8 @@ struct SleepFocusSyncFilter: SetFocusFilterIntent {
         guard Self.shouldSync(focusIsActive: focusIsActive) else {
             ObservabilityStore().recordMetricEvent(
                 source: "focus", detail: "Sleep Focus enabled; wake sync armed")
+            // Decision 78f-4: the same seen-active time a wake's read of the filter leaves.
+            SleepFocusDetection.note(.active, at: Date(), kind: "perform")
             return .result()
         }
 
@@ -60,6 +62,85 @@ struct SleepFocusSyncFilter: SetFocusFilterIntent {
     /// the default/off delivery is the single state that starts a sync.
     nonisolated static func shouldSync(focusIsActive: Bool) -> Bool {
         !focusIsActive
+    }
+}
+
+/// Decision 78f (#332): iOS may not run `perform()` at all when Sleep Focus ends on its schedule (the
+/// owner's b88 bundle: no `sleepFocus` record all morning), and without an App Intents extension
+/// nothing else is told. So the app reads the filter's state itself at its next wakes (every strap
+/// background run, the strap's post-sync hook, the app coming to the front): seen active, then read
+/// not active, means the Focus ended, and T is that read's time. It feeds decision 78a unchanged.
+/// It never connects, syncs or schedules anything by itself.
+enum SleepFocusDetection {
+    /// What one read of the filter said.
+    enum Reading: Equatable {
+        /// The Focus this filter belongs to is on.
+        case active
+        /// It is off: the filter came back with its default (off) value, or isn't found.
+        case inactive
+        /// The read failed another way: nothing is inferred.
+        case unknown
+    }
+
+    /// The latest time a read (or `perform()`) saw the Focus on.
+    nonisolated static let seenActiveKey = "helio.sleepFocusSeenActiveAt.v1"
+    /// A Focus seen on longer ago than this isn't the one that just ended.
+    static let seenActiveWindow: TimeInterval = 18 * 3600
+
+    /// The iOS read. `SetFocusFilterIntent.current` is `get async throws` and
+    /// `SetFocusFilterIntentError` has `notFound` and `missingParameterValue` (iOS 26 SDK); the header
+    /// doesn't say which a Focus that is off gives, so both shapes count as not active: the filter
+    /// with its default `focusIsActive == false`, and `notFound`. Any other error is `unknown`.
+    static func liveRead() async -> Reading {
+        do {
+            return reading(focusIsActive: try await SleepFocusSyncFilter.current.focusIsActive)
+        } catch {
+            return reading(thrown: error)
+        }
+    }
+
+    static func reading(focusIsActive: Bool) -> Reading { focusIsActive ? .active : .inactive }
+
+    static func reading(thrown error: Error) -> Reading {
+        (error as? SetFocusFilterIntentError) == .notFound ? .inactive : .unknown
+    }
+
+    /// One wake's check: read the filter, then `note` it at the read's time. Returns the detected T.
+    @discardableResult
+    static func check(kind: String, read: () async -> Reading = { await liveRead() },
+                      defaults: UserDefaults = .standard) async -> Date? {
+        let reading = await read()
+        return note(reading, at: Date(), kind: kind, defaults: defaults)
+    }
+
+    /// Decision 78f-1. Active: remember `now` as seen active. Not active, with a seen-active time in the
+    /// last 18 h that is newer than the persisted T: the Focus ended; persist T = `now`, forget the
+    /// seen-active time and leave one `focus` line. Anything else changes nothing. Returns the new T.
+    @discardableResult
+    static func note(_ reading: Reading, at now: Date, kind: String, defaults: UserDefaults = .standard) -> Date? {
+        switch reading {
+        case .unknown:
+            return nil
+        case .active:
+            if (seenActive(defaults: defaults).map { now > $0 } ?? true) {
+                defaults.set(now.timeIntervalSince1970, forKey: seenActiveKey)
+            }
+            return nil
+        case .inactive:
+            guard let seen = seenActive(defaults: defaults), now >= seen,
+                  now.timeIntervalSince(seen) <= seenActiveWindow,
+                  seen > (SleepFocusFinalization.persisted(defaults: defaults) ?? .distantPast) else { return nil }
+            SleepFocusFinalization.persist(now, defaults: defaults)
+            defaults.removeObject(forKey: seenActiveKey)
+            ObservabilityStore(defaults).recordMetricEvent(
+                source: "focus", detail: "Sleep Focus end detected at a wake (filter not run by iOS), kind=\(kind)")
+            return now
+        }
+    }
+
+    static func seenActive(defaults: UserDefaults = .standard) -> Date? {
+        let t = defaults.double(forKey: seenActiveKey)
+        return t > 0 ? Date(timeIntervalSince1970: t) : nil
     }
 }
 

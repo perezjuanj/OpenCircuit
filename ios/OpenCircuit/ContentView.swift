@@ -1364,6 +1364,8 @@ struct ContentView: View {
         if !ringActive {
             // The Helio Strap (#215): a standing reconnect to the saved strap, which syncs on connect.
             helio.setLocalStore(LocalStore(modelContext))
+            // Decision 78f: a Sleep Focus end iOS didn't report is noticed on coming to the front.
+            Task { await SleepFocusDetection.check(kind: "foreground") }
             helio.reconnectKnown()
             return
         }

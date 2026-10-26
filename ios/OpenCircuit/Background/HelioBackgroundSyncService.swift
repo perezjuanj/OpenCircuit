@@ -63,8 +63,10 @@ enum SleepFocusFinalization {
     /// minutes behind its end (decision 58), and a night still growing after Focus ended ends later.
     static let nightEndSlack: TimeInterval = 10 * 60
 
-    /// The Sleep Focus wake (ring and strap): Focus ended at `focusEnd`.
+    /// The Sleep Focus wake (ring and strap), or a wake that detected the end (decision 78f): Focus
+    /// ended at `focusEnd`. One store for both paths: the latest wins, and it never moves backwards.
     static func persist(_ focusEnd: Date, defaults: UserDefaults = .standard) {
+        guard focusEnd > (persisted(defaults: defaults) ?? .distantPast) else { return }
         defaults.set(focusEnd.timeIntervalSince1970, forKey: persistedKey)
     }
 
@@ -527,6 +529,10 @@ struct HelioBackgroundSyncService {
     /// app), for the refresh verdict after the flush; the flush reads it itself. nil in tests that
     /// don't set one.
     var persistedFocusEnd: @MainActor () -> Date? = { nil }
+    /// Decision 78f (#332): the run's read of the Sleep Focus filter, at its start, before anything
+    /// else and so before its flush decides finalization (`SleepFocusDetection.check` in the app). It
+    /// never connects, syncs or schedules. A no-op in tests that don't drive it.
+    var detectFocusEnd: @MainActor (_ kind: TaskRecord.Kind, _ now: Date) async -> Void = { _, _ in }
 
     /// One bounded run. `nightsFinalized` is the Sleep Focus wake's "the night is over": the time T
     /// Sleep Focus ended. The strap's nights then skip the 20-minute quiet margin, as the ring's do on
@@ -535,6 +541,9 @@ struct HelioBackgroundSyncService {
     func run(kind: TaskRecord.Kind, timeout: TimeInterval, nightsFinalized: Date? = nil,
              wake: HelioWake? = nil) async -> HelioBackgroundRun {
         let wake = wake ?? HelioWake(task: kind) ?? .foreground
+        // Decision 78f: iOS may not have run the Focus filter; a Focus end seen here persists T, which
+        // this run's own flush then uses (78a).
+        await detectFocusEnd(kind, now())
         let start = now()
         var run = HelioBackgroundRun(ending: .outOfTime)
         let syncDeadline = start.addingTimeInterval(max(0, timeout - Self.flushReserve))
@@ -860,6 +869,7 @@ extension HelioBackgroundSyncService {
             appIsActive: { UIApplication.shared.applicationState == .active },
             breadcrumbs: connection.breadcrumbs,
             storedNightSettles: { timeline, now in store.newestStrapNightSettles(timeline: timeline, now: now) },
-            persistedFocusEnd: { SleepFocusFinalization.persisted() })
+            persistedFocusEnd: { SleepFocusFinalization.persisted() },
+            detectFocusEnd: { kind, _ in await SleepFocusDetection.check(kind: kind.rawValue) })
     }
 }

@@ -1,3 +1,4 @@
+import AppIntents
 import BackgroundTasks
 import SwiftData
 import XCTest
@@ -2932,7 +2933,8 @@ extension HelioBackgroundSyncTests {
     /// clock, reading the persisted Focus end from `focusDefaults` (the app's run reads the standard
     /// defaults). The writer can't write in the simulator; `lastStrapNights` is the verdict its gate got.
     private func flushingService(_ link: FakeBackgroundLink, store: LocalStore, writer: HealthKitWriter,
-                                 focusDefaults: UserDefaults, pause: (@MainActor () -> Void)? = nil) -> HelioBackgroundSyncService {
+                                 focusDefaults: UserDefaults, pause: (@MainActor () -> Void)? = nil,
+                                 detect: @escaping @MainActor (TaskRecord.Kind, Date) async -> Void = { _, _ in }) -> HelioBackgroundSyncService {
         let base = service(link, store: store, pause: pause)
         return HelioBackgroundSyncService(
             link: base.link, keyStore: base.keyStore, observability: base.observability,
@@ -2941,7 +2943,8 @@ extension HelioBackgroundSyncTests {
                                                  focusEndedAt: focusEndedAt, now: self.clock, defaults: focusDefaults)
             },
             now: base.now, pause: base.pause, grace: base.grace, appIsActive: base.appIsActive,
-            persistedFocusEnd: { SleepFocusFinalization.persisted(defaults: focusDefaults) })
+            persistedFocusEnd: { SleepFocusFinalization.persisted(defaults: focusDefaults) },
+            detectFocusEnd: detect)
     }
 
     private func focusSuite() throws -> (UserDefaults, String) {
@@ -3124,5 +3127,103 @@ extension HelioBackgroundSyncTests {
         XCTAssertEqual(HelioSession.BusyReason(.invalidDevicePublicKey), .authFailedOther)
         XCTAssertEqual(HelioSession.BusyReason(.localCryptoFailure), .authFailedOther)
         XCTAssertEqual(HelioSession.BusyReason.notifyEnableFailed.rawValue, "notify enable failed")
+    }
+}
+
+// MARK: - Decision 78f (#332): iOS didn't run the filter; the next wake notices the Focus end
+
+extension HelioBackgroundSyncTests {
+    /// Seen active overnight, read not active by the morning's background run: T is that run's read time,
+    /// and the same run's flush finalizes the night that ended 5 minutes earlier (past the margin and
+    /// 58a's hold, which would otherwise keep it back).
+    func testAFocusSeenActiveThenReadInactiveAtARunFinalizesTheNightInThatRun() async throws {
+        let store = try makeStore()
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        SleepFocusDetection.note(.active, at: nightEnd.addingTimeInterval(-4 * 3600), kind: "processing", defaults: focusDefaults)
+        clock = nightEnd.addingTimeInterval(5 * 60)
+        let readAt = clock
+        let writer = HealthKitWriter()
+        let run = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults, detect: { kind, now in
+            SleepFocusDetection.note(.inactive, at: now, kind: kind.rawValue, defaults: focusDefaults)
+        }).run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+        XCTAssertEqual(run.ending, .synced)
+        XCTAssertEqual(SleepFocusFinalization.persisted(defaults: focusDefaults), readAt, "T = the detecting read's time")
+        XCTAssertNil(SleepFocusDetection.seenActive(defaults: focusDefaults))
+        XCTAssertFalse(SleepHealthGate.isSettled(latestSegmentEnd: nightEnd, now: readAt), "inside the margin")
+        XCTAssertTrue(writer.lastStrapNights.contains { $0.night.map(\.end).max() == nightEnd })
+        XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [true], "written by the detecting run itself")
+        XCTAssertEqual(ObservabilityStore(focusDefaults).metricRecords().filter { $0.source == "focus" }.map(\.detail),
+                       ["Sleep Focus end detected at a wake (filter not run by iOS), kind=appRefresh"])
+    }
+
+    /// Without a seen-active time, a read that says not active infers nothing: the run is master's.
+    func testAnInactiveReadWithNoSeenActiveTimeInfersNothing() async throws {
+        let store = try makeStore()
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        clock = nightEnd.addingTimeInterval(5 * 60)
+        let writer = HealthKitWriter()
+        _ = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults, detect: { kind, now in
+            SleepFocusDetection.note(.inactive, at: now, kind: kind.rawValue, defaults: focusDefaults)
+        }).run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+        XCTAssertNil(SleepFocusFinalization.persisted(defaults: focusDefaults))
+        XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [false])
+        XCTAssertTrue(ObservabilityStore(focusDefaults).metricRecords().filter { $0.source == "focus" }.isEmpty)
+    }
+
+    /// Seen active more than 18 h before the read: not the Focus that just ended. 18 h exactly still is.
+    func testASeenActiveTimeOverEighteenHoursOldInfersNothing() throws {
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let seen = nightEnd
+        SleepFocusDetection.note(.active, at: seen, kind: "processing", defaults: focusDefaults)
+        XCTAssertNil(SleepFocusDetection.note(.inactive, at: seen.addingTimeInterval(18 * 3600 + 1), kind: "appRefresh", defaults: focusDefaults))
+        XCTAssertNil(SleepFocusFinalization.persisted(defaults: focusDefaults))
+        XCTAssertEqual(SleepFocusDetection.note(.inactive, at: seen.addingTimeInterval(18 * 3600), kind: "appRefresh", defaults: focusDefaults),
+                       seen.addingTimeInterval(18 * 3600))
+    }
+
+    /// A read that throws for another reason changes nothing; `notFound` reads as not active.
+    func testAReadThatThrowsChangesNothing() throws {
+        struct Other: Error {}
+        XCTAssertEqual(SleepFocusDetection.reading(thrown: Other()), .unknown)
+        XCTAssertEqual(SleepFocusDetection.reading(thrown: SetFocusFilterIntentError.missingParameterValue), .unknown)
+        XCTAssertEqual(SleepFocusDetection.reading(thrown: SetFocusFilterIntentError.notFound), .inactive)
+        XCTAssertEqual(SleepFocusDetection.reading(focusIsActive: true), .active)
+        XCTAssertEqual(SleepFocusDetection.reading(focusIsActive: false), .inactive)
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let seen = nightEnd.addingTimeInterval(-4 * 3600)
+        SleepFocusDetection.note(.active, at: seen, kind: "processing", defaults: focusDefaults)
+        XCTAssertNil(SleepFocusDetection.note(.unknown, at: nightEnd, kind: "appRefresh", defaults: focusDefaults))
+        XCTAssertNil(SleepFocusFinalization.persisted(defaults: focusDefaults))
+        XCTAssertEqual(SleepFocusDetection.seenActive(defaults: focusDefaults), seen, "the seen-active time stays")
+    }
+
+    /// `perform()` and detection share one T: the latest wins and it never moves backwards. A Focus end
+    /// `perform()` already reported is not detected again, and a second not-active read doesn't move T.
+    func testPerformAndDetectionShareOneFocusEndThatNeverMovesBackwards() throws {
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let bedtime = nightEnd.addingTimeInterval(-8 * 3600)
+        SleepFocusDetection.note(.active, at: bedtime, kind: "perform", defaults: focusDefaults)   // perform(), Focus on
+        SleepFocusFinalization.persist(nightEnd, defaults: focusDefaults)                         // perform(), Focus off
+        XCTAssertNil(SleepFocusDetection.note(.inactive, at: nightEnd.addingTimeInterval(1800), kind: "appRefresh", defaults: focusDefaults),
+                     "perform() already reported this end")
+        XCTAssertEqual(SleepFocusFinalization.persisted(defaults: focusDefaults), nightEnd)
+
+        // The next night: perform() never runs at its end; a wake detects it, then a late T can't move it back.
+        let nextBedtime = nightEnd.addingTimeInterval(16 * 3600)
+        SleepFocusDetection.note(.active, at: nextBedtime, kind: "processing", defaults: focusDefaults)
+        let detected = nextBedtime.addingTimeInterval(8 * 3600 + 900)
+        XCTAssertEqual(SleepFocusDetection.note(.inactive, at: detected, kind: "appRefresh", defaults: focusDefaults), detected)
+        XCTAssertNil(SleepFocusDetection.note(.inactive, at: detected.addingTimeInterval(600), kind: "foreground", defaults: focusDefaults),
+                     "a second not-active read doesn't move T")
+        SleepFocusFinalization.persist(detected.addingTimeInterval(-900), defaults: focusDefaults)
+        XCTAssertEqual(SleepFocusFinalization.persisted(defaults: focusDefaults), detected, "never backwards")
+        XCTAssertEqual(ObservabilityStore(focusDefaults).metricRecords().filter { $0.source == "focus" }.count, 1)
     }
 }
