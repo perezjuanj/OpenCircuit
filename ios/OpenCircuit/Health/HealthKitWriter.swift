@@ -505,8 +505,8 @@ final class HealthKitWriter {
     /// timeline's pending samples (minus the kinds its policy withholds, `HelioHealthPolicy`) and the
     /// nights it staged. Their defaults are exactly the ring's pass, unchanged. `strapNightsFinalized`
     /// is `sleepFinalized` for those nights (the Sleep Focus wake, #215 phase 4), judged per night by
-    /// its end (decision 78a, #332): only a night that ended by the Sleep Focus end plus its slack skips
-    /// the margin.
+    /// its end (decision 78a, #332; 78g for a detected Focus end): only a night the Sleep Focus end
+    /// covers skips the margin.
     /// What a `flushToHealth` call was asked to mirror: the timeline and the kinds (nil = every
     /// mirrored kind, the ring's pass).
     struct FlushRequest: Equatable {

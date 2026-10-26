@@ -66,8 +66,8 @@ extension LocalStore {
     ///
     /// `now` must be the real wall clock at the check (`flushStrap`'s default), never a sync's start.
     ///
-    /// Decision 78a (#332): a night `finalization` covers (it ended by the Sleep Focus end plus its
-    /// slack, in a flush that may use that end) skips the 3 h hold: Focus ending says it is over.
+    /// Decision 78a (#332): a night `finalization` covers (by its end, against the Sleep Focus end and
+    /// that end's source, 78g, in a flush that may use it) skips the 3 h hold: Focus ending says it is over.
     /// Every other night waits exactly as above.
     ///
     /// Empty with an empty ownership log (a ring-only install): no query runs.

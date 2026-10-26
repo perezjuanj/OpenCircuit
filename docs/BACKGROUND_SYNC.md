@@ -220,42 +220,72 @@ Guide, "Core Bluetooth Background Processing for iOS Apps", and Technical Q&A QA
   (`pendingAction = .reconnect`), and that connect is a wake (review-225e N-1).
 
 **The Sleep Focus end outlives the Focus-off run** (decision 78, #332). The Focus-off run is one
-bounded wake (28 s), and it can miss the night: the link is down and the run is out of time before
-the sleep round, it coalesces into a run that then runs out of time, the strap was busy, or the
-record was still in progress. So:
-- **T is persisted** (`helio.sleepFocusEndedAt.v1`, ring and strap; only the strap reads it). Any
-  strap Health flush that starts at or after T and within 6 h of it finalizes each night whose last
-  segment ends at or before T + 10 min: that night skips the 20-min settle margin and decision 58a's
-  3 h newest-night hold. A night ending later (the person went back to sleep, or the next night) is
-  judged by the normal rules. Decided once per flush in `HelioConnection.flushStrap`
-  (`SleepFocusFinalization.nights`, from the latest of decision 31's in-memory T and the persisted
-  one), so the background run, the post-sync hook and the app's foreground flush all use it. T can
-  only make a night that was over arrive sooner; it never finalizes one still growing.
-- **The run asks again** (78b). After a strap Focus run, whatever its ending, if the newest stored
-  strap night that ended by T + 10 min (and within 18 h before T) has no mirror record, or there is
-  none, a refresh is recorded for T + 15 min through `StrapNightRefresh` (it survives `schedule()`),
-  unless a later one is pending. The run leaves the standing connect armed on every ending but key
-  needed, key rejected, no saved strap and a workout holding the strap (after a strap-busy ending the
-  re-arm meets the latch the try just set, so it waits for the latch to expire).
-- **Counts-only lines** (78c, source `focus`): one per strap Focus run, `ending=… night=written|
-  stored-not-written|none retry=yes|no`, and at most one per T from the first later flush that writes
-  a night only the persisted T finalized: `night written from the Sleep Focus end, N min after it`.
+bounded wake (28 s). It can miss the night in four ways:
+- the link is down, so the run is out of time before the sleep round;
+- it coalesces into a run that then runs out of time;
+- the strap is busy;
+- the record is still in progress.
 
-**iOS may not run the filter at all when Sleep Focus ends on its schedule** (decision 78f). The
-owner's b88 bundle showed a morning with no `sleepFocus` record anywhere: `perform()` never ran.
-Apple delivers Focus changes "when the system has determined that it's important", to an App
-Intents extension when the app isn't running, and OpenCircuit has none. So the app notices the end
-itself, at its next wake: every strap background run (at its start, before its flush), the strap's
-post-sync hook and the app coming to the front read the filter's state
-(`SetFocusFilterIntent.current`, `SleepFocusDetection`). A read that says the Focus is on records the
-time (`helio.sleepFocusSeenActiveAt.v1`; `perform()` with Focus on does too). A read that says it is
-off (the filter with its default value, or `notFound`), with a seen-on time in the last 18 h newer
-than the persisted T, persists T = the time of that read and leaves one `focus` line, `Sleep Focus
-end detected at a wake (filter not run by iOS), kind=…`. A read that fails another way changes
-nothing, and with no seen-on time nothing is inferred. The detecting run's own flush can then write
-the night. The cost: someone back asleep after the Focus ended but before that wake gets the shorter
-night written first; decision 58b replaces it with the later, longer copy. Nothing here connects,
-syncs or schedules by itself, and there is no extension.
+So:
+- **T is persisted, with its source** (`helio.sleepFocusEndedAt.v1` and `….source.v1`). Ring and strap
+  both record it; only the strap reads it.
+  - A strap Health flush that starts at or after T and within 6 h of it finalizes a night by the
+    night's last segment end.
+  - With a `perform()` T (iOS delivered the Focus-off), that is an end at or before T + 10 min.
+  - With a T found by detection (78f, below), it is an end at or before T − 10 min (decision 78g).
+  - A finalized night skips the 20-min settle margin and decision 58a's 3 h newest-night hold.
+  - Every other night (the person went back to sleep, or the next night) is judged by the normal rules.
+  - It is decided once per flush, in `HelioConnection.flushStrap`, so the background run, the post-sync
+    hook and the app's foreground flush all use it. The input is decision 31's in-memory T (a
+    `perform()` T) and the persisted T; when both apply, each one's own rule counts (`SleepFocusFinalization.nights`).
+  - **What T can and cannot do.** The strap hands over a record still in progress, its end about
+    3 min behind the sync that reads it (decision 58). So a `perform()` T can finalize a record read in
+    progress within its 10-min slack. A detected T can't finalize anything that ended less than 10 min
+    before the read.
+- **The run asks again** (78b). After a strap Focus run, whatever its ending, a refresh is recorded for
+  T + 15 min through `StrapNightRefresh`, so it survives `schedule()`.
+  - This happens when the newest stored strap night that ended by T + 10 min (and within 18 h before T)
+    has no mirror record, or when there is no such night.
+  - A refresh already pending later is kept.
+  - The run leaves the standing connect armed on every ending except four: key needed, key rejected,
+    no saved strap, and a workout holding the strap. After a strap-busy ending the re-arm meets the
+    latch the try just set, so it waits for the latch to expire.
+- **Counts-only lines** (78c, source `focus`):
+  - one per strap Focus run: `ending=… night=written|stored-not-written|none retry=yes|no`;
+  - at most one per T, from the first later flush that writes a night only the persisted T finalized:
+    `night written from the Sleep Focus end, N min after it`.
+
+**iOS may not run the filter at all when Sleep Focus ends on its schedule** (decision 78f). In the
+owner's b88 bundle, one morning had no `sleepFocus` record anywhere: `perform()` never ran. Apple
+delivers Focus changes "when the system has determined that it's important". If the app isn't
+running, they go to an App Intents extension, and OpenCircuit has none. So the app notices the end
+itself at its next wake.
+- **Where it reads** the filter's state (`SetFocusFilterIntent.current`, in `SleepFocusDetection`):
+  - every strap background run, at its start and before its flush;
+  - the strap's post-sync hook, before its flush;
+  - the app coming to the front, before the foreground strap flush (which waits for it).
+- **The read is bounded.** It times out after 2 s and then counts as unknown.
+- **Focus on.** A read that says on records its time (`helio.sleepFocusSeenActiveAt.v1`); `perform()`
+  with the Focus on does too.
+- **Focus off.** A read that says off counts when the filter comes back with its default value or
+  with `notFound`. It needs a seen-on time in the last 18 h that is newer than the persisted T. Then:
+  - T = the time of that read, persisted as detected;
+  - one `focus` line: `Sleep Focus end detected at a wake (filter not run by iOS), kind=…`.
+- **Nothing is inferred** from a read that fails another way, a slow read, or an off read with no
+  seen-on time.
+- **What the run that detects can write:** a night that ended 10 min or more before the read, in its
+  own flush. A night whose record ended less than 10 min before the read (likely still in progress, or
+  a misread "off" while the Focus is still on) waits for the margin and the 3 h hold as usual.
+- **Accepted residual (78g).** Say a person woke in the night, and the stored record ends at that
+  awakening, 10 min or more before a false "off" read. That night can still be written short. Decision
+  58b replaces it with the later, longer copy. The same holds for someone back asleep after the Focus
+  ended but before the wake that detects it.
+- **What the bundle shows.** A `Sleep Focus read: <shape>` line appears when a read's shape changes:
+  `on`, `off (default value)`, `off (notFound)`, `no answer in time`, or `error <type or
+  SetFocusFilterIntentError case>`. The strap bundle also always prints a fixed `Sleep Focus` line from
+  the persisted state, whatever the log still holds: the last read's shape, how many minutes ago the
+  Focus was last seen on, and how many minutes ago T was, with its source. No clock times.
+- **Limits.** Nothing here connects, syncs or schedules by itself, and there is no extension.
 
 **Two tasks granted together coalesce** (#233 item 3): no run sits out its window. A later run whose
 deadline isn't more than 5 s later than the active run's completes at once, successfully ("helio
