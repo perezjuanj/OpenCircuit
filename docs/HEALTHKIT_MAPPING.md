@@ -205,7 +205,12 @@ stores and writes what it measured for time it owned:
     segment over the same span, so Apple Health gets an `awake` sample before the first sleep stage and
     an `inBed` sample from the lead-in start, through the same writer path (`healthPublication`, no
     writer change). `inBed` never counts as asleep. **It is an estimate from the strap's measured rows,
-    not the record's own span.** Asleep time is unchanged; time in bed and awake time grow, so
+    not the record's own span.** Naps (decision 77j): the lead-in stops at the end of every nap (stored,
+    or one the same sync is about to store, activity-block naps included), and nearness, the 60 min
+    rule, 76l's prune and `saveNap`'s overlap backstop, is measured from the night's SLEEP, never its
+    lead-in; so the lead-in never prunes a nap, whatever order the nap and the night were stored in.
+    A manual nap's add or edit and the nap Health-delete fences still keep out of the whole in-bed
+    window. Asleep time is unchanged; time in bed and awake time grow, so
     efficiency and the Sleep Score drop (a synthetic 8 h night with a 60 min lead-in: in bed 480 →
     540 min, efficiency 0.969 → 0.861, Sleep Score 83 → 71). The skin-temperature verdict, overnight
     HRV, resting HR and the night key are those of the night without it.

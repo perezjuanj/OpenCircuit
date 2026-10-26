@@ -2565,6 +2565,15 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   and awake time grow, asleep time doesn't, efficiency and the Sleep Score drop. **It is an estimate**,
   not the record's span. The constants are provisional and live in one place
   (`HelioInBedLeadIn`, ZeppKit); they are to be calibrated on a real store before they are trusted.
+  - **Naps and nearness** (decision 77j, at the merge with #329): the lead-in stops at the end of every
+    nap (stored, the sync's own session sleeps, and the sync's activity-block naps more than 60 min
+    before the night's sleep), and a nap that runs into the night's in-bed start leaves it no room.
+    Nearness is measured from the night's SLEEP, never its lead-in, on every path: the 60 min rule of
+    the nap judgement, 76l's prune when the night is stored (its overlap test included) and `saveNap`'s
+    overlap backstop. So a lead-in that ends at a nap's end never prunes it, and the result doesn't
+    depend on whether the nap or the night was stored first. (A manual nap's add or edit, and the
+    fences that keep a nap's Health delete off a stored night, still use the whole in-bed window,
+    lead-in included: those are samples in Health.)
   - From the store, never a sync's fetched minutes, so every re-delivery derives the same lead-in
     (the 73f/73i/74b lesson), and the 50a hand-over and 50b backstop rebuild the night with the
     lead-in it was stored with.
