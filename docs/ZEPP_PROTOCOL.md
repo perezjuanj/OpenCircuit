@@ -2496,13 +2496,19 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   block must wait before it is used at all (its last sleep minute 20 min before the sync's newest
   minute), a nap is stored by the first sync at least 60 min after it ended. A block within 60 min
   after the night's last record still joins the night (a sleep-in, not a nap). One within 60 min
-  before a night is no nap because a nap from a block is not settled while the sync's activity
-  minutes hold any kind-sleep minute within 60 min after its end (decision 76h, review-327 B1):
-  synced while the night's minutes are still going on (73d keeps them out of the blocks) and before
-  its record arrives, the doze waits; once the record is stored, the doze lies within 60 min of it
-  and belongs to it under step 3 (no nap, and still no lead-in). Known gap of that wait: a short
-  sleep blip within the hour after a nap holds it on every sync that fetches the blip, and the nap
-  is lost once the next night's record moves the activity re-fetch past it. One that is the
+  before a night is no nap because a nap from a block is not settled while a sleep that may still be
+  going on starts within 60 min after its end (decisions 76h/76i, review-327 B1): a run of kind-sleep
+  minutes (up to 5 other minutes inside it, as a block's) with a minute in that hour and its last
+  minute less than 20 min before the sync's newest minute, the same "may still be going on" as a
+  block's. Synced while the night's minutes are still going on (73d keeps them out of the blocks)
+  and before its record arrives, the doze waits; once the record is stored, the doze lies within 60
+  min of it and belongs to it under step 3 (no nap, and still no lead-in). A finished run never holds
+  the nap, whatever its length: one of 20 min or more is a block the stitch and the nap rule judge,
+  a shorter one is a blip (holding the nap on it would lose the nap once the re-fetch moved on).
+  Known cost (76i): a sync that runs in a night's awakening of over 20 min, before the record
+  arrives, sees the doze and the night's first part as one finished sleep and can store it as a
+  nap; the night's record overlaps and prunes it, and Health keeps whatever of the nap's write lies
+  before the night's span. One that is the
   00:00–08:00 main sleep of a night no stored night covers is stored nowhere and counted
   (`mainOnlyBlocks=N`). The nap's segments are the block's own: one `.inBed` envelope, its sleep
   minutes as generic sleep, an awake gap of up to 5 min left a gap; no score. Every sync re-derives
