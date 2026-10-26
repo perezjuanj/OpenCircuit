@@ -74,16 +74,33 @@ extension HelioSleepSelection {
         }
     }
 
-    /// Decision 76h (review-327 B1): whether `minutes` (one sync's fetched activity minutes) hold a
-    /// kind-sleep minute within `napGap` after the end of `nap`, a nap candidate that holds an activity
-    /// block. Such a nap is not settled yet, whether or not that later sleep is a usable block: the
-    /// night's own minutes may still be going on (73d keeps them out of `activityBlocks`) and its
-    /// `0x48` record not delivered, so nothing else says the nap lies within 60 min of a night (76e).
-    /// It is judged again on a later sync. Judged on the nap's end, so the blocks a nap holds never
-    /// hold it.
+    /// Decisions 76h/76i (review-327 B1): whether `minutes` (one sync's fetched activity minutes) hold a
+    /// sleep that may still be going on within `napGap` after the end of `nap`, a nap candidate that
+    /// holds an activity block. Such a nap is not settled yet: the night's own minutes may still be
+    /// going on (73d keeps them out of `activityBlocks`) and its `0x48` record not delivered, so nothing
+    /// else says the nap lies within 60 min of a night (76e). It is judged again on a later sync.
+    ///
+    /// The kind-sleep minutes from the nap's end on form runs as in `activityBlocks` (up to
+    /// `activityBlockMaxGapMinutes` other minutes inside a run). A run holds the nap when one of its
+    /// minutes lies within `napGap` after the nap's end AND its last sleep minute is less than
+    /// `activityBlockSettleTime` before the newest minute (73d's "may still be going on"). A finished
+    /// run never holds it (76i): one of 20 min or more is a block the stitch and nap rules judge, and a
+    /// shorter one is a blip that would otherwise hold the nap until the re-fetch moved past it. Judged
+    /// on the nap's end, so the blocks a nap holds never hold it.
     public static func sleepFollowsWithinNapGap(_ nap: DateInterval, in minutes: [ZeppActivityMinute]) -> Bool {
-        minutes.contains { minute in
-            minute.kind == ZeppActivityMinute.kindSleep && minute.time >= nap.end && minute.time.timeIntervalSince(nap.end) <= napGap
+        guard let newest = minutes.map(\.time).max() else { return false }
+        let sleepTimes = Set(minutes.filter { $0.kind == ZeppActivityMinute.kindSleep && $0.time >= nap.end }.map(\.time)).sorted()
+        var runs: [[Date]] = []
+        for t in sleepTimes {
+            if let previous = runs.last?.last, t.timeIntervalSince(previous) <= TimeInterval(activityBlockMaxGapMinutes + 1) * 60 {
+                runs[runs.count - 1].append(t)
+            } else {
+                runs.append([t])
+            }
+        }
+        return runs.contains { run in
+            guard let first = run.first, let last = run.last else { return false }
+            return first.timeIntervalSince(nap.end) <= napGap && newest.timeIntervalSince(last) < activityBlockSettleTime
         }
     }
 

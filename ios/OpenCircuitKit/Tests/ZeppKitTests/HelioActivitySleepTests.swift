@@ -396,4 +396,20 @@ extension HelioActivitySleepTests {
         XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: asleep(700, 840) + up(840, 960)), "inside or before")
         XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: []))
     }
+
+    /// Decision 76i: a following run holds the nap only while it may still be going on (its last sleep
+    /// minute less than 20 min before the newest minute); a finished one doesn't, whatever its length.
+    func testOnlyASleepStillGoingOnHoldsTheNap() {
+        let nap = span(780, 840)
+        XCTAssertTrue(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 880) + up(880, 899)),
+                      "a blip ending 19 min before the newest minute may still be going on")
+        XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 880) + up(880, 900)),
+                       "one ending 20 min before has finished")
+        XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 930) + up(930, 960)),
+                       "a finished hour of sleep doesn't hold it either (the stitch judges it)")
+        XCTAssertTrue(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 880) + up(880, 884) + asleep(884, 960)),
+                      "a run going on that started within the hour, across a short gap")
+        XCTAssertFalse(HelioSleepSelection.sleepFollowsWithinNapGap(nap, in: up(840, 870) + asleep(870, 880) + up(880, 920) + asleep(920, 960)),
+                       "the run going on started 80 min after; the one within the hour finished")
+    }
 }
