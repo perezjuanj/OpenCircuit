@@ -3330,9 +3330,9 @@ struct LocalStore {
         // nothing. A night stored AFTER the re-arm is kept out by `staleNapHealthSpan`, which clips.
         // Decision 80a (#331 item 7): a STRAP nap that only touches a stored night (zero overlap: the
         // lead-in starts where the nap ends) is rewritten, so the card's nap and Health agree; the clean
-        // `staleNapHealthSpan` then computes ends one second clear of the night (the fence itself stays
-        // the whole in-bed window, touching included). One second of overlap still skips. The ring's
-        // naps are judged as before (touching skips).
+        // of its old write (`staleNapHealthSpan`) still ends one second clear of the night, whose fence
+        // stays the whole in-bed window, touching included. One second of overlap still skips. The
+        // ring's naps are judged as before (touching skips).
         let touchingSkips = family != .zeppOS
         if !mirrored.isEmpty,
            otherNapReaches(lo, hi, except: group)
