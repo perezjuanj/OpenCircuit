@@ -1206,7 +1206,18 @@ private final class FakeBackgroundLink: HelioBackgroundLink {
     var inRange = true
     /// The strap never answers (another phone holds it).
     var silent = false
-    var endedBusy = false
+    /// Decision 78d: when the link ended busy (the fake's clock), nil when it didn't.
+    var endedBusyAt: Date?
+    /// Set from a test: busy now, or cleared (what a new launch used to do).
+    var endedBusy: Bool {
+        get { endedBusyAt != nil }
+        set { endedBusyAt = newValue ? clock() : nil }
+    }
+    private(set) var busyClears = 0
+    func clearBusyLatch() {
+        busyClears += 1
+        endedBusyAt = nil
+    }
     var activeBackgroundRuns = 0
     var backgroundRunAdoptsNewSessions = false
     var pendingNightsFinalization: Date?

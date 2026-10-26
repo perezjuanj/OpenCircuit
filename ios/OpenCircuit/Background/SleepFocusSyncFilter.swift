@@ -75,6 +75,10 @@ private enum SleepFocusSyncRunner {
 
         observability.recordMetricEvent(
             source: "focus", detail: "Sleep Focus ended; sync INVOKED by iOS")
+        // Decision 78a (#332): T, the moment Sleep Focus ended, outlives this one bounded run. Recorded
+        // for both devices; only the strap's flushes read it.
+        let focusEnd = Date()
+        SleepFocusFinalization.persist(focusEnd)
 
         // The Focus-triggered run is additive. Keep both existing BGTask chains armed exactly as a
         // normal background run does; this does not cancel or replace either pending request.
@@ -93,7 +97,7 @@ private enum SleepFocusSyncRunner {
             // #215 phase 4, decision 1: the chosen device's drain only. With the Helio Strap chosen the
             // ring's scanner is never constructed; the strap's drain runs instead.
             if BackgroundDrain(ActiveDeviceChoiceStore.persisted()) == .strap {
-                await runStrap(store: store)
+                await runStrap(store: store, focusEnd: focusEnd)
                 return
             }
             let service = RingBackgroundSyncService(store: store, health: HealthKitWriter())
@@ -156,13 +160,21 @@ private enum SleepFocusSyncRunner {
     /// Focus ending is the authoritative "the night is over" signal, so the strap's nights skip the
     /// 20-minute quiet margin, exactly as the ring's do on this wake (`sleepFinalized`). The run logs
     /// itself ("helio strap: …", kind `sleepFocus`); the alert passes follow a finished sync.
-    private static func runStrap(store: LocalStore) async {
+    private static func runStrap(store: LocalStore, focusEnd: Date) async {
         let scheduler = BackgroundRefreshScheduler()
-        // T, the moment Sleep Focus ended (now): its nights skip the margin only within 30 min of it
-        // (decision 31).
+        // T, the moment Sleep Focus ended: in memory its nights skip the margin within 30 min of it
+        // (decision 31); persisted, a later flush within 6 h finalizes the nights that ended by then
+        // (decision 78a).
         let run = await HelioBackgroundSyncService.live(store: store).run(
-            kind: .sleepFocus, timeout: RingBackgroundSyncService.defaultTimeout, nightsFinalized: Date())
-        guard !Task.isCancelled else { return }
+            kind: .sleepFocus, timeout: RingBackgroundSyncService.defaultTimeout, nightsFinalized: focusEnd)
+        // The night as the store has it after the run's flush (or with none).
+        let night = HelioConnection.savedTimeline.map { store.strapFocusNight(timeline: $0, focusEnd: focusEnd) } ?? .none
+        guard !Task.isCancelled else {
+            // Decision 78b/78c: an expired run still asks for its retry and leaves its line.
+            SleepFocusStrapFollowUp.finish(run, focusEnd: focusEnd, night: night, expired: true,
+                                           scheduler: scheduler, observability: ObservabilityStore())
+            return
+        }
         await evaluateAlerts()
         if run.ending == .synced {
             let alerts = HealthNotificationCenter()
@@ -175,10 +187,10 @@ private enum SleepFocusSyncRunner {
         }
         scheduler.schedule()
         scheduler.scheduleProcessing()
-        // #233 item 5: a night this flush held back (it started over 30 min after Focus ended), and
-        // review-225e SF-3: one still pending survives the `schedule()` above.
-        if run.flushMS != nil { StrapNightRefresh.record(run.refreshAt, scheduler: scheduler) }
-        StrapNightRefresh.resubmit(scheduler, strapChosen: true)
+        // #233 item 5: a night this flush held back, and review-225e SF-3: one still pending survives
+        // the `schedule()` above. Decision 78b: a night not in Apple Health gets a retry at T + 15 min.
+        SleepFocusStrapFollowUp.finish(run, focusEnd: focusEnd, night: night, expired: false,
+                                       scheduler: scheduler, observability: ObservabilityStore())
     }
 
     private static func evaluateAlerts() async {

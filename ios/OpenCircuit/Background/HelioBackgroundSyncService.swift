@@ -21,11 +21,11 @@ import ZeppKit
 // flushes only when the budget (not iOS) ended it. If the app is in front when the budget runs out,
 // nothing is torn down: the sync is handed to the app, whose post-sync hook flushes it (review-225 S1).
 //
-// Key states (decision 7): no key, a rejected key (persisted), or a strap that ended busy earlier in
-// this app launch end the run before any radio work; a session that turns out keyless, rejected,
-// busy or unsupported ends it quietly. No retry, no Health write, and the log says why. "Busy" lasts
-// for the launch only: the next launch (a background relaunch too) tries once more, which is how the
-// strap comes back once Zepp lets go of it (review-225 F1).
+// Key states (decision 7): no key, a rejected key (persisted), or a strap that ended busy in the last
+// 20 minutes end the run before any radio work; a session that turns out keyless, rejected, busy or
+// unsupported ends it quietly. No retry, no Health write, and the log says why. "Busy" lasts 20
+// minutes (decision 78d, #316; it lasted the whole launch before): the next background run after that
+// tries once more, and a Sleep Focus run always does. A strap still held latches again (review-225 F1).
 
 /// Decision 31: Sleep Focus turning off at time T ("the night is over") lets the strap's nights skip
 /// the 20-minute settle margin only in a Health flush that STARTS within `window` of T. Every path that
@@ -51,6 +51,88 @@ enum SleepFocusFinalization {
     static func latest(_ a: Date?, _ b: Date?) -> Date? {
         [a, b].compactMap { $0 }.max()
     }
+
+    // MARK: Decision 78a (#332): the persisted Focus end, judged per night
+
+    /// Where the Sleep Focus wake persists T, for both devices (only the strap reads it).
+    nonisolated static let persistedKey = "helio.sleepFocusEndedAt.v1"
+    /// How long after T a flush may still use the persisted T: past the morning's last plausible
+    /// wake, well short of the next night's end.
+    static let persistedValidity: TimeInterval = 6 * 3600
+    /// How long after T a night may end and still count as over: a strap record is read about 3
+    /// minutes behind its end (decision 58), and a night still growing after Focus ended ends later.
+    static let nightEndSlack: TimeInterval = 10 * 60
+
+    /// The Sleep Focus wake (ring and strap): Focus ended at `focusEnd`.
+    static func persist(_ focusEnd: Date, defaults: UserDefaults = .standard) {
+        defaults.set(focusEnd.timeIntervalSince1970, forKey: persistedKey)
+    }
+
+    /// The last persisted Focus end, or nil when none was ever recorded.
+    static func persisted(defaults: UserDefaults = .standard) -> Date? {
+        let t = defaults.double(forKey: persistedKey)
+        return t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
+
+    /// What one strap Health flush finalizes: the nights that ended by `focusEnd` plus `nightEndSlack`.
+    /// A night finalized here skips the settle margin (`SleepHealthGate`) and the newest-night hold
+    /// (decision 58a); every other night is judged by the normal rules.
+    struct Nights: Equatable {
+        /// The Focus end this flush answers, nil when none applies.
+        let focusEnd: Date?
+        /// `focusEnd` is the persisted T, not decision 31's in-memory one (decision 78c's breadcrumb).
+        let fromPersisted: Bool
+
+        static let none = Nights(focusEnd: nil, fromPersisted: false)
+
+        /// Whether the night whose last segment ends at `end` is over.
+        func finalizes(nightEndingAt end: Date?) -> Bool {
+            guard let focusEnd, let end else { return false }
+            return end <= focusEnd.addingTimeInterval(SleepFocusFinalization.nightEndSlack)
+        }
+    }
+
+    /// Decision 78a: the one place a strap flush's finalization is decided. `inMemory` is decision
+    /// 31's T (the run's own, a waiter's or a hand-off's), used while the flush starts within `window`
+    /// of it; `persisted` is the Sleep Focus wake's T, used by a flush that starts at or after it and
+    /// within `persistedValidity`. The later of the two applies, per night, by the night's end: a
+    /// night still growing after Focus ended, and the next night, end later than T plus the slack and
+    /// are never finalized.
+    static func nights(inMemory: Date?, persisted: Date?, flushStartsAt flushStart: Date) -> Nights {
+        let memory = applies(focusEndedAt: inMemory, flushStartsAt: flushStart) ? inMemory : nil
+        let stored = persisted.flatMap { t in
+            flushStart >= t && flushStart.timeIntervalSince(t) <= persistedValidity ? t : nil
+        }
+        guard let focusEnd = latest(memory, stored) else { return .none }
+        return Nights(focusEnd: focusEnd, fromPersisted: memory == nil || focusEnd != memory)
+    }
+
+    /// The persisted T the 78c breadcrumb was last recorded for.
+    nonisolated static let persistedWriteLoggedKey = "helio.sleepFocusEndedAt.logged.v1"
+
+    /// Decision 78c: a flush wrote a night that only the persisted T finalized. One `focus` line per
+    /// T, from the first such flush: how many minutes after Focus ended. Counts only.
+    static func notePersistedWrite(focusEnd: Date, flushStart: Date, defaults: UserDefaults = .standard) {
+        guard defaults.double(forKey: persistedWriteLoggedKey) != focusEnd.timeIntervalSince1970 else { return }
+        defaults.set(focusEnd.timeIntervalSince1970, forKey: persistedWriteLoggedKey)
+        let minutes = max(0, Int(flushStart.timeIntervalSince(focusEnd) / 60))
+        ObservabilityStore(defaults).recordMetricEvent(
+            source: "focus", detail: "night written from the Sleep Focus end, \(minutes) min after it")
+    }
+}
+
+/// Decision 78d (#316): how long "the strap ended busy" holds. Decision 7 stands for a strap another
+/// central really holds (the next try latches again), but one failed auth no longer stops every
+/// background sync for the rest of the launch.
+enum HelioBusyLatch {
+    static let expiry: TimeInterval = 20 * 60
+
+    /// A latch set at `since` still holds at `now`: set, and no older than `expiry`.
+    static func holds(since: Date?, now: Date) -> Bool {
+        guard let since else { return false }
+        let age = now.timeIntervalSince(since)
+        return age >= 0 && age <= expiry
+    }
 }
 
 /// #233 item 5: when the next app-refresh should come after a strap flush, so a night the flush held
@@ -70,15 +152,17 @@ enum StrapNightRefresh {
     /// held night even when this sync didn't carry it, so a sync whose strap had stopped re-delivering
     /// the night (an app opened right after a background wake stored it) asks for the same refresh
     /// instead of clearing it. Read after the flush, a night it wrote has its mirror record and is nil.
+    ///
+    /// Decision 78a: a night counts as held unless the flush's finalization (`SleepFocusFinalization.
+    /// nights`, from `focusEndedAt` and `persistedFocusEnd`) covers that night's end.
     static func aim(nights: [HelioSleepSelection.Night], storedNightSettles: Date? = nil, focusEndedAt: Date?,
-                    flushStartedAt: Date, afterWokeUp wokeUp: Bool) -> Date? {
+                    persistedFocusEnd: Date? = nil, flushStartedAt: Date, afterWokeUp wokeUp: Bool) -> Date? {
         var candidates: [Date] = []
-        var held: [Date] = []
-        if !SleepFocusFinalization.applies(focusEndedAt: focusEndedAt, flushStartsAt: flushStartedAt) {
-            held = nights.compactMap { $0.segments.map(\.end).max() }
-                .filter { !SleepHealthGate.isSettled(latestSegmentEnd: $0, now: flushStartedAt) }
-                .map { $0.addingTimeInterval(SleepHealthGate.settleMargin) }
-        }
+        let finalization = SleepFocusFinalization.nights(inMemory: focusEndedAt, persisted: persistedFocusEnd,
+                                                         flushStartsAt: flushStartedAt)
+        var held = nights.compactMap { $0.segments.map(\.end).max() }
+            .filter { !finalization.finalizes(nightEndingAt: $0) && !SleepHealthGate.isSettled(latestSegmentEnd: $0, now: flushStartedAt) }
+            .map { $0.addingTimeInterval(SleepHealthGate.settleMargin) }
         if let storedNightSettles { held.append(storedNightSettles) }
         if let earliest = held.min() { candidates.append(earliest) }
         if wokeUp { candidates.append(flushStartedAt.addingTimeInterval(afterWokeUp)) }
@@ -126,6 +210,58 @@ enum StrapNightRefresh {
     }
 }
 
+/// Decision 78b/78c (#332): what a strap Sleep Focus run leaves behind, whatever its ending. The run
+/// is one bounded wake; when it didn't get the night into Apple Health (the link was down, it
+/// coalesced into a run that ran out of time, the strap was busy, the record was still in progress),
+/// a refresh soon after Focus ended asks again, and the persisted T (78a) finalizes the night there.
+enum SleepFocusStrapFollowUp {
+    /// The night a Focus run was for, as the store has it after the run.
+    enum Night: String {
+        /// The newest stored strap night that ended by T plus the slack, and within `nightLookback`
+        /// before T, has a Health mirror record.
+        case written
+        /// It has none.
+        case storedNotWritten = "stored-not-written"
+        /// No such night is stored.
+        case none
+    }
+
+    /// The retry refresh comes this long after Focus ended.
+    static let retryAfter: TimeInterval = 15 * 60
+    /// How long before T the night a Focus run was for may have ended.
+    static let nightLookback: TimeInterval = 18 * 3600
+
+    /// After the run. `expired`: iOS ended the task, so `schedule()` didn't run and nothing after it
+    /// does: only the retry and the breadcrumb, which are synchronous. Otherwise this comes after
+    /// `schedule()`: the run's own margin verdict (as before), then the retry, then the pending
+    /// refresh is submitted again. The retry is recorded (so `schedule()` doesn't replace it, review-
+    /// 225e SF-3) unless a refresh at or after it is already pending. Returns whether a retry is pending.
+    @discardableResult
+    static func finish(_ run: HelioBackgroundRun, focusEnd: Date, night: Night, expired: Bool,
+                       scheduler: BackgroundRefreshScheduler, observability: ObservabilityStore,
+                       defaults: UserDefaults = .standard, now: Date = Date()) -> Bool {
+        if !expired, run.flushMS != nil { StrapNightRefresh.record(run.refreshAt, scheduler: scheduler, defaults: defaults) }
+        var retry = false
+        if night != .written {
+            let at = focusEnd.addingTimeInterval(retryAfter)
+            if let pending = StrapNightRefresh.pending(now: now, defaults: defaults), pending >= at {
+                retry = true   // a later refresh is already pending: kept
+            } else if at > now {
+                StrapNightRefresh.record(at, scheduler: scheduler, defaults: defaults)
+                retry = true
+            }
+        }
+        observability.recordMetricEvent(source: "focus", detail: breadcrumb(ending: run.ending, night: night, retry: retry))
+        if !expired { StrapNightRefresh.resubmit(scheduler, strapChosen: true, now: now, defaults: defaults) }
+        return retry
+    }
+
+    /// Decision 78c: one line per strap Focus run. Counts only: no clock time of sleep, no value.
+    static func breadcrumb(ending: HelioBackgroundRun.Ending, night: Night, retry: Bool) -> String {
+        "ending=\(ending.label) night=\(night.rawValue) retry=\(retry ? "yes" : "no")"
+    }
+}
+
 /// The run holding the link, as a later run sees it (#233 item 3: coalescing).
 struct HelioActiveRun: Equatable {
     enum Stage: Equatable {
@@ -156,10 +292,11 @@ struct HelioHandOver {
 protocol HelioBackgroundLink: AnyObject {
     /// The strap's session on the current link, if any.
     var session: HelioSession? { get }
-    /// The last connection in this app launch ended with the strap busy (decision 7): nothing
-    /// reconnects by itself until the person asks or the app is next launched, so neither does a
-    /// background run.
-    var endedBusy: Bool { get }
+    /// When the last connection ended with the strap busy (decision 7), nil when it didn't. Decision
+    /// 78d (#316): it holds for `HelioBusyLatch.expiry`; after that a background run tries once again.
+    var endedBusyAt: Date? { get }
+    /// Decision 78d: a Sleep Focus run clears the busy latch and tries once.
+    func clearBusyLatch()
     /// Where the strap's rows live (`zeppos:<id>`): the connected strap's, else the saved one's; nil
     /// when no strap was ever connected.
     var strapTimeline: SyncDeviceID? { get }
@@ -386,6 +523,10 @@ struct HelioBackgroundSyncService {
     /// night still asks for its margin refresh, instead of clearing the one an earlier sync asked for.
     /// nil in tests that don't store nights.
     var storedNightSettles: @MainActor (_ timeline: SyncDeviceID, _ now: Date) -> Date? = { _, _ in nil }
+    /// Decision 78a (#332): the persisted Sleep Focus end (`SleepFocusFinalization.persisted` in the
+    /// app), for the refresh verdict after the flush; the flush reads it itself. nil in tests that
+    /// don't set one.
+    var persistedFocusEnd: @MainActor () -> Date? = { nil }
 
     /// One bounded run. `nightsFinalized` is the Sleep Focus wake's "the night is over": the time T
     /// Sleep Focus ended. The strap's nights then skip the 20-minute quiet margin, as the ring's do on
@@ -462,6 +603,9 @@ struct HelioBackgroundSyncService {
             await pause()
         }
 
+        // Decision 78d (#316): a Sleep Focus run clears the busy latch and tries once; a strap that is
+        // busy again on that try latches again (decision 7).
+        if kind == .sleepFocus { link.clearBusyLatch() }
         // Quiet endings before any radio work: nothing is connected and no central is created.
         if link.strapTimeline == nil {
             run.ending = .noSavedStrap
@@ -469,7 +613,8 @@ struct HelioBackgroundSyncService {
             run.ending = .keyNeeded
         } else if keyStore.isRejected {
             run.ending = .keyRejected
-        } else if link.endedBusy {
+        } else if HelioBusyLatch.holds(since: link.endedBusyAt, now: now()) {
+            // Decision 78d: only for `HelioBusyLatch.expiry`; an older latch is cleared and tried once.
             run.ending = .strapBusy
         }
         if run.endedQuietly { return record(run, kind: kind) }
@@ -626,6 +771,11 @@ struct HelioBackgroundSyncService {
         case .keyNeeded, .keyRejected, .strapBusy, .unsupported, .noSavedStrap:
             // Decision 7: end here, drop the link and leave it down; the next explicit connect retries.
             link.disconnectForBackground()
+            // Decision 78b (#332): a Sleep Focus run leaves the standing connect armed on every ending
+            // but key needed, key rejected, no saved strap and a workout holding the strap.
+            // DECISION-GAP: after `.strapBusy` the re-arm meets the latch just set (78d: a strap busy
+            // again latches again), so `rearmAfterTeardown` declines it until the latch expires.
+            if kind == .sleepFocus, run.ending == .strapBusy || run.ending == .unsupported { link.rearmAfterTeardown() }
             return record(run, kind: kind)
         }
 
@@ -641,7 +791,7 @@ struct HelioBackgroundSyncService {
             run.flushMS = Self.ms(from: flushStart, to: now())
             run.refreshAt = StrapNightRefresh.aim(nights: run.result?.nights ?? [],
                                                   storedNightSettles: storedNightSettles(timeline, now()),
-                                                  focusEndedAt: focusEnd,
+                                                  focusEndedAt: focusEnd, persistedFocusEnd: persistedFocusEnd(),
                                                   flushStartedAt: flushStart, afterWokeUp: wake == .strapEvent)
             if run.flush?.wroteAnything == true { observability.recordHealthWrite() }
         }
@@ -709,6 +859,7 @@ extension HelioBackgroundSyncService {
             },
             appIsActive: { UIApplication.shared.applicationState == .active },
             breadcrumbs: connection.breadcrumbs,
-            storedNightSettles: { timeline, now in store.newestStrapNightSettles(timeline: timeline, now: now) })
+            storedNightSettles: { timeline, now in store.newestStrapNightSettles(timeline: timeline, now: now) },
+            persistedFocusEnd: { SleepFocusFinalization.persisted() })
     }
 }
