@@ -2924,3 +2924,205 @@ private final class BackgroundMarginRecorder: BGTaskScheduling {
     func cancel(taskRequestWithIdentifier identifier: String) {}
     func submit(_ taskRequest: BGTaskRequest) throws { submitted = taskRequest }
 }
+
+// MARK: - Decision 78 (#332): the Sleep Focus end outlives the Focus-off run; #316: the busy latch expires
+
+extension HelioBackgroundSyncTests {
+    /// The service with the production Health pass: `HelioConnection.flushStrap` over `writer`, at the fake
+    /// clock, reading the persisted Focus end from `focusDefaults` (the app's run reads the standard
+    /// defaults). The writer can't write in the simulator; `lastStrapNights` is the verdict its gate got.
+    private func flushingService(_ link: FakeBackgroundLink, store: LocalStore, writer: HealthKitWriter,
+                                 focusDefaults: UserDefaults, pause: (@MainActor () -> Void)? = nil) -> HelioBackgroundSyncService {
+        let base = service(link, store: store, pause: pause)
+        return HelioBackgroundSyncService(
+            link: base.link, keyStore: base.keyStore, observability: base.observability,
+            flush: { [unowned self] timeline, nights, _, focusEndedAt in
+                await HelioConnection.flushStrap(writer, store: store, timeline: timeline, nights: nights.map(\.segments),
+                                                 focusEndedAt: focusEndedAt, now: self.clock, defaults: focusDefaults)
+            },
+            now: base.now, pause: base.pause, grace: base.grace, appIsActive: base.appIsActive,
+            persistedFocusEnd: { SleepFocusFinalization.persisted(defaults: focusDefaults) })
+    }
+
+    private func focusSuite() throws -> (UserDefaults, String) {
+        let name = "HelioBackgroundSyncTests.focus.\(UUID().uuidString)"
+        return (try XCTUnwrap(UserDefaults(suiteName: name)), name)
+    }
+
+    /// The fake strap's night ends at 07:00; Sleep Focus ends five minutes later.
+    private var nightEnd: Date { Date(timeIntervalSince1970: midnight + 7 * 3600) }
+
+    /// The Focus-off run finds the strap out of range and runs out of time before any sleep round. A
+    /// background run 2 h later fetches the night: finalized in that run's flush by the persisted T (decision
+    /// 31's 30 minutes are long gone). 7 h after Focus ended, the same run gets the normal rules.
+    func testAFocusRunOutOfTimeLeavesTheNightToARunTwoHoursLaterThatFinalizesIt() async throws {
+        for (after, finalized) in [(2.0, true), (7.0, false)] {
+            let store = try makeStore()
+            let (focusDefaults, suite) = try focusSuite()
+            defer { focusDefaults.removePersistentDomain(forName: suite) }
+            let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+            clock = nightEnd.addingTimeInterval(5 * 60)
+            let focusEnd = clock
+            SleepFocusFinalization.persist(focusEnd, defaults: focusDefaults)   // what the Focus wake does first
+            link.inRange = false
+            let writer = HealthKitWriter()
+            let focus = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults)
+                .run(kind: .sleepFocus, timeout: RingBackgroundSyncService.defaultTimeout, nightsFinalized: focusEnd)
+            XCTAssertEqual(focus.ending, .outOfTime)
+            XCTAssertTrue(try store.context.fetch(FetchDescriptor<StoredSleepSummary>()).isEmpty, "no sleep round ran")
+            XCTAssertEqual(store.strapFocusNight(timeline: try XCTUnwrap(link.strapTimeline), focusEnd: focusEnd), .none,
+                           "78b: the Focus run asks for its retry")
+
+            link.inRange = true
+            clock = focusEnd.addingTimeInterval(after * 3600)
+            let later = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults)
+                .run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+            XCTAssertEqual(later.ending, .synced)
+            XCTAssertFalse(writer.lastStrapNights.isEmpty, "\(after) h")
+            XCTAssertTrue(writer.lastStrapNights.contains { $0.night.map(\.end).max() == nightEnd }, "\(after) h")
+            XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [finalized], "\(after) h after Focus ended")
+        }
+    }
+
+    /// The Focus run coalesces into a processing run that then runs out of time mid-sync. The next run, 40
+    /// minutes after Focus ended (past decision 31's 30), still finalizes the night.
+    func testAFocusRunCoalescedIntoARunThatRanOutOfTimeStillFinalizesTheNightFortyMinutesLater() async throws {
+        let store = try makeStore()
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        clock = nightEnd.addingTimeInterval(5 * 60)
+        let writer = HealthKitWriter()
+        // One radio event a second: the processing run's 52 s window ends mid-sync.
+        let processing = flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults,
+                                         pause: { link.transport?.drainSteps(1) })
+        let a = Task { @MainActor in await processing.run(kind: .processing, timeout: 60) }
+        for _ in 0..<2000 where link.activeBackgroundRuns == 0 { await Task.yield() }
+        let focusEnd = clock
+        SleepFocusFinalization.persist(focusEnd, defaults: focusDefaults)
+        let focusRun = await Task { @MainActor in
+            await self.waitingService(link, store: store)
+                .run(kind: .sleepFocus, timeout: RingBackgroundSyncService.defaultTimeout, nightsFinalized: focusEnd)
+        }.value
+        XCTAssertEqual(focusRun.ending, .coalesced(into: .processing))
+        let first = await a.value
+        XCTAssertEqual(first.ending, .outOfTime)
+
+        clock = focusEnd.addingTimeInterval(40 * 60)
+        XCTAssertFalse(SleepFocusFinalization.applies(focusEndedAt: focusEnd, flushStartsAt: clock), "decision 31 alone: expired")
+        let next = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults)
+            .run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+        XCTAssertEqual(next.ending, .synced)
+        XCTAssertTrue(writer.lastStrapNights.contains { $0.night.map(\.end).max() == nightEnd })
+        XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [true])
+    }
+
+    // MARK: 78d (#316): the busy latch expires
+
+    func testTheBusyLatchHoldsForTwentyMinutes() {
+        let set = clock
+        XCTAssertEqual(HelioBusyLatch.expiry, 20 * 60)
+        XCTAssertTrue(HelioBusyLatch.holds(since: set, now: set))
+        XCTAssertTrue(HelioBusyLatch.holds(since: set, now: set.addingTimeInterval(20 * 60)))
+        XCTAssertFalse(HelioBusyLatch.holds(since: set, now: set.addingTimeInterval(20 * 60 + 1)))
+        XCTAssertFalse(HelioBusyLatch.holds(since: nil, now: set))
+    }
+
+    /// Busy set 25 minutes ago: a background run tries the radio once, and syncs.
+    func testABackgroundRunTriesAStrapThatEndedBusyTwentyFiveMinutesAgo() async throws {
+        let store = try makeStore()
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        link.endedBusyAt = clock.addingTimeInterval(-25 * 60)
+        let run = await service(link, store: store).run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+        XCTAssertEqual(run.ending, .synced)
+        XCTAssertEqual(link.connects, 1)
+    }
+
+    /// Busy set 5 minutes ago: the run ends quietly with `.strapBusy`, as before, touching no radio.
+    func testABackgroundRunLeavesAStrapThatEndedBusyFiveMinutesAgo() async throws {
+        let store = try makeStore()
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        link.endedBusyAt = clock.addingTimeInterval(-5 * 60)
+        let run = await service(link, store: store).run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+        XCTAssertEqual(run.ending, .strapBusy)
+        XCTAssertEqual(link.connects, 0)
+        XCTAssertEqual(link.busyClears, 0)
+    }
+
+    /// A Sleep Focus run clears a busy latch of any age and tries once.
+    func testASleepFocusRunClearsAFreshBusyLatchAndTriesOnce() async throws {
+        let store = try makeStore()
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        link.endedBusyAt = clock.addingTimeInterval(-60)
+        let run = await service(link, store: store)
+            .run(kind: .sleepFocus, timeout: RingBackgroundSyncService.defaultTimeout, nightsFinalized: clock)
+        XCTAssertEqual(run.ending, .synced)
+        XCTAssertEqual(link.busyClears, 1)
+        XCTAssertEqual(link.connects, 1)
+        XCTAssertNil(link.endedBusyAt)
+    }
+
+    /// A strap busy again on that try latches again (decision 7): the next run right after ends quietly.
+    /// A Focus run that meets it asks for the standing connect again (78b); the link declines it while
+    /// the latch is fresh.
+    func testAStrapBusyAgainOnTheTryLatchesAgain() async throws {
+        for kind in [TaskRecord.Kind.appRefresh, .sleepFocus] {
+            let store = try makeStore()
+            let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+            link.silent = true
+            link.endedBusyAt = clock.addingTimeInterval(-25 * 60)
+            let run = await service(link, store: store)
+                .run(kind: kind, timeout: RingBackgroundSyncService.defaultTimeout, nightsFinalized: kind == .sleepFocus ? clock : nil)
+            XCTAssertEqual(run.ending, .strapBusy, "\(kind)")
+            XCTAssertEqual(link.connects, 1, "\(kind)")
+            let latched = try XCTUnwrap(link.endedBusyAt)
+            XCTAssertTrue(HelioBusyLatch.holds(since: latched, now: clock), "latched again, now")
+            XCTAssertEqual(link.rearms, kind == .sleepFocus ? 1 : 0, "\(kind)")
+            let again = await service(link, store: store).run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+            XCTAssertEqual(again.ending, .strapBusy)
+            XCTAssertEqual(link.connects, 1, "no retry inside the latch")
+        }
+    }
+
+    /// The connection notes when it ended busy, and says which path did in its `helio-link` line; a Focus
+    /// run's clear empties it. Reason words only.
+    func testTheConnectionLatchesBusyWithItsTimeAndReasonWord() throws {
+        let suite = "HelioBackgroundSyncTests.busy.\(UUID().uuidString)"
+        let crumbsDefaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { crumbsDefaults.removePersistentDomain(forName: suite) }
+        let crumbs = HelioBreadcrumbs(observability: ObservabilityStore(crumbsDefaults), defaults: crumbsDefaults)
+        let connection = HelioConnection(keyStore: MemoryKeyStore(keyHex), breadcrumbs: crumbs)
+        let transport = FakeStrapTransport(device: makeStrap())
+        transport.silent = true
+        let keys = MemoryKeyStore(keyHex)
+        let session = HelioSession(transport: transport, identityID: "5B1E4C2A-0000-4000-8000-0000000000B7", key: keys.load(),
+                                   keyStore: keys, sink: nil, findState: HelioFindState(), clock: { [unowned self] in self.clock },
+                                   autoTick: false)
+        transport.session = session
+        session.start()
+        transport.drain()
+        clock = clock.addingTimeInterval(HelioSession.authTimeout + 1)
+        session.tick(now: clock)
+        XCTAssertEqual(session.phase, .strapBusy)
+        XCTAssertEqual(session.busyReason, .authTimeout)
+        connection.installSessionForTesting(session)
+        connection.disconnectForBackground()
+        XCTAssertTrue(connection.endedBusy)
+        XCTAssertNotNil(connection.endedBusyAt)
+        XCTAssertEqual(ObservabilityStore(crumbsDefaults).metricRecords().filter { $0.source == HelioBreadcrumbs.source }.map(\.detail),
+                       ["strap busy (auth timeout); background runs try again after 20 min"])
+        connection.clearBusyLatch()
+        XCTAssertFalse(connection.endedBusy)
+    }
+
+    /// §9's "Competing central" is the strap refusing auth with a status other than `25`; anything else
+    /// that ends auth busy is "auth failed other". What counts as busy doesn't change.
+    func testTheBusyReasonWordsFollowTheAuthFailure() {
+        XCTAssertEqual(HelioSession.BusyReason(.publicKeyRejected(status: 2)), .competingCentral)
+        XCTAssertEqual(HelioSession.BusyReason(.sessionRejected(status: 3)), .competingCentral)
+        XCTAssertEqual(HelioSession.BusyReason(.malformedReply), .authFailedOther)
+        XCTAssertEqual(HelioSession.BusyReason(.invalidDevicePublicKey), .authFailedOther)
+        XCTAssertEqual(HelioSession.BusyReason(.localCryptoFailure), .authFailedOther)
+        XCTAssertEqual(HelioSession.BusyReason.notifyEnableFailed.rawValue, "notify enable failed")
+    }
+}
