@@ -224,8 +224,16 @@ stores and writes what it measured for time it owned:
     Every reader that averages a night's vitals (the illness alert, Vitals Status, the card's
     overnight averages, Trends, the headache HRV and bedtime regularity) reads the night's sleep window,
     the in-bed window without the lead-in (decision 77h, `StoredSleepSummary.sleepWindowStart`), so
-    baselines and alerts are as before; a ring night, a night without a lead-in and an edited night
-    read exactly as before. A night an earlier build wrote without a lead-in that later extends at the
+    baselines and alerts are as before; a ring night and a night without a lead-in read exactly as
+    before. Only a strap night is read as having a lead-in (decision 79b, `isStrapNight`: the strap owns
+    its night under the ownership log, 28a), so a ring night of the same shape reads whole. A manually
+    edited strap night (decision 79a): the readers of its RECORDED columns (the illness alert, Vitals
+    Status, Trends' vitals averages, the nap windows and `saveNap`'s backstop) read the recorded night
+    without its recorded lead-in, from `recordedHypnogramData` (`recordedSleepWindowStart`); its edited
+    window is the person's own and is never trimmed. Trends' active energy and exercise minutes leave
+    out the whole in-bed window, lead-in included, like the dashboard, Goals, Wellness and the
+    active-energy flushes (decision 79c), so a day reads the same active kcal in Trends and on the
+    dashboard. A night an earlier build wrote without a lead-in that later extends at the
     end (58b) takes the lead-in along in that one rewrite (77i).
     - Steps: `StoredStepSample` rows carry no device column; they are the strap's by ownership (28:
       each step writer keeps its rows wholly in time its device owns), and the lead-in never reads

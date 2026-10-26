@@ -2608,6 +2608,21 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
     the in-bed window without the lead-in (decision 77h), so their baselines and alerts are as before.
     A night an earlier build wrote without a lead-in that later extends at the end (58b) takes its
     lead-in along in that one rewrite (77i); no start-only rewrite exists.
+  - Only a STRAP night is read as having a lead-in (decision 79b): a stored row is the strap's when the
+    strap owns its night under the ownership log (28a, the owner at its in-bed start; a lead-in never
+    starts before the strap's ownership start). A ring night of the same shape reads whole, and with no
+    switch on record (a ring-only install) every night does. No schema change.
+  - A manually edited strap night (decision 79a): the edit rewrites the hypnogram but leaves the
+    RECORDED in-bed columns frozen, lead-in included. Every reader of the recorded columns (the illness
+    alert, Vitals Status, Trends' vitals averages, the nap judgement's main sleeps and `saveNap`'s
+    overlap backstop) reads the recorded night without its recorded lead-in, decoded from the recording
+    the edit never touches (`recordedHypnogramData`). The edited window is the person's own and is
+    never trimmed: its readers (the Sleep card's overnight averages, the headache HRV and bedtime) read
+    it as before.
+  - Calories (decision 79c): Trends' active energy and exercise minutes leave out the night's whole
+    in-bed window, lead-in included, as the dashboard, Goals, Wellness and the Health active-energy
+    flushes do, so a day gives the same active kcal in Trends and on the dashboard. Trends' vitals
+    averages keep the sleep window (77h).
 - **Ownership**: a nap counts only when the strap owned all of it (no switch inside it).
 - **Under 20 minutes**: not stored; a `helio-link` breadcrumb notes it (step 4).
 - A stored strap nap within 60 min of a STRAP night stored later is removed by that night's store
