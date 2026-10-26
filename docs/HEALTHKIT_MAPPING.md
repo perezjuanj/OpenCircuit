@@ -99,7 +99,8 @@ stores and writes what it measured for time it owned:
     same `flushNaps` as ordinary `sleepAnalysis` samples with the strap's stages, naming the device
     that owned its start (the strap). A nap never displaces a night: naps are judged after the
     sync's nights are stored, `saveNap` refuses one that overlaps a stored night, and a night stored
-    later prunes an auto nap it overlaps, so the ring's night after a switch is kept either way;
+    later prunes an auto nap it overlaps (a strap night also the strap's auto naps within 60 min of
+    it, decision 76l), so the ring's night after a switch is kept either way;
   - strap naps from the activity minutes (decision 76, #327): the strap writes no `0x48` record for
     a daytime nap, only kind-sleep (`0x78`) minutes. An activity sleep block (decision 73, below)
     that joins no night is a nap candidate like the sleeps above, through the same rule: 20 min or

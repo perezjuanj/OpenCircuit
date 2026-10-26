@@ -2457,7 +2457,7 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   both, and the nights are stored before the naps are judged.
 - **Settling**: a nap is judged only once 60 min have passed since it ended, so a later session that
   would stitch onto it (28f) has had its chance. A night stored later still prunes an auto nap it
-  overlaps.
+  overlaps, and a strap night also the strap's auto naps within 60 min of it (decision 76l, below).
 - **One night, whatever the gap** (decision 71, #278): the stitch that runs before the nap split
   (`HelioSleepSelection.stitch`) also joins the overnight sleeps of one night key, judged on the
   night joined so far, as long as the joined night is no longer than 20 h. Neither part of such a
@@ -2549,8 +2549,9 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   the fragments' spans (`sleepSpans`), never a run.
 - **Ownership**: a nap counts only when the strap owned all of it (no switch inside it).
 - **Under 20 minutes**: not stored; a `helio-link` breadcrumb notes it (step 4).
-- A stored nap that a later sync finds within 60 min of a night (for instance the ring's night,
-  synced after the strap's nap) is not removed. Whether that ever happens on a real switch is open.
+- A stored strap nap within 60 min of a STRAP night stored later is removed by that night's store
+  (decision 76l). One within 60 min of the RING's night (synced after the strap's nap, on a switch)
+  is not: a ring night prunes by overlap only. Whether that ever happens on a real switch is open.
 
 ---
 

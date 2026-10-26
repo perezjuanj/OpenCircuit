@@ -576,7 +576,8 @@ public enum HelioSleepSelection {
     ///
     /// SPEC-GAP: §21.4 can't say when the strap writes a session record (🔴), so a later session can
     /// still arrive after this. A stored nap that a night later absorbs is removed by the night's own
-    /// store (`LocalStore.saveSleepSummary` prunes the auto naps its window overlaps).
+    /// store (`LocalStore.saveSleepSummary` prunes the auto naps its window overlaps, and a strap night
+    /// the strap's auto naps within `napGap` of it, decision 76l).
     public static let napSettleTime: TimeInterval = stitchGap
 
     /// What `naps(from:mainSleeps:now:)` made of each sleep.
