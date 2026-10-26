@@ -5,9 +5,9 @@ import OpenCircuitKit
 
 /// Decision 73: the strap writes one `0x48` session record per night and leaves a later sleep of that
 /// night only in its per-minute activity data (`0x01` minutes of kind `0x78`, ZEPP_PROTOCOL.md §6.5,
-/// 🟡 one night). These turn those minutes into sleeps a session's night can join. v1 uses a block only
-/// when it joins a night built from a `0x48` session (73c); a block that would stand alone is counted,
-/// never stored.
+/// 🟡 one night). These turn those minutes into sleeps a session's night can join. A block is a night's
+/// part only when it joins a night built from a `0x48` session (73c); one that stands alone is handed
+/// back (`ActivityJoin.aloneNights`) for the store to judge as a nap (decision 76, #327).
 extension HelioSleepSelection {
 
     /// Decision 73a: non-sleep minutes inside a run, this many or fewer, are an awake gap of the block;
@@ -81,14 +81,25 @@ extension HelioSleepSelection {
         public var nights: [Night]
         /// The blocks that joined a session's night (73c).
         public var joinedBlocks: Int
-        /// The blocks that would stand alone, used nowhere (73c).
+        /// The blocks that would stand alone, used in no night (73c).
         public var aloneBlocks: Int
+        /// Decision 76a: those `aloneBlocks` blocks themselves, oldest first, as `activityBlocks` built
+        /// them, for the store to judge as naps (`naps(from:mainSleeps:now:)`). No night holds one.
+        public var aloneNights: [Night]
+
+        public init(nights: [Night], joinedBlocks: Int, aloneBlocks: Int, aloneNights: [Night] = []) {
+            self.nights = nights
+            self.joinedBlocks = joinedBlocks
+            self.aloneBlocks = aloneBlocks
+            self.aloneNights = aloneNights
+        }
     }
 
     /// Decision 73c: the nights of a sync's (owned) session sleeps and (owned) activity blocks. They are
     /// stitched together by the one rule (`stitch`: 28f's 60 minutes, 71b's overnight sleeps of one
     /// night key), and a night is kept only when it holds a session; a block that stands alone, or with
-    /// other blocks only, is dropped. Without blocks this is `stitch(sessions)`, unchanged.
+    /// other blocks only, is in no night: it is counted and handed back in `aloneNights` (decision 76a).
+    /// Without blocks this is `stitch(sessions)`, unchanged.
     ///
     /// Decision 73f/73i: no lead-in, and nothing between fragments. A block is used only when it starts
     /// at or after the in-bed end of the LAST session of the night it joins; any other block is taken out
@@ -124,10 +135,10 @@ extension HelioSleepSelection {
             kept = withSession(stitch(sessions + used))
         }
         // 73g: a night its blocks would cost goes back to its sessions' own stitch.
-        var joined = 0
+        var joined: [Night] = []
         kept = kept.flatMap { night -> [Night] in
-            let held = used.filter { holds(night, $0) }.count
-            guard held > 0, !isOvernightSleep(night) || night.window.duration > maxNightLength else {
+            let held = used.filter { holds(night, $0) }
+            guard !held.isEmpty, !isOvernightSleep(night) || night.window.duration > maxNightLength else {
                 joined += held
                 return [night]
             }
@@ -138,6 +149,9 @@ extension HelioSleepSelection {
             }
             return alone
         }
-        return ActivityJoin(nights: kept, joinedBlocks: joined, aloneBlocks: blocks.count - joined)
+        // 76a: every block no kept night holds, in the order `activityBlocks` gave them.
+        let aloneNights = blocks.filter { block in !joined.contains(block) }
+        return ActivityJoin(nights: kept, joinedBlocks: joined.count, aloneBlocks: blocks.count - joined.count,
+                            aloneNights: aloneNights)
     }
 }
