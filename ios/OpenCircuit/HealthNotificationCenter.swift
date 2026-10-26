@@ -552,7 +552,7 @@ struct HealthNotificationCenter {
             .sorted { $0.inBedStart > $1.inBedStart }
             .prefix(IllnessSignals.Config().maxPriorNights + 1)
             .map { IllnessSignals.NightWindow(night: cal.startOfDay(for: $0.night),
-                                              start: $0.sleepWindowInBedStart, end: $0.inBedEnd) }   // 77h
+                                              start: $0.recordedSleepWindowStart(log: log), end: $0.inBedEnd) }   // 77h, 79a, 79b
         guard let since = windows.map(\.start).min() else { return nil }
         let offset = skinTempReport(store: store)?.report.offsetC
 

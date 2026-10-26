@@ -169,16 +169,17 @@ extension LocalStore {
     /// night either device keeps.
     ///
     /// Decision 77c: a strap night's recorded window is taken without its in-bed lead-in, so the
-    /// lead-in never changes which sleep is a nap (a night without one: its window, as before).
+    /// lead-in never changes which sleep is a nap (a night without one: its window, as before). Decision
+    /// 79a/79b: an edited strap night's recorded lead-in too, and only a strap night has one.
     func storedNightWindows(from start: Date, to end: Date) -> [DateInterval] {
         let lo = Calendar.current.date(byAdding: .day, value: -2, to: start) ?? start
         let hi = Calendar.current.date(byAdding: .day, value: 2, to: end) ?? end
         let rows = (try? sleepSummaries(from: lo, to: hi)) ?? []
+        let log = Self.ownershipLog()
         var windows: [DateInterval] = []
         for row in rows {
             if row.inBedEnd > row.inBedStart {
-                let window = DateInterval(start: row.inBedStart, end: row.inBedEnd)
-                windows.append(HelioSleepSelection.windowWithoutLeadIn(SleepHypnogramCodec.decode(row.hypnogramData), window: window))
+                windows.append(DateInterval(start: row.recordedSleepWindowStart(log: log), end: row.inBedEnd))
             }
             if row.isManuallyEdited, row.editedInBedEnd > row.editedInBedStart {
                 windows.append(DateInterval(start: row.editedInBedStart, end: row.editedInBedEnd))

@@ -3587,8 +3587,8 @@ struct LocalStore {
     /// within a calendar day of each other by construction.
     ///
     /// `sleepOnly` (decision 77j, the auto-nap path `saveNap`): a strap night's recorded window is taken
-    /// without its in-bed lead-in (`sleepWindowInBedStart`), as the nap judgement and 76l's prune take
-    /// it. A manual add or edit (`false`) still keeps out of the whole recorded window, lead-in included.
+    /// without its in-bed lead-in (`recordedSleepWindowInBedStart`, an edited strap night's too: 79a), as
+    /// the nap judgement and 76l's prune take it. A manual add or edit (`false`) still keeps out of the whole recorded window, lead-in included.
     private func overlapsStoredNight(_ start: Date, _ end: Date, sleepOnly: Bool = false) -> Bool {
         guard end > start else { return false }
         let lo = Calendar.current.date(byAdding: .day, value: -2, to: start) ?? start
@@ -3597,7 +3597,7 @@ struct LocalStore {
             predicate: #Predicate { $0.night >= lo && $0.night <= hi })
         let rows = (try? context.fetch(d)) ?? []
         return rows.contains { row in
-            let recordedStart = sleepOnly ? row.sleepWindowInBedStart : row.inBedStart
+            let recordedStart = sleepOnly ? row.recordedSleepWindowInBedStart : row.inBedStart   // 79a, 79b
             if row.inBedEnd > row.inBedStart,
                start < row.inBedEnd && end > recordedStart { return true }
             if row.isManuallyEdited, row.editedInBedEnd > row.editedInBedStart,
