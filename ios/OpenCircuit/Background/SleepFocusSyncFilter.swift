@@ -91,12 +91,32 @@ enum SleepFocusDetection {
     /// `SetFocusFilterIntentError` has `notFound` and `missingParameterValue` (iOS 26 SDK); the header
     /// doesn't say which a Focus that is off gives, so both shapes count as not active: the filter
     /// with its default `focusIsActive == false`, and `notFound`. Any other error is `unknown`.
-    static func liveRead() async -> Reading {
+    static func liveRead(kind: String = "") async -> Reading {
         do {
-            return reading(focusIsActive: try await SleepFocusSyncFilter.current.focusIsActive)
+            let active = try await SleepFocusSyncFilter.current.focusIsActive
+            noteShape(active ? "on" : "off (default value)", kind: kind)
+            return reading(focusIsActive: active)
         } catch {
+            let shape = (error as? SetFocusFilterIntentError) == .notFound
+                ? "off (notFound)" : "error \(String(describing: type(of: error)))"
+            noteShape(shape, kind: kind)
             return reading(thrown: error)
         }
+    }
+
+    /// The last read shape logged, so the bundle shows what iOS's read returned on a real phone (the
+    /// SDK doesn't say, 78f) with one line per change, not one per wake.
+    nonisolated static let lastShapeKey = "helio.sleepFocusReadShape.v1"
+
+    /// Leaves a `focus` line when this read's shape differs from the last one logged. Counts-only
+    /// words: on / off (default value) / off (notFound) / error <type name>. Returns whether it logged.
+    @discardableResult
+    static func noteShape(_ shape: String, kind: String, defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.string(forKey: lastShapeKey) != shape else { return false }
+        defaults.set(shape, forKey: lastShapeKey)
+        ObservabilityStore(defaults).recordMetricEvent(
+            source: "focus", detail: "Sleep Focus read: \(shape), kind=\(kind)")
+        return true
     }
 
     static func reading(focusIsActive: Bool) -> Reading { focusIsActive ? .active : .inactive }
@@ -107,9 +127,9 @@ enum SleepFocusDetection {
 
     /// One wake's check: read the filter, then `note` it at the read's time. Returns the detected T.
     @discardableResult
-    static func check(kind: String, read: () async -> Reading = { await liveRead() },
+    static func check(kind: String, read: (() async -> Reading)? = nil,
                       defaults: UserDefaults = .standard) async -> Date? {
-        let reading = await read()
+        let reading = await (read ?? { await liveRead(kind: kind) })()
         return note(reading, at: Date(), kind: kind, defaults: defaults)
     }
 

@@ -3174,6 +3174,22 @@ extension HelioBackgroundSyncTests {
         XCTAssertTrue(ObservabilityStore(focusDefaults).metricRecords().filter { $0.source == "focus" }.isEmpty)
     }
 
+    /// 78f: the bundle shows what iOS's read of the filter returned, one line per change of shape,
+    /// so a real phone proves which shape a Focus that is off gives (the SDK doesn't say).
+    func testTheFocusReadShapeIsLoggedOncePerChange() throws {
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        XCTAssertTrue(SleepFocusDetection.noteShape("on", kind: "cbWake", defaults: focusDefaults))
+        XCTAssertFalse(SleepFocusDetection.noteShape("on", kind: "appRefresh", defaults: focusDefaults))
+        XCTAssertTrue(SleepFocusDetection.noteShape("off (notFound)", kind: "appRefresh", defaults: focusDefaults))
+        XCTAssertFalse(SleepFocusDetection.noteShape("off (notFound)", kind: "postSync", defaults: focusDefaults))
+        XCTAssertTrue(SleepFocusDetection.noteShape("on", kind: "foreground", defaults: focusDefaults))
+        let lines = ObservabilityStore(focusDefaults).metricRecords().filter { $0.source == "focus" }.map(\.detail)
+        XCTAssertEqual(lines.sorted(), ["Sleep Focus read: off (notFound), kind=appRefresh",
+                                        "Sleep Focus read: on, kind=cbWake",
+                                        "Sleep Focus read: on, kind=foreground"])
+    }
+
     /// Seen active more than 18 h before the read: not the Focus that just ended. 18 h exactly still is.
     func testASeenActiveTimeOverEighteenHoursOldInfersNothing() throws {
         let (focusDefaults, suite) = try focusSuite()
