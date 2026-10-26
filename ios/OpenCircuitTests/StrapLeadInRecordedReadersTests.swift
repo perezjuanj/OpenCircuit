@@ -91,9 +91,10 @@ final class StrapLeadInRecordedReadersTests: XCTestCase {
     /// Nine strap nights (8 days ago … last night), with or without the 22:00–23:00 lead-in, and the same
     /// readings in both stores every 5 minutes: HR 58, HRV 60, breathing 14 asleep (last night HR 66, HRV
     /// 42), and HR 70, HRV 35, breathing 18 in the hour before sleep. Then last night is edited by hand:
-    /// its wake moved 30 min earlier, its in-bed start kept, so the EDITED window still starts where the
-    /// recorded one does (with a lead-in: at 22:00, the lead-in's start).
-    private func editedFixture(leadIn: Bool) throws -> (container: ModelContainer, store: LocalStore) {
+    /// its wake moved 30 min earlier, and its in-bed start kept, so the EDITED window still starts where
+    /// the recorded one does (with a lead-in: at 22:00, the lead-in's start), or (`movedBedtime`, a night
+    /// with a lead-in) moved 30 min later, the edited timeline keeping an awake start from there.
+    private func editedFixture(leadIn: Bool, movedBedtime: Bool = false) throws -> (container: ModelContainer, store: LocalStore) {
         let container = try makeContainer()
         let store = LocalStore(container.mainContext)
         for k in 0...8 {
@@ -112,13 +113,14 @@ final class StrapLeadInRecordedReadersTests: XCTestCase {
         try store.context.save()
         let row = try latest(store)
         let editedWake = wake(0).addingTimeInterval(-30 * 60)
-        let edited = strapSegments(bed: bed(0), end: editedWake, leadIn: leadIn ? leadInStart(0) : nil)
+        let editedBedtime = leadIn && movedBedtime ? leadInStart(0).addingTimeInterval(30 * 60) : row.inBedStart
+        let edited = strapSegments(bed: bed(0), end: editedWake, leadIn: leadIn ? editedBedtime : nil)
         XCTAssertTrue(try store.applySleepEdit(night: row.night,
-                                               times: SleepEdit.Times(inBedStart: row.inBedStart, sleepOnset: bed(0), sleepWake: editedWake),
+                                               times: SleepEdit.Times(inBedStart: editedBedtime, sleepOnset: bed(0), sleepWake: editedWake),
                                                summary: SleepStaging.summary(edited), hypnogram: edited))
         XCTAssertTrue(row.isManuallyEdited)
         XCTAssertEqual(row.inBedStart, leadIn ? leadInStart(0) : bed(0), "the recorded columns stay frozen")
-        XCTAssertEqual(row.editedInBedStart, row.inBedStart, "the edit kept the in-bed start")
+        XCTAssertEqual(row.editedInBedStart, editedBedtime)
         XCTAssertEqual(HelioSleepSelection.leadIn(in: SleepHypnogramCodec.decode(row.recordedHypnogramData)) != nil, leadIn)
         return (container, store)
     }
@@ -134,10 +136,12 @@ final class StrapLeadInRecordedReadersTests: XCTestCase {
     // MARK: 79a: an edited strap night's recorded columns
 
     func testAnEditedStrapNightsRecordedWindowIsReadWithoutTheRecordedLeadIn() throws {
-        let row = try latest(editedFixture(leadIn: true).store)
-        XCTAssertEqual(row.recordedSleepWindowStart(log: .strapOwnsAllTime), bed(0))
-        XCTAssertEqual(row.recordedSleepWindowInBedStart, bed(0))
-        XCTAssertEqual(VitalsStatusCardView.reportNight(row).inBedStart, bed(0))
+        for moved in [false, true] {
+            let row = try latest(editedFixture(leadIn: true, movedBedtime: moved).store)
+            XCTAssertEqual(row.recordedSleepWindowStart(log: .strapOwnsAllTime), bed(0), "bedtime moved: \(moved)")
+            XCTAssertEqual(row.recordedSleepWindowInBedStart, bed(0), "bedtime moved: \(moved)")
+            XCTAssertEqual(VitalsStatusCardView.reportNight(row).inBedStart, bed(0), "bedtime moved: \(moved)")
+        }
         // The same row unedited reads the same recorded window.
         let unedited = try latest(editedFixture(leadIn: true).store)
         unedited.isManuallyEdited = false
@@ -147,12 +151,16 @@ final class StrapLeadInRecordedReadersTests: XCTestCase {
 
     func testTheIllnessAlertReadsAnEditedNightWithoutItsRecordedLeadIn() async throws {
         let center = HealthNotificationCenter()
-        let readWith = await center.illnessNight(store: try editedFixture(leadIn: true).store, lastNotifiedNight: [:], defaults: defaults)
-        defaults.removePersistentDomain(forName: suite)
-        let readWithout = await center.illnessNight(store: try editedFixture(leadIn: false).store, lastNotifiedNight: [:], defaults: defaults)
-        let a = try XCTUnwrap(readWith), b = try XCTUnwrap(readWithout)
-        XCTAssertTrue(b.assessment.isSuspected, "last night's HR up and HRV down: the alert's own shape")
-        XCTAssertEqual(a.assessment, b.assessment)
+        for moved in [false, true] {
+            defaults.removePersistentDomain(forName: suite)
+            let readWith = await center.illnessNight(store: try editedFixture(leadIn: true, movedBedtime: moved).store,
+                                                     lastNotifiedNight: [:], defaults: defaults)
+            defaults.removePersistentDomain(forName: suite)
+            let readWithout = await center.illnessNight(store: try editedFixture(leadIn: false).store, lastNotifiedNight: [:], defaults: defaults)
+            let a = try XCTUnwrap(readWith), b = try XCTUnwrap(readWithout)
+            XCTAssertTrue(b.assessment.isSuspected, "last night's HR up and HRV down: the alert's own shape")
+            XCTAssertEqual(a.assessment, b.assessment, "bedtime moved: \(moved)")
+        }
     }
 
     func testVitalsStatusReadsAnEditedNightWithoutItsRecordedLeadIn() throws {
@@ -164,9 +172,11 @@ final class StrapLeadInRecordedReadersTests: XCTestCase {
                                                       fallbackRestingHR: nil, fallbackSpO2: nil, fallbackHRV: nil,
                                                       fallbackSkinTempOffsetC: nil)
         }
-        let a = try report(editedFixture(leadIn: true).store), b = try report(editedFixture(leadIn: false).store)
+        let b = try report(editedFixture(leadIn: false).store)
         XCTAssertNotNil(try XCTUnwrap(b?.signals.first { $0.vital == .overnightHRV }).baselineMean)
-        XCTAssertEqual(a, b)
+        for moved in [false, true] {
+            XCTAssertEqual(try report(editedFixture(leadIn: true, movedBedtime: moved).store), b, "bedtime moved: \(moved)")
+        }
     }
 
     func testTrendsVitalsReadAnEditedNightWithoutItsRecordedLeadIn() async throws {
@@ -174,31 +184,40 @@ final class StrapLeadInRecordedReadersTests: XCTestCase {
             let trends = await TrendsData.loadAsync(container: container, tempUnitRaw: TemperatureUnit.celsius.rawValue)
             return try XCTUnwrap(trends.points.first { calendar.isDate($0.date, inSameDayAs: day(0)) })
         }
-        let a = try await point(editedFixture(leadIn: true).container), b = try await point(editedFixture(leadIn: false).container)
+        let b = try await point(editedFixture(leadIn: false).container)
         XCTAssertEqual(b.sleepHRAvg, 66)
-        XCTAssertEqual(a.sleepHRAvg, b.sleepHRAvg)
-        XCTAssertEqual(a.sleepHRVAvg, b.sleepHRVAvg)
-        XCTAssertEqual(a.sleepRRAvg, b.sleepRRAvg)
+        for moved in [false, true] {
+            let a = try await point(editedFixture(leadIn: true, movedBedtime: moved).container)
+            XCTAssertEqual(a.sleepHRAvg, b.sleepHRAvg, "bedtime moved: \(moved)")
+            XCTAssertEqual(a.sleepHRVAvg, b.sleepHRVAvg, "bedtime moved: \(moved)")
+            XCTAssertEqual(a.sleepRRAvg, b.sleepRRAvg, "bedtime moved: \(moved)")
+        }
     }
 
     func testTheStrapNapWindowsReadAnEditedNightWithoutItsRecordedLeadIn() throws {
-        let store = try editedFixture(leadIn: true).store
-        let windows = store.storedNightWindows(from: bed(0), to: wake(0))
-        XCTAssertTrue(windows.contains(DateInterval(start: bed(0), end: wake(0))), "the recorded window, from its sleep")
-        XCTAssertTrue(windows.contains(DateInterval(start: leadInStart(0), end: wake(0).addingTimeInterval(-30 * 60))),
-                      "the edited window, whole")
-        XCTAssertFalse(windows.contains(DateInterval(start: leadInStart(0), end: wake(0))))
+        for moved in [false, true] {
+            let store = try editedFixture(leadIn: true, movedBedtime: moved).store
+            let windows = store.storedNightWindows(from: bed(0), to: wake(0))
+            XCTAssertTrue(windows.contains(DateInterval(start: bed(0), end: wake(0))), "the recorded window, from its sleep (moved: \(moved))")
+            let editedStart = leadInStart(0).addingTimeInterval(moved ? 30 * 60 : 0)
+            XCTAssertTrue(windows.contains(DateInterval(start: editedStart, end: wake(0).addingTimeInterval(-30 * 60))),
+                          "the edited window, whole (moved: \(moved))")
+            XCTAssertFalse(windows.contains(DateInterval(start: leadInStart(0), end: wake(0))), "moved: \(moved)")
+        }
     }
 
     /// The edited window is the person's own: the readers of the CURRENT window (the Sleep card's overnight
     /// averages, the headache HRV and bedtime) read it from its start, lead-in shape or not.
     func testTheEditedWindowIsNeverTrimmed() throws {
-        let row = try latest(editedFixture(leadIn: true).store)
-        let night = try XCTUnwrap(SleepCardView.selectNight(liveSegments: [], stored: row))
-        XCTAssertEqual(night.inBedStart, leadInStart(0))
-        XCTAssertEqual(SleepCardView.overnightWindow(for: night, latest: row)?.start, leadInStart(0))
-        XCTAssertEqual(HeadacheNightRow(row).inBedStart, leadInStart(0))
-        XCTAssertEqual(row.sleepWindowStart(from: row.sleepEditCurrentInBedStart), leadInStart(0))
+        for moved in [false, true] {
+            let row = try latest(editedFixture(leadIn: true, movedBedtime: moved).store)
+            let editedStart = leadInStart(0).addingTimeInterval(moved ? 30 * 60 : 0)
+            let night = try XCTUnwrap(SleepCardView.selectNight(liveSegments: [], stored: row))
+            XCTAssertEqual(night.inBedStart, editedStart, "moved: \(moved)")
+            XCTAssertEqual(SleepCardView.overnightWindow(for: night, latest: row)?.start, editedStart, "moved: \(moved)")
+            XCTAssertEqual(HeadacheNightRow(row).inBedStart, editedStart, "moved: \(moved)")
+            XCTAssertEqual(row.sleepWindowStart(from: row.sleepEditCurrentInBedStart), editedStart, "moved: \(moved)")
+        }
     }
 
     // MARK: 79b: only a strap night has a lead-in
