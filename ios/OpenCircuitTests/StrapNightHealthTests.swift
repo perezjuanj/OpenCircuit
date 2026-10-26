@@ -2393,8 +2393,11 @@ extension StrapNightHealthTests {
     /// One strap sync at `now` delivering each of `sessions` as its own session record and the activity
     /// minutes `activity` (contiguous spans of local hours, each one kind), through the production path.
     /// `temperatureFrom`: skin temperature minutes from that local hour to `now`.
+    /// `noHeartRateBefore` (decision 77, merge of #329): minutes before that local hour carry the strap's
+    /// "no reading" heart-rate byte, so the night gets no in-bed lead-in from the stored heart rate.
     private func syncWithActivity(_ sessions: [[(Double, Double, UInt8)]], activity: [(Double, Double, UInt8)],
-                                  temperatureFrom: Double? = nil, at now: Date, store: LocalStore) throws -> HelioSyncResult {
+                                  temperatureFrom: Double? = nil, at now: Date, store: LocalStore,
+                                  noHeartRateBefore: Double? = nil) throws -> HelioSyncResult {
         clock = now
         let device = makeStrap(sessions[0])
         device.fetchData[.sleepSession] = (stamp(hour(0).timeIntervalSince1970 - 86_400), sessions.flatMap(session))
@@ -2404,7 +2407,10 @@ extension StrapNightHealthTests {
         }
         if let first = activity.first {
             let bytes = activity.flatMap { span in
-                (0..<Int(((span.1 - span.0) * 60).rounded())).flatMap { _ in [span.2, 0x08, 0, 55, 0, 0, 0, 0] as [UInt8] }
+                (0..<Int(((span.1 - span.0) * 60).rounded())).flatMap { i -> [UInt8] in
+                    let worn = noHeartRateBefore.map { span.0 + Double(i) / 60 >= $0 - 1e-9 } ?? true
+                    return [span.2, 0x08, 0, worn ? 55 : 0, 0, 0, 0, 0]
+                }
             }
             device.fetchData[.activity] = (stamp(hour(first.0).timeIntervalSince1970), bytes)
         }
@@ -2616,7 +2622,7 @@ extension StrapNightHealthTests {
             let store = try makeStore()
             let nextNight: [(Double, Double, UInt8)] = [(23, 31, light)]
             let synced = try syncWithActivity([nextNight], activity: [(-1, 6, asleepKind), (6, 23, upKind), (23, 32, upKind)],
-                                              at: hour(32), store: store)
+                                              at: hour(32), store: store, noHeartRateBefore: 23)
             XCTAssertEqual(try rows(store).map { DateInterval(start: $0.inBedStart, end: $0.inBedEnd) },
                            [DateInterval(start: hour(23), end: hour(31))], "no night for the block")
             XCTAssertEqual(try napRows(store), [], "no nap")

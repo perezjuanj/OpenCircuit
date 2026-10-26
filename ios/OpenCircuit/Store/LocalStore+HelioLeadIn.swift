@@ -63,21 +63,30 @@ extension LocalStore {
                                       steps: walked, earliest: earliest)
     }
 
-    /// Decision 77c: the latest end, at or before `instant`, of any sleep the store keeps (a night or
-    /// nap of either device, its recorded or edited window) or of `sleeps`; `.distantPast` when none.
+    /// Decision 77c: where the lead-in before `instant` (a night's first in-bed start) must stop: the
+    /// latest end, at or before `instant`, of any stored night (either device, its recorded or edited
+    /// window), and, for a stored nap (either device) or one of `sleeps` that starts before `instant`,
+    /// its end or `instant`, whichever is earlier. A nap that runs into the in-bed start (one the night
+    /// is about to absorb and prune) leaves no room for a lead-in over it (77j: a lead-in never lies
+    /// over a nap). A stored night that runs into `instant` is this night's own earlier copy and is
+    /// not a sleep before it. `.distantPast` when none.
     func helioLatestSleepEnd(atOrBefore instant: Date, sleeps: [DateInterval] = []) -> Date {
         // Rows are keyed by the day they end on, naps by their start: two days back reaches every
         // sleep that can end within `maxLength` of `instant`.
         let lo = instant.addingTimeInterval(-2 * 86_400)
-        var ends = sleeps.map(\.end)
+        var ends: [Date] = []
         for row in (try? sleepSummaries(from: lo, to: instant.addingTimeInterval(86_400))) ?? [] {
             if row.inBedEnd > row.inBedStart { ends.append(row.inBedEnd) }
             if row.isManuallyEdited, row.editedInBedEnd > row.editedInBedStart { ends.append(row.editedInBedEnd) }
         }
+        ends = ends.filter { $0 <= instant }
+        var napSpans = sleeps
         for nap in (try? naps(from: lo, to: instant)) ?? [] {
-            ends.append(max(nap.end, nap.effectiveEnd))
+            let start = min(nap.start, nap.effectiveStart), end = max(nap.end, nap.effectiveEnd)
+            if end > start { napSpans.append(DateInterval(start: start, end: end)) }
         }
-        return ends.filter { $0 <= instant }.max() ?? .distantPast
+        ends += napSpans.filter { $0.start < instant }.map { min($0.end, instant) }
+        return ends.max() ?? .distantPast
     }
 }
 
@@ -99,4 +108,14 @@ extension StoredSleepSummary {
 
     /// `sleepWindowStart(from: inBedStart)`: the recorded in-bed start without a strap night's lead-in.
     var sleepWindowInBedStart: Date { sleepWindowStart(from: inBedStart) }
+}
+
+extension LocalStore {
+    /// Decision 77j: where a night saved with `hypnogram` over `inBedStart…inBedEnd` starts for NEARNESS
+    /// (76l's prune): the in-bed start without a strap night's lead-in, else `inBedStart`. A night with
+    /// no lead-in (the ring's, any night before decision 77) gives `inBedStart`.
+    nonisolated static func sleepStartForNearness(hypnogram: [SleepSegment], inBedStart: Date, inBedEnd: Date) -> Date {
+        guard inBedEnd > inBedStart else { return inBedStart }
+        return HelioSleepSelection.windowWithoutLeadIn(hypnogram, window: DateInterval(start: inBedStart, end: inBedEnd)).start
+    }
 }

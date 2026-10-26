@@ -516,7 +516,12 @@ final class HelioStoreSink: HelioHistorySink {
             // build, or before the heart rate was stored), it goes on WITHOUT a lead-in, exactly as
             // before decision 77, so the card and Health keep agreeing; any other start-only
             // difference is kept out below (28f, 58b). Only an extension (58b) takes its lead-in along.
-            let withLeadIn = store.helioWithLeadIn(filled, sleeps: nights.map(\.window), device: timeline)
+            // Decision 77j: the clamp also takes this sync's activity-block sleeps that may be naps (more
+            // than `napGap` before the night's sleep; a closer one is never a nap, 76b), so the lead-in
+            // stops at the end of a block nap `storeNaps` is about to judge, never swallowing it.
+            let blockNaps = join.aloneNights.map(\.window)
+                .filter { staged.window.start.timeIntervalSince($0.end) > HelioSleepSelection.napGap }
+            let withLeadIn = store.helioWithLeadIn(filled, sleeps: nights.map(\.window) + blockNaps, device: timeline)
             var night = withLeadIn
             // Decision 28f stitches sessions 60 min or less apart into one night, and decision 71b
             // (#278) the overnight sleeps of one night key whatever the gap, so a night can grow after

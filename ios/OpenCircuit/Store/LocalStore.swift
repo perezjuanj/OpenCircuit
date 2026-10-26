@@ -2180,7 +2180,12 @@ struct LocalStore {
         // samples out of the span the fresh night write covers.
         // Decision 76l (#327): a STRAP night also prunes the strap's own auto naps within 60 min of it,
         // whatever order the syncs ran in. The ring's nights prune by overlap only, as before.
-        pruneAutoNaps(overlapping: inBedStart, inBedEnd, night: dayStart,
+        // Decision 77j (#328): nearness (the overlap and the 60 min) is measured from the strap night's
+        // SLEEP, never its in-bed lead-in, which stops at the end of every nap (77c): a lead-in ending at
+        // a nap's end never prunes it. A night without a lead-in (every ring night) is judged as before.
+        let napNearnessStart = family == .zeppOS
+            ? Self.sleepStartForNearness(hypnogram: extras.hypnogram, inBedStart: inBedStart, inBedEnd: inBedEnd) : inBedStart
+        pruneAutoNaps(overlapping: napNearnessStart, inBedEnd, night: dayStart,
                       strapProximity: family == .zeppOS ? Self.strapNapProximity : 0)
         return existingRow == nil ? .inserted : .updated
     }
@@ -3281,8 +3286,9 @@ struct LocalStore {
         // Persistence-layer backstop mirroring the manual path's: a nap overlapping a STORED night
         // is that night's sleep counted twice. `NapDetection` excludes only overnight sleep blocks
         // it can see, so a morning bout the archive-union staging absorbed into the night (🟢
-        // 2026-08-16 device case; review find) is kept out here.
-        if overlapsStoredNight(start, end) { return }
+        // 2026-08-16 device case; review find) is kept out here. Decision 77j: judged against the
+        // night's SLEEP, so a nap the lead-in stopped at is stored (one rule with `naps` and the prune).
+        if overlapsStoredNight(start, end, sleepOnly: true) { return }
         // Decision 28: a nap in time the other device owned is not this device's to store.
         let log = Self.ownershipLog()
         if log.owner(at: DeviceOwnershipLog.midpoint(start, end)) != family { return }
@@ -3573,7 +3579,11 @@ struct LocalStore {
     /// Health. Checks the RECORDED in-bed window and, for an edited night, the user's edited window
     /// too (either overlap double-counts on screen). Nearby nights only — a nap and its night are
     /// within a calendar day of each other by construction.
-    private func overlapsStoredNight(_ start: Date, _ end: Date) -> Bool {
+    ///
+    /// `sleepOnly` (decision 77j, the auto-nap path `saveNap`): a strap night's recorded window is taken
+    /// without its in-bed lead-in (`sleepWindowInBedStart`), as the nap judgement and 76l's prune take
+    /// it. A manual add or edit (`false`) still keeps out of the whole recorded window, lead-in included.
+    private func overlapsStoredNight(_ start: Date, _ end: Date, sleepOnly: Bool = false) -> Bool {
         guard end > start else { return false }
         let lo = Calendar.current.date(byAdding: .day, value: -2, to: start) ?? start
         let hi = Calendar.current.date(byAdding: .day, value: 2, to: end) ?? end
@@ -3581,8 +3591,9 @@ struct LocalStore {
             predicate: #Predicate { $0.night >= lo && $0.night <= hi })
         let rows = (try? context.fetch(d)) ?? []
         return rows.contains { row in
+            let recordedStart = sleepOnly ? row.sleepWindowInBedStart : row.inBedStart
             if row.inBedEnd > row.inBedStart,
-               start < row.inBedEnd && end > row.inBedStart { return true }
+               start < row.inBedEnd && end > recordedStart { return true }
             if row.isManuallyEdited, row.editedInBedEnd > row.editedInBedStart,
                start < row.editedInBedEnd && end > row.editedInBedStart { return true }
             return false

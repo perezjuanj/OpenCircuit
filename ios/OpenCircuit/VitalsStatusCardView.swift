@@ -161,13 +161,13 @@ struct VitalsStatusCardView: View {
         }
     }
 
-    /// The nights half of `currentDeviceRows`.
     /// One stored night as `computeReport` reads it. Decision 77h: its sleep window, so a strap night's
     /// in-bed lead-in is never averaged as overnight HRV.
     static func reportNight(_ row: StoredSleepSummary) -> (night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date) {
         (night: row.night, skinTempC: row.skinTempC, inBedStart: row.sleepWindowInBedStart, inBedEnd: row.inBedEnd)
     }
 
+    /// The nights half of `currentDeviceRows`.
     static func ownNights(_ nights: [StoredSleepSummary], log: DeviceOwnershipLog) -> [StoredSleepSummary] {
         guard !log.isEmpty else { return nights }
         let device = log.currentFamily
