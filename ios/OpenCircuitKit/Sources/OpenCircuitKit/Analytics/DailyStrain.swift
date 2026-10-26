@@ -16,7 +16,7 @@
 //   - readings outside `LiveHR.validBPM` are dropped, as `RestingHR` does.
 //
 // Inputs, and why:
-//   maxHR     — `220 − age`, the convention every other HR-zone estimate here uses
+//   maxHR     — `220 − age` (or the max HR the user typed), the convention every other HR-zone estimate here uses
 //               (`Calories.dailyEstimate`, the workout recorder).
 //   restingHR — the day's `RestingHR` value, the same number the Resting HR tile shows, so the two
 //               tiles never disagree about the person's floor.
@@ -124,10 +124,12 @@ public enum DailyStrain {
     ///
     /// - Parameters:
     ///   - hr: heart-rate readings; anything outside `window` is ignored.
-    ///   - age: for `maxHR = 220 − age`.
+    ///   - age: for `maxHR = 220 − age` (Automatic).
+    ///   - manualMaxHR: the max HR the user typed, replacing the formula (decision 83c).
     ///   - restingHR: the day's resting HR in bpm, or nil when none is known (then there's no score).
-    public static func reading(hr: [HRSample], window: DateInterval, age: Int, restingHR: Double?) -> Reading {
-        let maxHR = max(220 - age, 1)
+    public static func reading(hr: [HRSample], window: DateInterval, age: Int, restingHR: Double?,
+                               manualMaxHR: Int? = nil) -> Reading {
+        let maxHR = MaxHeartRate.resolve(age: age, manual: manualMaxHR)
         let rhr = restingHR.flatMap { $0.isFinite && $0 > 0 ? Int($0.rounded()) : nil }
         let bpms = perSecondBPMs(hr, window: window)
         let latest = hr

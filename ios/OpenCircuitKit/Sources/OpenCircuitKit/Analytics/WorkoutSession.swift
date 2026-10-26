@@ -2,15 +2,9 @@
 // session aggregation. No HealthKit or CoreLocation imports; all app-framework concerns
 // stay in the app target.
 //
-// Zone boundaries match the APK's SportRecordModel / "Exercise Heart Rate" screen
-// (pp.txt:0x515c0, confirmed):
-//   Warm-up       50–60% of maxHR  (data below 50% not counted — APK note)
-//   Fat burning   61–70% of maxHR
-//   Aerobic       71–80% of maxHR
-//   Anaerobic     81–90% of maxHR
-//   Extreme       91–100% of maxHR
-//
-// maxHR = 220 − age  (APK pp.txt:0x515c0 calculation formula).
+// Zones are "Zone 1" … "Zone 5". Where each starts comes from `HeartRateZones` (decision 83: % of
+// max heart rate 50/60/70/80/90 by default, % of reserve, or custom bounds); data below zone 1's
+// lower bound is not counted. Max heart rate is `220 − age` unless the user typed one.
 //
 // Live-HR (#45) WARNING: The 0x95→0x15 live-HR path is best-effort — it has no
 // background-refresh and on-demand polling often misses updates. A long workout
@@ -100,24 +94,19 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
 
 // MARK: - HR Zones
 
-/// Five HR zones matching the APK's SportRecordModel zone schema.
-/// "Below zone" (< 50% maxHR) is NOT counted per the APK description.
+/// The five heart-rate zones. They are named "Zone 1" … "Zone 5" everywhere (decision 83a); the case
+/// names are historical (they match the stored `WorkoutZoneBreakdown` fields and must not change
+/// without a migration). Where a zone starts is NOT a property of the zone: it comes from the user's
+/// `HeartRateZones`.
 public enum HRZone: Int, CaseIterable, Sendable {
-    case warmUp    = 1   // 50–60%
-    case fatBurn   = 2   // 61–70%
-    case aerobic   = 3   // 71–80%
-    case anaerobic = 4   // 81–90%
-    case extreme   = 5   // 91–100%
+    case warmUp    = 1
+    case fatBurn   = 2
+    case aerobic   = 3
+    case anaerobic = 4
+    case extreme   = 5
 
-    public var displayName: String {
-        switch self {
-        case .warmUp:    return "Warm-up"
-        case .fatBurn:   return "Fat Burning"
-        case .aerobic:   return "Aerobic"
-        case .anaerobic: return "Anaerobic"
-        case .extreme:   return "Extreme"
-        }
-    }
+    /// "Zone 1" … "Zone 5".
+    public var displayName: String { "Zone \(rawValue)" }
 
     /// Color token names (used in the app UI; resolved in SwiftUI).
     public var colorName: String {
@@ -129,28 +118,6 @@ public enum HRZone: Int, CaseIterable, Sendable {
         case .extreme:   return "zoneRed"
         }
     }
-
-    /// Percentage LOWER bound (inclusive) of this zone, as a fraction of maxHR.
-    public var lowerFraction: Double {
-        switch self {
-        case .warmUp:    return 0.50
-        case .fatBurn:   return 0.61
-        case .aerobic:   return 0.71
-        case .anaerobic: return 0.81
-        case .extreme:   return 0.91
-        }
-    }
-
-    /// Percentage UPPER bound (inclusive) of this zone, as a fraction of maxHR.
-    public var upperFraction: Double {
-        switch self {
-        case .warmUp:    return 0.60
-        case .fatBurn:   return 0.70
-        case .aerobic:   return 0.80
-        case .anaerobic: return 0.90
-        case .extreme:   return 1.00
-        }
-    }
 }
 
 // MARK: - Zone classifier
@@ -158,15 +125,17 @@ public enum HRZone: Int, CaseIterable, Sendable {
 /// Pure functions for HR zone classification and time-in-zone accumulation.
 public enum HRZoneClassifier {
 
-    /// Classify a single BPM reading against maxHR, returning the zone (or nil if
-    /// below 50% of maxHR — per APK, sub-50% readings are not counted in zone distribution).
+    /// Classify a single BPM reading against the user's zones, returning the zone (or nil below
+    /// zone 1's lower bound: those readings are not counted in the zone distribution, 83e).
+    public static func zone(bpm: Int, zones: HeartRateZones) -> HRZone? {
+        zones.zone(bpm: bpm)
+    }
+
+    /// The default zones (50/60/70/80/90 % of `maxHR`). For code that has only a max heart rate; the
+    /// app always classifies with the user's `HeartRateZones`.
     public static func zone(bpm: Int, maxHR: Int) -> HRZone? {
-        guard maxHR > 0, bpm > 0 else { return nil }
-        let frac = Double(bpm) / Double(maxHR)
-        for zone in HRZone.allCases.reversed() {
-            if frac >= zone.lowerFraction { return zone }
-        }
-        return nil   // below 50% — not counted
+        guard maxHR > 0 else { return nil }
+        return zone(bpm: bpm, zones: HeartRateZones(percentOfMax: maxHR))
     }
 
     /// Accumulate time (seconds) spent in each zone from a list of timestamped HR samples.
@@ -176,16 +145,21 @@ public enum HRZoneClassifier {
     /// (end - start), defaulting to 0 if end == start (instantaneous reading).
     public static func timeInZones(
         hrSamples: [HRSample],
-        maxHR: Int
+        zones: HeartRateZones
     ) -> WorkoutZoneBreakdown {
         var seconds = [HRZone: Double]()
         for z in HRZone.allCases { seconds[z] = 0 }
         for sample in hrSamples {
             let dur = sample.end.timeIntervalSince(sample.start)
-            guard dur > 0, let zone = zone(bpm: sample.bpm, maxHR: maxHR) else { continue }
+            guard dur > 0, let zone = zones.zone(bpm: sample.bpm) else { continue }
             seconds[zone, default: 0] += dur
         }
         return WorkoutZoneBreakdown(secondsInZone: seconds)
+    }
+
+    /// `timeInZones` over the default zones for `maxHR`.
+    public static func timeInZones(hrSamples: [HRSample], maxHR: Int) -> WorkoutZoneBreakdown {
+        timeInZones(hrSamples: hrSamples, zones: HeartRateZones(percentOfMax: max(maxHR, 1)))
     }
 
     /// Default cap for a single reading's held interval (seconds). The sport stream lands ~every 10 s,
@@ -202,11 +176,11 @@ public enum HRZoneClassifier {
     /// Every held interval is CAPPED at `maxGapSeconds` (default `defaultHoldCapSeconds`) so a real
     /// dropout is never fabricated into zone time — the total stays honest: ≈ the workout duration when
     /// HR is continuous, and legitimately less when readings were actually missed. Time before the
-    /// first reading is not attributed (no zone is assumed before any data). Sub-50%-maxHR readings
+    /// first reading is not attributed (no zone is assumed before any data). Readings below zone 1
     /// contribute no zone time. Samples are sorted by start; pure and unit-testable.
     public static func timeInZonesHeld(
         hrSamples: [HRSample],
-        maxHR: Int,
+        zones: HeartRateZones,
         sessionEnd: Date,
         maxGapSeconds: Double = defaultHoldCapSeconds
     ) -> WorkoutZoneBreakdown {
@@ -216,10 +190,23 @@ public enum HRZoneClassifier {
         for (i, sample) in sorted.enumerated() {
             let nextAnchor = (i + 1 < sorted.count) ? sorted[i + 1].start : sessionEnd
             let held = min(max(nextAnchor.timeIntervalSince(sample.start), 0), maxGapSeconds)
-            guard held > 0, let zone = zone(bpm: sample.bpm, maxHR: maxHR) else { continue }
+            guard held > 0, let zone = zones.zone(bpm: sample.bpm) else { continue }
             seconds[zone, default: 0] += held
         }
         return WorkoutZoneBreakdown(secondsInZone: seconds)
+    }
+}
+
+extension HRZoneClassifier {
+    /// `timeInZonesHeld` over the default zones for `maxHR`.
+    public static func timeInZonesHeld(
+        hrSamples: [HRSample],
+        maxHR: Int,
+        sessionEnd: Date,
+        maxGapSeconds: Double = defaultHoldCapSeconds
+    ) -> WorkoutZoneBreakdown {
+        timeInZonesHeld(hrSamples: hrSamples, zones: HeartRateZones(percentOfMax: max(maxHR, 1)),
+                        sessionEnd: sessionEnd, maxGapSeconds: maxGapSeconds)
     }
 }
 
@@ -263,7 +250,7 @@ public struct WorkoutZoneBreakdown: Equatable, Codable, Sendable {
         }
     }
 
-    /// Total zone-counted seconds (excludes below-50% / not-in-zone intervals).
+    /// Total zone-counted seconds (excludes intervals below zone 1).
     public var totalZoneSeconds: Double {
         warmUpSeconds + fatBurnSeconds + aerobicSeconds + anaerobicSeconds + extremeSeconds
     }
@@ -311,8 +298,8 @@ public struct WorkoutSummary: Equatable, Codable, Sendable {
     /// Steps counted by the ring during the workout (native sport-mode `0x4e` stream, #90).
     /// nil when the workout wasn't recorded in native sport mode (e.g. the legacy live-HR path).
     public let steps: Int?
-    /// True when the user's max HR (220 − age) was used for zone calculations.
-    /// Always true for this implementation (formula from APK).
+    /// True when the max HR the zones were drawn with was the `220 − age` formula, false when the user
+    /// had typed one.
     public let usedFormulaMaxHR: Bool
 
     public init(
@@ -353,14 +340,16 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
 
     private var samples: [HRSample] = []
     private let startDate: Date
-    private let formulaMaxHR: Int
+    private let zones: HeartRateZones
 
     /// - Parameters:
     ///   - startDate: When the session started (wall clock).
-    ///   - userAge: Used to compute maxHR = 220 − age (APK formula). Must be > 0.
-    public init(startDate: Date, userAge: Int) {
+    ///   - userAge: The age behind the default zones (Automatic max HR, % of max) when `zones` is nil.
+    ///   - zones: The user's zones (`HeartRateZoneSettings` resolved for this workout). The app always
+    ///     passes them; nil is the default zones for `userAge`.
+    public init(startDate: Date, userAge: Int, zones: HeartRateZones? = nil) {
         self.startDate = startDate
-        self.formulaMaxHR = max(220 - max(userAge, 1), 1)
+        self.zones = zones ?? HeartRateZones(percentOfMax: MaxHeartRate.automatic(age: max(userAge, 1)))
     }
 
     /// Record a decoded HR reading. `start` and `end` should bound the interval the
@@ -423,8 +412,8 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
             : nil
         estimatedKcal = [hrKcal, distKcal].compactMap { $0 }.max()
 
-        let zones = HRZoneClassifier.timeInZonesHeld(
-            hrSamples: samples, maxHR: formulaMaxHR, sessionEnd: endDate)
+        let breakdown = HRZoneClassifier.timeInZonesHeld(
+            hrSamples: samples, zones: zones, sessionEnd: endDate)
         return WorkoutSummary(
             sport: sport,
             startDate: startDate,
@@ -432,12 +421,12 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
             avgHR: avgHR,
             maxHR: maxHRValue,
             estimatedActiveKcal: estimatedKcal,
-            zoneBreakdown: zones,
+            zoneBreakdown: breakdown,
             distanceMeters: distanceMeters,
             hasRoute: hasRoute,
             hrSampleCount: samples.count,
             steps: steps,
-            usedFormulaMaxHR: true
+            usedFormulaMaxHR: zones.maxHRIsAutomatic
         )
     }
 
