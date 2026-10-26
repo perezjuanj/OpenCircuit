@@ -100,6 +100,22 @@ stores and writes what it measured for time it owned:
     that owned its start (the strap). A nap never displaces a night: naps are judged after the
     sync's nights are stored, `saveNap` refuses one that overlaps a stored night, and a night stored
     later prunes an auto nap it overlaps, so the ring's night after a switch is kept either way;
+  - strap naps from the activity minutes (decision 76, #327): the strap writes no `0x48` record for
+    a daytime nap, only kind-sleep (`0x78`) minutes. An activity sleep block (decision 73, below)
+    that joins no night is a nap candidate like the sleeps above, through the same rule: 20 min or
+    longer, more than 60 min from every main sleep, settled 60 min after its end (and not still
+    going on, 73d), owned wholly by the strap. A block within 60 min after a night's last record
+    joins the night; one within 60 min before a record belongs to it and is no nap; one that is the
+    00:00–08:00 main sleep of a night no stored night covers is stored nowhere (an activity-only
+    night is out of scope) and counted (`mainOnlyBlocks`). The nap is a `StoredNap` like any strap
+    nap (`saveHelioNap`): one `.inBed` envelope over the block, its sleep minutes as generic sleep
+    (`.asleepCore`, the SPEC-GAP mapping), an awake gap of up to 5 min left a gap, no score, written
+    by the same `flushNaps`. Every sync re-derives it from the minutes it fetched; a nap holding a
+    block that a stored auto nap at the same start already covers is left exactly as stored (a
+    re-derivation from fewer minutes never shrinks a nap Apple Health holds, which would re-arm it
+    and delete what was written), and one whose start moved overlaps the stored nap and is not
+    stored (`otherNapOverlaps`). Not recovered: a nap before the last night's end (no longer
+    re-fetched);
   - a strap night already written to Health stands against anything that does not extend it (#225,
     narrowed by decision 58b, #274): a later night for its key replaces it only when it overlaps the
     written span and ends at least 10 min later (`LocalStore.strapNightExtends`). That one is stored
@@ -132,9 +148,9 @@ stores and writes what it measured for time it owned:
     and is used ONLY when it joins a night that holds a session record and starts at or after the
     in-bed end of that night's LAST session (no lead-in, nothing between records: 73f, 73i). A block never costs a night (73g):
     if the night it would make fails the overnight gates or is longer than 20 h while the sessions
-    alone make an overnight sleep, the sessions' night is kept and the block counted alone; one that would stand alone
-    (a daytime sleep, an evening doze, a night with no record) is stored as nothing, neither night
-    nor nap, and only counted in the sleep-round diagnostics line. A block whose last sleep minute
+    alone make an overnight sleep, the sessions' night is kept and the block counted alone. One that
+    stands alone (a daytime sleep, an evening doze, a night with no record) is never a night; since
+    decision 76 (#327) it is judged as a strap nap (next item). A block whose last sleep minute
     is less than 20 min before the sync's newest activity minute may still be going on and waits
     for the next sync. No new write path: the joined night overlaps the written night and ends
     later, so it is a 58b extension, rewritten once (write first, union delete), and a night not
