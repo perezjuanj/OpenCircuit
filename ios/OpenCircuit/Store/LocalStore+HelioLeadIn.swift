@@ -71,14 +71,15 @@ extension LocalStore {
     /// over a nap). A stored night that runs into `instant` is this night's own earlier copy and is
     /// not a sleep before it. `.distantPast` when none.
     ///
-    /// Known limit, documented and not fixed in this PR (ZEPP_PROTOCOL.md §21.6): the clamp applies when
-    /// the night is derived. A night stored BEFORE the sync that first sees a nap more than 60 min before
-    /// its sleep onset keeps the lead-in it was stored with while it is not re-delivered changed (the
-    /// merge keeps the stored copy, which has more time in bed), so the lead-in can lie over that nap by
-    /// up to the clamp difference (at most the 120 min cap): in Health an `inBed` overlap and an `awake`
-    /// sample over the nap's asleep one, asleep time not counted twice. It converges when the night comes
-    /// back changed enough for the merge to replace it. Rare on the production fetch: a session nap comes
-    /// with any later sync of the night, and a block nap with the night's own activity round.
+    /// The clamp applies when the night is derived. A night stored BEFORE the sync that first sees a nap
+    /// more than 60 min before its sleep onset was stored with a lead-in over that nap; the next
+    /// re-delivery replaces it while the night is not in Apple Health (decision 79e,
+    /// `helioStoredLeadInIsStale`). Known limit, documented and not fixed (ZEPP_PROTOCOL.md §21.6): a
+    /// night already WRITTEN keeps that lead-in (77f, forward-only), so it can lie over the nap by up to
+    /// the clamp difference (at most the 120 min cap): in Health an `inBed` overlap and an `awake` sample
+    /// over the nap's asleep one, asleep time not counted twice. It converges only when the night comes
+    /// back extended (58b). Rare on the production fetch: a session nap comes with any later sync of the
+    /// night, and a block nap with the night's own activity round.
     func helioLatestSleepEnd(atOrBefore instant: Date, sleeps: [DateInterval] = []) -> Date {
         // Rows are keyed by the day they end on, naps by their start: two days back reaches every
         // sleep that can end within `maxLength` of `instant`.
@@ -96,6 +97,33 @@ extension LocalStore {
         }
         ends += napSpans.filter { $0.start < instant }.map { min($0.end, instant) }
         return ends.max() ?? .distantPast
+    }
+}
+
+extension LocalStore {
+    /// Decision 79e (#331 item 1): whether `night` (`sleep` with its lead-in) replaces the stored copy of
+    /// its night instead of going to the merge: only while the night is NOT written to Apple Health
+    /// (`writtenNightSpan(for: sleep)`; a written night is left as 77f leaves it) and only a stored copy
+    /// with a stale lead-in (`helioStoredLeadInIsStale`).
+    func helioReplacesStoredCopy(with night: HelioSleepSelection.Night, sleep: HelioSleepSelection.Night) -> Bool {
+        writtenNightSpan(for: sleep) == nil && helioStoredLeadInIsStale(for: night)
+    }
+
+    /// Decision 79e: whether the stored copy of `night` (the row its window overlaps) is the
+    /// same night with a lead-in that starts EARLIER than `night`'s: an unedited strap night whose sleep
+    /// window (its window without its lead-in) is `night`'s, within a second, stored with a lead-in from
+    /// before `night`'s start. That copy was stored before a nap that now clamps the lead-in (77c), and
+    /// the merge would keep it (the same sleep, more time in bed). False for every other stored row: a
+    /// different sleep window goes to the merge as before.
+    func helioStoredLeadInIsStale(for night: HelioSleepSelection.Night) -> Bool {
+        guard let row = try? sleepSummaryOverlapping(start: night.window.start, end: night.window.end),
+              !row.isManuallyEdited, row.isStrapNight(log: Self.ownershipLog()), row.inBedStart < night.window.start
+        else { return false }
+        let sleep = HelioSleepSelection.windowWithoutLeadIn(SleepHypnogramCodec.decode(row.hypnogramData),
+                                                            window: DateInterval(start: row.inBedStart, end: row.inBedEnd))
+        let incoming = night.windowWithoutLeadIn
+        return sleep.start > row.inBedStart
+            && abs(sleep.start.timeIntervalSince(incoming.start)) <= 1 && abs(sleep.end.timeIntervalSince(incoming.end)) <= 1
     }
 }
 

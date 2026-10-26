@@ -126,8 +126,12 @@ extension LocalStore {
 
     /// Store one of the strap's staged nights, with its nightly skin temperature judged exactly as
     /// the ring's (`SkinTempBaseline.nightlyVerdict` over the stored, gated readings in the window).
+    ///
+    /// `replacingStoredCopy` (decision 79e): the stored copy of this night is replaced, not merged
+    /// (`helioStoredLeadInIsStale`).
     @discardableResult
-    func saveHelioNight(_ night: HelioSleepSelection.Night, device: SyncDeviceID) throws -> SleepPersistOutcome {
+    func saveHelioNight(_ night: HelioSleepSelection.Night, device: SyncDeviceID,
+                        replacingStoredCopy: Bool = false) throws -> SleepPersistOutcome {
         let segments = night.segments
         let window = night.window
         var extras = SleepNightExtras()
@@ -148,7 +152,7 @@ extension LocalStore {
                                     night: SleepNightKey.night(inBedStart: window.start, inBedEnd: window.end),
                                     inBedStart: window.start, inBedEnd: window.end,
                                     sleepOnset: sleep?.onset ?? .distantPast, sleepWake: sleep?.wake ?? .distantPast,
-                                    extras: extras, device: device)
+                                    extras: extras, device: device, replacingStoredCopy: replacingStoredCopy)
     }
 
     /// The span of the night already mirrored to Apple Health under `night`'s key (`mirrorSettledNight`
@@ -561,7 +565,13 @@ final class HelioStoreSink: HelioHistorySink {
             }
             let before = (try? store.sleepSummaryOverlapping(start: night.window.start, end: night.window.end))
                 .map { DateInterval(start: $0.inBedStart, end: max($0.inBedStart, $0.inBedEnd)) }
-            let outcome = try store.saveHelioNight(night, device: timeline)
+            // Decision 79e (#331 item 1): a night stored before the sync that first sees a nap more than
+            // 60 min before its sleep keeps a lead-in that lies over the nap, and the merge would keep
+            // that copy (the same sleep, more time in bed). While the night is NOT in Apple Health, the
+            // incoming copy with the same sleep window and a later lead-in start replaces it, so the
+            // lead-in stops at the nap (77c). A written night is left as 77f leaves it: no rewrite path.
+            let replacing = extending == nil && store.helioReplacesStoredCopy(with: night, sleep: filled)
+            let outcome = try store.saveHelioNight(night, device: timeline, replacingStoredCopy: replacing)
             // Keyed by the stitched sleep's own window (what `storeNaps` looks up), never the lead-in's.
             nightOutcomes[staged.window] = outcome
             if outcome == .inserted || outcome == .updated { storedNights.append(night) }
