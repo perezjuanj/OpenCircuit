@@ -60,7 +60,7 @@ rules are in `ZeppKit/HelioSyncPolicy.swift`, tested by `HelioSyncPolicyTests`.
 | Active / basal energy, resting HR, exercise minutes | derived from the stored HR, as for the ring | yes, the ring's derived writers |
 | Resting HR (`0x3a`, strap-reported) | `.restingHeartRate` (local only) | no: the ring's derived daily writer already writes one per day, and writing both would double it |
 | HRV (`0x49`, RMSSD 🟡) | `.hrvSDNN` | yes, per reading (`HelioHealthPolicy.writesHRV`, decision 44): the RMSSD value in the SDNN field, tagged `OpenCircuitHRVStatistic = "RMSSD"` like the ring's. Readings stored before this shipped backfill on the next flush (the strap's `hk:hrvSDNN` watermark was never advanced), back to the 30-day raw-sample retention. On iOS 27+ also Recovery HRV, through the same gates (decision 59; see "HRV: RMSSD stored in the SDNN field") |
-| Sleep (`0x48`) | the strap's own stages (each ending a minute after its inclusive end minute, decision 70e) → Sleep summary + hypnogram, plus one `.inBed` segment per session over the union of its stage span and its record span (`HelioSleepSelection.inBedSpan`, decisions 70a/70b; a stitched night has one per fragment, the gap stays out). Time in bed is the sum of those segments; the layer never counts as asleep or awake. No lead-in is estimated | yes, through `mirrorStrapNight` (`mirrorSettledNight`): the stages and **`inBed`**, as the ring's nights. Forward-only (decisions 70c, 70h): a night already in Health is not rewritten when its only differences from the written night are the `inBed` layer and/or the stage end's minute; a re-delivery still replaces it only under 28f/58b. A manually edited night is never overwritten. Strap naps carry the same `inBed` envelope as the ring's naps (decision 70g). No `SleepStaging` fallback yet (DECISION-GAP, see `HelioSleepSelection`) |
+| Sleep (`0x48`) | the strap's own stages (each ending a minute after its inclusive end minute, decision 70e) → Sleep summary + hypnogram, plus one `.inBed` segment per session over the union of its stage span and its record span (`HelioSleepSelection.inBedSpan`, decisions 70a/70b; a stitched night has one per fragment, the gap stays out). Time in bed is the sum of those segments; the layer never counts as asleep or awake. Plus the in-bed lead-in before the first fragment (decision 77, #328): one `.awake` and one `.inBed` segment over the minutes before sleep where the strap's STORED rows show it worn, still and near the sleeping heart rate (an estimate, not the record's span; below) | yes, through `mirrorStrapNight` (`mirrorSettledNight`): the stages and **`inBed`**, as the ring's nights. Forward-only (decisions 70c, 70h): a night already in Health is not rewritten when its only differences from the written night are the `inBed` layer and/or the stage end's minute; a re-delivery still replaces it only under 28f/58b. A manually edited night is never overwritten. Strap naps carry the same `inBed` envelope as the ring's naps (decision 70g). No `SleepStaging` fallback yet (DECISION-GAP, see `HelioSleepSelection`) |
 | Stress (`0x13`) | `.stress`, one 0–100 sample per minute (`ff` skipped), charted through the day (#239). A backfill moves only its fetch watermark back, up to 7 days and never before the strap's ownership start, and only when another build advanced that watermark without storing the minutes (builds 59/60) | **no**: no Health type (`HealthKitWriter.quantityType(for: .stress)` is nil; not in any mirrored-kind list; not exported) |
 | PAI (`0x0d`) | `.pai`, one row per valid record (value = total PAI, at the record's own time, owned rows only). Phone-only history (decision 45): the PAI tile in Today's Your Numbers grid shows the newest row under 48 h old (decision 49; tapping it explains PAI), so the number survives a sync with no `0x0d` record and every relaunch. A backfill moves only its fetch watermark back, up to 7 days, never before the strap's ownership start and never past the 30-day sample retention, and only when another build advanced that watermark without storing the records (builds 59–62). No chart, no trend, no usual range in v1, and not a `TodayTile` | **no**: no Health type (`HealthKitWriter.quantityType(for: .pai)` is nil; not in any mirrored-kind list; not exported) |
 | Walking + running distance | — | **no**: the ring's distance is its own per-step estimate, so it is derived only from step rows the RING owned (decision 28). The strap sends no distance history and its steps get none. The ring's day distance is one sample from midnight to its last row, named the ring, so on a day with a switch Health's hourly chart spreads it across the strap's hours too (review-224c N-c; the day total is right) |
@@ -157,6 +157,35 @@ stores and writes what it measured for time it owned:
     an edited night are byte-identical. The skin-temperature gate and verdict and the overnight HRV
     judge the sleep fragments only (`HelioSleepSelection.sleepSpans`), never a run; resting HR reads
     asleep segments only, so all four are unchanged;
+  - the in-bed lead-in before the night (decision 77, #328). The record's in-bed span starts at its
+    own sleep start, so the strap's time in bed began about 5 minutes before sleep and an app reading
+    Time to Fall Asleep from the `inBed` sample saw almost none. When the night is stored (after the
+    stitch, the nap split and the fill), `HelioInBedLeadIn` (ZeppKit) reaches back from its first
+    in-bed start over the minutes where the store holds the strap's own rows (`LocalStore+HelioLeadIn`):
+    a `.heartRate` sample under the strap's timeline (holes of 5 minutes or less bridged, as the fill),
+    fewer than 10 steps, and a heart rate at most 15 bpm above the night's sleeping level (the median
+    of the first 60 min from the first sleep minute). At most 120 min, nothing under 5 min. It never
+    starts before the end of the latest sleep before it (a stored night or nap of either device, or one
+    of the sync's own strap sleeps) nor before the strap's ownership start (28). These constants are
+    provisional and in one place, to be calibrated on a real store. It is one `.awake` and one `.inBed`
+    segment over the same span, so Apple Health gets an `awake` sample before the first sleep stage and
+    an `inBed` sample from the lead-in start, through the same writer path (`healthPublication`, no
+    writer change). `inBed` never counts as asleep. **It is an estimate from the strap's measured rows,
+    not the record's own span.** Asleep time is unchanged; time in bed and awake time grow, so
+    efficiency and the Sleep Score drop (a synthetic 8 h night with a 60 min lead-in: in bed 480 →
+    540 min, efficiency 0.969 → 0.861, Sleep Score 83 → 71). The skin-temperature verdict, overnight
+    HRV, resting HR and the night key are those of the night without it.
+    - Steps: `StoredStepSample` rows carry no device column; they are the strap's by ownership (28:
+      each step writer keeps its rows wholly in time its device owns), and the lead-in never reads
+      before the strap's ownership start.
+    - From the STORED rows, never a sync's fetched minutes, so every re-delivery derives the same
+      lead-in, and the 50a/50b paths rebuild the night with the lead-in it was stored with.
+    - Forward-only: a night already in Health is never rewritten for its lead-in. One written with the
+      same lead-in passes as before; one written without (an earlier build, or before the heart rate
+      was stored) goes on without a lead-in, exactly as before, so the card and Health agree; any other
+      start-only change is kept out by 28f/58b, store row included. A night not yet written is written
+      once with it, and a 58b extension takes it along.
+    - Naps, edited nights and the ring: unchanged;
   - the strap's gate is the ring's pass 1 only: the ring's second pass (a night whose onset was
     never recorded, `onsetIsUnobserved:`) needs its epoch archive's evidence of a hole, which the
     strap has no equivalent of, so a strap session recorded only from 06:00 is not a night;

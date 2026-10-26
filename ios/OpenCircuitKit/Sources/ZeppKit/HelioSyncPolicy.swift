@@ -382,7 +382,8 @@ public enum HelioSleepSelection {
     /// Decision 70a (#311): a session's in-bed span. The union of its stage span and its record span
     /// (`ZeppSleepSession.sleepStart` … `sleepEnd`) when the record span is valid: it starts before it
     /// ends, it overlaps the stage span, and the union is no longer than `maxNightLength`. Otherwise
-    /// the stage span. No lead-in is estimated.
+    /// the stage span. The record carries no lead-in; the store adds its estimate later, before the
+    /// night's first fragment (decision 77, `HelioInBedLeadIn`).
     public static func inBedSpan(stageSpan: DateInterval, recordStart: Date, recordEnd: Date) -> DateInterval {
         guard recordStart < recordEnd, recordStart < stageSpan.end, stageSpan.start < recordEnd else { return stageSpan }
         let union = DateInterval(start: min(stageSpan.start, recordStart), end: max(stageSpan.end, recordEnd))
