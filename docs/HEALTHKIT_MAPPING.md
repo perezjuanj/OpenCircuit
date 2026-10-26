@@ -117,7 +117,8 @@ stores and writes what it measured for time it owned:
     idempotent (decision 80b, #331 item 10): the span is scheduled only once the prune's delete is
     saved, and the prune also runs when the merge keeps a strap night's stored copy over a re-delivery
     (`.keptFullerStoredNight`, judged on the stored night), so a prune whose save failed is retried by
-    the next re-delivery; what the merge keeps is unchanged. A nap from a block is
+    the next re-delivery the merge judges (an edited night never retries); what the merge keeps is
+    unchanged. A nap from a block is
     also HELD (unsettled) by the chain of sleep that follows it (decision 76j, an optimisation that
     avoids a write followed by a delete): the sync's kind-sleep runs (up to 5 other minutes inside a
     run, as a block's) starting within 60 min after the nap's end, then each next run starting within
