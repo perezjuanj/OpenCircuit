@@ -105,10 +105,11 @@ private final class Transport: HelioTransport {
 
 @MainActor
 private final class Keys: HelioKeyStoring {
+    var isRejected = false
     func load() -> ZeppAuthKey? { HelioKeyText.parse(nKeyHex) }
     func save(pasted text: String) throws -> Bool { true }
     func forget() {}
-    func markRejected() {}
+    func markRejected() { isRejected = true }
 }
 
 // MARK: - Tests
