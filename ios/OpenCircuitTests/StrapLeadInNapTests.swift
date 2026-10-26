@@ -335,7 +335,7 @@ final class StrapLeadInNapTests: XCTestCase {
     /// under that lead-in. `saveNap`'s backstop judges the night by its SLEEP (`sleepOnly`), so the nap
     /// IS stored. Also pinned: the documented limit (ZEPP_PROTOCOL.md §21.6). With the night re-delivered
     /// unchanged, it keeps its lead-in over the nap, and one more identical sync does NOT converge.
-    func testANapSeenAfterTheNightIsStoredUnderItsLeadInAndTheOverlapIsTheDocumentedLimit() throws {
+    func testANapSeenAfterTheNightIsStoredAndTheUnwrittenNightsLeadInThenStopsAtIt() throws {
         let store = try makeStore()
         try storeHeartRate(-5, 8, store: store)
         try sync([nightRecord], at: 7.5, store: store)
@@ -343,14 +343,14 @@ final class StrapLeadInNapTests: XCTestCase {
 
         try sync([eveningNap, nightRecord], at: 7.75, store: store)
         XCTAssertEqual(try naps(store), [span(-4.5, -3.5)], "the nap is stored: its asleep time is kept")
-        XCTAssertEqual(try leadIn(store), span(-4, -2), "the documented limit: the stored lead-in stands")
-        XCTAssertEqual(try leadInOverNaps(store), 30 * 60, "an in-bed/awake overlap of 30 min")
+        XCTAssertEqual(try leadIn(store), span(-3.5, -2), "79e: the unwritten night's re-delivery replaces it")
+        XCTAssertEqual(try leadInOverNaps(store), 0, "no in-bed/awake overlap")
         XCTAssertEqual(scheduledCleans, [])
 
         try sync([eveningNap, nightRecord], at: 8.5, store: store)
         XCTAssertEqual(try naps(store), [span(-4.5, -3.5)])
-        XCTAssertEqual(try leadIn(store), span(-4, -2), "one more identical sync: no convergence (the documented limit)")
-        XCTAssertEqual(try leadInOverNaps(store), 30 * 60)
+        XCTAssertEqual(try leadIn(store), span(-3.5, -2), "one more identical sync: unchanged")
+        XCTAssertEqual(try leadInOverNaps(store), 0)
     }
 
     /// N14 (adopted from review-328c's probe P1): the Health-delete fence keeps a stale nap clean off the
