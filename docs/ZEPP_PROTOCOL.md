@@ -2531,6 +2531,14 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
     Health agree; any other start-only difference is kept out (28f, 58b), store row included. A night
     not yet written is written once with it, and an extension (58b) takes it along.
   - Naps and the ring get none.
+  - The lead-in can lie over minutes the strap marked as sleep in its activity minutes that the app
+    did not keep (a standalone doze just before bed, decision 73c/73f); there it is labelled awake and
+    in bed, never asleep.
+  - Every reader that averages a night's vitals (the illness alert, Vitals Status, the Sleep card's
+    overnight averages, Trends, the headache HRV and bedtime regularity) reads the night's sleep window,
+    the in-bed window without the lead-in (decision 77h), so their baselines and alerts are as before.
+    A night an earlier build wrote without a lead-in that later extends at the end (58b) takes its
+    lead-in along in that one rewrite (77i); no start-only rewrite exists.
 - **Ownership**: a nap counts only when the strap owned all of it (no switch inside it).
 - **Under 20 minutes**: not stored; a `helio-link` breadcrumb notes it (step 4).
 - A stored nap that a later sync finds within 60 min of a night (for instance the ring's night,

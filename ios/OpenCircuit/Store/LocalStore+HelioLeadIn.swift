@@ -80,3 +80,23 @@ extension LocalStore {
         return ends.filter { $0 <= instant }.max() ?? .distantPast
     }
 }
+
+// MARK: - 77h: the night's sleep window for every reader that averages its vitals
+
+extension StoredSleepSummary {
+    /// Decision 77h (#328): where the night's SLEEP window starts when a reader's window starts at
+    /// `start`: the end of a strap night's in-bed lead-in when `start` is that lead-in's start, else
+    /// `start` itself. The lead-in is no sleep, so a reader that averages a night's vitals (the illness
+    /// alert, Vitals Status, the Sleep card's overnight averages, Trends, the headache HRV and bedtime
+    /// regularity) reads the night as build 88 stored it. A ring night, a night without a lead-in and a
+    /// manually edited night (the person's own window) return `start` unchanged.
+    func sleepWindowStart(from start: Date) -> Date {
+        guard !isManuallyEdited, start == inBedStart, inBedEnd > inBedStart, !hypnogramData.isEmpty,
+              let lead = HelioSleepSelection.leadIn(in: SleepHypnogramCodec.decode(hypnogramData)),
+              lead.start == start, lead.end < inBedEnd else { return start }
+        return lead.end
+    }
+
+    /// `sleepWindowStart(from: inBedStart)`: the recorded in-bed start without a strap night's lead-in.
+    var sleepWindowInBedStart: Date { sleepWindowStart(from: inBedStart) }
+}

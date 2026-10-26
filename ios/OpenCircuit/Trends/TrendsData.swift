@@ -199,7 +199,7 @@ struct TrendsData {
             summaryByNight[cal.startOfDay(for: s.night)] = SleepRow(
                 night: s.night, asleepMin: s.asleepMin, sleepScore: s.sleepScore,
                 stressScore: s.stressScore, skinTempC: s.skinTempC,
-                inBedStart: s.inBedStart, inBedEnd: s.inBedEnd)
+                inBedStart: s.sleepWindowInBedStart, inBedEnd: s.inBedEnd)   // 77h: the sleep window
         }
         var stepsByDay: [Date: Int] = [:]
         for d in (try? context.fetch(LocalStore.recentDailiesDescriptor(limit: lookbackDays))) ?? [] {

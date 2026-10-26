@@ -609,3 +609,158 @@ final class StrapInBedLeadInTests: XCTestCase {
                        ".inBed never counts as asleep")
     }
 }
+
+// MARK: - Review-328 round 2
+
+extension StrapInBedLeadInTests {
+    private func mirror(_ store: LocalStore) throws -> String? {
+        store.mirroredNight(night: try XCTUnwrap(try rows(store).first).night)
+            .map { "\($0.signature) \($0.spanStart.timeIntervalSince1970) \($0.spanEnd.timeIntervalSince1970)" }
+    }
+
+    // MARK: S1: a re-delivery whose lead-in differs from the one written is kept out (77f, 28f)
+
+    func testANightWrittenWithItsLeadInKeepsOutALongerOneFromHeartRateStoredLater() async throws {
+        let store = try makeStore()
+        try storeHeartRate(-2, 7, store: store)
+        let first = try sync([night], at: hour(8), store: store)
+        XCTAssertEqual(first.nights.first?.leadIn, leadIn(from: -2))
+        let written = try await flush(first.nights.map(\.segments), at: hour(8), store: store)
+        XCTAssertEqual(written, [DateInterval(start: hour(-2), end: hour(7))], "written with the lead-in from 22:00")
+        let (hypnogramBefore, mirrorBefore) = (try hypnogram(store), try mirror(store))
+
+        try storeHeartRate(-3, -2, store: store)
+        XCTAssertEqual(store.helioLeadInStart(first.nights[0].withoutLeadIn, device: timeline), hour(-3), "a new derivation reaches 21:00")
+        let again = try sync([night], at: hour(9), store: store)
+        XCTAssertEqual(again.nights, [], "kept out: a same-end, start-only widening of a written night")
+        XCTAssertEqual(try rows(store).map(window), [DateInterval(start: hour(-2), end: hour(7))], "the row is the night Health holds")
+        XCTAssertEqual(try hypnogram(store), hypnogramBefore)
+        let rewritten = try await flush(again.nights.map(\.segments), at: hour(9), store: store)
+        XCTAssertEqual(rewritten, [], "no Health write")
+        XCTAssertEqual(try mirror(store), mirrorBefore)
+    }
+
+    func testANightWrittenWithoutALeadInIsKeptOutWhenTheStrapReStagesItsStartLater() async throws {
+        let store = try makeStore()
+        try storeHeartRate(-1, 7, store: store)
+        let first = try sync([night], at: hour(8), store: store)
+        let written = try await flush(first.nights.map(\.segments), at: hour(8), store: store)
+        XCTAssertEqual(written, [record], "written without a lead-in (build 88's shape)")
+        let (hypnogramBefore, mirrorBefore) = (try hypnogram(store), try mirror(store))
+
+        try storeHeartRate(-2, -1, store: store)
+        // The strap re-stages the night's start 10 minutes later; the store now reaches back to 22:00.
+        let restaged: [(Double, Double, UInt8)] = [(-1 + 10.0 / 60, 1, light)] + Array(night.dropFirst())
+        let again = try sync([restaged], at: hour(9), store: store)
+        XCTAssertEqual(again.nights, [], "kept out: neither its start nor its lead-in's is the written one")
+        XCTAssertEqual(try rows(store).map(window), [record])
+        XCTAssertEqual(try hypnogram(store), hypnogramBefore)
+        let rewritten = try await flush(again.nights.map(\.segments), at: hour(9), store: store)
+        XCTAssertEqual(rewritten, [], "no rewrite")
+        XCTAssertEqual(try mirror(store), mirrorBefore)
+    }
+
+    /// Stated: a night written with a capped lead-in (21:00–23:00) that the strap later re-stages to
+    /// start at 22:30 keeps what was written. The re-delivery's own lead-in would reach 20:30 (capped from
+    /// 22:30), a same-end start-only change, so 28f keeps it out: the row stays 21:00–07:00 with its
+    /// 23:00 stages, the extra half hour of staged sleep is not stored, and Health is not touched.
+    func testACappedLeadInStaysAsWrittenWhenTheStrapReStagesItsStartEarlier() async throws {
+        let store = try makeStore()
+        try storeHeartRate(-5, 7, store: store)
+        let first = try sync([night], at: hour(8), store: store)
+        let capped = DateInterval(start: hour(-1).addingTimeInterval(-HelioInBedLeadIn.maxLength), end: hour(-1))
+        XCTAssertEqual(first.nights.first?.leadIn, capped)
+        let written = try await flush(first.nights.map(\.segments), at: hour(8), store: store)
+        XCTAssertEqual(written, [DateInterval(start: capped.start, end: hour(7))])
+        let (hypnogramBefore, mirrorBefore) = (try hypnogram(store), try mirror(store))
+        let asleepBefore = try XCTUnwrap(try rows(store).first).asleepMin
+
+        let earlier: [(Double, Double, UInt8)] = [(-1.5, -1, light)] + night
+        let again = try sync([earlier], at: hour(9), store: store)
+        XCTAssertEqual(again.nights, [])
+        XCTAssertEqual(try rows(store).map(window), [DateInterval(start: capped.start, end: hour(7))], "the written night stands")
+        XCTAssertEqual(try XCTUnwrap(try rows(store).first).asleepMin, asleepBefore, "the earlier half hour is not stored")
+        XCTAssertEqual(try hypnogram(store), hypnogramBefore)
+        XCTAssertEqual(HelioSleepSelection.leadIn(in: try hypnogram(store)), capped)
+        let rewritten = try await flush(again.nights.map(\.segments), at: hour(9), store: store)
+        XCTAssertEqual(rewritten, [])
+        XCTAssertEqual(try mirror(store), mirrorBefore)
+    }
+
+    // MARK: N1 (77i): an earlier build's night, then an extension at the end
+
+    /// Stated: a night an earlier build wrote without a lead-in (23:00–03:00), then extended at the end
+    /// (58b, to 07:00) once the strap's heart rate before bed is stored, is rewritten ONCE, and that one
+    /// write takes the lead-in along: Health's night then starts at 22:00. No start-only rewrite exists.
+    func testANightWrittenWithoutALeadInThatExtendsAtTheEndIsRewrittenOnceWithItsLeadIn() async throws {
+        let store = try makeStore()
+        try storeHeartRate(-1, 9, store: store)
+        let early: [(Double, Double, UInt8)] = [(-1, 1, light), (1, 3, deep)]
+        let first = try sync([early], at: hour(3.5), store: store)
+        XCTAssertNil(first.nights.first?.leadIn)
+        let written = try await flush(first.nights.map(\.segments), at: hour(3.5), store: store)
+        XCTAssertEqual(written, [DateInterval(start: hour(-1), end: hour(3))])
+
+        try storeHeartRate(-2, -1, store: store)
+        let final = try sync([night], at: hour(8), store: store)
+        XCTAssertEqual(final.nights.first?.leadIn, leadIn(from: -2))
+        let rewritten = try await flush(final.nights.map(\.segments), at: hour(8), store: store)
+        XCTAssertEqual(rewritten, [DateInterval(start: hour(-2), end: hour(7))], "one rewrite, the start moves to the lead-in's")
+        XCTAssertEqual(try mirror(store)?.hasSuffix("\(hour(-2).timeIntervalSince1970) \(hour(7).timeIntervalSince1970)"), true)
+        let again = try await flush(final.nights.map(\.segments), at: hour(8), store: store)
+        XCTAssertEqual(again, [], "and only once")
+    }
+
+    // MARK: S2 (77d): resting heart rate from sparse sleep heart rate
+
+    /// The night's asleep heart rate is too sparse for `RestingHR`'s asleep mean (fewer than
+    /// `minSleepSamples`), so it falls back to the lowest sustained heart rate over the readings it is
+    /// given. Those must be the night's own: a calm, LOW lead-in (50 bpm, under the asleep 60) given to
+    /// the fallback would lower the resting heart rate and lift the Sleep Score. Here the window (without
+    /// the lead-in) is the protection; the asleep filter alone would not be.
+    func testRestingHeartRateFromSparseSleepHeartRateNeverReachesIntoTheLeadIn() throws {
+        func sparse(_ store: LocalStore, leadInHeartRate: Bool) throws {
+            if leadInHeartRate { try storeHeartRate(-2, -1, bpm: 50, store: store) }
+            for h in [-0.5, 3.0] {
+                store.context.insert(StoredSample(kindRaw: MetricKind.heartRate.rawValue, start: hour(h), end: hour(h), value: 60,
+                                                  deviceID: timeline.rawValue))
+            }
+            for m in stride(from: -120.0, to: 480, by: 10) {
+                let inLeadIn = m < -60
+                for (kind, value) in [(MetricKind.hrvSDNN, inLeadIn ? 15.0 : 55), (.temperature, inLeadIn ? 31.0 : 34.5)] {
+                    store.context.insert(StoredSample(kindRaw: kind.rawValue, start: hour(m / 60), end: hour(m / 60), value: value,
+                                                      deviceID: timeline.rawValue))
+                }
+            }
+            try store.context.save()
+        }
+        XCTAssertLessThan(2, RestingHR.minSleepSamples, "two asleep readings: under the asleep mean's floor")
+        let withLeadIn = try makeStore()
+        try sparse(withLeadIn, leadInHeartRate: true)
+        let night = try XCTUnwrap(try sync([night], at: hour(8), store: withLeadIn).nights.first)
+        XCTAssertEqual(night.leadIn, leadIn(from: -2), "the calm low heart rate before bed is a lead-in")
+
+        let without = try makeStore()
+        try sparse(without, leadInHeartRate: false)
+        var a = LocalStore.SleepNightExtras(), b = LocalStore.SleepNightExtras()
+        withLeadIn.applyHelioNightScores(to: &a, window: night.window, segments: night.segments, device: timeline)
+        without.applyHelioNightScores(to: &b, window: night.window, segments: night.segments, device: timeline)
+        XCTAssertGreaterThan(b.sleepScore, 0)
+        XCTAssertEqual(a.sleepScore, b.sleepScore, "the save path: the resting HR is the night's (60), not the lead-in's (50)")
+        XCTAssertEqual(a.stressScore, b.stressScore, "RMSSD: the sleep spans only")
+
+        // The same night through the repair pass, in both stores.
+        XCTAssertEqual(try without.saveHelioNight(night, device: timeline), .inserted)
+        let rowA = try XCTUnwrap(try rows(withLeadIn).first), rowB = try XCTUnwrap(try rows(without).first)
+        XCTAssertEqual(rowA.skinTempC, rowB.skinTempC, "the skin-temperature verdict")
+        XCTAssertEqual(rowA.skinTempC, 34.5, accuracy: 0.001)
+        XCTAssertEqual(rowA.hypnogramData, rowB.hypnogramData)
+        for row in [rowA, rowB] { row.sleepScore = 0 }
+        try withLeadIn.context.save()
+        try without.context.save()
+        _ = try withLeadIn.scoreUnscoredHelioNights()
+        _ = try without.scoreUnscoredHelioNights()
+        XCTAssertGreaterThan(rowB.sleepScore, 0)
+        XCTAssertEqual(rowA.sleepScore, rowB.sleepScore, "the repair pass: the same resting HR")
+    }
+}

@@ -705,7 +705,7 @@ extension HeadacheNightRow {
     @MainActor
     init(_ row: StoredSleepSummary) {
         self.init(night: row.night,
-                  inBedStart: row.sleepEditCurrentInBedStart,
+                  inBedStart: row.sleepWindowStart(from: row.sleepEditCurrentInBedStart),   // 77h: the sleep window
                   inBedEnd: row.sleepEditCurrentInBedEnd,
                   inBedSeconds: row.asSummary.inBed,
                   asleepMin: row.asleepMin,
