@@ -29,6 +29,10 @@ struct StrapSleepRoundSummary: Equatable {
     /// joined a session's night, and those that would have stood alone and were used nowhere.
     var activityBlocksJoined = 0
     var activityBlocksAlone = 0
+    /// Decision 76f: of `napsStored`, the naps that hold a standalone activity block; and the standalone
+    /// blocks taken as the provisional main sleep of a night no stored night covers (stored nowhere).
+    var napsFromBlocks = 0
+    var mainOnlyBlocks = 0
 
     /// The one breadcrumb line. Digits only; no clock time.
     var text: String {
@@ -40,7 +44,10 @@ struct StrapSleepRoundSummary: Equatable {
             + "outcomes: inserted=\(n(.inserted)) updated=\(n(.updated)) keptFuller=\(n(.keptFullerStoredNight)) "
             + "ownedByOther=\(n(.ownedByOtherDevice)) keyCollision=\(n(.refusedNightKeyCollision)) "
             + "manualEdit=\(n(.keptManualEdit)) keptOut58b=\(keptOut58b) other=\(other); "
-            + "naps: stored=\(napsStored) unsettled=\(napsUnsettled) tooShort=\(napsTooShort); "
+            + "naps: stored=\(napsStored) unsettled=\(napsUnsettled) tooShort=\(napsTooShort)"
+            // Decision 76f: each only when non-zero, so every line without one is the line shipped before.
+            + (napsFromBlocks > 0 ? " napsFromBlocks=\(napsFromBlocks)" : "")
+            + (mainOnlyBlocks > 0 ? " mainOnlyBlocks=\(mainOnlyBlocks)" : "") + "; "
             + "endsAfterNewestNight=\(endsAfterNewestNight); "
             + "activity sleep min outside sessions (24 h)=\(activitySleepMinutesOutsideSessions)"
             // Only when there was a block, so a sync without one leaves the line decision 72 shipped.
