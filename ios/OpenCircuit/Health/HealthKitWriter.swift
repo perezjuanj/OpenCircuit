@@ -412,6 +412,9 @@ final class HealthKitWriter {
         /// The Recovery HRV save threw this pass (decision 59e). Kept apart from `failures`, which
         /// names the regular copies: an HRV failure there means the regular HRV type.
         var recoveryHRVFailed = false
+        /// Strap nights written this pass that a Sleep Focus end finalized (decision 78a), for the
+        /// counts-only breadcrumb (78c). Also in `sleepSegments`, by their segments.
+        var finalizedStrapNights = 0
         /// Metrics whose HealthKit `save` actually THREW this pass (#135) — distinct from "nothing
         /// pending". Persisted per-metric so the UI can surface an honest "X hasn't synced" warning
         /// instead of the blanket "Auto-syncing" line. Empty on a clean/idle flush.
@@ -501,7 +504,9 @@ final class HealthKitWriter {
     /// `device` / `mirroredKinds` / `strapNights` are the Helio Strap's pass (#215 phase 3): its own
     /// timeline's pending samples (minus the kinds its policy withholds, `HelioHealthPolicy`) and the
     /// nights it staged. Their defaults are exactly the ring's pass, unchanged. `strapNightsFinalized`
-    /// is `sleepFinalized` for those nights (the Sleep Focus wake, #215 phase 4).
+    /// is `sleepFinalized` for those nights (the Sleep Focus wake, #215 phase 4), judged per night by
+    /// its end (decision 78a, #332; 78g for a detected Focus end): only a night the Sleep Focus end
+    /// covers skips the margin.
     /// What a `flushToHealth` call was asked to mirror: the timeline and the kinds (nil = every
     /// mirrored kind, the ring's pass).
     struct FlushRequest: Equatable {
@@ -513,14 +518,20 @@ final class HealthKitWriter {
     /// a call site passes without Health access (review-244 SF-2). Nothing in the app reads it.
     private(set) var lastFlushRequest: FlushRequest?
 
+    /// The strap nights the last `flushToHealth` was offered, each with whether it skipped the settle
+    /// margin (decision 78a), recorded before any gate like `lastFlushRequest`, so a test pins the
+    /// per-night verdict a flush site passes without Health access. Nothing in the app reads it.
+    private(set) var lastStrapNights: [(night: [SleepSegment], finalized: Bool)] = []
+
     @discardableResult
     func flushToHealth(store: LocalStore, sleepSegments: [SleepSegment] = [],
                        sleepFinalized: Bool = false,
                        device: SyncDeviceID = .ringConn,
                        mirroredKinds: [MetricKind]? = nil,
                        strapNights: [[SleepSegment]] = [],
-                       strapNightsFinalized: Bool = false) async -> FlushResult {
+                       strapNightsFinalized: SleepFocusFinalization.Nights = .none) async -> FlushResult {
         lastFlushRequest = FlushRequest(device: device, mirroredKinds: mirroredKinds)
+        lastStrapNights = strapNights.map { ($0, strapNightsFinalized.finalizes(nightEndingAt: $0.map(\.end).max())) }
         var result = FlushResult()
         guard isShareAuthorized, !Self.isFlushing else { return result }
         Self.isFlushing = true
@@ -567,11 +578,13 @@ final class HealthKitWriter {
         // and is a no-op for a night Health already holds (signature match), including one written
         // before the `.inBed` layer and the inclusive stage end (decision 70h, forward-only).
         for night in strapNights where SleepHealthGate.isReadyToWrite(
-            latestSegmentEnd: night.map(\.end).max(), now: Date(), finalized: strapNightsFinalized) {
+            latestSegmentEnd: night.map(\.end).max(), now: Date(),
+            finalized: strapNightsFinalized.finalizes(nightEndingAt: night.map(\.end).max())) {
             switch await mirrorStrapNight(local: store, segments: night) {
             case .wrote(let count):
                 result.sleepSegments += count
                 writtenKinds.insert(.sleep)
+                if strapNightsFinalized.finalizes(nightEndingAt: night.map(\.end).max()) { result.finalizedStrapNights += 1 }
             case .unchanged:
                 break
             case .declined:

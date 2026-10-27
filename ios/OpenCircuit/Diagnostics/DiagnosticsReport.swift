@@ -261,6 +261,7 @@ enum DiagnosticsReport {
     /// control bytes, no identifier and no health value.
     static func buildForStrap(firmware: String?, hardware: String?,
                               observability: ObservabilityStore = ObservabilityStore(),
+                              focusDefaults: UserDefaults = .standard,
                               timeZone: TimeZone = .current,
                               now: Date = Date()) -> String {
         let fmt = DateFormatter()
@@ -284,6 +285,8 @@ enum DiagnosticsReport {
         s.append("# Sync state")
         s.append("  Last successful sync: \(t(observability.lastSuccessfulSync))")
         s.append("  Last background run:  \(t(observability.bgLastRun))")
+        // Decision 78h S-1: always present, from the persisted state, whatever the log still holds.
+        s.append("  " + SleepFocusDetection.bundleLine(now: now, defaults: focusDefaults))
         s.append("")
         s.append(contentsOf: activityLogSection(observability, format: t))
         s.append("")

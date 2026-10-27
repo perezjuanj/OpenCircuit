@@ -49,6 +49,8 @@ struct SleepFocusSyncFilter: SetFocusFilterIntent {
         guard Self.shouldSync(focusIsActive: focusIsActive) else {
             ObservabilityStore().recordMetricEvent(
                 source: "focus", detail: "Sleep Focus enabled; wake sync armed")
+            // Decision 78f-4: the same seen-active time a wake's read of the filter leaves.
+            SleepFocusDetection.note(.active, at: Date(), kind: "perform")
             return .result()
         }
 
@@ -60,6 +62,186 @@ struct SleepFocusSyncFilter: SetFocusFilterIntent {
     /// the default/off delivery is the single state that starts a sync.
     nonisolated static func shouldSync(focusIsActive: Bool) -> Bool {
         !focusIsActive
+    }
+}
+
+/// Decision 78f (#332): iOS may not run `perform()` at all when Sleep Focus ends on its schedule (the
+/// owner's b88 bundle: no `sleepFocus` record all morning), and without an App Intents extension
+/// nothing else is told. So the app reads the filter's state itself at its next wakes (every strap
+/// background run, the strap's post-sync hook, the app coming to the front): seen active, then read
+/// not active, means the Focus ended, and T is that read's time. It feeds decision 78a unchanged.
+/// It never connects, syncs or schedules anything by itself.
+enum SleepFocusDetection {
+    /// What one read of the filter said.
+    enum Reading: Equatable {
+        /// The Focus this filter belongs to is on.
+        case active
+        /// It is off: the filter came back with its default (off) value, or isn't found.
+        case inactive
+        /// The read failed another way: nothing is inferred.
+        case unknown
+    }
+
+    /// The latest time a read (or `perform()`) saw the Focus on.
+    nonisolated static let seenActiveKey = "helio.sleepFocusSeenActiveAt.v1"
+    /// A Focus seen on longer ago than this isn't the one that just ended.
+    static let seenActiveWindow: TimeInterval = 18 * 3600
+
+    /// The iOS read. `SetFocusFilterIntent.current` is `get async throws` and
+    /// `SetFocusFilterIntentError` has `notFound` and `missingParameterValue` (iOS 26 SDK); the header
+    /// doesn't say which a Focus that is off gives, so both shapes count as not active: the filter
+    /// with its default `focusIsActive == false`, and `notFound`. Any other error is `unknown`.
+    ///
+    /// Decision 78h: bounded by `readTimeout` (a slower read is `unknown`, "no answer in time"), and its
+    /// shape goes to the `defaults` given (S-2, N-5).
+    static func liveRead(kind: String = "", defaults: UserDefaults = .standard, timeout: TimeInterval = readTimeout,
+                         read: @escaping @Sendable () async -> (Reading, String) = { await rawRead() }) async -> Reading {
+        let (reading, shape) = await firstOf(read, orAfter: timeout, fallback: (.unknown, "no answer in time"))
+        noteShape(shape, kind: kind, defaults: defaults)
+        return reading
+    }
+
+    /// Decision 78h S-2: how long a wake waits for iOS's read.
+    static let readTimeout: TimeInterval = 2
+
+    /// One read of iOS's filter state and the shape it came back in (counts-only words).
+    static func rawRead() async -> (Reading, String) {
+        do {
+            let active = try await SleepFocusSyncFilter.current.focusIsActive
+            return (reading(focusIsActive: active), active ? "on" : "off (default value)")
+        } catch {
+            return (reading(thrown: error), shape(thrown: error))
+        }
+    }
+
+    /// N-2: a `SetFocusFilterIntentError` by its case name; any other error by its type name only.
+    static func shape(thrown error: Error) -> String {
+        guard let focus = error as? SetFocusFilterIntentError else { return "error \(String(describing: type(of: error)))" }
+        switch focus {
+        case .notFound: return "off (notFound)"
+        case .missingParameterValue: return "error SetFocusFilterIntentError.missingParameterValue"
+        @unknown default: return "error SetFocusFilterIntentError (unknown case)"
+        }
+    }
+
+    /// `work`'s result, or `fallback` once `seconds` have passed, whichever comes first. A read that
+    /// never returns can't hold the wake: the caller goes on, and the late result is dropped.
+    static func firstOf<T: Sendable>(_ work: @escaping @Sendable () async -> T, orAfter seconds: TimeInterval,
+                                     fallback: T) async -> T {
+        await withCheckedContinuation { continuation in
+            let once = ResumeOnce(continuation)
+            Task { once.resume(await work()) }
+            Task {
+                try? await Task.sleep(for: .seconds(seconds))
+                once.resume(fallback)
+            }
+        }
+    }
+
+    /// The last read shape logged, so the bundle shows what iOS's read returned on a real phone (the
+    /// SDK doesn't say, 78f) with one line per change, not one per wake.
+    nonisolated static let lastShapeKey = "helio.sleepFocusReadShape.v1"
+
+    /// Leaves a `focus` line when this read's shape differs from the last one logged. Counts-only
+    /// words: on / off (default value) / off (notFound) / error <type name>. Returns whether it logged.
+    @discardableResult
+    static func noteShape(_ shape: String, kind: String, defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.string(forKey: lastShapeKey) != shape else { return false }
+        defaults.set(shape, forKey: lastShapeKey)
+        ObservabilityStore(defaults).recordMetricEvent(
+            source: "focus", detail: "Sleep Focus read: \(shape), kind=\(kind)")
+        return true
+    }
+
+    static func reading(focusIsActive: Bool) -> Reading { focusIsActive ? .active : .inactive }
+
+    static func reading(thrown error: Error) -> Reading {
+        (error as? SetFocusFilterIntentError) == .notFound ? .inactive : .unknown
+    }
+
+    /// One wake's check: read the filter, then `note` it at the read's time. Returns the detected T.
+    @discardableResult
+    static func check(kind: String, read: (() async -> Reading)? = nil,
+                      defaults: UserDefaults = .standard) async -> Date? {
+        let reading = await (read ?? { await liveRead(kind: kind, defaults: defaults) })()
+        return note(reading, at: Date(), kind: kind, defaults: defaults)
+    }
+
+    /// 78h N-1: the read the app's coming to the front started, which its strap flush waits for, so the
+    /// foreground flush decides with whatever T it found.
+    @MainActor private static var foregroundCheck: Task<Void, Never>?
+
+    /// The app came to the front (strap chosen): read the filter now.
+    @MainActor static func startForegroundCheck() {
+        foregroundCheck = Task { await check(kind: "foreground") }
+    }
+
+    /// Before the foreground strap flush: the read started on coming to the front has finished (at
+    /// most `readTimeout`).
+    @MainActor static func awaitForegroundCheck() async {
+        await foregroundCheck?.value
+    }
+
+    /// Decision 78f-1. Active: remember `now` as seen active. Not active, with a seen-active time in the
+    /// last 18 h that is newer than the persisted T: the Focus ended; persist T = `now` as a DETECTED T
+    /// (decision 78g: it finalizes only nights that ended 10 min or more before it), forget the
+    /// seen-active time and leave one `focus` line. Anything else changes nothing. Returns the new T.
+    @discardableResult
+    static func note(_ reading: Reading, at now: Date, kind: String, defaults: UserDefaults = .standard) -> Date? {
+        switch reading {
+        case .unknown:
+            return nil
+        case .active:
+            if (seenActive(defaults: defaults).map { now > $0 } ?? true) {
+                defaults.set(now.timeIntervalSince1970, forKey: seenActiveKey)
+            }
+            return nil
+        case .inactive:
+            guard let seen = seenActive(defaults: defaults), now >= seen,
+                  now.timeIntervalSince(seen) <= seenActiveWindow,
+                  seen > (SleepFocusFinalization.persisted(defaults: defaults) ?? .distantPast) else { return nil }
+            SleepFocusFinalization.persist(now, source: .detected, defaults: defaults)
+            defaults.removeObject(forKey: seenActiveKey)
+            ObservabilityStore(defaults).recordMetricEvent(
+                source: "focus", detail: "Sleep Focus end detected at a wake (filter not run by iOS), kind=\(kind)")
+            return now
+        }
+    }
+
+    static func seenActive(defaults: UserDefaults = .standard) -> Date? {
+        let t = defaults.double(forKey: seenActiveKey)
+        return t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
+
+    /// 78h S-1: the strap bundle's fixed `Sleep Focus` line, from the persisted state (never a log row,
+    /// which ages out of the metric log): the last read's shape, how long ago the Focus was last seen
+    /// on, and how long ago T was with its source. Minutes only, no clock times.
+    static func bundleLine(now: Date, defaults: UserDefaults = .standard) -> String {
+        func age(_ date: Date?) -> String {
+            guard let date else { return "none" }
+            guard now >= date else { return "ahead of the clock" }
+            return "\(Int(now.timeIntervalSince(date) / 60)) min ago"
+        }
+        let t = SleepFocusFinalization.persisted(defaults: defaults)
+        let source = t == nil ? "" : " (\(SleepFocusFinalization.persistedSource(defaults: defaults).rawValue))"
+        return "Sleep Focus: last read \(defaults.string(forKey: lastShapeKey) ?? "none"); seen on \(age(seenActive(defaults: defaults)));"
+            + " Focus end \(age(t))\(source)"
+    }
+}
+
+/// Resumes a continuation once, from whichever of two tasks gets there first (`firstOf`).
+private final class ResumeOnce<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+
+    init(_ continuation: CheckedContinuation<T, Never>) { self.continuation = continuation }
+
+    func resume(_ value: T) {
+        lock.lock()
+        let waiting = continuation
+        continuation = nil
+        lock.unlock()
+        waiting?.resume(returning: value)
     }
 }
 
@@ -75,6 +257,10 @@ private enum SleepFocusSyncRunner {
 
         observability.recordMetricEvent(
             source: "focus", detail: "Sleep Focus ended; sync INVOKED by iOS")
+        // Decision 78a (#332): T, the moment Sleep Focus ended, outlives this one bounded run. Recorded
+        // for both devices; only the strap's flushes read it.
+        let focusEnd = Date()
+        SleepFocusFinalization.persist(focusEnd)
 
         // The Focus-triggered run is additive. Keep both existing BGTask chains armed exactly as a
         // normal background run does; this does not cancel or replace either pending request.
@@ -93,7 +279,7 @@ private enum SleepFocusSyncRunner {
             // #215 phase 4, decision 1: the chosen device's drain only. With the Helio Strap chosen the
             // ring's scanner is never constructed; the strap's drain runs instead.
             if BackgroundDrain(ActiveDeviceChoiceStore.persisted()) == .strap {
-                await runStrap(store: store)
+                await runStrap(store: store, focusEnd: focusEnd)
                 return
             }
             let service = RingBackgroundSyncService(store: store, health: HealthKitWriter())
@@ -156,13 +342,21 @@ private enum SleepFocusSyncRunner {
     /// Focus ending is the authoritative "the night is over" signal, so the strap's nights skip the
     /// 20-minute quiet margin, exactly as the ring's do on this wake (`sleepFinalized`). The run logs
     /// itself ("helio strap: …", kind `sleepFocus`); the alert passes follow a finished sync.
-    private static func runStrap(store: LocalStore) async {
+    private static func runStrap(store: LocalStore, focusEnd: Date) async {
         let scheduler = BackgroundRefreshScheduler()
-        // T, the moment Sleep Focus ended (now): its nights skip the margin only within 30 min of it
-        // (decision 31).
+        // T, the moment Sleep Focus ended: in memory its nights skip the margin within 30 min of it
+        // (decision 31); persisted, a later flush within 6 h finalizes the nights that ended by then
+        // (decision 78a).
         let run = await HelioBackgroundSyncService.live(store: store).run(
-            kind: .sleepFocus, timeout: RingBackgroundSyncService.defaultTimeout, nightsFinalized: Date())
-        guard !Task.isCancelled else { return }
+            kind: .sleepFocus, timeout: RingBackgroundSyncService.defaultTimeout, nightsFinalized: focusEnd)
+        // The night as the store has it after the run's flush (or with none).
+        let night = HelioConnection.savedTimeline.map { store.strapFocusNight(timeline: $0, focusEnd: focusEnd) } ?? .none
+        guard !Task.isCancelled else {
+            // Decision 78b/78c: an expired run still asks for its retry and leaves its line.
+            SleepFocusStrapFollowUp.finish(run, focusEnd: focusEnd, night: night, expired: true,
+                                           scheduler: scheduler, observability: ObservabilityStore())
+            return
+        }
         await evaluateAlerts()
         if run.ending == .synced {
             let alerts = HealthNotificationCenter()
@@ -175,10 +369,10 @@ private enum SleepFocusSyncRunner {
         }
         scheduler.schedule()
         scheduler.scheduleProcessing()
-        // #233 item 5: a night this flush held back (it started over 30 min after Focus ended), and
-        // review-225e SF-3: one still pending survives the `schedule()` above.
-        if run.flushMS != nil { StrapNightRefresh.record(run.refreshAt, scheduler: scheduler) }
-        StrapNightRefresh.resubmit(scheduler, strapChosen: true)
+        // #233 item 5: a night this flush held back, and review-225e SF-3: one still pending survives
+        // the `schedule()` above. Decision 78b: a night not in Apple Health gets a retry at T + 15 min.
+        SleepFocusStrapFollowUp.finish(run, focusEnd: focusEnd, night: night, expired: false,
+                                       scheduler: scheduler, observability: ObservabilityStore())
     }
 
     private static func evaluateAlerts() async {
