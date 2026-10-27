@@ -651,10 +651,9 @@ struct ContentView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    if !trends.points.isEmpty {
-                        OCSectionHeader("Sleep Trends", systemImage: "chart.xyaxis.line", tint: Theme.sleep)
-                        SleepTrendsSection(points: trends.points, tempUnitRaw: tempUnitRaw)
-                    }
+                    // Wide: the trends live in the right-hand column instead (`sleepTrends`), so the
+                    // right pane never repeats last night, which the card on the left already shows.
+                    if sizeClass != .regular { sleepTrends() }
                     DetailLink { SleepFocusSyncSetupView() } label: {
                         card {
                             HStack(spacing: 8) {
@@ -684,7 +683,29 @@ struct ContentView: View {
             .background(Theme.pageBackground)
             .navigationTitle("Sleep")
         } emptyDetail: {
-            SleepNightsBrowserView()
+            // Trends are new information next to the last-night card; the nights browser would
+            // repeat that same night's stages. With no trends yet, fall back to the browser.
+            if trends.points.isEmpty {
+                SleepNightsBrowserView()
+            } else {
+                ScrollView {
+                    VStack(spacing: Theme.sectionSpacing) { sleepTrends(showsHeader: false) }
+                        .padding()
+                }
+                .background(Theme.pageBackground)
+                .navigationTitle("Sleep Trends")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sleepTrends(showsHeader: Bool = true) -> some View {
+        if !trends.points.isEmpty {
+            // The wide pane's navigation title already says "Sleep Trends".
+            if showsHeader {
+                OCSectionHeader("Sleep Trends", systemImage: "chart.xyaxis.line", tint: Theme.sleep)
+            }
+            SleepTrendsSection(points: trends.points, tempUnitRaw: tempUnitRaw)
         }
     }
 
