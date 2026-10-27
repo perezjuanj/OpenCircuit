@@ -122,6 +122,7 @@ struct WorkoutDetailView: View {
 
     @State private var hr: [HRSample] = []
     @State private var hrSource: WorkoutDetailContent.HeartRateSource = .none
+    @State private var recovery: HeartRateRecovery.Outcome?
     @State private var route: [CLLocationCoordinate2D] = []
     @State private var loaded = false
     @State private var confirming = false
@@ -194,7 +195,7 @@ struct WorkoutDetailView: View {
             owner: LocalStore.ownershipLog().owner(at: item.start))
         return OCCard {
             ForEach(WorkoutDetailContent.rows(item, hr: hr, age: age, unit: distanceUnit,
-                                              recordedWith: recorder)) { row in
+                                              recordedWith: recorder, recovery: recovery)) { row in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack {
                         Text(row.title).font(.subheadline)
@@ -282,6 +283,16 @@ struct WorkoutDetailView: View {
             })
         hr = chosen.samples
         hrSource = chosen.source
+        // #337: heart rate recovery from the app's stored rows inside the workout's recovery window.
+        if let window = WorkoutRecoveryWindows().window(endingWorkoutAt: item.end) {
+            let rows = OpenCircuitApp.sharedContainer.flatMap {
+                try? LocalStore($0.mainContext).ownedSamples(kind: .heartRate, from: window.start, to: window.end)
+            } ?? []
+            recovery = WorkoutDetailContent.recovery(
+                workoutHR: chosen.samples,
+                storedRows: rows.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) },
+                window: window, age: age)
+        }
         if let workout { route = await store.route(of: workout) }
         loaded = true
     }

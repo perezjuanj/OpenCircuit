@@ -76,6 +76,33 @@ enum WorkoutDetailContent {
         return zones.totalZoneSeconds > 0 ? zones : nil
     }
 
+    // MARK: Heart rate recovery (#337)
+
+    /// HRR1/HRR2 for a strap workout that had a recovery window, or nil (the row is then left out:
+    /// a ring workout, or one recorded before #337). The recovery readings are OpenCircuit's own
+    /// stored rows (`LocalStore`), never Health's: only rows with a real span (a workout-shaped
+    /// reading, `end > start`) inside the window this app recorded for the workout, so neither the
+    /// all-day history instants nor the next workout's readings can stand in for them.
+    static func recovery(workoutHR: [HRSample], storedRows: [HRSample], window: DateInterval?,
+                         age: Int) -> HeartRateRecovery.Outcome? {
+        guard let window else { return nil }
+        let readings = storedRows.filter {
+            $0.end > $0.start && $0.start >= window.start && $0.end <= window.end
+        }
+        let maxHR = TrainingLoad.zoneMaxHR(age: age)
+        let bound = HeartRateRecovery.zoneFourLowerBound { HRZoneClassifier.zone(bpm: $0, maxHR: maxHR) }
+            ?? LiveHR.validBPM.upperBound + 1
+        return HeartRateRecovery.measure(activeReadings: workoutHR, recoveryReadings: readings,
+                                         end: window.start, zoneFourLowerBound: bound)
+    }
+
+    /// The detail's recovery row: the values, and why one is missing.
+    static func recoveryRow(_ outcome: HeartRateRecovery.Outcome) -> Row {
+        let reasons = HeartRateRecoveryText.reasons(outcome)
+        return Row(title: "Heart rate recovery", value: HeartRateRecoveryText.values(outcome),
+                   caption: reasons.isEmpty ? nil : reasons.joined(separator: " "))
+    }
+
     // MARK: Device
 
     /// Which wearable recorded the workout. The strap's workouts name it (`HKDevice`, decision 11).
@@ -104,7 +131,8 @@ enum WorkoutDetailContent {
 
     /// The summary rows, in order, holding only what the workout has.
     static func rows(_ item: WorkoutHistoryReader.Item, hr: [HRSample], age: Int,
-                     unit: DistanceUnit, recordedWith: String) -> [Row] {
+                     unit: DistanceUnit, recordedWith: String,
+                     recovery: HeartRateRecovery.Outcome? = nil) -> [Row] {
         var rows: [Row] = []
         let paused = item.pausedSeconds
         let moving = item.movingSeconds
@@ -127,6 +155,7 @@ enum WorkoutDetailContent {
             rows.append(Row(title: "Training load", value: "\(Int(load.rounded()))",
                             caption: "Minutes in each heart-rate zone times the zone number (1 to 5)."))
         }
+        if let recovery { rows.append(recoveryRow(recovery)) }
         rows.append(Row(title: "Recorded with", value: recordedWith))
         return rows
     }
