@@ -98,6 +98,12 @@ final class WorkoutSessionManager: NSObject {
     private(set) var vo2MaxOutcome: VO2MaxEstimate.Outcome?
     /// What happened to that estimate in Apple Health. nil while the write is pending.
     private(set) var vo2MaxHealthStatus: VO2MaxHealthWriter.Status?
+    /// An indoor run or walk (#339, decision 84d): steps per minute over the last 60 s, nil while paused.
+    private(set) var liveCadence: Double?
+    /// Active steps × stride so far ("est.").
+    private(set) var liveEstimatedMeters: Double?
+    /// The finished indoor run or walk: the treadmill prompt, cadence, Health writes, indoor VO₂ max.
+    private(set) var indoorRun: IndoorRunFinish?
 
     // MARK: Private
 
@@ -118,6 +124,9 @@ final class WorkoutSessionManager: NSObject {
     /// ring's running total so a workout's step count excludes time it was paused, the same promise
     /// already kept for HR, distance and energy.
     private var pausedRingSteps = 0
+    /// An indoor run or walk's steps (#339, decision 84a/84c): the ring's running `0x4e` total
+    /// (`carriedSportSteps + session.sportSteps`) read on every HR poll, as deltas. nil otherwise.
+    private var indoorSteps: IndoorStepTracker?
 
     /// Drives the workout Live Activity (Lock Screen + Dynamic Island: time / calories / BPM). Owns
     /// all ActivityKit calls so this manager stays a plain state machine. No-op when the user has
@@ -392,6 +401,14 @@ final class WorkoutSessionManager: NSObject {
         hrSampleCount = 0
         routeLocations = []
         lastLocation = nil
+        liveCadence = nil
+        liveEstimatedMeters = nil
+        indoorRun = nil
+        indoorSteps = IndoorStepWorkout.applies(to: selectedSport)
+            ? IndoorStepTracker(sport: selectedSport, stride: IndoorStride.forWorkout(
+                sport: selectedSport, heightCm: IndoorRunProfile.userSetHeightCm(),
+                calibrated: IndoorStrideCalibrations().stride(timeline: .ringConn, sport: selectedSport)))
+            : nil
 
         recordingState = .starting
 
@@ -418,6 +435,7 @@ final class WorkoutSessionManager: NSObject {
         carriedSportSteps = 0
         carriedSportFrameCursors = []
         fallbackCapturedSamples = []
+        sampleIndoorSteps(running: true)   // #339: the base, before the ring's first `0x4e` frame
 
         // Keep the screen awake while a workout is foregrounded so it doesn't auto-dim → lock →
         // suspend (which would stall the poll loops). Background tracking is handled by the
@@ -442,6 +460,7 @@ final class WorkoutSessionManager: NSObject {
                 guard let self else { break }   // self-terminate if the manager went away
                 await MainActor.run {
                     self.collectHRSnapshot()
+                    self.sampleIndoorSteps(running: !self.isPaused)
                     self.mergeBufferedSportRecords(until: Date())
                 }
             }
@@ -489,10 +508,12 @@ final class WorkoutSessionManager: NSObject {
     func pause() {
         guard recordingState == .active, var ledger, !ledger.isPaused else { return }
         let now = Date()
+        sampleIndoorSteps(running: true)   // the steps up to the pause count
         ledger.pause(at: now)
         self.ledger = ledger
         paceTracker.reset()
         elapsedSeconds = ledger.activeSeconds(until: now)
+        liveCadence = nil
         pauseStepBaseline = session?.sportSteps
         Task { await pushLiveActivityUpdate() }
     }
@@ -502,6 +523,7 @@ final class WorkoutSessionManager: NSObject {
     func resume() {
         guard recordingState == .active, var ledger, ledger.isPaused else { return }
         let now = Date()
+        sampleIndoorSteps(running: false)   // the pause's steps move the base and count nothing
         ledger.resume(at: now)
         self.ledger = ledger
         lastLocation = nil
@@ -613,6 +635,7 @@ final class WorkoutSessionManager: NSObject {
             pausedRingSteps += max(0, current - baseline)
         }
         pauseStepBaseline = nil
+        sampleIndoorSteps(running: !isPaused)   // the last reading before SportStop
         let liveSportSteps = max(0, carriedSportSteps + (session?.endSportSession() ?? 0) - pausedRingSteps)
         let sportSteps = liveSportSteps + bufferedSteps
         session = nil
@@ -666,7 +689,10 @@ final class WorkoutSessionManager: NSObject {
             activeSeconds = paused.activeSeconds
         }
         finishedActiveSeconds = activeSeconds
+        let activeSegments = ledger?.activeSegments(until: endDate) ?? [DateInterval(start: summary.startDate, end: endDate)]
         ledger = nil
+        let indoor = indoorSteps
+        indoorSteps = nil
 
         // Dismiss the Live Activity now (before the slower HealthKit write) so it clears as the
         // summary screen appears. Publish a final coherent state from the finalized summary.
@@ -680,7 +706,8 @@ final class WorkoutSessionManager: NSObject {
         let saved = await writeWorkout(summary: summary,
                                        hrSamples: agg.collectedSamples,   // none recorded while paused
                                        routeLocations: hasRoute ? routeLocations : [],
-                                       pauses: pauses)
+                                       pauses: pauses,
+                                       indoorDistanceMeters: indoor?.estimatedMeters)
         if !saved { unresolve() }   // not in Health → let its records be reviewed as detected
 
         // Persist this workout's continuous HR into LocalStore — same store the ring's history
@@ -759,6 +786,22 @@ final class WorkoutSessionManager: NSObject {
                              route: hasRoute ? routeLocations : [])
             : nil
         vo2MaxHealthStatus = saved ? nil : .failed
+        if let indoor {
+            // #339: the treadmill prompt, cadence and the Health writes beyond the workout, from the
+            // ring's own live `0x4e` steps (buffered `0x4d` records fill HR gaps, not these minutes).
+            var restingHR: Double?
+            if summary.sport == .runningIndoor, let store {
+                restingHR = VO2MaxInputs.restingHR(store: store, workoutStart: summary.startDate, workoutEnd: summary.endDate)
+            }
+            let finish = IndoorRunFinish(inputs: IndoorRunInputs(
+                sport: summary.sport, timeline: .ringConn, start: summary.startDate, end: summary.endDate,
+                activeSeconds: activeSeconds, activeSegments: activeSegments, steps: indoor.log,
+                stride: indoor.stride, stepsInterrupted: false, savedToHealth: saved,
+                heartRate: agg.collectedSamples, age: VO2MaxInputs.userSetAge(), restingHR: restingHR),
+                health: IndoorRunHealthWriter(), calibrations: IndoorStrideCalibrations())
+            indoorRun = finish
+            finish.writeEstimateMetrics()
+        }
         recordingState = .finished(summary: summary)
         if saved, case .estimate(let estimate)? = vo2MaxOutcome {
             Task { [weak self] in
@@ -804,6 +847,9 @@ final class WorkoutSessionManager: NSObject {
         let finalState = currentLiveActivityState()
         Task { await liveActivity.end(final: finalState) }
         ledger = nil
+        indoorSteps = nil
+        liveCadence = nil
+        liveEstimatedMeters = nil
         session?.endSportSession()   // SportStop — discarded session, nothing persisted
         session?.clearManualWorkout()   // discarded: its records may be offered as detected again
         session = nil
@@ -829,7 +875,28 @@ final class WorkoutSessionManager: NSObject {
         currentHR = nil
         vo2MaxOutcome = nil
         vo2MaxHealthStatus = nil
+        indoorSteps = nil
+        liveCadence = nil
+        liveEstimatedMeters = nil
+        indoorRun = nil
     }
+
+    /// One reading of the ring's running step total for an indoor run or walk (#339): the live `0x4e`
+    /// steps of every session this workout used, as deltas (`IndoorStepTracker`). A reconnect keeps the
+    /// total continuous (`carriedSportSteps`), and a total that goes backwards is a new base, never a
+    /// negative step count (84c).
+    private func sampleIndoorSteps(running: Bool, now: Date = Date()) {
+        guard var tracker = indoorSteps, let session else { return }
+        tracker.observe(Self.indoorStepReading(carried: carriedSportSteps, sessionSteps: session.sportSteps),
+                        at: now, running: running)
+        indoorSteps = tracker
+        liveCadence = running ? tracker.liveCadence(now: now) : nil
+        liveEstimatedMeters = tracker.estimatedMeters
+    }
+
+    /// The ring's running step total for this workout: every session it left behind plus the current
+    /// one's live `0x4e` sum (a reconnect's new session counts from zero again).
+    nonisolated static func indoorStepReading(carried: Int, sessionSteps: Int) -> Int { carried + sessionSteps }
 
     // ⚠️ OWNERSHIP — CORRECTED (tester report 2026-08-29, build 49). This note used to end "Ring
     // teardown (`stopLiveMonitoring`) is handled by `stop()` via the view's `.onDisappear` (#75)".
@@ -1033,7 +1100,8 @@ final class WorkoutSessionManager: NSObject {
         summary: WorkoutSummary,
         hrSamples: [HRSample],
         routeLocations: [CLLocation],
-        pauses: [DateInterval] = []
+        pauses: [DateInterval] = [],
+        indoorDistanceMeters: Double? = nil
     ) async -> Bool {
         guard HKHealthStore.isHealthDataAvailable() else { return false }
         let activityType = Self.hkActivityType(for: summary.sport)
@@ -1131,6 +1199,18 @@ final class WorkoutSessionManager: NSObject {
                 metadata: [HKMetadataKeyWasUserEntered: false])
             try? await builder.addSamples([distSample])
             if !isCycling { walkRunDistanceToCredit = dist }
+        } else if let indoor = indoorDistanceMeters, indoor > 0, IndoorStepWorkout.applies(to: summary.sport) {
+            // An indoor run or walk (#339, decision 84f): the ring's active steps × stride, an ESTIMATE
+            // until the person types the treadmill's distance (`IndoorRunHealthWriter.replaceEstimate`).
+            let distSample = HKQuantitySample(
+                type: HKQuantityType(.distanceWalkingRunning),
+                quantity: HKQuantity(unit: .meter(), doubleValue: indoor),
+                start: summary.startDate, end: summary.endDate,
+                metadata: [HKMetadataKeyWasUserEntered: false, IndoorRunMetadata.estimatedKey: true])
+            do {
+                try await builder.addSamples([distSample])
+                walkRunDistanceToCredit = indoor
+            } catch {}
         }
 
         // End collection and finish workout

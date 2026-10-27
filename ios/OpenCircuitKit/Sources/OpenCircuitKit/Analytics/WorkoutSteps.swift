@@ -11,7 +11,7 @@
 //     nothing, and the recorder rebases at every resume and reconnect, so the steps taken in a pause or
 //     a link gap are never credited to the next running minute.
 //   • Distance estimate = active steps × stride, stride = height × a named per-sport factor (walking
-//     0.415, running 0.65). Both factors are ROUGH ESTIMATES (docs/TRAINING_METRICS.md §3), so the
+//     0.415, running 0.65). Both factors are ROUGH ESTIMATES (docs/TRAINING_METRICS.md §2.7), so the
 //     distance is labelled "est." until the person types the treadmill's distance; that distance then
 //     calibrates the stride for the next indoor run of that sport on that device.
 
@@ -145,7 +145,7 @@ public struct IndoorStride: Equatable, Sendable {
     }
 
     /// Decision 84d's factors: stride ≈ height × 0.415 walking, × 0.65 running. Rough estimates,
-    /// documented in docs/TRAINING_METRICS.md §3.
+    /// documented in docs/TRAINING_METRICS.md §2.7.
     public static let walkingHeightFactor = 0.415
     public static let runningHeightFactor = 0.65
 

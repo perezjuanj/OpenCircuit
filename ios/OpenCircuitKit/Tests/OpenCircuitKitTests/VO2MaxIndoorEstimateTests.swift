@@ -64,6 +64,8 @@ final class VO2MaxIndoorEstimateTests: XCTestCase {
     func testEachRefusalIsItsReason() {
         XCTAssertEqual(skip(treadmillRun(typed: false)), .noTypedDistance)
         XCTAssertEqual(skip(treadmillRun(noStepsDuring: 0 ... 99)), .noStepData)
+        XCTAssertEqual(skip(treadmillRun(typed: false, noStepsDuring: 0 ... 99)), .noStepData,
+                       "with no steps, asking for the treadmill's distance would not help")
         XCTAssertEqual(skip(treadmillRun(sport: .walkingIndoor)), .notAnIndoorRun)
         XCTAssertEqual(skip(treadmillRun(sport: .runningOutdoor)), .notAnIndoorRun)
         XCTAssertEqual(skip(treadmillRun(minutes: 9)), .tooShort)

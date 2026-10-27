@@ -85,6 +85,11 @@ final class HealthKitAuthorizationSurfaceTests: XCTestCase {
     /// argument as the VO₂ max one — pinned by `testTheLazyBodyMassRequestNamesOnlyBodyMass` below and,
     /// on the app side, by `HealthKitShareTypesTests.testBodyMassStaysOutOfTheMainRequest`.
     ///
+    /// `IndoorRunHealthWriter.swift` = 2 (#339, decision 84f): running speed and running stride length,
+    /// each asked lazily in its own one-type request the first time it is written, the VO₂ max pattern.
+    /// Neither type is in the main request's sets — pinned by `IndoorRunHealthTypesTests` (Kit) and, on
+    /// the app side, by `IndoorRunHealthShareTypesTests`.
+    ///
     /// `CalibrationSupport.swift` = 3 (SpO₂, Apple Watch HR, Apple Watch ECG). These are read-only
     /// requests inside the cuff/PPG calibration dev tool, reachable ONLY from the `#if DEBUG` block
     /// in `ContentView` (`showCalibration = true` at ContentView.swift is inside `#if DEBUG` …
@@ -111,7 +116,8 @@ final class HealthKitAuthorizationSurfaceTests: XCTestCase {
         }
 
         let expected = ["HealthKitWriter.swift": 2, "CalibrationSupport.swift": 3,
-                        "VO2MaxHealthWriter.swift": 1, "HealthKitWeightReader.swift": 1]
+                        "VO2MaxHealthWriter.swift": 1, "HealthKitWeightReader.swift": 1,
+                        "IndoorRunHealthWriter.swift": 2]
         XCTAssertEqual(found, expected, """
             The HealthKit authorization surface moved. Found \(found), expected \(expected).
 

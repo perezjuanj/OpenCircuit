@@ -55,9 +55,10 @@ extension VO2MaxEstimate {
         guard input.sport == .runningIndoor else { return .skipped(.notAnIndoorRun) }
         guard input.activeSeconds >= minimumDuration,
               input.end.timeIntervalSince(input.start) >= minimumDuration else { return .skipped(.tooShort) }
-        guard let typed = input.typedDistance, typed > 0 else { return .skipped(.noTypedDistance) }
+        // No steps first: without them a typed distance can't become a speed either.
         let totalSteps = input.activeSteps
         guard totalSteps > 0 else { return .skipped(.noStepData) }
+        guard let typed = input.typedDistance, typed > 0 else { return .skipped(.noTypedDistance) }
         guard input.heartRate.count >= minReadingsPerMinute * segmentMinutes else {
             return .skipped(.noHeartRate)
         }

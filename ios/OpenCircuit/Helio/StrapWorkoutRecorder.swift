@@ -69,6 +69,20 @@ protocol StrapWorkoutHeartRateSource: AnyObject {
 
 extension HelioSession: StrapWorkoutHeartRateSource {}
 
+/// An indoor run or walk's steps from the strap (#339, decision 84b): the realtime step stream. Apart
+/// from `StrapWorkoutHeartRateSource` so a source without it simply has no steps. `HelioSession` conforms.
+@MainActor
+protocol StrapWorkoutStepSource: AnyObject {
+    var stepCounterObserver: (@MainActor (Int, Date) -> Void)? { get set }
+    /// `05 01`, refused unless the connection can stream steps and a workout holds the link. true when sent.
+    @discardableResult func startWorkoutSteps() -> Bool
+    func stopWorkoutSteps()
+    /// The `05 00` owed for a stream left on (`StrapStepStreamFlag`), if owed and authenticated.
+    func sendOwedStepsOff()
+}
+
+extension HelioSession: StrapWorkoutStepSource {}
+
 /// What became of one heart-rate recovery write to Apple Health (decision 82c, 82e).
 enum HeartRateRecoveryHealthStatus: Equatable {
     case saved
@@ -137,6 +151,8 @@ struct StrapWorkoutWrite {
     let samples: [HRSample]
     let route: [CLLocation]
     let timeline: SyncDeviceID
+    /// An indoor run or walk's step-based distance (#339), nil otherwise.
+    var indoorDistance: IndoorDistanceWrite? = nil
 }
 
 @MainActor
@@ -276,6 +292,12 @@ final class StrapWorkoutRecorder {
     private(set) var vo2MaxHealthStatus: VO2MaxHealthWriter.Status?
     /// The +120 s mark of the open recovery window, for the countdown. nil when no window is open.
     private(set) var recoveryMarkAt: Date?
+    /// An indoor run or walk (#339): steps per minute over the last 60 s, nil while paused or before any.
+    private(set) var liveCadence: Double?
+    /// Active steps × stride so far ("est."), nil without steps or a stride.
+    private(set) var liveEstimatedMeters: Double?
+    /// The finished indoor run or walk: the distance prompt, cadence, its Health writes and indoor VO₂ max.
+    private(set) var indoorRun: IndoorRunFinish?
     /// HRR1/HRR2 once the window closed (decision 82d). nil while it is open, and with no window.
     private(set) var heartRateRecovery: HeartRateRecovery.Outcome?
     /// How the window closed.
@@ -359,6 +381,11 @@ final class StrapWorkoutRecorder {
     /// Heart rate recovery's Apple Health writes. nil: no recovery window (End as before #337).
     @ObservationIgnored private let recoveryHealth: (any HeartRateRecoveryHealthWriting)?
     @ObservationIgnored private let recoveryWindows: WorkoutRecoveryWindows
+    /// Indoor runs' Health writes beyond the workout (#339). nil: none (a rig that didn't ask).
+    @ObservationIgnored private let indoorHealth: (any IndoorRunHealthWriting)?
+    @ObservationIgnored private let stepStreamFlag: StrapStepStreamFlag
+    @ObservationIgnored private let strideCalibrations: IndoorStrideCalibrations
+    @ObservationIgnored private let userHeightCm: () -> Double?
 
     // MARK: Session state
 
@@ -382,6 +409,13 @@ final class StrapWorkoutRecorder {
         var activeReadings: [HRSample]?
     }
     @ObservationIgnored private var recoveryWindow: RecoveryWindow?
+    /// An indoor run or walk's steps (#339, decision 84c); nil for every other sport.
+    @ObservationIgnored private var steps: IndoorStepTracker?
+    @ObservationIgnored private weak var stepSource: (any StrapWorkoutStepSource)?
+    /// This workout's `05 01` is in force (decision 84b).
+    @ObservationIgnored private var stepsStreaming = false
+    /// The stream stopped with the link and wasn't turned on again (no `05 01` after a reconnect).
+    @ObservationIgnored private var stepsInterrupted = false
     /// Readings received during the open pause (82d measures from the end, and a workout ended while
     /// paused ended where the pause began). Cleared at every pause and resume.
     @ObservationIgnored private var pausedReadings: [HRSample] = []
@@ -406,6 +440,10 @@ final class StrapWorkoutRecorder {
          tombstones: WorkoutTombstones = WorkoutTombstones(),
          recoveryHealth: (any HeartRateRecoveryHealthWriting)? = nil,
          recoveryWindows: WorkoutRecoveryWindows = WorkoutRecoveryWindows(),
+         indoorHealth: (any IndoorRunHealthWriting)? = nil,
+         stepStreamFlag: StrapStepStreamFlag = StrapStepStreamFlag(),
+         strideCalibrations: IndoorStrideCalibrations = IndoorStrideCalibrations(),
+         userHeightCm: @escaping () -> Double? = { IndoorRunProfile.userSetHeightCm() },
          clock: @escaping () -> Date = Date.init,
          autoTick: Bool = true,
          managesIdleTimer: Bool = true) {
@@ -422,6 +460,10 @@ final class StrapWorkoutRecorder {
         self.tombstones = tombstones
         self.recoveryHealth = recoveryHealth
         self.recoveryWindows = recoveryWindows
+        self.indoorHealth = indoorHealth
+        self.stepStreamFlag = stepStreamFlag
+        self.strideCalibrations = strideCalibrations
+        self.userHeightCm = userHeightCm
         self.clock = clock
         self.autoTick = autoTick
         self.managesIdleTimer = managesIdleTimer
@@ -441,7 +483,8 @@ final class StrapWorkoutRecorder {
                              location: StrapWorkoutLocation(),
                              liveActivity: WorkoutLiveActivityController(),
                              vo2: StrapVO2MaxLive(store: store),
-                             recoveryHealth: HeartRateRecoveryHealthWriter())
+                             recoveryHealth: HeartRateRecoveryHealthWriter(),
+                             indoorHealth: IndoorRunHealthWriter())
     }
 
     // MARK: Start, pause, resume
@@ -475,6 +518,12 @@ final class StrapWorkoutRecorder {
         vo2MaxHealthStatus = nil
         clearHeartRateRecovery()
         rrIntervalCount = 0
+        clearSteps()
+        if IndoorStepWorkout.applies(to: sport) {
+            steps = IndoorStepTracker(sport: sport, stride: IndoorStride.forWorkout(
+                sport: sport, heightCm: userHeightCm(),
+                calibrated: strideCalibrations.stride(timeline: session.timeline, sport: sport)))
+        }
         // Review-238 N1: an interrupted workout still waiting for the person's answer ("Not now") is set
         // aside, never deleted; the next launch offers it again. A put-off offer's slot no longer points
         // at it once it is parked, so nothing may answer it in this process any more.
@@ -489,6 +538,8 @@ final class StrapWorkoutRecorder {
         }
         if managesIdleTimer { UIApplication.shared.isIdleTimerDisabled = true }
         state = .active
+        // Decision 84b: `05 01` at the start of an indoor workout, once the workout holds the link.
+        turnStepsOn(session, now: now)
         helioLog.notice("helio: workout started (\(sport.rawValue, privacy: .public))")
         liveActivity?.start(sport: sport, startDate: now,
                             initial: WorkoutActivityAttributes.ContentState(
@@ -503,6 +554,7 @@ final class StrapWorkoutRecorder {
         self.ledger = ledger
         pausedReadings = []
         paceTracker.reset()
+        turnStepsOff()   // decision 84b: `05 00` at pause
         location.setPaused(true)
         refresh(now: now)
         persistJournal(now: now)
@@ -517,6 +569,7 @@ final class StrapWorkoutRecorder {
         self.ledger = ledger
         pausedReadings = []
         paceTracker.reset()
+        if let attached { turnStepsOn(attached, now: now) }   // decision 84b: `05 01` at resume
         location.setPaused(false)
         refresh(now: now)
         persistJournal(now: now)
@@ -556,6 +609,10 @@ final class StrapWorkoutRecorder {
         guard let ledger else { return }
         activeSeconds = ledger.activeSeconds(until: now)
         if !ledger.isPaused, selectedSport.isOutdoor { paceTracker.observe(distanceMeters: location.distanceMeters, at: now) }
+        if let steps {
+            liveCadence = ledger.isPaused ? nil : steps.liveCadence(now: now)
+            liveEstimatedMeters = steps.estimatedMeters
+        }
         liveZoneBreakdown = StrapWorkoutSummaryBuilder.zones(samples, ledger: ledger, end: now, maxHR: maxHR)
     }
 
@@ -571,6 +628,15 @@ final class StrapWorkoutRecorder {
         if let attached, attached !== current || !attached.isLinkConnected {
             attached.heartRateObserver = nil
             self.attached = nil
+            // Decision 84b: the stream went with the link. The reconnected session sends the owed
+            // `05 00` at its setup, and nothing turns it on again until a resume.
+            if stepsStreaming {
+                stepsStreaming = false
+                stepsInterrupted = true
+                persistJournal(now: now)
+            }
+            stepSource?.stepCounterObserver = nil
+            stepSource = nil
         }
         if attached == nil, !ledger.isInGap {
             ledger.beginGap(at: now)
@@ -614,6 +680,50 @@ final class StrapWorkoutRecorder {
         hrSampleCount += 1
     }
 
+    // MARK: Steps (#339, decision 84b, 84c)
+
+    /// `05 01` for an indoor run or walk that is running, on a source that has the stream. The first
+    /// frame after it is a base (`IndoorStepTracker.rebase`), so nothing from before is credited.
+    private func turnStepsOn(_ session: any StrapWorkoutHeartRateSource, now: Date) {
+        guard steps != nil, state == .active, ledger?.isPaused == false, !stepsStreaming,
+              let source = session as? any StrapWorkoutStepSource else { return }
+        steps?.rebase()
+        source.stepCounterObserver = { [weak self] counter, at in self?.receiveSteps(counter: counter, at: at) }
+        stepSource = source
+        if source.startWorkoutSteps() {
+            stepsStreaming = true
+            persistJournal(now: now)
+        }
+    }
+
+    /// `05 00` for this workout's stream (pause, End, cancel). The next reading is a base.
+    private func turnStepsOff() {
+        guard steps != nil else { return }
+        if stepsStreaming { stepSource?.stopWorkoutSteps() }
+        stepsStreaming = false
+        steps?.rebase()
+        liveCadence = nil
+    }
+
+    /// One counter reading from the strap: counted only while the workout runs (84c).
+    private func receiveSteps(counter: Int, at: Date) {
+        guard state == .active, var tracker = steps, let ledger else { return }
+        tracker.observe(counter, at: at, running: !ledger.isPaused && !ledger.isInGap)
+        steps = tracker
+        liveEstimatedMeters = tracker.estimatedMeters
+    }
+
+    private func clearSteps() {
+        steps = nil
+        stepSource?.stepCounterObserver = nil
+        stepSource = nil
+        stepsStreaming = false
+        stepsInterrupted = false
+        liveCadence = nil
+        liveEstimatedMeters = nil
+        indoorRun = nil
+    }
+
     // MARK: End
 
     /// End the workout: write one `HKWorkout`, queue its readings for `LocalStore`, then keep the strap's
@@ -630,6 +740,11 @@ final class StrapWorkoutRecorder {
         let end = ledger.openPauseStart ?? now
         // 82a/82b: the stream keeps running after End for the recovery window; the workout below is
         // exactly today's. Without a window (no recovery writer) the stream stops here, as before.
+        // Decision 84b: `05 00` at End, before anything else can wait.
+        turnStepsOff()
+        stepSource?.stepCounterObserver = nil
+        stepSource = nil
+        let indoorSteps = steps
         let windowOpen = openRecoveryWindow(end: end, now: now, timeline: timeline)
         if !windowOpen {
             tickTask?.cancel()
@@ -663,8 +778,12 @@ final class StrapWorkoutRecorder {
             activeKcal: Int((summary.summary.estimatedActiveKcal ?? 0).rounded()),
             bpm: summary.summary.avgHR, hrIsStale: true))
 
+        // An indoor run or walk: its step estimate is the workout's distance (84f), replaced later if the
+        // person types the treadmill's (84e). Nothing about it delays this write.
+        let indoorDistance = indoorSteps?.estimatedMeters.map(IndoorDistanceWrite.init(meters:))
         let saved = await health.save(StrapWorkoutWrite(summary: summary, samples: counted,
-                                                         route: hasRoute ? location.route : [], timeline: timeline))
+                                                         route: hasRoute ? location.route : [], timeline: timeline,
+                                                         indoorDistance: indoorDistance))
         helioLog.notice("helio: workout ended, \(counted.count, privacy: .public) reading(s), saved to Health \(saved, privacy: .public)")
         landPendingHeartRate()
         // #232: the VO₂ max estimate for an outdoor run, after the workout's own write so a one-time
@@ -674,6 +793,19 @@ final class StrapWorkoutRecorder {
             : nil
         // Not saved: the workout isn't in Health, so neither is its estimate (the ring's rule).
         vo2MaxHealthStatus = saved ? nil : .failed
+        if let indoorSteps {
+            let finish = IndoorRunFinish(inputs: IndoorRunInputs(
+                sport: selectedSport, timeline: timeline, start: ledger.start, end: end,
+                activeSeconds: summary.activeSeconds, activeSegments: ledger.activeSegments(until: end),
+                steps: indoorSteps.log, stride: indoorSteps.stride, stepsInterrupted: stepsInterrupted,
+                savedToHealth: saved, heartRate: counted,
+                age: vo2?.userSetAge(),
+                restingHR: selectedSport == .runningIndoor
+                    ? vo2?.restingHR(workoutStart: ledger.start, workoutEnd: end) : nil),
+                health: indoorHealth, calibrations: strideCalibrations)
+            indoorRun = finish
+            finish.writeEstimateMetrics()
+        }
         // `.finished` BEFORE the sync, so the hold is already released when `syncHistory` asks:
         // otherwise the workout's own hold would defer the very sync it held back. With a recovery
         // window, `.measuringRecovery` first: the hold stays, and the sync waits for the window.
@@ -875,6 +1007,8 @@ final class StrapWorkoutRecorder {
         tickTask?.cancel()
         tickTask = nil
         if Self.running === self { Self.running = nil }
+        turnStepsOff()   // decision 84b: `05 00` at cancel
+        clearSteps()
         attached?.stopWorkoutHeartRate()
         attached?.heartRateObserver = nil
         attached = nil
@@ -909,6 +1043,7 @@ final class StrapWorkoutRecorder {
         vo2MaxHealthStatus = nil
         clearHeartRateRecovery()
         rrIntervalCount = 0
+        clearSteps()
     }
 
     // MARK: Journal
@@ -918,7 +1053,8 @@ final class StrapWorkoutRecorder {
         flushReadings()
         journal.saveJournal(StrapWorkoutJournal(sport: selectedSport, ledger: ledger, lastAliveAt: now,
                                                 timelineRaw: timeline.rawValue,
-                                                distanceMeters: location.distanceMeters))
+                                                distanceMeters: location.distanceMeters,
+                                                stepStreamOn: steps == nil ? nil : stepsStreaming))
     }
 
     private func flushReadings() {
@@ -943,6 +1079,8 @@ final class StrapWorkoutRecorder {
             // Review-238 SF2: whatever the answer (Save, Discard, Not now, or a refusal below), the dead
             // process's stream is owed one `04 00`, sent at the strap's next authenticated `ready`.
             orphanStop.owed = true
+            // Decision 84b: a workout killed with the step stream on owes the strap a `05 00` too.
+            if running.stepStreamOn == true { stepStreamFlag.offOwed = true }
             switch tombstones.filter(StrapWorkoutRecovery.decide(journal: running, samples: journal.loadSamples(), now: now)) {
             case .nothingToRecover:
                 break
@@ -970,6 +1108,8 @@ final class StrapWorkoutRecorder {
             if parked.count != before { journal.saveParked(parked) }
         }
         if orphanStop.owed, let session = source(), session.ready { session.sendOwedOrphanStop() }
+        if stepStreamFlag.owesOff, let session = source(), session.ready,
+           let steps = session as? any StrapWorkoutStepSource { steps.sendOwedStepsOff() }
     }
 
     /// Take the offer on screen (or put off by the alert's dismissal a moment ago) as answered.

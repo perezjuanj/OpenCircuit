@@ -214,14 +214,18 @@ public struct StrapWorkoutJournal: Codable, Equatable, Sendable {
     public var timelineRaw: String
     /// GPS distance so far, informational (the route itself is not journaled; see recovery).
     public var distanceMeters: Double?
+    /// The strap's realtime step stream was on for this indoor workout (#339, decision 84b): a killed
+    /// process leaves the next connection an owed `05 00`. nil in journals written before #339.
+    public var stepStreamOn: Bool?
 
     public init(sport: WorkoutSportType, ledger: WorkoutActivityLedger, lastAliveAt: Date,
-                timelineRaw: String, distanceMeters: Double? = nil) {
+                timelineRaw: String, distanceMeters: Double? = nil, stepStreamOn: Bool? = nil) {
         self.sport = sport
         self.ledger = ledger
         self.lastAliveAt = lastAliveAt
         self.timelineRaw = timelineRaw
         self.distanceMeters = distanceMeters
+        self.stepStreamOn = stepStreamOn
     }
 
     public func encoded() -> Data? { try? JSONEncoder().encode(self) }

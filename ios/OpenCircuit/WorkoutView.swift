@@ -381,6 +381,13 @@ struct WorkoutView: View {
             }
             .padding(.horizontal)
 
+            // An indoor run or walk (#339): cadence and the step-based distance from the ring's steps.
+            if IndoorStepWorkout.applies(to: manager.selectedSport) {
+                IndoorRunLiveStats(cadence: manager.liveCadence, estimatedMeters: manager.liveEstimatedMeters,
+                                   distanceUnit: distanceUnit)
+                    .padding(.horizontal)
+            }
+
             Divider()
 
             // Live zone bars
@@ -514,10 +521,17 @@ struct WorkoutView: View {
                 }
                 .padding(.horizontal)
 
-                // Training load, and the VO₂ max estimate for an outdoor run (#232).
+                // An indoor run or walk (#339): cadence, the distance and the treadmill prompt.
+                if let indoor = manager.indoorRun {
+                    IndoorRunSummarySection(finish: indoor, distanceUnit: distanceUnit)
+                        .padding(.horizontal)
+                }
+
+                // Training load, and the VO₂ max estimate for an outdoor run (#232). An indoor run's
+                // comes from its prompt (#339).
                 WorkoutTrainingMetricsSection(summary: summary,
-                                              vo2Outcome: manager.vo2MaxOutcome,
-                                              vo2HealthStatus: manager.vo2MaxHealthStatus,
+                                              vo2Outcome: manager.indoorRun?.vo2MaxOutcome ?? manager.vo2MaxOutcome,
+                                              vo2HealthStatus: manager.indoorRun.map(\.vo2MaxHealthStatus) ?? manager.vo2MaxHealthStatus,
                                               distanceUnit: distanceUnit)
                     .padding(.horizontal)
 

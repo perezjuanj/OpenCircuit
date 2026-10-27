@@ -28,6 +28,11 @@ struct WorkoutTrainingMetricsSection: View {
             if summary.sport == .runningOutdoor {
                 Divider()
                 vo2Row(vo2Outcome ?? .skipped(.noGPS))
+            } else if summary.sport == .runningIndoor {
+                // #339 (decision 84g): from the typed treadmill distance and the steps. nil: no step
+                // data was recorded (a recovered or detected workout).
+                Divider()
+                vo2Row(vo2Outcome ?? .skipped(.noStepData))
             }
         }
     }
@@ -71,12 +76,23 @@ struct WorkoutTrainingMetricsSection: View {
     }
 
     static func estimateCaption(_ e: VO2MaxEstimate.Estimate, unit: DistanceUnit) -> String {
+        if e.speedSource == .treadmillSteps { return indoorCaption(e, unit: unit) }
         let maxSource = e.maxHRSource == .observed ? "the highest in this run" : "age formula"
         let grade = e.gradeFromElevation
             ? String(format: "%.0f%% grade from GPS elevation", e.grade * 100)
             : "assumed flat (GPS elevation not reliable)"
         return "Estimated from a steady 5-minute stretch at \(pace(e.speed, unit: unit)) and "
             + "\(Int(e.heartRate.rounded())) bpm, \(grade); resting heart rate "
+            + "\(Int(e.restingHR.rounded())), maximum \(Int(e.maxHR.rounded())) (\(maxSource))."
+    }
+
+    /// The indoor run's (decision 84g): the speed is the steps times the stride the typed distance gave,
+    /// and the grade is the typed incline.
+    static func indoorCaption(_ e: VO2MaxEstimate.Estimate, unit: DistanceUnit) -> String {
+        let maxSource = e.maxHRSource == .observed ? "the highest in this run" : "age formula"
+        let grade = e.grade > 0 ? String(format: "%g%% incline as you typed it", e.grade * 100) : "no incline (treated as flat)"
+        return "Estimated from a steady 5-minute stretch at \(pace(e.speed, unit: unit)) (your steps times the "
+            + "stride the treadmill distance gave) and \(Int(e.heartRate.rounded())) bpm, \(grade); resting heart rate "
             + "\(Int(e.restingHR.rounded())), maximum \(Int(e.maxHR.rounded())) (\(maxSource))."
     }
 

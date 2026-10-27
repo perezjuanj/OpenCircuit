@@ -176,6 +176,13 @@ struct StrapWorkoutView: View {
             }
             .padding(.horizontal)
 
+            // An indoor run or walk (#339): cadence and the step-based distance.
+            if IndoorStepWorkout.applies(to: recorder.selectedSport) {
+                IndoorRunLiveStats(cadence: recorder.liveCadence, estimatedMeters: recorder.liveEstimatedMeters,
+                                   distanceUnit: distanceUnit)
+                    .padding(.horizontal)
+            }
+
             Divider()
 
             VStack(alignment: .leading, spacing: 8) {
@@ -283,11 +290,17 @@ struct StrapWorkoutView: View {
                 recoverySection
                     .padding(.horizontal)
 
+                // An indoor run or walk (#339): cadence, the distance and the treadmill prompt.
+                if let indoor = recorder.indoorRun {
+                    IndoorRunSummarySection(finish: indoor, distanceUnit: distanceUnit)
+                        .padding(.horizontal)
+                }
+
                 // Training load, and the VO₂ max estimate for an outdoor run (#232) — the ring's
-                // section, over the strap's heart rate.
+                // section, over the strap's heart rate. An indoor run's comes from its prompt (#339).
                 WorkoutTrainingMetricsSection(summary: summary,
-                                              vo2Outcome: recorder.vo2MaxOutcome,
-                                              vo2HealthStatus: recorder.vo2MaxHealthStatus,
+                                              vo2Outcome: recorder.indoorRun?.vo2MaxOutcome ?? recorder.vo2MaxOutcome,
+                                              vo2HealthStatus: recorder.indoorRun.map(\.vo2MaxHealthStatus) ?? recorder.vo2MaxHealthStatus,
                                               distanceUnit: distanceUnit)
                     .padding(.horizontal)
 
