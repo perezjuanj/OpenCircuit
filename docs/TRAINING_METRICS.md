@@ -233,9 +233,9 @@ indoors, so each 1-minute bin's speed comes from steps.
   run."; no typed distance, "enter the treadmill's distance above, so your steps can be turned into
   a speed."; any other sport, "it is only estimated for indoor runs." The rest are §2.4's.
 - **Apple Health.** §2.5's write (`VO2MaxHealthWriter`, the same lazy request and test type), made
-  when the distance is typed (the estimate can only be computed after the prompt), with
-  `OpenCircuitVO2MaxMethod` = "ACSM running equation + Swain %HRR (estimate), treadmill distance +
-  steps".
+  once the distance is typed AND the workout itself is in Health (84j: the typed distance saves the
+  workout first), with `OpenCircuitVO2MaxMethod` = "ACSM running equation + Swain %HRR (estimate),
+  treadmill distance + steps".
 - **Sensitivity.** The treadmill's own distance display is the weak link: belt calibration errors of a
   few percent are common, and they move the estimate by the same few percent.
 
@@ -258,7 +258,19 @@ Code: `OpenCircuitKit/Analytics/VO2MaxEstimate+Indoor.swift` (`VO2MaxIndoorEstim
   the stride for the next indoor run of that sport on that device (`IndoorStrideCalibrations`). A
   result outside 0.2–2.5 m per step is a typo, not a stride, and is not stored.
 - **Strap link drops.** The stream stops with the link and the reconnect turns it off (§16.5); it is
-  turned on again only at a resume. The summary says the steps cover only the time before.
+  turned on again only at a resume, and from then on the run counts as whole again (review N2).
+  Until then the summary says the steps cover only the time before, and a typed distance doesn't
+  calibrate the stride.
+- **The distance prompt and the workout's save (decision 84e as amended by 84j).** At End the summary
+  asks "Treadmill distance?" (optional, in the person's distance unit) and "Incline %" (optional,
+  0–15). An indoor run or walk WITH STEPS saves its `HKWorkout` only when the prompt is answered (the
+  typed distance is the workout's distance) or skipped, the summary is dismissed, or 10 minutes after
+  End (the step estimate), whichever comes first; the heart-rate recovery window still opens at End
+  and the held-back sync still runs when it closes, while the recovery readings and Cardio Recovery
+  are written after the workout's save. Every other workout saves at End (82a). A kill before the save
+  is offered back at the next launch and saved with the estimate. A distance typed after the 10-minute
+  save replaces the estimate's samples (`docs/HEALTHKIT_MAPPING.md`). No typed distance and no steps:
+  no distance, as before.
 
 ---
 
