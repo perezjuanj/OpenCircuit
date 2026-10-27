@@ -218,13 +218,15 @@ stores and writes what it measured for time it owned:
     moved re-detection only touches that window (zero overlap: the lead-in starts where the nap ends)
     is rewritten, so the card's nap and Health agree, and the clean of its old write still ends one
     second clear of the lead-in and the night's `inBed`; one that overlaps by even one second is still
-    not rewritten (Health keeps the old write), and a ring nap touching a ring night is unchanged. Known limit, not fixed in this PR: a night
-    stored BEFORE the sync that first sees a nap more than 60 min before its sleep onset keeps its
-    lead-in until it is re-delivered changed enough for the merge to replace it, so the lead-in can lie
-    over that nap by up to the clamp difference (30 min for a nap ending 90 min before onset, 59 min at
-    61 min, at most the 120 min cap): in Health an `inBed` overlap and an `awake` sample over the nap's
-    asleep one, asleep time not counted twice; the card shows the night in bed from the lead-in start
-    and the nap until its end. Rare on the production fetch (a session nap comes with any later sync of
+    not rewritten (Health keeps the old write), and a ring nap touching a ring night is unchanged. A
+    night stored BEFORE the sync that first sees a nap more than 60 min before its sleep onset, and not
+    yet written, is replaced by its next re-delivery with the same sleep window and a later (or no)
+    lead-in start, whatever moved it, so its lead-in stops at the nap (decision 79e). Known limit, not fixed: such a night already WRITTEN keeps its lead-in (77f,
+    forward-only) until it extends (58b), so the lead-in can lie over that nap by up to the clamp
+    difference (30 min for a nap ending 90 min before onset, 59 min at 61 min, at most the 120 min cap):
+    in Health an `inBed` overlap and an `awake` sample over the nap's asleep one, asleep time not counted
+    twice; the card shows the night in bed from the lead-in start and the nap until its end. Rare on the
+    production fetch (a session nap comes with any later sync of
     the night; the activity fetch starts at or before the last session night's end, so a block nap
     comes with the night). ZEPP_PROTOCOL.md §21.6 has the details. Asleep time is unchanged; time in bed and awake time grow, so
     efficiency and the Sleep Score drop (a synthetic 8 h night with a 60 min lead-in: in bed 480 →
@@ -233,8 +235,16 @@ stores and writes what it measured for time it owned:
     Every reader that averages a night's vitals (the illness alert, Vitals Status, the card's
     overnight averages, Trends, the headache HRV and bedtime regularity) reads the night's sleep window,
     the in-bed window without the lead-in (decision 77h, `StoredSleepSummary.sleepWindowStart`), so
-    baselines and alerts are as before; a ring night, a night without a lead-in and an edited night
-    read exactly as before. A night an earlier build wrote without a lead-in that later extends at the
+    baselines and alerts are as before; a ring night and a night without a lead-in read exactly as
+    before. Only a strap night is read as having a lead-in (decision 79b, `isStrapNight`: the strap owns
+    its night under the ownership log, 28a), so a ring night of the same shape reads whole. A manually
+    edited strap night (decision 79a): the readers of its RECORDED columns (the illness alert, Vitals
+    Status, Trends' vitals averages, the nap windows and `saveNap`'s backstop) read the recorded night
+    without its recorded lead-in, from `recordedHypnogramData` (`recordedSleepWindowStart`); its edited
+    window is the person's own and is never trimmed. Trends' active energy and exercise minutes leave
+    out the whole in-bed window, lead-in included, like the dashboard, Goals, Wellness and the
+    active-energy flushes (decision 79c), so a day reads the same active kcal in Trends and on the
+    dashboard. A night an earlier build wrote without a lead-in that later extends at the
     end (58b) takes the lead-in along in that one rewrite (77i).
     - Steps: `StoredStepSample` rows carry no device column; they are the strap's by ownership (28:
       each step writer keeps its rows wholly in time its device owns), and the lead-in never reads
