@@ -45,6 +45,24 @@ enum ActiveDeviceChoice: String, CaseIterable, Sendable {
         case .helioStrap: return .storedOnDevice
         }
     }
+
+    /// Whether the device can start its Measure by itself when the app opens, and the setting's default
+    /// (decision 81e). Exhaustive (decision 51e). The strap streams cheaply and defaults on; the ring's
+    /// live measure costs battery, so it is offered but defaults off.
+    var autoLiveHeartRateOnOpen: AutoLiveHeartRateOnOpenSupport {
+        switch self {
+        case .ringConn: return .supported(defaultOn: false)
+        case .helioStrap: return .supported(defaultOn: true)
+        }
+    }
+}
+
+/// `ActiveDeviceChoice.autoLiveHeartRateOnOpen`.
+enum AutoLiveHeartRateOnOpenSupport: Equatable {
+    /// The device can't start a live heart rate by itself.
+    case unsupported
+    /// It can; `defaultOn` is the setting's value until the person changes it.
+    case supported(defaultOn: Bool)
 }
 
 /// `ActiveDeviceChoice.onDemandVibration`.

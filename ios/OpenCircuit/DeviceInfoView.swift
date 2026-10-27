@@ -201,6 +201,8 @@ struct DeviceInfoView: View {
                      + "uses more battery, matching the RingConn feature.")
             }
 
+            AutoLiveHeartRateOnOpenRow(choice: .ringConn)
+
             // Switching rings is uncommon (most people have one ring), so it lives here rather than
             // on the main screen. Opens a picker that scans for OTHER nearby rings — it keeps the
             // current link until you actually pick another, so cancelling is non-destructive. Data

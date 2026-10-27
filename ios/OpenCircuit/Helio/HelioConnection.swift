@@ -540,6 +540,7 @@ extension HelioConnection {
                            workoutHoldsStrap: StrapWorkoutRecorder.holdsStrapLink) {
             session.syncHistory(manual: false)
         }
+        session.activationSyncWasDecided()   // decision 81b: live heart rate on open goes after this
     }
 }
 
