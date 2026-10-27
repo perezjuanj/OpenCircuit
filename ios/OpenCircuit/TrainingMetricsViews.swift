@@ -104,7 +104,7 @@ struct WorkoutTrainingMetricsSection: View {
 // MARK: - Weekly load line
 
 /// Reads back this app's own workouts from the last 5 weeks and scores each from the heart-rate
-/// samples saved with it — the same samples, zones and max HR the summary used — so the weekly line
+/// samples saved with it — the same samples, zones and max HR the summary used (the zones the user has set now) — so the weekly line
 /// needs no local table (and no SwiftData change).
 ///
 /// READ AUTHORIZATION: nothing new. Workouts come from our own source (share covers that, see
@@ -113,7 +113,7 @@ struct WorkoutTrainingMetricsSection: View {
 struct WorkoutLoadReader {
     private let store = HKHealthStore()
 
-    func recentLoads(now: Date, age: Int) async -> [TrainingLoad.DatedLoad] {
+    func recentLoads(now: Date, zones: HeartRateZones) async -> [TrainingLoad.DatedLoad] {
         guard HKHealthStore.isHealthDataAvailable() else { return [] }
         let since = now.addingTimeInterval(-35 * 86_400)
         let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
@@ -132,7 +132,7 @@ struct WorkoutLoadReader {
             let hr = await heartRate(of: workout)
             loads.append(TrainingLoad.DatedLoad(
                 end: workout.endDate,
-                load: TrainingLoad.workoutLoad(hrSamples: hr, age: age, sessionEnd: workout.endDate)))
+                load: TrainingLoad.workoutLoad(hrSamples: hr, zones: zones, sessionEnd: workout.endDate)))
         }
         return loads
     }
@@ -166,8 +166,8 @@ struct WeeklyTrainingLoadLine: View {
     var body: some View {
         content.task(id: reloadToken) {
             let now = Date()
-            let age = HealthKitWriter.storedUserProfile().age
-            let loads = await WorkoutLoadReader().recentLoads(now: now, age: age)
+            let zones = await HeartRateZoneDefaults.currentZones()
+            let loads = await WorkoutLoadReader().recentLoads(now: now, zones: zones)
             // No workout in the last 35 days → no line, rather than "0 · no earlier workouts" above
             // a list of older workouts (review-237 N1). `content` still renders the clear
             // placeholder, so this task keeps a view to run on.

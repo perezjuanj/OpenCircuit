@@ -41,6 +41,8 @@ private struct WellnessBalanceCardBody: View {
     @AppStorage(GoalDefaults.activeKcal)      private var activeKcalGoal = GoalDefaults.defaultActiveKcal
     @AppStorage(GoalDefaults.activityMinutes) private var actMinGoal     = GoalDefaults.defaultActivityMinutes
     @AppStorage("userProfile.age") private var age = 35
+    // Decision 83c: a typed max HR (0 = Automatic) feeds the same calorie maths as the 220 - age formula.
+    @AppStorage(HeartRateZoneDefaults.manualMaxHRKey) private var manualMaxHR = 0
     @AppStorage("userProfile.weightKg") private var weightKg = 70.0
     // #284: manual-entry date + cached latest Apple Health body mass; the newer one feeds the math.
     @AppStorage(WeightResolver.Keys.manualSetAt) private var weightSetAtEpoch = 0.0
@@ -88,7 +90,8 @@ private struct WellnessBalanceCardBody: View {
     private var currentSteps: Int { todayDaily.first?.steps ?? 0 }
     private var profile: UserProfile {
         UserProfile(age: age, weightKg: max(effectiveWeightKg, 1), heightCm: max(heightCm, 1),
-                    sex: BiologicalSex(rawValue: sexRaw) ?? .male)
+                    sex: BiologicalSex(rawValue: sexRaw) ?? .male,
+                    manualMaxHR: manualMaxHR)
     }
 
     /// Only credit last night's stored scores when the night actually ended today — the same recency
@@ -143,7 +146,7 @@ private struct WellnessBalanceCardBody: View {
 
     /// Recompute identity — changes only when an input to readiness changes.
     private var inputsKey: String {
-        "\(activity == nil ? "-" : "")\(activity?.heartRate.count ?? 0)|\(currentSteps)|\(activity?.steps.count ?? 0)|\(age)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
+        "\(activity == nil ? "-" : "")\(activity?.heartRate.count ?? 0)|\(currentSteps)|\(activity?.steps.count ?? 0)|\(age)|\(manualMaxHR)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
         + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(latestSleep.first?.sleepScore ?? 0)|"
         + "\(latestSleep.first?.stressScore ?? 0)|\(sleepCredited ? 1 : 0)|"
         + "\(stepsGoal)|\(Int(actMinGoal))|\(Int(activeKcalGoal))|\(workoutCreditsRevision)"

@@ -196,6 +196,12 @@ struct UserProfileSettingsView: View {
                     // only: this reads the key, it never writes it.
                     LabeledContent("Age", value: Self.ageRowValue(age: age))
                 }
+                // Next to the age the max HR formula uses (decision 83): the zones, and a max HR of your own.
+                NavigationLink {
+                    HeartRateZonesSettingsView()
+                } label: {
+                    LabeledContent("Heart Rate Zones", value: HeartRateZoneSummary.profileRowValue(age: age))
+                }
                 LabeledContent("Weight") {
                     HStack(spacing: 4) {
                         if bodyUnit == .metric {

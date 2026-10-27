@@ -4,9 +4,10 @@
 // 0 or "--". A workout saved without heart rate has no heart-rate rows, no zones and no training
 // load; one without a route has no distance, pace or map.
 //
-// No physiology of its own: zones are `HRZoneClassifier.timeInZonesHeld` with the workout's
-// `TrainingLoad.zoneMaxHR`, and the load is `TrainingLoad.workoutLoad(hrSamples:age:sessionEnd:)`,
-// exactly what the weekly load line scores the same workout with.
+// No physiology of its own: zones are `HRZoneClassifier.timeInZonesHeld` over the user's
+// `HeartRateZones` as set now (decision 83f: history re-derives from the stored readings), and the
+// load is `TrainingLoad.workoutLoad(hrSamples:zones:sessionEnd:)`, exactly what the weekly load line
+// scores the same workout with.
 
 import Foundation
 import HealthKit
@@ -69,11 +70,15 @@ enum WorkoutDetailContent {
     }
 
     /// Time in each zone, or nil when no reading reached a zone (nothing to draw).
-    static func zones(_ hr: [HRSample], age: Int, end: Date) -> WorkoutZoneBreakdown? {
+    static func zones(_ hr: [HRSample], zones userZones: HeartRateZones, end: Date) -> WorkoutZoneBreakdown? {
         guard !hr.isEmpty else { return nil }
-        let zones = HRZoneClassifier.timeInZonesHeld(hrSamples: hr, maxHR: TrainingLoad.zoneMaxHR(age: age),
-                                                     sessionEnd: end)
+        let zones = HRZoneClassifier.timeInZonesHeld(hrSamples: hr, zones: userZones, sessionEnd: end)
         return zones.totalZoneSeconds > 0 ? zones : nil
+    }
+
+    /// The same over the default zones for `age` (Automatic max HR, % of max).
+    static func zones(_ hr: [HRSample], age: Int, end: Date) -> WorkoutZoneBreakdown? {
+        zones(hr, zones: HeartRateZones(percentOfMax: TrainingLoad.zoneMaxHR(age: age)), end: end)
     }
 
     // MARK: Device
@@ -105,6 +110,12 @@ enum WorkoutDetailContent {
     /// The summary rows, in order, holding only what the workout has.
     static func rows(_ item: WorkoutHistoryReader.Item, hr: [HRSample], age: Int,
                      unit: DistanceUnit, recordedWith: String) -> [Row] {
+        rows(item, hr: hr, zones: HeartRateZones(percentOfMax: TrainingLoad.zoneMaxHR(age: age)),
+             unit: unit, recordedWith: recordedWith)
+    }
+
+    static func rows(_ item: WorkoutHistoryReader.Item, hr: [HRSample], zones: HeartRateZones,
+                     unit: DistanceUnit, recordedWith: String) -> [Row] {
         var rows: [Row] = []
         let paused = item.pausedSeconds
         let moving = item.movingSeconds
@@ -123,7 +134,7 @@ enum WorkoutDetailContent {
                 rows.append(pace)
             }
         }
-        if let load = TrainingLoad.workoutLoad(hrSamples: hr, age: age, sessionEnd: item.end) {
+        if let load = TrainingLoad.workoutLoad(hrSamples: hr, zones: zones, sessionEnd: item.end) {
             rows.append(Row(title: "Training load", value: "\(Int(load.rounded()))",
                             caption: "Minutes in each heart-rate zone times the zone number (1 to 5)."))
         }

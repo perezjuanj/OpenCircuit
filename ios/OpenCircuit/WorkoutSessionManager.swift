@@ -68,6 +68,8 @@ final class WorkoutSessionManager: NSObject {
     }
     /// Running zone breakdown updated as HR samples arrive.
     private(set) var liveZoneBreakdown = WorkoutZoneBreakdown()
+    /// The zones the running session classifies against (nil with no session): the zone bars show their ranges.
+    var activeZones: HeartRateZones? { aggregator?.zones }
     /// GPS distance in meters (phone CoreLocation). nil until first location fix.
     private(set) var distanceMeters: Double?
     /// Whether GPS is currently active for this session.
@@ -375,7 +377,9 @@ final class WorkoutSessionManager: NSObject {
         sessionStart = start
         let profile = HealthKitWriter.storedUserProfile()
         profileSnapshot = profile
-        aggregator = WorkoutSessionAggregator(startDate: start, userAge: profile.age)
+        aggregator = WorkoutSessionAggregator(
+            startDate: start, userAge: profile.age,
+            zones: HeartRateZoneDefaults.zonesForNewWorkout(profile: profile, store: store))
         ledger = WorkoutActivityLedger(start: start)
         paceTracker.reset()
         finishedActiveSeconds = nil
@@ -655,7 +659,8 @@ final class WorkoutSessionManager: NSObject {
         if let ledger, !ledger.pauses(until: endDate).isEmpty {
             let paused = StrapWorkoutSummaryBuilder.summarize(
                 sport: selectedSport, ledger: ledger, samples: agg.collectedSamples, end: endDate,
-                distanceMeters: hasRoute ? distanceMeters : nil, hasRoute: hasRoute, profile: profile)
+                distanceMeters: hasRoute ? distanceMeters : nil, hasRoute: hasRoute, profile: profile,
+                zones: agg.zones)
             let p = paused.summary
             summary = WorkoutSummary(
                 sport: p.sport, startDate: p.startDate, endDate: p.endDate, avgHR: p.avgHR, maxHR: p.maxHR,
@@ -933,12 +938,11 @@ final class WorkoutSessionManager: NSObject {
     /// Live zone totals. A workout never paused keeps the original held attribution untouched; one
     /// that was paused runs it per running stretch so no reading is held across a pause (#283).
     private func recomputeLiveZones(agg: WorkoutSessionAggregator, now: Date) {
-        let maxHR = max(220 - HealthKitWriter.storedUserProfile().age, 1)
         if let ledger, !ledger.pauses(until: now).isEmpty {
-            liveZoneBreakdown = StrapWorkoutSummaryBuilder.zones(agg.collectedSamples, ledger: ledger, end: now, maxHR: maxHR)
+            liveZoneBreakdown = StrapWorkoutSummaryBuilder.zones(agg.collectedSamples, ledger: ledger, end: now, zones: agg.zones)
         } else {
             liveZoneBreakdown = HRZoneClassifier.timeInZonesHeld(
-                hrSamples: agg.collectedSamples, maxHR: maxHR, sessionEnd: now)
+                hrSamples: agg.collectedSamples, zones: agg.zones, sessionEnd: now)
         }
     }
 
@@ -959,7 +963,6 @@ final class WorkoutSessionManager: NSObject {
         // GPS figures only for an outdoor session that has a fix: indoor and no-fix workouts publish
         // nil, and the widget then shows no distance or pace at all (#283, NO-FABRICATION).
         let distance = selectedSport.isOutdoor && locationPurpose == .route ? distanceMeters : nil
-        let maxHR = max(220 - (profileSnapshot ?? HealthKitWriter.storedUserProfile()).age, 1)
         return WorkoutLiveActivityController.state(
             activeSeconds: active, activeKcal: Int(kcal.rounded()),
             bpm: currentHR, hrIsStale: currentHRIsStale,
@@ -967,7 +970,7 @@ final class WorkoutSessionManager: NSObject {
             distanceMeters: distance,
             currentPaceSecPerKm: paceTracker.currentSecPerKm(now: now),
             avgPaceSecPerKm: WorkoutPace.averageSecPerKm(distanceMeters: distance, activeSeconds: active),
-            hrZone: WorkoutPace.liveZone(bpm: currentHR, isStale: currentHRIsStale, maxHR: maxHR),
+            hrZone: aggregator.flatMap { WorkoutPace.liveZone(bpm: currentHR, isStale: currentHRIsStale, zones: $0.zones) },
             now: now)
     }
 

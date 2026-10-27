@@ -130,7 +130,12 @@ struct WorkoutDetailView: View {
     @State private var failureTitle = "Workout not fully deleted"
     @State private var deleted = false
 
-    private var age: Int { HealthKitWriter.storedUserProfile().age }
+    /// The user's zones as set now: the bars re-derive from the stored readings (decision 83f). Loaded
+    /// with the readings; the default zones show until then.
+    @State private var zones = HeartRateZones(percentOfMax: MaxHeartRate.automatic(age: max(HealthKitWriter.storedUserProfile().age, 1)))
+    @AppStorage(HeartRateZoneDefaults.methodKey) private var zoneMethodRaw = HeartRateZoneMethod.percentOfMax.rawValue
+    @AppStorage(HeartRateZoneDefaults.manualMaxHRKey) private var zoneManualMaxHR = 0
+    @AppStorage(HeartRateZoneDefaults.customBoundsKey) private var zoneCustomBounds = ""
 
     var body: some View {
         ScrollView {
@@ -158,6 +163,9 @@ struct WorkoutDetailView: View {
         .navigationTitle(WorkoutActivityDisplay.name(item.activityType))
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
+        .task(id: "\(zoneMethodRaw)|\(zoneManualMaxHR)|\(zoneCustomBounds)") {
+            zones = await HeartRateZoneDefaults.currentZones()
+        }
         .confirmationDialog(WorkoutDeleter.confirmationTitle, isPresented: $confirming,
                             titleVisibility: .visible) {
             Button("Delete Workout", role: .destructive) { Task { await delete() } }
@@ -193,7 +201,7 @@ struct WorkoutDetailView: View {
             deviceName: item.deviceName, deviceManufacturer: item.deviceManufacturer,
             owner: LocalStore.ownershipLog().owner(at: item.start))
         return OCCard {
-            ForEach(WorkoutDetailContent.rows(item, hr: hr, age: age, unit: distanceUnit,
+            ForEach(WorkoutDetailContent.rows(item, hr: hr, zones: zones, unit: distanceUnit,
                                               recordedWith: recorder)) { row in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack {
@@ -232,12 +240,17 @@ struct WorkoutDetailView: View {
 
     @ViewBuilder
     private var zonesCard: some View {
-        if let zones = WorkoutDetailContent.zones(hr, age: age, end: item.end) {
+        if let breakdown = WorkoutDetailContent.zones(hr, zones: zones, end: item.end) {
             OCCard {
                 OCSectionHeader("Time in Heart-Rate Zones", systemImage: "chart.bar.fill", tint: .orange)
                 ForEach(HRZone.allCases, id: \.rawValue) { zone in
-                    ZoneBarRow(zone: zone, seconds: zones.seconds(in: zone), fraction: zones.fraction(in: zone))
+                    ZoneBarRow(zone: zone, seconds: breakdown.seconds(in: zone),
+                               fraction: breakdown.fraction(in: zone), rangeText: zones.rangeText(of: zone))
                 }
+                if let note = zones.fallbackNote {
+                    Text(note).font(.caption2).foregroundStyle(.secondary)
+                }
+                HeartRateZonesLink()
             }
         }
     }

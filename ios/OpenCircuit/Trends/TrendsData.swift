@@ -168,7 +168,8 @@ struct TrendsData {
             .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
         let rhr = restingHR.first { $0.day == today }?.bpm
             ?? restingHR.filter { $0.day < today }.max { $0.day < $1.day }?.bpm
-        return DailyStrain.reading(hr: hr, window: window, age: i.profile.age, restingHR: rhr)
+        return DailyStrain.reading(hr: hr, window: window, age: i.profile.age, restingHR: rhr,
+                                   manualMaxHR: i.profile.manualMaxHR)
     }
 
     /// Newest reading start across every series the window fetched.

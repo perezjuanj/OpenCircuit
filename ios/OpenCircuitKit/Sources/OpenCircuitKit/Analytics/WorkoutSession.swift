@@ -340,7 +340,8 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
 
     private var samples: [HRSample] = []
     private let startDate: Date
-    private let zones: HeartRateZones
+    /// The zones this session classifies against, fixed when it started.
+    public let zones: HeartRateZones
 
     /// - Parameters:
     ///   - startDate: When the session started (wall clock).
