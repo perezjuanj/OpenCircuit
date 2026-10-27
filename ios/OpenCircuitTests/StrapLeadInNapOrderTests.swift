@@ -316,3 +316,30 @@ extension StrapLeadInNapOrderTests {
         XCTAssertFalse(store.helioReplacesStoredCopy(with: incoming, sleep: stored.withoutLeadIn), "written: 77f, no rewrite path")
     }
 }
+
+extension StrapLeadInNapOrderTests {
+    /// Only a STRAP row is read as having a stale lead-in (79b): a row of the same shape in time the ring
+    /// owns (an empty log, or the strap chosen only after the night) is never replaced; the same row in
+    /// time the strap owns is.
+    func testAStaleLeadInIsNeverReadOnARingOrOtherDeviceRow() throws {
+        var strapAfterTheNight = DeviceOwnershipLog()
+        _ = strapAfterTheNight.record(.zeppOS, since: hour(12))
+        for (label, log) in [("empty log", DeviceOwnershipLog()), ("the strap chosen after the night", strapAfterTheNight)] {
+            ownership.install(log)
+            let store = try makeStore()
+            let base = [SleepSegment(start: hour(-2), end: hour(7), stage: .inBed), SleepSegment(start: hour(-2), end: hour(7), stage: .asleepCore)]
+            let segments = HelioSleepSelection.withLeadIn(base, window: span(-2, 7), from: hour(-4))
+            var extras = LocalStore.SleepNightExtras()
+            extras.hypnogram = segments
+            XCTAssertEqual(try store.saveSleepSummary(SleepStaging.summary(segments), night: SleepNightKey.night(inBedStart: hour(-4), inBedEnd: hour(7)),
+                                                      inBedStart: hour(-4), inBedEnd: hour(7), sleepOnset: hour(-2), sleepWake: hour(7),
+                                                      extras: extras), .inserted, label)
+            let stored = HelioSleepSelection.Night(segments: segments, window: span(-4, 7), strapScore: nil, recordedTimeZone: nil)
+            let incoming = stored.withLeadIn(from: hour(-3.5))
+            XCTAssertFalse(store.helioStoredLeadInIsStale(for: incoming), "\(label): not the strap's row")
+            XCTAssertFalse(store.helioReplacesStoredCopy(with: incoming, sleep: stored.withoutLeadIn), label)
+            ownership.install(.strapOwnsAllTime)
+            XCTAssertTrue(store.helioStoredLeadInIsStale(for: incoming), "\(label): the same row, the strap's")
+        }
+    }
+}
