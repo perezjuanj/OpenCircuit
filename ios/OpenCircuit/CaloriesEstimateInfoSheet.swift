@@ -17,8 +17,8 @@ struct CaloriesEstimateInfoSheet: View {
             + "resting energy from this app, it is nudged by your measured resting heart rate compared with "
             + "your own recent average: about 1% per bpm, never more than 20% either way. With fewer than "
             + "\(Calories.minRestingBaselineDays) earlier days of resting heart rate, there is no nudge.",
-        "Est. max HR is 220 minus your age. It is a rule of thumb, not a measured peak, and it sets the "
-            + "heart rate intensity behind the Active estimate.",
+        "Est. max HR is 220 minus your age, unless you set your own in Heart Rate Zones. It is a rule of "
+            + "thumb, not a measured peak, and it sets the heart rate intensity behind the Active estimate.",
         "These are estimates, not a medical device. If age, weight, height or sex still show as default, "
             + "set them in Profile.",
     ]

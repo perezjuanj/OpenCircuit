@@ -402,9 +402,14 @@ struct WorkoutView: View {
                     ZoneBarRow(
                         zone: zone,
                         seconds: manager.liveZoneBreakdown.seconds(in: zone),
-                        fraction: manager.liveZoneBreakdown.fraction(in: zone)
+                        fraction: manager.liveZoneBreakdown.fraction(in: zone),
+                        rangeText: manager.activeZones?.rangeText(of: zone)
                     )
                 }
+                if let note = manager.activeZones?.fallbackNote {
+                    Text(note).font(.caption2).foregroundStyle(.secondary)
+                }
+                HeartRateZonesLink()
             }
             .padding(.horizontal)
 
@@ -669,6 +674,8 @@ struct ZoneBarRow: View {   // also the strap's zones (StrapWorkoutView, #227)
     let zone: HRZone
     let seconds: Double
     let fraction: Double
+    /// The zone's bpm range ("120–139 bpm"), when the caller knows the zones in force.
+    var rangeText: String?
 
     private var zoneColor: Color {
         switch zone {
@@ -682,9 +689,14 @@ struct ZoneBarRow: View {   // also the strap's zones (StrapWorkoutView, #227)
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(zone.displayName)
-                .font(.caption).foregroundStyle(.secondary)
-                .frame(width: 80, alignment: .leading)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(zone.displayName)
+                    .font(.caption).foregroundStyle(.secondary)
+                if let rangeText {
+                    Text(rangeText).font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+            .frame(width: 80, alignment: .leading)
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 4)
@@ -702,6 +714,21 @@ struct ZoneBarRow: View {   // also the strap's zones (StrapWorkoutView, #227)
                 .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                 .frame(width: 44, alignment: .trailing)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Self.accessibilityLabel(zone: zone, seconds: seconds, rangeText: rangeText))
+    }
+
+    /// "Zone 2, 120 to 139 beats per minute, 3 minutes 10 seconds".
+    static func accessibilityLabel(zone: HRZone, seconds: Double, rangeText: String?) -> String {
+        var parts = [zone.displayName]
+        if let rangeText {
+            parts.append(rangeText.replacingOccurrences(of: "–", with: " to ")
+                .replacingOccurrences(of: "+ bpm", with: " beats per minute and up")
+                .replacingOccurrences(of: " bpm", with: " beats per minute"))
+        }
+        let t = Int(seconds)
+        parts.append(t == 0 ? "no time" : t < 60 ? "\(t) seconds" : "\(t / 60) minutes \(t % 60) seconds")
+        return parts.joined(separator: ", ")
     }
 
     private var formattedTime: String {

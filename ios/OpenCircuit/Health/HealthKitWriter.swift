@@ -2222,7 +2222,8 @@ final class HealthKitWriter {
         let heightCm = defaults.object(forKey: "userProfile.heightCm") as? Double ?? 170
         let sexRaw = defaults.string(forKey: "userProfile.sex") ?? BiologicalSex.male.rawValue
         return UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
-                           sex: BiologicalSex(rawValue: sexRaw) ?? .male)
+                           sex: BiologicalSex(rawValue: sexRaw) ?? .male,
+                           manualMaxHR: HeartRateZoneDefaults.manualMaxHR(defaults))
     }
 
     private static func startOfHour(_ date: Date, _ cal: Calendar = .current) -> Date {
@@ -2254,7 +2255,7 @@ final class HealthKitWriter {
             return DateInterval(start: s.inBedStart, end: s.inBedEnd)
         }
         let hrSamples = rawSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        let maxHR = max(220 - profile.age, 1)
+        let maxHR = profile.maxHR
         // The same motion evidence `flushActiveCalories` hands `Calories.dailyEstimate`, so with the
         // #281 gate on the minutes and the energy share one qualifying set.
         let stepWindows = ((try? local.stepSamples(from: today.addingTimeInterval(-86_400), to: now)) ?? [])

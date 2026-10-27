@@ -193,8 +193,13 @@ struct StrapWorkoutView: View {
                 ForEach(HRZone.allCases, id: \.rawValue) { zone in
                     ZoneBarRow(zone: zone,
                                seconds: recorder.liveZoneBreakdown.seconds(in: zone),
-                               fraction: recorder.liveZoneBreakdown.fraction(in: zone))
+                               fraction: recorder.liveZoneBreakdown.fraction(in: zone),
+                               rangeText: recorder.activeZones.rangeText(of: zone))
                 }
+                if let note = recorder.activeZones.fallbackNote {
+                    Text(note).font(.caption2).foregroundStyle(.secondary)
+                }
+                HeartRateZonesLink()
             }
             .padding(.horizontal)
 

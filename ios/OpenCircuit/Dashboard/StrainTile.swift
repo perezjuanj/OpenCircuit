@@ -135,7 +135,7 @@ struct StrainInfoSheet: View {
             + "running total would always look low next to whole past days.",
         "Light is under 10, moderate 10 to 14, high 14 to 18, and all out 18 or more.",
         "Your zones come from your resting heart rate (the same one the Resting HR tile shows) and an "
-            + "estimated maximum of 220 minus the age in your profile.",
+            + "estimated maximum of 220 minus the age in your profile, or the maximum you set in Heart Rate Zones.",
         "It's an estimate from your wearable's heart-rate readings, which come every minute or few "
             + "minutes, not every beat. It needs at least 10 minutes of them to score.",
         "Strain stays in the app. Apple Health has no type for it.",

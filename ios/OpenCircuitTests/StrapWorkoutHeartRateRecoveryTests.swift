@@ -579,7 +579,7 @@ final class HeartRateRecoveryPresentationTests: XCTestCase {
 
         let rose = HeartRateRecovery.Outcome(peak: 150, oneMinute: .measured(drop: -4, reading: 154, at: at(60)),
                                              twoMinutes: .measured(drop: 10, reading: 140, at: at(120)))
-        XCTAssertEqual(HeartRateRecoveryText.values(rose), "1 min +4 bpm, 2 min -10 bpm")
+        XCTAssertEqual(HeartRateRecoveryText.values(rose), "1 min heart rate rose, 2 min -10 bpm")
     }
 
     func testCardioRecoveryIsInTheOneShareSetAndNamed() {

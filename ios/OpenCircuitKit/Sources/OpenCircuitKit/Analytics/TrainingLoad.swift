@@ -8,10 +8,10 @@
 //
 // INPUT. The workout's own 5-zone breakdown (`WorkoutZoneBreakdown`, #75) — the same numbers the
 // workout screen draws as zone bars, so the load always agrees with what the user can see. Those
-// zones are %maxHR with maxHR = 220 − age, which is Edwards' own zone basis. Two documented
-// deviations, both in `docs/TRAINING_METRICS.md` §1: the app's zone boundaries sit at 50/61/71/81/91 %
-// (not 50/60/70/80/90 %), and a minute without a heart-rate reading adds nothing (gaps are never
-// filled, #45).
+// zones are the user's `HeartRateZones` (decision 83): by default 50/60/70/80/90 % of max heart rate
+// with max = 220 − age, which is Edwards' own zone basis. One documented deviation, in
+// `docs/TRAINING_METRICS.md` §1: a minute without a heart-rate reading adds nothing (gaps are never
+// filled, #45). Manual max HR, % of reserve and custom bounds move the zones, and so the load.
 //
 // Device-agnostic: the input is a zone breakdown, whichever wearable produced the heart rate.
 // Pure value math, no HealthKit.
@@ -36,28 +36,34 @@ public enum TrainingLoad {
 
     /// The load to show for a workout, or nil when the workout recorded no heart rate at all.
     ///
-    /// nil and 0 mean different things: 0 is a real result (heart rate was recorded and stayed under
-    /// 50 % of max — Edwards gives that no weight), nil is "nothing to score", which the UI says in
+    /// nil and 0 mean different things: 0 is a real result (heart rate was recorded and stayed below
+    /// zone 1 — Edwards gives that no weight), nil is "nothing to score", which the UI says in
     /// words rather than printing a 0 that would read as a measurement.
     public static func workoutLoad(zones: WorkoutZoneBreakdown, hrSampleCount: Int) -> Double? {
         guard hrSampleCount > 0 else { return nil }
         return edwardsTRIMP(zones)
     }
 
-    /// The max HR the workout zones are drawn with: 220 − age, exactly as
-    /// `WorkoutSessionAggregator` computes it, so a load recomputed later from the workout's stored
-    /// heart rate matches the one shown when the workout ended.
+    /// The max HR (Automatic) the default workout zones are drawn with: `220 − age` with the age
+    /// floored at 1, exactly as `WorkoutSessionAggregator` computes it.
     public static func zoneMaxHR(age: Int) -> Int {
-        max(220 - max(age, 1), 1)
+        MaxHeartRate.automatic(age: max(age, 1))
+    }
+
+    /// Load from a workout's heart-rate series over the default zones for `age` (Automatic max HR,
+    /// % of max). The app passes the user's zones to the overload below.
+    public static func workoutLoad(hrSamples: [HRSample], age: Int, sessionEnd: Date) -> Double? {
+        workoutLoad(hrSamples: hrSamples, zones: HeartRateZones(percentOfMax: zoneMaxHR(age: age)),
+                    sessionEnd: sessionEnd)
     }
 
     /// Load from a workout's heart-rate series — the path for workouts read back out of Apple
     /// Health, where only the samples survive. Same held attribution as the live aggregator.
-    public static func workoutLoad(hrSamples: [HRSample], age: Int, sessionEnd: Date) -> Double? {
+    public static func workoutLoad(hrSamples: [HRSample], zones: HeartRateZones, sessionEnd: Date) -> Double? {
         guard !hrSamples.isEmpty else { return nil }
-        let zones = HRZoneClassifier.timeInZonesHeld(
-            hrSamples: hrSamples, maxHR: zoneMaxHR(age: age), sessionEnd: sessionEnd)
-        return edwardsTRIMP(zones)
+        let breakdown = HRZoneClassifier.timeInZonesHeld(
+            hrSamples: hrSamples, zones: zones, sessionEnd: sessionEnd)
+        return edwardsTRIMP(breakdown)
     }
 
     // MARK: - Weekly trend
