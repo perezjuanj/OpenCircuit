@@ -372,6 +372,7 @@ final class StrapWorkoutHeartRateRecoveryTests: XCTestCase {
     func testRecoveryReadingsAreWrittenAfterTheWorkoutAndNeverInsideIt() async throws {
         let rig = makeRig()
         await runAndEnd(rig)
+        rig.source.send(150, at: at(600.5))   // spans 599.5 … 600.5: partly inside the workout
         await recover(rig, to: 120)
         await rig.recorder.recoveryWriteTask?.value
         let readings = try XCTUnwrap(rig.recovery?.readingWrites.first)
@@ -531,8 +532,8 @@ final class HeartRateRecoveryPresentationTests: XCTestCase {
     func testTheDetailUsesOnlyStoredReadingsInsideTheWorkoutsWindow() throws {
         let workout = (1...600).map { reading($0 > 540 ? 170 : 150, Double($0)) }
         let window = DateInterval(start: at(600), end: at(690))   // skipped at +90 s
-        let rows = [reading(130, 660),
-                    HRSample(bpm: 90, start: at(659.5)),          // an all-day history instant
+        let rows = [reading(130, 661),
+                    HRSample(bpm: 90, start: at(660)),             // an all-day history instant, right on the mark
                     reading(150, 720)]                             // the next workout's first reading
         let outcome = try XCTUnwrap(WorkoutDetailContent.recovery(workoutHR: workout, storedRows: rows,
                                                                   window: window, age: 40))
