@@ -113,7 +113,12 @@ stores and writes what it measured for time it owned:
     A pruned nap's Health write is removed: inside the night by the night's own mirror, outside it by
     the next nap flush (#327 S1/S2: `cleanPrunedNaps`, this app's own samples in the pruned strap
     nap's written span, one second clear of every stored night and nap; the span is kept until its
-    delete succeeds and dropped 14 days after it ended; a ring nap is unchanged). A nap from a block is
+    delete succeeds and dropped 14 days after it ended; a ring nap is unchanged). The prune is
+    idempotent (decision 80b, #331 item 10): the span is scheduled only once the prune's delete is
+    saved, and the prune also runs when the merge keeps a strap night's stored copy over a re-delivery
+    (`.keptFullerStoredNight`, judged on the stored night), so a prune whose save failed is retried by
+    the next re-delivery the merge judges (an edited night never retries); what the merge keeps is
+    unchanged. A nap from a block is
     also HELD (unsettled) by the chain of sleep that follows it (decision 76j, an optimisation that
     avoids a write followed by a delete): the sync's kind-sleep runs (up to 5 other minutes inside a
     run, as a block's) starting within 60 min after the nap's end, then each next run starting within
@@ -209,13 +214,19 @@ stores and writes what it measured for time it owned:
     or one the same sync is about to store, activity-block naps included), and nearness, the 60 min
     rule, 76l's prune and `saveNap`'s overlap backstop, is measured from the night's SLEEP, never its
     lead-in; so the lead-in never prunes a nap. A manual nap's add or edit and the nap Health-delete
-    fences still keep out of the whole in-bed window. Known limit, not fixed in this PR: a night
-    stored BEFORE the sync that first sees a nap more than 60 min before its sleep onset keeps its
-    lead-in until it is re-delivered changed enough for the merge to replace it, so the lead-in can lie
-    over that nap by up to the clamp difference (30 min for a nap ending 90 min before onset, 59 min at
-    61 min, at most the 120 min cap): in Health an `inBed` overlap and an `awake` sample over the nap's
-    asleep one, asleep time not counted twice; the card shows the night in bed from the lead-in start
-    and the nap until its end. Rare on the production fetch (a session nap comes with any later sync of
+    fences still keep out of the whole in-bed window. Decision 80a (#331 item 7): a strap nap whose
+    moved re-detection only touches that window (zero overlap: the lead-in starts where the nap ends)
+    is rewritten, so the card's nap and Health agree, and the clean of its old write still ends one
+    second clear of the lead-in and the night's `inBed`; one that overlaps by even one second is still
+    not rewritten (Health keeps the old write), and a ring nap touching a ring night is unchanged. A
+    night stored BEFORE the sync that first sees a nap more than 60 min before its sleep onset, and not
+    yet written, is replaced by its next re-delivery with the same sleep window and a later (or no)
+    lead-in start, whatever moved it, so its lead-in stops at the nap (decision 79e). Known limit, not fixed: such a night already WRITTEN keeps its lead-in (77f,
+    forward-only) until it extends (58b), so the lead-in can lie over that nap by up to the clamp
+    difference (30 min for a nap ending 90 min before onset, 59 min at 61 min, at most the 120 min cap):
+    in Health an `inBed` overlap and an `awake` sample over the nap's asleep one, asleep time not counted
+    twice; the card shows the night in bed from the lead-in start and the nap until its end. Rare on the
+    production fetch (a session nap comes with any later sync of
     the night; the activity fetch starts at or before the last session night's end, so a block nap
     comes with the night). ZEPP_PROTOCOL.md §21.6 has the details. Asleep time is unchanged; time in bed and awake time grow, so
     efficiency and the Sleep Score drop (a synthetic 8 h night with a 60 min lead-in: in bed 480 →
@@ -224,8 +235,16 @@ stores and writes what it measured for time it owned:
     Every reader that averages a night's vitals (the illness alert, Vitals Status, the card's
     overnight averages, Trends, the headache HRV and bedtime regularity) reads the night's sleep window,
     the in-bed window without the lead-in (decision 77h, `StoredSleepSummary.sleepWindowStart`), so
-    baselines and alerts are as before; a ring night, a night without a lead-in and an edited night
-    read exactly as before. A night an earlier build wrote without a lead-in that later extends at the
+    baselines and alerts are as before; a ring night and a night without a lead-in read exactly as
+    before. Only a strap night is read as having a lead-in (decision 79b, `isStrapNight`: the strap owns
+    its night under the ownership log, 28a), so a ring night of the same shape reads whole. A manually
+    edited strap night (decision 79a): the readers of its RECORDED columns (the illness alert, Vitals
+    Status, Trends' vitals averages, the nap windows and `saveNap`'s backstop) read the recorded night
+    without its recorded lead-in, from `recordedHypnogramData` (`recordedSleepWindowStart`); its edited
+    window is the person's own and is never trimmed. Trends' active energy and exercise minutes leave
+    out the whole in-bed window, lead-in included, like the dashboard, Goals, Wellness and the
+    active-energy flushes (decision 79c), so a day reads the same active kcal in Trends and on the
+    dashboard. A night an earlier build wrote without a lead-in that later extends at the
     end (58b) takes the lead-in along in that one rewrite (77i).
     - Steps: `StoredStepSample` rows carry no device column; they are the strap's by ownership (28:
       each step writer keeps its rows wholly in time its device owns), and the lead-in never reads

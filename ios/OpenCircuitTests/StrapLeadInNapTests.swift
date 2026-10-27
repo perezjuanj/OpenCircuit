@@ -8,8 +8,8 @@ import ZeppKit
 // in-bed lead-in. 76l's prune, `saveNap`'s overlap backstop and the nap judgement all use the night's
 // window without the lead-in, and the lead-in stops at the end of every nap (77c), the same sync's
 // block-nap candidates included. So a lead-in can end at a nap's end without pruning it. The order of
-// nap and night doesn't matter, with one documented limit (a night stored before the sync that first
-// sees a nap keeps its lead-in over it until the night comes back changed; pinned below). Through the
+// nap and night doesn't matter, with one documented limit (a night already written to Apple Health before
+// the sync that first sees a nap keeps its lead-in over it, `StrapLeadInNapOrderTests`). Through the
 // production path (the sink and a fake strap). Every key, reading and time is synthetic.
 
 private let jMidnight: TimeInterval = 1_789_862_400          // 2026-09-20T00:00:00Z
@@ -333,9 +333,10 @@ final class StrapLeadInNapTests: XCTestCase {
     /// stored FIRST (calm heart rate from 19:00, lead-in capped 20:00–22:00, sleep from 22:00); a later
     /// sync stores a 60 min nap 19:30–20:30 (90 min before onset, a real nap under §21.5) that lies 30 min
     /// under that lead-in. `saveNap`'s backstop judges the night by its SLEEP (`sleepOnly`), so the nap
-    /// IS stored. Also pinned: the documented limit (ZEPP_PROTOCOL.md §21.6). With the night re-delivered
-    /// unchanged, it keeps its lead-in over the nap, and one more identical sync does NOT converge.
-    func testANapSeenAfterTheNightIsStoredUnderItsLeadInAndTheOverlapIsTheDocumentedLimit() throws {
+    /// IS stored. The night is not in Apple Health, so its re-delivery replaces it (decision 79e, ratified
+    /// 79f): the lead-in stops at the nap's end and nothing overlaps, and one more identical sync keeps it
+    /// so. The written night's limit (ZEPP_PROTOCOL.md §21.6) is pinned in `StrapLeadInNapOrderTests`.
+    func testANapSeenAfterTheNightIsStoredAndTheUnwrittenNightsLeadInThenStopsAtIt() throws {
         let store = try makeStore()
         try storeHeartRate(-5, 8, store: store)
         try sync([nightRecord], at: 7.5, store: store)
@@ -343,14 +344,14 @@ final class StrapLeadInNapTests: XCTestCase {
 
         try sync([eveningNap, nightRecord], at: 7.75, store: store)
         XCTAssertEqual(try naps(store), [span(-4.5, -3.5)], "the nap is stored: its asleep time is kept")
-        XCTAssertEqual(try leadIn(store), span(-4, -2), "the documented limit: the stored lead-in stands")
-        XCTAssertEqual(try leadInOverNaps(store), 30 * 60, "an in-bed/awake overlap of 30 min")
+        XCTAssertEqual(try leadIn(store), span(-3.5, -2), "79e: the unwritten night's re-delivery replaces it")
+        XCTAssertEqual(try leadInOverNaps(store), 0, "no in-bed/awake overlap")
         XCTAssertEqual(scheduledCleans, [])
 
         try sync([eveningNap, nightRecord], at: 8.5, store: store)
         XCTAssertEqual(try naps(store), [span(-4.5, -3.5)])
-        XCTAssertEqual(try leadIn(store), span(-4, -2), "one more identical sync: no convergence (the documented limit)")
-        XCTAssertEqual(try leadInOverNaps(store), 30 * 60)
+        XCTAssertEqual(try leadIn(store), span(-3.5, -2), "one more identical sync: unchanged")
+        XCTAssertEqual(try leadInOverNaps(store), 0)
     }
 
     /// N14 (adopted from review-328c's probe P1): the Health-delete fence keeps a stale nap clean off the
