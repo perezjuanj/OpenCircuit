@@ -814,8 +814,10 @@ final class HelioSession: WearableSession {
         phase = .ready
         helioLog.notice("helio: ready (clock \(self.clockSet ? "set" : "NOT set", privacy: .public), controls: find \(self.controlCapabilities.isSupported(.findDevice), privacy: .public), alarms \(self.controlCapabilities.isSupported(.alarms), privacy: .public))")
         sendOwedOrphanStop()   // before any stream or sync (review-238 SF2)
-        if autoSyncOnConnect { syncHistory(manual: false) }
-        if !appInBackground { activationSyncSettled = true }
+        if autoSyncOnConnect {
+            syncHistory(manual: false)
+            if !appInBackground { activationSyncSettled = true }
+        }
     }
 
     private func handleMessage(_ message: ZeppMessage) {
