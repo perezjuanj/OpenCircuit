@@ -269,19 +269,21 @@ final class StrapLeadInRecordedReadersTests: XCTestCase {
     }
 
     /// Trends reads a ring night of the lead-in shape whole: the readings before its sleep are averaged.
+    /// The night before last night's (day 1), so the whole night is in the past at any time of day the
+    /// suite runs: Trends drops readings after now, and day 0's night runs to 07:00 today.
     func testTrendsAverageARingNightOfTheLeadInShapeWhole() async throws {
         ownership.install(DeviceOwnershipLog())
         let container = try makeContainer()
         let store = LocalStore(container.mainContext)
-        try save(strapSegments(bed: bed(0), end: wake(0), leadIn: leadInStart(0)), store: store, device: .ringConn)
-        for t in stride(from: leadInStart(0).timeIntervalSince1970, to: wake(0).timeIntervalSince1970, by: 300) {
+        try save(strapSegments(bed: bed(1), end: wake(1), leadIn: leadInStart(1)), store: store, device: .ringConn)
+        for t in stride(from: leadInStart(1).timeIntervalSince1970, to: wake(1).timeIntervalSince1970, by: 300) {
             let at = Date(timeIntervalSince1970: t + 30)
             store.context.insert(StoredSample(kindRaw: MetricKind.heartRate.rawValue, start: at, end: at,
-                                              value: t < bed(0).timeIntervalSince1970 ? 82 : 58, deviceID: SyncDeviceID.ringConn.rawValue))
+                                              value: t < bed(1).timeIntervalSince1970 ? 82 : 58, deviceID: SyncDeviceID.ringConn.rawValue))
         }
         try store.context.save()
         let trends = await TrendsData.loadAsync(container: container, tempUnitRaw: TemperatureUnit.celsius.rawValue)
-        let point = try XCTUnwrap(trends.points.first { calendar.isDate($0.date, inSameDayAs: day(0)) })
+        let point = try XCTUnwrap(trends.points.first { calendar.isDate($0.date, inSameDayAs: day(1)) })
         let readings = (0..<12).map { _ in 82.0 } + (0..<96).map { _ in 58.0 }
         XCTAssertEqual(try XCTUnwrap(point.sleepHRAvg), readings.reduce(0, +) / Double(readings.count), accuracy: 1e-9)
     }
