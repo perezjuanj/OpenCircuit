@@ -107,6 +107,64 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
     }
 }
 
+// MARK: - Heart rate recovery in Apple Health (#337)
+
+/// The recovery readings and Cardio Recovery (decision 82c, 82e), each its own `HKHealthStore.save`,
+/// never part of the workout's `HKWorkoutBuilder`. The readings are plain heart-rate samples built by
+/// the flush's own `HealthKitWriter.quantitySample` with the strap's `HKDevice` (the resolver every
+/// strap sample uses), so they are attributed exactly as other heart-rate writes. Only readings in
+/// time the strap owns are written (decision 28; `LocalStore` keeps the same rule for its rows).
+@MainActor
+final class HeartRateRecoveryHealthWriter: HeartRateRecoveryHealthWriting {
+    /// Cardio Recovery. Third-party writable (decision 82: the share probe doesn't throw), and in the
+    /// app's one share set (`HealthKitWriter.allTypes`), so an existing install is asked for it once.
+    nonisolated static let cardioRecoveryType = HKQuantityType(.heartRateRecoveryOneMinute)
+    private let hkStore = HKHealthStore()
+
+    func saveRecoveryHeartRate(_ samples: [HRSample], timeline: SyncDeviceID) async -> HeartRateRecoveryHealthStatus {
+        guard HKHealthStore.isHealthDataAvailable(), HealthKitWriter().isShareAuthorized else { return .notConnected }
+        let log = LocalStore.ownershipLog()
+        let device = HealthKitWriter.wearableDevice(forTimeline: timeline, wearable: .shared)
+        let hr = samples
+            .filter { log.owns(timeline, at: $0.start) }
+            .compactMap {
+                HealthKitWriter.quantitySample(QuantitySample(kind: .heartRate, start: $0.start, end: $0.end,
+                                                              value: Double($0.bpm)), device: device)
+            }
+        guard !hr.isEmpty else { return .saved }
+        do {
+            try await hkStore.save(hr)
+            return .saved
+        } catch {
+            helioLog.error("helio: recovery heart rate not saved to Health")
+            return .failed
+        }
+    }
+
+    func saveCardioRecovery(_ bpm: Int, at date: Date, timeline: SyncDeviceID) async -> HeartRateRecoveryHealthStatus {
+        guard HKHealthStore.isHealthDataAvailable(), HealthKitWriter().isShareAuthorized else { return .notConnected }
+        // Never asked here: the app's one request asks for it (ContentView's reconcile at the next open).
+        switch hkStore.authorizationStatus(for: Self.cardioRecoveryType) {
+        case .sharingAuthorized: break
+        case .sharingDenied: return .sharingOff
+        default: return .notConnected
+        }
+        let sample = HKQuantitySample(
+            type: Self.cardioRecoveryType,
+            quantity: HKQuantity(unit: HKUnit.count().unitDivided(by: .minute()), doubleValue: Double(bpm)),
+            start: date, end: date,
+            device: HealthKitWriter.wearableDevice(forTimeline: timeline, wearable: .shared),
+            metadata: [HKMetadataKeyWasUserEntered: false])
+        do {
+            try await hkStore.save(sample)
+            return .saved
+        } catch {
+            helioLog.error("helio: Cardio Recovery not saved to Health")
+            return .failed
+        }
+    }
+}
+
 // MARK: - Journal files
 
 /// The journal in Application Support/StrapWorkout: the small journal (rewritten on the heartbeat),

@@ -28,7 +28,7 @@ struct StrapWorkoutView: View {
                     activeView
                 case .finishing:
                     ProgressView("Saving workout…").padding()
-                case .finished(let summary, let saved):
+                case .measuringRecovery(let summary, let saved), .finished(let summary, let saved):
                     summaryView(summary, saved: saved)
                 case .error(let message):
                     VStack(spacing: 16) {
@@ -278,6 +278,11 @@ struct StrapWorkoutView: View {
                 }
                 .padding(.horizontal)
 
+                // Heart rate recovery (#337): the countdown and Skip while the window is open, then
+                // the result or why there is none.
+                recoverySection
+                    .padding(.horizontal)
+
                 // Training load, and the VO₂ max estimate for an outdoor run (#232) — the ring's
                 // section, over the strap's heart rate.
                 WorkoutTrainingMetricsSection(summary: summary,
@@ -322,11 +327,73 @@ struct StrapWorkoutView: View {
                 }
                 .padding(.horizontal)
 
-                Button("Done") { recorder.reset(); dismiss() }
-                    .buttonStyle(.borderedProminent)
-                    .padding()
+                // Not while the recovery window is open: Skip ends it first.
+                if !recorder.isMeasuringRecovery {
+                    Button("Done") { recorder.reset(); dismiss() }
+                        .buttonStyle(.borderedProminent)
+                        .padding()
+                }
             }
         }
+    }
+
+    @ViewBuilder
+    private var recoverySection: some View {
+        if recorder.isMeasuringRecovery, let mark = recorder.recoveryMarkAt {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("HEART RATE RECOVERY").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let remaining = mark.timeIntervalSince(context.date)
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(remaining > 0 ? Self.clock(remaining.rounded(.up)) : "Last reading…")
+                            .font(.title2.weight(.bold)).monospacedDigit()
+                        Spacer()
+                        if let hr = recorder.currentHR, !recorder.currentHRIsStale {
+                            Text("\(hr) bpm").font(.title3.weight(.semibold)).monospacedDigit().foregroundStyle(.red)
+                        }
+                    }
+                }
+                Text("Stay still for the most accurate recovery reading.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Skip") { recorder.skipRecovery() }
+                    .buttonStyle(.bordered)
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+        } else if let outcome = recorder.heartRateRecovery {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("HEART RATE RECOVERY").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Text(HeartRateRecoveryText.headline(outcome)).font(.subheadline.weight(.semibold))
+                ForEach(HeartRateRecoveryText.reasons(outcome, closedBy: recorder.recoveryClosedBy), id: \.self) { reason in
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
+                }
+                if let note = Self.recoveryHealthNote(recorder.recoveryHealthStatus) {
+                    Text(note).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// What reached Apple Health from the recovery window, when something didn't.
+    static func recoveryHealthNote(_ status: (readings: HeartRateRecoveryHealthStatus?,
+                                              cardioRecovery: HeartRateRecoveryHealthStatus?)?) -> String? {
+        guard let status else { return nil }
+        var notes: [String] = []
+        switch status.readings {
+        case .failed?: notes.append("The heart rate after End didn't reach Apple Health.")
+        case .notConnected?: notes.append("The heart rate after End isn't in Apple Health: Health isn't connected.")
+        default: break
+        }
+        switch status.cardioRecovery {
+        case .saved?: notes.append("1-minute recovery saved to Apple Health as Cardio Recovery.")
+        case .sharingOff?: notes.append("Cardio Recovery isn't saved: it's turned off for OpenCircuit in Apple Health.")
+        case .notConnected?: notes.append("Cardio Recovery isn't saved: Apple Health hasn't allowed it yet. OpenCircuit asks the next time it opens.")
+        case .failed?: notes.append("Apple Health didn't accept the Cardio Recovery value.")
+        case nil: break
+        }
+        return notes.isEmpty ? nil : notes.joined(separator: " ")
     }
 
     private func statCell(_ label: String, _ value: String) -> some View {
@@ -426,10 +493,17 @@ struct StrapWorkoutHooks: ViewModifier {
                 // A terminal state must not outlive its sheet (the ring's rule, same reason).
                 switch recorder.state {
                 case .finished, .error: recorder.reset()
+                // Closed by anything but Skip while the recovery window is open (#337): the window
+                // ends with what it has, then the summary goes as above.
+                case .measuringRecovery:
+                    recorder.skipRecovery()
+                    recorder.reset()
                 default: break
                 }
             }) {
                 StrapWorkoutView(recorder: recorder, session: session)
+                    // The countdown stays up until Skip or the window's end (82b).
+                    .interactiveDismissDisabled(recorder.isMeasuringRecovery)
             }
             .alert("Interrupted workout", isPresented: Binding(
                 get: { recoveryAlert.isPresented },

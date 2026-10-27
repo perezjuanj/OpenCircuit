@@ -1067,6 +1067,8 @@ struct ContentView: View {
         guard let strap = helioSession, strap.ready, strap.canStreamHeartRate, !strap.syncing else { return false }
         switch strapWorkouts.state {
         case .idle, .finished, .error: return true
+        // A saved workout's recovery window: the shortcut ends it first (#337).
+        case .measuringRecovery: return true
         case .active, .finishing: return false
         }
     }
@@ -1125,6 +1127,7 @@ struct ContentView: View {
             guard case .idle = workoutManager.recordingState else { return false }
             workoutManager.selectedSport = sport
         case .strap:
+            strapWorkouts.endRecoveryForNewWorkout()   // a recovery window ends at a new start (82b)
             strapWorkouts.reset()   // acts on a finished summary or an error only
             guard strapWorkouts.state == .idle else { return false }
             strapWorkouts.selectedSport = sport

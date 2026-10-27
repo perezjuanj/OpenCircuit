@@ -30,6 +30,20 @@ import UIKit
 // the strap's heart rate and the phone's route, exactly the ring's method (docs/TRAINING_METRICS.md),
 // saved to Apple Health attributed to the strap.
 //
+// Heart rate recovery (#337, decision 82): End is unchanged (the same end time, `HKWorkout` and
+// samples, saved at once), but the strap's stream keeps running for a recovery window of 120 s (+ up
+// to 10 s to catch the +120 s reading). The end of a workout is a small state machine:
+//
+//     .active ──End──▶ .finishing ──saved──▶ .measuringRecovery ──window closed──▶ .finished
+//                         (the HKWorkout write)   (countdown + Skip)
+//
+// The window closes on its own at the +120 s reading (or end + 130 s), or on Skip, a new workout, or
+// the link dropping; it may close while `.finishing` is still writing, and then `.measuringRecovery`
+// passes straight on. Only then: HRR1/HRR2 (`HeartRateRecovery`), the recovery readings to Apple
+// Health and `LocalStore`, Cardio Recovery, and the sync the workout held back (82g). The hold on the
+// strap lasts through the window. A recorder built without a `recoveryHealth` writer has no window:
+// End goes straight from `.finishing` to `.finished`, exactly as before #337.
+//
 // Ring-only users: one recorder is still built per launch (ContentView's hooks are unconditional),
 // and it is inert. It touches no CoreBluetooth and no CoreLocation until a strap workout starts, and
 // its launch checks find no journal (review-238b N-3).
@@ -54,6 +68,67 @@ protocol StrapWorkoutHeartRateSource: AnyObject {
 }
 
 extension HelioSession: StrapWorkoutHeartRateSource {}
+
+/// What became of one heart-rate recovery write to Apple Health (decision 82c, 82e).
+enum HeartRateRecoveryHealthStatus: Equatable {
+    case saved
+    /// Apple Health isn't connected, or hasn't been asked for this type yet (the app asks once, at
+    /// its next open: `ContentView.reconcileNewlyAuthorizableShareTypes`).
+    case notConnected
+    /// The person turned this type off in Health.
+    case sharingOff
+    case failed
+}
+
+/// The Apple Health half of heart rate recovery, apart from the workout's own write, so neither can
+/// fail the other or the workout (decision 82c, 82e).
+@MainActor
+protocol HeartRateRecoveryHealthWriting: AnyObject {
+    /// The recovery readings as plain heart-rate samples, all after the workout's end.
+    func saveRecoveryHeartRate(_ samples: [HRSample], timeline: SyncDeviceID) async -> HeartRateRecoveryHealthStatus
+    /// HRR1 as Cardio Recovery (`heartRateRecoveryOneMinute`, count/min), dated `date`.
+    func saveCardioRecovery(_ bpm: Int, at date: Date, timeline: SyncDeviceID) async -> HeartRateRecoveryHealthStatus
+}
+
+/// Why a heart-rate recovery window closed.
+enum RecoveryWindowClose: Equatable {
+    /// The +120 s reading arrived, or the window's limit passed.
+    case complete
+    case skipped
+    /// The strap's link dropped (or another session replaced it).
+    case linkLost
+    /// Another workout started; it takes over the hold, so the held-back sync waits for its End.
+    case newWorkout
+}
+
+/// Where each strap workout's recovery window sat (workout end → window close), so the workout
+/// detail can tell recovery readings from the next workout's (#337). UserDefaults, not SwiftData
+/// (no schema change). Bounded to the latest `limit` windows.
+struct WorkoutRecoveryWindows {
+    nonisolated static let key = "strapWorkout.recoveryWindows.v1"
+    static let limit = 500
+    let defaults: UserDefaults
+    init(_ defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    var all: [DateInterval] {
+        guard let pairs = defaults.array(forKey: Self.key) as? [[Double]] else { return [] }
+        return pairs.compactMap { pair in
+            guard pair.count == 2, pair[1] >= pair[0] else { return nil }
+            return DateInterval(start: Date(timeIntervalSince1970: pair[0]), end: Date(timeIntervalSince1970: pair[1]))
+        }
+    }
+
+    func add(_ window: DateInterval) {
+        let kept = all.filter { $0.start != window.start } + [window]
+        defaults.set(kept.suffix(Self.limit).map { [$0.start.timeIntervalSince1970, $0.end.timeIntervalSince1970] },
+                     forKey: Self.key)
+    }
+
+    /// The window of the workout that ended at `end` (within a second: Health stores the same date).
+    func window(endingWorkoutAt end: Date) -> DateInterval? {
+        all.last { abs($0.start.timeIntervalSince(end)) < 1 }
+    }
+}
 
 /// One finished strap workout on its way to Apple Health.
 struct StrapWorkoutWrite {
@@ -167,6 +242,9 @@ final class StrapWorkoutRecorder {
         case idle
         case active
         case finishing
+        /// Saved; the heart-rate recovery window is still open (decision 82b). Not the
+        /// interrupted-workout recovery (`recoverable`), which is about a killed process.
+        case measuringRecovery(StrapWorkoutSummary, savedToHealth: Bool)
         case finished(StrapWorkoutSummary, savedToHealth: Bool)
         case error(String)
     }
@@ -196,6 +274,15 @@ final class StrapWorkoutRecorder {
     private(set) var vo2MaxOutcome: VO2MaxEstimate.Outcome?
     /// What became of the estimate's Apple Health write: nil while it is in flight.
     private(set) var vo2MaxHealthStatus: VO2MaxHealthWriter.Status?
+    /// The +120 s mark of the open recovery window, for the countdown. nil when no window is open.
+    private(set) var recoveryMarkAt: Date?
+    /// HRR1/HRR2 once the window closed (decision 82d). nil while it is open, and with no window.
+    private(set) var heartRateRecovery: HeartRateRecovery.Outcome?
+    /// How the window closed.
+    private(set) var recoveryClosedBy: RecoveryWindowClose?
+    /// The recovery readings' and Cardio Recovery's Apple Health writes: nil while in flight, and a
+    /// nil member when that write wasn't attempted.
+    private(set) var recoveryHealthStatus: (readings: HeartRateRecoveryHealthStatus?, cardioRecovery: HeartRateRecoveryHealthStatus?)?
     /// A workout the previous process was running when it died, offered back (save or discard). What
     /// the alert shows: nil once it is answered or put off.
     private(set) var recoverable: RecoveredStrapWorkout?
@@ -234,7 +321,21 @@ final class StrapWorkoutRecorder {
     /// `end()` clears `running` on the way out whatever happens.
     static var holdsStrapLink: Bool {
         guard let running else { return false }
-        return running.state == .active || running.state == .finishing
+        return running.state == .active || running.state == .finishing || running.isMeasuringRecovery
+    }
+
+    /// The recovery window is open and the workout is saved (decision 82b). The hold lasts through it.
+    var isMeasuringRecovery: Bool {
+        if case .measuringRecovery = state { return true }
+        return false
+    }
+
+    /// The summary on screen, during the recovery window and after it.
+    private var shownSummary: StrapWorkoutSummary? {
+        switch state {
+        case .measuringRecovery(let summary, _), .finished(let summary, _): return summary
+        default: return nil
+        }
     }
     private static weak var running: StrapWorkoutRecorder?
 
@@ -255,6 +356,9 @@ final class StrapWorkoutRecorder {
     @ObservationIgnored private let vo2: (any StrapVO2MaxProviding)?
     /// Workouts deleted from the history screen (#293): never offered back after a kill.
     @ObservationIgnored private let tombstones: WorkoutTombstones
+    /// Heart rate recovery's Apple Health writes. nil: no recovery window (End as before #337).
+    @ObservationIgnored private let recoveryHealth: (any HeartRateRecoveryHealthWriting)?
+    @ObservationIgnored private let recoveryWindows: WorkoutRecoveryWindows
 
     // MARK: Session state
 
@@ -266,6 +370,23 @@ final class StrapWorkoutRecorder {
     @ObservationIgnored private var profileSnapshot: UserProfile?
     @ObservationIgnored private var tickCount = 0
     @ObservationIgnored private var tickTask: Task<Void, Never>?
+
+    /// The open recovery window: from End until its readings are handed on.
+    private struct RecoveryWindow {
+        let workoutEnd: Date
+        let timeline: SyncDeviceID
+        var readings: [HRSample] = []
+        var closedBy: RecoveryWindowClose?
+        var closedAt: Date?
+        /// The workout's active-time readings, for the peak (set once the workout is saved).
+        var activeReadings: [HRSample]?
+    }
+    @ObservationIgnored private var recoveryWindow: RecoveryWindow?
+    /// Readings received during the open pause (82d measures from the end, and a workout ended while
+    /// paused ended where the pause began). Cleared at every pause and resume.
+    @ObservationIgnored private var pausedReadings: [HRSample] = []
+    /// The recovery Health writes and landing, for tests to await.
+    @ObservationIgnored private(set) var recoveryWriteTask: Task<Void, Never>?
 
     /// Journal heartbeat and Live Activity refresh, the ring's ~10 s cadence.
     static let heartbeatTicks = 10
@@ -283,6 +404,8 @@ final class StrapWorkoutRecorder {
          orphanStop: StrapWorkoutOrphanStop = StrapWorkoutOrphanStop(),
          vo2: (any StrapVO2MaxProviding)? = nil,
          tombstones: WorkoutTombstones = WorkoutTombstones(),
+         recoveryHealth: (any HeartRateRecoveryHealthWriting)? = nil,
+         recoveryWindows: WorkoutRecoveryWindows = WorkoutRecoveryWindows(),
          clock: @escaping () -> Date = Date.init,
          autoTick: Bool = true,
          managesIdleTimer: Bool = true) {
@@ -297,6 +420,8 @@ final class StrapWorkoutRecorder {
         self.orphanStop = orphanStop
         self.vo2 = vo2
         self.tombstones = tombstones
+        self.recoveryHealth = recoveryHealth
+        self.recoveryWindows = recoveryWindows
         self.clock = clock
         self.autoTick = autoTick
         self.managesIdleTimer = managesIdleTimer
@@ -315,7 +440,8 @@ final class StrapWorkoutRecorder {
                              hrStore: store,
                              location: StrapWorkoutLocation(),
                              liveActivity: WorkoutLiveActivityController(),
-                             vo2: StrapVO2MaxLive(store: store))
+                             vo2: StrapVO2MaxLive(store: store),
+                             recoveryHealth: HeartRateRecoveryHealthWriter())
     }
 
     // MARK: Start, pause, resume
@@ -347,6 +473,7 @@ final class StrapWorkoutRecorder {
         tickCount = 0
         vo2MaxOutcome = nil
         vo2MaxHealthStatus = nil
+        clearHeartRateRecovery()
         rrIntervalCount = 0
         // Review-238 N1: an interrupted workout still waiting for the person's answer ("Not now") is set
         // aside, never deleted; the next launch offers it again. A put-off offer's slot no longer points
@@ -374,6 +501,7 @@ final class StrapWorkoutRecorder {
         let now = clock()
         ledger.pause(at: now)
         self.ledger = ledger
+        pausedReadings = []
         paceTracker.reset()
         location.setPaused(true)
         refresh(now: now)
@@ -387,6 +515,7 @@ final class StrapWorkoutRecorder {
         let now = clock()
         ledger.resume(at: now)
         self.ledger = ledger
+        pausedReadings = []
         paceTracker.reset()
         location.setPaused(false)
         refresh(now: now)
@@ -411,6 +540,7 @@ final class StrapWorkoutRecorder {
     /// Once a second in production; tests call it directly. Follows the link (gap, adoption), keeps
     /// the readings journaled, and on the heartbeat re-stamps the journal and the Live Activity.
     func tick(now: Date) async {
+        if recoveryWindow != nil { return followRecovery(now: now) }
         guard state == .active else { return }
         followLink(now: now)
         flushReadings()
@@ -467,6 +597,7 @@ final class StrapWorkoutRecorder {
 
     /// One reading from the strap. Shown always; recorded only while running, once per instant.
     func receive(bpm: Int, at: Date) {
+        if recoveryWindow != nil { return receiveRecovery(bpm: bpm, at: at) }
         guard state == .active, let ledger, LiveHR.validBPM.contains(bpm) else { return }
         currentHR = bpm
         currentHRAt = at
@@ -474,6 +605,7 @@ final class StrapWorkoutRecorder {
             rrIntervalCount += max(0, total - rrIntervalsRead)
             rrIntervalsRead = total
         }
+        if let pausedAt = ledger.openPauseStart { keepPausedReading(bpm: bpm, at: at, pausedAt: pausedAt) }
         guard !ledger.isPaused, at > ledger.start, at > (lastRecordedAt ?? .distantPast) else { return }
         lastRecordedAt = at
         let sample = HRSample(bpm: bpm, start: at.addingTimeInterval(-StrapWorkoutSampleLine.span), end: at)
@@ -484,23 +616,31 @@ final class StrapWorkoutRecorder {
 
     // MARK: End
 
-    /// End the workout: write one `HKWorkout`, queue its readings for `LocalStore`, release the link.
+    /// End the workout: write one `HKWorkout`, queue its readings for `LocalStore`, then keep the strap's
+    /// stream for the heart-rate recovery window (decision 82) and release the link when it closes.
     func end() async {
         guard state == .active, let ledger, let timeline else { return }
         state = .finishing
-        // The hold lasts until this returns, through the Health write (SF-1); released here whatever
-        // path leaves the function, so nothing can hold the strap for good.
-        defer { if Self.running === self { Self.running = nil } }
+        // The hold lasts until this returns, through the Health write (SF-1), and on through an open
+        // recovery window (82g); released here whatever path leaves the function otherwise, so nothing
+        // can hold the strap for good.
+        defer { if Self.running === self, !isMeasuringRecovery { Self.running = nil } }
         let now = clock()
         // Ended while paused: the workout ends where it stopped running.
         let end = ledger.openPauseStart ?? now
-        tickTask?.cancel()
-        tickTask = nil
-        attached?.stopWorkoutHeartRate()
-        attached?.heartRateObserver = nil
-        attached = nil
+        // 82a/82b: the stream keeps running after End for the recovery window; the workout below is
+        // exactly today's. Without a window (no recovery writer) the stream stops here, as before.
+        let windowOpen = openRecoveryWindow(end: end, now: now, timeline: timeline)
+        if !windowOpen {
+            tickTask?.cancel()
+            tickTask = nil
+            attached?.stopWorkoutHeartRate()
+            attached?.heartRateObserver = nil
+            attached = nil
+        }
         location.stop()
-        if managesIdleTimer { UIApplication.shared.isIdleTimerDisabled = false }
+        // The screen stays on through an open window: the countdown is on it.
+        if managesIdleTimer, !windowOpen { UIApplication.shared.isIdleTimerDisabled = false }
 
         let hasRoute = selectedSport.isOutdoor && !location.route.isEmpty
         let summary = StrapWorkoutSummaryBuilder.summarize(
@@ -513,7 +653,8 @@ final class StrapWorkoutRecorder {
         // nothing; then drop the journal BEFORE the Health write, as the ring drops its snapshot: a
         // kill during the write costs this one workout's recovery offer, never a duplicate in Health.
         // They are stored after the write; Health never gets them a second time from the store
-        // (`StrapWorkoutHealthExclusions`).
+        // (`StrapWorkoutHealthExclusions`). A kill in the recovery window that follows loses only the
+        // recovery readings, which are in memory (82g).
         enqueueLanding(counted, timeline: timeline)
         journal.clearRunning()
 
@@ -534,20 +675,181 @@ final class StrapWorkoutRecorder {
         // Not saved: the workout isn't in Health, so neither is its estimate (the ring's rule).
         vo2MaxHealthStatus = saved ? nil : .failed
         // `.finished` BEFORE the sync, so the hold is already released when `syncHistory` asks:
-        // otherwise the workout's own hold would defer the very sync it held back.
-        state = .finished(summary, savedToHealth: saved)
+        // otherwise the workout's own hold would defer the very sync it held back. With a recovery
+        // window, `.measuringRecovery` first: the hold stays, and the sync waits for the window.
+        if recoveryWindow != nil {
+            recoveryWindow?.activeReadings = counted
+            state = .measuringRecovery(summary, savedToHealth: saved)
+        } else {
+            state = .finished(summary, savedToHealth: saved)
+        }
         if saved, case .estimate(let estimate)? = vo2MaxOutcome, let vo2 {
             let workoutEnd = summary.summary.endDate
             Task { [weak self] in
                 let status = await vo2.save(estimate, workoutEnd: workoutEnd, timeline: timeline)
                 // Only into the summary it belongs to (the person may have started another workout).
-                guard let self, case .finished(let shown, _) = self.state,
+                guard let self, let shown = self.shownSummary,
                       shown.summary.startDate == summary.summary.startDate else { return }
                 self.vo2MaxHealthStatus = status
             }
         }
+        if recoveryWindow != nil {
+            // The window may have closed while the workout was being written.
+            finishRecoveryIfClosed()
+            return
+        }
         // The sync the workout held back (T6's re-arm, for the strap).
+        runHeldBackSync()
+    }
+
+    private func runHeldBackSync() {
         if let session = source(), session.ready, !session.syncing { session.syncHistory(manual: false) }
+    }
+
+    // MARK: Heart rate recovery (#337, decision 82)
+
+    /// Skip on the summary: the window closes now with the readings so far.
+    func skipRecovery() {
+        closeRecovery(.skipped, now: clock())
+    }
+
+    /// Another workout is about to start (the "Start Workout" shortcut): the window closes now, and
+    /// the summary passes on to `.finished` so `reset()` can clear it. The new workout takes the hold,
+    /// so the held-back sync runs at ITS end instead (82g). Only once the workout is saved.
+    func endRecoveryForNewWorkout() {
+        guard isMeasuringRecovery else { return }
+        closeRecovery(.newWorkout, now: clock())
+    }
+
+    /// Open the window at End. False when there is none: no recovery writer, or nothing left to
+    /// wait for. A window with no stream to keep (the link already down, or a long pause that already
+    /// outlasted it) opens closed, so the readings the pause kept are still measured.
+    private func openRecoveryWindow(end: Date, now: Date, timeline: SyncDeviceID) -> Bool {
+        guard recoveryHealth != nil else { return false }
+        var window = RecoveryWindow(workoutEnd: end, timeline: timeline)
+        window.readings = pausedReadings.filter { $0.start >= end && $0.end <= end.addingTimeInterval(HeartRateRecovery.windowLimit) }
+        pausedReadings = []
+        recoveryWindow = window
+        recoveryMarkAt = end.addingTimeInterval(HeartRateRecovery.window)
+        let streaming = attached.map { $0 === source() && $0.isLinkConnected } ?? false
+        if !streaming {
+            closeRecovery(.linkLost, now: now)
+        } else if let last = window.readings.last, last.end >= end.addingTimeInterval(HeartRateRecovery.window) {
+            closeRecovery(.complete, now: now)
+        } else if now >= end.addingTimeInterval(HeartRateRecovery.windowLimit) {
+            closeRecovery(.complete, now: now)
+        }
+        return recoveryWindow?.closedBy == nil
+    }
+
+    /// While paused: a reading the strap still streams, kept in case the workout ends in this pause.
+    private func keepPausedReading(bpm: Int, at: Date, pausedAt: Date) {
+        let sample = HRSample(bpm: bpm, start: at.addingTimeInterval(-StrapWorkoutSampleLine.span), end: at)
+        guard sample.start >= pausedAt, at <= pausedAt.addingTimeInterval(HeartRateRecovery.windowLimit),
+              at > (pausedReadings.last?.end ?? .distantPast) else { return }
+        pausedReadings.append(sample)
+    }
+
+    /// One reading inside the window: shown live, and kept when it lies wholly after the workout's
+    /// end (never inside it, 82c) and inside the window. The +120 s reading closes the window.
+    private func receiveRecovery(bpm: Int, at: Date) {
+        guard var window = recoveryWindow, window.closedBy == nil, LiveHR.validBPM.contains(bpm) else { return }
+        currentHR = bpm
+        currentHRAt = at
+        let limit = window.workoutEnd.addingTimeInterval(HeartRateRecovery.windowLimit)
+        let sample = HRSample(bpm: bpm, start: at.addingTimeInterval(-StrapWorkoutSampleLine.span), end: at)
+        if sample.start >= window.workoutEnd, at <= limit, at > (window.readings.last?.end ?? .distantPast) {
+            window.readings.append(sample)
+            recoveryWindow = window
+        }
+        if at >= window.workoutEnd.addingTimeInterval(HeartRateRecovery.window) {
+            closeRecovery(.complete, now: at)
+        }
+    }
+
+    /// Each tick of an open window: the link dropped or was replaced, or the window ran out.
+    private func followRecovery(now: Date) {
+        guard let window = recoveryWindow, window.closedBy == nil else { return }
+        if let attached, attached === source(), attached.isLinkConnected {
+            if now >= window.workoutEnd.addingTimeInterval(HeartRateRecovery.windowLimit) {
+                closeRecovery(.complete, now: now)
+            }
+        } else {
+            attached?.heartRateObserver = nil
+            attached = nil
+            closeRecovery(.linkLost, now: now)
+        }
+    }
+
+    /// Close the window: the stream stops, the screen may sleep. The readings are handed on once the
+    /// workout is saved (`finishRecoveryIfClosed`).
+    private func closeRecovery(_ reason: RecoveryWindowClose, now: Date) {
+        guard var window = recoveryWindow, window.closedBy == nil else { return }
+        window.closedBy = reason
+        window.closedAt = min(max(now, window.workoutEnd),
+                              window.workoutEnd.addingTimeInterval(HeartRateRecovery.windowLimit))
+        recoveryWindow = window
+        tickTask?.cancel()
+        tickTask = nil
+        attached?.stopWorkoutHeartRate()
+        attached?.heartRateObserver = nil
+        attached = nil
+        if managesIdleTimer { UIApplication.shared.isIdleTimerDisabled = false }
+        helioLog.notice("helio: recovery window closed (\(String(describing: reason), privacy: .public)), \(window.readings.count, privacy: .public) reading(s)")
+        finishRecoveryIfClosed()
+    }
+
+    /// A closed window of a saved workout: HRR1/HRR2, `.finished`, the hold released, the readings to
+    /// Apple Health and `LocalStore`, Cardio Recovery, then the held-back sync (82g).
+    private func finishRecoveryIfClosed() {
+        guard let window = recoveryWindow, let closedBy = window.closedBy, let active = window.activeReadings,
+              case .measuringRecovery(let summary, let saved) = state else { return }
+        recoveryWindow = nil
+        recoveryMarkAt = nil
+        let bound = HeartRateRecovery.zoneFourLowerBound { [maxHR] in HRZoneClassifier.zone(bpm: $0, maxHR: maxHR) }
+            ?? LiveHR.validBPM.upperBound + 1
+        let outcome = HeartRateRecovery.measure(activeReadings: active, recoveryReadings: window.readings,
+                                                end: window.workoutEnd, zoneFourLowerBound: bound)
+        heartRateRecovery = outcome
+        recoveryClosedBy = closedBy
+        state = .finished(summary, savedToHealth: saved)
+        if Self.running === self { Self.running = nil }
+        recoveryWindows.add(DateInterval(start: window.workoutEnd, end: window.closedAt ?? window.workoutEnd))
+        // Queued before any Health write, so a kill in between still stores them (never twice in Health:
+        // they land behind a `StrapWorkoutHealthExclusions` span, as the workout's own readings do).
+        enqueueLanding(window.readings, timeline: window.timeline)
+        let timeline = window.timeline
+        let readings = window.readings
+        let cardioAt = window.workoutEnd.addingTimeInterval(HeartRateRecovery.oneMinute)
+        recoveryWriteTask = Task { [weak self] in
+            guard let self else { return }
+            var readingsStatus: HeartRateRecoveryHealthStatus?
+            var cardioStatus: HeartRateRecoveryHealthStatus?
+            if let health = self.recoveryHealth {
+                // Each write on its own: neither can fail the other, and the workout is already saved.
+                if !readings.isEmpty {
+                    readingsStatus = await health.saveRecoveryHeartRate(readings, timeline: timeline)
+                }
+                // 82e: HRR1 to Cardio Recovery, when computed. Not for a workout Health refused (the
+                // VO₂ max rule): the value would describe a workout that isn't there.
+                if saved, let drop = outcome.oneMinute.drop {
+                    cardioStatus = await health.saveCardioRecovery(drop, at: cardioAt, timeline: timeline)
+                }
+            }
+            self.landPendingHeartRate()
+            guard let shown = self.shownSummary, shown.summary.startDate == summary.summary.startDate else { return }
+            self.recoveryHealthStatus = (readingsStatus, cardioStatus)
+        }
+        if closedBy != .newWorkout { runHeldBackSync() }
+    }
+
+    private func clearHeartRateRecovery() {
+        recoveryWindow = nil
+        pausedReadings = []
+        recoveryMarkAt = nil
+        heartRateRecovery = nil
+        recoveryClosedBy = nil
+        recoveryHealthStatus = nil
     }
 
     /// `VO2MaxEstimate` over this workout. The strap's readings are only those inside the running
@@ -605,6 +907,7 @@ final class StrapWorkoutRecorder {
         liveZoneBreakdown = WorkoutZoneBreakdown()
         vo2MaxOutcome = nil
         vo2MaxHealthStatus = nil
+        clearHeartRateRecovery()
         rrIntervalCount = 0
     }
 
