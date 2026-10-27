@@ -244,7 +244,8 @@ final class IndoorRunRecorderTests: XCTestCase {
         now = at(600)
         await rig.recorder.end()
         let finish = try XCTUnwrap(rig.recorder.indoorRun)
-        XCTAssertEqual(finish.inputs.stride, IndoorStride(meters: 1.17, source: .height))
+        XCTAssertEqual(finish.inputs.stride?.source, .height)
+        XCTAssertEqual(finish.inputs.stride?.meters ?? 0, 1.17, accuracy: 1e-9)
         XCTAssertEqual(rig.health.writes.last?.indoorDistance?.meters ?? 0, 1_755, accuracy: 0.001)
         XCTAssertEqual(finish.distanceMeters ?? 0, 1_755, accuracy: 0.001)
         XCTAssertTrue(finish.distanceIsEstimate)
@@ -332,6 +333,7 @@ final class IndoorRunRecorderTests: XCTestCase {
         XCTAssertEqual(minutes[1].speed, 120 * 1.17 / 60, accuracy: 1e-9, "6 × 20 steps × stride ÷ 60 s")
 
         let walk = makeRig(sport: .walkingIndoor)
+        now = t0
         walk.recorder.start()
         walk.source.counter(0, at: at(0))
         _ = await run(walk, from: 0, to: 300, counter: 0)

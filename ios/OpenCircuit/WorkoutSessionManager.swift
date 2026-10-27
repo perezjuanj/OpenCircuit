@@ -689,7 +689,7 @@ final class WorkoutSessionManager: NSObject {
             activeSeconds = paused.activeSeconds
         }
         finishedActiveSeconds = activeSeconds
-        let activeSegments = ledger?.activeSegments(until: endDate) ?? [DateInterval(start: summary.startDate, end: endDate)]
+        let activeSegments = ledger?.activeSegments(until: endDate) ?? [DateInterval(start: summary.startDate, end: max(endDate, summary.startDate))]
         ledger = nil
         let indoor = indoorSteps
         indoorSteps = nil

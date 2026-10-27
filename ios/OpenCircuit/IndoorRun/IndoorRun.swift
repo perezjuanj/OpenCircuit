@@ -246,7 +246,7 @@ final class IndoorRunFinish {
         let previous = writeTask
         writeTask = Task { [weak self] in
             await previous?.value
-            let workout = DateInterval(start: inputs.start, end: inputs.end)
+            let workout = DateInterval(start: inputs.start, end: max(inputs.end, inputs.start))
             let distance = await health.replaceEstimate(workout: workout, typedMeters: typedMeters, timeline: inputs.timeline)
             var metrics: IndoorRunHealthStatus?
             if IndoorStepWorkout.writesRunningMetrics(inputs.sport), let strideForMinutes {
