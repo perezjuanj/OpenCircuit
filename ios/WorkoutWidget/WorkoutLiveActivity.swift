@@ -77,7 +77,8 @@ struct WorkoutLiveActivity: Widget {
                                     Text("avg \(LiveFormat.pace(avg, miles: context.state.usesMiles))")
                                 }
                                 if live, let zone = context.state.hrZone {
-                                    Text("Z\(zone)")
+                                    Text(WorkoutActivityAttributes.ContentState.zoneLabel(zone))
+                                        .accessibilityLabel(WorkoutActivityAttributes.ContentState.zoneAccessibilityLabel(zone))
                                 }
                             }
                             .font(.caption.weight(.semibold)).monospacedDigit()
@@ -184,9 +185,10 @@ private struct LockScreenLiveActivityView: View {
                     }
                     if let zoneText {
                         Spacer()
-                        metric(title: "ZONE") {
+                        metric(title: "HEART RATE") {
                             Text(zoneText)
                                 .font(.system(.headline, design: .rounded).weight(.bold))
+                                .accessibilityLabel(zoneAccessibilityText ?? zoneText)
                         }
                     }
                 }
@@ -200,7 +202,12 @@ private struct LockScreenLiveActivityView: View {
 
     private var zoneText: String? {
         guard !(context.state.hrIsStale || context.isStale), let zone = context.state.hrZone else { return nil }
-        return "Z\(zone)"
+        return WorkoutActivityAttributes.ContentState.zoneLabel(zone)
+    }
+
+    private var zoneAccessibilityText: String? {
+        guard !(context.state.hrIsStale || context.isStale), let zone = context.state.hrZone else { return nil }
+        return WorkoutActivityAttributes.ContentState.zoneAccessibilityLabel(zone)
     }
 
     @ViewBuilder

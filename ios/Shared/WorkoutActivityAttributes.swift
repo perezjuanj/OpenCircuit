@@ -64,6 +64,11 @@ struct WorkoutActivityAttributes: ActivityAttributes {
         /// Show distance in miles and pace per mile (the app's distance-unit setting, which the
         /// widget extension cannot read itself). false = km.
         public var usesMiles: Bool = false
+
+        /// "Zone 3": how the Live Activity names a zone (decision 83a), the same name the app uses.
+        public static func zoneLabel(_ zone: Int) -> String { "Zone \(zone)" }
+        /// What VoiceOver says for the zone: "Heart rate zone 3".
+        public static func zoneAccessibilityLabel(_ zone: Int) -> String { "Heart rate zone \(zone)" }
     }
 
     // MARK: Fixed attributes (set once at start, immutable for the Activity's life)
