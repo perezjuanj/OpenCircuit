@@ -66,8 +66,13 @@ extension LocalStore {
     ///
     /// `now` must be the real wall clock at the check (`flushStrap`'s default), never a sync's start.
     ///
+    /// Decision 78a (#332): a night `finalization` covers (by its end, against the Sleep Focus end and
+    /// that end's source, 78g, in a flush that may use it) skips the 3 h hold: Focus ending says it is over.
+    /// Every other night waits exactly as above.
+    ///
     /// Empty with an empty ownership log (a ring-only install): no query runs.
-    func strapNightsAwaitingHealth(timeline: SyncDeviceID, now: Date) -> [[SleepSegment]] {
+    func strapNightsAwaitingHealth(timeline: SyncDeviceID, now: Date,
+                                   finalization: SleepFocusFinalization.Nights = .none) -> [[SleepSegment]] {
         let log = Self.ownershipLog()
         guard !log.isEmpty, let newest = newestSleepNightKey(notAfter: now) else { return [] }
         let family = DeviceOwnershipLog.Family(timeline: timeline)
@@ -78,7 +83,8 @@ extension LocalStore {
         return ((try? context.fetch(descriptor)) ?? []).compactMap { row in
             guard let segments = strapSegmentsAwaitingHealth(row, log: log, family: family) else { return nil }
             let end = max(row.inBedEnd, segments.map(\.end).max() ?? row.inBedEnd)
-            guard row.night < newest || now.timeIntervalSince(end) > Self.strapNewestNightHealthBuffer else { return nil }
+            guard row.night < newest || now.timeIntervalSince(end) > Self.strapNewestNightHealthBuffer
+                    || finalization.finalizes(nightEndingAt: end) else { return nil }
             // Decision 74 (#278): the night as the store path gives it, with its awake fill from the
             // stored heart rate (a row a build before 74 stored has none). Inside the segments' span.
             guard let start = segments.map(\.start).min() else { return segments }
@@ -101,6 +107,32 @@ extension LocalStore {
         else { return nil }
         let end = max(row.inBedEnd, segments.map(\.end).max() ?? row.inBedEnd)
         return SleepHealthGate.isSettled(latestSegmentEnd: end, now: now) ? nil : end.addingTimeInterval(SleepHealthGate.settleMargin)
+    }
+
+    /// Decision 78b (#332): the night a strap Sleep Focus run that ended Focus at `focusEnd` was for:
+    /// the newest stored night the strap owns (decision 28a) that ended at or before `focusEnd` plus
+    /// `SleepFocusFinalization.nightEndSlack` and no earlier than `SleepFocusStrapFollowUp.nightLookback`
+    /// before it, and whether it has a Health mirror record. Its end is the later of `inBedEnd` and the
+    /// hypnogram's last segment, as the backstop reads it. `.none` with an empty ownership log.
+    func strapFocusNight(timeline: SyncDeviceID, focusEnd: Date) -> SleepFocusStrapFollowUp.Night {
+        let log = Self.ownershipLog()
+        guard !log.isEmpty else { return .none }
+        let family = DeviceOwnershipLog.Family(timeline: timeline)
+        let latest = focusEnd.addingTimeInterval(SleepFocusFinalization.nightEndSlack)
+        let earliest = focusEnd.addingTimeInterval(-SleepFocusStrapFollowUp.nightLookback)
+        // A night is never longer than a day, so one that ends after `earliest` began after this.
+        let since = earliest.addingTimeInterval(-86_400)
+        let descriptor = FetchDescriptor<StoredSleepSummary>(predicate: #Predicate { $0.inBedStart >= since })
+        let night = ((try? context.fetch(descriptor)) ?? [])
+            .compactMap { row -> (row: StoredSleepSummary, end: Date)? in
+                guard row.inBedEnd > row.inBedStart,
+                      log.owner(ofNightFrom: row.inBedStart, to: row.inBedEnd) == family else { return nil }
+                let end = max(row.inBedEnd, SleepHypnogramCodec.decode(row.hypnogramData).map(\.end).max() ?? row.inBedEnd)
+                return end >= earliest && end <= latest ? (row, end) : nil
+            }
+            .max { $0.end < $1.end }
+        guard let night else { return .none }
+        return MirroredNightOverlay.hasRecord(storedNight: night.row.night) ? .written : .storedNotWritten
     }
 
     /// `row`'s stored hypnogram when the row is a strap night that may still go to Apple Health: the

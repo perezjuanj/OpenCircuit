@@ -1948,7 +1948,8 @@ struct LocalStore {
                           inBedStart: Date, inBedEnd: Date,
                           sleepOnset: Date = .distantPast, sleepWake: Date = .distantPast,
                           extras: SleepNightExtras = SleepNightExtras(),
-                          device: SyncDeviceID = .ringConn) throws -> SleepPersistOutcome {
+                          device: SyncDeviceID = .ringConn,
+                          replacingStoredCopy: Bool = false) throws -> SleepPersistOutcome {
         // Before the FIRST write under the new key — see `ensureNightKeyMigrated`. A failed
         // migration DEFERS the write rather than filing it under a scheme the rest of the table has
         // not adopted; the epochs survive in the archive and the next drain re-stages them.
@@ -2084,7 +2085,9 @@ struct LocalStore {
                 && abs(existing.inBedEnd.timeIntervalSince(inBedEnd)) <= epochTolerance
             // Completeness is judged on time ASLEEP (span is a fallback): a later, shorter slice — or a
             // wide window padded with awake — can't shrink a fuller night. See SleepSummaryMerge.
-            guard SleepSummaryMerge.shouldReplace(
+            // `replacingStoredCopy` (decision 79e, the strap's store path only): the caller has judged
+            // that this staging replaces the stored copy whatever the merge would keep.
+            guard replacingStoredCopy || SleepSummaryMerge.shouldReplace(
                 storedInBed: storedSpan, newInBed: newSpan,
                 storedAsleep: TimeInterval(existing.asleepMin) * 60,
                 newAsleep: TimeInterval(m.asleep) * 60,
@@ -3620,8 +3623,8 @@ struct LocalStore {
     /// within a calendar day of each other by construction.
     ///
     /// `sleepOnly` (decision 77j, the auto-nap path `saveNap`): a strap night's recorded window is taken
-    /// without its in-bed lead-in (`sleepWindowInBedStart`), as the nap judgement and 76l's prune take
-    /// it. A manual add or edit (`false`) still keeps out of the whole recorded window, lead-in included.
+    /// without its in-bed lead-in (`recordedSleepWindowInBedStart`, an edited strap night's too: 79a), as
+    /// the nap judgement and 76l's prune take it. A manual add or edit (`false`) still keeps out of the whole recorded window, lead-in included.
     private func overlapsStoredNight(_ start: Date, _ end: Date, sleepOnly: Bool = false) -> Bool {
         guard end > start else { return false }
         let lo = Calendar.current.date(byAdding: .day, value: -2, to: start) ?? start
@@ -3630,7 +3633,7 @@ struct LocalStore {
             predicate: #Predicate { $0.night >= lo && $0.night <= hi })
         let rows = (try? context.fetch(d)) ?? []
         return rows.contains { row in
-            let recordedStart = sleepOnly ? row.sleepWindowInBedStart : row.inBedStart
+            let recordedStart = sleepOnly ? row.recordedSleepWindowInBedStart : row.inBedStart   // 79a, 79b
             if row.inBedEnd > row.inBedStart,
                start < row.inBedEnd && end > recordedStart { return true }
             if row.isManuallyEdited, row.editedInBedEnd > row.editedInBedStart,

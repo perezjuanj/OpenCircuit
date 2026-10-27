@@ -45,7 +45,10 @@ final class HelioConnection: NSObject {
     /// phone or app holds it. Nothing retries inside that connection or on a timer (no retry loop,
     /// decision 7). The next connect clears it: "Try again", or the one `reconnectKnown()` every
     /// foreground activation makes, so a busy strap costs at most one re-auth per foreground.
-    private(set) var endedBusy = false
+    var endedBusy: Bool { endedBusyAt != nil }
+    /// When it was set (decision 78d, #316). For the background paths (a run, a re-arm, the standing
+    /// connect) it holds only `HelioBusyLatch.expiry`: after that they try once more.
+    private(set) var endedBusyAt: Date?
 
     @ObservationIgnored let keyStore: any HelioKeyStoring
     @ObservationIgnored private var central: CBCentralManager?
@@ -146,7 +149,7 @@ final class HelioConnection: NSObject {
 
     /// Connect: to the saved strap by identifier, else by a foreground search.
     func connect() {
-        endedBusy = false
+        endedBusyAt = nil
         wantConnection = true
         if Self.hasSavedStrap, reconnectKnown() { return }
         scan()
@@ -177,7 +180,7 @@ final class HelioConnection: NSObject {
     /// A standing connect to the saved strap (no scan). false when there is none to reconnect to.
     @discardableResult
     func reconnectKnown() -> Bool {
-        endedBusy = false
+        endedBusyAt = nil
         guard ActiveDeviceChoiceStore.persisted() == .helioStrap,
               let id = Self.savedPeripheralID, let uuid = UUID(uuidString: id) else { return false }
         if state == .connecting || (state == .connected && session != nil) { return true }
@@ -374,6 +377,8 @@ final class HelioConnection: NSObject {
         observability.recordSyncOutcome(kind: kind, success: !result.interrupted && result.roundsFailed == 0,
                                         detail: "helio: \(result.roundsStored) round(s) stored, \(result.roundsFailed) failed, \(result.nights.count) night(s)")
         guard let store else { return }
+        // Decision 78f: a Sleep Focus end iOS didn't report is noticed here, before the flush decides.
+        await SleepFocusDetection.check(kind: kind == .foreground ? "foreground" : "postSync")
         let flushStart = Date()
         guard let flush = await healthFlush(timeline: timeline, store: store, nights: result.nights,
                                             identity: result.identity,
@@ -394,19 +399,19 @@ final class HelioConnection: NSObject {
                                 flushStartedAt: Date, now: Date = Date()) -> Date? {
         StrapNightRefresh.aim(nights: result.nights,
                               storedNightSettles: store.newestStrapNightSettles(timeline: timeline, now: now),
-                              focusEndedAt: result.nightsFinalized, flushStartedAt: flushStartedAt, afterWokeUp: false)
+                              focusEndedAt: result.nightsFinalized, persistedFocusEnd: SleepFocusFinalization.persisted(),
+                              persistedSource: SleepFocusFinalization.persistedSource(),
+                              flushStartedAt: flushStartedAt, afterWokeUp: false)
     }
 
     /// The strap's Apple Health pass, shared by the post-sync hook and the background run (#215
     /// phase 4): its timeline's pending samples (`HelioHealthPolicy.healthMirroredKinds()`) and `nights`. nil when
     /// Health isn't available on this device, or when `mayFlush` says no. `nightsFinalized` is the
-    /// time T Sleep Focus ended, if a Focus wake is behind this flush: the nights skip their 20-minute
-    /// quiet margin (as the ring's do on that wake) only if this flush starts within 30 minutes of T.
-    /// This is the one place that decides it (decision 31).
+    /// time T Sleep Focus ended, if a Focus wake is behind this flush (decision 31's in-memory T): it
+    /// reaches `flushStrap`, which decides per night with the persisted T (decision 78a).
     static func healthFlush(timeline: SyncDeviceID, store: LocalStore, nights: [HelioSleepSelection.Night],
                             identity: WearableIdentity?, nightsFinalized: Date? = nil) async -> HealthKitWriter.FlushResult? {
         guard HealthKitWriter.isAvailable else { return nil }
-        let finalized = SleepFocusFinalization.applies(focusEndedAt: nightsFinalized, flushStartsAt: Date())
         // Decision 28 (review-224 S3): record the identity the sync ended with, so this flush — and
         // any later one for these rows — names THIS strap even if the wearer has switched back to
         // the ring meanwhile. A strap that never passed the first-write guard writes nothing once
@@ -418,7 +423,7 @@ final class HelioConnection: NSObject {
             return nil
         }
         let flush = await flushStrap(HealthKitWriter(), store: store, timeline: timeline,
-                                     nights: nights.map(\.segments), nightsFinalized: finalized)
+                                     nights: nights.map(\.segments), focusEndedAt: nightsFinalized)
         helioLog.notice("helio: Health flush samples=\(flush.samples, privacy: .public) sleep=\(flush.sleepSegments, privacy: .public) steps=\(flush.steps, privacy: .public) rhr=\(flush.restingDays, privacy: .public)\(flush.recoveryHRVLogSuffix, privacy: .public)")
         return flush
     }
@@ -427,12 +432,27 @@ final class HelioConnection: NSObject {
     /// `ContentView.flushHealth`): the strap's timeline, the kinds `HelioHealthPolicy` mirrors (HRV
     /// included, decision 44) and its nights. The kinds are decided here only, and a test pins them
     /// through `HealthKitWriter.lastFlushRequest` (review-244 SF-2).
+    ///
+    /// Decision 78a (#332): which nights are over is decided here, once per flush, for both sites:
+    /// from `focusEndedAt` (decision 31's in-memory T, the background run's and the post-sync hook's)
+    /// and the Sleep Focus end persisted in `defaults`, at `now` (the flush's start), per night by its
+    /// end (`SleepFocusFinalization.nights`). The same verdict lifts the settle margin in the writer
+    /// and the newest-night hold in the backstop. With no T (none persisted, or one in the future or
+    /// over 6 h old, and no in-memory T) every night is judged exactly as before.
     static func flushStrap(_ writer: HealthKitWriter, store: LocalStore, timeline: SyncDeviceID,
-                           nights: [[SleepSegment]], nightsFinalized: Bool = false,
-                           now: Date = Date()) async -> HealthKitWriter.FlushResult {
-        await writer.flushToHealth(store: store, device: timeline, mirroredKinds: HelioHealthPolicy.healthMirroredKinds(),
-                                   strapNights: strapNights(nights, store: store, timeline: timeline, now: now),
-                                   strapNightsFinalized: nightsFinalized)
+                           nights: [[SleepSegment]], focusEndedAt: Date? = nil,
+                           now: Date = Date(), defaults: UserDefaults = .standard) async -> HealthKitWriter.FlushResult {
+        let finalization = SleepFocusFinalization.nights(inMemory: focusEndedAt, persisted: SleepFocusFinalization.persisted(defaults: defaults),
+                                                         source: SleepFocusFinalization.persistedSource(defaults: defaults),
+                                                         flushStartsAt: now)
+        let flush = await writer.flushToHealth(store: store, device: timeline, mirroredKinds: HelioHealthPolicy.healthMirroredKinds(),
+                                               strapNights: strapNights(nights, store: store, timeline: timeline, now: now,
+                                                                        finalization: finalization),
+                                               strapNightsFinalized: finalization)
+        if finalization.fromPersisted, flush.finalizedStrapNights > 0, let focusEnd = finalization.detectedEnd ?? finalization.focusEnd {
+            SleepFocusFinalization.notePersistedWrite(focusEnd: focusEnd, flushStart: now, defaults: defaults)
+        }
+        return flush
     }
 
     /// The nights a strap flush offers the writer: the sync's own `nights`, then the stored strap
@@ -442,13 +462,13 @@ final class HelioConnection: NSObject {
     /// when the sync already carries the same window. The writer's gate, `mirrorSettledNight` and its
     /// bails judge these exactly as the sync's own.
     static func strapNights(_ nights: [[SleepSegment]], store: LocalStore, timeline: SyncDeviceID,
-                            now: Date) -> [[SleepSegment]] {
+                            now: Date, finalization: SleepFocusFinalization.Nights = .none) -> [[SleepSegment]] {
         func window(_ night: [SleepSegment]) -> DateInterval? {
             guard let start = night.map(\.start).min(), let end = night.map(\.end).max(), end > start else { return nil }
             return DateInterval(start: start, end: end)
         }
         let carried = Set(nights.compactMap(window))
-        return nights + store.strapNightsAwaitingHealth(timeline: timeline, now: now)
+        return nights + store.strapNightsAwaitingHealth(timeline: timeline, now: now, finalization: finalization)
             .filter { window($0).map { !carried.contains($0) } ?? false }
     }
 
@@ -630,15 +650,29 @@ extension HelioConnection: HelioBackgroundLink {
     func disconnectForBackground(cancelNow: Bool) {
         // `disconnect()` drops the session before the link goes, so `didDisconnectPeripheral` can't see
         // a busy strap any more: note it here, so nothing reconnects by itself (decision 7).
-        if session?.phase == .strapBusy { endedBusy = true }
+        if session?.phase == .strapBusy { latchBusy() }
         disconnect(cancelNow: cancelNow)
     }
+
+    /// Decision 78d: a Sleep Focus run tries the strap once, whatever an earlier connection said.
+    func clearBusyLatch() {
+        endedBusyAt = nil
+    }
+
+    /// The connection ended with the strap busy: note when, and which path said so (a reason word).
+    private func latchBusy() {
+        endedBusyAt = Date()
+        breadcrumbs.strapBusy(reason: session?.busyReason)
+    }
+
+    /// A busy latch still holds for the background paths (decision 78d).
+    private var busyLatchHolds: Bool { HelioBusyLatch.holds(since: endedBusyAt, now: Date()) }
 
     /// Decision 33: after a run's teardown (out of time, or expired), arm a standing connect again, so
     /// the strap coming back (or still in range) can wake the app later. Never after a quiet ending
     /// (decision 7). The reconnect itself doesn't sync: `HelioWakePolicy`'s cooldown sees the run.
     func rearmAfterTeardown() {
-        guard ActiveDeviceChoiceStore.persisted() == .helioStrap, !endedBusy, Self.hasSavedStrap else { return }
+        guard ActiveDeviceChoiceStore.persisted() == .helioStrap, !busyLatchHolds, Self.hasSavedStrap else { return }
         if peripheral == nil || peripheral?.state == .disconnected, state == .idle {
             reconnectKnown()
         } else {
@@ -839,7 +873,7 @@ extension HelioConnection: CBCentralManagerDelegate {
             // Auth refused as "busy" on this connection: don't reconnect by itself, or a strap held
             // by another app would be re-authenticated in a loop.
             if session?.phase == .strapBusy {
-                endedBusy = true
+                latchBusy()
                 wantConnection = false
             }
             session?.linkLost()
@@ -850,7 +884,7 @@ extension HelioConnection: CBCentralManagerDelegate {
             let expected = !wantConnection
             if rearmOnDisconnect {
                 rearmOnDisconnect = false
-                if ActiveDeviceChoiceStore.persisted() == .helioStrap, !endedBusy { wantConnection = true }
+                if ActiveDeviceChoiceStore.persisted() == .helioStrap, !busyLatchHolds { wantConnection = true }
             }
             if wantConnection, central.state == .poweredOn {
                 state = .connecting

@@ -1367,6 +1367,9 @@ struct ContentView: View {
         if !ringActive {
             // The Helio Strap (#215): a standing reconnect to the saved strap, which syncs on connect.
             helio.setLocalStore(LocalStore(modelContext))
+            // Decision 78f: a Sleep Focus end iOS didn't report is noticed on coming to the front; the
+            // strap flush below waits for this read (78h N-1).
+            SleepFocusDetection.startForegroundCheck()
             helio.reconnectKnown()
             return
         }
@@ -2644,6 +2647,7 @@ struct ContentView: View {
             guard let timeline else { return }
             let nights = helioSession?.lastSyncResult?.nights.map(\.segments) ?? []
             Task {
+                await SleepFocusDetection.awaitForegroundCheck()
                 let r = await HelioConnection.flushStrap(health, store: store, timeline: timeline, nights: nights)
                 refreshHealthShareState()
                 if r.wroteAnything {

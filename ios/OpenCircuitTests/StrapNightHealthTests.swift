@@ -3192,3 +3192,299 @@ extension StrapNightHealthTests {
         }
     }
 }
+
+// MARK: - Decision 78 (#332): the Sleep Focus end outlives the Focus-off run
+
+/// Every flush here runs through `HelioConnection.flushStrap` (both strap flush sites' shared pass) and
+/// reads the writer's per-night verdict before its authorization guard (`lastStrapNights`): the
+/// simulator has no Health access, so "skips the margin" is the verdict the writer's gate receives.
+/// Sleep Focus ends at 07:00 (`focusEnd`); the persisted T lives in a suite of its own.
+extension StrapNightHealthTests {
+    private var focusEnd: Date { hour(7) }
+
+    private func focusDefaults() throws -> (UserDefaults, String) {
+        let suite = "StrapNightHealthTests.focus.\(UUID().uuidString)"
+        return (try XCTUnwrap(UserDefaults(suiteName: suite)), suite)
+    }
+
+    /// A flush at `now` through the shared strap pass; what the writer was offered, with each night's verdict.
+    private func focusFlush(_ store: LocalStore, nights: [[SleepSegment]] = [], focusEndedAt: Date? = nil, at now: Date,
+                            defaults: UserDefaults) async -> [(night: [SleepSegment], finalized: Bool)] {
+        let writer = HealthKitWriter()
+        _ = await HelioConnection.flushStrap(writer, store: store, timeline: timeline, nights: nights,
+                                             focusEndedAt: focusEndedAt, now: now, defaults: defaults)
+        return writer.lastStrapNights
+    }
+
+    func testTheFocusEndConstantsAreSixHoursAndTenMinutes() {
+        XCTAssertEqual(SleepFocusFinalization.persistedValidity, 6 * 3600)
+        XCTAssertEqual(SleepFocusFinalization.nightEndSlack, 10 * 60)
+        XCTAssertEqual(SleepFocusFinalization.persistedKey, "helio.sleepFocusEndedAt.v1")
+    }
+
+    /// The Focus-off run ran out of time before any sleep round; a background run 2 h later fetches the
+    /// night, which ended 5 minutes before Focus did. With the persisted T: finalized (no margin), and
+    /// the stored copy is offered despite the 3 h newest-night hold.
+    func testAPersistedFocusEndFinalizesANightThatEndedBeforeItInAFlushTwoHoursLater() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        try saveNight(store, from: -1, to: 7 - 5.0 / 60)
+        let night = try hypnogram(store, endingAt: 7 - 5.0 / 60)
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let without = await focusFlush(store, nights: [night], at: hour(9), defaults: defaults)
+        XCTAssertEqual(without.map(\.finalized), [false], "no Focus end: the normal rules")
+        let heldWithout = await focusFlush(store, at: hour(9), defaults: defaults)
+        XCTAssertEqual(heldWithout.count, 0, "the 3 h hold keeps the stored copy back")
+
+        SleepFocusFinalization.persist(focusEnd, defaults: defaults)
+        let carried = await focusFlush(store, nights: [night], at: hour(9), defaults: defaults)
+        XCTAssertEqual(carried.map(\.night), [night])
+        XCTAssertEqual(carried.map(\.finalized), [true], "finalized: it skips the margin")
+        let stored = await focusFlush(store, at: hour(9), defaults: defaults)
+        XCTAssertEqual(stored.map(\.night), [night], "the stored night is offered despite the 3 h hold (58a)")
+        XCTAssertEqual(stored.map(\.finalized), [true])
+    }
+
+    /// The same 7 h after Focus ended: the persisted T no longer applies (6 h), so the normal rules.
+    /// The boundary: 6 h exactly applies, a second later doesn't.
+    func testAPersistedFocusEndOverSixHoursOldIsIgnored() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        try saveNight(store, from: -1, to: 7 - 5.0 / 60)
+        let night = try hypnogram(store, endingAt: 7 - 5.0 / 60)
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SleepFocusFinalization.persist(focusEnd, defaults: defaults)
+
+        let late = await focusFlush(store, nights: [night], at: hour(14), defaults: defaults)
+        XCTAssertEqual(late.map(\.finalized), [false], "7 h after Focus ended: the normal rules")
+        let edge = await focusFlush(store, nights: [night], at: focusEnd.addingTimeInterval(6 * 3600), defaults: defaults)
+        XCTAssertEqual(edge.map(\.finalized), [true], "6 h exactly")
+        let past = await focusFlush(store, nights: [night], at: focusEnd.addingTimeInterval(6 * 3600 + 1), defaults: defaults)
+        XCTAssertEqual(past.map(\.finalized), [false], "6 h and a second")
+    }
+
+    /// The Focus run stored the night but its flush didn't run (it ran out of time after the sleep round).
+    /// The next flush, 20 minutes after Focus ended, from the post-sync hook or the app in front (both
+    /// `flushStrap`), carries no night: it offers the stored one, finalized, despite 58a's 3 h hold.
+    func testANightTheFocusRunStoredButDidNotFlushIsOfferedByTheNextFlushDespiteTheHold() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        try saveNight(store, from: -1, to: 7 - 5.0 / 60)
+        let night = try hypnogram(store, endingAt: 7 - 5.0 / 60)
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let next = focusEnd.addingTimeInterval(20 * 60)
+        let heldBefore = await focusFlush(store, at: next, defaults: defaults)
+        XCTAssertEqual(heldBefore.count, 0, "without T: held 3 h (58a)")
+        SleepFocusFinalization.persist(focusEnd, defaults: defaults)
+        let offered = await focusFlush(store, at: next, defaults: defaults)
+        XCTAssertEqual(offered.map(\.night), [night])
+        XCTAssertEqual(offered.map(\.finalized), [true])
+    }
+
+    /// The person went back to sleep: the night ends 30 minutes AFTER Focus ended. It is not over by T:
+    /// the margin and 58a's hold apply as usual.
+    func testANightEndingThirtyMinutesAfterTheFocusEndIsNotFinalized() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        try saveNight(store, from: -1, to: 7.5)
+        let night = try hypnogram(store, endingAt: 7.5)
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SleepFocusFinalization.persist(focusEnd, defaults: defaults)
+        let now = hour(7.5 + 10.0 / 60)
+        let growing = await focusFlush(store, nights: [night], at: now, defaults: defaults)
+        XCTAssertEqual(growing.map(\.finalized), [false])
+        let heldGrowing = await focusFlush(store, at: hour(9), defaults: defaults)
+        XCTAssertEqual(heldGrowing.count, 0, "58a's hold: 3 h from its end")
+        let inMemory = await focusFlush(store, nights: [night], focusEndedAt: focusEnd, at: hour(7.6), defaults: defaults)
+        XCTAssertEqual(inMemory.map(\.finalized), [false], "decision 31's in-memory T is judged per night too")
+    }
+
+    /// The boundary of "ended by T": the last segment at T + 10 min is over, a second later it isn't.
+    func testANightEndingTenMinutesAfterTheFocusEndIsTheLastOneFinalized() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SleepFocusFinalization.persist(focusEnd, defaults: defaults)
+        let atSlack = [SleepSegment(start: hour(-1), end: focusEnd.addingTimeInterval(10 * 60), stage: .asleepCore)]
+        let past = [SleepSegment(start: hour(-1), end: focusEnd.addingTimeInterval(10 * 60 + 1), stage: .asleepCore)]
+        let verdicts = await focusFlush(store, nights: [atSlack, past], at: hour(8), defaults: defaults)
+        XCTAssertEqual(verdicts.map(\.finalized), [true, false])
+    }
+
+    /// The next evening's night, synced while still in progress within 6 h of T: it ends after T + 10
+    /// min, so never finalized. And the morning's night beside it still is: per night, never per flush.
+    func testTheNextNightSyncedInProgressWithinSixHoursIsNeverFinalized() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SleepFocusFinalization.persist(focusEnd, defaults: defaults)
+        let morning = [SleepSegment(start: hour(-1), end: hour(6.9), stage: .asleepCore)]
+        let inProgress = [SleepSegment(start: hour(11), end: hour(12.9), stage: .asleepCore)]
+        let verdicts = await focusFlush(store, nights: [morning, inProgress], at: hour(12.95), defaults: defaults)
+        XCTAssertEqual(verdicts.map(\.finalized), [true, false])
+    }
+
+    /// No persisted T, or one in the future (a clock moved back): the flush is exactly master's.
+    func testAnAbsentOrFuturePersistedFocusEndChangesNothing() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        try saveNight(store, from: -1, to: 7 - 5.0 / 60)
+        let night = try hypnogram(store, endingAt: 7 - 5.0 / 60)
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertNil(SleepFocusFinalization.persisted(defaults: defaults))
+        for _ in 0..<2 {
+            let carried = await focusFlush(store, nights: [night], at: hour(9), defaults: defaults)
+            XCTAssertEqual(carried.map(\.night), [night])
+            XCTAssertEqual(carried.map(\.finalized), [false])
+            let backstop = await focusFlush(store, at: hour(9), defaults: defaults)
+            XCTAssertEqual(backstop.count, 0)
+            XCTAssertEqual(HelioConnection.strapNights([], store: store, timeline: timeline, now: hour(9)), [])
+            SleepFocusFinalization.persist(hour(10), defaults: defaults)   // the second pass: a T after the flush
+        }
+        XCTAssertEqual(SleepFocusFinalization.nights(inMemory: nil, persisted: nil, flushStartsAt: hour(9)), .none)
+        XCTAssertEqual(SleepFocusFinalization.nights(inMemory: nil, persisted: hour(10), flushStartsAt: hour(9)), .none)
+    }
+
+    /// Decision 31's in-memory T keeps working on its own (within 30 minutes), and the later of the two
+    /// T's applies; the persisted one alone is what the 78c line counts.
+    func testTheInMemoryAndPersistedFocusEndsMeetAsTheLatest() {
+        let t = focusEnd
+        let memory = SleepFocusFinalization.nights(inMemory: t, persisted: nil, flushStartsAt: t.addingTimeInterval(60))
+        XCTAssertEqual(memory, SleepFocusFinalization.Nights(focusEnd: t, fromPersisted: false))
+        XCTAssertEqual(SleepFocusFinalization.nights(inMemory: t, persisted: nil, flushStartsAt: t.addingTimeInterval(31 * 60)), .none,
+                       "decision 31: in memory, 30 minutes")
+        XCTAssertEqual(SleepFocusFinalization.nights(inMemory: t, persisted: t, flushStartsAt: t.addingTimeInterval(60)),
+                       SleepFocusFinalization.Nights(focusEnd: t, fromPersisted: false), "the Focus run's own flush")
+        XCTAssertEqual(SleepFocusFinalization.nights(inMemory: t, persisted: t, flushStartsAt: t.addingTimeInterval(31 * 60)),
+                       SleepFocusFinalization.Nights(focusEnd: t, fromPersisted: true))
+        let later = t.addingTimeInterval(600)
+        XCTAssertEqual(SleepFocusFinalization.nights(inMemory: t, persisted: later, flushStartsAt: later.addingTimeInterval(60)),
+                       SleepFocusFinalization.Nights(focusEnd: later, fromPersisted: true))
+    }
+
+    /// Decision 78c's second line: once per T, minutes after it, counts only.
+    func testThePersistedFocusEndWriteLineIsRecordedOncePerFocusEnd() throws {
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SleepFocusFinalization.notePersistedWrite(focusEnd: focusEnd, flushStart: focusEnd.addingTimeInterval(125 * 60), defaults: defaults)
+        SleepFocusFinalization.notePersistedWrite(focusEnd: focusEnd, flushStart: focusEnd.addingTimeInterval(200 * 60), defaults: defaults)
+        SleepFocusFinalization.notePersistedWrite(focusEnd: hour(31), flushStart: hour(32), defaults: defaults)
+        let lines = ObservabilityStore(defaults).metricRecords().filter { $0.source == "focus" }.map(\.detail)
+        XCTAssertEqual(lines, ["night written from the Sleep Focus end, 125 min after it",
+                               "night written from the Sleep Focus end, 60 min after it"])
+    }
+
+    // MARK: 78b: the retry after a strap Focus run
+
+    private func followUpScheduler(now: Date) -> (BackgroundRefreshScheduler, MarginRecorder) {
+        let recorder = MarginRecorder()
+        return (BackgroundRefreshScheduler(scheduler: recorder, now: { now }, window: { _ in nil }), recorder)
+    }
+
+    /// The Focus run ran out of time with the night stored but not in Health: a refresh at T + 15 min,
+    /// recorded, so the app's `schedule()` doesn't replace it.
+    func testAFocusRunThatLeftTheNightOutOfHealthRecordsARetryThatSurvivesSchedule() throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        try saveNight(store, from: -1, to: 7 - 5.0 / 60)
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = focusEnd.addingTimeInterval(28)
+        let (scheduler, recorder) = followUpScheduler(now: now)
+        let night = store.strapFocusNight(timeline: timeline, focusEnd: focusEnd)
+        XCTAssertEqual(night, .storedNotWritten)
+        let retry = SleepFocusStrapFollowUp.finish(HelioBackgroundRun(ending: .outOfTime), focusEnd: focusEnd, night: night,
+                                                   expired: false, scheduler: scheduler, observability: observability,
+                                                   defaults: defaults, now: now)
+        XCTAssertTrue(retry)
+        let at = focusEnd.addingTimeInterval(15 * 60)
+        XCTAssertEqual(StrapNightRefresh.pending(now: now, defaults: defaults), at)
+        XCTAssertEqual(recorder.submitted?.earliestBeginDate, at)
+        scheduler.schedule()
+        XCTAssertTrue(StrapNightRefresh.resubmit(scheduler, strapChosen: true, now: now, defaults: defaults))
+        XCTAssertEqual(recorder.submitted?.earliestBeginDate, at, "it survives `schedule()`")
+        XCTAssertEqual(observability.metricRecords().filter { $0.source == "focus" }.map(\.detail),
+                       ["ending=outOfTime night=stored-not-written retry=yes"])
+    }
+
+    /// Every ending is included: coalesced, another run active, strap busy, and an expired task (which
+    /// still records it, with no resubmit after a `schedule()` that never ran). No night stored at all
+    /// asks too.
+    func testEveryFocusRunEndingAsksForTheRetryWhenNoNightIsInHealth() throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: focusEnd), .none)
+        let endings: [HelioBackgroundRun.Ending] = [.coalesced(into: .processing), .anotherRunActive, .strapBusy, .expired, .synced]
+        for ending in endings {
+            let (defaults, suite) = try focusDefaults()
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let now = focusEnd.addingTimeInterval(10)
+            let (scheduler, recorder) = followUpScheduler(now: now)
+            XCTAssertTrue(SleepFocusStrapFollowUp.finish(HelioBackgroundRun(ending: ending), focusEnd: focusEnd, night: .none,
+                                                         expired: ending == .expired, scheduler: scheduler,
+                                                         observability: observability, defaults: defaults, now: now), ending.label)
+            XCTAssertEqual(StrapNightRefresh.pending(now: now, defaults: defaults), focusEnd.addingTimeInterval(15 * 60), ending.label)
+            XCTAssertEqual(recorder.submitted?.earliestBeginDate, focusEnd.addingTimeInterval(15 * 60), ending.label)
+        }
+        XCTAssertEqual(observability.metricRecords().filter { $0.source == "focus" }.map(\.detail).last,
+                       "ending=synced night=none retry=yes")
+    }
+
+    /// A Focus run that wrote the night: no retry, and its flush's verdict (nil) clears a pending refresh.
+    func testAFocusRunThatWroteTheNightAsksForNoRetry() throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        try saveNight(store, from: -1, to: 7 - 5.0 / 60)
+        try recordMirror(try hypnogram(store, endingAt: 7 - 5.0 / 60), store: store)
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = focusEnd.addingTimeInterval(20)
+        let (scheduler, _) = followUpScheduler(now: now)
+        StrapNightRefresh.record(focusEnd.addingTimeInterval(10 * 60), scheduler: scheduler, defaults: defaults)
+        let night = store.strapFocusNight(timeline: timeline, focusEnd: focusEnd)
+        XCTAssertEqual(night, .written)
+        var run = HelioBackgroundRun(ending: .synced)
+        run.flushMS = 40
+        XCTAssertFalse(SleepFocusStrapFollowUp.finish(run, focusEnd: focusEnd, night: night, expired: false, scheduler: scheduler,
+                                                      observability: observability, defaults: defaults, now: now))
+        XCTAssertNil(StrapNightRefresh.pending(now: now, defaults: defaults))
+        XCTAssertEqual(observability.metricRecords().filter { $0.source == "focus" }.map(\.detail), ["ending=synced night=written retry=no"])
+    }
+
+    /// A later refresh already pending is kept, not pulled forward.
+    func testAPendingLaterRefreshIsKeptByTheFocusRetry() throws {
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = focusEnd.addingTimeInterval(20)
+        let (scheduler, _) = followUpScheduler(now: now)
+        let later = focusEnd.addingTimeInterval(40 * 60)
+        StrapNightRefresh.record(later, scheduler: scheduler, defaults: defaults)
+        XCTAssertTrue(SleepFocusStrapFollowUp.finish(HelioBackgroundRun(ending: .outOfTime), focusEnd: focusEnd, night: .storedNotWritten,
+                                                     expired: false, scheduler: scheduler, observability: observability,
+                                                     defaults: defaults, now: now))
+        XCTAssertEqual(StrapNightRefresh.pending(now: now, defaults: defaults), later)
+    }
+
+    /// The night a Focus run was for: one ending after T + 10 min (still growing), or over 18 h before T,
+    /// or the ring's, is not it.
+    func testTheFocusRunsNightEndsByTheSlackAndWithinEighteenHoursBeforeIt() throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        try saveNight(store, from: -1, to: 7.5)
+        XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: focusEnd), .none, "ends 30 min after T")
+        XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: hour(7.5).addingTimeInterval(18 * 3600)), .storedNotWritten)
+        XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: hour(7.5).addingTimeInterval(18 * 3600 + 1)), .none)
+        XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: hour(7.5).addingTimeInterval(-10 * 60)), .storedNotWritten)
+
+        ownership.install(DeviceOwnershipLog())
+        XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: hour(7.5)), .none, "ring-only: no strap night")
+    }
+}
