@@ -71,6 +71,10 @@ struct WorkoutView: View {
                         .padding()
                 case .finished(let summary):
                     summaryView(summary)
+                        // 84j: the SUMMARY going away (Done, the sheet dismissed) saves an indoor workout
+                        // still waiting for its distance prompt. Not the `.onDisappear { stop() }` the note
+                        // below forbids: the workout has already ended, and this only saves it.
+                        .onDisappear { manager.indoorRun?.endWait(.dismissed) }
                 case .error(let msg):
                     VStack(spacing: 16) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -557,8 +561,17 @@ struct WorkoutView: View {
                         noteRow(icon: "location.slash", color: .secondary,
                                 text: "No GPS route — location access is off for OpenCircuit.")
                     }
-                    noteRow(icon: "checkmark.circle", color: .green,
-                            text: "Workout saved to Apple Health.")
+                    if manager.indoorRun?.savePending == true {
+                        // 84j: an indoor run or walk waits for its distance prompt (the note is in its section).
+                        noteRow(icon: "clock", color: .secondary,
+                                text: "Not in Apple Health yet: waiting for the treadmill distance.")
+                    } else if manager.indoorRun?.workoutSaved == false {
+                        noteRow(icon: "exclamationmark.triangle", color: .orange,
+                                text: "Apple Health didn't accept this workout, so it isn't in Health.")
+                    } else {
+                        noteRow(icon: "checkmark.circle", color: .green,
+                                text: "Workout saved to Apple Health.")
+                    }
                 }
                 .padding(.horizontal)
 

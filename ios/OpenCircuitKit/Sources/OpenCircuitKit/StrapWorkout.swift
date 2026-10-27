@@ -217,15 +217,20 @@ public struct StrapWorkoutJournal: Codable, Equatable, Sendable {
     /// The strap's realtime step stream was on for this indoor workout (#339, decision 84b): a killed
     /// process leaves the next connection an owed `05 00`. nil in journals written before #339.
     public var stepStreamOn: Bool?
+    /// An indoor run or walk that ENDED and is waiting for its distance prompt before its `HKWorkout` is
+    /// saved (#339, decision 84j): the step estimate it is saved with if the app dies first. nil otherwise.
+    public var indoorEstimateMeters: Double?
 
     public init(sport: WorkoutSportType, ledger: WorkoutActivityLedger, lastAliveAt: Date,
-                timelineRaw: String, distanceMeters: Double? = nil, stepStreamOn: Bool? = nil) {
+                timelineRaw: String, distanceMeters: Double? = nil, stepStreamOn: Bool? = nil,
+                indoorEstimateMeters: Double? = nil) {
         self.sport = sport
         self.ledger = ledger
         self.lastAliveAt = lastAliveAt
         self.timelineRaw = timelineRaw
         self.distanceMeters = distanceMeters
         self.stepStreamOn = stepStreamOn
+        self.indoorEstimateMeters = indoorEstimateMeters
     }
 
     public func encoded() -> Data? { try? JSONEncoder().encode(self) }
@@ -269,6 +274,8 @@ public struct RecoveredStrapWorkout: Equatable, Sendable {
     /// The readings inside the recovered span.
     public let samples: [HRSample]
     public let timelineRaw: String
+    /// An ended indoor run's step estimate, saved as its distance (decision 84j). nil otherwise.
+    public var indoorEstimateMeters: Double? = nil
 
     public var activeSeconds: TimeInterval { ledger.activeSeconds(until: end) }
 }
@@ -298,6 +305,7 @@ public enum StrapWorkoutRecovery {
         guard end > start, journal.ledger.activeSeconds(until: end) > 0 else { return .discard(.noObservedSpan) }
         guard end <= now else { return .discard(.endsInTheFuture) }
         return .offer(RecoveredStrapWorkout(sport: journal.sport, ledger: journal.ledger, end: end,
-                                            samples: inSpan.filter { $0.end <= end }, timelineRaw: journal.timelineRaw))
+                                            samples: inSpan.filter { $0.end <= end }, timelineRaw: journal.timelineRaw,
+                                            indoorEstimateMeters: journal.indoorEstimateMeters))
     }
 }

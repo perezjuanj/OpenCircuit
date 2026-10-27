@@ -8,9 +8,12 @@ import OpenCircuitKit
 // the ring's (`WorkoutSessionManager`, its `0x4e` sport steps). Each recorder counts the steps
 // (`IndoorStepTracker`) and, at End, hands one `IndoorRunFinish` to the summary.
 //
-// Order at End (decision 82a, 84e): the workout is saved exactly when it is today, with the step
-// estimate as its distance (`OpenCircuitEstimated = true`); nothing waits for the prompt. The prompt then
-// replaces the estimate when the person types the treadmill's distance; no answer keeps the estimate.
+// When the workout is saved (decision 84j, which replaces 84e's "at End" for this one case): an indoor run
+// or walk WITH STEPS saves its `HKWorkout` when the person answers or skips the distance prompt, dismisses
+// the summary, or 10 minutes after End, whichever comes first, so the workout's own total distance is the
+// typed one when given (else the step estimate, `OpenCircuitEstimated = true`). Every other workout, and
+// an indoor one without steps, saves at End as before (82a). A distance typed after an estimate save
+// replaces the estimate's samples (`IndoorRunHealthWriter.replaceEstimate`).
 
 /// Our metadata key on every sample computed from a step estimate (decision 84f).
 enum IndoorRunMetadata {
@@ -21,6 +24,8 @@ enum IndoorRunMetadata {
 /// `WorkoutSessionManager.writeWorkout`).
 struct IndoorDistanceWrite: Equatable {
     let meters: Double
+    /// The person typed it from the treadmill (decision 84j); false for the step estimate.
+    var typed = false
 }
 
 /// The stride a typed distance calibrated, per device and sport (decision 84e): the next indoor run of
@@ -111,8 +116,6 @@ struct IndoorRunInputs: Equatable {
     /// The step stream stopped before End and didn't come back (the strap's link dropped: no `05 01`
     /// after a reconnect, decision 84b). The steps cover only part of the run.
     let stepsInterrupted: Bool
-    /// The workout's own Health write committed: nothing is written about a workout Health refused.
-    let savedToHealth: Bool
     let heartRate: [HRSample]
     let age: Int?
     let restingHR: Double?
@@ -158,11 +161,19 @@ protocol IndoorRunHealthWriting: AnyObject {
     func saveVO2Max(_ estimate: VO2MaxEstimate.Estimate, workoutEnd: Date, timeline: SyncDeviceID) async -> VO2MaxHealthWriter.Status
 }
 
-/// The summary's indoor-run state and its one action, `submit` (decision 84e–84g). One per finished
-/// indoor workout, owned by the recorder that ended it.
+/// The summary's indoor-run state and its actions, `submit` and `skip` (decision 84e–84g, 84j). One per
+/// finished indoor workout, owned by the recorder that ended it.
 @Observable
 @MainActor
 final class IndoorRunFinish {
+    /// What ended the wait for the workout's save (decision 84j).
+    enum SaveTrigger: Equatable {
+        case answered, skipped, dismissed, timedOut
+    }
+
+    /// How long after End a waiting workout saves on its own (decision 84j).
+    static let saveDeadline: TimeInterval = 10 * 60
+
     let inputs: IndoorRunInputs
     /// The typed distance, once submitted (metres).
     private(set) var typedMeters: Double?
@@ -172,6 +183,9 @@ final class IndoorRunFinish {
     /// The typed distance's stride was stored for the next indoor run of this sport on this device
     /// (false when it was refused: an implausible ratio, or a step stream cut short).
     private(set) var calibrationStored = false
+    /// The workout's own Health write: nil while it waits for the prompt (84j), then whether it committed.
+    private(set) var workoutSaved: Bool?
+    private(set) var saveTrigger: SaveTrigger?
     /// Per-minute speed and stride to Health: nil while in flight or not attempted.
     private(set) var runningMetricsStatus: IndoorRunHealthStatus?
     /// The typed distance's Health write: nil while in flight or before a submit.
@@ -181,12 +195,20 @@ final class IndoorRunFinish {
     private(set) var vo2MaxHealthStatus: VO2MaxHealthWriter.Status?
     /// The Health writes, for tests to await.
     @ObservationIgnored private(set) var writeTask: Task<Void, Never>?
+    /// The recorder's deferred workout save (84j): the typed distance in metres, or nil for the estimate.
+    /// It reports back through `workoutSaveFinished(saved:)`.
+    @ObservationIgnored var saveWorkout: (@MainActor (Double?) -> Void)?
 
     @ObservationIgnored private let health: (any IndoorRunHealthWriting)?
     @ObservationIgnored private let calibrations: IndoorStrideCalibrations
+    /// The stride the typed distance gave, when it may be used for the per-minute samples.
+    @ObservationIgnored private var typedStride: IndoorStride?
 
-    init(inputs: IndoorRunInputs, health: (any IndoorRunHealthWriting)?, calibrations: IndoorStrideCalibrations) {
+    /// `workoutSaved`: the result of a save made at End, or nil when the save waits for the prompt.
+    init(inputs: IndoorRunInputs, workoutSaved: Bool?, health: (any IndoorRunHealthWriting)?,
+         calibrations: IndoorStrideCalibrations) {
         self.inputs = inputs
+        self.workoutSaved = workoutSaved
         self.health = health
         self.calibrations = calibrations
         stride = inputs.stride
@@ -197,6 +219,10 @@ final class IndoorRunFinish {
     var distanceMeters: Double? { typedMeters ?? inputs.estimatedMeters }
     var distanceIsEstimate: Bool { typedMeters == nil }
     var submitted: Bool { typedMeters != nil }
+    /// The workout waits for the prompt before it is saved (84j).
+    var savePending: Bool { workoutSaved == nil }
+    /// The prompt is offered until a distance is typed or the person skipped it.
+    var promptOpen: Bool { !submitted && saveTrigger != .skipped }
 
     var averageCadence: Double? { inputs.steps.averageCadence(activeSeconds: inputs.activeSeconds) }
 
@@ -206,15 +232,17 @@ final class IndoorRunFinish {
             .filter(\.wholeInActiveTime)
     }
 
-    /// At End, after the workout's own write: the per-minute speed and stride for an indoor RUN from
-    /// the estimated stride, marked estimated. Never before the workout is saved, never for a walk.
+    /// After a save made at End: the per-minute speed and stride for an indoor RUN from the estimated
+    /// stride, marked estimated. Never before the workout is saved, never for a walk.
     func writeEstimateMetrics() {
-        guard inputs.savedToHealth, IndoorStepWorkout.writesRunningMetrics(inputs.sport),
+        guard workoutSaved == true, IndoorStepWorkout.writesRunningMetrics(inputs.sport),
               let stride = inputs.stride, let health else { return }
         let minutes = Self.minuteSamples(inputs, stride: stride.meters)
         guard !minutes.isEmpty else { return }
         let timeline = inputs.timeline
+        let previous = writeTask
         writeTask = Task { [weak self] in
+            await previous?.value
             let status = await health.saveRunningMetrics(minutes, estimated: true, timeline: timeline)
             // A submit that already replaced them owns the status now.
             guard let self, !self.submitted else { return }
@@ -222,9 +250,10 @@ final class IndoorRunFinish {
         }
     }
 
-    /// The prompt's answer (decision 84e). A typed distance replaces the estimate: the summary, the
-    /// workout's distance in Health, the stride stored for the next indoor run of this sport on this
-    /// device, the per-minute samples, and (indoor run) the VO₂ max. Once per workout.
+    /// The prompt's answer (decision 84e). A typed distance replaces the estimate: the summary, the stride
+    /// stored for the next indoor run of this sport on this device, the per-minute samples, (indoor run)
+    /// the VO₂ max, and the workout's distance in Health: saved WITH the workout when it is still waiting
+    /// (84j), else replacing the estimate's samples. Once per workout.
     func submit(typedMeters: Double, inclinePercent: Double?) {
         guard !submitted, typedMeters > 0 else { return }
         let incline = inclinePercent.flatMap { IndoorRunEntry.inclineRange.contains($0) ? $0 : nil }
@@ -233,7 +262,7 @@ final class IndoorRunFinish {
         let calibrated = IndoorStride.calibrate(typedMeters: typedMeters, activeSteps: inputs.activeSteps)
         // A run whose step stream was cut short has too few steps for the typed distance: its ratio is
         // not a stride, so it is never stored, and the minutes keep the estimated stride.
-        let typedStride = inputs.stepsInterrupted ? nil : calibrated
+        typedStride = inputs.stepsInterrupted ? nil : calibrated
         if let typedStride {
             stride = typedStride
             calibrations.store(typedStride.meters, timeline: inputs.timeline, sport: inputs.sport)
@@ -244,11 +273,16 @@ final class IndoorRunFinish {
                 ? .skipped(.noStepData)
                 : Self.vo2(inputs, typed: typedMeters, incline: incline)
         }
+        if savePending {
+            requestSave(.answered)
+            return
+        }
         // The workout isn't in Health, so nothing describing it is written (the VO₂ max rule).
-        if !inputs.savedToHealth, case .estimate? = vo2MaxOutcome { vo2MaxHealthStatus = .failed }
-        guard inputs.savedToHealth, let health else { return }
+        if workoutSaved == false, case .estimate? = vo2MaxOutcome { vo2MaxHealthStatus = .failed }
+        guard workoutSaved == true, let health else { return }
         let inputs = inputs
         let vo2 = vo2MaxOutcome
+        let typedStride = typedStride
         let strideForMinutes = typedStride ?? inputs.stride
         let previous = writeTask
         writeTask = Task { [weak self] in
@@ -272,6 +306,60 @@ final class IndoorRunFinish {
             self.distanceStatus = distance
             self.runningMetricsStatus = metrics
             self.vo2MaxHealthStatus = vo2Status
+        }
+    }
+
+    /// "Skip" on the prompt (84j): the waiting workout is saved now, with the step estimate.
+    func skip() {
+        guard savePending, !submitted else { return }
+        requestSave(.skipped)
+    }
+
+    /// The summary was dismissed, or 10 minutes passed since End (84j): a waiting workout is saved now
+    /// with the step estimate. A no-op once it is saved.
+    func endWait(_ trigger: SaveTrigger) {
+        guard savePending else { return }
+        requestSave(trigger)
+    }
+
+    private func requestSave(_ trigger: SaveTrigger) {
+        guard savePending, saveTrigger == nil else { return }
+        saveTrigger = trigger
+        saveWorkout?(trigger == .answered ? typedMeters : nil)
+    }
+
+    /// The recorder's deferred save committed (or not). Then, and only then, what describes the workout
+    /// goes to Health: the per-minute speed and stride (indoor run) and the VO₂ max.
+    func workoutSaveFinished(saved: Bool) {
+        guard savePending else { return }
+        workoutSaved = saved
+        guard saved else {
+            if case .estimate? = vo2MaxOutcome { vo2MaxHealthStatus = .failed }
+            return
+        }
+        if submitted { distanceStatus = .saved }
+        guard let health else { return }
+        let inputs = inputs
+        let vo2 = vo2MaxOutcome
+        let typedStride = submitted ? self.typedStride : nil
+        let strideForMinutes = typedStride ?? inputs.stride
+        let previous = writeTask
+        writeTask = Task { [weak self] in
+            await previous?.value
+            var metrics: IndoorRunHealthStatus?
+            if IndoorStepWorkout.writesRunningMetrics(inputs.sport), let strideForMinutes {
+                let minutes = Self.minuteSamples(inputs, stride: strideForMinutes.meters)
+                if !minutes.isEmpty {
+                    metrics = await health.saveRunningMetrics(minutes, estimated: typedStride == nil, timeline: inputs.timeline)
+                }
+            }
+            var vo2Status: VO2MaxHealthWriter.Status?
+            if case .estimate(let estimate)? = vo2 {
+                vo2Status = await health.saveVO2Max(estimate, workoutEnd: inputs.end, timeline: inputs.timeline)
+            }
+            guard let self else { return }
+            if metrics != nil { self.runningMetricsStatus = metrics }
+            if vo2Status != nil { self.vo2MaxHealthStatus = vo2Status }
         }
     }
 

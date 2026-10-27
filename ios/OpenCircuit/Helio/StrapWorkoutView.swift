@@ -30,6 +30,9 @@ struct StrapWorkoutView: View {
                     ProgressView("Saving workout…").padding()
                 case .measuringRecovery(let summary, let saved), .finished(let summary, let saved):
                     summaryView(summary, saved: saved)
+                        // 84j: the summary going away (Done, the sheet dismissed) saves an indoor workout
+                        // still waiting for its distance prompt. Saves only; it ends no recording.
+                        .onDisappear { recorder.summaryDismissed() }
                 case .error(let message):
                     VStack(spacing: 16) {
                         Image(systemName: "exclamationmark.triangle.fill").font(.largeTitle).foregroundStyle(.orange)
@@ -332,7 +335,10 @@ struct StrapWorkoutView: View {
                     } else if summary.sport.isOutdoor {
                         noteRow("location.slash", .secondary, "No GPS route — location access is off for OpenCircuit.")
                     }
-                    if saved {
+                    if recorder.workoutSavePending {
+                        // 84j: an indoor run or walk waits for its distance prompt (the note is in its section).
+                        noteRow("clock", .secondary, "Not in Apple Health yet: waiting for the treadmill distance.")
+                    } else if saved {
                         noteRow("checkmark.circle", .green, "Workout saved to Apple Health.")
                     } else {
                         noteRow("exclamationmark.triangle", .orange, "Apple Health didn't accept this workout, so it isn't in Health.")

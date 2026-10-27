@@ -67,7 +67,7 @@ struct IndoorRunSummarySection: View {
                 }
                 .font(.caption)
             }
-            if !finish.submitted {
+            if finish.promptOpen {
                 prompt
             }
         }
@@ -91,13 +91,23 @@ struct IndoorRunSummarySection: View {
             if !inclineIsValid {
                 Text("Incline must be between 0 and 15 %.").font(.caption).foregroundStyle(.orange)
             }
-            Button("Save Distance") {
-                guard let typed else { return }
-                focused = false
-                finish.submit(typedMeters: typed, inclinePercent: IndoorRunEntry.incline(inclineText))
+            HStack {
+                Button("Save Distance") {
+                    guard let typed else { return }
+                    focused = false
+                    finish.submit(typedMeters: typed, inclinePercent: IndoorRunEntry.incline(inclineText))
+                }
+                .buttonStyle(.bordered)
+                .disabled(typed == nil || !inclineIsValid)
+                // 84j: the workout waits for this prompt; Skip saves it now with the step estimate.
+                if finish.savePending {
+                    Button("Skip") {
+                        focused = false
+                        finish.skip()
+                    }
+                    .buttonStyle(.borderless)
+                }
             }
-            .buttonStyle(.bordered)
-            .disabled(typed == nil || !inclineIsValid)
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
@@ -136,8 +146,14 @@ struct IndoorRunSummarySection: View {
         if inputs.stepsInterrupted, finish.distanceIsEstimate {
             notes.append("Steps stopped when the strap disconnected, so the steps and the estimate cover only the time before.")
         }
-        if !inputs.savedToHealth {
+        switch finish.workoutSaved {
+        case nil:
+            notes.append("This workout is saved to Apple Health when you save or skip the treadmill distance, close this summary, or 10 minutes after End.")
             return notes
+        case false?:
+            return notes
+        case true?:
+            break
         }
         switch finish.distanceStatus {
         case .saved?: notes.append("Distance saved to Apple Health.")

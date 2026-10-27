@@ -78,13 +78,15 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
             if !isCycling { walkRunDistanceToCredit = distance }
         } else if let indoor = write.indoorDistance, indoor.meters > 0,
                   IndoorStepWorkout.applies(to: summary.sport) {
-            // An indoor run or walk (#339, decision 84f): active steps × stride, an ESTIMATE until the
-            // person types the treadmill's distance (`IndoorRunHealthWriter.replaceEstimate`).
+            // An indoor run or walk (#339, decision 84f, 84j): the treadmill distance the person typed
+            // (user-entered, no wearable named), else active steps × stride, an ESTIMATE.
             let sample = HKQuantitySample(
                 type: HKQuantityType(.distanceWalkingRunning),
                 quantity: HKQuantity(unit: .meter(), doubleValue: indoor.meters),
-                start: summary.startDate, end: summary.endDate, device: strap,
-                metadata: [HKMetadataKeyWasUserEntered: false, IndoorRunMetadata.estimatedKey: true])
+                start: summary.startDate, end: summary.endDate, device: indoor.typed ? nil : strap,
+                metadata: indoor.typed
+                    ? [HKMetadataKeyWasUserEntered: true]
+                    : [HKMetadataKeyWasUserEntered: false, IndoorRunMetadata.estimatedKey: true])
             do {
                 try await builder.addSamples([sample])
                 walkRunDistanceToCredit = indoor.meters

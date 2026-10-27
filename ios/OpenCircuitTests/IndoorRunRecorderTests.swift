@@ -32,10 +32,13 @@ private final class StepSource: StrapWorkoutHeartRateSource, StrapWorkoutStepSou
 
     init(timeline: SyncDeviceID) { self.timeline = timeline }
 
+    private(set) var syncRequests = 0
+    var log: EventLog?
+
     func startWorkoutHeartRate() {}
     func stopWorkoutHeartRate() {}
     func sendOwedOrphanStop() {}
-    func syncHistory(manual: Bool) {}
+    func syncHistory(manual: Bool) { syncRequests += 1; log?.add("sync") }
     func startWorkoutSteps() -> Bool {
         guard hasSteps else { return false }
         commands.append("on")
@@ -53,13 +56,39 @@ private final class StepSource: StrapWorkoutHeartRateSource, StrapWorkoutStepSou
     func heartRate(_ bpm: Int, at date: Date) { heartRateObserver?(bpm, date) }
 }
 
+/// The order things happened in, across the fakes.
+@MainActor
+private final class EventLog {
+    private(set) var events: [String] = []
+    func add(_ event: String) { events.append(event) }
+}
+
 @MainActor
 private final class WorkoutHealth: StrapWorkoutHealthWriting {
     private(set) var writes: [StrapWorkoutWrite] = []
     var accept = true
+    var log: EventLog?
     func save(_ write: StrapWorkoutWrite) async -> Bool {
         writes.append(write)
+        log?.add("workout saved")
         return accept
+    }
+}
+
+@MainActor
+private final class RecoveryWrites: HeartRateRecoveryHealthWriting {
+    private(set) var readingWrites = 0
+    private(set) var cardioWrites = 0
+    var log: EventLog?
+    func saveRecoveryHeartRate(_ samples: [HRSample], timeline: SyncDeviceID) async -> HeartRateRecoveryHealthStatus {
+        readingWrites += 1
+        log?.add("recovery readings saved")
+        return .saved
+    }
+    func saveCardioRecovery(_ bpm: Int, at date: Date, timeline: SyncDeviceID) async -> HeartRateRecoveryHealthStatus {
+        cardioWrites += 1
+        log?.add("cardio recovery saved")
+        return .saved
     }
 }
 
@@ -157,16 +186,23 @@ final class IndoorRunRecorderTests: XCTestCase {
         let journal: Journal
         let flag: StrapStepStreamFlag
         let calibrations: IndoorStrideCalibrations
+        let recovery: RecoveryWrites?
+        let log: EventLog
     }
 
     private func makeRig(sport: WorkoutSportType = .runningIndoor, height: Double? = 180,
                          calibrations: IndoorStrideCalibrations? = nil,
-                         source: StepSource? = nil) -> Rig {
+                         source: StepSource? = nil, journal: Journal? = nil, recoveryWindow: Bool = false) -> Rig {
+        let log = EventLog()
         let source = source ?? StepSource(timeline: timeline)
+        source.log = log
         let current = Box(source)
         let health = WorkoutHealth()
+        health.log = log
+        let recovery = recoveryWindow ? RecoveryWrites() : nil
+        recovery?.log = log
         let indoor = IndoorHealth()
-        let journal = Journal()
+        let journal = journal ?? Journal()
         let flag = StrapStepStreamFlag(defaults())
         let calibrations = calibrations ?? IndoorStrideCalibrations(defaults())
         let profile = self.profile
@@ -174,7 +210,7 @@ final class IndoorRunRecorderTests: XCTestCase {
             source: { current.value }, health: health, journal: journal, hrStore: { HRStore() },
             location: Treadmill(), liveActivity: nil, profile: { profile }, indoorKeepAlive: { false },
             orphanStop: StrapWorkoutOrphanStop(defaults()), vo2: VO2Inputs(),
-            tombstones: WorkoutTombstones(defaults()), recoveryHealth: nil,
+            tombstones: WorkoutTombstones(defaults()), recoveryHealth: recovery,
             recoveryWindows: WorkoutRecoveryWindows(defaults()), indoorHealth: indoor, stepStreamFlag: flag,
             strideCalibrations: calibrations, userHeightCm: { height },
             clock: { [unowned self] in self.now }, autoTick: false, managesIdleTimer: false)
@@ -182,7 +218,13 @@ final class IndoorRunRecorderTests: XCTestCase {
         recorders.append(recorder)
         boxes[ObjectIdentifier(recorder)] = current
         return Rig(recorder: recorder, source: source, health: health, indoor: indoor, journal: journal,
-                   flag: flag, calibrations: calibrations)
+                   flag: flag, calibrations: calibrations, recovery: recovery, log: log)
+    }
+
+    /// The deferred workout save (84j) and the indoor run's writes after it, finished.
+    private func settle(_ rig: Rig) async {
+        await rig.recorder.workoutSaveTask?.value
+        await rig.recorder.indoorRun?.writeTask?.value
     }
 
     /// The source a recorder sees; tests swap it to model a reconnect's new session.
@@ -247,8 +289,14 @@ final class IndoorRunRecorderTests: XCTestCase {
         let finish = try XCTUnwrap(rig.recorder.indoorRun)
         XCTAssertEqual(finish.inputs.stride?.source, .height)
         XCTAssertEqual(finish.inputs.stride?.meters ?? 0, 1.17, accuracy: 1e-9)
-        XCTAssertEqual(rig.health.writes.last?.indoorDistance?.meters ?? 0, 1_755, accuracy: 0.001)
+        XCTAssertEqual(rig.health.writes.count, 0, "an indoor run with steps waits for its prompt (84j)")
+        XCTAssertTrue(finish.savePending)
         XCTAssertEqual(finish.distanceMeters ?? 0, 1_755, accuracy: 0.001)
+        finish.skip()
+        await settle(rig)
+        XCTAssertEqual(rig.health.writes.count, 1)
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance?.meters ?? 0, 1_755, accuracy: 0.001)
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance?.typed, false, "skipped: the step estimate")
         XCTAssertTrue(finish.distanceIsEstimate)
         XCTAssertEqual(finish.averageCadence ?? 0, 150, accuracy: 0.001)
         XCTAssertEqual(finish.minuteCadence.count, 10)
@@ -264,23 +312,27 @@ final class IndoorRunRecorderTests: XCTestCase {
         now = at(600)
         await rig.recorder.end()
         let finish = try XCTUnwrap(rig.recorder.indoorRun)
-        await finish.writeTask?.value
+        XCTAssertEqual(rig.health.writes.count, 0)
         finish.submit(typedMeters: 1_875, inclinePercent: 2)
-        await finish.writeTask?.value
+        await settle(rig)
 
         XCTAssertFalse(finish.distanceIsEstimate)
         XCTAssertEqual(finish.distanceMeters, 1_875)
-        XCTAssertEqual(rig.indoor.replacements.map(\.meters), [1_875])
-        XCTAssertEqual(rig.indoor.replacements.first?.workout, DateInterval(start: t0, end: at(600)))
+        // 84j: the workout is saved WITH the typed distance, so its own total is the typed one.
+        XCTAssertEqual(rig.health.writes.count, 1)
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance, IndoorDistanceWrite(meters: 1_875, typed: true))
+        XCTAssertEqual(rig.indoor.replacements.count, 0, "no estimate was ever written to replace")
+        XCTAssertEqual(finish.distanceStatus, .saved)
         XCTAssertEqual(calibrations.stride(timeline: timeline, sport: .runningIndoor) ?? 0, 1.25, accuracy: 1e-9)
         XCTAssertNil(calibrations.stride(timeline: timeline, sport: .walkingIndoor), "per sport")
         XCTAssertNil(calibrations.stride(timeline: .ringConn, sport: .runningIndoor), "per device")
-        // The per-minute samples are rewritten with the typed stride, no longer marked estimated.
-        XCTAssertEqual(rig.indoor.metrics.map(\.estimated), [true, false])
+        // The per-minute samples go once, after the save, with the typed stride, not marked estimated.
+        XCTAssertEqual(rig.indoor.metrics.map(\.estimated), [false])
         XCTAssertEqual(rig.indoor.metrics.last?.minutes.first?.strideLength ?? 0, 1.25, accuracy: 1e-9)
         finish.submit(typedMeters: 2_000, inclinePercent: nil)
-        await finish.writeTask?.value
-        XCTAssertEqual(rig.indoor.replacements.count, 1, "once per workout")
+        await settle(rig)
+        XCTAssertEqual(rig.health.writes.count, 1, "once per workout")
+        XCTAssertEqual(rig.indoor.replacements.count, 0)
 
         // The next indoor run of this sport on this device starts from the calibration.
         rig.recorder.reset()
@@ -302,13 +354,15 @@ final class IndoorRunRecorderTests: XCTestCase {
         now = at(300)
         await rig.recorder.end()
         let finish = try XCTUnwrap(rig.recorder.indoorRun)
+        XCTAssertEqual(rig.health.writes.count, 0)
+        rig.recorder.reset()   // Done, with no answer
+        await rig.recorder.workoutSaveTask?.value
         await finish.writeTask?.value
-        XCTAssertNotNil(rig.health.writes.last?.indoorDistance, "the workout carries the estimate")
+        XCTAssertEqual(finish.saveTrigger, .dismissed)
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance?.typed, false, "the workout carries the estimate")
         XCTAssertEqual(rig.indoor.metrics.map(\.estimated), [true])
         XCTAssertEqual(rig.indoor.replacements.count, 0)
         XCTAssertTrue(finish.distanceIsEstimate)
-        rig.recorder.reset()
-        XCTAssertEqual(rig.indoor.replacements.count, 0, "leaving the summary changes nothing in Health")
     }
 
     func testSpeedAndStrideAreWrittenForRunsOnlyAndOnlyForWholeRunningMinutes() async throws {
@@ -326,7 +380,8 @@ final class IndoorRunRecorderTests: XCTestCase {
         now = at(420)
         await rig.recorder.end()
         let finish = try XCTUnwrap(rig.recorder.indoorRun)
-        await finish.writeTask?.value
+        finish.skip()
+        await settle(rig)
         let minutes = try XCTUnwrap(rig.indoor.metrics.first?.minutes)
         XCTAssertEqual(minutes.map(\.start), [at(0), at(60), at(120), at(240), at(300), at(360)],
                        "never the minute the pause touched")
@@ -341,11 +396,11 @@ final class IndoorRunRecorderTests: XCTestCase {
         now = at(300)
         await walk.recorder.end()
         let walkFinish = try XCTUnwrap(walk.recorder.indoorRun)
-        await walkFinish.writeTask?.value
         walkFinish.submit(typedMeters: 300, inclinePercent: nil)
-        await walkFinish.writeTask?.value
+        await settle(walk)
         XCTAssertEqual(walk.indoor.metrics.count, 0, "a walk writes no running speed or stride")
-        XCTAssertEqual(walk.indoor.replacements.count, 1, "its distance is still corrected")
+        XCTAssertEqual(walk.health.writes.last?.indoorDistance, IndoorDistanceWrite(meters: 300, typed: true),
+                       "its workout still gets the typed distance")
         XCTAssertEqual(walkFinish.inputs.stride?.meters ?? 0, 1.8 * 0.415, accuracy: 1e-9)
         XCTAssertNil(walkFinish.vo2MaxOutcome)
     }
@@ -420,28 +475,30 @@ final class IndoorRunRecorderTests: XCTestCase {
         XCTAssertTrue(finish.inputs.stepsInterrupted)
         XCTAssertEqual(finish.inputs.activeSteps, 240)
         finish.submit(typedMeters: 250, inclinePercent: nil)   // 1.04 m a step: a plausible ratio, still not a stride
-        await finish.writeTask?.value
+        await settle(rig)
         XCTAssertNil(rig.calibrations.stride(timeline: timeline, sport: .runningIndoor),
                      "too few steps for the typed distance: not a stride, not stored")
         XCTAssertEqual(finish.vo2MaxOutcome, .skipped(.noStepData))
-        XCTAssertEqual(rig.indoor.replacements.map(\.meters), [250], "the typed distance still replaces the estimate")
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance, IndoorDistanceWrite(meters: 250, typed: true),
+                       "the typed distance is still the workout's")
     }
 
     // MARK: Indoor VO₂ max (84g)
 
-    private func steadyInputs(sport: WorkoutSportType = .runningIndoor, saved: Bool = true) -> IndoorRunInputs {
+    private func steadyInputs(sport: WorkoutSportType = .runningIndoor) -> IndoorRunInputs {
         var log = WorkoutStepLog()
         for s in stride(from: 10, through: 1_200, by: 10) { log.add(26, at: at(Double(s) - 0.5)) }   // 156 spm
         let hr = stride(from: 0, to: 1_200, by: 10).map { HRSample(bpm: 160, start: at(Double($0))) }
         return IndoorRunInputs(sport: sport, timeline: timeline, start: t0, end: at(1_200), activeSeconds: 1_200,
                                activeSegments: [DateInterval(start: t0, end: at(1_200))], steps: log,
                                stride: IndoorStride(meters: 1.17, source: .height), stepsInterrupted: false,
-                               savedToHealth: saved, heartRate: hr, age: 40, restingHR: 60)
+                               heartRate: hr, age: 40, restingHR: 60)
     }
 
     func testTheIndoorVO2MaxIsComputedFromTheTypedDistanceAndInclineAndWrittenWithTheTreadmillMethod() async throws {
         let health = IndoorHealth()
-        let finish = IndoorRunFinish(inputs: steadyInputs(), health: health, calibrations: IndoorStrideCalibrations(defaults()))
+        let finish = IndoorRunFinish(inputs: steadyInputs(), workoutSaved: true, health: health,
+                                     calibrations: IndoorStrideCalibrations(defaults()))
         XCTAssertEqual(finish.vo2MaxOutcome, .skipped(.noTypedDistance))
         // 3 120 steps; typed 3 900 m → stride 1.25 → 195 m/min; incline 5 %.
         finish.submit(typedMeters: 3_900, inclinePercent: 5)
@@ -459,13 +516,167 @@ final class IndoorRunRecorderTests: XCTestCase {
 
     func testAWorkoutHealthRefusedGetsNoIndoorWritesAtAll() async {
         let health = IndoorHealth()
-        let finish = IndoorRunFinish(inputs: steadyInputs(saved: false), health: health,
+        let finish = IndoorRunFinish(inputs: steadyInputs(), workoutSaved: false, health: health,
                                      calibrations: IndoorStrideCalibrations(defaults()))
         finish.writeEstimateMetrics()
         finish.submit(typedMeters: 3_900, inclinePercent: nil)
         await finish.writeTask?.value
         XCTAssertEqual(health.metrics.count + health.replacements.count + health.vo2.count, 0)
         XCTAssertEqual(finish.vo2MaxHealthStatus, .failed)
+    }
+
+    // MARK: The waiting save (84j)
+
+    /// A 5-minute indoor run, 600 steps (1.17 m stride from height: 702 m estimated), ended at +300.
+    private func endedRun(_ rig: Rig, bpm: Int = 160) async throws -> IndoorRunFinish {
+        rig.recorder.start()
+        rig.source.counter(0, at: at(0))
+        _ = await run(rig, from: 0, to: 300, counter: 0, bpm: bpm)
+        now = at(300)
+        await rig.recorder.end()
+        return try XCTUnwrap(rig.recorder.indoorRun)
+    }
+
+    func testAnsweringThePromptSavesTheWorkoutOnceWithTheTypedDistance() async throws {
+        let rig = makeRig()
+        let finish = try await endedRun(rig)
+        XCTAssertEqual(rig.health.writes.count, 0)
+        XCTAssertTrue(rig.recorder.workoutSavePending)
+        finish.submit(typedMeters: 750, inclinePercent: nil)
+        await settle(rig)
+        XCTAssertEqual(finish.saveTrigger, .answered)
+        XCTAssertEqual(rig.health.writes.map(\.indoorDistance), [IndoorDistanceWrite(meters: 750, typed: true)])
+        XCTAssertEqual(finish.workoutSaved, true)
+        XCTAssertFalse(rig.recorder.workoutSavePending)
+        rig.recorder.reset()
+        finish.skip()
+        await settle(rig)
+        XCTAssertEqual(rig.health.writes.count, 1, "saved once")
+    }
+
+    func testSkippingThePromptSavesTheWorkoutWithTheEstimate() async throws {
+        let rig = makeRig()
+        let finish = try await endedRun(rig)
+        finish.skip()
+        await settle(rig)
+        XCTAssertEqual(finish.saveTrigger, .skipped)
+        XCTAssertFalse(finish.promptOpen, "skipped: the prompt goes away")
+        XCTAssertEqual(rig.health.writes.count, 1)
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance?.typed, false)
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance?.meters ?? 0, 702, accuracy: 0.001)
+        XCTAssertEqual(rig.indoor.metrics.map(\.estimated), [true])
+    }
+
+    func testDismissingTheSummarySavesTheWorkoutWithTheEstimate() async throws {
+        let rig = makeRig()
+        let finish = try await endedRun(rig)
+        rig.recorder.summaryDismissed()   // the sheet went away
+        await settle(rig)
+        XCTAssertEqual(finish.saveTrigger, .dismissed)
+        XCTAssertEqual(rig.health.writes.count, 1)
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance?.typed, false)
+        rig.recorder.reset()   // then Done
+        await settle(rig)
+        XCTAssertEqual(rig.health.writes.count, 1, "saved once")
+    }
+
+    func testTenMinutesAfterEndTheWaitingWorkoutSavesItselfAndATypedDistanceThenReplacesTheEstimate() async throws {
+        let rig = makeRig()
+        let finish = try await endedRun(rig)
+        rig.recorder.saveIfDeadlinePassed(now: at(300 + 599))
+        await settle(rig)
+        XCTAssertEqual(rig.health.writes.count, 0, "not before 10 minutes")
+        rig.recorder.saveIfDeadlinePassed(now: at(300 + 600))
+        await settle(rig)
+        XCTAssertEqual(finish.saveTrigger, .timedOut)
+        XCTAssertEqual(rig.health.writes.count, 1)
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance?.typed, false)
+        XCTAssertTrue(finish.promptOpen, "the prompt stays: a distance typed later still corrects it")
+        finish.submit(typedMeters: 750, inclinePercent: nil)
+        await settle(rig)
+        XCTAssertEqual(rig.indoor.replacements.map(\.meters), [750])
+        XCTAssertEqual(rig.health.writes.count, 1)
+    }
+
+    func testAKillBeforeTheSaveIsOfferedBackAndSavedOnceWithTheEstimate() async throws {
+        let journal = Journal()
+        let rig = makeRig(journal: journal)
+        _ = try await endedRun(rig)
+        XCTAssertEqual(rig.health.writes.count, 0)
+        let kept = try XCTUnwrap(journal.journal, "the journal stays until the save")
+        XCTAssertEqual(kept.indoorEstimateMeters ?? 0, 702, accuracy: 0.001)
+        XCTAssertEqual(kept.stepStreamOn, false)
+        XCTAssertFalse(journal.samples.isEmpty)
+
+        // The process dies here. The next launch: a fresh recorder over the same journal.
+        let relaunched = makeRig(journal: journal)
+        relaunched.recorder.resolveOrphan(now: at(4_000))
+        XCTAssertNotNil(relaunched.recorder.recoverable)
+        let saved = await relaunched.recorder.saveRecovered()
+        XCTAssertTrue(saved)
+        XCTAssertEqual(relaunched.health.writes.count, 1)
+        XCTAssertEqual(relaunched.health.writes.last?.indoorDistance?.meters ?? 0, 702, accuracy: 0.001)
+        XCTAssertEqual(relaunched.health.writes.last?.indoorDistance?.typed, false)
+        let again = await relaunched.recorder.saveRecovered()
+        XCTAssertFalse(again)
+        XCTAssertEqual(relaunched.health.writes.count, 1, "saved once")
+        XCTAssertNil(journal.journal)
+        relaunched.recorder.resolveOrphan(now: at(5_000))
+        XCTAssertNil(relaunched.recorder.recoverable, "nothing left to offer")
+    }
+
+    func testEveryOtherWorkoutStillSavesAtEnd() async throws {
+        for sport in [WorkoutSportType.runningOutdoor, .walkingOutdoor, .cyclingIndoor, .rowing, .strengthTraining] {
+            let rig = makeRig(sport: sport)
+            now = t0
+            rig.recorder.start()
+            rig.source.counter(0, at: at(0))
+            _ = await run(rig, from: 0, to: 300, counter: 0)
+            now = at(300)
+            await rig.recorder.end()
+            XCTAssertEqual(rig.health.writes.count, 1, "\(sport): saved at End")
+            XCTAssertNil(rig.health.writes.last?.indoorDistance)
+            XCTAssertNil(rig.recorder.indoorRun)
+            XCTAssertNil(rig.journal.journal, "\(sport): the journal goes at End, as before")
+        }
+        // An indoor run without steps (no step stream) has nothing to wait for either.
+        let source = StepSource(timeline: timeline)
+        source.hasSteps = false
+        let rig = makeRig(source: source)
+        now = t0
+        rig.recorder.start()
+        _ = await run(rig, from: 0, to: 300, counter: 0)
+        now = at(300)
+        await rig.recorder.end()
+        XCTAssertEqual(rig.health.writes.count, 1)
+        XCTAssertEqual(rig.recorder.indoorRun?.workoutSaved, true)
+        XCTAssertFalse(rig.recorder.workoutSavePending)
+    }
+
+    func testTheRecoveryWindowAndHeldBackSyncDoNotWaitButTheirHealthWritesFollowTheSave() async throws {
+        let rig = makeRig(recoveryWindow: true)
+        let finish = try await endedRun(rig, bpm: 170)
+        XCTAssertTrue(rig.recorder.isMeasuringRecovery, "the window opens at End, as before")
+        // One reading a second after End, falling, until the +120 s reading closes the window.
+        var s = 301.0
+        while rig.recorder.isMeasuringRecovery, s <= 440 {
+            now = at(s)
+            rig.source.heartRate(160 - Int((s - 300) / 4), at: now)
+            await rig.recorder.tick(now: now)
+            s += 1
+        }
+        XCTAssertFalse(rig.recorder.isMeasuringRecovery)
+        XCTAssertEqual(rig.source.syncRequests, 1, "the held-back sync runs when the window closes")
+        XCTAssertFalse(StrapWorkoutRecorder.holdsStrapLink, "and the strap is released")
+        XCTAssertEqual(rig.health.writes.count, 0, "the workout still waits for its prompt")
+        XCTAssertEqual(rig.recovery?.readingWrites, 0, "no recovery write before the workout is in Health")
+        XCTAssertEqual(rig.recovery?.cardioWrites, 0)
+
+        finish.skip()
+        await settle(rig)
+        await rig.recorder.recoveryWriteTask?.value
+        XCTAssertEqual(rig.log.events, ["sync", "workout saved", "recovery readings saved", "cardio recovery saved"])
+        XCTAssertNotNil(rig.recorder.heartRateRecovery?.oneMinute.drop)
     }
 
     // MARK: Review fixes (84i)
@@ -481,8 +692,9 @@ final class IndoorRunRecorderTests: XCTestCase {
             now = at(300)
             await rig.recorder.end()
             let finish = try XCTUnwrap(rig.recorder.indoorRun)
-            await finish.writeTask?.value
-            finish.submit(typedMeters: 380, inclinePercent: nil)
+            rig.recorder.saveIfDeadlinePassed(now: at(900))   // 84j: saved with the estimate at +10 min
+            await settle(rig)
+            finish.submit(typedMeters: 380, inclinePercent: nil)   // typed later: the replace path
             await finish.writeTask?.value
             XCTAssertEqual(rig.indoor.metrics.map(\.estimated), [true], "\(status): the estimated set only")
             XCTAssertEqual(finish.distanceStatus, status)
@@ -523,7 +735,7 @@ final class IndoorRunRecorderTests: XCTestCase {
         await rig.recorder.end()
         let finish = try XCTUnwrap(rig.recorder.indoorRun)
         finish.submit(typedMeters: 6_000, inclinePercent: nil)   // 10 m a step: refused
-        await finish.writeTask?.value
+        await settle(rig)
         XCTAssertFalse(finish.calibrationStored)
         let notes = IndoorRunSummarySection.notes(finish)
         XCTAssertFalse(notes.contains { $0.contains("calibrated from it") })
@@ -537,7 +749,7 @@ final class IndoorRunRecorderTests: XCTestCase {
         await calibrated.recorder.end()
         let ok = try XCTUnwrap(calibrated.recorder.indoorRun)
         ok.submit(typedMeters: 720, inclinePercent: nil)
-        await ok.writeTask?.value
+        await settle(calibrated)
         XCTAssertTrue(ok.calibrationStored)
         XCTAssertTrue(IndoorRunSummarySection.notes(ok).contains { $0.contains("calibrated from it") })
     }

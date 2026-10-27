@@ -61,6 +61,9 @@ public struct WorkoutSessionSnapshot: Codable, Equatable, Sendable {
     /// snapshot while paused, includes time the workout was not running at all. When present, this
     /// is where the recovered workout must end, not `lastAliveAt`.
     public var openPauseStart: Date?
+    /// An indoor run or walk that ENDED and is waiting for its distance prompt before its `HKWorkout` is
+    /// saved (#339, decision 84j): the step estimate it is saved with if the app dies first. nil otherwise.
+    public var indoorEstimateMeters: Double?
 
     public init(sport: WorkoutSportType,
                 startDate: Date,
@@ -69,7 +72,8 @@ public struct WorkoutSessionSnapshot: Codable, Equatable, Sendable {
                 activeKcal: Double? = nil,
                 avgHR: Int? = nil,
                 maxHR: Int? = nil,
-                openPauseStart: Date? = nil) {
+                openPauseStart: Date? = nil,
+                indoorEstimateMeters: Double? = nil) {
         self.sport = sport
         self.startDate = startDate
         self.lastAliveAt = lastAliveAt
@@ -78,6 +82,7 @@ public struct WorkoutSessionSnapshot: Codable, Equatable, Sendable {
         self.avgHR = avgHR
         self.maxHR = maxHR
         self.openPauseStart = openPauseStart
+        self.indoorEstimateMeters = indoorEstimateMeters
     }
 
     /// JSON for the app's UserDefaults blob. Returns nil only if encoding fails, which for this
@@ -105,11 +110,14 @@ public struct RecoveredWorkout: Equatable, Sendable {
     public var activeKcal: Double?
     public var avgHR: Int?
     public var maxHR: Int?
+    /// An ended indoor run's step estimate, saved as its distance (decision 84j). nil otherwise.
+    public var indoorEstimateMeters: Double?
 
     public var durationSeconds: TimeInterval { end.timeIntervalSince(start) }
 
     public init(sport: WorkoutSportType, start: Date, end: Date, hrSampleCount: Int,
-                activeKcal: Double? = nil, avgHR: Int? = nil, maxHR: Int? = nil) {
+                activeKcal: Double? = nil, avgHR: Int? = nil, maxHR: Int? = nil,
+                indoorEstimateMeters: Double? = nil) {
         self.sport = sport
         self.start = start
         self.end = end
@@ -117,6 +125,7 @@ public struct RecoveredWorkout: Equatable, Sendable {
         self.activeKcal = activeKcal
         self.avgHR = avgHR
         self.maxHR = maxHR
+        self.indoorEstimateMeters = indoorEstimateMeters
     }
 }
 
@@ -169,6 +178,7 @@ public enum WorkoutSessionRecovery {
             hrSampleCount: snapshot.hrSampleCount,
             activeKcal: snapshot.activeKcal,
             avgHR: snapshot.avgHR,
-            maxHR: snapshot.maxHR))
+            maxHR: snapshot.maxHR,
+            indoorEstimateMeters: snapshot.indoorEstimateMeters))
     }
 }

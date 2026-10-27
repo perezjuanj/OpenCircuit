@@ -416,6 +416,20 @@ final class StrapWorkoutRecorder {
     @ObservationIgnored private var stepsStreaming = false
     /// The stream stopped with the link and wasn't turned on again (no `05 01` after a reconnect).
     @ObservationIgnored private var stepsInterrupted = false
+    /// An ended indoor run or walk whose `HKWorkout` waits for the distance prompt (decision 84j).
+    private struct PendingSave {
+        let write: StrapWorkoutWrite
+        let estimate: Double?
+    }
+    @ObservationIgnored private var pendingSave: PendingSave?
+    @ObservationIgnored private var saveInFlight = false
+    /// The 10-minute deadline after End (84j).
+    @ObservationIgnored private var saveDeadlineTask: Task<Void, Never>?
+    /// The deferred `HKWorkout` write, for tests to await.
+    @ObservationIgnored private(set) var workoutSaveTask: Task<Void, Never>?
+    /// The recovery window's Health writes, held until the waiting workout is saved (84j): HRR and
+    /// Cardio Recovery describe a workout, so they never reach Health before it.
+    @ObservationIgnored private var recoveryWritesAwaitingSave: ((Bool) -> Void)?
     /// Readings received during the open pause (82d measures from the end, and a workout ended while
     /// paused ended where the pause began). Cleared at every pause and resume.
     @ObservationIgnored private var pausedReadings: [HRSample] = []
@@ -498,6 +512,7 @@ final class StrapWorkoutRecorder {
 
     func start() {
         guard state == .idle, let session = source(), canStart(session) else { return }
+        summaryDismissed()   // 84j: never start over a workout still waiting to be saved
         let now = clock()
         let sport = selectedSport
         Self.running = self
@@ -765,29 +780,48 @@ final class StrapWorkoutRecorder {
             distanceMeters: hasRoute ? location.distanceMeters : nil, hasRoute: hasRoute,
             profile: profileSnapshot ?? profile())
         let counted = StrapWorkoutSummaryBuilder.activeSamples(samples, ledger: ledger, end: end)
+        // Decision 84j: an indoor run or walk with steps waits for its distance prompt before the
+        // `HKWorkout` is saved (answered, skipped, the summary dismissed, or 10 min after End). Every
+        // other workout is saved below, at End, exactly as before (82a).
+        let waitsForPrompt = (indoorSteps?.log.total ?? 0) > 0
+        let estimate = indoorSteps?.estimatedMeters
 
-        // Queue the readings for LocalStore BEFORE dropping the journal, so a kill in between loses
-        // nothing; then drop the journal BEFORE the Health write, as the ring drops its snapshot: a
-        // kill during the write costs this one workout's recovery offer, never a duplicate in Health.
-        // They are stored after the write; Health never gets them a second time from the store
-        // (`StrapWorkoutHealthExclusions`). A kill in the recovery window that follows loses only the
-        // recovery readings, which are in memory (82g).
-        enqueueLanding(counted, timeline: timeline)
-        journal.clearRunning()
+        if waitsForPrompt {
+            // Kept, not dropped: a kill before the save leaves the journal, so the next launch offers
+            // the workout back (and saves it with the step estimate) exactly as it does any interrupted
+            // workout. Closed at End: no step stream, and the estimate it is saved with.
+            flushReadings()
+            journal.saveJournal(StrapWorkoutJournal(sport: selectedSport, ledger: ledger, lastAliveAt: end,
+                                                    timelineRaw: timeline.rawValue, distanceMeters: nil,
+                                                    stepStreamOn: false, indoorEstimateMeters: estimate))
+        } else {
+            // Queue the readings for LocalStore BEFORE dropping the journal, so a kill in between loses
+            // nothing; then drop the journal BEFORE the Health write, as the ring drops its snapshot: a
+            // kill during the write costs this one workout's recovery offer, never a duplicate in Health.
+            // They are stored after the write; Health never gets them a second time from the store
+            // (`StrapWorkoutHealthExclusions`). A kill in the recovery window that follows loses only the
+            // recovery readings, which are in memory (82g).
+            enqueueLanding(counted, timeline: timeline)
+            journal.clearRunning()
+        }
 
         await liveActivity?.end(final: WorkoutActivityAttributes.ContentState(
             elapsedSeconds: summary.activeSeconds,
             activeKcal: Int((summary.summary.estimatedActiveKcal ?? 0).rounded()),
             bpm: summary.summary.avgHR, hrIsStale: true))
 
-        // An indoor run or walk: its step estimate is the workout's distance (84f), replaced later if the
-        // person types the treadmill's (84e). Nothing about it delays this write.
-        let indoorDistance = indoorSteps?.estimatedMeters.map(IndoorDistanceWrite.init(meters:))
-        let saved = await health.save(StrapWorkoutWrite(summary: summary, samples: counted,
-                                                         route: hasRoute ? location.route : [], timeline: timeline,
-                                                         indoorDistance: indoorDistance))
-        helioLog.notice("helio: workout ended, \(counted.count, privacy: .public) reading(s), saved to Health \(saved, privacy: .public)")
-        landPendingHeartRate()
+        let write = StrapWorkoutWrite(summary: summary, samples: counted,
+                                      route: hasRoute ? location.route : [], timeline: timeline)
+        let saved: Bool
+        if waitsForPrompt {
+            pendingSave = PendingSave(write: write, estimate: estimate)
+            saved = false
+            helioLog.notice("helio: workout ended, \(counted.count, privacy: .public) reading(s); saved when the distance prompt is answered (84j)")
+        } else {
+            saved = await health.save(write)
+            helioLog.notice("helio: workout ended, \(counted.count, privacy: .public) reading(s), saved to Health \(saved, privacy: .public)")
+            landPendingHeartRate()
+        }
         // #232: the VO₂ max estimate for an outdoor run, after the workout's own write so a one-time
         // VO₂ max permission sheet never sits on the "Saving workout…" path (the ring's order).
         vo2MaxOutcome = summary.summary.sport == .runningOutdoor
@@ -800,13 +834,19 @@ final class StrapWorkoutRecorder {
                 sport: selectedSport, timeline: timeline, start: ledger.start, end: end,
                 activeSeconds: summary.activeSeconds, activeSegments: ledger.activeSegments(until: end),
                 steps: indoorSteps.log, stride: indoorSteps.stride, stepsInterrupted: stepsInterrupted,
-                savedToHealth: saved, heartRate: counted,
+                heartRate: counted,
                 age: vo2?.userSetAge(),
                 restingHR: selectedSport == .runningIndoor
                     ? vo2?.restingHR(workoutStart: ledger.start, workoutEnd: end) : nil),
+                workoutSaved: waitsForPrompt ? nil : saved,
                 health: indoorHealth, calibrations: strideCalibrations)
             indoorRun = finish
-            finish.writeEstimateMetrics()
+            if waitsForPrompt {
+                finish.saveWorkout = { [weak self] typed in self?.saveWaitingWorkout(typedMeters: typed) }
+                scheduleSaveDeadline(end: end)
+            } else {
+                finish.writeEstimateMetrics()
+            }
         }
         // `.finished` BEFORE the sync, so the hold is already released when `syncHistory` asks:
         // otherwise the workout's own hold would defer the very sync it held back. With a recovery
@@ -955,6 +995,21 @@ final class StrapWorkoutRecorder {
         let timeline = window.timeline
         let readings = window.readings
         let cardioAt = window.workoutEnd.addingTimeInterval(HeartRateRecovery.oneMinute)
+        let startWrites: (Bool) -> Void = { [weak self] saved in self?.writeRecovery(
+            readings: readings, outcome: outcome, saved: saved, cardioAt: cardioAt, timeline: timeline, summary: summary) }
+        // Decision 84j: a workout still waiting for its prompt isn't in Health yet; its recovery writes
+        // go once it is saved (`saveWaitingWorkout`). The held-back sync below doesn't wait.
+        if pendingSave != nil || saveInFlight {
+            recoveryWritesAwaitingSave = startWrites
+        } else {
+            startWrites(saved)
+        }
+        if closedBy != .newWorkout { runHeldBackSync() }
+    }
+
+    /// The recovery readings and Cardio Recovery to Apple Health, then into `LocalStore` (82c, 82e).
+    private func writeRecovery(readings: [HRSample], outcome: HeartRateRecovery.Outcome, saved: Bool, cardioAt: Date,
+                               timeline: SyncDeviceID, summary: StrapWorkoutSummary) {
         recoveryWriteTask = Task { [weak self] in
             guard let self else { return }
             var readingsStatus: HeartRateRecoveryHealthStatus?
@@ -974,7 +1029,80 @@ final class StrapWorkoutRecorder {
             guard let shown = self.shownSummary, shown.summary.startDate == summary.summary.startDate else { return }
             self.recoveryHealthStatus = (readingsStatus, cardioStatus)
         }
-        if closedBy != .newWorkout { runHeldBackSync() }
+    }
+
+    // MARK: The waiting save (#339, decision 84j)
+
+    /// The workout waits for the prompt: shown on the summary instead of "saved".
+    var workoutSavePending: Bool { indoorRun?.savePending == true }
+
+    private func scheduleSaveDeadline(end: Date) {
+        saveDeadlineTask?.cancel()
+        let delay = max(0, end.addingTimeInterval(IndoorRunFinish.saveDeadline).timeIntervalSince(clock()))
+        saveDeadlineTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.saveIfDeadlinePassed(now: self.clock())
+        }
+    }
+
+    /// 10 minutes after End (84j): a workout still waiting is saved with the step estimate. Called by the
+    /// deadline timer; tests call it directly.
+    func saveIfDeadlinePassed(now: Date) {
+        guard pendingSave != nil, let finish = indoorRun,
+              now >= finish.inputs.end.addingTimeInterval(IndoorRunFinish.saveDeadline) else { return }
+        finish.endWait(.timedOut)
+    }
+
+    /// The summary went away (Done, the sheet dismissed, a new workout): a waiting workout is saved now.
+    func summaryDismissed() {
+        indoorRun?.endWait(.dismissed)
+    }
+
+    /// The deferred save (84j). Synchronous half first, as a recovered save's: the readings queued for
+    /// `LocalStore` and the journal dropped BEFORE the write, so a kill during it can never offer or write
+    /// the workout twice. Then one `HKWorkout` with the typed distance (or the step estimate), the
+    /// readings landed, the indoor run's own writes, and the recovery writes that waited for it.
+    private func saveWaitingWorkout(typedMeters: Double?) {
+        guard let pending = pendingSave else { return }
+        pendingSave = nil
+        saveDeadlineTask?.cancel()
+        saveDeadlineTask = nil
+        var write = pending.write
+        enqueueLanding(write.samples, timeline: write.timeline)
+        journal.clearRunning()
+        if let typedMeters {
+            write.indoorDistance = IndoorDistanceWrite(meters: typedMeters, typed: true)
+        } else if let estimate = pending.estimate {
+            write.indoorDistance = IndoorDistanceWrite(meters: estimate)
+        }
+        let finish = indoorRun
+        let start = write.summary.summary.startDate
+        saveInFlight = true
+        workoutSaveTask = Task { [weak self] in
+            guard let self else { return }
+            let saved = await self.health.save(write)
+            self.saveInFlight = false
+            helioLog.notice("helio: indoor workout saved to Health \(saved, privacy: .public) (\(typedMeters == nil ? "step estimate" : "typed distance", privacy: .public))")
+            self.landPendingHeartRate()
+            finish?.workoutSaveFinished(saved: saved)
+            self.markShownSummarySaved(saved, start: start)
+            let writes = self.recoveryWritesAwaitingSave
+            self.recoveryWritesAwaitingSave = nil
+            writes?(saved)
+        }
+    }
+
+    /// The summary on screen says whether the waiting workout reached Health (only that summary).
+    private func markShownSummarySaved(_ saved: Bool, start: Date) {
+        switch state {
+        case .measuringRecovery(let summary, _) where summary.summary.startDate == start:
+            state = .measuringRecovery(summary, savedToHealth: saved)
+        case .finished(let summary, _) where summary.summary.startDate == start:
+            state = .finished(summary, savedToHealth: saved)
+        default:
+            break
+        }
     }
 
     private func clearHeartRateRecovery() {
@@ -1033,6 +1161,7 @@ final class StrapWorkoutRecorder {
         case .finished, .error: break
         default: return
         }
+        summaryDismissed()   // 84j: Done saves a workout still waiting for its prompt
         state = .idle
         ledger = nil
         samples = []
@@ -1146,7 +1275,10 @@ final class StrapWorkoutRecorder {
         let counted = StrapWorkoutSummaryBuilder.activeSamples(recovered.samples, ledger: recovered.ledger, end: recovered.end)
         enqueueLanding(counted, timeline: timeline)
         clear(offer.slot)   // before the write: a second offer can never write it twice
-        return StrapWorkoutWrite(summary: summary, samples: counted, route: [], timeline: timeline)
+        // An indoor run killed while it waited for its distance prompt (84j): saved with its step estimate.
+        let indoorDistance = recovered.indoorEstimateMeters.map { IndoorDistanceWrite(meters: $0) }
+        return StrapWorkoutWrite(summary: summary, samples: counted, route: [], timeline: timeline,
+                                 indoorDistance: indoorDistance)
     }
 
     /// Save's async half: one `HKWorkout` over the recovered span, with its readings.
