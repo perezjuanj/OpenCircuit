@@ -738,13 +738,13 @@ final class StrapWorkoutRecorder {
         let now = clock()
         // Ended while paused: the workout ends where it stopped running.
         let end = ledger.openPauseStart ?? now
-        // 82a/82b: the stream keeps running after End for the recovery window; the workout below is
-        // exactly today's. Without a window (no recovery writer) the stream stops here, as before.
         // Decision 84b: `05 00` at End, before anything else can wait.
         turnStepsOff()
         stepSource?.stepCounterObserver = nil
         stepSource = nil
         let indoorSteps = steps
+        // 82a/82b: the stream keeps running after End for the recovery window; the workout below is
+        // exactly today's. Without a window (no recovery writer) the stream stops here, as before.
         let windowOpen = openRecoveryWindow(end: end, now: now, timeline: timeline)
         if !windowOpen {
             tickTask?.cancel()

@@ -63,7 +63,7 @@ struct VO2MaxHealthWriter {
     /// `method` is the metadata value naming how the estimate was made: the outdoor run's
     /// `methodMetadataValue`, or the indoor run's "treadmill distance + steps" (decision 84g).
     func save(_ estimate: VO2MaxEstimate.Estimate, workoutEnd: Date,
-              timeline: SyncDeviceID = .ringConn, method: String = Self.methodMetadataValue) async -> Status {
+              timeline: SyncDeviceID = .ringConn, method: String = VO2MaxHealthWriter.methodMetadataValue) async -> Status {
         guard HKHealthStore.isHealthDataAvailable() else { return .healthNotConnected }
         guard HealthKitWriter().isShareAuthorized else { return .healthNotConnected }
 
