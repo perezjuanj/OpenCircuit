@@ -147,6 +147,8 @@ final class HeartRateRecoveryFollowUpRecorderTests: XCTestCase {
     private let timeline = SyncDeviceID.timeline(for: .zeppOS(model: "Helio Strap"), identityID: "STRAP-FU")
     private let profile = UserProfile(age: 40, weightKg: 70, heightCm: 175, sex: .male)   // max HR 180
     private var recorders: [StrapWorkoutRecorder] = []
+    /// The session holds its transport weakly: keep every one alive for the test.
+    private var transports: [StrapTransport] = []
 
     override func tearDown() {
         for recorder in recorders {
@@ -155,6 +157,7 @@ final class HeartRateRecoveryFollowUpRecorderTests: XCTestCase {
         }
         recorders.removeAll()
         XCTAssertFalse(StrapWorkoutRecorder.holdsStrapLink, "no test may leave the strap held")
+        transports.removeAll()
         super.tearDown()
     }
 
@@ -162,9 +165,11 @@ final class HeartRateRecoveryFollowUpRecorderTests: XCTestCase {
         StrapWorkoutOrphanStop(UserDefaults(suiteName: "strap-hrr-fu-orphan-\(UUID().uuidString)")!)
     }
 
-    private func makeRecorder(source: StrapWorkoutHeartRateSource?, journal: MemoryJournal = MemoryJournal(),
-                              orphanStop: StrapWorkoutOrphanStop, recovery: RecoveryHealth = RecoveryHealth())
+    private func makeRecorder(source: StrapWorkoutHeartRateSource?, journal: MemoryJournal? = nil,
+                              orphanStop: StrapWorkoutOrphanStop, recovery: RecoveryHealth? = nil)
         -> StrapWorkoutRecorder {
+        let journal = journal ?? MemoryJournal()
+        let recovery = recovery ?? RecoveryHealth()
         let profile = self.profile
         let recorder = StrapWorkoutRecorder(
             source: { source }, health: AcceptingHealth(), journal: journal, hrStore: { DiscardingHRStore() },
@@ -196,6 +201,7 @@ final class HeartRateRecoveryFollowUpRecorderTests: XCTestCase {
         session.orphanStop = orphanStop
         session.start()
         transport.drain()
+        transports.append(transport)
         return (session, transport)
     }
 
@@ -223,7 +229,7 @@ final class HeartRateRecoveryFollowUpRecorderTests: XCTestCase {
     func testAKillInTheWindowLeavesTheStrapAnOwedStopSentOnceAtItsNextReady() async {
         let owed = freshOrphanStop()
         let journal = MemoryJournal()
-        let (session, transport) = connect(orphanStop: freshOrphanStop())
+        let (session, _) = connect(orphanStop: freshOrphanStop())
         let recorder = makeRecorder(source: session, journal: journal, orphanStop: owed)
         await runAndEnd(session, recorder)
         await stream(session, recorder, from: 600, to: 640) { _ in 150 }   // +40 s: killed here
@@ -242,7 +248,6 @@ final class HeartRateRecoveryFollowUpRecorderTests: XCTestCase {
         XCTAssertFalse(owed.owed)
         let (_, later) = connect(orphanStop: owed)
         XCTAssertEqual(later.heartRateCommands, [], "and never again")
-        _ = transport
     }
 
     func testAKillInTheWindowOnAReadyStrapSendsTheStopFromTheLaunchRecovery() async {
