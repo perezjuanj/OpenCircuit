@@ -72,11 +72,15 @@ load always agrees with what the user sees.
   the load is a lower bound.
 
 **Past workouts (decision 83f).** What re-derives from stored heart-rate readings follows the zones
-set now: the Time in Heart-Rate Zones bars and the Training load row in a workout's history detail,
-and the weekly training-load line. What was computed when a workout ended is not rewritten: the
-finished-workout summary screen (its zone bars and training load) is built once at End and shown
-until it is dismissed; no zone breakdown is persisted anywhere, so nothing else exists to go stale.
-A workout recovered after a kill has no readings and so no zones, as before.
+set now: the Time in Heart-Rate Zones bars, the Training load row and the Heart rate recovery row's
+Zone 4 bound in a workout's history detail, and the weekly training-load line. What was computed
+when a workout ended is not rewritten, and uses the zones in force at that moment (the user's, from
+`HeartRateZoneDefaults`): the finished-workout summary screen of a live ring or strap workout, and
+the finished summary of an auto-detected ring workout the user confirms (zones, training load). A
+ring workout recovered after a kill has no readings and so no zones. A strap workout recovered
+after a kill has its readings: its breakdown is built with the user's zones and rides along only in
+the Health write, it is not shown. No zone breakdown is persisted anywhere else, so nothing else
+exists to go stale.
 
 **Why Edwards and not Banister.** Banister's TRIMP weights mean %HR-reserve with a sex-specific
 exponential. It needs a resting HR for every workout and a mean HR that hides intervals. Edwards
