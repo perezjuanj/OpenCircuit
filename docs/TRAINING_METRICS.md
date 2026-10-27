@@ -44,6 +44,8 @@ Monitor Book*. Sacramento, CA: Feet Fleet Press; 1993:113–123.
 
     TRIMP = 1 × min(50–60 % HRmax) + 2 × min(60–70 %) + 3 × min(70–80 %) + 4 × min(80–90 %) + 5 × min(90–100 %)
 
+(the default zones; see the zone-boundary note below for the other methods)
+
 Worked example (in the tests): 10 / 15 / 20 / 8 / 2 minutes in zones 1–5
 → 10 + 30 + 60 + 32 + 10 = **142**.
 
@@ -52,14 +54,29 @@ load always agrees with what the user sees.
 
 **Where it differs from Edwards, on purpose:**
 
-- *Zone boundaries.* The app's zones (from RingConn's own zone screen, #75) start at 50/61/71/81/91 %
-  of max instead of 50/60/70/80/90 %. A reading between 60 % and 61 % therefore counts as zone 1, not
-  zone 2. Re-zoning would make the load disagree with the bars drawn right above it.
-- *Max HR.* The zones use 220 − age, as the workout screen always has. Edwards uses the athlete's
-  measured maximum.
+- *Zone boundaries (decision 83, #338).* The zones are named Zone 1 to Zone 5 and start, by default, at
+  Edwards' own 50/60/70/80/90 % of max heart rate. This replaces the 50/61/71/81/91 % split the app
+  took from RingConn's zone screen (#75), so there is no longer a boundary deviation. A reading below
+  Zone 1's lower bound is in no zone. The user can instead choose % of heart-rate reserve (Karvonen,
+  using the active device's resting heart rate; with none it falls back to % of max and says so) or
+  five custom bounds in bpm (strictly increasing). Every bound is a whole bpm, rounded up from the
+  percentage. The pure rules are `HeartRateZones` in the Kit; the app reads the user's choices in one
+  place (`HeartRateZoneDefaults`). The load is Edwards' sum over whichever zones are in force, so
+  changing the method or the max moves the load; the arithmetic over a given breakdown is unchanged.
+- *Max HR.* Automatic is 220 − age, exactly as before, and the same value is used by the calorie,
+  strain and exercise-minute estimates. The user can instead type a maximum (an integer, 100 to 230
+  bpm), which then replaces 220 − age in all of those. Edwards uses the athlete's measured maximum,
+  so a typed maximum is closer to his method. VO₂ max keeps its own Tanaka rule and is untouched.
 - *Gaps.* Each reading is held until the next one, for at most 30 s (`timeInZonesHeld`). A dropout
   longer than that adds nothing, and nothing is interpolated (#45). Where the ring missed readings,
   the load is a lower bound.
+
+**Past workouts (decision 83f).** What re-derives from stored heart-rate readings follows the zones
+set now: the Time in Heart-Rate Zones bars and the Training load row in a workout's history detail,
+and the weekly training-load line. What was computed when a workout ended is not rewritten: the
+finished-workout summary screen (its zone bars and training load) is built once at End and shown
+until it is dismissed; no zone breakdown is persisted anywhere, so nothing else exists to go stale.
+A workout recovered after a kill has no readings and so no zones, as before.
 
 **Why Edwards and not Banister.** Banister's TRIMP weights mean %HR-reserve with a sex-specific
 exponential. It needs a resting HR for every workout and a mean HR that hides intervals. Edwards
@@ -92,9 +109,10 @@ missing value.
 **Source of history.** No local table and no SwiftData change. The line reads this app's own
 workouts from the last 35 days back out of Apple Health. It re-scores each one from the heart-rate
 samples saved with that workout (`HKQuery.predicateForObjects(from: workout)`), using the same held
-zones and 220 − age as the summary, so the two agree (pinned by
-`testLoadFromStoredHeartRateMatchesTheSummaryLoad`). The current age is used, so a birthday moves
-older workouts' loads by one zone-boundary bpm at most. This needs no new authorization: workouts
+zones as the summary, so the two agree (pinned by
+`testLoadFromStoredHeartRateMatchesTheSummaryLoad`). The zones in force NOW are used (decision 83f),
+so editing them, or a birthday, re-scores older workouts: a workout's stored heart-rate readings are
+re-read, not a stored zone breakdown. This needs no new authorization: workouts
 come from our own source, and heart rate is already in the main request's read set.
 
 ---
