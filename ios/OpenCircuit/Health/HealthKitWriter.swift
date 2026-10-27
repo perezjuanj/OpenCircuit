@@ -142,6 +142,10 @@ final class HealthKitWriter {
         // exactly the shipped one. It is third-party writable (measured against the iOS 27 framework,
         // decision 59), unlike the Apple-computed types that crash this request (#110, #121).
         if let recoveryHRVType { set.insert(recoveryHRVType) }
+        // Decision 82e: heart rate recovery's one-minute value (Cardio Recovery) after a strap workout.
+        // Third-party writable (the share probe for decision 82 doesn't throw, like SDNN). New here, so
+        // `ContentView.reconcileNewlyAuthorizableShareTypes` asks an existing install once.
+        set.insert(HKQuantityType(.heartRateRecoveryOneMinute))
         set.insert(HKQuantityType(.basalEnergyBurned))
         set.insert(HKCategoryType(.sleepAnalysis))
         // Workout types (#75): HKWorkout + GPS route (workout sessions feature).
@@ -343,6 +347,7 @@ final class HealthKitWriter {
         if type.isEqual(HKCategoryType(.menstrualFlow)) { return "Cycle Tracking" }
         if type.isEqual(systolicType) || type.isEqual(diastolicType) { return "Blood Pressure" }
         if type.isEqual(HKQuantityType(.distanceCycling)) { return "Cycling Distance" }
+        if type.isEqual(HKQuantityType(.heartRateRecoveryOneMinute)) { return "Cardio Recovery" }
         if type is HKWorkoutType || type is HKSeriesType { return "Workouts" }
         // Without this the #132 partial-grant banner would show the raw
         // "HKCategoryTypeIdentifierHeadache" from the fallthrough below.
