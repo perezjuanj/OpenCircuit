@@ -273,7 +273,8 @@ final class WorkoutHealthDeleteScopeTests: XCTestCase {
         XCTAssertTrue(owned.contains(HKQuantityType(.activeEnergyBurned)))
         XCTAssertTrue(owned.contains(HKQuantityType(.distanceWalkingRunning)))
         XCTAssertTrue(owned.contains(HKQuantityType(.distanceCycling)))
-        XCTAssertEqual(owned.count, 4)
+        XCTAssertTrue(owned.contains(HKQuantityType(.heartRateRecoveryOneMinute)), "Cardio Recovery goes with the workout (#337)")
+        XCTAssertEqual(owned.count, 5)
         for kept in HealthKitWorkoutStore.keptSampleTypes {
             XCTAssertFalse(owned.contains(kept), "\(kept) is a measurement and is never deleted")
         }

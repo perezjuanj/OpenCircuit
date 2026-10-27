@@ -86,6 +86,9 @@ enum WorkoutDetailContent {
     static func recovery(workoutHR: [HRSample], storedRows: [HRSample], window: DateInterval?,
                          age: Int) -> HeartRateRecovery.Outcome? {
         guard let window else { return nil }
+        // 85c: the peak comes from workout-shaped rows only (`end > start`), the filter the recovery
+        // rows already get: an all-day history instant in the workout's span is not a workout reading.
+        let workoutHR = workoutHR.filter { $0.end > $0.start }
         let readings = storedRows.filter {
             $0.end > $0.start && $0.start >= window.start && $0.end <= window.end
         }
