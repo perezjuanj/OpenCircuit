@@ -739,7 +739,11 @@ final class StrapWorkoutRecorder {
         } else if now >= end.addingTimeInterval(HeartRateRecovery.windowLimit) {
             closeRecovery(.complete, now: now)
         }
-        return recoveryWindow?.closedBy == nil
+        let open = recoveryWindow?.closedBy == nil
+        // 85a: the journal is gone by now, so a kill in the window would leave the strap streaming with
+        // nothing owed to stop it. Owed while the window keeps the stream; `closeRecovery` clears it.
+        if open { orphanStop.owed = true }
+        return open
     }
 
     /// While paused: a reading the strap still streams, kept in case the workout ends in this pause.
@@ -791,7 +795,12 @@ final class StrapWorkoutRecorder {
         recoveryWindow = window
         tickTask?.cancel()
         tickTask = nil
+        // 85a: the stop is sent now, so the stop owed since the window opened is paid. On a dropped or
+        // replaced link nothing was sent (`followRecovery` has already let go of the session): it stays
+        // owed for the strap's next authenticated `ready`.
+        let stopSent = attached.map { $0 === source() && $0.isLinkConnected } ?? false
         attached?.stopWorkoutHeartRate()
+        if stopSent { orphanStop.owed = false }
         attached?.heartRateObserver = nil
         attached = nil
         if managesIdleTimer { UIApplication.shared.isIdleTimerDisabled = false }
@@ -831,8 +840,10 @@ final class StrapWorkoutRecorder {
                     readingsStatus = await health.saveRecoveryHeartRate(readings, timeline: timeline)
                 }
                 // 82e: HRR1 to Cardio Recovery, when computed. Not for a workout Health refused (the
-                // VO₂ max rule): the value would describe a workout that isn't there.
-                if saved, let drop = outcome.oneMinute.drop {
+                // VO₂ max rule): the value would describe a workout that isn't there. 85b: only a drop
+                // above zero; a reading that rose (or held) is not a recovery value, and Health's type
+                // is a positive count. The summary still shows what was measured.
+                if saved, let drop = outcome.oneMinute.drop, drop > 0 {
                     cardioStatus = await health.saveCardioRecovery(drop, at: cardioAt, timeline: timeline)
                 }
             }

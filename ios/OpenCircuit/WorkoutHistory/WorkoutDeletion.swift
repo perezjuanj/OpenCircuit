@@ -140,7 +140,27 @@ final class HealthKitWorkoutStore: WorkoutHealthDeleting {
         HKQuantityType(.distanceWalkingRunning),
         HKQuantityType(.distanceCycling),
         HKSeriesType.workoutRoute(),
+        // #337: Cardio Recovery is written on its own (not through the workout's builder), so it is
+        // matched by `ownedPredicate`, not by "saved with the workout".
+        HeartRateRecoveryHealthWriter.cardioRecoveryType,
     ]
+
+    /// How a workout's own sample of `type` is found: saved with the workout, except Cardio Recovery,
+    /// which is our own sample dated exactly 1 minute after the workout's end (where
+    /// `saveCardioRecovery` puts it). Our source in both, and never a wider time window (85d).
+    static func ownedPredicate(for type: HKSampleType, workout: HKWorkout,
+                               ourSource: @autoclosure () -> NSPredicate = HKQuery.predicateForObjects(from: .default()))
+        -> NSPredicate {
+        guard type == HeartRateRecoveryHealthWriter.cardioRecoveryType else {
+            return savedWith(workout, ourSource: ourSource())
+        }
+        let mark = workout.endDate.addingTimeInterval(HeartRateRecovery.oneMinute)
+        return NSCompoundPredicate(andPredicateWithSubpredicates: [
+            HKQuery.predicateForSamples(withStart: mark.addingTimeInterval(-0.5), end: mark.addingTimeInterval(0.5),
+                                        options: [.strictStartDate, .strictEndDate]),
+            ourSource(),
+        ])
+    }
 
     /// Workout `id`, if it is ours and still exists. Throws when the query itself failed, so a
     /// failed lookup is never mistaken for "already deleted".
@@ -156,7 +176,7 @@ final class HealthKitWorkoutStore: WorkoutHealthDeleting {
         guard let workout = try await workout(id) else { return }
         var owned: [HKSample] = []
         for type in Self.ownedSampleTypes {
-            owned += try await samples(of: type, predicate: Self.savedWith(workout))
+            owned += try await samples(of: type, predicate: Self.ownedPredicate(for: type, workout: workout))
         }
         // One call, so a failure leaves all of them in place rather than some. Skipped when empty:
         // deleting nothing (no route share grant, say) would fail for nothing.
