@@ -2914,6 +2914,8 @@ private struct CaloriesCardBody: View {
     private let onShowEstimateInfo: () -> Void
     // Shared @AppStorage keys with UserProfileSettingsView (single source of truth).
     @AppStorage("userProfile.age") private var age = 35
+    // Decision 83c: a typed max HR (0 = Automatic) feeds the same calorie maths as the 220 - age formula.
+    @AppStorage(HeartRateZoneDefaults.manualMaxHRKey) private var manualMaxHR = 0
     @AppStorage("userProfile.weightKg") private var weightKg = 70.0
     // #284: manual-entry date + cached latest Apple Health body mass; the newer one feeds the math.
     @AppStorage(WeightResolver.Keys.manualSetAt) private var weightSetAtEpoch = 0.0
@@ -2963,7 +2965,7 @@ private struct CaloriesCardBody: View {
     /// Identity for the recompute `.task` — the HR count, today's steps, and the profile inputs.
     private var caloriesInputsKey: String {
         "\(activity == nil ? "-" : "")\(activity?.heartRate.count ?? 0)|\(todayDaily.first?.steps ?? 0)|\(activity?.steps.count ?? 0)|"
-        + "\(age)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
+        + "\(age)|\(manualMaxHR)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
         + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(workoutCreditsRevision)"
     }
     /// Bumped when a deleted workout's credited span is undone (#293), so the estimate recomputes.
@@ -2971,9 +2973,10 @@ private struct CaloriesCardBody: View {
 
     private var profile: UserProfile {
         UserProfile(age: age, weightKg: max(effectiveWeightKg, 1), heightCm: max(heightCm, 1),
-                    sex: BiologicalSex(rawValue: sexRaw) ?? .male)
+                    sex: BiologicalSex(rawValue: sexRaw) ?? .male,
+                    manualMaxHR: manualMaxHR)
     }
-    private var maxHR: Int { max(220 - age, 1) }
+    private var maxHR: Int { profile.maxHR }
 
     /// Resting kcal accrued so far today: full-day BMR scaled by the elapsed fraction of today.
     private var restingToday: Double {
@@ -2999,7 +3002,8 @@ private struct CaloriesCardBody: View {
             // "max HR" here is the 220-age zone/calorie reference, NOT an observed peak.
             let defaultsNow = ProfileDefaultsStatus.current()
             Text(CaloriesReferenceLine.text(bmr: Int(Calories.bmrKcalPerDay(profile: profile).rounded()),
-                                            maxHR: maxHR, age: age, status: defaultsNow))
+                                            maxHR: maxHR, age: age, status: defaultsNow,
+                                            manualMaxHR: manualMaxHR))
                 .font(.caption2).foregroundStyle(.secondary)
             HStack(spacing: 12) {
                 // Buttons, never a NavigationLink: inside the Today List a link is hoisted to the
@@ -3015,6 +3019,7 @@ private struct CaloriesCardBody: View {
                         .font(.caption2.weight(.semibold))
                 }
                 .buttonStyle(.borderless)
+                HeartRateZonesLink()
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

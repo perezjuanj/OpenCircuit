@@ -285,7 +285,7 @@ public enum Calories {
         motion: ExerciseMinutes.MotionEvidence = ExerciseMinutes.MotionEvidence(),
         corroborateMotion: Bool = ExerciseMinutes.motionCorroborationEnabled
     ) -> DailyEstimate {
-        let maxHR = max(220 - profile.age, 1)
+        let maxHR = profile.maxHR
 
         // The minutes AND the qualifying bpm come from ONE list of elevated readings, so they always
         // share a threshold and a gate verdict. Until #281 this re-derived the threshold by hand,
@@ -349,7 +349,7 @@ public enum Calories {
         motion: ExerciseMinutes.MotionEvidence = ExerciseMinutes.MotionEvidence(),
         corroborateMotion: Bool = ExerciseMinutes.motionCorroborationEnabled
     ) -> DailyEstimate? {
-        let maxHR = max(220 - profile.age, 1)
+        let maxHR = profile.maxHR
         // #281: a gated reading is simply not a piece. Everything below is untouched, so its steps
         // (if any) are credited in full as walking energy, as for any other non-elevated time.
         let pieces = ExerciseMinutes.elevatedPieces(hrSamples: hrSamples,

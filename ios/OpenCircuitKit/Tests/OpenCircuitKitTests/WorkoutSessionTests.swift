@@ -28,8 +28,8 @@ final class WorkoutSessionTests: XCTestCase {
     }
 
     func testZoneWarmUpUpperBound() {
-        // 60% of 200 = 120 bpm → still warm-up
-        XCTAssertEqual(HRZoneClassifier.zone(bpm: 120, maxHR: 200), .warmUp)
+        // Decision 83d: zone 2 starts at 60% (120 bpm), so 119 bpm is the top of zone 1
+        XCTAssertEqual(HRZoneClassifier.zone(bpm: 119, maxHR: 200), .warmUp)
     }
 
     func testZoneFatBurnLower() {
@@ -38,8 +38,8 @@ final class WorkoutSessionTests: XCTestCase {
     }
 
     func testZoneFatBurnUpper() {
-        // 70% of 200 = 140 bpm → fat burn
-        XCTAssertEqual(HRZoneClassifier.zone(bpm: 140, maxHR: 200), .fatBurn)
+        // Decision 83d: zone 3 starts at 70% (140 bpm), so 139 bpm is the top of zone 2
+        XCTAssertEqual(HRZoneClassifier.zone(bpm: 139, maxHR: 200), .fatBurn)
     }
 
     func testZoneAerobicLower() {
@@ -48,8 +48,8 @@ final class WorkoutSessionTests: XCTestCase {
     }
 
     func testZoneAerobicUpper() {
-        // 80% of 200 = 160 bpm → aerobic
-        XCTAssertEqual(HRZoneClassifier.zone(bpm: 160, maxHR: 200), .aerobic)
+        // Decision 83d: zone 4 starts at 80% (160 bpm), so 159 bpm is the top of zone 3
+        XCTAssertEqual(HRZoneClassifier.zone(bpm: 159, maxHR: 200), .aerobic)
     }
 
     func testZoneAnaerobicLower() {
@@ -58,8 +58,8 @@ final class WorkoutSessionTests: XCTestCase {
     }
 
     func testZoneAnaerobicUpper() {
-        // 90% of 200 = 180 bpm → anaerobic
-        XCTAssertEqual(HRZoneClassifier.zone(bpm: 180, maxHR: 200), .anaerobic)
+        // Decision 83d: zone 5 starts at 90% (180 bpm), so 179 bpm is the top of zone 4
+        XCTAssertEqual(HRZoneClassifier.zone(bpm: 179, maxHR: 200), .anaerobic)
     }
 
     func testZoneExtremeLower() {

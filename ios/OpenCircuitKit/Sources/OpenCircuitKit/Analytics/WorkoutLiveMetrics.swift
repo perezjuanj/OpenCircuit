@@ -56,9 +56,14 @@ public enum WorkoutPace {
 
     /// The live HR zone (1...5) for a reading, or nil when there is no fresh reading or it is below
     /// zone 1. Never a zone for a stale number.
-    public static func liveZone(bpm: Int?, isStale: Bool, maxHR: Int) -> Int? {
+    public static func liveZone(bpm: Int?, isStale: Bool, zones: HeartRateZones) -> Int? {
         guard let bpm, !isStale else { return nil }
-        return HRZoneClassifier.zone(bpm: bpm, maxHR: maxHR)?.rawValue
+        return zones.zone(bpm: bpm)?.rawValue
+    }
+
+    /// `liveZone` over the default zones for `maxHR`.
+    public static func liveZone(bpm: Int?, isStale: Bool, maxHR: Int) -> Int? {
+        liveZone(bpm: bpm, isStale: isStale, zones: HeartRateZones(percentOfMax: max(maxHR, 1)))
     }
 }
 

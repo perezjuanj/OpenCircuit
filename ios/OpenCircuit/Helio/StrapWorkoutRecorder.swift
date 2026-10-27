@@ -368,6 +368,9 @@ final class StrapWorkoutRecorder {
     @ObservationIgnored private var unjournaled: [HRSample] = []
     @ObservationIgnored private var lastRecordedAt: Date?
     @ObservationIgnored private var profileSnapshot: UserProfile?
+    /// The user's heart-rate zones, fixed when the workout starts (decision 83), like the profile.
+    @ObservationIgnored private var zonesSnapshot: HeartRateZones?
+    @ObservationIgnored private let zonesFor: @MainActor (UserProfile) -> HeartRateZones
     @ObservationIgnored private var tickCount = 0
     @ObservationIgnored private var tickTask: Task<Void, Never>?
 
@@ -398,6 +401,9 @@ final class StrapWorkoutRecorder {
          location: any WorkoutLocationTracking,
          liveActivity: WorkoutLiveActivityController?,
          profile: @escaping @MainActor () -> UserProfile = { HealthKitWriter.storedUserProfile() },
+         zones: @escaping @MainActor (UserProfile) -> HeartRateZones = {
+             HeartRateZoneDefaults.zones(profile: $0, restingHR: nil)
+         },
          indoorKeepAlive: @escaping () -> Bool = {
              UserDefaults.standard.bool(forKey: WorkoutSessionManager.indoorKeepAliveEnabledKey)
          },
@@ -416,6 +422,7 @@ final class StrapWorkoutRecorder {
         self.location = location
         self.liveActivity = liveActivity
         self.profile = profile
+        self.zonesFor = zones
         self.indoorKeepAlive = indoorKeepAlive
         self.orphanStop = orphanStop
         self.vo2 = vo2
@@ -440,6 +447,7 @@ final class StrapWorkoutRecorder {
                              hrStore: store,
                              location: StrapWorkoutLocation(),
                              liveActivity: WorkoutLiveActivityController(),
+                             zones: { HeartRateZoneDefaults.zonesForNewWorkout(profile: $0, store: store()) },
                              vo2: StrapVO2MaxLive(store: store),
                              recoveryHealth: HeartRateRecoveryHealthWriter())
     }
@@ -461,6 +469,7 @@ final class StrapWorkoutRecorder {
         timeline = session.timeline
         ledger = WorkoutActivityLedger(start: now)
         profileSnapshot = profile()
+        zonesSnapshot = profileSnapshot.map(zonesFor)
         samples = []
         unjournaled = []
         lastRecordedAt = nil
@@ -556,10 +565,12 @@ final class StrapWorkoutRecorder {
         guard let ledger else { return }
         activeSeconds = ledger.activeSeconds(until: now)
         if !ledger.isPaused, selectedSport.isOutdoor { paceTracker.observe(distanceMeters: location.distanceMeters, at: now) }
-        liveZoneBreakdown = StrapWorkoutSummaryBuilder.zones(samples, ledger: ledger, end: now, maxHR: maxHR)
+        liveZoneBreakdown = StrapWorkoutSummaryBuilder.zones(samples, ledger: ledger, end: now, zones: activeZones)
     }
 
-    private var maxHR: Int { max(220 - max((profileSnapshot ?? profile()).age, 1), 1) }
+    /// The zones this workout classifies against: the ones fixed at Start, or the user's current ones
+    /// for a workout restored without them.
+    var activeZones: HeartRateZones { zonesSnapshot ?? zonesFor(profileSnapshot ?? profile()) }
 
     // MARK: The link
 
@@ -646,7 +657,7 @@ final class StrapWorkoutRecorder {
         let summary = StrapWorkoutSummaryBuilder.summarize(
             sport: selectedSport, ledger: ledger, samples: samples, end: end,
             distanceMeters: hasRoute ? location.distanceMeters : nil, hasRoute: hasRoute,
-            profile: profileSnapshot ?? profile())
+            profile: profileSnapshot ?? profile(), zones: activeZones)
         let counted = StrapWorkoutSummaryBuilder.activeSamples(samples, ledger: ledger, end: end)
 
         // Queue the readings for LocalStore BEFORE dropping the journal, so a kill in between loses
@@ -815,7 +826,8 @@ final class StrapWorkoutRecorder {
               case .measuringRecovery(let summary, let saved) = state else { return }
         recoveryWindow = nil
         recoveryMarkAt = nil
-        let bound = HeartRateRecovery.zoneFourLowerBound { [maxHR] in HRZoneClassifier.zone(bpm: $0, maxHR: maxHR) }
+        let zones = activeZones
+        let bound = HeartRateRecovery.zoneFourLowerBound { zones.zone(bpm: $0) }
             ?? LiveHR.validBPM.upperBound + 1
         let outcome = HeartRateRecovery.measure(activeReadings: active, recoveryReadings: window.readings,
                                                 end: window.workoutEnd, zoneFourLowerBound: bound)
@@ -1009,9 +1021,10 @@ final class StrapWorkoutRecorder {
         guard let offer = takeOffer() else { return nil }
         let recovered = offer.workout
         let timeline = SyncDeviceID(rawValue: recovered.timelineRaw)
+        let savedProfile = profile()
         let summary = StrapWorkoutSummaryBuilder.summarize(
             sport: recovered.sport, ledger: recovered.ledger, samples: recovered.samples, end: recovered.end,
-            distanceMeters: nil, hasRoute: false, profile: profile())
+            distanceMeters: nil, hasRoute: false, profile: savedProfile, zones: zonesFor(savedProfile))
         let counted = StrapWorkoutSummaryBuilder.activeSamples(recovered.samples, ledger: recovered.ledger, end: recovered.end)
         enqueueLanding(counted, timeline: timeline)
         clear(offer.slot)   // before the write: a second offer can never write it twice
@@ -1094,7 +1107,7 @@ final class StrapWorkoutRecorder {
             distanceMeters: distance,
             currentPaceSecPerKm: paceTracker.currentSecPerKm(now: now),
             avgPaceSecPerKm: WorkoutPace.averageSecPerKm(distanceMeters: distance, activeSeconds: active),
-            hrZone: WorkoutPace.liveZone(bpm: currentHR, isStale: currentHRIsStale, maxHR: maxHR),
+            hrZone: WorkoutPace.liveZone(bpm: currentHR, isStale: currentHRIsStale, zones: activeZones),
             now: now))
     }
 }

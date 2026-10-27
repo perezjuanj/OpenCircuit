@@ -42,10 +42,14 @@ struct ProfileDefaultsStatus: Equatable {
 
 /// The Calories card's reference line, as text. Same as before when the profile is set.
 enum CaloriesReferenceLine {
-    static func text(bmr: Int, maxHR: Int, age: Int, status: ProfileDefaultsStatus) -> String {
+    static func text(bmr: Int, maxHR: Int, age: Int, status: ProfileDefaultsStatus,
+                     manualMaxHR: Int? = nil) -> String {
         var bmrPart = "BMR \(bmr) kcal/day"
         if status.anyDefault {
             bmrPart += " (default \(list(status.defaultBMRInputs)))"
+        }
+        if let manualMaxHR, MaxHeartRate.isValidManual(manualMaxHR) {
+            return "\(bmrPart) · max HR \(manualMaxHR) bpm (set by you)"
         }
         let formula = status.age ? "220 − default age \(age)" : "220 − age"
         return "\(bmrPart) · est. max HR \(maxHR) bpm (\(formula))"

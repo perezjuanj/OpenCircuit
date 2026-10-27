@@ -147,11 +147,11 @@ public enum StrapWorkoutSummaryBuilder {
     /// Time in zones, held (step-function) attribution like the ring's (`timeInZonesHeld`), run per
     /// running stretch so no reading is ever held across a pause. A gap longer than the hold cap
     /// (30 s) contributes no zone time at all, so a link drop is never filled in.
-    public static func zones(_ samples: [HRSample], ledger: WorkoutActivityLedger, end: Date, maxHR: Int) -> WorkoutZoneBreakdown {
+    public static func zones(_ samples: [HRSample], ledger: WorkoutActivityLedger, end: Date, zones: HeartRateZones) -> WorkoutZoneBreakdown {
         var total = WorkoutZoneBreakdown()
         for segment in ledger.activeSegments(until: end) {
             let inside = samples.filter { $0.end > segment.start && $0.end <= segment.end }
-            let z = HRZoneClassifier.timeInZonesHeld(hrSamples: inside, maxHR: maxHR, sessionEnd: segment.end)
+            let z = HRZoneClassifier.timeInZonesHeld(hrSamples: inside, zones: zones, sessionEnd: segment.end)
             total.warmUpSeconds += z.warmUpSeconds
             total.fatBurnSeconds += z.fatBurnSeconds
             total.aerobicSeconds += z.aerobicSeconds
@@ -170,11 +170,13 @@ public enum StrapWorkoutSummaryBuilder {
                                  end: Date,
                                  distanceMeters: Double?,
                                  hasRoute: Bool,
-                                 profile: UserProfile) -> StrapWorkoutSummary {
+                                 profile: UserProfile,
+                                 zones: HeartRateZones? = nil) -> StrapWorkoutSummary {
         let end = max(end, ledger.start)
         let counted = activeSamples(samples, ledger: ledger, end: end)
         let active = ledger.activeSeconds(until: end)
-        let maxHR = max(220 - max(profile.age, 1), 1)
+        // The app always passes the user's zones; nil is the default zones for the profile's age.
+        let zones = zones ?? HeartRateZones(percentOfMax: MaxHeartRate.automatic(age: max(profile.age, 1)))
         let avgHR = counted.isEmpty ? nil : counted.reduce(0) { $0 + $1.bpm } / counted.count
         let maxBPM = counted.map(\.bpm).max()
         let hrKcal = avgHR.map { Calories.workoutActiveKcal(avgHR: $0, durationSeconds: active, profile: profile) }
@@ -186,12 +188,12 @@ public enum StrapWorkoutSummaryBuilder {
             avgHR: avgHR,
             maxHR: maxBPM,
             estimatedActiveKcal: [hrKcal, distKcal].compactMap { $0 }.max(),
-            zoneBreakdown: zones(counted, ledger: ledger, end: end, maxHR: maxHR),
+            zoneBreakdown: Self.zones(counted, ledger: ledger, end: end, zones: zones),
             distanceMeters: distanceMeters,
             hasRoute: hasRoute,
             hrSampleCount: counted.count,
             steps: nil,   // the strap reports no per-workout steps here (realtime steps stay off, §7.2)
-            usedFormulaMaxHR: true)
+            usedFormulaMaxHR: zones.maxHRIsAutomatic)
         return StrapWorkoutSummary(summary: summary, activeSeconds: active,
                                    pauses: ledger.pauses(until: end), gaps: ledger.gaps(until: end))
     }
