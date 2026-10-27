@@ -176,6 +176,14 @@ final class HelioBreadcrumbs {
         }
     }
 
+    /// Decision 78d (#316): the connection ended with the strap busy. `reason` is which path said so,
+    /// a word (no values); background runs try again after the latch expires.
+    func strapBusy(reason: HelioSession.BusyReason?) {
+        keyed("strap-busy", .link) {
+            "strap busy (\(reason?.rawValue ?? "unknown")); background runs try again after \(Int(HelioBusyLatch.expiry / 60)) min"
+        }
+    }
+
     func bluetoothOff(standingConnectArmed: Bool, upFor: TimeInterval? = nil) {
         keyed("bluetooth-off", .link) {
             "Bluetooth off; the link is gone\(Self.upFor(upFor)); reconnect \(standingConnectArmed ? "armed for when it is back on" : "NOT armed")"

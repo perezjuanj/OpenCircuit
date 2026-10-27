@@ -151,6 +151,27 @@ final class HelioSession: WearableSession {
         case syncing
     }
 
+    /// Which auth path set `.strapBusy` (decision 78d, #316): a reason word for the `helio-link`
+    /// breadcrumb. What counts as busy is unchanged. §9's "Competing central": the strap answered auth
+    /// with a status other than `25` (it refused us); a reply we couldn't use, or a local failure, is
+    /// "auth failed other".
+    enum BusyReason: String, Equatable {
+        case authTimeout = "auth timeout"
+        case notifyEnableFailed = "notify enable failed"
+        case authFailedOther = "auth failed other"
+        case competingCentral = "competing central"
+
+        init(_ failure: ZeppAuthFailure) {
+            switch failure {
+            case .publicKeyRejected, .sessionRejected: self = .competingCentral
+            case .wrongAuthKey, .malformedReply, .invalidDevicePublicKey, .localCryptoFailure: self = .authFailedOther
+            }
+        }
+    }
+
+    /// Why this session's auth ended `.strapBusy`, nil otherwise.
+    @ObservationIgnored private(set) var busyReason: BusyReason?
+
     /// Decision 8: v1 always acks keep-on-strap (`03 09`). There is no delete path in the app.
     static let ackPolicy: ZeppAckPolicy = .keepOnDevice
     /// How long after this session last sent to an endpoint a message there still counts as a reply
@@ -288,6 +309,11 @@ final class HelioSession: WearableSession {
     @ObservationIgnored private var tierZeroSubscribed = false
     /// The app is in the background: nothing is subscribed for display (§16.5), so Tier 0 waits.
     @ObservationIgnored var appInBackground = false
+    /// Decision 81b: this foreground's activation sync has been decided (started, or left alone by its
+    /// throttle), or the connection's own on-connect sync has been asked for. Live heart rate on open
+    /// waits for it, so it can never take the link ahead of the sync (a running stream would stop the
+    /// activation sync from starting: `HelioActivationSync`). Observed, so the auto-start re-asks.
+    private(set) var activationSyncSettled = false
     /// §16.5's fail-safes, each sent at most once per connection.
     @ObservationIgnored private var heartRateFailSafeSent = false
     @ObservationIgnored private var realtimeStepsOffSent = false
@@ -443,7 +469,7 @@ final class HelioSession: WearableSession {
         if failed {
             pendingNotify.removeAll()
             switch notifyPurpose {
-            case .auth?: failAuthentication(busy: true, reason: "notify on \(characteristic.rawValue) failed")
+            case .auth?: failAuthentication(busy: .notifyEnableFailed, reason: "notify on \(characteristic.rawValue) failed")
             case .fetch?: finishFetch(interrupted: true)
             case nil: break
             }
@@ -563,9 +589,15 @@ final class HelioSession: WearableSession {
     /// the workout's location session keeps the app alive, as the ring's does.
     func appDidEnterBackground() {
         appInBackground = true
+        activationSyncSettled = false
         stopFind()
         if liveHeartRateOwner != .workout { stopLiveHeartRate() }
         stopTierZero()
+    }
+
+    /// The activation sync has been decided for this foreground (decision 81b).
+    func activationSyncWasDecided() {
+        activationSyncSettled = true
     }
 
     /// Back in front: a keyless session listens for standard heart rate again (decision 7).
@@ -594,7 +626,7 @@ final class HelioSession: WearableSession {
     /// keep-alive and the sync watchdog. Production calls it every 250 ms; tests call it directly.
     func tick(now: Date) {
         if let authDeadline, now >= authDeadline, phase == .authenticating {
-            failAuthentication(busy: true, reason: "no auth reply in \(Int(Self.authTimeout)) s")
+            failAuthentication(busy: .authTimeout, reason: "no auth reply in \(Int(Self.authTimeout)) s")
         }
         if findState.machine.nextDeadline.map({ now >= $0 }) == true {
             performFind(findState.machine.tick(now: now))
@@ -648,10 +680,12 @@ final class HelioSession: WearableSession {
         handle(out)
     }
 
-    private func failAuthentication(busy: Bool, reason: String) {
+    /// `busy`: why the strap reads as busy (decision 78d's reason word); nil for a rejected key.
+    private func failAuthentication(busy: BusyReason?, reason: String) {
         authDeadline = nil
         link = nil
-        phase = busy ? .strapBusy : .keyRejected
+        busyReason = busy
+        phase = busy != nil ? .strapBusy : .keyRejected
         helioLog.error("helio: auth failed (\(reason, privacy: .public))")
         startTierZero()
     }
@@ -675,9 +709,9 @@ final class HelioSession: WearableSession {
             case .authenticationFailed(.wrongAuthKey):
                 // Decision 7: "key rejected", never a retry loop. The mark stays until the key changes.
                 keyStore?.markRejected()
-                failAuthentication(busy: false, reason: "10 05 25, wrong key")
+                failAuthentication(busy: nil, reason: "10 05 25, wrong key")
             case .authenticationFailed(let failure):
-                failAuthentication(busy: true, reason: "\(failure)")
+                failAuthentication(busy: BusyReason(failure), reason: "\(failure)")
             case .message(let message):
                 handleMessage(message)
             case .undecryptable(let endpoint):
@@ -803,7 +837,10 @@ final class HelioSession: WearableSession {
         phase = .ready
         helioLog.notice("helio: ready (clock \(self.clockSet ? "set" : "NOT set", privacy: .public), controls: find \(self.controlCapabilities.isSupported(.findDevice), privacy: .public), alarms \(self.controlCapabilities.isSupported(.alarms), privacy: .public))")
         sendOwedOrphanStop()   // before any stream or sync (review-238 SF2)
-        if autoSyncOnConnect { syncHistory(manual: false) }
+        if autoSyncOnConnect {
+            syncHistory(manual: false)
+            if !appInBackground { activationSyncSettled = true }
+        }
     }
 
     private func handleMessage(_ message: ZeppMessage) {

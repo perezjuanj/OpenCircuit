@@ -19,7 +19,8 @@ struct SleepFocusSyncSetupView: View {
                 }
                 Text("After this one-time setup, turning off Sleep Focus starts a short history "
                      + "sync from your device and saves it to Apple Health. Your other automatic syncs continue "
-                     + "to work as before.")
+                     + "to work as before. iOS doesn't always run it when Focus ends on a schedule; then the next "
+                     + "automatic sync picks the night up.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

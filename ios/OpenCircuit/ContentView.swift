@@ -152,6 +152,8 @@ struct ContentView: View {
     /// link is `ready`. A user "Scan & connect" never sets this, so the auto-refresh can't
     /// fire on top of a manual connect.
     @State private var pendingAutoSync = false
+    /// Live heart rate when the app opens (decision 81): one foreground activation's memory.
+    @State private var autoLiveHR = AutoLiveHeartRateCoordinator()
     /// Tracks whether the ring was at 100 % (charged) in the current connection so the
     /// charging-complete notification fires exactly once per charge cycle. (#86)
     @State private var batteryWasFull = false
@@ -175,6 +177,11 @@ struct ContentView: View {
     private var helioSession: HelioSession? { ringActive ? nil : helio.session }
     /// The strap's Measure (decision 30); nil with the ring chosen.
     private var strapLive: StrapLiveHeartRate? { helioSession.map { StrapLiveHeartRate(session: $0) } }
+    /// The chosen device's reach for live heart rate on open (decision 81); nil while it has no session.
+    private var autoLiveDriver: (any AutoLiveHeartRateDriver)? {
+        if ringActive { return session.map { RingAutoLiveDriver(session: $0, foregroundSyncPending: pendingAutoSync) } }
+        return helioSession.map { StrapAutoLiveDriver(session: $0) }
+    }
     /// What a metric detail's Measure card needs (#245, decision 47): the live devices, plus THIS
     /// view's live buffer and session range. Handing the detail the same two values is what keeps
     /// one live feed — the number under the chart and the number on Today cannot disagree.
@@ -369,6 +376,8 @@ struct ContentView: View {
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
                     handleForegroundActivation()
+                    // Decision 81: after the foreground sync was asked for, never before it.
+                    autoLiveHR.activate(choice: deviceChoice.current, driver: autoLiveDriver)
                     refreshObservability()        // pick up anything a background run wrote
                     evaluateForegroundAlerts()    // live battery + Health-auth check (#44)
 #if DEBUG
@@ -376,12 +385,18 @@ struct ContentView: View {
                     Task { await calibration.refreshLatestEstimateIfNeeded() }
 #endif
                 } else if phase == .background {
+                    autoLiveHR.leftForeground(driver: autoLiveDriver)   // decision 81d
                     // Don't leave a user-initiated foreground scan/picker running once we leave the
                     // foreground — a nil-filtered scan yields nothing in the background and just keeps
                     // the radio engaged. Preserves the active ring (cancelScan, not stop).
                     if ringActive, case .scanning = scanner.state { scanner.cancelScan() }
                 }
             }
+            // Decision 81: live heart rate on open starts, or keeps waiting, as the link, the sync and the
+            // stream's owner change. Observes only; it never starts or delays a sync.
+            .modifier(AutoLiveHeartRateObserver(facts: autoLiveDriver?.facts) {
+                autoLiveHR.evaluate(choice: deviceChoice.current, driver: autoLiveDriver)
+            })
             // Fire the armed one-shot sync the moment the (re)connected link is ready.
             .onChange(of: session?.ready) { _, ready in
                 if ready == true { maybeAutoSyncOnReady() }
@@ -1367,6 +1382,9 @@ struct ContentView: View {
         if !ringActive {
             // The Helio Strap (#215): a standing reconnect to the saved strap, which syncs on connect.
             helio.setLocalStore(LocalStore(modelContext))
+            // Decision 78f: a Sleep Focus end iOS didn't report is noticed on coming to the front; the
+            // strap flush below waits for this read (78h N-1).
+            SleepFocusDetection.startForegroundCheck()
             helio.reconnectKnown()
             return
         }
@@ -2644,6 +2662,7 @@ struct ContentView: View {
             guard let timeline else { return }
             let nights = helioSession?.lastSyncResult?.nights.map(\.segments) ?? []
             Task {
+                await SleepFocusDetection.awaitForegroundCheck()
                 let r = await HelioConnection.flushStrap(health, store: store, timeline: timeline, nights: nights)
                 refreshHealthShareState()
                 if r.wroteAnything {

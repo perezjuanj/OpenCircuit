@@ -1168,7 +1168,8 @@ final class StrapWorkoutStoreTests: XCTestCase {
 @MainActor
 private final class CountingLink: HelioBackgroundLink {
     var session: HelioSession?
-    var endedBusy = false
+    var endedBusyAt: Date?
+    func clearBusyLatch() { endedBusyAt = nil }
     var strapTimeline: SyncDeviceID? = .timeline(for: .zeppOS(model: "Helio Strap"), identityID: "STRAP-H")
     var activeBackgroundRuns = 0
     var backgroundRunAdoptsNewSessions = false
