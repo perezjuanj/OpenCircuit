@@ -1010,9 +1010,10 @@ final class StrapWorkoutRecorder {
         guard let offer = takeOffer() else { return nil }
         let recovered = offer.workout
         let timeline = SyncDeviceID(rawValue: recovered.timelineRaw)
+        let savedProfile = profile()
         let summary = StrapWorkoutSummaryBuilder.summarize(
             sport: recovered.sport, ledger: recovered.ledger, samples: recovered.samples, end: recovered.end,
-            distanceMeters: nil, hasRoute: false, profile: profile())
+            distanceMeters: nil, hasRoute: false, profile: savedProfile, zones: zonesFor(savedProfile))
         let counted = StrapWorkoutSummaryBuilder.activeSamples(recovered.samples, ledger: recovered.ledger, end: recovered.end)
         enqueueLanding(counted, timeline: timeline)
         clear(offer.slot)   // before the write: a second offer can never write it twice

@@ -395,6 +395,9 @@ struct WorkoutView: View {
                         rangeText: manager.activeZones?.rangeText(of: zone)
                     )
                 }
+                if let note = manager.activeZones?.fallbackNote {
+                    Text(note).font(.caption2).foregroundStyle(.secondary)
+                }
                 HeartRateZonesLink()
             }
             .padding(.horizontal)

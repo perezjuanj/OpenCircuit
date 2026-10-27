@@ -244,4 +244,76 @@ final class HeartRateZoneAppTests: XCTestCase {
         XCTAssertEqual(recorder.activeZones, first, "later edits do not move a running workout's zones")
         XCTAssertEqual(calls, 1)
     }
+
+    // MARK: Ring live zones (SF-2)
+
+    func testTheRingsLiveZoneBarsAndActiveZonesUseTheSessionsZones() {
+        // 152 bpm: Zone 4 on the default zones for a 180 max, Zone 5 on these.
+        let custom = HeartRateZones(settings: HeartRateZoneSettings(method: .custom, customLowerBounds: [100, 110, 120, 130, 140]),
+                                    age: 40, restingHR: nil)
+        let manager = WorkoutSessionManager()
+        XCTAssertNil(manager.activeZones)
+        let agg = WorkoutSessionAggregator(startDate: zt0, userAge: 40, zones: custom)
+        agg.add(sample: HRSample(bpm: 152, start: zt0, end: zt0.addingTimeInterval(10)))
+        manager.aggregator = agg
+        XCTAssertEqual(manager.activeZones, custom)
+        manager.recomputeLiveZones(agg: agg, now: zt0.addingTimeInterval(10))
+        XCTAssertEqual(manager.liveZoneBreakdown.extremeSeconds, 10, accuracy: 0.001)
+        XCTAssertEqual(manager.liveZoneBreakdown.anaerobicSeconds, 0)
+    }
+
+    // MARK: The active device's resting heart rate (SF-3, decision 29)
+
+    private func zonesStoreContainer() throws -> ModelContainer {
+        try ModelContainer(
+            for: StoredSample.self, StoredCursor.self, StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
+            StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
+            StoredHeadacheEntry.self, StoredHeadacheRisk.self,
+            configurations: ModelConfiguration(isStoredInMemoryOnly: true))
+    }
+
+    /// A day of readings 08:00-14:00 every 10 minutes at one rate, from `device`, yesterday.
+    private func insertReadings(_ bpm: Double, device: SyncDeviceID, into context: ModelContext) {
+        let cal = Calendar.current
+        let day = cal.date(byAdding: .day, value: -1, to: cal.startOfDay(for: Date()))!
+        for step in 0...36 {
+            let at = day.addingTimeInterval(8 * 3600 + Double(step) * 600)
+            context.insert(StoredSample(QuantitySample(kind: .heartRate, start: at, end: at, value: bpm), device: device))
+        }
+    }
+
+    func testPercentOfReserveReadsTheActiveDevicesRestingHeartRateNotAnotherDevicesLower() async throws {
+        let strap = SyncDeviceID.timeline(for: .zeppOS(model: "Helio Strap"), identityID: "STRAP-Z")
+        let container = try zonesStoreContainer()
+        insertReadings(48, device: .ringConn, into: container.mainContext)   // the ring's: lower
+        insertReadings(66, device: strap, into: container.mainContext)       // the strap's: the active device
+        try container.mainContext.save()
+
+        let override = OwnershipOverride()
+        defer { override.restore() }
+        override.install(.strapOwnsAllTime)
+        let off = await HeartRateZoneRestingHR.latest(container: container, log: .strapOwnsAllTime)
+        XCTAssertEqual(off ?? 0, 66, accuracy: 0.5, "the strap owns the present: only its readings")
+        XCTAssertEqual(HeartRateZoneRestingHR.latest(store: LocalStore(container.mainContext)) ?? 0, 66, accuracy: 0.5)
+
+        // With the ring as the active device, the ring's own value is read.
+        override.install(DeviceOwnershipLog(entries: [.init(family: .zeppOS, since: .distantPast),
+                                                       .init(family: .ringConn, since: Date().addingTimeInterval(-3 * 86_400))]))
+        let ringLog = DeviceOwnershipLog(entries: [.init(family: .zeppOS, since: .distantPast),
+                                                   .init(family: .ringConn, since: Date().addingTimeInterval(-3 * 86_400))])
+        let ring = await HeartRateZoneRestingHR.latest(container: container, log: ringLog)
+        XCTAssertEqual(ring ?? 0, 48, accuracy: 0.5)
+    }
+
+    // MARK: Settings preview (SF-4)
+
+    func testAnInvalidCustomDraftShowsTheLastValidSetInForce() {
+        let stored = HeartRateZoneDefaults.encode([100, 120, 140, 160, 180])
+        XCTAssertEqual(HeartRateZoneDefaults.customBoundsInForce(draft: [100, 120, 120, 160, 180], storedText: stored),
+                       [100, 120, 140, 160, 180])
+        XCTAssertEqual(HeartRateZoneDefaults.customBoundsInForce(draft: [90, 110, 130, 150, 170], storedText: stored),
+                       [90, 110, 130, 150, 170])
+        XCTAssertEqual(HeartRateZoneDefaults.customBoundsInForce(draft: [5, 4, 3, 2, 1], storedText: nil),
+                       HeartRateZoneSettings.defaultCustomLowerBounds)
+    }
 }

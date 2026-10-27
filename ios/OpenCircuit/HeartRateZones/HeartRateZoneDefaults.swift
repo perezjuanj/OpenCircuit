@@ -44,6 +44,14 @@ enum HeartRateZoneDefaults {
         return parts.count == 5 ? parts : nil
     }
 
+    /// The custom bounds in force while the Custom editor holds `draft`: the draft once it is valid, else
+    /// the last valid set that was stored (an invalid draft is never written).
+    static func customBoundsInForce(draft: [Int], storedText: String?) -> [Int] {
+        HeartRateZones.isValidCustom(draft)
+            ? draft
+            : (customBounds(storedText) ?? HeartRateZoneSettings.defaultCustomLowerBounds)
+    }
+
     /// The zones for `profile`. The age is floored at 1, as the workout zones always have been.
     static func zones(profile: UserProfile, restingHR: Double?,
                       defaults: UserDefaults = .standard) -> HeartRateZones {

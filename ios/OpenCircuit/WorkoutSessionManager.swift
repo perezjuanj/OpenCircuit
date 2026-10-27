@@ -103,7 +103,7 @@ final class WorkoutSessionManager: NSObject {
 
     // MARK: Private
 
-    private var aggregator: WorkoutSessionAggregator?
+    var aggregator: WorkoutSessionAggregator?   // internal (not private) so a test can seat one; only start() sets it
     private var sessionStart: Date?
     /// The session's time line: when the person paused and resumed (#283). Same type as the strap's.
     private var ledger: WorkoutActivityLedger?
@@ -344,7 +344,8 @@ final class WorkoutSessionManager: NSObject {
         let prepared = AutomaticWorkoutConfirmation.prepare(
             candidate: candidate,
             sport: sport,
-            profile: profile
+            profile: profile,
+            zones: await HeartRateZoneDefaults.currentZones()
         )
         let saved = await writeWorkout(
             summary: prepared.summary,
@@ -937,7 +938,7 @@ final class WorkoutSessionManager: NSObject {
 
     /// Live zone totals. A workout never paused keeps the original held attribution untouched; one
     /// that was paused runs it per running stretch so no reading is held across a pause (#283).
-    private func recomputeLiveZones(agg: WorkoutSessionAggregator, now: Date) {
+    func recomputeLiveZones(agg: WorkoutSessionAggregator, now: Date) {
         if let ledger, !ledger.pauses(until: now).isEmpty {
             liveZoneBreakdown = StrapWorkoutSummaryBuilder.zones(agg.collectedSamples, ledger: ledger, end: now, zones: agg.zones)
         } else {

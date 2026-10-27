@@ -320,4 +320,27 @@ final class HeartRateZonesTests: XCTestCase {
         XCTAssertEqual(TrainingLoad.workoutLoad(hrSamples: samples, zones: zones(.custom, custom: [101, 110, 120, 130, 140]),
                                                 sessionEnd: end), 4.0 * 30 / 60)
     }
+
+    // MARK: Auto-detected workout (83g SF-1)
+
+    func testADetectedWorkoutsSummaryUsesTheZonesItIsGiven() {
+        let profile = UserProfile(age: 40, weightKg: 70, heightCm: 175, sex: .male)
+        let samples = (1...60).map {
+            HistoricalSportFrame.Sample(cursor: UInt32(1_000_000 + $0 * 10), heartRate: 152, steps: 0)
+        }
+        let candidate = AutomaticWorkoutDetector.Candidate(
+            start: samples[0].endDate.addingTimeInterval(-10), end: samples.last!.endDate,
+            samples: samples, suggestedKind: nil)
+        // 152 bpm: Zone 4 on the default zones for a 180 max, Zone 5 on these.
+        let custom = zones(.custom, custom: [100, 110, 120, 130, 140])
+        let mine = AutomaticWorkoutConfirmation.prepare(candidate: candidate, sport: .yoga, profile: profile, zones: custom)
+        XCTAssertGreaterThan(mine.summary.zoneBreakdown.extremeSeconds, 0)
+        XCTAssertEqual(mine.summary.zoneBreakdown.anaerobicSeconds, 0)
+        let manual = AutomaticWorkoutConfirmation.prepare(candidate: candidate, sport: .yoga, profile: profile,
+                                                          zones: zones(manual: 200))
+        XCTAssertFalse(manual.summary.usedFormulaMaxHR)
+        let plain = AutomaticWorkoutConfirmation.prepare(candidate: candidate, sport: .yoga, profile: profile)
+        XCTAssertGreaterThan(plain.summary.zoneBreakdown.anaerobicSeconds, 0)
+        XCTAssertEqual(plain.summary.zoneBreakdown.extremeSeconds, 0)
+    }
 }

@@ -35,14 +35,20 @@ struct HeartRateZonesSettingsView: View {
         method == .custom && !HeartRateZones.isValidCustom(customDraft)
     }
 
-    /// What the preview shows: the buffers over the stored choices. An invalid buffer previews as the
-    /// fallback it would produce, and says so.
+    /// What the preview shows: the buffers over the stored choices. An invalid custom draft previews the
+    /// last valid set (the zones in force); the red note above the steppers says the draft is not used.
     private var previewZones: HeartRateZones {
         HeartRateZones(
             settings: HeartRateZoneSettings(method: method,
                                             manualMaxHR: useManualMax ? (manualValue ?? storedManual) : nil,
-                                            customLowerBounds: customDraft),
+                                            customLowerBounds: customBoundsInForce),
             age: max(age, 1), restingHR: restingHR)
+    }
+
+    /// The custom bounds every zone surface uses: the draft while it is valid, else the last valid set
+    /// that was stored (an invalid draft is never written), so the preview shows the zones in force.
+    private var customBoundsInForce: [Int] {
+        HeartRateZoneDefaults.customBoundsInForce(draft: customDraft, storedText: customText)
     }
 
     private var storedManual: Int? { MaxHeartRate.isValidManual(manualMaxHR) ? manualMaxHR : nil }

@@ -316,9 +316,10 @@ public enum AutomaticWorkoutConfirmation {
     public static func prepare(
         candidate: AutomaticWorkoutDetector.Candidate,
         sport: WorkoutSportType,
-        profile: UserProfile
+        profile: UserProfile,
+        zones: HeartRateZones? = nil
     ) -> Prepared {
-        let aggregator = WorkoutSessionAggregator(startDate: candidate.start, userAge: profile.age)
+        let aggregator = WorkoutSessionAggregator(startDate: candidate.start, userAge: profile.age, zones: zones)
         for sample in candidate.samples {
             guard let bpm = sample.heartRate else { continue }
             aggregator.add(sample: HRSample(
