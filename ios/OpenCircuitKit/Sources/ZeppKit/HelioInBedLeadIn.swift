@@ -128,7 +128,8 @@ extension HelioSleepSelection {
     /// and an `.awake` over one span with no asleep segment in it, `awakeFillRuns`) that lies before
     /// the night's first sleep fragment. Decision 74's awake fill only ever fills BETWEEN fragments,
     /// so a run before the first one can only be the lead-in. nil on a night with no lead-in, and on
-    /// every night a build before decision 77 stored.
+    /// every night a build before decision 77 stored. This judges the shape only: the app reads a stored
+    /// row as having a lead-in only when it is a strap night (decision 79b, `StoredSleepSummary.isStrapNight`).
     public static func leadIn(in segments: [SleepSegment]) -> DateInterval? {
         let runs = awakeFillRuns(in: segments)
         guard !runs.isEmpty else { return nil }

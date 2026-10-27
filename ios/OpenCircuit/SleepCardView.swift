@@ -1417,7 +1417,7 @@ struct SleepCardView: View {
     /// with no clock times) or no samples fall inside it (e.g. a night older than the query
     /// window). SpO₂ is stored 0…1 and surfaced as a whole percent.
     private func overnightAverages(_ night: Night) -> (hr: Int?, hrv: Int?, spo2: Int?)? {
-        guard let window = Self.overnightWindow(night, row: night.stageSource == .stored ? latest : nil) else { return nil }
+        guard let window = Self.overnightWindow(for: night, latest: latest) else { return nil }
         // Shared overnight-mean helper — the SAME computation the Vitals HRV/RR rows use, so the
         // two surfaces can't disagree (HRV "86 in Vitals vs 64 in Sleep" was a point-vs-mean clash).
         // The rows come grouped by kind from the off-main read, so `body` no longer walks them.
@@ -1429,6 +1429,13 @@ struct SleepCardView: View {
         let hrv = mean(.hrvSDNN).map { Int($0.rounded()) }
         let spo2 = mean(.spo2).map { Int(($0 * 100).rounded()) }   // SpO₂ stored 0…1, surfaced as %
         return (hr == nil && hrv == nil && spo2 == nil) ? nil : (hr, hrv, spo2)
+    }
+
+    /// The window the card's overnight averages read for the night it shows: `overnightWindow(_:row:)`
+    /// with the stored row `latest` when the night shown IS the stored one, never for a live staging.
+    /// The card's call line (decision 79d: one expression the view and a test both call).
+    static func overnightWindow(for night: Night, latest: StoredSleepSummary?) -> DateInterval? {
+        overnightWindow(night, row: night.stageSource == .stored ? latest : nil)
     }
 
     /// The window the overnight averages read: the night's in-bed window, from its SLEEP window's start

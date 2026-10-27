@@ -124,8 +124,7 @@ struct VitalsStatusCardView: View {
             // Decision 29: "today" is the current device's, so its readings and nights are the only
             // baseline (a new device shows "Building your baseline"). Every row with an empty log.
             let log = LocalStore.ownershipLog()
-            let nights = Self.ownNights(sleepNights, log: log)
-                .map(Self.reportNight)
+            let nights = Self.reportNights(sleepNights, log: log)
             let fbRestingHR = healthBaselineReport?.restingHR.map { (day: $0.day, value: $0.value) }
             let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
             let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
@@ -161,10 +160,23 @@ struct VitalsStatusCardView: View {
         }
     }
 
+    /// The nights `computeReport` reads: the current device's own (`ownNights`), each as `reportNight`.
+    /// The card's call line (decision 79d: one expression the view and a test both call).
+    static func reportNights(_ rows: [StoredSleepSummary], log: DeviceOwnershipLog)
+        -> [(night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date)] {
+        ownNights(rows, log: log).map { reportNight($0, log: log) }
+    }
+
     /// One stored night as `computeReport` reads it. Decision 77h: its sleep window, so a strap night's
-    /// in-bed lead-in is never averaged as overnight HRV.
+    /// in-bed lead-in is never averaged as overnight HRV. Decision 79a/79b: the RECORDED window, without
+    /// the recorded night's lead-in (an edited strap night included), and only a strap night has one.
+    static func reportNight(_ row: StoredSleepSummary, log: DeviceOwnershipLog) -> (night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date) {
+        (night: row.night, skinTempC: row.skinTempC, inBedStart: row.recordedSleepWindowStart(log: log), inBedEnd: row.inBedEnd)
+    }
+
+    /// `reportNight(_:log:)` with the store's ownership log.
     static func reportNight(_ row: StoredSleepSummary) -> (night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date) {
-        (night: row.night, skinTempC: row.skinTempC, inBedStart: row.sleepWindowInBedStart, inBedEnd: row.inBedEnd)
+        reportNight(row, log: LocalStore.ownershipLog())
     }
 
     /// The nights half of `currentDeviceRows`.

@@ -75,7 +75,12 @@ struct TrendsData {
         let night: Date
         let asleepMin, sleepScore, stressScore: Int
         let skinTempC: Double
+        /// The recorded in-bed window, a strap night's lead-in included: what the dashboard, Goals,
+        /// Wellness and the Health active-energy flushes take as the night (decision 79c).
         let inBedStart, inBedEnd: Date
+        /// Where the night's SLEEP window starts (decision 77h): `inBedStart` without a strap night's
+        /// lead-in. Only the vitals averages read it.
+        let sleepStart: Date
     }
     struct TempRow: Sendable { let time: Date; let celsius: Double }
     struct StepRow: Sendable { let start: Date; let end: Date; let delta: Int }
@@ -200,7 +205,8 @@ struct TrendsData {
             summaryByNight[cal.startOfDay(for: s.night)] = SleepRow(
                 night: s.night, asleepMin: s.asleepMin, sleepScore: s.sleepScore,
                 stressScore: s.stressScore, skinTempC: s.skinTempC,
-                inBedStart: s.sleepWindowInBedStart, inBedEnd: s.inBedEnd)   // 77h: the sleep window
+                inBedStart: s.inBedStart, inBedEnd: s.inBedEnd,
+                sleepStart: s.recordedSleepWindowStart(log: ownership))   // 77h, 79a, 79b: the sleep window
         }
         var stepsByDay: [Date: Int] = [:]
         for d in (try? context.fetch(LocalStore.recentDailiesDescriptor(limit: lookbackDays))) ?? [] {
@@ -249,8 +255,13 @@ struct TrendsData {
 
         return allDays.map { day -> TrendsEngine.DailyPoint in
             let s = i.summaryByNight[day]
+            // Decision 79c: the calories and exercise minutes leave out the night's whole in-bed window
+            // (a strap night's lead-in included), as the dashboard does; decision 77h: the vitals
+            // averages read its sleep window.
             let window = (s?.inBedStart ?? .distantPast) > Date.distantPast
                 ? DateInterval(start: s!.inBedStart, end: s!.inBedEnd) : nil
+            let sleepWindow = (s?.inBedStart ?? .distantPast) > Date.distantPast
+                ? DateInterval(start: s!.sleepStart, end: s!.inBedEnd) : nil
             let dayWindow = DateInterval(start: day, end: cal.date(byAdding: .day, value: 1, to: day) ?? day)
 
             func avg(_ samples: [QuantitySample], in w: DateInterval?, minVal: Double = 0) -> Double? {
@@ -300,10 +311,10 @@ struct TrendsData {
                 dayTempC:      daytimeTempsByDay[day].flatMap { vals in
                     vals.isEmpty ? nil : vals.reduce(0, +) / Double(vals.count)
                 },
-                sleepHRAvg:    avg(i.hr, in: window, minVal: TrendsEngine.minValidHR),
-                sleepHRVAvg:   avg(i.hrv, in: window),
-                sleepSpO2Avg:  avg(i.spo2, in: window),
-                sleepRRAvg:    avg(i.rr, in: window),
+                sleepHRAvg:    avg(i.hr, in: sleepWindow, minVal: TrendsEngine.minValidHR),
+                sleepHRVAvg:   avg(i.hrv, in: sleepWindow),
+                sleepSpO2Avg:  avg(i.spo2, in: sleepWindow),
+                sleepRRAvg:    avg(i.rr, in: sleepWindow),
                 dayHRAvg:      avg(i.hr, in: dayWindow, minVal: TrendsEngine.minValidHR),
                 dayHRVAvg:     avg(i.hrv, in: dayWindow),
                 daySpO2Avg:    avg(i.spo2, in: dayWindow),
