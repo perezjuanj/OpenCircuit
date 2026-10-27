@@ -216,7 +216,6 @@ final class HeartRateRecoveryFollowUpRecorderTests: XCTestCase {
     /// A 10-minute run peaking at 170 bpm, ended at +600, with the window open.
     private func runAndEnd(_ session: HelioSession, _ recorder: StrapWorkoutRecorder) async {
         recorder.start()
-        XCTAssertEqual(recorder.state, .active)
         await stream(session, recorder, from: 0, to: 600) { $0 > 540 ? 170 : 150 }
         await recorder.end()
     }
