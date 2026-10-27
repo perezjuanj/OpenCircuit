@@ -314,6 +314,9 @@ final class HelioSession: WearableSession {
     /// waits for it, so it can never take the link ahead of the sync (a running stream would stop the
     /// activation sync from starting: `HelioActivationSync`). Observed, so the auto-start re-asks.
     private(set) var activationSyncSettled = false
+    /// How many Measure streams this session has started: lets "live heart rate on open" tell its own stream
+    /// from one the person started right after stopping it (decision 81g, N2).
+    @ObservationIgnored private(set) var liveMeasureStarts = 0
     /// §16.5's fail-safes, each sent at most once per connection.
     @ObservationIgnored private var heartRateFailSafeSent = false
     @ObservationIgnored private var realtimeStepsOffSent = false
@@ -1142,6 +1145,7 @@ final class HelioSession: WearableSession {
     /// The authenticated stream: start, then `04 02` every second, stop after `duration`.
     func startLiveHeartRate(duration: TimeInterval = 60) {
         guard canStreamHeartRate, !liveHeartRateRunning, let transport else { return }
+        liveMeasureStarts += 1
         // A new measurement shows only its own readings (decision 30), never the last one's.
         liveHR = nil
         liveHRAt = nil

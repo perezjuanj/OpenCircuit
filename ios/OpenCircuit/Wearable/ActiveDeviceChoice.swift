@@ -57,6 +57,17 @@ enum ActiveDeviceChoice: String, CaseIterable, Sendable {
     }
 }
 
+extension ActiveDeviceChoice {
+    /// How long the device's heart-rate Measure runs, from the device's own constant (decision 81g, N3).
+    /// Exhaustive (decision 51e).
+    var liveHeartRateMeasureDuration: TimeInterval {
+        switch self {
+        case .ringConn: return RingSession.userHeartRateMeasureBudget
+        case .helioStrap: return StrapLiveHeartRate.duration
+        }
+    }
+}
+
 /// `ActiveDeviceChoice.autoLiveHeartRateOnOpen`.
 enum AutoLiveHeartRateOnOpenSupport: Equatable {
     /// The device can't start a live heart rate by itself.
