@@ -206,6 +206,22 @@ final class StrapLeadInRecordedReadersTests: XCTestCase {
         }
     }
 
+    /// `saveNap`'s overlap backstop (an auto nap is not stored over a night's sleep, 77j) reads an edited
+    /// strap night's RECORDED window without its recorded lead-in, and the edited window whole. The night
+    /// was recorded in bed from 22:00 (asleep from 23:00) and edited to bed at 22:30: a nap 22:05–22:25 lies
+    /// in the recorded lead-in only, so it is stored; one 22:35–22:58 lies in the edited window, so it isn't.
+    func testTheNapBackstopReadsAnEditedNightWithoutItsRecordedLeadIn() throws {
+        let store = try editedFixture(leadIn: true, movedBedtime: true).store
+        let row = try latest(store)
+        XCTAssertEqual(row.recordedSleepWindowInBedStart, bed(0))
+        let inLeadIn = (start: leadInStart(0).addingTimeInterval(5 * 60), end: leadInStart(0).addingTimeInterval(25 * 60))
+        try store.saveNap(start: inLeadIn.start, end: inLeadIn.end, asleepMin: 20, isLongNap: false, family: .zeppOS)
+        let inEdited = (start: leadInStart(0).addingTimeInterval(35 * 60), end: leadInStart(0).addingTimeInterval(58 * 60))
+        try store.saveNap(start: inEdited.start, end: inEdited.end, asleepMin: 23, isLongNap: false, family: .zeppOS)
+        let naps = try store.context.fetch(FetchDescriptor<StoredNap>()).map { DateInterval(start: $0.start, end: $0.end) }
+        XCTAssertEqual(naps, [DateInterval(start: inLeadIn.start, end: inLeadIn.end)])
+    }
+
     /// The edited window is the person's own: the readers of the CURRENT window (the Sleep card's overnight
     /// averages, the headache HRV and bedtime) read it from its start, lead-in shape or not.
     func testTheEditedWindowIsNeverTrimmed() throws {
@@ -268,6 +284,25 @@ final class StrapLeadInRecordedReadersTests: XCTestCase {
         let point = try XCTUnwrap(trends.points.first { calendar.isDate($0.date, inSameDayAs: day(0)) })
         let readings = (0..<12).map { _ in 82.0 } + (0..<96).map { _ in 58.0 }
         XCTAssertEqual(try XCTUnwrap(point.sleepHRAvg), readings.reduce(0, +) / Double(readings.count), accuracy: 1e-9)
+    }
+
+    /// A lead-in that starts at the strap's ownership start, a switch recorded at a fraction of a second
+    /// (77c's floor), is read like any other: the hypnogram is stored to the whole second and the in-bed
+    /// start is not, so the readers match the two within a second.
+    func testALeadInStartingAtAFractionOfASecondIsReadWithoutIt() throws {
+        let switchedAt = leadInStart(0).addingTimeInterval(0.4)
+        ownership.install(DeviceOwnershipLog(entries: [.init(family: .zeppOS, since: switchedAt)]))
+        let store = LocalStore(try makeContainer().mainContext)
+        try save(strapSegments(bed: bed(0), end: wake(0), leadIn: switchedAt), store: store, device: strap)
+        let row = try latest(store)
+        XCTAssertEqual(row.inBedStart, switchedAt)
+        XCTAssertNotEqual(HelioSleepSelection.leadIn(in: SleepHypnogramCodec.decode(row.hypnogramData))?.start, switchedAt,
+                          "the stored hypnogram is whole seconds")
+        XCTAssertEqual(row.recordedSleepWindowStart(log: LocalStore.ownershipLog()), bed(0))
+        XCTAssertEqual(row.sleepWindowStart(from: row.inBedStart), bed(0))
+        XCTAssertEqual(VitalsStatusCardView.reportNight(row).inBedStart, bed(0))
+        let night = try XCTUnwrap(SleepCardView.selectNight(liveSegments: [], stored: row))
+        XCTAssertEqual(SleepCardView.overnightWindow(for: night, latest: row)?.start, bed(0))
     }
 
     // MARK: 79c: Trends' calories read the in-bed window, like the dashboard

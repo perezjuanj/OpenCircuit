@@ -181,10 +181,13 @@ extension StoredSleepSummary {
     var recordedSleepWindowInBedStart: Date { recordedSleepWindowStart(log: LocalStore.ownershipLog()) }
 
     /// The end of the lead-in a strap night recorded over `start…end` with `hypnogram` starts with, or nil.
+    /// The hypnogram is stored to the whole second (`SleepHypnogramCodec`), the in-bed columns are not: a
+    /// lead-in that starts at the strap's ownership start (a switch recorded at `now`, 77c) starts at a
+    /// fraction of a second, so the lead-in's start is matched to `start` within a second.
     private static func leadInEnd(recordedColumns hypnogram: Data, from start: Date, to end: Date, isStrap: Bool) -> Date? {
         guard isStrap, end > start, !hypnogram.isEmpty,
               let lead = HelioSleepSelection.leadIn(in: SleepHypnogramCodec.decode(hypnogram)),
-              lead.start == start, lead.end < end else { return nil }
+              abs(lead.start.timeIntervalSince(start)) <= 1, lead.end < end else { return nil }
         return lead.end
     }
 }
