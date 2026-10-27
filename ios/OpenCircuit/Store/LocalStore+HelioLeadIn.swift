@@ -71,14 +71,15 @@ extension LocalStore {
     /// over a nap). A stored night that runs into `instant` is this night's own earlier copy and is
     /// not a sleep before it. `.distantPast` when none.
     ///
-    /// Known limit, documented and not fixed in this PR (ZEPP_PROTOCOL.md §21.6): the clamp applies when
-    /// the night is derived. A night stored BEFORE the sync that first sees a nap more than 60 min before
-    /// its sleep onset keeps the lead-in it was stored with while it is not re-delivered changed (the
-    /// merge keeps the stored copy, which has more time in bed), so the lead-in can lie over that nap by
-    /// up to the clamp difference (at most the 120 min cap): in Health an `inBed` overlap and an `awake`
-    /// sample over the nap's asleep one, asleep time not counted twice. It converges when the night comes
-    /// back changed enough for the merge to replace it. Rare on the production fetch: a session nap comes
-    /// with any later sync of the night, and a block nap with the night's own activity round.
+    /// The clamp applies when the night is derived. A night stored BEFORE the sync that first sees a nap
+    /// more than 60 min before its sleep onset was stored with a lead-in over that nap; the next
+    /// re-delivery replaces it while the night is not in Apple Health (decision 79e,
+    /// `helioStoredLeadInIsStale`). Known limit, documented and not fixed (ZEPP_PROTOCOL.md §21.6): a
+    /// night already WRITTEN keeps that lead-in (77f, forward-only), so it can lie over the nap by up to
+    /// the clamp difference (at most the 120 min cap): in Health an `inBed` overlap and an `awake` sample
+    /// over the nap's asleep one, asleep time not counted twice. It converges only when the night comes
+    /// back extended (58b). Rare on the production fetch: a session nap comes with any later sync of the
+    /// night, and a block nap with the night's own activity round.
     func helioLatestSleepEnd(atOrBefore instant: Date, sleeps: [DateInterval] = []) -> Date {
         // Rows are keyed by the day they end on, naps by their start: two days back reaches every
         // sleep that can end within `maxLength` of `instant`.
@@ -99,24 +100,96 @@ extension LocalStore {
     }
 }
 
+extension LocalStore {
+    /// Decision 79e (#331 item 1): whether `night` (`sleep` with its lead-in) replaces the stored copy of
+    /// its night instead of going to the merge: only while the night is NOT written to Apple Health
+    /// (`writtenNightSpan(for: sleep)`; a written night is left as 77f leaves it) and only a stored copy
+    /// with a stale lead-in (`helioStoredLeadInIsStale`).
+    func helioReplacesStoredCopy(with night: HelioSleepSelection.Night, sleep: HelioSleepSelection.Night) -> Bool {
+        writtenNightSpan(for: sleep) == nil && helioStoredLeadInIsStale(for: night)
+    }
+
+    /// Decision 79e: whether the stored copy of `night` (the row its window overlaps) is the
+    /// same night with a lead-in that starts EARLIER than `night`'s: an unedited strap night whose sleep
+    /// window (its window without its lead-in) is `night`'s, within a second, stored with a lead-in from
+    /// before `night`'s start. That copy was stored before a nap that now clamps the lead-in (77c), and
+    /// the merge would keep it (the same sleep, more time in bed). False for every other stored row: a
+    /// different sleep window goes to the merge as before.
+    func helioStoredLeadInIsStale(for night: HelioSleepSelection.Night) -> Bool {
+        guard let row = try? sleepSummaryOverlapping(start: night.window.start, end: night.window.end),
+              !row.isManuallyEdited, row.isStrapNight(log: Self.ownershipLog()), row.inBedStart < night.window.start
+        else { return false }
+        let sleep = HelioSleepSelection.windowWithoutLeadIn(SleepHypnogramCodec.decode(row.hypnogramData),
+                                                            window: DateInterval(start: row.inBedStart, end: row.inBedEnd))
+        let incoming = night.windowWithoutLeadIn
+        return sleep.start > row.inBedStart
+            && abs(sleep.start.timeIntervalSince(incoming.start)) <= 1 && abs(sleep.end.timeIntervalSince(incoming.end)) <= 1
+    }
+}
+
 // MARK: - 77h: the night's sleep window for every reader that averages its vitals
 
 extension StoredSleepSummary {
+    /// Decision 79b (#331 item 3): whether this row is a strap night, so it may carry a lead-in. The
+    /// lead-in is recognised by its shape (`HelioSleepSelection.leadIn(in:)`), and only the strap's store
+    /// path adds one, so a row is read as having one only when the strap owns its night: the device you
+    /// went to bed with (decision 28a, `owner(ofNightFrom:to:)`, the owner at the in-bed start). A strap
+    /// night's lead-in never starts before the strap's ownership start (77c), so every strap row passes;
+    /// a ring row of the same shape doesn't, and with an empty log (a ring-only install) no row does.
+    /// No schema change: the ownership log is the store's rule for a row's device (decision 28).
+    func isStrapNight(log: DeviceOwnershipLog) -> Bool {
+        inBedEnd > inBedStart && log.owner(ofNightFrom: inBedStart, to: inBedEnd) == .zeppOS
+    }
+
     /// Decision 77h (#328): where the night's SLEEP window starts when a reader's window starts at
     /// `start`: the end of a strap night's in-bed lead-in when `start` is that lead-in's start, else
     /// `start` itself. The lead-in is no sleep, so a reader that averages a night's vitals (the illness
     /// alert, Vitals Status, the Sleep card's overnight averages, Trends, the headache HRV and bedtime
-    /// regularity) reads the night as build 88 stored it. A ring night, a night without a lead-in and a
-    /// manually edited night (the person's own window) return `start` unchanged.
-    func sleepWindowStart(from start: Date) -> Date {
-        guard !isManuallyEdited, start == inBedStart, inBedEnd > inBedStart, !hypnogramData.isEmpty,
-              let lead = HelioSleepSelection.leadIn(in: SleepHypnogramCodec.decode(hypnogramData)),
-              lead.start == start, lead.end < inBedEnd else { return start }
-        return lead.end
+    /// regularity) reads the night as build 88 stored it. A ring night (79b), a night without a lead-in
+    /// and a manually edited night return `start` unchanged: this reads the window a reader of the
+    /// CURRENT window sees, and an edited window is the person's own (79a). A reader of the RECORDED
+    /// columns uses `recordedSleepWindowStart(log:)`.
+    func sleepWindowStart(from start: Date, log: DeviceOwnershipLog) -> Date {
+        guard !isManuallyEdited, start == inBedStart else { return start }
+        return Self.leadInEnd(recordedColumns: hypnogramData, from: inBedStart, to: inBedEnd,
+                              isStrap: isStrapNight(log: log)) ?? start
     }
 
-    /// `sleepWindowStart(from: inBedStart)`: the recorded in-bed start without a strap night's lead-in.
+    /// `sleepWindowStart(from:log:)` with the store's ownership log.
+    @MainActor
+    func sleepWindowStart(from start: Date) -> Date { sleepWindowStart(from: start, log: LocalStore.ownershipLog()) }
+
+    /// `sleepWindowStart(from: inBedStart)`: the in-bed start without a strap night's lead-in, as a reader
+    /// of the current window sees it (an edited night: the recorded start, untouched).
+    @MainActor
     var sleepWindowInBedStart: Date { sleepWindowStart(from: inBedStart) }
+
+    /// Decision 79a (#331 item 2): the RECORDED in-bed start (`inBedStart`) without the recorded night's
+    /// lead-in, for every reader of the recorded columns (the illness alert, Vitals Status, Trends' vitals
+    /// averages, the strap's nap backstop). A manual edit rewrites `hypnogramData` but leaves the recorded
+    /// columns frozen, lead-in included, so on an edited row the recorded night's lead-in is read from
+    /// `recordedHypnogramData`, the recording the edit never touches. An unedited row reads exactly what
+    /// `sleepWindowStart(from: inBedStart, log:)` reads; a ring row (79b), a night without a lead-in and
+    /// an edited row with no recording kept return `inBedStart`.
+    func recordedSleepWindowStart(log: DeviceOwnershipLog) -> Date {
+        Self.leadInEnd(recordedColumns: isManuallyEdited ? recordedHypnogramData : hypnogramData,
+                       from: inBedStart, to: inBedEnd, isStrap: isStrapNight(log: log)) ?? inBedStart
+    }
+
+    /// `recordedSleepWindowStart(log:)` with the store's ownership log.
+    @MainActor
+    var recordedSleepWindowInBedStart: Date { recordedSleepWindowStart(log: LocalStore.ownershipLog()) }
+
+    /// The end of the lead-in a strap night recorded over `start…end` with `hypnogram` starts with, or nil.
+    /// The hypnogram is stored to the whole second (`SleepHypnogramCodec`), the in-bed columns are not: a
+    /// lead-in that starts at the strap's ownership start (a switch recorded at `now`, 77c) starts at a
+    /// fraction of a second, so the lead-in's start is matched to `start` within a second.
+    private static func leadInEnd(recordedColumns hypnogram: Data, from start: Date, to end: Date, isStrap: Bool) -> Date? {
+        guard isStrap, end > start, !hypnogram.isEmpty,
+              let lead = HelioSleepSelection.leadIn(in: SleepHypnogramCodec.decode(hypnogram)),
+              abs(lead.start.timeIntervalSince(start)) <= 1, lead.end < end else { return nil }
+        return lead.end
+    }
 }
 
 extension LocalStore {
