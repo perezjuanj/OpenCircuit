@@ -506,7 +506,13 @@ struct StrapWorkoutHooks: ViewModifier {
             // One app-lifetime observer handles either active device; it pauses locally and asks
             // before resuming after the last call ends (#283).
             .modifier(WorkoutCallPausePrompt(coordinator: .shared))
-            .onAppear { WorkoutCallPauseCoordinator.shared.start(ring: ringManager) }
+            .onAppear {
+                WorkoutCallPauseCoordinator.shared.start(ring: ringManager)
+                // Review-indoor-run-b S3: an indoor workout saved after its prompt (84j) reloads the
+                // history and Today's recent workouts once it is in Health, not when the sheet closed.
+                recorder.onDeferredWorkoutSaved = onWorkoutsChanged
+                ringManager.onDeferredWorkoutSaved = onWorkoutsChanged
+            }
             .task {
                 recorder.resolveOrphan()
                 recorder.landPendingHeartRate()

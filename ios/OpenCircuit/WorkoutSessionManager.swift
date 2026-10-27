@@ -140,6 +140,15 @@ final class WorkoutSessionManager: NSObject {
     }
     private var pendingRingSave: PendingRingSave?
     private var saveDeadlineTask: Task<Void, Never>?
+    /// The deferred save, for tests to await.
+    private(set) var deferredSaveTask: Task<Void, Never>?
+    /// A waiting workout's readings and pauses on disk (84l). Injectable for tests.
+    var pendingReadings: any RingPendingWorkoutStoring = RingPendingWorkoutFile()
+    /// Test seam: replaces `writeWorkout` for the deferred and recovered saves only (the save at End,
+    /// every other sport's, never goes through it).
+    var deferredWriteOverride: ((WorkoutSummary, [HRSample], [DateInterval], Double?, Bool) async -> Bool)?
+    /// Called once a deferred save has finished (review-indoor-run-b S3): ContentView reloads the history.
+    var onDeferredWorkoutSaved: (() -> Void)?
 
     /// Drives the workout Live Activity (Lock Screen + Dynamic Island: time / calories / BPM). Owns
     /// all ActivityKit calls so this manager stays a plain state machine. No-op when the user has
@@ -304,7 +313,11 @@ final class WorkoutSessionManager: NSObject {
     /// and died with the process; the snapshot records how MANY readings there were so the UI can
     /// say so, but reconstructing samples from a count would be fabrication. The zone breakdown is
     /// therefore empty and the summary screen's "No HR zone data captured" branch tells the truth.
-    func saveRecoveredWorkout(_ recovered: RecoveredWorkout) async -> Bool {
+    func saveRecoveredWorkout(_ recovered: RecoveredWorkout, store recoveredStore: LocalStore? = nil) async -> Bool {
+        // 84l (review-indoor-run-b B1): an indoor run killed while it waited for its distance prompt left
+        // its readings and pauses on disk. Taken (and removed) before the write, so they are written and
+        // landed once.
+        let pending = pendingReadings.take(start: recovered.start)
         let summary = WorkoutSummary(
             sport: recovered.sport,
             startDate: recovered.start,
@@ -318,9 +331,17 @@ final class WorkoutSessionManager: NSObject {
             hrSampleCount: recovered.hrSampleCount,
             steps: nil,
             usedFormulaMaxHR: true)
-        // An indoor run killed while it waited for its distance prompt (84j): saved with its step estimate.
-        return await writeWorkout(summary: summary, hrSamples: [], routeLocations: [],
-                                  indoorDistanceMeters: recovered.indoorEstimateMeters)
+        // An indoor run killed while it waited for its distance prompt (84j): saved with its step estimate
+        // and, from the file, its heart-rate readings and pauses, which then land in LocalStore after the
+        // write as a normal save's do (84l). Every other recovered workout: no file, exactly as before.
+        guard let pending else {
+            return await writeWorkout(summary: summary, hrSamples: [], routeLocations: [],
+                                      indoorDistanceMeters: recovered.indoorEstimateMeters)
+        }
+        let saved = await writeDeferred(summary: summary, hrSamples: pending.hrSamples, pauses: pending.pauses,
+                                        distance: recovered.indoorEstimateMeters, typed: false)
+        await landWorkoutHeartRate(pending.hrSamples, into: recoveredStore ?? store)
+        return saved
     }
 
     private weak var session: RingSession?
@@ -329,7 +350,8 @@ final class WorkoutSessionManager: NSObject {
     /// to. Without this, a workout's HR only ever reached HealthKit via its own HKWorkoutBuilder
     /// write; LocalStore (and anything reading from it, like GoalsCardView) never saw it, so a
     /// fully-tracked workout with clearly elevated HR throughout still counted 0 Activity minutes.
-    private var store: LocalStore?
+    /// Internal (not private) so the 84l tests can give a manager built without `start` its store.
+    var store: LocalStore?
 
     // MARK: HealthKit
 
@@ -718,11 +740,8 @@ final class WorkoutSessionManager: NSObject {
         // launch exactly as any interrupted workout. Every other workout is saved below, at End.
         let waitsForPrompt = (indoor?.log.total ?? 0) > 0
         if waitsForPrompt {
-            let snapshot = WorkoutSessionSnapshot(
-                sport: summary.sport, startDate: summary.startDate, lastAliveAt: endDate,
-                hrSampleCount: summary.hrSampleCount, activeKcal: summary.estimatedActiveKcal,
-                avgHR: summary.avgHR, maxHR: summary.maxHR, indoorEstimateMeters: indoor?.estimatedMeters)
-            if let data = snapshot.encoded() { UserDefaults.standard.set(data, forKey: Self.sessionSnapshotKey) }
+            beginWaitingSave(summary: summary, end: endDate, hrSamples: agg.collectedSamples, pauses: pauses,
+                             estimate: indoor?.estimatedMeters, unresolve: { unresolve() })
         }
 
         // Dismiss the Live Activity now (before the slower HealthKit write) so it clears as the
@@ -736,8 +755,6 @@ final class WorkoutSessionManager: NSObject {
         // Write to HealthKit (best-effort; gracefully silent on failure).
         let saved: Bool
         if waitsForPrompt {
-            pendingRingSave = PendingRingSave(summary: summary, hrSamples: agg.collectedSamples, pauses: pauses,
-                                              estimate: indoor?.estimatedMeters, unresolve: { unresolve() })
             saved = false
         } else {
             saved = await writeWorkout(summary: summary,
@@ -788,7 +805,7 @@ final class WorkoutSessionManager: NSObject {
         // drags the O(n) math onto the main thread. Every chunk still runs AFTER the banked
         // active-energy credit, so a `flushHealth()` that lands between chunks still nets out
         // exactly as the single-shot write did.
-        if !waitsForPrompt { await landWorkoutHeartRate(agg.collectedSamples) }
+        if !waitsForPrompt { await landWorkoutHeartRate(agg.collectedSamples, into: store) }
 
         // #232: VO₂ max estimate for an outdoor run. Runs after the HR ingest above, so nothing
         // here sits between the workout's active-energy credit and that ingest, and its Health write
@@ -842,7 +859,7 @@ final class WorkoutSessionManager: NSObject {
     /// The ring workout's readings into `LocalStore` (#241 / decision 46: `landRingWorkoutHeartRate`,
     /// chunked, under a background-task assertion). Moved here unchanged from `stop()` so the indoor
     /// run's deferred save (#339, decision 84j) lands them the same way, after ITS `writeWorkout`.
-    private func landWorkoutHeartRate(_ samples: [HRSample]) async {
+    private func landWorkoutHeartRate(_ samples: [HRSample], into store: LocalStore?) async {
         if let store {
             // PARTIAL-WRITE HARDENING (review MF3): the crash scenario this fixes IS "user
             // backgrounds right after the summary", so this chunked loop very often runs as the app
@@ -960,24 +977,55 @@ final class WorkoutSessionManager: NSObject {
     /// writes the workout twice, `stop()`'s rule), then one `HKWorkout` with the typed distance or the
     /// step estimate, the readings landed after it (the active-energy credit ordering), and the indoor
     /// run's own writes.
-    private func saveWaitingWorkout(typedMeters: Double?) {
+    func saveWaitingWorkout(typedMeters: Double?) {
         guard let pending = pendingRingSave else { return }
         pendingRingSave = nil
         saveDeadlineTask?.cancel()
         saveDeadlineTask = nil
         Self.clearSessionSnapshot()
+        pendingReadings.clear()   // 84l: dropped with the snapshot, before the write
         let finish = indoorRun
-        Task { [weak self] in
+        let store = store
+        deferredSaveTask = Task { [weak self] in
             guard let self else { return }
-            let saved = await self.writeWorkout(summary: pending.summary, hrSamples: pending.hrSamples,
-                                                routeLocations: [], pauses: pending.pauses,
-                                                indoorDistanceMeters: typedMeters ?? pending.estimate,
-                                                indoorDistanceTyped: typedMeters != nil)
+            let saved = await self.writeDeferred(summary: pending.summary, hrSamples: pending.hrSamples,
+                                                 pauses: pending.pauses, distance: typedMeters ?? pending.estimate,
+                                                 typed: typedMeters != nil)
             if !saved { pending.unresolve() }
-            await self.landWorkoutHeartRate(pending.hrSamples)
+            await self.landWorkoutHeartRate(pending.hrSamples, into: store)
             finish?.workoutSaveFinished(saved: saved)
+            // Review-indoor-run-b S3: the history and Today reloads waited for this save.
+            self.onDeferredWorkoutSaved?()
         }
     }
+
+    /// Stop's half of the wait (84j, 84l): the pending save in memory, and on disk the snapshot (closed at
+    /// End, with the step estimate) plus the readings and pauses, so a kill at any point after End is
+    /// offered back and saved with them (`saveRecoveredWorkout`).
+    func beginWaitingSave(summary: WorkoutSummary, end: Date, hrSamples: [HRSample], pauses: [DateInterval],
+                          estimate: Double?, unresolve: @escaping () -> Void) {
+        pendingRingSave = PendingRingSave(summary: summary, hrSamples: hrSamples, pauses: pauses,
+                                          estimate: estimate, unresolve: unresolve)
+        let snapshot = WorkoutSessionSnapshot(
+            sport: summary.sport, startDate: summary.startDate, lastAliveAt: end,
+            hrSampleCount: summary.hrSampleCount, activeKcal: summary.estimatedActiveKcal,
+            avgHR: summary.avgHR, maxHR: summary.maxHR, indoorEstimateMeters: estimate)
+        if let data = snapshot.encoded() { UserDefaults.standard.set(data, forKey: Self.sessionSnapshotKey) }
+        pendingReadings.save(RingPendingWorkout(start: summary.startDate, hrSamples: hrSamples, pauses: pauses))
+    }
+
+    /// The deferred and recovered saves' Health write: `writeWorkout`, or the test seam.
+    private func writeDeferred(summary: WorkoutSummary, hrSamples: [HRSample], pauses: [DateInterval],
+                               distance: Double?, typed: Bool) async -> Bool {
+        if let deferredWriteOverride {
+            return await deferredWriteOverride(summary, hrSamples, pauses, distance, typed)
+        }
+        return await writeWorkout(summary: summary, hrSamples: hrSamples, routeLocations: [], pauses: pauses,
+                                  indoorDistanceMeters: distance, indoorDistanceTyped: typed)
+    }
+
+    /// The person discarded an interrupted workout: its readings go too.
+    func discardPendingReadings() { pendingReadings.clear() }
 
     // ⚠️ OWNERSHIP — CORRECTED (tester report 2026-08-29, build 49). This note used to end "Ring
     // teardown (`stopLiveMonitoring`) is handled by `stop()` via the view's `.onDisappear` (#75)".

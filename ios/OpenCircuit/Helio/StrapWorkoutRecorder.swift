@@ -153,6 +153,8 @@ struct StrapWorkoutWrite {
     let timeline: SyncDeviceID
     /// An indoor run or walk's step-based distance (#339), nil otherwise.
     var indoorDistance: IndoorDistanceWrite? = nil
+    /// A recovered indoor run's recovery-window writes, owed after its save (84l), nil otherwise.
+    var pendingRecovery: StrapWorkoutPendingRecovery? = nil
 }
 
 @MainActor
@@ -433,6 +435,8 @@ final class StrapWorkoutRecorder {
     /// The recovery window's Health writes, held until the waiting workout is saved (84j): HRR and
     /// Cardio Recovery describe a workout, so they never reach Health before it.
     @ObservationIgnored private var recoveryWritesAwaitingSave: ((Bool) -> Void)?
+    /// Called once a deferred save has finished (review-indoor-run-b S3): the history reloads then.
+    @ObservationIgnored var onDeferredWorkoutSaved: (() -> Void)?
     /// Readings received during the open pause (82d measures from the end, and a workout ended while
     /// paused ended where the pause began). Cleared at every pause and resume.
     @ObservationIgnored private var pausedReadings: [HRSample] = []
@@ -1022,6 +1026,14 @@ final class StrapWorkoutRecorder {
         // go once it is saved (`saveWaitingWorkout`). The held-back sync below doesn't wait.
         if pendingSave != nil || saveInFlight {
             recoveryWritesAwaitingSave = startWrites
+            // 84l (review-indoor-run-b S2): also on disk with the waiting workout's journal, so a kill
+            // before its save still writes them once, after the recovered save (`writeRecovered`).
+            if pendingSave != nil, var kept = journal.loadJournal() {
+                let drop = outcome.oneMinute.drop.flatMap { $0 > 0 ? $0 : nil }
+                kept.pendingRecovery = StrapWorkoutPendingRecovery(readings: readings, cardioRecoveryBPM: drop,
+                                                                   cardioAt: cardioAt)
+                journal.saveJournal(kept)
+            }
         } else {
             startWrites(saved)
         }
@@ -1113,6 +1125,7 @@ final class StrapWorkoutRecorder {
             let writes = self.recoveryWritesAwaitingSave
             self.recoveryWritesAwaitingSave = nil
             writes?(saved)
+            self.onDeferredWorkoutSaved?()
         }
     }
 
@@ -1302,7 +1315,7 @@ final class StrapWorkoutRecorder {
         // An indoor run killed while it waited for its distance prompt (84j): saved with its step estimate.
         let indoorDistance = recovered.indoorEstimateMeters.map { IndoorDistanceWrite(meters: $0) }
         return StrapWorkoutWrite(summary: summary, samples: counted, route: [], timeline: timeline,
-                                 indoorDistance: indoorDistance)
+                                 indoorDistance: indoorDistance, pendingRecovery: recovered.pendingRecovery)
     }
 
     /// Save's async half: one `HKWorkout` over the recovered span, with its readings.
@@ -1310,6 +1323,16 @@ final class StrapWorkoutRecorder {
         let saved = await health.save(write)
         helioLog.notice("helio: interrupted workout saved to Health \(saved, privacy: .public)")
         landPendingHeartRate()
+        // 84l (review-indoor-run-b S2): the recovery window's writes a kill left owed, once, after the
+        // workout they describe. Cardio Recovery only for a saved workout (82e's rule).
+        if let owed = write.pendingRecovery, let recoveryHealth {
+            if !owed.readings.isEmpty {
+                _ = await recoveryHealth.saveRecoveryHeartRate(owed.readings, timeline: write.timeline)
+            }
+            if saved, let bpm = owed.cardioRecoveryBPM {
+                _ = await recoveryHealth.saveCardioRecovery(bpm, at: owed.cardioAt, timeline: write.timeline)
+            }
+        }
         return saved
     }
 

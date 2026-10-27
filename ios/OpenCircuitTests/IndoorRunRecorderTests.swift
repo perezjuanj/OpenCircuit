@@ -679,6 +679,92 @@ final class IndoorRunRecorderTests: XCTestCase {
         XCTAssertNotNil(rig.recorder.heartRateRecovery?.oneMinute.drop)
     }
 
+    // MARK: Review-indoor-run-b fixes (84l)
+
+    /// S1 (the reviewer's probe, pure): the deadline's save already started with the estimate when the
+    /// distance is typed. The typed distance reaches Health through the replace path after that save,
+    /// and the summary claims nothing before it has.
+    func testADistanceTypedWhileTheDeadlineSaveRunsReplacesTheEstimateAfterIt() async {
+        let health = IndoorHealth()
+        let finish = IndoorRunFinish(inputs: steadyInputs(), workoutSaved: nil, health: health,
+                                     calibrations: IndoorStrideCalibrations(defaults()))
+        var requested: [Double?] = []
+        finish.saveWorkout = { requested.append($0) }
+        finish.endWait(.timedOut)                               // save in flight, with the estimate
+        finish.submit(typedMeters: 3_900, inclinePercent: nil)  // typed before it finished
+        XCTAssertNil(finish.distanceStatus, "nothing is claimed while the save runs")
+        finish.workoutSaveFinished(saved: true)
+        XCTAssertNil(finish.distanceStatus, "nor before the replace ran")
+        await finish.writeTask?.value
+        XCTAssertEqual(requested.count, 1)
+        XCTAssertNil(requested.first ?? 0, "that save carried the estimate")
+        XCTAssertEqual(health.replacements.map(\.meters), [3_900], "the typed distance replaces it")
+        XCTAssertEqual(finish.distanceStatus, .saved)
+        XCTAssertEqual(health.metrics.map(\.estimated), [true, false], "estimated set, then the calibrated one")
+        XCTAssertEqual(health.vo2.count, 1)
+    }
+
+    /// S1 through the real strap recorder (the reviewer's second probe): one workout save, and the typed
+    /// 750 m reaches Health.
+    func testADistanceTypedWhileTheDeadlineSaveRunsReachesHealthThroughTheRecorder() async throws {
+        let rig = makeRig()
+        let finish = try await endedRun(rig)
+        rig.recorder.saveIfDeadlinePassed(now: at(900))   // the deadline: the save Task exists, not yet run
+        finish.submit(typedMeters: 750, inclinePercent: nil)
+        await settle(rig)
+        await finish.writeTask?.value
+        XCTAssertEqual(rig.health.writes.count, 1, "one workout save")
+        XCTAssertEqual(rig.health.writes.last?.indoorDistance?.typed, false)
+        XCTAssertEqual(rig.indoor.replacements.map(\.meters), [750])
+        XCTAssertTrue(IndoorRunSummarySection.notes(finish).contains("Distance saved to Apple Health."))
+    }
+
+    /// S2: the recovery window closed while the workout waited, then the app died. The next launch's
+    /// recovered save writes the recovery readings and Cardio Recovery once, after the workout.
+    func testAKillAfterTheRecoveryWindowClosedStillWritesItsRecoveryOnceAfterTheRecoveredSave() async throws {
+        let journal = Journal()
+        let rig = makeRig(journal: journal, recoveryWindow: true)
+        _ = try await endedRun(rig, bpm: 170)
+        var s = 301.0
+        while rig.recorder.isMeasuringRecovery, s <= 440 {
+            now = at(s)
+            rig.source.heartRate(160 - Int((s - 300) / 4), at: now)
+            await rig.recorder.tick(now: now)
+            s += 1
+        }
+        XCTAssertFalse(rig.recorder.isMeasuringRecovery)
+        let owed = try XCTUnwrap(journal.journal?.pendingRecovery, "persisted with the waiting workout")
+        XCTAssertFalse(owed.readings.isEmpty)
+        let bpm = try XCTUnwrap(owed.cardioRecoveryBPM)
+        XCTAssertEqual(owed.cardioAt, at(360))
+        XCTAssertEqual(rig.recovery?.readingWrites, 0)
+
+        // The process dies here. The next launch:
+        let relaunched = makeRig(journal: journal, recoveryWindow: true)
+        relaunched.recorder.resolveOrphan(now: at(4_000))
+        let saved = await relaunched.recorder.saveRecovered()
+        XCTAssertTrue(saved)
+        XCTAssertEqual(relaunched.log.events, ["workout saved", "recovery readings saved", "cardio recovery saved"])
+        XCTAssertGreaterThan(bpm, 0)
+        let again = await relaunched.recorder.saveRecovered()
+        XCTAssertFalse(again)
+        XCTAssertEqual(relaunched.recovery?.readingWrites, 1, "once")
+        XCTAssertEqual(relaunched.recovery?.cardioWrites, 1, "once")
+    }
+
+    /// S3: the history reload (Today's recent workouts, the history list) waits for the deferred save.
+    func testTheHistoryReloadsOnlyOnceTheDeferredSaveHasFinished() async throws {
+        let rig = makeRig()
+        var reloads: [Int] = []
+        rig.recorder.onDeferredWorkoutSaved = { reloads.append(rig.health.writes.count) }
+        let finish = try await endedRun(rig)
+        rig.recorder.reset()   // Done
+        XCTAssertEqual(reloads, [], "not when the summary closes")
+        await settle(rig)
+        XCTAssertEqual(reloads, [1], "once, after the workout is in Health")
+        XCTAssertEqual(finish.saveTrigger, .dismissed)
+    }
+
     // MARK: Review fixes (84i)
 
     func testAReplaceThatDidNotRemoveTheEstimateNeverAddsASecondSetOfSpeedAndStride() async throws {

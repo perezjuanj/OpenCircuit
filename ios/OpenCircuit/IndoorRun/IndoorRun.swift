@@ -274,9 +274,19 @@ final class IndoorRunFinish {
                 : Self.vo2(inputs, typed: typedMeters, incline: incline)
         }
         if savePending {
+            // Still waiting: the workout is saved with this distance. A save that already started with
+            // the estimate (the deadline, a dismissal) can't take it any more: the distance is applied
+            // once that save finishes, through the replace path (review-indoor-run-b S1).
             requestSave(.answered)
             return
         }
+        replaceWithTypedDistance()
+    }
+
+    /// The typed distance after the workout is in Health with the step estimate (84e, 84i): the estimate's
+    /// samples are replaced, then the calibrated speed/stride and the VO₂ max are written.
+    private func replaceWithTypedDistance() {
+        guard let typedMeters else { return }
         // The workout isn't in Health, so nothing describing it is written (the VO₂ max rule).
         if workoutSaved == false, case .estimate? = vo2MaxOutcome { vo2MaxHealthStatus = .failed }
         guard workoutSaved == true, let health else { return }
@@ -335,6 +345,14 @@ final class IndoorRunFinish {
         workoutSaved = saved
         guard saved else {
             if case .estimate? = vo2MaxOutcome { vo2MaxHealthStatus = .failed }
+            return
+        }
+        // Review-indoor-run-b S1: typed while a save with the ESTIMATE was already running. That save
+        // committed the estimate, so the typed distance now replaces it like any later correction; the
+        // summary says "saved" only once that replace has.
+        if submitted, saveTrigger != .answered {
+            writeEstimateMetrics()
+            replaceWithTypedDistance()
             return
         }
         if submitted { distanceStatus = .saved }
