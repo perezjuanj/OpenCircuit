@@ -138,6 +138,12 @@ public enum VO2MaxEstimate {
         case noSteadySegment
         case intensityTooLow
         case implausible
+        /// Indoor (decision 84g): the treadmill's distance wasn't entered, so steps can't be a speed.
+        case noTypedDistance
+        /// Indoor (decision 84g): no steps were counted during the run.
+        case noStepData
+        /// Indoor (decision 84g): the indoor estimate is only for an indoor run.
+        case notAnIndoorRun
 
         /// What the workout screen says, after "No VO₂ max estimate: ".
         public var explanation: String {
@@ -151,6 +157,9 @@ public enum VO2MaxEstimate {
             case .noSteadySegment: return "the run had no steady 5-minute stretch (even pace, heart rate and GPS, level or uphill)."
             case .intensityTooLow: return "the steady stretch was too easy (under half your heart-rate reserve) to extrapolate from."
             case .implausible: return "the result fell outside a plausible range, so it was discarded."
+            case .noTypedDistance: return "enter the treadmill's distance above, so your steps can be turned into a speed."
+            case .noStepData: return "no steps were counted during this run."
+            case .notAnIndoorRun: return "it is only estimated for indoor runs."
             }
         }
     }
@@ -178,6 +187,13 @@ public enum VO2MaxEstimate {
         public let restingHR: Double
         public let maxHR: Double
         public let maxHRSource: MaxHRSource
+        /// Where `speed` came from: the GPS route (#232), or treadmill distance + steps (decision 84g).
+        public var speedSource: SpeedSource = .gpsRoute
+    }
+
+    public enum SpeedSource: Equatable, Sendable {
+        case gpsRoute
+        case treadmillSteps
     }
 
     public enum Outcome: Equatable, Sendable {

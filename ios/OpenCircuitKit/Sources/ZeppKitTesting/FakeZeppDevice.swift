@@ -66,6 +66,8 @@ public final class FakeZeppDevice {
     public var configReadHandler: (([UInt8]) -> [UInt8]?)?
     /// Status byte of the config write ack (`06 <status>`); nil = the strap never acks a write.
     public var configWriteAckStatus: UInt8? = 0x01
+    /// The status byte of the `06 <status> <enabled>` ack to `05 xx` on `0x0016`; nil = no ack.
+    public var realtimeStepsAckStatus: UInt8? = 0x01
     /// Called with each config write BEFORE its ack goes out, so a test can make the strap's later
     /// reads reflect it (e.g. by replacing `configReplies`).
     public var onConfigWrite: (([UInt8]) -> Void)?
@@ -85,6 +87,10 @@ public final class FakeZeppDevice {
     public private(set) var alarmCommands: [[UInt8]] = []
     public private(set) var timeSetCount = 0
     public private(set) var configWrites: [[UInt8]] = []
+    /// Every payload received on the realtime-steps endpoint `0x0016` (§7.2), in order.
+    public private(set) var realtimeStepsCommands: [[UInt8]] = []
+    /// Whether the realtime step stream is on (it persists across connections on a real strap, §16.2).
+    public private(set) var realtimeStepsOn = false
 
     private var expectedPhoneSequence: UInt32 = 0
     private var deviceSequence: UInt32 = 0
@@ -193,6 +199,10 @@ public final class FakeZeppDevice {
         case 0x0043 where p == [0x01]:
             guard let reply = deviceInfoReply else { failures.append("unhandled message on 67"); return [] }
             return send(endpoint: 0x0043, reply)
+        case 0x0016 where p.count == 2 && p[0] == 0x05 && p[1] <= 0x01:
+            realtimeStepsCommands.append(p)
+            realtimeStepsOn = p[1] == 0x01
+            return realtimeStepsAckStatus.map { send(endpoint: 0x0016, [0x06, $0, p[1]]) } ?? []
         case 0x001A:
             return findDevice(p)
         case 0x000F:
@@ -249,6 +259,14 @@ public final class FakeZeppDevice {
         }
         if announcesAlarmChanges && alarmAckStatus == 0x01 { out += send(endpoint: 0x000F, [0x0f]) }
         return out
+    }
+
+    /// A realtime step frame (§16.2 row 5): `07` + 13 bytes, the counter as u16 LE at offset 1 of the 13.
+    public func stepFrame(_ counter: UInt16) -> [Notification] {
+        var body = [UInt8](repeating: 0, count: 13)
+        body[1] = UInt8(counter & 0xff)
+        body[2] = UInt8(counter >> 8)
+        return send(endpoint: 0x0016, [0x07] + body)
     }
 
     /// A strap-originated message (find device `07`, find phone `11`, alarms changed `0f`, …).

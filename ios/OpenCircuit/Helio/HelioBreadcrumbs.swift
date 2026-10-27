@@ -256,6 +256,27 @@ final class HelioBreadcrumbs {
         }
     }
 
+    /// Decision 84c: what an indoor workout's realtime step stream did on one connection, counts and
+    /// control bytes only (never a step count): whether frames came, how soon after `05 01`, and the
+    /// ack's bytes. At most 4 lines per 12 h window.
+    func stepStream(_ report: StrapStepStreamReport) {
+        keyed("step-stream", .message, perWindow: HelioBreadcrumbBudget.messageLinesPerKey) {
+            Self.stepStreamText(report)
+        }
+    }
+
+    nonisolated static func stepStreamText(_ report: StrapStepStreamReport) -> String {
+        var parts = ["realtime steps: \(report.frames) frame(s)"]
+        if let delay = report.firstFrameDelay { parts.append(String(format: "first after %.0f s", delay)) }
+        if report.unreadable > 0 { parts.append("\(report.unreadable) unreadable") }
+        if let status = report.ackStatus {
+            parts.append("ack 06 " + ([status] + (report.ackEnabled.map { [$0] } ?? [])).map { String(format: "%02x", $0) }.joined(separator: " "))
+        } else {
+            parts.append("no ack")
+        }
+        return parts.joined(separator: ", ")
+    }
+
     /// A notification on a standard characteristic nothing asked for (no bytes at all: it can be a
     /// heart-rate value).
     func strapNotification(characteristic: String) {
