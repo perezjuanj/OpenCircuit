@@ -26,6 +26,9 @@ final class IndoorRunHealthWriter: IndoorRunHealthWriting {
     static let indoorVO2MaxMethod = "ACSM running equation + Swain %HRR (estimate), treadmill distance + steps"
 
     private let store = HKHealthStore()
+    private let samples: any IndoorRunSampleStoring
+
+    init(samples: (any IndoorRunSampleStoring)? = nil) { self.samples = samples ?? HealthKitIndoorRunSamples() }
 
     // MARK: Per-minute speed and stride (84f)
 
@@ -83,56 +86,54 @@ final class IndoorRunHealthWriter: IndoorRunHealthWriting {
         }
     }
 
-    // MARK: The typed distance replaces the estimate (84e, 84f)
+    // MARK: The typed distance replaces the estimate (84e, 84f; review-indoor-run SF2a)
 
+    /// The typed distance is SAVED FIRST and the estimate deleted only after that save succeeded, so a
+    /// failure never leaves the workout with no distance in Health:
+    ///   • the query or the typed save fails → `.failed`, nothing changed (the estimate stays);
+    ///   • the typed save succeeds but the delete fails → `.savedEstimateKept` (Health holds both);
+    ///   • both succeed → `.saved`: exactly one distance sample for the workout, the typed one.
     func replaceEstimate(workout span: DateInterval, typedMeters: Double, timeline: SyncDeviceID) async -> IndoorRunHealthStatus {
-        guard HKHealthStore.isHealthDataAvailable(), HealthKitWriter().isShareAuthorized else { return .notConnected }
+        guard samples.healthConnected else { return .notConnected }
         let distanceType = HKQuantityType(.distanceWalkingRunning)
-        // This app's own estimated samples inside the workout (never anything else's, never a typed one).
-        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
-            HKQuery.predicateForObjects(from: .default()),
-            HKQuery.predicateForSamples(withStart: span.start, end: span.end, options: [.strictStartDate, .strictEndDate]),
-            HKQuery.predicateForObjects(withMetadataKey: IndoorRunMetadata.estimatedKey, allowedValues: [true]),
-        ])
-        var estimated: [HKSample] = []
         var types: [HKQuantityType] = [distanceType]
-        for type in [Self.runningSpeedType, Self.runningStrideLengthType]
-        where store.authorizationStatus(for: type) == .sharingAuthorized { types.append(type) }
+        for type in [Self.runningSpeedType, Self.runningStrideLengthType] where samples.isSharing(type) { types.append(type) }
+        var estimated: [HKSample] = []
         do {
-            for type in types { estimated += try await samples(of: type, predicate: predicate) }
-            if !estimated.isEmpty { try await store.delete(estimated) }
+            for type in types { estimated += try await samples.estimatedSamples(of: type, in: span) }
         } catch {
-            helioLog.error("indoor run: the step estimate could not be removed from Health; the typed distance is not written")
+            helioLog.error("indoor run: the step estimate could not be read from Health; the typed distance is not written")
+            return .failed
+        }
+        // The treadmill measured it and the person typed it: no wearable is named.
+        let typed = HKQuantitySample(type: distanceType, quantity: HKQuantity(unit: .meter(), doubleValue: typedMeters),
+                                     start: span.start, end: span.end, metadata: [HKMetadataKeyWasUserEntered: true])
+        do {
+            try await samples.saveForWorkout(typed, workoutStart: span.start)
+        } catch {
+            helioLog.error("indoor run: the typed distance was not saved to Health; the estimate stays")
             return .failed
         }
         let estimatedMeters = estimated.compactMap { $0 as? HKQuantitySample }
             .filter { $0.quantityType == distanceType }
             .reduce(0.0) { $0 + $1.quantity.doubleValue(for: .meter()) }
-        // The treadmill measured it and the person typed it: no wearable is named.
-        let sample = HKQuantitySample(type: distanceType, quantity: HKQuantity(unit: .meter(), doubleValue: typedMeters),
-                                      start: span.start, end: span.end, metadata: [HKMetadataKeyWasUserEntered: true])
-        do {
-            if let workout = try await ownWorkout(startingAt: span.start) {
-                // Associated with the workout, so deleting the workout from the history deletes it too
-                // (`HealthKitWorkoutStore.deleteOwnedSamples`). HealthKit keeps a finished workout's own
-                // totals as written, so its summary may still show the estimate (see the PR body).
-                try await store.addSamples([sample], to: workout)
-            } else {
-                try await store.save(sample)
+        var deleted = true
+        if !estimated.isEmpty {
+            do { try await samples.delete(estimated) } catch {
+                deleted = false
+                helioLog.error("indoor run: the typed distance is saved but the estimate could not be removed")
             }
-        } catch {
-            helioLog.error("indoor run: the typed distance was not saved to Health")
-            return .failed
         }
         // The daily steps × stride distance nets out workout distance (`recordWorkoutWalkRunDistance`):
-        // swap the estimate it was credited with for the typed distance, today only (the rule's own).
+        // credit the typed distance, and undo the estimate's credit only when the estimate is gone from
+        // Health. Today only (the rule's own).
         if Calendar.current.isDateInToday(span.end) {
-            if estimatedMeters > 0 { HealthKitWriter.undoWorkoutWalkRunDistance(estimatedMeters) }
+            if deleted, estimatedMeters > 0 { HealthKitWriter.undoWorkoutWalkRunDistance(estimatedMeters) }
             HealthKitWriter.recordWorkoutWalkRunDistance(typedMeters)
             let key = HealthKitWriter.workoutCreditsRevisionKey
             UserDefaults.standard.set(UserDefaults.standard.integer(forKey: key) + 1, forKey: key)
         }
-        return .saved
+        return deleted ? .saved : .savedEstimateKept
     }
 
     // MARK: Indoor VO₂ max (84g)
@@ -141,7 +142,56 @@ final class IndoorRunHealthWriter: IndoorRunHealthWriting {
         await VO2MaxHealthWriter().save(estimate, workoutEnd: workoutEnd, timeline: timeline, method: Self.indoorVO2MaxMethod)
     }
 
-    // MARK: Queries
+}
+
+/// What `replaceEstimate` needs from HealthKit, apart from it so the one-distance rule (save the typed
+/// distance, then delete the estimate) is testable without HealthKit (review-indoor-run SF3).
+@MainActor
+protocol IndoorRunSampleStoring: AnyObject {
+    /// Apple Health is available and the app's main share grant is in place.
+    var healthConnected: Bool { get }
+    func isSharing(_ type: HKQuantityType) -> Bool
+    /// This app's own samples of `type` inside `span` that carry `OpenCircuitEstimated = true`.
+    func estimatedSamples(of type: HKQuantityType, in span: DateInterval) async throws -> [HKSample]
+    /// Save `sample`, associated with this app's workout that started at `workoutStart` when it exists.
+    func saveForWorkout(_ sample: HKQuantitySample, workoutStart: Date) async throws
+    func delete(_ samples: [HKSample]) async throws
+}
+
+@MainActor
+final class HealthKitIndoorRunSamples: IndoorRunSampleStoring {
+    private let store = HKHealthStore()
+
+    var healthConnected: Bool { HKHealthStore.isHealthDataAvailable() && HealthKitWriter().isShareAuthorized }
+
+    func isSharing(_ type: HKQuantityType) -> Bool { store.authorizationStatus(for: type) == .sharingAuthorized }
+
+    /// The predicate: this app as the source, wholly inside the workout's span, marked estimated.
+    static func estimatePredicate(_ span: DateInterval) -> NSPredicate {
+        NSCompoundPredicate(andPredicateWithSubpredicates: [
+            HKQuery.predicateForObjects(from: .default()),
+            HKQuery.predicateForSamples(withStart: span.start, end: span.end, options: [.strictStartDate, .strictEndDate]),
+            HKQuery.predicateForObjects(withMetadataKey: IndoorRunMetadata.estimatedKey, allowedValues: [true]),
+        ])
+    }
+
+    func estimatedSamples(of type: HKQuantityType, in span: DateInterval) async throws -> [HKSample] {
+        try await samples(of: type, predicate: Self.estimatePredicate(span))
+    }
+
+    func saveForWorkout(_ sample: HKQuantitySample, workoutStart: Date) async throws {
+        if let workout = try await ownWorkout(startingAt: workoutStart) {
+            // Associated with the workout, so deleting the workout from the history deletes it too
+            // (`HealthKitWorkoutStore.deleteOwnedSamples`). HealthKit keeps a finished workout's own
+            // totals as written; decision 84j saves an indoor run's workout only once the prompt is
+            // answered or skipped, so this path is only for a distance typed after that save.
+            try await store.addSamples([sample], to: workout)
+        } else {
+            try await store.save(sample)
+        }
+    }
+
+    func delete(_ samples: [HKSample]) async throws { try await store.delete(samples) }
 
     private func ownWorkout(startingAt start: Date) async throws -> HKWorkout? {
         let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [

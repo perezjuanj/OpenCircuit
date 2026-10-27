@@ -116,8 +116,10 @@ struct IndoorRunSummarySection: View {
     static func notes(_ finish: IndoorRunFinish) -> [String] {
         var notes: [String] = []
         let inputs = finish.inputs
-        if inputs.activeSteps == 0 {
-            notes.append("No steps were counted during this workout, so it has no distance or cadence.")
+        if inputs.activeSteps == 0, finish.distanceIsEstimate {
+            notes.append("No steps were counted during this workout, so it has no distance estimate or cadence.")
+        } else if inputs.activeSteps == 0 {
+            notes.append("Distance as you typed it. No steps were counted, so there is no cadence and no stride to calibrate.")
         } else if finish.distanceIsEstimate {
             switch finish.stride?.source {
             case .height?: notes.append("The distance is an ESTIMATE: your steps times a stride from your height. Type the treadmill's distance to correct it.")
@@ -126,8 +128,10 @@ struct IndoorRunSummarySection: View {
             }
         } else if inputs.stepsInterrupted {
             notes.append("Distance as you typed it. Steps stopped when the strap disconnected, so this run didn't calibrate your stride.")
-        } else {
+        } else if finish.calibrationStored {
             notes.append("Distance as you typed it; your stride for the next one is calibrated from it.")
+        } else {
+            notes.append("Distance as you typed it. It doesn't fit your step count as a stride, so your stride wasn't changed.")
         }
         if inputs.stepsInterrupted, finish.distanceIsEstimate {
             notes.append("Steps stopped when the strap disconnected, so the steps and the estimate cover only the time before.")
@@ -137,7 +141,8 @@ struct IndoorRunSummarySection: View {
         }
         switch finish.distanceStatus {
         case .saved?: notes.append("Distance saved to Apple Health.")
-        case .failed?: notes.append("Apple Health didn't accept the distance; the estimate stays there.")
+        case .failed?: notes.append("Apple Health didn't accept the typed distance; the estimate stays there.")
+        case .savedEstimateKept?: notes.append("The typed distance is in Apple Health, but the estimate couldn't be removed, so Health shows both for this workout.")
         case .notConnected?: notes.append("The distance isn't in Apple Health: Health isn't connected.")
         case .sharingOff?, nil: break
         }
@@ -146,7 +151,7 @@ struct IndoorRunSummarySection: View {
             case .saved?: notes.append("Running speed and stride length saved to Apple Health, minute by minute.")
             case .sharingOff?: notes.append("Running speed and stride length aren't saved: they're turned off for OpenCircuit in Apple Health.")
             case .failed?: notes.append("Apple Health didn't accept the running speed and stride length.")
-            case .notConnected?, nil: break
+            case .notConnected?, .savedEstimateKept?, nil: break
             }
         }
         notes.append("Cadence stays in OpenCircuit: Apple Health has no cadence type.")

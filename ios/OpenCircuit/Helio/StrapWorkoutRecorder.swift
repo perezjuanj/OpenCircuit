@@ -692,6 +692,8 @@ final class StrapWorkoutRecorder {
         stepSource = source
         if source.startWorkoutSteps() {
             stepsStreaming = true
+            // Review-indoor-run N2: a resume that turns steps back on after a link drop counts again.
+            stepsInterrupted = false
             persistJournal(now: now)
         }
     }

@@ -68,13 +68,14 @@ private final class IndoorHealth: IndoorRunHealthWriting {
     private(set) var metrics: [(minutes: [IndoorRunMinuteSample], estimated: Bool)] = []
     private(set) var replacements: [(workout: DateInterval, meters: Double)] = []
     private(set) var vo2: [(estimate: VO2MaxEstimate.Estimate, end: Date)] = []
+    var replaceStatus: IndoorRunHealthStatus = .saved
     func saveRunningMetrics(_ minutes: [IndoorRunMinuteSample], estimated: Bool, timeline: SyncDeviceID) async -> IndoorRunHealthStatus {
         metrics.append((minutes, estimated))
         return .saved
     }
     func replaceEstimate(workout: DateInterval, typedMeters: Double, timeline: SyncDeviceID) async -> IndoorRunHealthStatus {
         replacements.append((workout, typedMeters))
-        return .saved
+        return replaceStatus
     }
     func saveVO2Max(_ estimate: VO2MaxEstimate.Estimate, workoutEnd: Date, timeline: SyncDeviceID) async -> VO2MaxHealthWriter.Status {
         vo2.append((estimate, workoutEnd))
@@ -465,6 +466,96 @@ final class IndoorRunRecorderTests: XCTestCase {
         await finish.writeTask?.value
         XCTAssertEqual(health.metrics.count + health.replacements.count + health.vo2.count, 0)
         XCTAssertEqual(finish.vo2MaxHealthStatus, .failed)
+    }
+
+    // MARK: Review fixes (84i)
+
+    func testAReplaceThatDidNotRemoveTheEstimateNeverAddsASecondSetOfSpeedAndStride() async throws {
+        for status in [IndoorRunHealthStatus.failed, .savedEstimateKept, .notConnected] {
+            let rig = makeRig()
+            rig.indoor.replaceStatus = status
+            now = t0
+            rig.recorder.start()
+            rig.source.counter(0, at: at(0))
+            _ = await run(rig, from: 0, to: 300, counter: 0)
+            now = at(300)
+            await rig.recorder.end()
+            let finish = try XCTUnwrap(rig.recorder.indoorRun)
+            await finish.writeTask?.value
+            finish.submit(typedMeters: 380, inclinePercent: nil)
+            await finish.writeTask?.value
+            XCTAssertEqual(rig.indoor.metrics.map(\.estimated), [true], "\(status): the estimated set only")
+            XCTAssertEqual(finish.distanceStatus, status)
+        }
+    }
+
+    func testAResumeThatTurnsStepsBackOnAfterALinkDropCountsTheRunAsWholeAgain() async throws {
+        let rig = makeRig()
+        rig.recorder.start()
+        rig.source.counter(0, at: at(0))
+        _ = await run(rig, from: 0, to: 120, counter: 0)
+        rig.source.isLinkConnected = false
+        now = at(121)
+        await rig.recorder.tick(now: now)
+        let reconnected = StepSource(timeline: timeline)
+        boxes[ObjectIdentifier(rig.recorder)]?.value = reconnected
+        now = at(130)
+        await rig.recorder.tick(now: now)
+        rig.recorder.pause()
+        now = at(140)
+        rig.recorder.resume()
+        XCTAssertEqual(reconnected.commands, ["on"], "`05 01` again only at the resume")
+        reconnected.counter(7_000, at: at(150))
+        _ = await run(rig, from: 150, to: 300, counter: 7_000, source: reconnected)
+        now = at(300)
+        await rig.recorder.end()
+        let finish = try XCTUnwrap(rig.recorder.indoorRun)
+        XCTAssertFalse(finish.inputs.stepsInterrupted)
+        XCTAssertEqual(finish.inputs.activeSteps, 240 + 15 * 20)
+    }
+
+    func testTheSummaryClaimsACalibrationOnlyWhenOneWasStored() async throws {
+        let rig = makeRig()
+        rig.recorder.start()
+        rig.source.counter(0, at: at(0))
+        _ = await run(rig, from: 0, to: 300, counter: 0)   // 600 steps
+        now = at(300)
+        await rig.recorder.end()
+        let finish = try XCTUnwrap(rig.recorder.indoorRun)
+        finish.submit(typedMeters: 6_000, inclinePercent: nil)   // 10 m a step: refused
+        await finish.writeTask?.value
+        XCTAssertFalse(finish.calibrationStored)
+        let notes = IndoorRunSummarySection.notes(finish)
+        XCTAssertFalse(notes.contains { $0.contains("calibrated from it") })
+        XCTAssertTrue(notes.contains { $0.contains("your stride wasn't changed") })
+
+        let calibrated = makeRig()
+        calibrated.recorder.start()
+        calibrated.source.counter(0, at: at(300))
+        _ = await run(calibrated, from: 300, to: 600, counter: 0)
+        now = at(600)
+        await calibrated.recorder.end()
+        let ok = try XCTUnwrap(calibrated.recorder.indoorRun)
+        ok.submit(typedMeters: 720, inclinePercent: nil)
+        await ok.writeTask?.value
+        XCTAssertTrue(ok.calibrationStored)
+        XCTAssertTrue(IndoorRunSummarySection.notes(ok).contains { $0.contains("calibrated from it") })
+    }
+
+    func testATypedDistanceWithNoStepsNeverSaysThereIsNoDistance() async throws {
+        let source = StepSource(timeline: timeline)
+        source.hasSteps = false
+        let rig = makeRig(source: source)
+        rig.recorder.start()
+        now = at(300)
+        await rig.recorder.end()
+        let finish = try XCTUnwrap(rig.recorder.indoorRun)
+        XCTAssertTrue(IndoorRunSummarySection.notes(finish).contains { $0.contains("no distance estimate") })
+        finish.submit(typedMeters: 900, inclinePercent: nil)
+        await finish.writeTask?.value
+        let notes = IndoorRunSummarySection.notes(finish)
+        XCTAssertFalse(notes.contains { $0.contains("no distance") })
+        XCTAssertTrue(notes.contains { $0.hasPrefix("Distance as you typed it") })
     }
 
     // MARK: The ring (84a)

@@ -141,6 +141,9 @@ enum IndoorRunHealthStatus: Equatable {
     /// The person declined or turned off this type for OpenCircuit.
     case sharingOff
     case failed
+    /// The typed distance is saved, but the estimate could not be removed: Health holds both
+    /// (review-indoor-run SF2a; the estimate is deleted only AFTER the typed save succeeded).
+    case savedEstimateKept
 }
 
 /// The Apple Health half of an indoor run beyond the workout's own write (decision 84f, 84g).
@@ -166,6 +169,9 @@ final class IndoorRunFinish {
     private(set) var inclinePercent: Double?
     /// The stride the summary's numbers use now: the typed calibration once submitted.
     private(set) var stride: IndoorStride?
+    /// The typed distance's stride was stored for the next indoor run of this sport on this device
+    /// (false when it was refused: an implausible ratio, or a step stream cut short).
+    private(set) var calibrationStored = false
     /// Per-minute speed and stride to Health: nil while in flight or not attempted.
     private(set) var runningMetricsStatus: IndoorRunHealthStatus?
     /// The typed distance's Health write: nil while in flight or before a submit.
@@ -231,6 +237,7 @@ final class IndoorRunFinish {
         if let typedStride {
             stride = typedStride
             calibrations.store(typedStride.meters, timeline: inputs.timeline, sport: inputs.sport)
+            calibrationStored = true
         }
         if inputs.sport == .runningIndoor {
             vo2MaxOutcome = inputs.stepsInterrupted
@@ -249,7 +256,9 @@ final class IndoorRunFinish {
             let workout = DateInterval(start: inputs.start, end: max(inputs.end, inputs.start))
             let distance = await health.replaceEstimate(workout: workout, typedMeters: typedMeters, timeline: inputs.timeline)
             var metrics: IndoorRunHealthStatus?
-            if IndoorStepWorkout.writesRunningMetrics(inputs.sport), let strideForMinutes {
+            // Review-indoor-run SF2b: only once the estimate is gone. A replace that failed (or left the
+            // estimate in place) keeps the estimated speed/stride, so a second set is never added.
+            if distance == .saved, IndoorStepWorkout.writesRunningMetrics(inputs.sport), let strideForMinutes {
                 let minutes = Self.minuteSamples(inputs, stride: strideForMinutes.meters)
                 if !minutes.isEmpty {
                     metrics = await health.saveRunningMetrics(minutes, estimated: typedStride == nil, timeline: inputs.timeline)
