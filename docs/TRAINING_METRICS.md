@@ -233,6 +233,67 @@ one person's trend on similar routes. It is not a lab value.
 - **Not yet observed on a device:** that this second, disjoint request leaves the existing Workouts,
   Workout Routes and Heart Rate grants intact. This is the PR's on-phone check.
 
+### 2.6 Indoor runs: treadmill distance + steps (#339, decision 84g)
+
+The same estimate for **Indoor Running**, with one input changed: the speed. There is no route
+indoors, so each 1-minute bin's speed comes from steps.
+
+- **Speed.** That minute's steps × the calibrated stride, where stride = the treadmill distance the
+  person typed ÷ the run's total active steps. The bins are the outdoor bins (from the workout's
+  start, whole minutes), so a minute with no steps (a pause, a gap in the step stream) has speed 0
+  and can never be part of the steady segment.
+- **Grade.** The typed incline ÷ 100, 0 when none was typed. The field accepts 0–15 %, the outdoor
+  grade range's uphill half; no elevation is read.
+- **Everything else is §2.3 unchanged:** the 10-minute minimum on running time, the 4-minute warm-up,
+  the steady 5-minute segment (speed CV ≤ 10 %, HR spread ≤ 10 bpm, 80–400 m/min), the 50 %
+  reserve floor, the maximum (Tanaka or observed), Swain's extrapolation and the 15–90 range.
+- **Only with a typed distance AND step data.** A stride from height (§2.7) is a rough estimate; the
+  estimate's error budget can't absorb a guessed speed, so without the treadmill's distance there is
+  no number. A strap run whose step stream stopped with the link (§2.7) is skipped too: its steps
+  are too few for the typed distance, so their ratio is not a stride.
+- **Skip reasons** (after "No VO₂ max estimate: "): no steps, "no steps were counted during this
+  run."; no typed distance, "enter the treadmill's distance above, so your steps can be turned into
+  a speed."; any other sport, "it is only estimated for indoor runs." The rest are §2.4's.
+- **Apple Health.** §2.5's write (`VO2MaxHealthWriter`, the same lazy request and test type), made
+  once the distance is typed AND the workout itself is in Health (84j: the typed distance saves the
+  workout first), with `OpenCircuitVO2MaxMethod` = "ACSM running equation + Swain %HRR (estimate),
+  treadmill distance + steps".
+- **Sensitivity.** The treadmill's own distance display is the weak link: belt calibration errors of a
+  few percent are common, and they move the estimate by the same few percent.
+
+Code: `OpenCircuitKit/Analytics/VO2MaxEstimate+Indoor.swift` (`VO2MaxIndoorEstimateTests`).
+
+### 2.7 Indoor steps, cadence and the step-based distance (#339, decision 84a–84f)
+
+- **Steps.** The ring: the native sport frames' steps (`RingSession.sportSteps`, PROTOCOL.md). The
+  strap: the realtime step stream (ZEPP_PROTOCOL.md §16.2 row 5), on only during an indoor run or
+  walk (§16.5). Both arrive as a running counter and are counted as **deltas**: the first reading is
+  a base, a reading below the last one is a new base (a reset or a wrap; never a negative count), and
+  readings taken while paused count nothing (`StepCounterDeltas`).
+- **Cadence** = steps per minute: over the last 60 s live; the average and each whole running minute
+  on the summary. Apple Health has no cadence type, so cadence stays in the app.
+- **Stride.** Height × 0.415 for walking, × 0.65 for running. **Both factors are rough estimates**
+  (commonly quoted rules of thumb, not a measurement), so the distance is shown as "est." and written
+  with `OpenCircuitEstimated = true`. The height is only the one the person set in Profile; with no
+  height and no calibration there is no estimate.
+- **Calibration.** A typed treadmill distance replaces the estimate, and typed ÷ active steps becomes
+  the stride for the next indoor run of that sport on that device (`IndoorStrideCalibrations`). A
+  result outside 0.2–2.5 m per step is a typo, not a stride, and is not stored.
+- **Strap link drops.** The stream stops with the link and the reconnect turns it off (§16.5); it is
+  turned on again only at a resume, and from then on the run counts as whole again (review N2).
+  Until then the summary says the steps cover only the time before, and a typed distance doesn't
+  calibrate the stride.
+- **The distance prompt and the workout's save (decision 84e as amended by 84j).** At End the summary
+  asks "Treadmill distance?" (optional, in the person's distance unit) and "Incline %" (optional,
+  0–15). An indoor run or walk WITH STEPS saves its `HKWorkout` only when the prompt is answered (the
+  typed distance is the workout's distance) or skipped, the summary is dismissed, or 10 minutes after
+  End (the step estimate), whichever comes first; the heart-rate recovery window still opens at End
+  and the held-back sync still runs when it closes, while the recovery readings and Cardio Recovery
+  are written after the workout's save. Every other workout saves at End (82a). A kill before the save
+  is offered back at the next launch and saved with the estimate. A distance typed after the 10-minute
+  save replaces the estimate's samples (`docs/HEALTHKIT_MAPPING.md`). No typed distance and no steps:
+  no distance, as before.
+
 ---
 
 ## 2b. Heart rate recovery (#337, decision 82)

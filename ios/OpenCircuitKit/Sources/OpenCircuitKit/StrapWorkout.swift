@@ -216,14 +216,27 @@ public struct StrapWorkoutJournal: Codable, Equatable, Sendable {
     public var timelineRaw: String
     /// GPS distance so far, informational (the route itself is not journaled; see recovery).
     public var distanceMeters: Double?
+    /// The strap's realtime step stream was on for this indoor workout (#339, decision 84b): a killed
+    /// process leaves the next connection an owed `05 00`. nil in journals written before #339.
+    public var stepStreamOn: Bool?
+    /// An indoor run or walk that ENDED and is waiting for its distance prompt before its `HKWorkout` is
+    /// saved (#339, decision 84j): the step estimate it is saved with if the app dies first. nil otherwise.
+    public var indoorEstimateMeters: Double?
+    /// The heart-rate recovery window closed while that workout still waited (84l, review-indoor-run-b
+    /// S2): its readings and Cardio Recovery value, written once after the recovered save. nil otherwise.
+    public var pendingRecovery: StrapWorkoutPendingRecovery?
 
     public init(sport: WorkoutSportType, ledger: WorkoutActivityLedger, lastAliveAt: Date,
-                timelineRaw: String, distanceMeters: Double? = nil) {
+                timelineRaw: String, distanceMeters: Double? = nil, stepStreamOn: Bool? = nil,
+                indoorEstimateMeters: Double? = nil, pendingRecovery: StrapWorkoutPendingRecovery? = nil) {
         self.sport = sport
         self.ledger = ledger
         self.lastAliveAt = lastAliveAt
         self.timelineRaw = timelineRaw
         self.distanceMeters = distanceMeters
+        self.stepStreamOn = stepStreamOn
+        self.indoorEstimateMeters = indoorEstimateMeters
+        self.pendingRecovery = pendingRecovery
     }
 
     public func encoded() -> Data? { try? JSONEncoder().encode(self) }
@@ -231,6 +244,21 @@ public struct StrapWorkoutJournal: Codable, Equatable, Sendable {
     public static func decoded(from data: Data?) -> StrapWorkoutJournal? {
         guard let data else { return nil }
         return try? JSONDecoder().decode(StrapWorkoutJournal.self, from: data)
+    }
+}
+
+/// What a heart-rate recovery window owes Apple Health once its workout is saved (#337 with #339, decision
+/// 84l): the recovery readings (after the workout's end) and the 1-minute recovery value for Cardio
+/// Recovery (only a drop above zero, 85b), dated `cardioAt`.
+public struct StrapWorkoutPendingRecovery: Codable, Equatable, Sendable {
+    public var readings: [HRSample]
+    public var cardioRecoveryBPM: Int?
+    public var cardioAt: Date
+
+    public init(readings: [HRSample], cardioRecoveryBPM: Int?, cardioAt: Date) {
+        self.readings = readings
+        self.cardioRecoveryBPM = cardioRecoveryBPM
+        self.cardioAt = cardioAt
     }
 }
 
@@ -267,6 +295,10 @@ public struct RecoveredStrapWorkout: Equatable, Sendable {
     /// The readings inside the recovered span.
     public let samples: [HRSample]
     public let timelineRaw: String
+    /// An ended indoor run's step estimate, saved as its distance (decision 84j). nil otherwise.
+    public var indoorEstimateMeters: Double? = nil
+    /// Its recovery window's writes still owed to Health (84l). nil otherwise.
+    public var pendingRecovery: StrapWorkoutPendingRecovery? = nil
 
     public var activeSeconds: TimeInterval { ledger.activeSeconds(until: end) }
 }
@@ -296,6 +328,8 @@ public enum StrapWorkoutRecovery {
         guard end > start, journal.ledger.activeSeconds(until: end) > 0 else { return .discard(.noObservedSpan) }
         guard end <= now else { return .discard(.endsInTheFuture) }
         return .offer(RecoveredStrapWorkout(sport: journal.sport, ledger: journal.ledger, end: end,
-                                            samples: inSpan.filter { $0.end <= end }, timelineRaw: journal.timelineRaw))
+                                            samples: inSpan.filter { $0.end <= end }, timelineRaw: journal.timelineRaw,
+                                            indoorEstimateMeters: journal.indoorEstimateMeters,
+                                            pendingRecovery: journal.pendingRecovery))
     }
 }

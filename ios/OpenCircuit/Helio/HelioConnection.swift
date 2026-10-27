@@ -592,6 +592,8 @@ extension HelioConnection {
             Self.wakeHandler(.strapEvent)
         case .fellAsleep:
             break   // a breadcrumb only (the strap-message line above)
+        case .stepStream(let report):
+            breadcrumbs.stepStream(report)
         }
     }
 

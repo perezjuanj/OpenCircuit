@@ -60,8 +60,10 @@ struct VO2MaxHealthWriter {
     ///
     /// `timeline` is the wearable whose heart rate the estimate came from: the ring for a ring workout,
     /// the strap for a strap workout (#232 on the strap).
+    /// `method` is the metadata value naming how the estimate was made: the outdoor run's
+    /// `methodMetadataValue`, or the indoor run's "treadmill distance + steps" (decision 84g).
     func save(_ estimate: VO2MaxEstimate.Estimate, workoutEnd: Date,
-              timeline: SyncDeviceID = .ringConn) async -> Status {
+              timeline: SyncDeviceID = .ringConn, method: String = VO2MaxHealthWriter.methodMetadataValue) async -> Status {
         guard HKHealthStore.isHealthDataAvailable() else { return .healthNotConnected }
         guard HealthKitWriter().isShareAuthorized else { return .healthNotConnected }
 
@@ -87,7 +89,7 @@ struct VO2MaxHealthWriter {
         let metadata: [String: Any] = [
             HKMetadataKeyVO2MaxTestType: HKVO2MaxTestType.predictionSubMaxExercise.rawValue,
             HKMetadataKeyWasUserEntered: false,
-            Self.methodMetadataKey: Self.methodMetadataValue,
+            Self.methodMetadataKey: method,
         ]
         // The estimate names the wearable whose heart rate it came from (the ring's or the strap's
         // workout), like BP and the distance estimate (review-224b N-2): attribution follows the

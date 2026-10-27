@@ -30,6 +30,9 @@ struct StrapWorkoutView: View {
                     ProgressView("Saving workout…").padding()
                 case .measuringRecovery(let summary, let saved), .finished(let summary, let saved):
                     summaryView(summary, saved: saved)
+                        // 84j: the summary going away (Done, the sheet dismissed) saves an indoor workout
+                        // still waiting for its distance prompt. Saves only; it ends no recording.
+                        .onDisappear { recorder.summaryDismissed() }
                 case .error(let message):
                     VStack(spacing: 16) {
                         Image(systemName: "exclamationmark.triangle.fill").font(.largeTitle).foregroundStyle(.orange)
@@ -176,6 +179,13 @@ struct StrapWorkoutView: View {
             }
             .padding(.horizontal)
 
+            // An indoor run or walk (#339): cadence and the step-based distance.
+            if IndoorStepWorkout.applies(to: recorder.selectedSport) {
+                IndoorRunLiveStats(cadence: recorder.liveCadence, estimatedMeters: recorder.liveEstimatedMeters,
+                                   distanceUnit: distanceUnit)
+                    .padding(.horizontal)
+            }
+
             Divider()
 
             VStack(alignment: .leading, spacing: 8) {
@@ -288,11 +298,17 @@ struct StrapWorkoutView: View {
                 recoverySection
                     .padding(.horizontal)
 
+                // An indoor run or walk (#339): cadence, the distance and the treadmill prompt.
+                if let indoor = recorder.indoorRun {
+                    IndoorRunSummarySection(finish: indoor, distanceUnit: distanceUnit)
+                        .padding(.horizontal)
+                }
+
                 // Training load, and the VO₂ max estimate for an outdoor run (#232) — the ring's
-                // section, over the strap's heart rate.
+                // section, over the strap's heart rate. An indoor run's comes from its prompt (#339).
                 WorkoutTrainingMetricsSection(summary: summary,
-                                              vo2Outcome: recorder.vo2MaxOutcome,
-                                              vo2HealthStatus: recorder.vo2MaxHealthStatus,
+                                              vo2Outcome: recorder.indoorRun?.vo2MaxOutcome ?? recorder.vo2MaxOutcome,
+                                              vo2HealthStatus: recorder.indoorRun.map(\.vo2MaxHealthStatus) ?? recorder.vo2MaxHealthStatus,
                                               distanceUnit: distanceUnit)
                     .padding(.horizontal)
 
@@ -324,7 +340,10 @@ struct StrapWorkoutView: View {
                     } else if summary.sport.isOutdoor {
                         noteRow("location.slash", .secondary, "No GPS route — location access is off for OpenCircuit.")
                     }
-                    if saved {
+                    if recorder.workoutSavePending {
+                        // 84j: an indoor run or walk waits for its distance prompt (the note is in its section).
+                        noteRow("clock", .secondary, "Not in Apple Health yet: waiting for the treadmill distance.")
+                    } else if saved {
                         noteRow("checkmark.circle", .green, "Workout saved to Apple Health.")
                     } else {
                         noteRow("exclamationmark.triangle", .orange, "Apple Health didn't accept this workout, so it isn't in Health.")
@@ -487,7 +506,13 @@ struct StrapWorkoutHooks: ViewModifier {
             // One app-lifetime observer handles either active device; it pauses locally and asks
             // before resuming after the last call ends (#283).
             .modifier(WorkoutCallPausePrompt(coordinator: .shared))
-            .onAppear { WorkoutCallPauseCoordinator.shared.start(ring: ringManager) }
+            .onAppear {
+                WorkoutCallPauseCoordinator.shared.start(ring: ringManager)
+                // Review-indoor-run-b S3: an indoor workout saved after its prompt (84j) reloads the
+                // history and Today's recent workouts once it is in Health, not when the sheet closed.
+                recorder.onDeferredWorkoutSaved = onWorkoutsChanged
+                ringManager.onDeferredWorkoutSaved = onWorkoutsChanged
+            }
             .task {
                 recorder.resolveOrphan()
                 recorder.landPendingHeartRate()

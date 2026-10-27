@@ -81,6 +81,53 @@ enum HelioSessionEvent: Equatable {
     /// whether the Helio sends them at all, so they are only ever a hint (§16.4). They carry no time.
     case fellAsleep
     case wokeUp
+    /// The realtime step stream a workout turned on was turned off, or its connection ended (decision
+    /// 84c): counts and control bytes only, for the breadcrumb.
+    case stepStream(StrapStepStreamReport)
+}
+
+/// What one connection's realtime step stream did (decision 84c): counts only, so a diagnostics bundle
+/// shows whether the strap sends steps at all (🔴 on the Helio, decision 84a). Never a step count.
+struct StrapStepStreamReport: Equatable {
+    /// `07` frames received while the stream was ours.
+    var frames = 0
+    /// Seconds from the first `05 01` to the first frame; nil when none arrived.
+    var firstFrameDelay: TimeInterval?
+    /// The status and enabled bytes of the last `06` ack, as received; nil when none arrived.
+    var ackStatus: UInt8?
+    var ackEnabled: UInt8?
+    /// Frames that were too short to read.
+    var unreadable = 0
+}
+
+/// Decision 84b: the strap's realtime step stream PERSISTS across connections (§16.2 row 5), so every
+/// `05 01` this app sends is owed a `05 00`. Persisted, because the process can die with it on:
+///   • `turnedOn`: set BEFORE a `05 01` goes out, cleared only once a `05 00` was sent on a live link;
+///   • `offOwed`: a journal said a workout ended or was killed with the stream on (the recorder's
+///     launch recovery, like the owed `04 00` of `StrapWorkoutOrphanStop`).
+/// Either one makes the next authenticated connection send `05 00` (`HelioSession.sendOwedStepsOff`).
+struct StrapStepStreamFlag {
+    nonisolated static let turnedOnKey = "strapWorkout.stepStreamOn.v1"
+    nonisolated static let offOwedKey = "strapWorkout.stepStreamOffOwed.v1"
+    let defaults: UserDefaults
+    init(_ defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    var turnedOn: Bool {
+        get { defaults.bool(forKey: Self.turnedOnKey) }
+        nonmutating set { if newValue { defaults.set(true, forKey: Self.turnedOnKey) } else { defaults.removeObject(forKey: Self.turnedOnKey) } }
+    }
+
+    var offOwed: Bool {
+        get { defaults.bool(forKey: Self.offOwedKey) }
+        nonmutating set { if newValue { defaults.set(true, forKey: Self.offOwedKey) } else { defaults.removeObject(forKey: Self.offOwedKey) } }
+    }
+
+    var owesOff: Bool { turnedOn || offOwed }
+
+    func clear() {
+        turnedOn = false
+        offOwed = false
+    }
 }
 
 /// Where fetched rounds go. `HelioStoreSink` is the `LocalStore` implementation.
@@ -276,6 +323,11 @@ final class HelioSession: WearableSession {
     @ObservationIgnored var heartRateObserver: (@MainActor (Int, Date) -> Void)?
     /// The `04 00` owed after an interrupted workout (#227, review-238 SF2).
     @ObservationIgnored var orphanStop = StrapWorkoutOrphanStop()
+    /// The `05 00` owed for a step stream this app turned on (decision 84b).
+    @ObservationIgnored var stepStreamFlag = StrapStepStreamFlag()
+    /// Every realtime step frame of the workout's stream, as it arrives: the strap's running counter
+    /// (the indoor-run recorder, decision 84c). Frames nothing on this connection asked for never reach it.
+    @ObservationIgnored var stepCounterObserver: (@MainActor (Int, Date) -> Void)?
     /// Every alarm editor event, after the session's own handling: Shortcuts' wake alarm (#260, decision
     /// 52b) records its slot only from the re-read that confirms its write (`StrapWakeAlarmApplier`).
     @ObservationIgnored var alarmEventObserver: (@MainActor (ZeppAlarmEditor.Event) -> Void)?
@@ -320,6 +372,10 @@ final class HelioSession: WearableSession {
     /// §16.5's fail-safes, each sent at most once per connection.
     @ObservationIgnored private var heartRateFailSafeSent = false
     @ObservationIgnored private var realtimeStepsOffSent = false
+    /// This connection sent `05 01` for a workout and no `05 00` since (decision 84b).
+    @ObservationIgnored private(set) var workoutStepsOn = false
+    @ObservationIgnored private var stepStreamReport = StrapStepStreamReport()
+    @ObservationIgnored private var stepStreamFirstOnAt: Date?
     @ObservationIgnored private var chunkedWriteSubscribed = false
 
     private enum NotifyPurpose { case auth, fetch }
@@ -554,6 +610,12 @@ final class HelioSession: WearableSession {
     /// progress can't be acked (the strap keeps unacked data, §6.3); what was stored stays stored.
     func linkLost() {
         isLinkConnected = false
+        // Decision 84b: the stream can't be turned off on a dead link; the flag stays set, so the next
+        // connection's setup sends the `05 00` (`sendOwedStepsOff`).
+        if workoutStepsOn {
+            workoutStepsOn = false
+            onEvent(.stepStream(stepStreamReport))
+        }
         findState.machine.connectionLost()
         findState.persist()
         findPhase = findState.machine.state
@@ -840,6 +902,7 @@ final class HelioSession: WearableSession {
         phase = .ready
         helioLog.notice("helio: ready (clock \(self.clockSet ? "set" : "NOT set", privacy: .public), controls: find \(self.controlCapabilities.isSupported(.findDevice), privacy: .public), alarms \(self.controlCapabilities.isSupported(.alarms), privacy: .public))")
         sendOwedOrphanStop()   // before any stream or sync (review-238 SF2)
+        sendOwedStepsOff()     // decision 84b: a step stream left on is turned off at every connect
         if autoSyncOnConnect {
             syncHistory(manual: false)
             if !appInBackground { activationSyncSettled = true }
@@ -929,12 +992,33 @@ final class HelioSession: WearableSession {
             case .wokeUp?: onEvent(.wokeUp)
             case .controlReply?, nil: break
             }
+        case ZeppEndpoint.realtimeSteps where payload.first == 0x07 && workoutStepsOn:
+            // Decision 84b/84c: the workout's own stream. The counter goes to the recorder; only the
+            // counts go to the breadcrumb.
+            guard case .steps(let counter)? = ZeppRealtimeSteps.parse(payload) else {
+                stepStreamReport.unreadable += 1
+                return
+            }
+            let now = clock()
+            stepStreamReport.frames += 1
+            if stepStreamReport.firstFrameDelay == nil, let on = stepStreamFirstOnAt {
+                stepStreamReport.firstFrameDelay = max(0, now.timeIntervalSince(on))
+            }
+            stepCounterObserver?(Int(counter), now)
         case ZeppEndpoint.realtimeSteps where payload.first == 0x07:
             // §16.2 row 5, §16.5: realtime steps flowing unasked means someone else turned the
-            // persistent stream on. `05 00` once undoes that and records nothing. Never `05 01`.
+            // persistent stream on. `05 00` once undoes that and records nothing. `05 01` only ever
+            // comes from `startWorkoutSteps` (decision 84b).
             if !realtimeStepsOffSent {
                 realtimeStepsOffSent = true
-                send(ZeppEndpoint.realtimeSteps, [0x05, 0x00])
+                send(ZeppEndpoint.realtimeSteps, ZeppRealtimeSteps.disable)
+            }
+        case ZeppEndpoint.realtimeSteps where payload.first == 0x06:
+            // The ack of our `05 xx` (§7.2): kept as received for the breadcrumb, never interpreted.
+            if case .ack(let status, let enabled)? = ZeppRealtimeSteps.parse(payload) {
+                stepStreamReport.ackStatus = status
+                stepStreamReport.ackEnabled = enabled
+                helioLog.notice("helio: realtime steps ack \(String(format: "06 %02x", status), privacy: .public)")
             }
         case ZeppEndpoint.activityFetch:
             // Path B replies (§6.1). The app drives Path A, so this only arrives if the strap answers there.
@@ -1088,7 +1172,7 @@ final class HelioSession: WearableSession {
         switch message.endpoint {
         case ZeppEndpoint.heartRate where first == 0x06: return true                     // sleep events, §16.2
         case ZeppEndpoint.connection where first == 0x03 || first == 0x02: return true   // ping, MTU, §16.2
-        case ZeppEndpoint.realtimeSteps where first == 0x07: return true                 // steps, §16.2 row 5
+        case ZeppEndpoint.realtimeSteps where first == 0x07: return !workoutStepsOn     // steps, §16.2 row 5 (unasked)
         case Self.workoutEndpoint where first == 0x20 || first == 0x11: return true      // workout, §16.2 rows 8–9
         case ZeppEndpoint.alarms where first == 0x0f: return true                        // edited on the strap, §12.5
         case ZeppEndpoint.findDevice where [0x07, 0x11, 0x13].contains(first): return true  // §11.3, §11.5
@@ -1198,6 +1282,55 @@ final class HelioSession: WearableSession {
             helioLog.notice("helio: sent the 04 00 owed since an interrupted workout")
         }
         orphanStop.owed = false
+    }
+
+    // MARK: Realtime steps for an indoor workout (decision 84b)
+
+    /// The step stream is possible on this connection: authenticated, and the services list has
+    /// `0x0016` (§16.2 row 5). Nothing is ever sent to a strap that doesn't list it.
+    var canStreamSteps: Bool {
+        isAuthenticated && isLinkConnected && services?.contains(ZeppEndpoint.realtimeSteps) == true
+    }
+
+    /// Decision 84b: `05 01` only at the start (and resume) of an indoor workout, on an authenticated
+    /// connection whose services list has `0x0016`. The recorder calls this for an indoor run or walk
+    /// only; the session also refuses unless a workout holds its link. The persisted flag is set BEFORE
+    /// the write, so a process killed right after it still owes the `05 00`. true when sent.
+    @discardableResult
+    func startWorkoutSteps() -> Bool {
+        guard canStreamSteps, workoutHoldsLink(), !workoutStepsOn else { return false }
+        stepStreamFlag.turnedOn = true
+        workoutStepsOn = true
+        if stepStreamFirstOnAt == nil { stepStreamFirstOnAt = clock() }
+        send(ZeppEndpoint.realtimeSteps, ZeppRealtimeSteps.enable)
+        helioLog.notice("helio: realtime steps on (05 01) for an indoor workout")
+        return true
+    }
+
+    /// `05 00` for the workout's stream (End, pause, cancel). On a live link the flag clears once it is
+    /// sent; on a link that is gone it stays, and the next connection's setup sends it.
+    func stopWorkoutSteps() {
+        guard workoutStepsOn else { return }
+        workoutStepsOn = false
+        if isLinkConnected, isAuthenticated {
+            send(ZeppEndpoint.realtimeSteps, ZeppRealtimeSteps.disable)
+            stepStreamFlag.clear()
+            helioLog.notice("helio: realtime steps off (05 00)")
+        }
+        onEvent(.stepStream(stepStreamReport))
+    }
+
+    /// Decision 84b: at every connect, a `05 00` when the persisted flag says this app turned the stream
+    /// on, or a journal said a workout ended or was killed with it on. Sent at this connection's first
+    /// authenticated `ready` (`setupFinished`, before any workout can turn it on again), then cleared. A
+    /// strap whose services list lacks `0x0016` never got a `05 01`: cleared, nothing sent.
+    func sendOwedStepsOff() {
+        guard stepStreamFlag.owesOff, isAuthenticated, !workoutStepsOn else { return }
+        if canStreamSteps {
+            send(ZeppEndpoint.realtimeSteps, ZeppRealtimeSteps.disable)
+            helioLog.notice("helio: sent the 05 00 owed for a step stream left on")
+        }
+        stepStreamFlag.clear()
     }
 
     func stopLiveHeartRate() {

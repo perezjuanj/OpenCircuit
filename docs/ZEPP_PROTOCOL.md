@@ -859,7 +859,10 @@ of the record or of the record's span, and nothing above describes it.
 
 `05 01`/`05 00` enable/disable (ack `06 <status> <enabled>`); notifications `07` + 13 bytes,
 steps = u16 LE at offset 1 of those 13. Gadgetbridge turns it **off** on connect because the
-setting persists across connections. 🟡 `SVC/Steps:36-110`. Not needed for v1.
+setting persists across connections. 🟡 `SVC/Steps:36-110`. Used only during an indoor run or
+walk (#339; when it may be on, and the owed `05 00`: §16.5). The counter is read as deltas: a
+reading below the last one is a new base (a reset or a wrap). 🔴 whether the counter is a daily total
+or counts from `05 01`, and whether the Helio sends these frames at all.
 
 ### 7.3 Battery
 
@@ -1800,8 +1803,15 @@ them.
   replies allowed are the ping answer, the find-phone ack `12 01` (§11.5) and chunk acks (§3.4).
 - If `0x2A37` frames arrive that we did not ask for, do what Gadgetbridge does: send `04 00` on
   `0x001D` and unsubscribe.
-- Never send `05 01` on `0x0016`. If a session finds realtime steps flowing (row 5 arriving
-  unasked), send `05 00` once: it only undoes a state someone else set and records nothing.
+- `05 01` on `0x0016` only for an indoor workout (OpenCircuit decision 84b, which supersedes this
+  section's earlier "never send `05 01`" for that one case): at the start (and at a resume) of an
+  indoor run or walk, on an authenticated connection whose services list has `0x0016`. `05 00` at
+  End, at pause, at cancel, on a link drop's reconnect, at every connect when a journal says a
+  workout ended or was killed with the stream on (an owed off, like the owed `04 00`), and at every
+  connect anyway when the persisted flag says the app turned it on. Never `05 01` from any other
+  path, and never in the background on its own (§16.4).
+- If a session finds realtime steps flowing that it did not ask for (row 5 arriving unasked), send
+  `05 00` once: it only undoes a state someone else set and records nothing.
 - Unknown endpoint or first byte: log the endpoint, the first byte and the length, **never the
   payload** (it may hold health data). Reply nothing.
 - Timestamp every event on arrival, and treat it as "at or before now", never as "now": queuing

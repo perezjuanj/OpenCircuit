@@ -1248,7 +1248,8 @@ struct ContentView: View {
         // prompting on every launch.
         WorkoutSessionManager.clearSessionSnapshot()
         Task {
-            let saved = await workoutManager.saveRecoveredWorkout(recovered)
+            // 84l: a store, so an indoor run's persisted readings land as a normal save's do.
+            let saved = await workoutManager.saveRecoveredWorkout(recovered, store: LocalStore(modelContext))
             ringLog.notice("workout: recovered-session save to Health returned \(saved, privacy: .public)")
             if saved { workoutHistoryToken += 1 }
         }
@@ -1258,6 +1259,7 @@ struct ContentView: View {
     private func discardRecoverableWorkout() {
         recoverableWorkout = nil
         WorkoutSessionManager.clearSessionSnapshot()
+        workoutManager.discardPendingReadings()   // 84l: an indoor run's readings go with it
     }
 
     // MARK: - Headache quick-log deep link (#183)

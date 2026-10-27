@@ -71,6 +71,10 @@ struct WorkoutView: View {
                         .padding()
                 case .finished(let summary):
                     summaryView(summary)
+                        // 84j: the SUMMARY going away (Done, the sheet dismissed) saves an indoor workout
+                        // still waiting for its distance prompt. Not the `.onDisappear { stop() }` the note
+                        // below forbids: the workout has already ended, and this only saves it.
+                        .onDisappear { manager.indoorRun?.endWait(.dismissed) }
                 case .error(let msg):
                     VStack(spacing: 16) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -381,6 +385,13 @@ struct WorkoutView: View {
             }
             .padding(.horizontal)
 
+            // An indoor run or walk (#339): cadence and the step-based distance from the ring's steps.
+            if IndoorStepWorkout.applies(to: manager.selectedSport) {
+                IndoorRunLiveStats(cadence: manager.liveCadence, estimatedMeters: manager.liveEstimatedMeters,
+                                   distanceUnit: distanceUnit)
+                    .padding(.horizontal)
+            }
+
             Divider()
 
             // Live zone bars
@@ -519,10 +530,17 @@ struct WorkoutView: View {
                 }
                 .padding(.horizontal)
 
-                // Training load, and the VO₂ max estimate for an outdoor run (#232).
+                // An indoor run or walk (#339): cadence, the distance and the treadmill prompt.
+                if let indoor = manager.indoorRun {
+                    IndoorRunSummarySection(finish: indoor, distanceUnit: distanceUnit)
+                        .padding(.horizontal)
+                }
+
+                // Training load, and the VO₂ max estimate for an outdoor run (#232). An indoor run's
+                // comes from its prompt (#339).
                 WorkoutTrainingMetricsSection(summary: summary,
-                                              vo2Outcome: manager.vo2MaxOutcome,
-                                              vo2HealthStatus: manager.vo2MaxHealthStatus,
+                                              vo2Outcome: manager.indoorRun?.vo2MaxOutcome ?? manager.vo2MaxOutcome,
+                                              vo2HealthStatus: manager.indoorRun.map(\.vo2MaxHealthStatus) ?? manager.vo2MaxHealthStatus,
                                               distanceUnit: distanceUnit)
                     .padding(.horizontal)
 
@@ -548,8 +566,17 @@ struct WorkoutView: View {
                         noteRow(icon: "location.slash", color: .secondary,
                                 text: "No GPS route — location access is off for OpenCircuit.")
                     }
-                    noteRow(icon: "checkmark.circle", color: .green,
-                            text: "Workout saved to Apple Health.")
+                    if manager.indoorRun?.savePending == true {
+                        // 84j: an indoor run or walk waits for its distance prompt (the note is in its section).
+                        noteRow(icon: "clock", color: .secondary,
+                                text: "Not in Apple Health yet: waiting for the treadmill distance.")
+                    } else if manager.indoorRun?.workoutSaved == false {
+                        noteRow(icon: "exclamationmark.triangle", color: .orange,
+                                text: "Apple Health didn't accept this workout, so it isn't in Health.")
+                    } else {
+                        noteRow(icon: "checkmark.circle", color: .green,
+                                text: "Workout saved to Apple Health.")
+                    }
                 }
                 .padding(.horizontal)
 
