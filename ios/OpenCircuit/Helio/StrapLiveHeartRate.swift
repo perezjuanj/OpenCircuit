@@ -11,7 +11,7 @@ struct StrapLiveHeartRate {
     /// How long one measurement runs: the ring's heart-rate Measure budget (`RingSession`'s 90 s user
     /// measure). The spec sets no limit: the strap streams for as long as the app sends the 1 s
     /// keep-alive (ZEPP_PROTOCOL.md §7.1), and stops on `04 00`.
-    static let duration: TimeInterval = 90
+    nonisolated static let duration: TimeInterval = 90
     /// Said on the live card, so the stop is never a surprise.
     static let durationCopy = "Stops by itself after 90 seconds."
 

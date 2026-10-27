@@ -73,6 +73,9 @@ final class RingSession: NSObject {
     /// stop-time persist keep ONLY readings actually measured during this cycle, so a value
     /// lingering from an earlier cycle isn't re-persisted (and re-dated) at stop.
     private var monitoringStartedAt: Date?
+    /// How many live monitoring cycles this session has started: lets "live heart rate on open" tell its own
+    /// stream from one the person started right after stopping it (decision 81g, N2).
+    private(set) var liveMonitoringStarts = 0
     /// True during the open→drain phase before the live stream starts. The ring won't
     /// emit live frames until its history backlog is fully drained, so we surface this
     /// so the UI shows "preparing" instead of a dead reading.
@@ -1087,6 +1090,7 @@ final class RingSession: NSObject {
         syncing = false
         monitoring = true
         monitoringStartedAt = Date()
+        liveMonitoringStarts += 1
         livePreparing = true
         if clearStaleValue {
             // Fresh user read — don't let a stale value look live (#45 C). Clear BOTH metrics: an
@@ -3469,8 +3473,11 @@ final class RingSession: NSObject {
 
     /// Per-mode user-measure budget (seconds): HR needs longer stillness to converge than SpO₂.
     private func userMeasureBudget(for mode: LiveMode) -> TimeInterval {
-        mode == .spo2 ? 45 : 90
+        mode == .spo2 ? 45 : Self.userHeartRateMeasureBudget
     }
+
+    /// How long a heart-rate Measure runs (seconds). The copy of "Live heart rate when the app opens" reads it.
+    nonisolated static let userHeartRateMeasureBudget: TimeInterval = 90
 
     /// (Re)arm the user-measure poll deadline for the current mode, or clear it on the auto path.
     /// Called when the poll loop starts AND on a re-tap (`rearmUserMeasure`) so the budget is

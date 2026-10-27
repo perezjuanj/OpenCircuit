@@ -377,7 +377,7 @@ struct ContentView: View {
                 if phase == .active {
                     handleForegroundActivation()
                     // Decision 81: after the foreground sync was asked for, never before it.
-                    autoLiveHR.activate(choice: deviceChoice.current, driver: autoLiveDriver)
+                    autoLiveHR.sceneChanged(to: phase, choice: deviceChoice.current, driver: autoLiveDriver)
                     refreshObservability()        // pick up anything a background run wrote
                     evaluateForegroundAlerts()    // live battery + Health-auth check (#44)
 #if DEBUG
@@ -385,7 +385,7 @@ struct ContentView: View {
                     Task { await calibration.refreshLatestEstimateIfNeeded() }
 #endif
                 } else if phase == .background {
-                    autoLiveHR.leftForeground(driver: autoLiveDriver)   // decision 81d
+                    autoLiveHR.sceneChanged(to: phase, choice: deviceChoice.current, driver: autoLiveDriver)   // decision 81d
                     // Don't leave a user-initiated foreground scan/picker running once we leave the
                     // foreground — a nil-filtered scan yields nothing in the background and just keeps
                     // the radio engaged. Preserves the active ring (cancelScan, not stop).

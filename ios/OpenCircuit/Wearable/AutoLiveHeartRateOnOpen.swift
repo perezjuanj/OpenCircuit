@@ -24,18 +24,19 @@ extension ActiveDeviceChoice {
 
 enum AutoLiveHeartRateOnOpenCopy {
     static let label = "Live heart rate when the app opens"
-    /// The strap's and the ring's heart-rate Measure both run for `StrapLiveHeartRate.duration`
-    /// (the ring's is `RingSession`'s 90 s user measure).
-    @MainActor static var footnote: String {
-        "Measures for \(Int(StrapLiveHeartRate.duration)) seconds each time you open the app."
+    /// Each device's own Measure length (decision 81g, N3).
+    static func footnote(for choice: ActiveDeviceChoice) -> String {
+        "Measures for \(Int(choice.liveHeartRateMeasureDuration)) seconds each time you open the app."
     }
 }
 
 /// The settings row, the same in each device's own settings screen.
 struct AutoLiveHeartRateOnOpenRow: View {
     @AppStorage private var isOn: Bool
+    private let choice: ActiveDeviceChoice
 
     init(choice: ActiveDeviceChoice) {
+        self.choice = choice
         var defaultOn = false
         if case .supported(let on) = choice.autoLiveHeartRateOnOpen { defaultOn = on }
         _isOn = AppStorage(wrappedValue: defaultOn, choice.autoLiveHeartRateOnOpenKey)
@@ -45,7 +46,7 @@ struct AutoLiveHeartRateOnOpenRow: View {
         Section {
             Toggle(AutoLiveHeartRateOnOpenCopy.label, isOn: $isOn)
         } footer: {
-            Text(AutoLiveHeartRateOnOpenCopy.footnote)
+            Text(AutoLiveHeartRateOnOpenCopy.footnote(for: choice))
         }
     }
 }
@@ -62,6 +63,9 @@ protocol AutoLiveHeartRateDriver {
     /// The foreground sync's start isn't decided yet (81b).
     var syncStillToDecide: Bool { get }
     var owner: AutoLiveHeartRate.Owner { get }
+    /// Counts the Measure streams the device's session has started, so a stream the person starts right
+    /// after stopping ours is told apart from ours even when the owner never visibly changed (81g, N2).
+    var streamStarts: Int { get }
     func startMeasure()
     /// Stops the Measure stream. Called only while a Measure (never a workout) owns it.
     func stopMeasure()
@@ -69,7 +73,8 @@ protocol AutoLiveHeartRateDriver {
 
 extension AutoLiveHeartRateDriver {
     var facts: AutoLiveHeartRateFacts {
-        AutoLiveHeartRateFacts(sessionReady: sessionReady, syncing: syncing, syncStillToDecide: syncStillToDecide, owner: owner)
+        AutoLiveHeartRateFacts(sessionReady: sessionReady, syncing: syncing, syncStillToDecide: syncStillToDecide,
+                               owner: owner, streamStarts: streamStarts)
     }
 }
 
@@ -79,6 +84,7 @@ struct AutoLiveHeartRateFacts: Equatable {
     var syncing: Bool
     var syncStillToDecide: Bool
     var owner: AutoLiveHeartRate.Owner
+    var streamStarts: Int
 }
 
 /// Re-asks the coordinator when the driver's facts change. A modifier of its own, so the screen's
@@ -108,6 +114,8 @@ struct StrapAutoLiveDriver: AutoLiveHeartRateDriver {
         return StrapWorkoutRecorder.holdsStrapLink ? .workout : .none
     }
 
+    var streamStarts: Int { session.liveMeasureStarts }
+
     func startMeasure() { session.startLiveHeartRate(duration: StrapLiveHeartRate.duration) }
     func stopMeasure() { session.stopLiveHeartRate() }
 }
@@ -131,6 +139,8 @@ struct RingAutoLiveDriver: AutoLiveHeartRateDriver {
         return session.monitoring ? .measure : .none
     }
 
+    var streamStarts: Int { session.liveMonitoringStarts }
+
     func startMeasure() { session.startMonitoring(mode: .hr, userInitiated: true, quickLiveRead: true) }
     func stopMeasure() { session.stopLiveMonitoring() }
 }
@@ -138,12 +148,14 @@ struct RingAutoLiveDriver: AutoLiveHeartRateDriver {
 // MARK: Coordinator
 
 /// One foreground activation's memory (81c): what was started, and what the person did. The view calls
-/// `activate` when the scene becomes active, `evaluate` whenever the driver's facts change, and
-/// `leftForeground` when the scene goes to the background.
+/// `sceneChanged` as the scene phase changes and `evaluate` whenever the driver's facts change.
+///
+/// An activation begins when the scene becomes active after the app was in the BACKGROUND (or at the
+/// first activation). An `.inactive` to `.active` bounce (Control Center, a banner) is not one: it keeps
+/// what this activation started and what the person did (decision 81g, SF1), as the activation sync does.
 @MainActor
 final class AutoLiveHeartRateCoordinator {
     private let defaults: UserDefaults
-    private let measureDuration: TimeInterval
 
     private var choice: ActiveDeviceChoice?
     private var activatedAt: Date?
@@ -154,14 +166,30 @@ final class AutoLiveHeartRateCoordinator {
     /// The stream running now is the one this coordinator started (81d stops only that one).
     private var autoStreamLive = false
     private var autoStartedAt: Date?
+    /// `driver.streamStarts` right after our start: a different count means a newer stream is not ours.
+    private var autoStreamStarts = 0
 
-    init(defaults: UserDefaults = .standard, measureDuration: TimeInterval = StrapLiveHeartRate.duration) {
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.measureDuration = measureDuration
     }
 
-    /// The scene became active: a fresh activation, then ask.
+    /// The one entry the scene-phase hook calls. `.inactive` does nothing: it is not leaving the front.
+    func sceneChanged(to phase: ScenePhase, choice: ActiveDeviceChoice, driver: (any AutoLiveHeartRateDriver)?,
+                      now: Date = Date()) {
+        switch phase {
+        case .active: activate(choice: choice, driver: driver, now: now)
+        case .background: leftForeground(driver: driver)
+        case .inactive: break
+        @unknown default: break
+        }
+    }
+
+    /// The scene became active: a fresh activation unless the app never left the front, then ask.
     func activate(choice: ActiveDeviceChoice, driver: (any AutoLiveHeartRateDriver)?, now: Date = Date()) {
+        guard !(inFront && activatedAt != nil) else {
+            evaluate(choice: choice, driver: driver, now: now)   // a bounce
+            return
+        }
         self.choice = choice
         activatedAt = now
         inFront = true
@@ -187,9 +215,11 @@ final class AutoLiveHeartRateCoordinator {
         // The stream we started has ended: by its own timer, or early because the person stopped it
         // (or the link dropped). An early end is treated as the person's stop, the side where nothing
         // restarts (81c).
-        if autoStreamLive, driver.owner != .measure {
+        if autoStreamLive, !ownsStream(driver) {
             autoStreamLive = false
-            if let autoStartedAt, now.timeIntervalSince(autoStartedAt) < measureDuration - 2 { stoppedByPerson = true }
+            if let autoStartedAt, now.timeIntervalSince(autoStartedAt) < choice.liveHeartRateMeasureDuration - 2 {
+                stoppedByPerson = true
+            }
         }
         let decision = AutoLiveHeartRate.decide(.init(
             supported: choice.autoLiveHeartRateOnOpen != .unsupported,
@@ -200,17 +230,23 @@ final class AutoLiveHeartRateCoordinator {
             alreadyAutoStarted: autoStarted, stoppedByPerson: stoppedByPerson))
         guard decision == .startNow else { return }
         autoStarted = true
-        autoStreamLive = true
         autoStartedAt = now
         driver.startMeasure()
+        autoStreamStarts = driver.streamStarts
+        autoStreamLive = true
     }
 
     /// The scene left the front (81d): an automatically started stream stops at once. A Measure the
-    /// person started keeps today's behaviour.
+    /// person started keeps today's behaviour, even one started right after stopping ours (81g, N2).
     func leftForeground(driver: (any AutoLiveHeartRateDriver)?) {
         inFront = false
         defer { autoStreamLive = false }
-        guard autoStreamLive, let driver, driver.owner == .measure else { return }
+        guard autoStreamLive, let driver, ownsStream(driver) else { return }
         driver.stopMeasure()
+    }
+
+    /// A Measure runs and it is the stream this coordinator started, not a later one.
+    private func ownsStream(_ driver: any AutoLiveHeartRateDriver) -> Bool {
+        driver.owner == .measure && driver.streamStarts == autoStreamStarts
     }
 }
