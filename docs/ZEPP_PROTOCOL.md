@@ -2587,11 +2587,14 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
     overlaps the night's sleep is not stored at all (the backstop of 77j).
     A ring nap that touches a ring night is still not rewritten.
   - **A night stored before its nap** (decision 79e): a night stored BEFORE the sync that first sees a
-    nap more than 60 min before its sleep onset was stored with a lead-in over that nap. While the night
-    is NOT written to Apple Health, its next re-delivery with the same sleep window and a lead-in that
-    now starts later (stopped at the nap, 77c) replaces the stored copy instead of the merge keeping
-    the copy with more time in bed, so the lead-in stops at the nap. Any other re-delivery goes to the
-    merge as before.
+    nap more than 60 min before its sleep onset was stored with a lead-in over that nap. The rule: while
+    the night is NOT written to Apple Health, a re-delivery whose sleep window is the stored one's (within
+    a second) and whose re-derived lead-in starts LATER than the stored one, or that has none, replaces
+    the stored copy instead of the merge keeping the copy with more time in bed, whatever moved the
+    lead-in start (a nap that now clamps it, 77c, or stored rows that changed since). The replacement is
+    the re-delivered staging as it is, asleep minutes included, without the merge's completeness check;
+    its sleep window is the same. So the lead-in then stops at the nap. Any other re-delivery (another
+    sleep window, a lead-in starting as early or earlier) goes to the merge as before.
   - **Known limit, not fixed:** a night already WRITTEN to Apple Health keeps the lead-in it was written
     with (77f, forward-only; there is no rewrite path). The nap is stored (it is a real nap, §21.5),
     and the night's lead-in can lie over it by up to the clamp difference: 30 min for a nap ending 90

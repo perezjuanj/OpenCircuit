@@ -220,8 +220,8 @@ stores and writes what it measured for time it owned:
     second clear of the lead-in and the night's `inBed`; one that overlaps by even one second is still
     not rewritten (Health keeps the old write), and a ring nap touching a ring night is unchanged. A
     night stored BEFORE the sync that first sees a nap more than 60 min before its sleep onset, and not
-    yet written, is replaced by its next re-delivery with the same sleep window, so its lead-in stops at
-    the nap (decision 79e). Known limit, not fixed: such a night already WRITTEN keeps its lead-in (77f,
+    yet written, is replaced by its next re-delivery with the same sleep window and a later (or no)
+    lead-in start, whatever moved it, so its lead-in stops at the nap (decision 79e). Known limit, not fixed: such a night already WRITTEN keeps its lead-in (77f,
     forward-only) until it extends (58b), so the lead-in can lie over that nap by up to the clamp
     difference (30 min for a nap ending 90 min before onset, 59 min at 61 min, at most the 120 min cap):
     in Health an `inBed` overlap and an `awake` sample over the nap's asleep one, asleep time not counted
