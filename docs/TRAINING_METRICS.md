@@ -213,6 +213,35 @@ one person's trend on similar routes. It is not a lab value.
 
 ---
 
+## 2b. Heart rate recovery (#337, decision 82)
+
+Heart rate recovery (HRR) is how far heart rate falls after a hard effort. The app measures it the way
+the tester's app (Bevel) defines it, from readings only: nothing is interpolated or defaulted.
+
+- **Peak** = the highest reading in the workout's active time (the running stretches; pauses hold none).
+- **HRR1** = peak − the reading nearest end + 60 s; **HRR2** = peak − the reading nearest end + 120 s.
+  A reading counts only within 10 s of its mark (inclusive; on a tie the earlier one).
+- **Only after zone 4.** Computed only when the peak reached zone 4, the bound read through the zone
+  classifier for the person (`HeartRateRecovery.zoneFourLowerBound`), whatever source of bounds is
+  current. Otherwise "not measured", with the reason in words.
+- **The window.** After End the strap's stream keeps running for 120 s, plus up to 10 s to catch the
+  +120 s reading. The workout itself is saved at End exactly as before. Skip, a new workout, or the
+  link dropping end the window early; a missing value then says why. A workout ended while paused
+  ended where the pause began, so the readings the strap streamed during that pause count.
+- **Where it shows.** The summary (a countdown with Skip, then "Heart rate recovery: 1 min -N bpm,
+  2 min -M bpm"), and the workout detail, re-derived from the app's stored rows inside the window this
+  app recorded for that workout (`WorkoutRecoveryWindows`), never from Health's readings.
+- **Apple Health.** The readings as heart-rate samples after the workout; HRR1 as Cardio Recovery at
+  end + 60 s (`docs/HEALTHKIT_MAPPING.md`).
+- **The ring** has no recovery window yet: its workout ends with SportStop (`06 00 00`), and its live
+  heart rate after that is a smoothed, converging average whose first value after a mode change is
+  not yet measured on hardware (follow-up in #337's PR).
+
+Code: `OpenCircuitKit/Analytics/HeartRateRecovery.swift` (pure, `HeartRateRecoveryTests`), the
+recorder's window in `Helio/StrapWorkoutRecorder.swift`.
+
+---
+
 ## 3. Recovery time and training effect: not shipped
 
 The brief allows these only with a published, documented method, and we found none that can be
