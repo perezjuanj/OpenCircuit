@@ -114,7 +114,12 @@ stores and writes what it measured for time it owned:
     A pruned nap's Health write is removed: inside the night by the night's own mirror, outside it by
     the next nap flush (#327 S1/S2: `cleanPrunedNaps`, this app's own samples in the pruned strap
     nap's written span, one second clear of every stored night and nap; the span is kept until its
-    delete succeeds and dropped 14 days after it ended; a ring nap is unchanged). A nap from a block is
+    delete succeeds and dropped 14 days after it ended; a ring nap is unchanged). The prune is
+    idempotent (decision 80b, #331 item 10): the span is scheduled only once the prune's delete is
+    saved, and the prune also runs when the merge keeps a strap night's stored copy over a re-delivery
+    (`.keptFullerStoredNight`, judged on the stored night), so a prune whose save failed is retried by
+    the next re-delivery the merge judges (an edited night never retries); what the merge keeps is
+    unchanged. A nap from a block is
     also HELD (unsettled) by the chain of sleep that follows it (decision 76j, an optimisation that
     avoids a write followed by a delete): the sync's kind-sleep runs (up to 5 other minutes inside a
     run, as a block's) starting within 60 min after the nap's end, then each next run starting within
@@ -210,7 +215,11 @@ stores and writes what it measured for time it owned:
     or one the same sync is about to store, activity-block naps included), and nearness, the 60 min
     rule, 76l's prune and `saveNap`'s overlap backstop, is measured from the night's SLEEP, never its
     lead-in; so the lead-in never prunes a nap. A manual nap's add or edit and the nap Health-delete
-    fences still keep out of the whole in-bed window. Known limit, not fixed in this PR: a night
+    fences still keep out of the whole in-bed window. Decision 80a (#331 item 7): a strap nap whose
+    moved re-detection only touches that window (zero overlap: the lead-in starts where the nap ends)
+    is rewritten, so the card's nap and Health agree, and the clean of its old write still ends one
+    second clear of the lead-in and the night's `inBed`; one that overlaps by even one second is still
+    not rewritten (Health keeps the old write), and a ring nap touching a ring night is unchanged. Known limit, not fixed in this PR: a night
     stored BEFORE the sync that first sees a nap more than 60 min before its sleep onset keeps its
     lead-in until it is re-delivered changed enough for the merge to replace it, so the lead-in can lie
     over that nap by up to the clamp difference (30 min for a nap ending 90 min before onset, 59 min at
