@@ -145,6 +145,15 @@ final class HealthKitWorkoutStore: WorkoutHealthDeleting {
         HeartRateRecoveryHealthWriter.cardioRecoveryType,
     ]
 
+    /// The owned types a delete asks Health about. Cardio Recovery is asked for lazily (the app's share
+    /// request for it comes at a later open), and a query on a type never asked for can fail, which
+    /// would fail every workout delete: nothing of ours can exist for it unless sharing was granted.
+    static func ownedTypesToQuery(cardioRecoveryStatus: HKAuthorizationStatus) -> [HKSampleType] {
+        ownedSampleTypes.filter {
+            $0 != HeartRateRecoveryHealthWriter.cardioRecoveryType || cardioRecoveryStatus == .sharingAuthorized
+        }
+    }
+
     /// How a workout's own sample of `type` is found: saved with the workout, except Cardio Recovery,
     /// which is our own sample dated exactly 1 minute after the workout's end (where
     /// `saveCardioRecovery` puts it). Our source in both, and never a wider time window (85d).
@@ -175,7 +184,8 @@ final class HealthKitWorkoutStore: WorkoutHealthDeleting {
     func deleteOwnedSamples(ofWorkout id: UUID) async throws {
         guard let workout = try await workout(id) else { return }
         var owned: [HKSample] = []
-        for type in Self.ownedSampleTypes {
+        let cardioStatus = store.authorizationStatus(for: HeartRateRecoveryHealthWriter.cardioRecoveryType)
+        for type in Self.ownedTypesToQuery(cardioRecoveryStatus: cardioStatus) {
             owned += try await samples(of: type, predicate: Self.ownedPredicate(for: type, workout: workout))
         }
         // One call, so a failure leaves all of them in place rather than some. Skipped when empty:

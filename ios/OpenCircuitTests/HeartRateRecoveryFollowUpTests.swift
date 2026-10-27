@@ -331,6 +331,37 @@ final class HeartRateRecoveryFollowUpRecorderTests: XCTestCase {
         XCTAssertTrue(owed.owed, "nothing could be sent down a dropped link: the next ready sends it")
     }
 
+    func testAWindowClosedByTheTickAtTenSecondsPastTheMarkLeavesNothingOwed() async {
+        let owed = freshOrphanStop()
+        let (session, transport) = connect(orphanStop: freshOrphanStop())
+        let recorder = makeRecorder(source: session, orphanStop: owed)
+        await runAndEnd(session, recorder)
+        await stream(session, recorder, from: 600, to: 700) { _ in 150 }
+        XCTAssertTrue(recorder.isMeasuringRecovery)
+        XCTAssertTrue(owed.owed)
+        now = at(729)
+        await recorder.tick(now: now)
+        XCTAssertTrue(recorder.isMeasuringRecovery, "up to 10 s to catch the +120 s reading")
+        now = at(730)
+        await recorder.tick(now: now)
+        XCTAssertEqual(recorder.recoveryClosedBy, .complete)
+        XCTAssertFalse(owed.owed, "the window stopped the stream itself")
+        XCTAssertEqual(transport.heartRateCommands.last, ZeppHeartRateControl.stop)
+    }
+
+    func testAWindowClosedByANewWorkoutLeavesNothingOwed() async {
+        let owed = freshOrphanStop()
+        let (session, transport) = connect(orphanStop: freshOrphanStop())
+        let recorder = makeRecorder(source: session, orphanStop: owed)
+        await runAndEnd(session, recorder)
+        await stream(session, recorder, from: 600, to: 640) { _ in 150 }
+        XCTAssertTrue(owed.owed)
+        recorder.endRecoveryForNewWorkout()
+        XCTAssertEqual(recorder.recoveryClosedBy, .newWorkout)
+        XCTAssertFalse(owed.owed)
+        XCTAssertEqual(transport.heartRateCommands.last, ZeppHeartRateControl.stop)
+    }
+
     // MARK: 85b — no negative Cardio Recovery
 
     /// A 10-minute run peaking at 170 bpm (zone 5 at 40), then `after` bpm for the whole window.
@@ -353,7 +384,7 @@ final class HeartRateRecoveryFollowUpRecorderTests: XCTestCase {
     func testAHeartRateThatRoseIsShownAndNotWrittenToHealth() async {
         let (writes, outcome) = await cardioWrites(after: 172)
         XCTAssertEqual(outcome?.oneMinute.drop, -2, "the summary still has the measured value")
-        XCTAssertEqual(HeartRateRecoveryText.values(outcome!), "1 min +2 bpm, 2 min +2 bpm")
+        XCTAssertEqual(HeartRateRecoveryText.values(outcome!), "1 min heart rate rose, 2 min +2 bpm")
         XCTAssertEqual(writes.count, 0, "Cardio Recovery is a drop, not a rise")
     }
 
@@ -394,6 +425,48 @@ final class HeartRateRecoveryFollowUpHistoryTests: XCTestCase {
         let outcome = try XCTUnwrap(WorkoutDetailContent.recovery(workoutHR: workout, storedRows: [reading(130, 661)],
                                                                   window: window, age: 40))
         XCTAssertEqual(outcome.oneMinute, .notMeasured(.noWorkoutHeartRate))
+    }
+
+    // 85e N1: the words for a heart rate that did not fall
+
+    private func outcome(oneMinute: Int, twoMinutes: Int) -> HeartRateRecovery.Outcome {
+        HeartRateRecovery.Outcome(peak: 170, oneMinute: .measured(drop: oneMinute, reading: 170 - oneMinute, at: at(60)),
+                                  twoMinutes: .measured(drop: twoMinutes, reading: 170 - twoMinutes, at: at(120)))
+    }
+
+    func testAOneMinuteValueThatDidNotFallSaysHeartRateRoseNeverMinusZero() {
+        for drop in [-4, 0] {
+            let o = outcome(oneMinute: drop, twoMinutes: 10)
+            XCTAssertEqual(HeartRateRecoveryText.values(o), "1 min heart rate rose, 2 min -10 bpm")
+            XCTAssertEqual(HeartRateRecoveryText.headline(o), "Heart rate recovery: 1 min heart rate rose, 2 min -10 bpm")
+            XCTAssertEqual(HeartRateRecoveryText.reasons(o),
+                           ["1 min: heart rate rose, so it isn't saved to Apple Health as Cardio Recovery."])
+            let rows = WorkoutDetailContent.recoveryRow(o)
+            XCTAssertEqual(rows.value, "1 min heart rate rose, 2 min -10 bpm", "the detail says it too")
+            XCTAssertNotNil(rows.caption)
+        }
+        XCTAssertFalse(HeartRateRecoveryText.values(outcome(oneMinute: 0, twoMinutes: 0)).contains("-0"))
+    }
+
+    func testAOneMinuteDropKeepsItsNumberAndNeedsNoExplanation() {
+        let o = outcome(oneMinute: 1, twoMinutes: 20)
+        XCTAssertEqual(HeartRateRecoveryText.values(o), "1 min -1 bpm, 2 min -20 bpm")
+        XCTAssertEqual(HeartRateRecoveryText.reasons(o), [])
+    }
+
+    // 85e S1: a delete never asks Health about a type it was never granted
+
+    func testADeleteAsksAboutCardioRecoveryOnlyWhenSharingIsGranted() {
+        let cardio = HKQuantityType(.heartRateRecoveryOneMinute)
+        for status in [HKAuthorizationStatus.notDetermined, .sharingDenied] {
+            let types = HealthKitWorkoutStore.ownedTypesToQuery(cardioRecoveryStatus: status)
+            XCTAssertFalse(types.contains(cardio), "\(status.rawValue): nothing of ours can exist")
+            XCTAssertEqual(types.count, HealthKitWorkoutStore.ownedSampleTypes.count - 1,
+                           "every other owned type is still asked")
+        }
+        let granted = HealthKitWorkoutStore.ownedTypesToQuery(cardioRecoveryStatus: .sharingAuthorized)
+        XCTAssertEqual(granted, HealthKitWorkoutStore.ownedSampleTypes)
+        XCTAssertTrue(granted.contains(cardio))
     }
 
     // 85d

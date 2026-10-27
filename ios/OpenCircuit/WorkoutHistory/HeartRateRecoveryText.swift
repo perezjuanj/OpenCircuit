@@ -11,7 +11,14 @@ enum HeartRateRecoveryText {
     /// when neither was.
     static func values(_ outcome: HeartRateRecovery.Outcome) -> String {
         if outcome.oneMinute.drop == nil, outcome.twoMinutes.drop == nil { return "Not measured" }
-        return "1 min \(value(outcome.oneMinute)), 2 min \(value(outcome.twoMinutes))"
+        return "1 min \(oneMinuteValue(outcome.oneMinute)), 2 min \(value(outcome.twoMinutes))"
+    }
+
+    /// The 1-minute value. One that did not fall (the heart rate rose, or held) says so in words: it is
+    /// not a recovery value and is not saved to Apple Health as Cardio Recovery (85b, 85e).
+    private static func oneMinuteValue(_ value: HeartRateRecovery.Value) -> String {
+        if let drop = value.drop, drop <= 0 { return "heart rate rose" }
+        return Self.value(value)
     }
 
     /// The summary's line: "Heart rate recovery: 1 min -N bpm, 2 min -M bpm".
@@ -23,7 +30,7 @@ enum HeartRateRecoveryText {
     /// A drop is how far heart rate fell from the peak: "-N bpm". One that rose says "+N bpm".
     private static func value(_ value: HeartRateRecovery.Value) -> String {
         guard let drop = value.drop else { return "not measured" }
-        return drop >= 0 ? "-\(drop) bpm" : "+\(-drop) bpm"
+        return drop > 0 ? "-\(drop) bpm" : drop == 0 ? "0 bpm" : "+\(-drop) bpm"
     }
 
     /// Why each missing value is missing, in words; empty when both were measured. `closedBy` (the
@@ -39,6 +46,9 @@ enum HeartRateRecoveryText {
             break
         }
         var reasons: [String] = []
+        if let drop = outcome.oneMinute.drop, drop <= 0 {
+            reasons.append("1 min: heart rate rose, so it isn't saved to Apple Health as Cardio Recovery.")
+        }
         if case .notMeasured(.noReadingNearMark) = outcome.oneMinute { reasons.append(missing("1 min", "1 minute", closedBy)) }
         if case .notMeasured(.noReadingNearMark) = outcome.twoMinutes { reasons.append(missing("2 min", "2 minutes", closedBy)) }
         return reasons
