@@ -1,4 +1,5 @@
 import CoreLocation
+import SwiftData
 import XCTest
 import OpenCircuitKit
 import ZeppKit
