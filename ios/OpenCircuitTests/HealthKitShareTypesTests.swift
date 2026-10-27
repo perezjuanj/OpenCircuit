@@ -143,6 +143,7 @@ final class HealthKitShareTypesTests: XCTestCase {
             HKQuantityTypeIdentifier.distanceWalkingRunning.rawValue,
             HKQuantityTypeIdentifier.basalEnergyBurned.rawValue,
             HKQuantityTypeIdentifier.distanceCycling.rawValue,
+            HKQuantityTypeIdentifier.heartRateRecoveryOneMinute.rawValue,   // decision 82e (#337)
             HKQuantityTypeIdentifier.bloodPressureSystolic.rawValue,
             HKQuantityTypeIdentifier.bloodPressureDiastolic.rawValue,
             HKCategoryTypeIdentifier.sleepAnalysis.rawValue,
