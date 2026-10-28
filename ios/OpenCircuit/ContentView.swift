@@ -593,33 +593,17 @@ struct ContentView: View {
     private var liveMeasureCard: some View {
         if let session, session.monitoring == true {
             let isHR = session.liveMode == .hr
-            OCCard {
-                OCSectionHeader(isHR ? "Live Heart Rate" : "Live SpO₂",
-                                systemImage: isHR ? "heart.fill" : "lungs.fill",
-                                tint: isHR ? Theme.hr : Theme.spo2)
-                // Large live readout above the scrolling chart (#216). nil/0 = still warming up.
-                LiveVitalReadout(value: (isHR ? session.liveHR : session.liveSpO2).flatMap { $0 > 0 ? $0 : nil },
-                                 unit: isHR ? "bpm" : "%", tint: isHR ? Theme.hr : Theme.spo2,
-                                 pulses: isHR, sessionRange: liveRange)
-                LiveVitalsChart(buffer: liveBuffer,
-                                color: isHR ? Theme.hr : Theme.spo2,
-                                window: 90,
-                                unit: isHR ? "bpm" : "%",
-                                emptyText: "Hold still — getting a reading…")
-                    .frame(height: 150)
-            }
+            // Small on Today (nil/0 = still warming up); the big readout and chart are on the
+            // Measure card in the metric detail, one tap away.
+            LiveMeasureStrip(title: isHR ? "Live heart rate" : "Live SpO₂",
+                             value: (isHR ? session.liveHR : session.liveSpO2).flatMap { $0 > 0 ? $0 : nil },
+                             unit: isHR ? "bpm" : "%", tint: isHR ? Theme.hr : Theme.spo2,
+                             pulses: isHR, sessionRange: liveRange, buffer: liveBuffer)
             .modifier(OpensMeasureDetail { path.append(.metric((isHR ? MeasuredVital.heartRate : .spo2).detailMetric)) })
         } else if let strapLive, strapLive.measuring {
             // The strap's measurement on the same card (decision 30); heart rate only, no SpO₂.
-            OCCard {
-                OCSectionHeader("Live Heart Rate", systemImage: "heart.fill", tint: Theme.hr)
-                LiveVitalReadout(value: strapLive.liveHR, unit: "bpm", tint: Theme.hr,
-                                 pulses: true, sessionRange: liveRange)
-                LiveVitalsChart(buffer: liveBuffer, color: Theme.hr, window: 90, unit: "bpm",
-                                emptyText: "Hold still — getting a reading…")
-                    .frame(height: 150)
-                Text(StrapLiveHeartRate.durationCopy).font(.caption2).foregroundStyle(.secondary)
-            }
+            LiveMeasureStrip(title: "Live heart rate", value: strapLive.liveHR, unit: "bpm", tint: Theme.hr,
+                             pulses: true, sessionRange: liveRange, buffer: liveBuffer)
             .modifier(OpensMeasureDetail { path.append(.metric(MeasuredVital.heartRate.detailMetric)) })
         }
     }
