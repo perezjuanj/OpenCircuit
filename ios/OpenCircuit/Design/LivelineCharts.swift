@@ -35,6 +35,8 @@ struct LiveVitalsChart: View {
     var unit: String = ""
     /// Shown centered when there are no points yet (warm-up).
     var emptyText: String = "Waiting for a reading…"
+    /// A bare sparkline for the Today strip: no badge, no big value, a thinner line.
+    var compact = false
 
     var body: some View {
         LivelineChart(
@@ -45,12 +47,12 @@ struct LiveVitalsChart: View {
                 theme: scheme == .dark ? .dark : .light,
                 window: window,
                 grid: false,
-                badge: true,
+                badge: !compact,
                 fill: true,
                 pulse: true,
-                lineWidth: 3,
+                lineWidth: compact ? 2 : 3,
                 scrub: false,                 // it's live — no historical scrubbing
-                showValue: true,
+                showValue: !compact,
                 valueMomentumColor: true,     // rising = green, falling = red endpoint value
                 emptyText: emptyText,
                 formatValue: { v in
