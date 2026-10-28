@@ -11,6 +11,65 @@
 // Pure layout and navigation plumbing; no state beyond which detail is showing.
 
 import SwiftUI
+import UIKit
+
+// MARK: - Wide split (width, not just size class)
+
+/// Whether a tab shows its two-column master–detail layout. `horizontalSizeClass == .regular` is
+/// necessary but not enough: iPhone Duo's inner display is regular width in PORTRAIT too, at about
+/// 669 pt, where a 340–440 pt list column leaves a cramped detail pane (the system then tucks the
+/// list behind a sidebar button). Below `WideSplit.minimumWidth` the app keeps the single-column
+/// phone layout; landscape (951 pt) and iPad keep the split.
+enum WideSplit {
+    static let minimumWidth: CGFloat = 700
+}
+
+private struct WideSplitKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    /// True when the window is regular width AND wide enough for two columns. Set once at the root
+    /// by `provideWideSplit()`; read by `SplitTab` and the tabs that branch on wide.
+    var isWideSplit: Bool {
+        get { self[WideSplitKey.self] }
+        set { self[WideSplitKey.self] = newValue }
+    }
+}
+
+private struct WindowWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+private struct WideSplitProvider: ViewModifier {
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var width: CGFloat = Self.initialWindowWidth()
+
+    /// The window's width before the first layout pass, so a regular-width but narrow window (iPhone
+    /// Duo's inner display in portrait) never builds the split for one frame on a cold launch. 0 when
+    /// no scene is connected yet, which falls back to the size class alone.
+    private static func initialWindowWidth() -> CGFloat {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        return scene?.coordinateSpace.bounds.width ?? 0
+    }
+
+    func body(content: Content) -> some View {
+        // Until a width is known, follow the size class alone (as the app always did).
+        let wide = sizeClass == .regular && (width == 0 || width >= WideSplit.minimumWidth)
+        content
+            .environment(\.isWideSplit, wide)
+            .background(GeometryReader { geo in
+                Color.clear.preference(key: WindowWidthKey.self, value: geo.size.width)
+            })
+            .onPreferenceChange(WindowWidthKey.self) { width = $0 }
+    }
+}
+
+extension View {
+    /// Apply once, above everything that reads `isWideSplit` (including `ContentView` itself).
+    func provideWideSplit() -> some View { modifier(WideSplitProvider()) }
+}
 
 // MARK: - Detail model + environment
 
@@ -69,7 +128,7 @@ struct DetailLink<Destination: View, Label: View>: View {
 /// One tab's root. Compact: a plain `NavigationStack` around `primary`. Regular: `primary` as the
 /// left column and the selected detail (or `emptyDetail` until something is chosen) on the right.
 struct SplitTab<Primary: View, EmptyDetail: View>: View {
-    @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.isWideSplit) private var isWide
     @State private var model = SplitDetailModel()
     private let primary: Primary
     private let emptyDetail: EmptyDetail
@@ -80,7 +139,7 @@ struct SplitTab<Primary: View, EmptyDetail: View>: View {
     }
 
     var body: some View {
-        if sizeClass == .regular {
+        if isWide {
             NavigationSplitView(columnVisibility: .constant(.doubleColumn)) {
                 primary
                     .environment(\.splitDetail, model)
@@ -97,6 +156,33 @@ struct SplitTab<Primary: View, EmptyDetail: View>: View {
         } else {
             NavigationStack { primary }
         }
+    }
+}
+
+// MARK: - Viewport pin (compact only)
+
+private struct PinnedToViewportWhenCompact: ViewModifier {
+    @Environment(\.isWideSplit) private var isWide
+
+    func body(content: Content) -> some View {
+        if isWide {
+            // Wide: this view lives in a split-view column. `containerRelativeFrame` would size it
+            // against the WHOLE window instead of the column, so a detail pane overran its column
+            // and was clipped (the Sleep tab on an unfolded foldable / iPad). The column already
+            // proposes the right width.
+            content
+        } else {
+            content.containerRelativeFrame(.horizontal)
+        }
+    }
+}
+
+extension View {
+    /// Pins a vertical `ScrollView`'s content to exactly the viewport width, so fractional-point
+    /// rounding can never let it pan sideways (see the Sleep tab, commit 87d2911). Compact width
+    /// only: in a wide split-view column the pin is skipped, because it resolves against the window.
+    func pinnedToViewportWhenCompact() -> some View {
+        modifier(PinnedToViewportWhenCompact())
     }
 }
 

@@ -7,7 +7,7 @@ import UIKit   // UIApplication.openSettingsURLString for the Bluetooth-off / de
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.isWideSplit) private var isWide
     /// Which wearable the app drives (#215, decision 1). The ring's scanner is read only while the
     /// ring is chosen, and the strap's connection only while the strap is, so the inactive driver is
     /// never constructed by this view.
@@ -218,6 +218,14 @@ struct ContentView: View {
         .tint(Theme.accent)
 #if DEBUG && targetEnvironment(simulator)
         .modifier(DemoScreenModifier())   // screenshot harness (#216); inert without -OCDemoData
+        .onAppear {
+            // `-OCDemoTab today|sleep|activity|trends|profile`: open on that tab, so a screenshot
+            // matrix (iPhone Duo poses) needs no UI automation. Simulator + DEBUG only.
+            guard DemoData.isRequested, let raw = UserDefaults.standard.string(forKey: "OCDemoTab") else { return }
+            let tabs: [String: Tab] = ["today": .today, "sleep": .sleep, "activity": .activity,
+                                       "trends": .trends, "profile": .profile]
+            if let tab = tabs[raw] { selectedTab = tab }
+        }
 #endif
             // Shared trends cache: load once, then refresh on foreground return and after each sync.
             // Every hook goes through `TrendsRefreshPolicy` — at a cold launch `.task` and
@@ -514,7 +522,7 @@ struct ContentView: View {
     /// long-press-draggable (the reorder QoL), so this tab keeps a `List`.
     private var todayTab: some View {
         Group {
-            if sizeClass == .regular {
+            if isWide {
                 // Wide: the list stays at phone width on the left; whatever a tap appends to `path`
                 // (a tile's chart, the timeline, cycle, headache…) opens on the right. Until a
                 // choice is made the right column shows today's timeline, so it is never blank.
@@ -643,9 +651,25 @@ struct ContentView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    if !trends.points.isEmpty {
-                        OCSectionHeader("Sleep Trends", systemImage: "chart.xyaxis.line", tint: Theme.sleep)
-                        SleepTrendsSection(points: trends.points, tempUnitRaw: tempUnitRaw)
+                    // Wide: the trends live in the right-hand column instead (`sleepTrends`), so the
+                    // right pane never repeats last night, which the card on the left already shows.
+                    if !isWide { sleepTrends() }
+                    // Wide: once a Past Nights or Sleep Focus screen has replaced the right pane, this
+                    // is the way back to the trends.
+                    if isWide && !trends.points.isEmpty {
+                        DetailLink { sleepTrendsPane } label: {
+                            card {
+                                HStack(spacing: 8) {
+                                    KeylineGlyph(.activity, size: 16).foregroundStyle(Theme.sleep)
+                                    Text("SLEEP TRENDS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                    Spacer()
+                                    KeylineGlyph(.chevronRight, size: 12, relativeTo: .caption).foregroundStyle(.tertiary)
+                                }
+                                Text("Score, stress, duration, heart rate and HRV over time")
+                                    .font(.subheadline).foregroundStyle(.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
                     }
                     DetailLink { SleepFocusSyncSetupView() } label: {
                         card {
@@ -671,12 +695,39 @@ struct ContentView: View {
                 // a ~77pt drag. No subview is actually over-wide — every row measured at or under its
                 // 329.33pt proposal (widest: 329.33 `hints`, 308.00 `stageLegend`) — so there is
                 // nothing to narrow; the content simply has to be told it is exactly viewport-width.
-                .containerRelativeFrame(.horizontal)
+                .pinnedToViewportWhenCompact()
             }
             .background(Theme.pageBackground)
             .navigationTitle("Sleep")
         } emptyDetail: {
-            SleepNightsBrowserView()
+            // Trends are new information next to the last-night card; the nights browser would
+            // repeat that same night's stages. With no trends yet, fall back to the browser.
+            if trends.points.isEmpty {
+                SleepNightsBrowserView()
+            } else {
+                sleepTrendsPane
+            }
+        }
+    }
+
+    /// The wide right pane's default, and what the "Sleep Trends" row reopens.
+    private var sleepTrendsPane: some View {
+        ScrollView {
+            VStack(spacing: Theme.sectionSpacing) { sleepTrends(showsHeader: false) }
+                .padding()
+        }
+        .background(Theme.pageBackground)
+        .navigationTitle("Sleep Trends")
+    }
+
+    @ViewBuilder
+    private func sleepTrends(showsHeader: Bool = true) -> some View {
+        if !trends.points.isEmpty {
+            // The wide pane's navigation title already says "Sleep Trends".
+            if showsHeader {
+                OCSectionHeader("Sleep Trends", systemImage: "chart.xyaxis.line", tint: Theme.sleep)
+            }
+            SleepTrendsSection(points: trends.points, tempUnitRaw: tempUnitRaw)
         }
     }
 
@@ -708,9 +759,9 @@ struct ContentView: View {
                     // The same four rings, for the days BEFORE today. Derived from the shared trends
                     // cache — no extra fetch, no new stored column (see `GoalHistory`).
                     // Wide: the history lives in the right-hand column instead (`activityHistory`).
-                    if sizeClass != .regular { activityHistory }
+                    if !isWide { activityHistory }
                     caloriesCard
-                    if sizeClass != .regular { activityTrends }
+                    if !isWide { activityTrends }
                 }
                 .padding()
             }
