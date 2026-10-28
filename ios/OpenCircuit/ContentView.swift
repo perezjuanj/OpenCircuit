@@ -654,6 +654,23 @@ struct ContentView: View {
                     // Wide: the trends live in the right-hand column instead (`sleepTrends`), so the
                     // right pane never repeats last night, which the card on the left already shows.
                     if !isWide { sleepTrends() }
+                    // Wide: once a Past Nights or Sleep Focus screen has replaced the right pane, this
+                    // is the way back to the trends.
+                    if isWide && !trends.points.isEmpty {
+                        DetailLink { sleepTrendsPane } label: {
+                            card {
+                                HStack(spacing: 8) {
+                                    KeylineGlyph(.activity, size: 16).foregroundStyle(Theme.sleep)
+                                    Text("SLEEP TRENDS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                    Spacer()
+                                    KeylineGlyph(.chevronRight, size: 12, relativeTo: .caption).foregroundStyle(.tertiary)
+                                }
+                                Text("Score, stress, duration, heart rate and HRV over time")
+                                    .font(.subheadline).foregroundStyle(.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
                     DetailLink { SleepFocusSyncSetupView() } label: {
                         card {
                             HStack(spacing: 8) {
@@ -688,14 +705,19 @@ struct ContentView: View {
             if trends.points.isEmpty {
                 SleepNightsBrowserView()
             } else {
-                ScrollView {
-                    VStack(spacing: Theme.sectionSpacing) { sleepTrends(showsHeader: false) }
-                        .padding()
-                }
-                .background(Theme.pageBackground)
-                .navigationTitle("Sleep Trends")
+                sleepTrendsPane
             }
         }
+    }
+
+    /// The wide right pane's default, and what the "Sleep Trends" row reopens.
+    private var sleepTrendsPane: some View {
+        ScrollView {
+            VStack(spacing: Theme.sectionSpacing) { sleepTrends(showsHeader: false) }
+                .padding()
+        }
+        .background(Theme.pageBackground)
+        .navigationTitle("Sleep Trends")
     }
 
     @ViewBuilder

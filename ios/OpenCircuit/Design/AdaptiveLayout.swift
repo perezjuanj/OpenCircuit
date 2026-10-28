@@ -11,6 +11,7 @@
 // Pure layout and navigation plumbing; no state beyond which detail is showing.
 
 import SwiftUI
+import UIKit
 
 // MARK: - Wide split (width, not just size class)
 
@@ -43,10 +44,18 @@ private struct WindowWidthKey: PreferenceKey {
 
 private struct WideSplitProvider: ViewModifier {
     @Environment(\.horizontalSizeClass) private var sizeClass
-    @State private var width: CGFloat = 0
+    @State private var width: CGFloat = Self.initialWindowWidth()
+
+    /// The window's width before the first layout pass, so a regular-width but narrow window (iPhone
+    /// Duo's inner display in portrait) never builds the split for one frame on a cold launch. 0 when
+    /// no scene is connected yet, which falls back to the size class alone.
+    private static func initialWindowWidth() -> CGFloat {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        return scene?.coordinateSpace.bounds.width ?? 0
+    }
 
     func body(content: Content) -> some View {
-        // Until the first measurement, follow the size class alone (as the app always did).
+        // Until a width is known, follow the size class alone (as the app always did).
         let wide = sizeClass == .regular && (width == 0 || width >= WideSplit.minimumWidth)
         content
             .environment(\.isWideSplit, wide)
