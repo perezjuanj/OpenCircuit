@@ -7,7 +7,7 @@ import UIKit   // UIApplication.openSettingsURLString for the Bluetooth-off / de
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.isWideSplit) private var isWide
     /// Which wearable the app drives (#215, decision 1). The ring's scanner is read only while the
     /// ring is chosen, and the strap's connection only while the strap is, so the inactive driver is
     /// never constructed by this view.
@@ -522,7 +522,7 @@ struct ContentView: View {
     /// long-press-draggable (the reorder QoL), so this tab keeps a `List`.
     private var todayTab: some View {
         Group {
-            if sizeClass == .regular {
+            if isWide {
                 // Wide: the list stays at phone width on the left; whatever a tap appends to `path`
                 // (a tile's chart, the timeline, cycle, headache…) opens on the right. Until a
                 // choice is made the right column shows today's timeline, so it is never blank.
@@ -653,7 +653,7 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                     // Wide: the trends live in the right-hand column instead (`sleepTrends`), so the
                     // right pane never repeats last night, which the card on the left already shows.
-                    if sizeClass != .regular { sleepTrends() }
+                    if !isWide { sleepTrends() }
                     DetailLink { SleepFocusSyncSetupView() } label: {
                         card {
                             HStack(spacing: 8) {
@@ -737,9 +737,9 @@ struct ContentView: View {
                     // The same four rings, for the days BEFORE today. Derived from the shared trends
                     // cache — no extra fetch, no new stored column (see `GoalHistory`).
                     // Wide: the history lives in the right-hand column instead (`activityHistory`).
-                    if sizeClass != .regular { activityHistory }
+                    if !isWide { activityHistory }
                     caloriesCard
-                    if sizeClass != .regular { activityTrends }
+                    if !isWide { activityTrends }
                 }
                 .padding()
             }

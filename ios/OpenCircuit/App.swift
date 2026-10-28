@@ -12,6 +12,7 @@ struct OpenCircuitApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .provideWideSplit()
                 // Retention housekeeping: drop raw samples older than the window once per launch
                 // (the data already lives in Apple Health; rollups are kept). Runs off the launch
                 // path, never per write — see LocalStore.pruneExpiredSamples. (#32)
