@@ -147,9 +147,12 @@ struct MetricChartCard: View {
         }
         .chartXSelection(value: $selectedDate)
         .modifier(OptionalYDomain(domain: yDomain))
-        // Clip every mark to the plot rect so the area fill / catmull-rom overshoot can't bleed past
-        // the axes and out of the card (the reported gradient-bleed bug).
-        .chartPlotStyle { plot in plot.clipped() }
+        // Clip every mark to the plot rect (plus `PlotClip.room`) so the area fill can't bleed past
+        // the axes and out of the card (the reported gradient-bleed bug). The room matters: a series
+        // that sits on the axis maximum (Goals Closed at 4 of 4, Goal Attainment at 100 %) gets an
+        // automatic y-axis ending exactly there, and a hard clip at the plot edge shaved the line,
+        // its dots and the curve's overshoot flat along the top.
+        .chartPlotStyle { plot in plot.clipShape(PlotClip()) }
         .chartXAxis {
             AxisMarks(values: .stride(by: .day)) { _ in
                 AxisValueLabel(format: .dateTime.weekday(.narrow))
@@ -162,6 +165,20 @@ struct MetricChartCard: View {
                 AxisValueLabel().font(.caption2)
             }
         }
+    }
+}
+
+/// The plot rect with a little room on every side, so a line drawn at the axis extreme is not cut
+/// flat. The bottom gets less: the area fill's gradient is nearly clear there, and the axis labels sit
+/// right below it.
+private struct PlotClip: Shape {
+    static let room: CGFloat = 6
+    static let bottomRoom: CGFloat = 3
+
+    func path(in rect: CGRect) -> Path {
+        Path(CGRect(x: rect.minX - Self.room, y: rect.minY - Self.room,
+                    width: rect.width + 2 * Self.room,
+                    height: rect.height + Self.room + Self.bottomRoom))
     }
 }
 
