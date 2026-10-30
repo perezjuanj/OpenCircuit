@@ -182,10 +182,11 @@ enum SleepFocusDetection {
         await foregroundCheck?.value
     }
 
-    /// Decision 78f-1. Active: remember `now` as seen active. Not active, with a seen-active time in the
-    /// last 18 h that is newer than the persisted T: the Focus ended; persist T = `now` as a DETECTED T
-    /// (decision 78g: it finalizes only nights that ended 10 min or more before it), forget the
-    /// seen-active time and leave one `focus` line. Anything else changes nothing. Returns the new T.
+    /// Decision 78f-1. Active: remember `now` as seen active (decision 87c: a seen-active time later
+    /// than the persisted T voids that T). Not active, with a seen-active time in the last 18 h that is
+    /// newer than the persisted T: the Focus ended; persist T = `now` as a DETECTED T (decision 87a: it
+    /// finalizes like a `perform()` one), forget the seen-active time and leave one `focus` line.
+    /// Anything else changes nothing. Returns the new T.
     @discardableResult
     static func note(_ reading: Reading, at now: Date, kind: String, defaults: UserDefaults = .standard) -> Date? {
         switch reading {

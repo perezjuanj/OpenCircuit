@@ -217,6 +217,14 @@ final class HelioBreadcrumbs {
         record("wake=\(wake.rawValue): \(text)", .sync)
     }
 
+    /// Decision 87d: the strap's woke-up event decided not to sync. One line per event, outside the
+    /// budget (it neither spends nor is refused by it): the sync lines can be spent by the night's
+    /// wakes before the morning's woke-up event, the one line that says why the night waited. Counts
+    /// and reason words only.
+    func wokeUpSkipped(_ text: String) {
+        observability.recordMetricEvent(source: Self.source, detail: "wake=\(HelioWake.strapEvent.rawValue): \(text)", at: clock())
+    }
+
     /// Review-224e S-2: a strap sleep more than 60 min from the rest of its night was kept out (the
     /// night's longer part holds the key). Since decision 71b (#278), only a sleep the overnight join
     /// can't reach (it would make the night longer than 20 h). Since #231 such a sleep is judged as a

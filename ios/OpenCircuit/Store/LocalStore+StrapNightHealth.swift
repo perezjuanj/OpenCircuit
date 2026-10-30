@@ -66,9 +66,9 @@ extension LocalStore {
     ///
     /// `now` must be the real wall clock at the check (`flushStrap`'s default), never a sync's start.
     ///
-    /// Decision 78a (#332): a night `finalization` covers (by its end, against the Sleep Focus end and
-    /// that end's source, 78g, in a flush that may use it) skips the 3 h hold: Focus ending says it is over.
-    /// Every other night waits exactly as above.
+    /// Decision 78a (#332): a night `finalization` covers (by its end, or by its stored sleep start,
+    /// decision 87, in a flush that may use the Sleep Focus end) skips the 3 h hold: Focus ending says
+    /// it is over. Every other night waits exactly as above.
     ///
     /// Empty with an empty ownership log (a ring-only install): no query runs.
     func strapNightsAwaitingHealth(timeline: SyncDeviceID, now: Date,
@@ -84,7 +84,8 @@ extension LocalStore {
             guard let segments = strapSegmentsAwaitingHealth(row, log: log, family: family) else { return nil }
             let end = max(row.inBedEnd, segments.map(\.end).max() ?? row.inBedEnd)
             guard row.night < newest || now.timeIntervalSince(end) > Self.strapNewestNightHealthBuffer
-                    || finalization.finalizes(nightEndingAt: end) else { return nil }
+                    || finalization.finalizes(sleepStart: SleepFocusFinalization.sleepStart(of: segments),
+                                              nightEndingAt: end) else { return nil }
             // Decision 74 (#278): the night as the store path gives it, with its awake fill from the
             // stored heart rate (a row a build before 74 stored has none). Inside the segments' span.
             guard let start = segments.map(\.start).min() else { return segments }
@@ -110,15 +111,17 @@ extension LocalStore {
     }
 
     /// Decision 78b (#332): the night a strap Sleep Focus run that ended Focus at `focusEnd` was for:
-    /// the newest stored night the strap owns (decision 28a) that ended at or before `focusEnd` plus
-    /// `SleepFocusFinalization.nightEndSlack` and no earlier than `SleepFocusStrapFollowUp.nightLookback`
-    /// before it, and whether it has a Health mirror record. Its end is the later of `inBedEnd` and the
-    /// hypnogram's last segment, as the backstop reads it. `.none` with an empty ownership log.
+    /// the newest stored night the strap owns (decision 28a) that `focusEnd` finalizes (`Nights.
+    /// finalizes`: it ended at or before `focusEnd` plus `SleepFocusFinalization.nightEndSlack`, or its
+    /// sleep began before `focusEnd`, decision 87b) and that ended no earlier than `SleepFocusStrap
+    /// FollowUp.nightLookback` before it, and whether it has a Health mirror record. Its end is the later
+    /// of `inBedEnd` and the hypnogram's last segment, as the backstop reads it. `.none` with an empty
+    /// ownership log.
     func strapFocusNight(timeline: SyncDeviceID, focusEnd: Date) -> SleepFocusStrapFollowUp.Night {
         let log = Self.ownershipLog()
         guard !log.isEmpty else { return .none }
         let family = DeviceOwnershipLog.Family(timeline: timeline)
-        let latest = focusEnd.addingTimeInterval(SleepFocusFinalization.nightEndSlack)
+        let finalization = SleepFocusFinalization.Nights(focusEnd: focusEnd, fromPersisted: false)
         let earliest = focusEnd.addingTimeInterval(-SleepFocusStrapFollowUp.nightLookback)
         // A night is never longer than a day, so one that ends after `earliest` began after this.
         let since = earliest.addingTimeInterval(-86_400)
@@ -127,8 +130,10 @@ extension LocalStore {
             .compactMap { row -> (row: StoredSleepSummary, end: Date)? in
                 guard row.inBedEnd > row.inBedStart,
                       log.owner(ofNightFrom: row.inBedStart, to: row.inBedEnd) == family else { return nil }
-                let end = max(row.inBedEnd, SleepHypnogramCodec.decode(row.hypnogramData).map(\.end).max() ?? row.inBedEnd)
-                return end >= earliest && end <= latest ? (row, end) : nil
+                let segments = SleepHypnogramCodec.decode(row.hypnogramData)
+                let end = max(row.inBedEnd, segments.map(\.end).max() ?? row.inBedEnd)
+                return end >= earliest && finalization.finalizes(sleepStart: SleepFocusFinalization.sleepStart(of: segments),
+                                                                 nightEndingAt: end) ? (row, end) : nil
             }
             .max { $0.end < $1.end }
         guard let night else { return .none }
