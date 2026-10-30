@@ -149,4 +149,22 @@ final class HelioBreadcrumbsTests: XCTestCase {
         XCTAssertTrue(report.contains("link up (connected; app in background)"))
         XCTAssertTrue(report.contains("It holds no health values and no device identifiers."))
     }
+
+    // MARK: Decision 87d (#352)
+
+    /// The woke-up event's skip line is outside the budget: logged with the sync lines spent, and it
+    /// spends none of them.
+    func testTheWokeUpSkipLineSurvivesASpentSyncBudget() throws {
+        let crumbs = HelioBreadcrumbs(observability: ObservabilityStore(suite), defaults: suite, clock: { [t0] in t0 })
+        for i in 0..<(HelioBreadcrumbBudget.Kind.sync.linesPerWindow + 3) { crumbs.wakeNote(.reconnect, "line \(i)") }
+        crumbs.wokeUpSkipped("no catch-up: a background run started under 30 min ago; refresh requested in 20 min")
+        crumbs.wokeUpSkipped("no catch-up: a background run started under 30 min ago; an earlier refresh is pending")
+        let lines = ObservabilityStore(suite).metricRecords().filter { $0.source == HelioBreadcrumbs.source }.map(\.detail)
+        XCTAssertEqual(lines.count, HelioBreadcrumbBudget.Kind.sync.linesPerWindow + 2)
+        XCTAssertTrue(lines.contains("wake=strapEvent: no catch-up: a background run started under 30 min ago; refresh requested in 20 min"))
+        XCTAssertTrue(lines.contains("wake=strapEvent: no catch-up: a background run started under 30 min ago; an earlier refresh is pending"))
+        let budget = try JSONDecoder().decode(HelioBreadcrumbBudget.self, from: try XCTUnwrap(suite.data(forKey: HelioBreadcrumbs.budgetKey)))
+        XCTAssertEqual(budget.suppressed, 3, "only the budgeted lines were counted")
+    }
 }
+

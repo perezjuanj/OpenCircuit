@@ -510,8 +510,8 @@ final class HealthKitWriter {
     /// timeline's pending samples (minus the kinds its policy withholds, `HelioHealthPolicy`) and the
     /// nights it staged. Their defaults are exactly the ring's pass, unchanged. `strapNightsFinalized`
     /// is `sleepFinalized` for those nights (the Sleep Focus wake, #215 phase 4), judged per night by
-    /// its end (decision 78a, #332; 78g for a detected Focus end): only a night the Sleep Focus end
-    /// covers skips the margin.
+    /// its end or its sleep start (decision 78a, #332; decision 87, `Nights.finalizes`): only a night
+    /// the Sleep Focus end covers skips the margin.
     /// What a `flushToHealth` call was asked to mirror: the timeline and the kinds (nil = every
     /// mirrored kind, the ring's pass).
     struct FlushRequest: Equatable {
@@ -536,7 +536,7 @@ final class HealthKitWriter {
                        strapNights: [[SleepSegment]] = [],
                        strapNightsFinalized: SleepFocusFinalization.Nights = .none) async -> FlushResult {
         lastFlushRequest = FlushRequest(device: device, mirroredKinds: mirroredKinds)
-        lastStrapNights = strapNights.map { ($0, strapNightsFinalized.finalizes(nightEndingAt: $0.map(\.end).max())) }
+        lastStrapNights = strapNights.map { ($0, strapNightsFinalized.finalizes($0)) }
         var result = FlushResult()
         guard isShareAuthorized, !Self.isFlushing else { return result }
         Self.isFlushing = true
@@ -584,12 +584,12 @@ final class HealthKitWriter {
         // before the `.inBed` layer and the inclusive stage end (decision 70h, forward-only).
         for night in strapNights where SleepHealthGate.isReadyToWrite(
             latestSegmentEnd: night.map(\.end).max(), now: Date(),
-            finalized: strapNightsFinalized.finalizes(nightEndingAt: night.map(\.end).max())) {
+            finalized: strapNightsFinalized.finalizes(night)) {
             switch await mirrorStrapNight(local: store, segments: night) {
             case .wrote(let count):
                 result.sleepSegments += count
                 writtenKinds.insert(.sleep)
-                if strapNightsFinalized.finalizes(nightEndingAt: night.map(\.end).max()) { result.finalizedStrapNights += 1 }
+                if strapNightsFinalized.finalizes(night) { result.finalizedStrapNights += 1 }
             case .unchanged:
                 break
             case .declined:

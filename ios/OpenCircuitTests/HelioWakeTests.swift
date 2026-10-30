@@ -1,3 +1,4 @@
+import BackgroundTasks
 import OpenCircuitKit
 import XCTest
 import ZeppKit
@@ -232,3 +233,118 @@ final class HelioWakeTests: XCTestCase {
         XCTAssertEqual(HelioWakeState(defaults).lastBackgroundRunStart, now.addingTimeInterval(-60))
     }
 }
+
+// MARK: - Decision 87d (#352): a woke-up event skipped for the cooldown asks for a refresh
+
+/// What the app asked iOS for (the refresh a skipped woke-up event records).
+private final class WokeUpRefreshRecorder: BGTaskScheduling {
+    private(set) var submitted: BGTaskRequest?
+    func register(forTaskWithIdentifier identifier: String, using queue: DispatchQueue?,
+                  launchHandler: @escaping (BGTask) -> Void) -> Bool { true }
+    func cancel(taskRequestWithIdentifier identifier: String) {}
+    func submit(_ taskRequest: BGTaskRequest) throws { submitted = taskRequest }
+}
+
+extension HelioWakeTests {
+    /// The refresh comes at the later of the cooldown's end and a minute from now; only for the woke-up
+    /// event and only for the cooldown's skip.
+    func testTheSkippedWokeUpEventAimsItsRefreshAtTheCooldownsEnd() {
+        let start = now.addingTimeInterval(-10 * 60)
+        let skip = HelioWakePolicy.Action.skip(HelioWakePolicy.cooldownReason)
+        XCTAssertEqual(HelioWakePolicy.cooldownReason, "a background run started under 30 min ago")
+        XCTAssertEqual(HelioWakePolicy.refreshAfterSkip(for: .strapEvent, action: skip, lastBackgroundRunStart: start, now: now),
+                       start.addingTimeInterval(30 * 60))
+        let nearEnd = now.addingTimeInterval(-(30 * 60 - 20))
+        XCTAssertEqual(HelioWakePolicy.refreshAfterSkip(for: .strapEvent, action: skip, lastBackgroundRunStart: nearEnd, now: now),
+                       now.addingTimeInterval(60), "at least a minute away")
+        for wake in [HelioWake.reconnect, .restoration, .idleTraffic, .healthDelivery] {
+            XCTAssertNil(HelioWakePolicy.refreshAfterSkip(for: wake, action: skip, lastBackgroundRunStart: start, now: now), wake.rawValue)
+        }
+        XCTAssertNil(HelioWakePolicy.refreshAfterSkip(for: .strapEvent, action: .skip("a background run already holds the strap"),
+                                                      lastBackgroundRunStart: start, now: now))
+        XCTAssertNil(HelioWakePolicy.refreshAfterSkip(for: .strapEvent, action: .catchUp, lastBackgroundRunStart: start, now: now))
+    }
+
+    private func wokeUpCoordinator(_ h: Harness, defaults: UserDefaults, scheduler: BackgroundRefreshScheduler,
+                                   skipLines: @escaping (String) -> Void) -> HelioWakeCoordinator {
+        HelioWakeCoordinator(.init(
+            strapChosen: { h.strapChosen }, appIsActive: { h.appIsActive }, runActive: { h.runActive },
+            state: HelioWakeState(defaults), now: { [now] in now },
+            syncInForeground: { h.foregroundSyncs += 1 },
+            beginAssertion: { _ in h.begun += 1; return h.begun },
+            endAssertion: { h.ended.append($0) },
+            run: { wake in
+                h.runs.append(wake)
+                return HelioBackgroundRun(ending: .synced)
+            },
+            expire: { h.expired += 1 },
+            afterRun: { _ in h.afterRuns += 1 },
+            note: { wake, text in h.notes.append("\(wake.rawValue): \(text)") },
+            requestRefresh: { at, now in
+                StrapNightRefresh.recordAfterSkippedWokeUp(at, now: now, scheduler: scheduler, defaults: defaults)
+            },
+            noteWokeUpSkip: skipLines))
+    }
+
+    /// A woke-up event 10 minutes after a background run started: skipped, and a refresh is recorded at
+    /// the cooldown's end (so `schedule()` keeps it). The skip line says so, outside the budget.
+    func testAWokeUpEventInsideTheCooldownRecordsARefreshAtItsEnd() {
+        let defaults = UserDefaults(suiteName: "HelioWakeTests.\(UUID().uuidString)")!
+        HelioWakeState(defaults).lastBackgroundRunStart = now.addingTimeInterval(-10 * 60)
+        let recorder = WokeUpRefreshRecorder()
+        let scheduler = BackgroundRefreshScheduler(scheduler: recorder, now: { [now] in now }, window: { _ in nil })
+        let h = Harness()
+        var lines: [String] = []
+        var done = 0
+        wokeUpCoordinator(h, defaults: defaults, scheduler: scheduler, skipLines: { lines.append($0) }).wake(.strapEvent) { done += 1 }
+        XCTAssertEqual(done, 1)
+        XCTAssertEqual(h.runs, [], "skipped")
+        let at = now.addingTimeInterval(20 * 60)
+        XCTAssertEqual(StrapNightRefresh.pending(now: now, defaults: defaults), at)
+        XCTAssertEqual(recorder.submitted?.earliestBeginDate, at)
+        XCTAssertEqual(lines, ["no catch-up: a background run started under 30 min ago; refresh requested in 20 min"])
+        XCTAssertEqual(h.notes, [], "not through the budgeted note")
+    }
+
+    /// An earlier pending refresh is kept (it looks again sooner); a later one gives way.
+    func testAWokeUpSkipKeepsAnEarlierPendingRefresh() {
+        for (pendingIn, kept) in [(5.0, true), (50.0, false)] {
+            let defaults = UserDefaults(suiteName: "HelioWakeTests.\(UUID().uuidString)")!
+            HelioWakeState(defaults).lastBackgroundRunStart = now.addingTimeInterval(-10 * 60)
+            let recorder = WokeUpRefreshRecorder()
+            let scheduler = BackgroundRefreshScheduler(scheduler: recorder, now: { [now] in now }, window: { _ in nil })
+            let pending = now.addingTimeInterval(pendingIn * 60)
+            StrapNightRefresh.record(pending, scheduler: scheduler, defaults: defaults)
+            var lines: [String] = []
+            wokeUpCoordinator(Harness(), defaults: defaults, scheduler: scheduler, skipLines: { lines.append($0) }).wake(.strapEvent)
+            XCTAssertEqual(StrapNightRefresh.pending(now: now, defaults: defaults), kept ? pending : now.addingTimeInterval(20 * 60), "\(pendingIn)")
+            XCTAssertEqual(lines, [kept ? "no catch-up: a background run started under 30 min ago; an earlier refresh is pending"
+                                        : "no catch-up: a background run started under 30 min ago; refresh requested in 20 min"])
+        }
+    }
+
+    /// 40 minutes after the run started: a catch-up, as before; nothing recorded. A reconnect inside the
+    /// cooldown records nothing either.
+    func testAWokeUpEventPastTheCooldownCatchesUpAndRecordsNothing() async {
+        let defaults = UserDefaults(suiteName: "HelioWakeTests.\(UUID().uuidString)")!
+        HelioWakeState(defaults).lastBackgroundRunStart = now.addingTimeInterval(-40 * 60)
+        let recorder = WokeUpRefreshRecorder()
+        let scheduler = BackgroundRefreshScheduler(scheduler: recorder, now: { [now] in now }, window: { _ in nil })
+        let h = Harness()
+        var lines: [String] = []
+        var done = 0
+        let coordinator = wokeUpCoordinator(h, defaults: defaults, scheduler: scheduler, skipLines: { lines.append($0) })
+        coordinator.wake(.strapEvent) { done += 1 }
+        for _ in 0..<20_000 where done == 0 { await Task.yield() }
+        XCTAssertEqual(h.runs, [.strapEvent])
+        XCTAssertNil(StrapNightRefresh.pending(now: now, defaults: defaults))
+        XCTAssertNil(recorder.submitted)
+
+        HelioWakeState(defaults).lastBackgroundRunStart = now.addingTimeInterval(-10 * 60)
+        HelioWakeState(defaults).lastCompletedSync = now.addingTimeInterval(-5 * 3600)
+        coordinator.wake(.reconnect)
+        XCTAssertNil(StrapNightRefresh.pending(now: now, defaults: defaults), "only the woke-up event")
+        XCTAssertEqual(lines, [])
+    }
+}
+

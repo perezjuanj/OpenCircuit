@@ -401,6 +401,7 @@ final class HelioConnection: NSObject {
                               storedNightSettles: store.newestStrapNightSettles(timeline: timeline, now: now),
                               focusEndedAt: result.nightsFinalized, persistedFocusEnd: SleepFocusFinalization.persisted(),
                               persistedSource: SleepFocusFinalization.persistedSource(),
+                              focusSeenActive: SleepFocusDetection.seenActive(),
                               flushStartedAt: flushStartedAt, afterWokeUp: false)
     }
 
@@ -435,23 +436,22 @@ final class HelioConnection: NSObject {
     ///
     /// Decision 78a (#332): which nights are over is decided here, once per flush, for both sites:
     /// from `focusEndedAt` (decision 31's in-memory T, the background run's and the post-sync hook's)
-    /// and the Sleep Focus end persisted in `defaults`, at `now` (the flush's start), per night by its
-    /// end (`SleepFocusFinalization.nights`). The same verdict lifts the settle margin in the writer
-    /// and the newest-night hold in the backstop. With no T (none persisted, or one in the future or
-    /// over 6 h old, and no in-memory T) every night is judged exactly as before.
+    /// and the Sleep Focus end persisted in `defaults` (with the seen-active time that voids it,
+    /// decision 87c), at `now` (the flush's start), per night by its end or its sleep start
+    /// (`SleepFocusFinalization.Nights.finalizes`, decision 87). The same verdict lifts the settle
+    /// margin in the writer and the newest-night hold in the backstop. With no T (none persisted, or
+    /// one in the future, over 6 h old or voided, and no in-memory T) every night is judged exactly as
+    /// before.
     static func flushStrap(_ writer: HealthKitWriter, store: LocalStore, timeline: SyncDeviceID,
                            nights: [[SleepSegment]], focusEndedAt: Date? = nil,
                            now: Date = Date(), defaults: UserDefaults = .standard) async -> HealthKitWriter.FlushResult {
-        let finalization = SleepFocusFinalization.nights(inMemory: focusEndedAt, persisted: SleepFocusFinalization.persisted(defaults: defaults),
-                                                         source: SleepFocusFinalization.persistedSource(defaults: defaults),
-                                                         flushStartsAt: now)
+        let finalization = SleepFocusFinalization.nights(inMemory: focusEndedAt, flushStartsAt: now, defaults: defaults)
         let flush = await writer.flushToHealth(store: store, device: timeline, mirroredKinds: HelioHealthPolicy.healthMirroredKinds(),
                                                strapNights: strapNights(nights, store: store, timeline: timeline, now: now,
                                                                         finalization: finalization),
                                                strapNightsFinalized: finalization)
-        if finalization.fromPersisted, flush.finalizedStrapNights > 0, let focusEnd = finalization.detectedEnd ?? finalization.focusEnd {
-            SleepFocusFinalization.notePersistedWrite(focusEnd: focusEnd, flushStart: now, defaults: defaults)
-        }
+        SleepFocusFinalization.notePersistedWrite(finalization, finalizedWrites: flush.finalizedStrapNights, flushStart: now,
+                                                  defaults: defaults)
         return flush
     }
 

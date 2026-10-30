@@ -61,6 +61,16 @@ enum HelioWakePolicy {
 
     /// The skip reason while the app records a strap workout (#227, review-238 B1).
     static let workoutHoldsStrapReason = "a strap workout holds the strap"
+    /// The skip reason inside `reconnectCooldown` of the last background run's start.
+    static let cooldownReason = "a background run started under \(Int(reconnectCooldown / 60)) min ago"
+
+    /// Decision 87d: when a woke-up event skipped for the cooldown asks for its app refresh: the later of
+    /// the cooldown's end and a minute from now. nil for every other wake and every other action: the
+    /// event is a hint to look again, never a finalization (decision 33: it carries no time).
+    static func refreshAfterSkip(for wake: HelioWake, action: Action, lastBackgroundRunStart: Date?, now: Date) -> Date? {
+        guard wake == .strapEvent, action == .skip(cooldownReason), let start = lastBackgroundRunStart else { return nil }
+        return max(start.addingTimeInterval(reconnectCooldown), now.addingTimeInterval(60))
+    }
 
     static func action(for wake: HelioWake, strapChosen: Bool, appIsActive: Bool, runActive: Bool,
                        lastCompletedSync: Date?, lastBackgroundRunStart: Date?, now: Date,
@@ -83,7 +93,7 @@ enum HelioWakePolicy {
             // Review-235 S3: a woke-up event can repeat at every night-time awakening; at most one
             // event-triggered catch-up per cooldown.
             if let start = lastBackgroundRunStart, now >= start, now.timeIntervalSince(start) < reconnectCooldown {
-                return .skip("a background run started under \(Int(reconnectCooldown / 60)) min ago")
+                return .skip(cooldownReason)
             }
             return .catchUp
         case .reconnect, .restoration, .idleTraffic:
@@ -91,7 +101,7 @@ enum HelioWakePolicy {
                 return .skip("last completed sync under \(Int(reconnectCatchUpAfter / 3600)) h ago")
             }
             if let start = lastBackgroundRunStart, now >= start, now.timeIntervalSince(start) < reconnectCooldown {
-                return .skip("a background run started under \(Int(reconnectCooldown / 60)) min ago")
+                return .skip(cooldownReason)
             }
             return .catchUp
         case .healthDelivery:
@@ -189,6 +199,13 @@ final class HelioWakeCoordinator {
         var note: @MainActor (HelioWake, String) -> Void
         /// The app records a strap workout (#227): every wake skips (review-238 B1).
         var workoutHoldsStrap: @MainActor () -> Bool = { StrapWorkoutRecorder.holdsStrapLink }
+        /// Decision 87d: a woke-up event skipped for the cooldown asks for an app refresh at this date
+        /// (`StrapNightRefresh.recordAfterSkippedWokeUp` in the app); false when an earlier pending one
+        /// was kept. A no-op in tests that don't drive it.
+        var requestRefresh: @MainActor (_ notBefore: Date, _ now: Date) -> Bool = { _, _ in false }
+        /// Decision 87d: the woke-up event's skip line, outside the breadcrumb budget
+        /// (`HelioBreadcrumbs.wokeUpSkipped` in the app); nil: through `note`, like every other line.
+        var noteWokeUpSkip: (@MainActor (String) -> Void)? = nil
     }
 
     static let shared = HelioWakeCoordinator(.live)
@@ -209,10 +226,23 @@ final class HelioWakeCoordinator {
             workoutHoldsStrap: env.workoutHoldsStrap())
         switch action {
         case .skip(let reason):
+            // Decision 87d: a woke-up event inside the cooldown isn't lost: it asks for an app refresh
+            // at the cooldown's end (an earlier pending one is kept), so the morning's night is looked
+            // at again even when no other wake comes.
+            var text = "no catch-up: \(reason)"
+            let now = env.now()
+            if let at = HelioWakePolicy.refreshAfterSkip(for: wake, action: action,
+                                                         lastBackgroundRunStart: env.state.lastBackgroundRunStart, now: now) {
+                text += env.requestRefresh(at, now)
+                    ? "; refresh requested in \(Int((at.timeIntervalSince(now) / 60).rounded(.up))) min"
+                    : "; an earlier refresh is pending"
+            }
             // A reconnect or Health delivery that has nothing to do is the common case: noted only
             // for the woke-up event, which should always lead somewhere, and for a workout's hold.
-            if wake == .strapEvent || reason == HelioWakePolicy.workoutHoldsStrapReason {
-                env.note(wake, "no catch-up: \(reason)")
+            if wake == .strapEvent, let noteWokeUpSkip = env.noteWokeUpSkip {
+                noteWokeUpSkip(text)
+            } else if wake == .strapEvent || reason == HelioWakePolicy.workoutHoldsStrapReason {
+                env.note(wake, text)
             }
             once.call()
         case .syncInForeground:
@@ -300,7 +330,11 @@ extension HelioWakeCoordinator.Environment {
             },
             expire: { connection.tearDownForExpiry() },
             afterRun: { run in await HelioWakeCoordinator.afterRun?(run) },
-            note: { wake, text in connection.breadcrumbs.wakeNote(wake, text) })
+            note: { wake, text in connection.breadcrumbs.wakeNote(wake, text) },
+            requestRefresh: { at, now in
+                StrapNightRefresh.recordAfterSkippedWokeUp(at, now: now, scheduler: BackgroundRefreshScheduler())
+            },
+            noteWokeUpSkip: { text in connection.breadcrumbs.wokeUpSkipped(text) })
     }
 }
 

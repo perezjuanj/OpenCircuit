@@ -59,18 +59,17 @@ enum SleepFocusFinalization {
     /// How long after T a flush may still use the persisted T: past the morning's last plausible
     /// wake, well short of the next night's end.
     static let persistedValidity: TimeInterval = 6 * 3600
-    /// The slack around T. A `perform()` T (a real Focus-off delivery) finalizes nights that end up to
-    /// this long AFTER it: a strap record is read about 3 minutes behind its end (decision 58), so a
-    /// record read in progress within the slack can be finalized too. A detected T (78f) finalizes only
-    /// nights that end at least this long BEFORE it (decision 78g): a misread "not active" while the
-    /// Focus is still on must not write the in-progress record a sync read minutes earlier.
+    /// The slack after T (decision 78a, kept for both sources by decision 87a): a night that ends up to
+    /// this long AFTER T is finalized. A strap record is read about 3 minutes behind its end (decision
+    /// 58), so the record a sync reads at the Focus end, or at the wake that detects it, is covered.
     static let nightEndSlack: TimeInterval = 10 * 60
 
-    /// Where a persisted T came from (decision 78g).
+    /// Where a persisted T came from. Since decision 87a both finalize alike; the source is kept for
+    /// the bundle's `Sleep Focus` line (78h S-1).
     enum Source: String, Equatable {
-        /// `perform()` ran with the Focus off (or decision 31's in-memory T): `end <= T + 10 min`.
+        /// `perform()` ran with the Focus off (or decision 31's in-memory T).
         case perform
-        /// A wake read the filter not active after seeing it active (78f): `end <= T - 10 min`.
+        /// A wake read the filter not active after seeing it active (78f).
         case detected
     }
 
@@ -97,44 +96,67 @@ enum SleepFocusFinalization {
         return t > 0 ? Date(timeIntervalSince1970: t) : nil
     }
 
-    /// What one strap Health flush finalizes: the nights that ended by `focusEnd` plus `nightEndSlack`
-    /// (a `perform()` T), and those that ended by `detectedEnd` minus `nightEndSlack` (a detected T,
-    /// decision 78g): the union of each one's own rule. A night finalized here skips the settle margin
-    /// (`SleepHealthGate`) and the newest-night hold (decision 58a); every other night is judged by the
-    /// normal rules.
+    /// Decision 87b: when a night's SLEEP began: its first asleep segment (core, deep or REM). The
+    /// decision 77 lead-in is an `.inBed` and an `.awake` segment over one span, and an in-bed span
+    /// with no sleep in it is `.inBed`/`.awake` only, so neither can ever be the sleep start, whether
+    /// or not the lead-in is recognised as one. nil for a night with no asleep segment.
+    static func sleepStart(of night: [SleepSegment]) -> Date? {
+        night.filter { $0.stage == .asleepCore || $0.stage == .asleepDeep || $0.stage == .asleepREM }.map(\.start).min()
+    }
+
+    /// What one strap Health flush finalizes, per night, from the Focus ends that apply to it (each
+    /// T: decision 31's in-memory one, the persisted one of either source). A night is over when, for
+    /// some T, it ends by T plus `nightEndSlack` (decision 87a, both sources) or its sleep began before
+    /// T (decision 87b: the night in progress when the Focus went off is over, whatever its end). A
+    /// night finalized here skips the settle margin (`SleepHealthGate`) and the newest-night hold
+    /// (decision 58a); every other night is judged by the normal rules. Every reader (the writer's gate
+    /// and its 78c count, the 58a backstop, the refresh aim, 78b's Focus night) asks `finalizes`, so
+    /// they can't disagree.
     struct Nights: Equatable {
         /// The `perform()` Focus end this flush answers (in memory or persisted), nil when none applies.
         let focusEnd: Date?
         /// A persisted T, not decision 31's in-memory one, applies (decision 78c's breadcrumb).
         let fromPersisted: Bool
-        /// The detected Focus end this flush answers (78f, 78g), nil when none applies.
+        /// The detected Focus end this flush answers (78f), nil when none applies.
         var detectedEnd: Date? = nil
 
         static let none = Nights(focusEnd: nil, fromPersisted: false)
 
-        /// Whether the night whose last segment ends at `end` is over.
-        func finalizes(nightEndingAt end: Date?) -> Bool {
+        /// Whether `night` (its segments, lead-in included or not) is over.
+        func finalizes(_ night: [SleepSegment]) -> Bool {
+            finalizes(sleepStart: SleepFocusFinalization.sleepStart(of: night), nightEndingAt: night.map(\.end).max())
+        }
+
+        /// The one rule: the night whose sleep began at `sleepStart` (nil: unknown) and whose last
+        /// segment ends at `end` is over.
+        func finalizes(sleepStart: Date?, nightEndingAt end: Date?) -> Bool {
             guard let end else { return false }
-            let slack = SleepFocusFinalization.nightEndSlack
-            if let focusEnd, end <= focusEnd.addingTimeInterval(slack) { return true }
-            if let detectedEnd, end <= detectedEnd.addingTimeInterval(-slack) { return true }
-            return false
+            return [focusEnd, detectedEnd].compactMap { $0 }.contains { t in
+                end <= t.addingTimeInterval(SleepFocusFinalization.nightEndSlack)
+                    || sleepStart.map { $0 < t } == true
+            }
+        }
+
+        /// By the end alone (decision 87a): for a caller that knows no sleep start.
+        func finalizes(nightEndingAt end: Date?) -> Bool {
+            finalizes(sleepStart: nil, nightEndingAt: end)
         }
     }
 
     /// Decision 78a: the one place a strap flush's finalization is decided. `inMemory` is decision
     /// 31's T (the run's own, a waiter's or a hand-off's; always a `perform()` T), used while the flush
     /// starts within `window` of it; `persisted` is the stored T with its `source`, used by a flush
-    /// that starts at or after it and within `persistedValidity`. Per night, by the night's end: a
-    /// `perform()` T (the later of the two when both are) finalizes nights ending up to `nightEndSlack`
-    /// after it, which includes a record read in progress within the slack; a detected T (78g)
-    /// finalizes only nights ending `nightEndSlack` or more before it; both apply as a union. The next
-    /// night ends hours after T and is never finalized.
-    static func nights(inMemory: Date?, persisted: Date?, source: Source = .perform,
+    /// that starts at or after it and within `persistedValidity`. Decision 87c: a Focus seen on after
+    /// the persisted T (`seenActive`, 78f-1; a `perform()` Focus-on sets it too, 78f-4) voids it, for
+    /// either source, until a new T is persisted: a misread "off" in the night stops finalizing at the
+    /// next wake that reads the Focus on. Decision 31's in-memory T comes only from a `perform()` that
+    /// just ran, and keeps working as before. Per night: `Nights.finalizes`.
+    static func nights(inMemory: Date?, persisted: Date?, source: Source = .perform, seenActive: Date? = nil,
                        flushStartsAt flushStart: Date) -> Nights {
         let memory = applies(focusEndedAt: inMemory, flushStartsAt: flushStart) ? inMemory : nil
         let stored = persisted.flatMap { t in
-            flushStart >= t && flushStart.timeIntervalSince(t) <= persistedValidity ? t : nil
+            flushStart >= t && flushStart.timeIntervalSince(t) <= persistedValidity
+                && !(seenActive.map { $0 > t } ?? false) ? t : nil
         }
         switch source {
         case .perform:
@@ -144,6 +166,24 @@ enum SleepFocusFinalization {
             guard memory != nil || stored != nil else { return .none }
             return Nights(focusEnd: memory, fromPersisted: memory == nil, detectedEnd: stored)
         }
+    }
+
+    /// `nights` from what `defaults` holds: the persisted T, its source and the seen-active time.
+    /// What every strap flush site and the refresh verdict after it read, so they read alike.
+    static func nights(inMemory: Date?, flushStartsAt flushStart: Date, defaults: UserDefaults) -> Nights {
+        nights(inMemory: inMemory, persisted: persisted(defaults: defaults), source: persistedSource(defaults: defaults),
+               seenActive: SleepFocusDetection.seenActive(defaults: defaults), flushStartsAt: flushStart)
+    }
+
+    /// After a strap flush (`HelioConnection.flushStrap`): decision 78c's line when the flush wrote
+    /// `finalizedWrites` nights its finalization covered (the writer counts them with `Nights.finalizes`,
+    /// so a night decision 87b finalized counts) and that finalization came from the persisted T, of
+    /// either source (decision 87e).
+    static func notePersistedWrite(_ finalization: Nights, finalizedWrites: Int, flushStart: Date,
+                                   defaults: UserDefaults = .standard) {
+        guard finalization.fromPersisted, finalizedWrites > 0,
+              let focusEnd = finalization.detectedEnd ?? finalization.focusEnd else { return }
+        notePersistedWrite(focusEnd: focusEnd, flushStart: flushStart, defaults: defaults)
     }
 
     /// The persisted T the 78c breadcrumb was last recorded for.
@@ -193,15 +233,18 @@ enum StrapNightRefresh {
     /// instead of clearing it. Read after the flush, a night it wrote has its mirror record and is nil.
     ///
     /// Decision 78a: a night counts as held unless the flush's finalization (`SleepFocusFinalization.
-    /// nights`, from `focusEndedAt` and `persistedFocusEnd`) covers that night's end.
+    /// nights`, from `focusEndedAt`, `persistedFocusEnd` and the seen-active time, decision 87c) covers
+    /// that night (`Nights.finalizes`: by its end, or by its sleep start, decision 87).
     static func aim(nights: [HelioSleepSelection.Night], storedNightSettles: Date? = nil, focusEndedAt: Date?,
                     persistedFocusEnd: Date? = nil, persistedSource: SleepFocusFinalization.Source = .perform,
-                    flushStartedAt: Date, afterWokeUp wokeUp: Bool) -> Date? {
+                    focusSeenActive: Date? = nil, flushStartedAt: Date, afterWokeUp wokeUp: Bool) -> Date? {
         var candidates: [Date] = []
         let finalization = SleepFocusFinalization.nights(inMemory: focusEndedAt, persisted: persistedFocusEnd,
-                                                         source: persistedSource, flushStartsAt: flushStartedAt)
-        var held = nights.compactMap { $0.segments.map(\.end).max() }
-            .filter { !finalization.finalizes(nightEndingAt: $0) && !SleepHealthGate.isSettled(latestSegmentEnd: $0, now: flushStartedAt) }
+                                                         source: persistedSource, seenActive: focusSeenActive,
+                                                         flushStartsAt: flushStartedAt)
+        var held = nights.filter { !finalization.finalizes($0.segments) }
+            .compactMap { $0.segments.map(\.end).max() }
+            .filter { !SleepHealthGate.isSettled(latestSegmentEnd: $0, now: flushStartedAt) }
             .map { $0.addingTimeInterval(SleepHealthGate.settleMargin) }
         if let storedNightSettles { held.append(storedNightSettles) }
         if let earliest = held.min() { candidates.append(earliest) }
@@ -226,6 +269,17 @@ enum StrapNightRefresh {
         } else {
             defaults.removeObject(forKey: pendingKey)
         }
+    }
+
+    /// Decision 87d: a woke-up event skipped for the cooldown asks for a refresh at `at`. A pending
+    /// refresh at or before `at` is kept (it looks again sooner); otherwise `at` is recorded, so the
+    /// app's own `schedule()` doesn't replace it. Returns whether `at` was recorded.
+    @discardableResult
+    static func recordAfterSkippedWokeUp(_ at: Date, now: Date, scheduler: BackgroundRefreshScheduler,
+                                         defaults: UserDefaults = .standard) -> Bool {
+        if let pending = pending(now: now, defaults: defaults), pending <= at { return false }
+        record(at, scheduler: scheduler, defaults: defaults)
+        return true
     }
 
     /// The pending refresh while it is still ahead of `now`; one that has passed is cleared.
@@ -257,8 +311,9 @@ enum StrapNightRefresh {
 enum SleepFocusStrapFollowUp {
     /// The night a Focus run was for, as the store has it after the run.
     enum Night: String {
-        /// The newest stored strap night that ended by T plus the slack, and within `nightLookback`
-        /// before T, has a Health mirror record.
+        /// The newest stored strap night that T finalizes (it ended by T plus the slack, or its sleep
+        /// began before T, decision 87b), and that ended within `nightLookback` before T, has a Health
+        /// mirror record.
         case written
         /// It has none.
         case storedNotWritten = "stored-not-written"
@@ -567,8 +622,11 @@ struct HelioBackgroundSyncService {
     /// app), for the refresh verdict after the flush; the flush reads it itself. nil in tests that
     /// don't set one.
     var persistedFocusEnd: @MainActor () -> Date? = { nil }
-    /// Its source (decision 78g; `SleepFocusFinalization.persistedSource` in the app).
+    /// Its source (`SleepFocusFinalization.persistedSource` in the app).
     var persistedFocusSource: @MainActor () -> SleepFocusFinalization.Source = { .perform }
+    /// Decision 87c: the time a read (or `perform()`) last saw the Focus on (`SleepFocusDetection.
+    /// seenActive` in the app); one later than the persisted T voids it. nil in tests that don't set one.
+    var focusSeenActive: @MainActor () -> Date? = { nil }
     /// Decision 78f (#332): the run's read of the Sleep Focus filter, at its start, before anything
     /// else and so before its flush decides finalization (`SleepFocusDetection.check` in the app). It
     /// never connects, syncs or schedules. A no-op in tests that don't drive it.
@@ -583,7 +641,7 @@ struct HelioBackgroundSyncService {
         let wake = wake ?? HelioWake(task: kind) ?? .foreground
         let start = now()
         // Decision 78f: iOS may not have run the Focus filter; a Focus end seen here persists T, which
-        // this run's own flush then uses (78a, 78g). The read is bounded (2 s, 78h S-2), and the run's
+        // this run's own flush then uses (78a, 87). The read is bounded (2 s, 78h S-2), and the run's
         // budget counts from `start`, taken before it.
         await detectFocusEnd(kind, start)
         var run = HelioBackgroundRun(ending: .outOfTime)
@@ -842,7 +900,7 @@ struct HelioBackgroundSyncService {
             run.refreshAt = StrapNightRefresh.aim(nights: run.result?.nights ?? [],
                                                   storedNightSettles: storedNightSettles(timeline, now()),
                                                   focusEndedAt: focusEnd, persistedFocusEnd: persistedFocusEnd(),
-                                                  persistedSource: persistedFocusSource(),
+                                                  persistedSource: persistedFocusSource(), focusSeenActive: focusSeenActive(),
                                                   flushStartedAt: flushStart, afterWokeUp: wake == .strapEvent)
             if run.flush?.wroteAnything == true { observability.recordHealthWrite() }
         }
@@ -913,6 +971,7 @@ extension HelioBackgroundSyncService {
             storedNightSettles: { timeline, now in store.newestStrapNightSettles(timeline: timeline, now: now) },
             persistedFocusEnd: { SleepFocusFinalization.persisted() },
             persistedFocusSource: { SleepFocusFinalization.persistedSource() },
+            focusSeenActive: { SleepFocusDetection.seenActive() },
             detectFocusEnd: { kind, _ in await SleepFocusDetection.check(kind: kind.rawValue) })
     }
 }
