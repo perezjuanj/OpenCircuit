@@ -3285,9 +3285,11 @@ extension StrapNightHealthTests {
         XCTAssertEqual(offered.map(\.finalized), [true])
     }
 
-    /// The person went back to sleep: the night ends 30 minutes AFTER Focus ended. It is not over by T:
-    /// the margin and 58a's hold apply as usual.
-    func testANightEndingThirtyMinutesAfterTheFocusEndIsNotFinalized() async throws {
+    /// The person went back to sleep: the night ends 30 minutes AFTER Focus ended. AMENDED BY DECISION 87b
+    /// (#352, awaits ratification): its sleep began before T, so it is over by T whatever its end: no
+    /// margin, no 58a hold, for the in-memory T too (78a judged it by its end and held it). Was
+    /// `testANightEndingThirtyMinutesAfterTheFocusEndIsNotFinalized`.
+    func testANightEndingThirtyMinutesAfterTheFocusEndIsFinalizedBecauseItsSleepBeganBeforeIt() async throws {
         ownership.install(.strapOwnsAllTime)
         let store = try makeStore()
         try saveNight(store, from: -1, to: 7.5)
@@ -3297,15 +3299,19 @@ extension StrapNightHealthTests {
         SleepFocusFinalization.persist(focusEnd, defaults: defaults)
         let now = hour(7.5 + 10.0 / 60)
         let growing = await focusFlush(store, nights: [night], at: now, defaults: defaults)
-        XCTAssertEqual(growing.map(\.finalized), [false])
+        XCTAssertEqual(growing.map(\.finalized), [true])
         let heldGrowing = await focusFlush(store, at: hour(9), defaults: defaults)
-        XCTAssertEqual(heldGrowing.count, 0, "58a's hold: 3 h from its end")
+        XCTAssertEqual(heldGrowing.count, 1, "87b: no 58a hold")
         let inMemory = await focusFlush(store, nights: [night], focusEndedAt: focusEnd, at: hour(7.6), defaults: defaults)
-        XCTAssertEqual(inMemory.map(\.finalized), [false], "decision 31's in-memory T is judged per night too")
+        XCTAssertEqual(inMemory.map(\.finalized), [true], "decision 31's in-memory T is judged per night too")
     }
 
-    /// The boundary of "ended by T": the last segment at T + 10 min is over, a second later it isn't.
-    func testANightEndingTenMinutesAfterTheFocusEndIsTheLastOneFinalized() async throws {
+    /// The boundary of "ended by T": the last segment at T + 10 min is over. AMENDED BY DECISION 87b
+    /// (#352, awaits ratification): a second later it is over too, because its sleep began before T (78a
+    /// held it). The 87a boundary alone, for a night whose sleep began after T, is
+    /// `testTheSlackBoundsANightWhoseSleepBeganAfterTheFocusEnd`. Was
+    /// `testANightEndingTenMinutesAfterTheFocusEndIsTheLastOneFinalized`.
+    func testANightEndingPastTheSlackIsFinalizedWhenItsSleepBeganBeforeTheFocusEnd() async throws {
         ownership.install(.strapOwnsAllTime)
         let store = try makeStore()
         let (defaults, suite) = try focusDefaults()
@@ -3314,7 +3320,7 @@ extension StrapNightHealthTests {
         let atSlack = [SleepSegment(start: hour(-1), end: focusEnd.addingTimeInterval(10 * 60), stage: .asleepCore)]
         let past = [SleepSegment(start: hour(-1), end: focusEnd.addingTimeInterval(10 * 60 + 1), stage: .asleepCore)]
         let verdicts = await focusFlush(store, nights: [atSlack, past], at: hour(8), defaults: defaults)
-        XCTAssertEqual(verdicts.map(\.finalized), [true, false])
+        XCTAssertEqual(verdicts.map(\.finalized), [true, true])
     }
 
     /// The next evening's night, synced while still in progress within 6 h of T: it ends after T + 10
@@ -3473,13 +3479,16 @@ extension StrapNightHealthTests {
         XCTAssertEqual(StrapNightRefresh.pending(now: now, defaults: defaults), later)
     }
 
-    /// The night a Focus run was for: one ending after T + 10 min (still growing), or over 18 h before T,
-    /// or the ring's, is not it.
-    func testTheFocusRunsNightEndsByTheSlackAndWithinEighteenHoursBeforeIt() throws {
+    /// The night a Focus run was for: one over 18 h before T, or the ring's, is not it. AMENDED BY
+    /// DECISION 87b (#352, awaits ratification): one ending after T + 10 min whose sleep began before T
+    /// IS it (78b read it by its end alone: `.none`). Was
+    /// `testTheFocusRunsNightEndsByTheSlackAndWithinEighteenHoursBeforeIt`.
+    func testTheFocusRunsNightIsOneTheFocusEndFinalizesWithinEighteenHoursBeforeIt() throws {
         ownership.install(.strapOwnsAllTime)
         let store = try makeStore()
         try saveNight(store, from: -1, to: 7.5)
-        XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: focusEnd), .none, "ends 30 min after T")
+        XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: focusEnd), .storedNotWritten,
+                       "ends 30 min after T, its sleep began before T (87b)")
         XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: hour(7.5).addingTimeInterval(18 * 3600)), .storedNotWritten)
         XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: hour(7.5).addingTimeInterval(18 * 3600 + 1)), .none)
         XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: hour(7.5).addingTimeInterval(-10 * 60)), .storedNotWritten)

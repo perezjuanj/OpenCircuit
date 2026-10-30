@@ -3272,10 +3272,13 @@ extension HelioBackgroundSyncTests {
     }
 
     /// A false "not active" read in the middle of the night (Focus still on), at a run that reads an
-    /// in-progress record ending 3 minutes before it: not finalized, so it waits for the margin; a flush
-    /// soon after doesn't offer the stored copy (58a's hold); and the full night, delivered later, is
-    /// judged by the normal rules: nothing was written early for it to replace.
-    func testAFalseInactiveReadMidNightLeavesAnInProgressRecordBehindTheMarginAndTheHold() async throws {
+    /// in-progress record ending 3 minutes before it. AMENDED BY DECISION 87 (#352; the first two
+    /// assertions are 78g encodings, the last is 87b's and awaits ratification): the record is finalized
+    /// (87a), a flush soon after offers the stored copy despite 58a's hold, and the full night delivered
+    /// 2 h later is finalized too, because its sleep began before T (87b); it replaces the short copy
+    /// through 58b. Decision 87g's accepted residual; a Focus-on read after T stops it (87c, tested
+    /// below). Was `testAFalseInactiveReadMidNightLeavesAnInProgressRecordBehindTheMarginAndTheHold`.
+    func testAFalseInactiveReadMidNightFinalizesTheInProgressRecordAndTheFullNightLater() async throws {
         let store = try makeStore()
         let (focusDefaults, suite) = try focusSuite()
         defer { focusDefaults.removePersistentDomain(forName: suite) }
@@ -3302,7 +3305,7 @@ extension HelioBackgroundSyncTests {
         let later = HealthKitWriter()
         _ = await HelioConnection.flushStrap(later, store: store, timeline: timeline, nights: [fullNight],
                                              now: nightEnd.addingTimeInterval(2 * 3600 + 5 * 60), defaults: focusDefaults)
-        XCTAssertEqual(later.lastStrapNights.first.map(\.finalized), false, "the full night: the normal rules")
+        XCTAssertEqual(later.lastStrapNights.first.map(\.finalized), true, "87b: the full night's sleep began before T")
     }
 
     /// AMENDED BY DECISION 87a (#352): both sources finalize nights that end up to 10 min after T (78g's
