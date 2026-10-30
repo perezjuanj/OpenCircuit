@@ -3394,3 +3394,111 @@ extension HelioBackgroundSyncTests {
         XCTAssertTrue(bundle.contains("  Sleep Focus: last read off (notFound); seen on 30 min ago; Focus end 125 min ago (detected)\n"), bundle)
     }
 }
+
+// MARK: - Decision 87 (#352): Sleep Focus off ends the night, in the background too
+
+extension HelioBackgroundSyncTests {
+    /// The b91 shape: the Focus seen on at a background wake overnight; the next background wake reads it
+    /// off (a detected T) and syncs the strap's record, which ends 3 minutes before that wake. Written by
+    /// that wake: no margin, and a flush soon after offers the stored copy despite 58a's hold. Nothing asks
+    /// for a margin refresh.
+    func testAWakeThatDetectsTheFocusEndWritesTheRecordEndingThreeMinutesBeforeIt() async throws {
+        let store = try makeStore()
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        clock = nightEnd.addingTimeInterval(-4 * 3600)
+        SleepFocusDetection.note(.active, at: clock, kind: "cbWake", defaults: focusDefaults)   // the overnight wake's read
+        clock = nightEnd.addingTimeInterval(3 * 60)
+        let wake = clock
+        let writer = HealthKitWriter()
+        let run = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults, detect: { kind, now in
+            SleepFocusDetection.note(.inactive, at: now, kind: kind.rawValue, defaults: focusDefaults)
+        }).run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+        XCTAssertEqual(run.ending, .synced)
+        XCTAssertEqual(SleepFocusFinalization.persisted(defaults: focusDefaults), wake)
+        XCTAssertEqual(SleepFocusFinalization.persistedSource(defaults: focusDefaults), .detected)
+        XCTAssertTrue(writer.lastStrapNights.contains { $0.night.map(\.end).max() == nightEnd })
+        XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [true], "87a: no margin")
+        XCTAssertNil(run.refreshAt, "no night held")
+
+        let timeline = try XCTUnwrap(link.strapTimeline)
+        let soon = HealthKitWriter()
+        _ = await HelioConnection.flushStrap(soon, store: store, timeline: timeline, nights: [],
+                                             now: wake.addingTimeInterval(10 * 60), defaults: focusDefaults)
+        XCTAssertEqual(soon.lastStrapNights.map(\.finalized), [true], "no 58a hold for the stored copy")
+    }
+
+    /// The Focus end was detected 15 minutes before the record ends (a wake with no sync); the night is
+    /// first stored by a background run 20 minutes after T, its end 5 minutes before that run (past T + 10
+    /// min). Written in that run by 87b: its sleep began before T.
+    func testANightFirstStoredTwentyMinutesAfterADetectedFocusEndIsWrittenBecauseItsSleepBeganBeforeIt() async throws {
+        let store = try makeStore()
+        let (focusDefaults, suite) = try focusSuite()
+        defer { focusDefaults.removePersistentDomain(forName: suite) }
+        let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+        SleepFocusDetection.note(.active, at: nightEnd.addingTimeInterval(-4 * 3600), kind: "cbWake", defaults: focusDefaults)
+        let t = nightEnd.addingTimeInterval(-15 * 60)
+        XCTAssertEqual(SleepFocusDetection.note(.inactive, at: t, kind: "postSync", defaults: focusDefaults), t)
+        clock = t.addingTimeInterval(20 * 60)
+        XCTAssertGreaterThan(nightEnd, t.addingTimeInterval(10 * 60), "past the slack")
+        let writer = HealthKitWriter()
+        let run = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults)
+            .run(kind: .processing, timeout: RingBackgroundSyncService.defaultTimeout)
+        XCTAssertEqual(run.ending, .synced)
+        XCTAssertTrue(writer.lastStrapNights.contains { $0.night.map(\.end).max() == nightEnd })
+        XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [true], "87b")
+        XCTAssertNil(run.refreshAt)
+    }
+
+    /// The wake that detected the Focus end ran out of time before any sleep round. A background run 2 h
+    /// later fetches the night and finalizes it by the persisted detected T; 7 h after T, the same run gets
+    /// the normal rules (6 h).
+    func testADetectingWakeOutOfTimeLeavesTheNightToARunTwoHoursLaterThatFinalizesIt() async throws {
+        for (after, finalized) in [(2.0, true), (7.0, false)] {
+            let store = try makeStore()
+            let (focusDefaults, suite) = try focusSuite()
+            defer { focusDefaults.removePersistentDomain(forName: suite) }
+            let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+            SleepFocusDetection.note(.active, at: nightEnd.addingTimeInterval(-4 * 3600), kind: "cbWake", defaults: focusDefaults)
+            clock = nightEnd.addingTimeInterval(5 * 60)
+            let t = clock
+            link.inRange = false
+            let writer = HealthKitWriter()
+            let detecting = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults, detect: { kind, now in
+                SleepFocusDetection.note(.inactive, at: now, kind: kind.rawValue, defaults: focusDefaults)
+            }).run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+            XCTAssertEqual(detecting.ending, .outOfTime)
+            XCTAssertEqual(SleepFocusFinalization.persisted(defaults: focusDefaults), t)
+            XCTAssertTrue(try store.context.fetch(FetchDescriptor<StoredSleepSummary>()).isEmpty, "no sleep round ran")
+
+            link.inRange = true
+            clock = t.addingTimeInterval(after * 3600)
+            let later = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults)
+                .run(kind: .appRefresh, timeout: RingBackgroundSyncService.defaultTimeout)
+            XCTAssertEqual(later.ending, .synced)
+            XCTAssertTrue(writer.lastStrapNights.contains { $0.night.map(\.end).max() == nightEnd }, "\(after) h")
+            XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [finalized], "\(after) h after the detected T")
+        }
+    }
+
+    /// A delivered `perform()` T, through the Focus run: the night that ended 5 minutes before it is
+    /// finalized as on master (78a), and so is one that ends 30 minutes after it, whose sleep began before
+    /// it (87b, through the shared flush on the same run).
+    func testAPerformedFocusEndFinalizesTheNightItEndedAndTheNightInProgressAtIt() async throws {
+        for (focusAfterEnd, finalized) in [(5.0, true), (-30.0, true)] {
+            let store = try makeStore()
+            let (focusDefaults, suite) = try focusSuite()
+            defer { focusDefaults.removePersistentDomain(forName: suite) }
+            let link = FakeBackgroundLink(device: makeStrap(), keyStore: MemoryKeyStore(keyHex), store: store, clock: { [unowned self] in self.clock })
+            let focusEnd = nightEnd.addingTimeInterval(focusAfterEnd * 60)
+            SleepFocusFinalization.persist(focusEnd, defaults: focusDefaults)
+            clock = max(focusEnd, nightEnd).addingTimeInterval(3 * 60)
+            let writer = HealthKitWriter()
+            let run = await flushingService(link, store: store, writer: writer, focusDefaults: focusDefaults)
+                .run(kind: .sleepFocus, timeout: RingBackgroundSyncService.defaultTimeout, nightsFinalized: focusEnd)
+            XCTAssertEqual(run.ending, .synced)
+            XCTAssertEqual(Set(writer.lastStrapNights.map(\.finalized)), [finalized], "Focus \(focusAfterEnd) min after the end")
+        }
+    }
+}

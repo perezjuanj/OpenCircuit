@@ -450,9 +450,8 @@ final class HelioConnection: NSObject {
                                                strapNights: strapNights(nights, store: store, timeline: timeline, now: now,
                                                                         finalization: finalization),
                                                strapNightsFinalized: finalization)
-        if finalization.fromPersisted, flush.finalizedStrapNights > 0, let focusEnd = finalization.detectedEnd ?? finalization.focusEnd {
-            SleepFocusFinalization.notePersistedWrite(focusEnd: focusEnd, flushStart: now, defaults: defaults)
-        }
+        SleepFocusFinalization.notePersistedWrite(finalization, finalizedWrites: flush.finalizedStrapNights, flushStart: now,
+                                                  defaults: defaults)
         return flush
     }
 

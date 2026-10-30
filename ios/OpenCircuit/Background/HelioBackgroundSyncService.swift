@@ -175,6 +175,17 @@ enum SleepFocusFinalization {
                seenActive: SleepFocusDetection.seenActive(defaults: defaults), flushStartsAt: flushStart)
     }
 
+    /// After a strap flush (`HelioConnection.flushStrap`): decision 78c's line when the flush wrote
+    /// `finalizedWrites` nights its finalization covered (the writer counts them with `Nights.finalizes`,
+    /// so a night decision 87b finalized counts) and that finalization came from the persisted T, of
+    /// either source (decision 87e).
+    static func notePersistedWrite(_ finalization: Nights, finalizedWrites: Int, flushStart: Date,
+                                   defaults: UserDefaults = .standard) {
+        guard finalization.fromPersisted, finalizedWrites > 0,
+              let focusEnd = finalization.detectedEnd ?? finalization.focusEnd else { return }
+        notePersistedWrite(focusEnd: focusEnd, flushStart: flushStart, defaults: defaults)
+    }
+
     /// The persisted T the 78c breadcrumb was last recorded for.
     nonisolated static let persistedWriteLoggedKey = "helio.sleepFocusEndedAt.logged.v1"
 

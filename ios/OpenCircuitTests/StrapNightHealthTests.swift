@@ -3497,3 +3497,268 @@ extension StrapNightHealthTests {
         XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: hour(7.5)), .none, "ring-only: no strap night")
     }
 }
+
+// MARK: - Decision 87 (#352): Sleep Focus off ends the night, whatever its source
+//
+// 87a: a detected T finalizes like a `perform()` one (end <= T + 10 min). 87b: a night whose SLEEP
+// began before T is over too, whatever its end. 87c: a Focus seen on after the persisted T voids it.
+// Every verdict is `HelioConnection.flushStrap`'s, read from the writer (`focusFlush`); a write is shown
+// as in the decision 58 tests (`recordWrite` after `mirrorStrapNight` gets past every bail).
+
+/// A night from 23:00, as the strap shows it while still going on, up to `end` (local hours).
+private func bedtimeNight(until end: Double) -> [(Double, Double, UInt8)] {
+    let stages: [(Double, Double, UInt8)] = [(-1, 1, light), (1, 2, deep), (2, 3.5, rem), (3.5, 6, light), (6, 9, light)]
+    return stages.compactMap { stage in stage.0 < end ? (stage.0, min(stage.1, end), stage.2) : nil }
+}
+
+extension StrapNightHealthTests {
+    /// A strap flush at `now` through `HelioConnection.flushStrap` with the Sleep Focus state in
+    /// `defaults`, then each night the writer's gate lets through (with its verdict, at `now`) to
+    /// `mirrorStrapNight`, recorded as written. The spans written.
+    private func focusWrite(_ nights: [[SleepSegment]], at now: Date, store: LocalStore,
+                            defaults: UserDefaults) async throws -> [DateInterval] {
+        var written: [DateInterval] = []
+        for (night, finalized) in await focusFlush(store, nights: nights, at: now, defaults: defaults)
+        where SleepHealthGate.isReadyToWrite(latestSegmentEnd: night.map(\.end).max(), now: now, finalized: finalized) {
+            let outcome = await HealthKitWriter().mirrorStrapNight(local: store, segments: night)
+            if case .declined = outcome { store.noteStrapNightDeclined(night) }
+            guard !isUnchanged(outcome) else { continue }
+            try recordWrite(night, store: store)
+            written.append(span(night))
+        }
+        return written
+    }
+
+    /// A stored strap night with exactly `segments` as its hypnogram (its window is theirs).
+    private func saveNight(_ store: LocalStore, segments: [SleepSegment]) throws {
+        let start = segments.map(\.start).min()!, end = segments.map(\.end).max()!
+        var extras = LocalStore.SleepNightExtras()
+        extras.hypnogram = segments
+        let outcome = try store.saveSleepSummary(SleepStaging.summary(segments), night: SleepNightKey.night(inBedStart: start, inBedEnd: end),
+                                                 inBedStart: start, inBedEnd: end, sleepOnset: start, sleepWake: end,
+                                                 extras: extras, device: timeline)
+        XCTAssertEqual(outcome, .inserted)
+    }
+
+    /// A strap night with a decision 77 lead-in from `leadIn` to `sleep`, then asleep from `sleep` to `end`
+    /// (local hours), shaped as the store gives it: the lead-in's `.inBed` + `.awake`, the fragment's `.inBed`
+    /// layer, its stages.
+    private func nightWithLeadIn(from leadIn: Double, sleep: Double, end: Double) -> [SleepSegment] {
+        [SleepSegment(start: hour(leadIn), end: hour(sleep), stage: .inBed),
+         SleepSegment(start: hour(leadIn), end: hour(sleep), stage: .awake),
+         SleepSegment(start: hour(sleep), end: hour(end), stage: .inBed),
+         SleepSegment(start: hour(sleep), end: hour(end), stage: .asleepCore)]
+    }
+
+    /// The one predicate, for a `perform()` T and a detected one alike: over when the night ends by T + 10
+    /// min (87a), or its sleep began before T (87b); a night whose sleep began after T and ends later is not.
+    func testOnePredicateJudgesEveryNightByItsSleepStartAndItsEnd() {
+        let t = focusEnd
+        for source in [SleepFocusFinalization.Source.perform, .detected] {
+            let n = SleepFocusFinalization.nights(inMemory: nil, persisted: t, source: source, flushStartsAt: t.addingTimeInterval(60))
+            let label = source.rawValue
+            for start in [nil, t.addingTimeInterval(-3600), t.addingTimeInterval(5 * 60)] {
+                XCTAssertTrue(n.finalizes(sleepStart: start, nightEndingAt: t.addingTimeInterval(10 * 60)), "\(label): by its end")
+            }
+            XCTAssertTrue(n.finalizes(sleepStart: t.addingTimeInterval(-1), nightEndingAt: t.addingTimeInterval(3 * 3600)), "\(label): 87b")
+            XCTAssertFalse(n.finalizes(sleepStart: t, nightEndingAt: t.addingTimeInterval(3 * 3600)), "\(label): sleep began AT T")
+            XCTAssertFalse(n.finalizes(sleepStart: nil, nightEndingAt: t.addingTimeInterval(10 * 60 + 1)), "\(label): no sleep start")
+            XCTAssertFalse(n.finalizes(sleepStart: t.addingTimeInterval(60), nightEndingAt: t.addingTimeInterval(10 * 60 + 1)), label)
+            XCTAssertFalse(n.finalizes(sleepStart: t.addingTimeInterval(-3600), nightEndingAt: nil), "\(label): no end")
+        }
+        XCTAssertFalse(SleepFocusFinalization.Nights.none.finalizes(sleepStart: t.addingTimeInterval(-3600), nightEndingAt: t))
+        // The segments' form reads the sleep start from the first asleep segment, never `.inBed` or `.awake`.
+        let n = SleepFocusFinalization.nights(inMemory: nil, persisted: t, flushStartsAt: t.addingTimeInterval(60))
+        XCTAssertFalse(n.finalizes(nightWithLeadIn(from: 6.5, sleep: 7.25, end: 9)))
+        XCTAssertTrue(n.finalizes(nightWithLeadIn(from: 6.5, sleep: 6.9, end: 9)))
+        XCTAssertEqual(SleepFocusFinalization.sleepStart(of: nightWithLeadIn(from: 6.5, sleep: 7.25, end: 9)), hour(7.25))
+        XCTAssertNil(SleepFocusFinalization.sleepStart(of: [SleepSegment(start: hour(1), end: hour(9), stage: .inBed),
+                                                            SleepSegment(start: hour(1), end: hour(9), stage: .awake)]))
+    }
+
+    /// The 87a boundary alone: a night whose sleep began after T (so 87b can't apply) is over when it ends
+    /// at T + 10 min, and not a second later.
+    func testTheSlackBoundsANightWhoseSleepBeganAfterTheFocusEnd() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SleepFocusFinalization.persist(focusEnd, source: .detected, defaults: defaults)
+        let atSlack = [SleepSegment(start: hour(7 + 1.0 / 60), end: focusEnd.addingTimeInterval(10 * 60), stage: .asleepCore)]
+        let past = [SleepSegment(start: hour(7 + 1.0 / 60), end: focusEnd.addingTimeInterval(10 * 60 + 1), stage: .asleepCore)]
+        let verdicts = await focusFlush(store, nights: [atSlack, past], at: hour(7.2), defaults: defaults)
+        XCTAssertEqual(verdicts.map(\.finalized), [true, false])
+    }
+
+    /// Decision 77: a lead-in that starts BEFORE T is not sleep. A night whose lead-in began at 06:30 but
+    /// whose sleep began at 07:15 (after T, 07:00) and ends at 09:00 is not over by T, carried by a sync or
+    /// offered from the store (58a's hold applies). The same night with its sleep from 06:55 is.
+    func testALeadInBeforeTheFocusEndDoesNotMakeALaterSleepFinalized() async throws {
+        for (sleep, finalized) in [(7.25, false), (6 + 55.0 / 60, true)] {
+            ownership.install(.strapOwnsAllTime)
+            let store = try makeStore()
+            let (defaults, suite) = try focusDefaults()
+            defer { defaults.removePersistentDomain(forName: suite) }
+            SleepFocusFinalization.persist(focusEnd, defaults: defaults)
+            let night = nightWithLeadIn(from: 6.5, sleep: sleep, end: 9)
+            XCTAssertEqual(HelioSleepSelection.leadIn(in: night), DateInterval(start: hour(6.5), end: hour(sleep)), "a real lead-in shape")
+            try saveNight(store, segments: night)
+            let now = hour(9 + 5.0 / 60)
+            let carried = await focusFlush(store, nights: [night], at: now, defaults: defaults)
+            XCTAssertEqual(carried.map(\.finalized), [finalized], "sleep from \(sleep)")
+            let stored = await focusFlush(store, at: now, defaults: defaults)
+            XCTAssertEqual(stored.map(\.finalized), finalized ? [true] : [], "sleep from \(sleep): the stored copy")
+        }
+    }
+
+    /// The alarm switched off at 07:00 (`perform()` T), then back to sleep. The Focus run's sync reads the
+    /// record in progress (to 07:00) and writes it (87a). A re-delivery 5 minutes longer is kept out (28f,
+    /// 58b): no rewrite. One 25 minutes longer is stored and, 5 minutes after its end, written at once,
+    /// because its sleep began before T (87b), replacing the short night through 58b: exactly one rewrite.
+    func testAlarmOffThenBackAsleepWritesTheNightAtTheFocusEndAndOneLongerCopyReplacesIt() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SleepFocusFinalization.persist(focusEnd, defaults: defaults)
+
+        let atT = try sync(inProgress(until: 7), at: hour(7 + 3.0 / 60), store: store)
+        let first = try await focusWrite(atT.nights.map(\.segments), at: clock, store: store, defaults: defaults)
+        XCTAssertEqual(first, [DateInterval(start: hour(0.5), end: hour(7))], "written at T's wake, no margin")
+        let key = try XCTUnwrap(try rows(store).first).night
+        let written = mirrorRecord(store, key)
+
+        let fiveLonger = try sync(inProgress(until: 7 + 5.0 / 60), at: hour(7 + 10.0 / 60), store: store)
+        XCTAssertEqual(fiveLonger.nights.count, 0, "28f keeps it out")
+        let none = try await focusWrite(fiveLonger.nights.map(\.segments), at: clock, store: store, defaults: defaults)
+        XCTAssertEqual(none, [])
+        XCTAssertEqual(mirrorRecord(store, key), written, "no rewrite")
+
+        let longer = DateInterval(start: hour(0.5), end: hour(7 + 25.0 / 60))
+        let twentyFiveLonger = try sync(inProgress(until: 7 + 25.0 / 60), at: hour(7.5), store: store)
+        XCTAssertEqual(twentyFiveLonger.nights.map(\.window), [longer], "58b: it extends the written night")
+        let verdicts = await focusFlush(store, nights: twentyFiveLonger.nights.map(\.segments), at: clock, defaults: defaults)
+        XCTAssertEqual(verdicts.map(\.finalized), [true], "87b: its sleep began before T; 5 min after its end")
+        let rewrite = try await focusWrite(twentyFiveLonger.nights.map(\.segments), at: clock, store: store, defaults: defaults)
+        XCTAssertEqual(rewrite, [longer])
+        XCTAssertEqual(try mirrorSpan(store), longer)
+        let again = try sync(inProgress(until: 7 + 25.0 / 60), at: hour(7.75), store: store)
+        let noMore = try await focusWrite(again.nights.map(\.segments), at: clock, store: store, defaults: defaults)
+        XCTAssertEqual(noMore, [], "written once")
+        XCTAssertEqual(extensionBreadcrumbs().count, 1, "exactly one rewrite")
+    }
+
+    /// A false "off" read in the night (02:30 detected T) writes the record in progress short. The next
+    /// wake reads the Focus ON (seen active after T): from then T finalizes nothing (87c), so the growing
+    /// record waits for its margin and the stored copy for 58a's hold. The real Focus end in the morning is
+    /// a new T, and the full night replaces the short one through 58b.
+    func testAFocusOnReadAfterAFalseOffVoidsItUntilTheRealFocusEnd() async throws {
+        try await inFixedZone {
+            ownership.install(.strapOwnsAllTime)
+            let store = try makeStore()
+            let (defaults, suite) = try focusDefaults()
+            defer { defaults.removePersistentDomain(forName: suite) }
+            SleepFocusDetection.note(.active, at: hour(-1.5), kind: "processing", defaults: defaults)
+            let falseOff = hour(2.5)
+            XCTAssertEqual(SleepFocusDetection.note(.inactive, at: falseOff, kind: "cbWake", defaults: defaults), falseOff)
+
+            let short = try sync(bedtimeNight(until: 2.5 - 3.0 / 60), at: falseOff, store: store)
+            let shortWindow = DateInterval(start: hour(-1), end: hour(2.5 - 3.0 / 60))
+            let writtenShort = try await focusWrite(short.nights.map(\.segments), at: clock, store: store, defaults: defaults)
+            XCTAssertEqual(writtenShort, [shortWindow], "87g's accepted residual: written short")
+
+            SleepFocusDetection.note(.active, at: hour(3.5), kind: "cbWake", defaults: defaults)
+            XCTAssertEqual(SleepFocusFinalization.nights(inMemory: nil, flushStartsAt: hour(3.5), defaults: defaults), .none, "87c: T is void")
+            let growing = try sync(bedtimeNight(until: 3.5 - 3.0 / 60), at: hour(3.5), store: store)
+            XCTAssertEqual(growing.nights.count, 1, "it extends the written night: stored")
+            let verdicts = await focusFlush(store, nights: growing.nights.map(\.segments), at: clock, defaults: defaults)
+            XCTAssertEqual(verdicts.map(\.finalized), [false], "the margin applies again")
+            let held = try await focusWrite(growing.nights.map(\.segments), at: clock, store: store, defaults: defaults)
+            XCTAssertEqual(held, [])
+            let backstop = await focusFlush(store, at: hour(4), defaults: defaults)
+            XCTAssertEqual(backstop.count, 0, "58a's hold applies again")
+            XCTAssertEqual(try mirrorSpan(store), shortWindow)
+
+            let realOff = hour(7 + 5.0 / 60)
+            XCTAssertEqual(SleepFocusDetection.note(.inactive, at: realOff, kind: "appRefresh", defaults: defaults), realOff, "a new T")
+            let full = try sync(bedtimeNight(until: 7), at: realOff, store: store)
+            let fullWindow = DateInterval(start: hour(-1), end: hour(7))
+            let replaced = try await focusWrite(full.nights.map(\.segments), at: clock, store: store, defaults: defaults)
+            XCTAssertEqual(replaced, [fullWindow])
+            XCTAssertEqual(try mirrorSpan(store), fullWindow, "the short night is inside the rewrite's delete span")
+        }
+    }
+
+    /// 87c in the predicate: a seen-active time later than the persisted T voids it for both sources; one
+    /// at or before T doesn't; a new T after it applies again. Decision 31's in-memory T (a `perform()`
+    /// that just ran) is not voided.
+    func testASeenActiveTimeAfterThePersistedFocusEndVoidsIt() {
+        let t = focusEnd, flush = focusEnd.addingTimeInterval(60)
+        for source in [SleepFocusFinalization.Source.perform, .detected] {
+            XCTAssertEqual(SleepFocusFinalization.nights(inMemory: nil, persisted: t, source: source,
+                                                         seenActive: t.addingTimeInterval(1), flushStartsAt: flush), .none, source.rawValue)
+            XCTAssertNotEqual(SleepFocusFinalization.nights(inMemory: nil, persisted: t, source: source,
+                                                            seenActive: t, flushStartsAt: flush), .none, source.rawValue)
+            XCTAssertNotEqual(SleepFocusFinalization.nights(inMemory: nil, persisted: t, source: source,
+                                                            seenActive: t.addingTimeInterval(-3600), flushStartsAt: flush), .none)
+        }
+        XCTAssertEqual(SleepFocusFinalization.nights(inMemory: t, persisted: t, seenActive: t.addingTimeInterval(1), flushStartsAt: flush),
+                       SleepFocusFinalization.Nights(focusEnd: t, fromPersisted: false), "the in-memory T stands")
+    }
+
+    /// The refresh verdict reads the same predicate: a night the persisted T finalizes by its sleep start
+    /// asks for no margin refresh; voided by a Focus-on read, it does.
+    func testTheRefreshAimFollowsThePredicate() {
+        let night = HelioSleepSelection.Night(
+            segments: [SleepSegment(start: hour(0.5), end: hour(7.5), stage: .asleepCore)],
+            window: DateInterval(start: hour(0.5), end: hour(7.5)), strapScore: 80)
+        let flush = hour(7.5 + 5.0 / 60)
+        XCTAssertNil(StrapNightRefresh.aim(nights: [night], focusEndedAt: nil, persistedFocusEnd: focusEnd, persistedSource: .detected,
+                                           flushStartedAt: flush, afterWokeUp: false), "87b: finalized")
+        XCTAssertEqual(StrapNightRefresh.aim(nights: [night], focusEndedAt: nil, persistedFocusEnd: focusEnd, persistedSource: .detected,
+                                             focusSeenActive: hour(7.25), flushStartedAt: flush, afterWokeUp: false),
+                       hour(7.5).addingTimeInterval(SleepHealthGate.settleMargin), "87c: voided, the margin")
+    }
+
+    /// 87e: the 78c line is recorded for a detected T exactly as for a delivered one, and for a night that
+    /// only 87b finalized (the writer counts it with the same predicate); and the bundle's fixed line names
+    /// the source. The simulator can't write to Health, so the writer's count is the verdict's.
+    func testThePersistedWriteLineIsRecordedForADetectedFocusEndAndASleepStartNight() async throws {
+        ownership.install(.strapOwnsAllTime)
+        let store = try makeStore()
+        let (defaults, suite) = try focusDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SleepFocusDetection.note(.active, at: hour(-1.5), kind: "processing", defaults: defaults)
+        SleepFocusDetection.note(.inactive, at: focusEnd, kind: "cbWake", defaults: defaults)
+        XCTAssertEqual(SleepFocusFinalization.persistedSource(defaults: defaults), .detected)
+        let sleepStartNight = [SleepSegment(start: hour(0.5), end: hour(7.5), stage: .asleepCore)]
+        let now = hour(7.5 + 5.0 / 60)
+        let verdicts = await focusFlush(store, nights: [sleepStartNight], at: now, defaults: defaults)
+        XCTAssertEqual(verdicts.map(\.finalized), [true], "87b alone: it ends 30 min after T")
+        let finalization = SleepFocusFinalization.nights(inMemory: nil, flushStartsAt: now, defaults: defaults)
+        XCTAssertTrue(finalization.fromPersisted)
+        SleepFocusFinalization.notePersistedWrite(finalization, finalizedWrites: verdicts.filter(\.finalized).count,
+                                                  flushStart: now, defaults: defaults)
+        SleepFocusFinalization.notePersistedWrite(finalization, finalizedWrites: 1, flushStart: now.addingTimeInterval(600), defaults: defaults)
+        XCTAssertEqual(ObservabilityStore(defaults).metricRecords().filter { $0.source == "focus" }.map(\.detail),
+                       ["Sleep Focus end detected at a wake (filter not run by iOS), kind=cbWake",
+                        "night written from the Sleep Focus end, 35 min after it"], "once per T")
+        XCTAssertTrue(SleepFocusDetection.bundleLine(now: now, defaults: defaults).hasSuffix("Focus end 35 min ago (detected)"))
+
+        let memoryOnly = SleepFocusFinalization.nights(inMemory: now, persisted: nil, flushStartsAt: now)
+        let (other, otherSuite) = try focusDefaults()
+        defer { other.removePersistentDomain(forName: otherSuite) }
+        SleepFocusFinalization.notePersistedWrite(memoryOnly, finalizedWrites: 1, flushStart: now, defaults: other)
+        XCTAssertTrue(ObservabilityStore(other).metricRecords().isEmpty, "decision 31's in-memory T alone: no line")
+    }
+
+    /// Ring-only installs: no strap night is offered and no Focus night is found, whatever T says.
+    func testRingOnlyNothingIsFinalizedOrOffered() throws {
+        ownership.install(DeviceOwnershipLog())
+        let store = try makeStore()
+        try saveNight(store, from: -1, to: 7.5, device: .ringConn)
+        let covering = SleepFocusFinalization.Nights(focusEnd: focusEnd, fromPersisted: true)
+        XCTAssertEqual(store.strapNightsAwaitingHealth(timeline: timeline, now: hour(7.6), finalization: covering), [])
+        XCTAssertEqual(store.strapFocusNight(timeline: timeline, focusEnd: focusEnd), .none)
+    }
+}
