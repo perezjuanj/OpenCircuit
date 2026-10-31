@@ -292,6 +292,9 @@ final class StrapWorkoutRecorder {
     private(set) var vo2MaxOutcome: VO2MaxEstimate.Outcome?
     /// What became of the estimate's Apple Health write: nil while it is in flight.
     private(set) var vo2MaxHealthStatus: VO2MaxHealthWriter.Status?
+    /// The finished workout's heart rate stayed below Zone 1 for most of it (#355, decision 88): the
+    /// summary shows `StrapWorkoutLowHeartRateNote.text`. Display only.
+    private(set) var showsLowHeartRateNote = false
     /// The +120 s mark of the open recovery window, for the countdown. nil when no window is open.
     private(set) var recoveryMarkAt: Date?
     /// An indoor run or walk (#339): steps per minute over the last 60 s, nil while paused or before any.
@@ -544,6 +547,7 @@ final class StrapWorkoutRecorder {
         tickCount = 0
         vo2MaxOutcome = nil
         vo2MaxHealthStatus = nil
+        showsLowHeartRateNote = false
         clearHeartRateRecovery()
         rrIntervalCount = 0
         clearSteps()
@@ -844,6 +848,10 @@ final class StrapWorkoutRecorder {
             : nil
         // Not saved: the workout isn't in Health, so neither is its estimate (the ring's rule).
         vo2MaxHealthStatus = saved ? nil : .failed
+        // Decision 88: over exactly the summary's active time, counted readings and zones.
+        showsLowHeartRateNote = StrapWorkoutLowHeartRateNote.applies(
+            isStrapWorkout: true, sport: summary.summary.sport, activeSeconds: summary.activeSeconds,
+            activeReadings: counted, zones: activeZones)
         if let indoorSteps {
             let finish = IndoorRunFinish(inputs: IndoorRunInputs(
                 sport: selectedSport, timeline: timeline, start: ledger.start, end: end,
@@ -1208,6 +1216,7 @@ final class StrapWorkoutRecorder {
         liveZoneBreakdown = WorkoutZoneBreakdown()
         vo2MaxOutcome = nil
         vo2MaxHealthStatus = nil
+        showsLowHeartRateNote = false
         clearHeartRateRecovery()
         rrIntervalCount = 0
         clearSteps()

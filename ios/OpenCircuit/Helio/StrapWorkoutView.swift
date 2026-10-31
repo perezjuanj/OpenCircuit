@@ -323,6 +323,10 @@ struct StrapWorkoutView: View {
                         noteRow("antenna.radiowaves.left.and.right.slash", .orange,
                                 "No heart rate for \(Self.duration(result.gapSeconds)) while the strap was disconnected. That time has no readings and no zone time.")
                     }
+                    if recorder.showsLowHeartRateNote {
+                        // Decision 88: informational, display only.
+                        noteRow("info.circle", .secondary, StrapWorkoutLowHeartRateNote.text)
+                    }
                     if summary.estimatedActiveKcal != nil {
                         noteRow("info.circle", .secondary, summary.hrSampleCount > 0
                                 ? "Active calories are an ESTIMATE (from your heart rate, active time, age and body mass; not strap sensor data)."
