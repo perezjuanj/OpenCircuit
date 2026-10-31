@@ -149,7 +149,9 @@ enum WorkoutDetailContent {
 
     /// Whether the detail shows `StrapWorkoutLowHeartRateNote.text` (decision 88): a strap workout only,
     /// over its moving time and the workout-shaped readings (`end > start`) outside its pauses, with
-    /// the zones the detail shows. An activity type no OpenCircuit sport writes shows nothing.
+    /// the zones the detail shows. An activity type no OpenCircuit sport writes shows nothing. On the
+    /// main actor for `WorkoutSessionManager.hkActivityType(for:)`, the mapping the save uses.
+    @MainActor
     static func showsLowHeartRateNote(_ item: WorkoutHistoryReader.Item, hr: [HRSample], zones: HeartRateZones,
                                       isStrapWorkout: Bool) -> Bool {
         guard let sport = WorkoutSportType.allCases.first(where: {
