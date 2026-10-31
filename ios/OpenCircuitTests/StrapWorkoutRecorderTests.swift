@@ -342,6 +342,58 @@ final class StrapWorkoutRecorderTests: XCTestCase {
         XCTAssertEqual(rig.recorder.rrIntervalCount, 0)
     }
 
+    // MARK: Heart rate below Zone 1 (#355, decision 88)
+
+    func testTwentyMinutesBelowZoneOneShowsTheLowHeartRateNoteUntilReset() async throws {
+        let source = makeSource()
+        let rig = makeRig(source: { source })
+        rig.recorder.selectedSport = .other
+        rig.recorder.start()
+        await stream(rig, source, from: 0, to: 1200, bpm: 80)          // Zone 1 starts at 90 (max 180)
+        XCTAssertFalse(rig.recorder.showsLowHeartRateNote, "only once the workout has ended")
+        await rig.recorder.end()
+        XCTAssertTrue(rig.recorder.showsLowHeartRateNote)
+        let write = try XCTUnwrap(rig.health.writes.first)
+        XCTAssertEqual(write.samples.count, 1200, "the note changes nothing that is written")
+        XCTAssertEqual(write.summary.summary.avgHR, 80)
+        rig.recorder.reset()
+        XCTAssertFalse(rig.recorder.showsLowHeartRateNote)
+    }
+
+    func testPausedTimeKeepsAWorkoutUnderTwentyMinutesFromTheNote() async throws {
+        let source = makeSource()
+        let rig = makeRig(source: { source })
+        rig.recorder.selectedSport = .strengthTraining
+        rig.recorder.start()
+        await stream(rig, source, from: 0, to: 600, bpm: 80)
+        rig.recorder.pause()
+        await stream(rig, source, from: 600, to: 1200, bpm: 80)        // not the workout's
+        rig.recorder.resume()
+        await stream(rig, source, from: 1200, to: 1500, bpm: 80)       // 15 min running in all
+        await rig.recorder.end()
+        XCTAssertFalse(rig.recorder.showsLowHeartRateNote)
+    }
+
+    private func endsWithLowHeartRateNote(_ sport: WorkoutSportType, bpm: Int) async -> Bool {
+        let source = makeSource()
+        let rig = makeRig(source: { source })
+        rig.recorder.selectedSport = sport
+        rig.recorder.start()
+        await stream(rig, source, from: 0, to: 1200, bpm: bpm)
+        await rig.recorder.end()
+        return rig.recorder.showsLowHeartRateNote
+    }
+
+    func testYogaBelowZoneOneShowsNoLowHeartRateNote() async {
+        let shows = await endsWithLowHeartRateNote(.yoga, bpm: 80)
+        XCTAssertFalse(shows)
+    }
+
+    func testAWorkoutInZonesShowsNoLowHeartRateNote() async {
+        let shows = await endsWithLowHeartRateNote(.other, bpm: 150)
+        XCTAssertFalse(shows)
+    }
+
     func testAnIndoorRunHasNoVO2MaxEstimate() async throws {
         let source = makeSource()
         let vo2 = FakeVO2()
