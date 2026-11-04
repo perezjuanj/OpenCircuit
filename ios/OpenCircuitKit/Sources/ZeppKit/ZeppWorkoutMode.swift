@@ -30,7 +30,8 @@
 //     ends the workout instead of carrying on.
 //   • the marker is persisted start-unconfirmed before `02` and the flag goes only with the ack of our
 //     `03 01` or an exact-start `06 00` (89q a); a late `06 00` reply is still decided, and our
-//     `10 02 01` or a frame after a "foreign" read is still adopted (89q b, c).
+//     accepted `10 02` after a "foreign" read is still adopted (89q b, c), but never a frame then:
+//     it may be the other workout's (89r a).
 
 import Foundation
 import OpenCircuitKit
@@ -244,8 +245,10 @@ public struct ZeppWorkoutModeMarker: Codable, Equatable, Sendable {
     /// strap, so the strap may hold its own clock's start (89p a, c). Cleared only by an exact match.
     public var startUnconfirmed: Bool
 
-    /// 89p (c): how far the strap's own start may sit from ours while the start is unconfirmed (its
-    /// clock started the workout when our `02` arrived, within the 8 s reply window, plus clock skew).
+    /// 89p (c): how far the strap's own start may sit from ours while the start is unconfirmed: its clock
+    /// started the workout when our `02` arrived, and `02` can go out up to about 16 s after OpenCircuit's
+    /// start (the `01` and `06 00` steps, 8 s each at worst), so inside +30 s the clock-skew tolerance is
+    /// about 14 s (89r c).
     public static let unconfirmedStartWindow: ClosedRange<Int64> = -2...30
 
     public init(startTime: UInt32, sportCode: UInt8, activeSeconds: UInt32 = 0, strapPaused: Bool = false,
@@ -443,6 +446,10 @@ public struct ZeppWorkoutModeMachine: Equatable {
         case end(UInt32)
     }
     private var queued: [Queued] = []
+    /// 89r (a): a `06 00` reply during this start reported a running workout that isn't ours. From then
+    /// on `14` frames may be that workout's, so they never prove our `02` started; only an accepted
+    /// `10 02` (the strap's answer to OUR start request) does.
+    private var foreignReadDuringStart = false
     private var keepAliveAt: Date?
 
     public init(configuration: Configuration = Configuration()) {
@@ -490,6 +497,7 @@ public struct ZeppWorkoutModeMachine: Equatable {
         appPaused = false
         appActiveSeconds = 0
         endRequested = nil
+        foreignReadDuringStart = false
         pendingControls = []
         phase = .starting(.capability, deadline: now.addingTimeInterval(configuration.replyTimeout))
         return Output(messages: [ZeppWorkoutCommand.capabilityQuery])
@@ -716,7 +724,9 @@ public struct ZeppWorkoutModeMachine: Equatable {
             return Output(events: [.unavailable(.noReply(.start)), .clearMarker(startTime: marker.startTime)])
         case .running:
             // Not ours: never touched. The marker stays (flagged) for the next connection's `06 00`,
-            // and a late `10 02 01` or a frame still proves our `02` started (89q c).
+            // and a late accepted `10 02` still proves our `02` started (89q c). Frames no longer do
+            // (89r a): they may be this other workout's.
+            foreignReadDuringStart = true
             phase = .startUnconfirmed
             return Output(events: [.unavailable(.notIdle)])
         case .unknown:
@@ -753,7 +763,9 @@ public struct ZeppWorkoutModeMachine: Equatable {
             out.events.append(.running)
         case .starting(.start, _), .confirmingStart, .startUnconfirmed:
             // 89p (a): a frame after our `02` (the strap read idle just before it) is the strap
-            // running ours, whatever happened to the `10 02 01`.
+            // running ours, whatever happened to the `10 02 01`. 89r (a): unless a `06 00` already
+            // reported another workout running: then the frame may be that one's, and proves nothing.
+            guard !foreignReadDuringStart else { return out }
             out = adoptStart(now: now, frameArrived: true)
             guard phase == .running else { return out }
         case .running:

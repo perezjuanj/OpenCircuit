@@ -625,23 +625,46 @@ final class WorkoutModeRound3Tests: XCTestCase {
         XCTAssertEqual(idle.receive(idleState, now: at(21)).events, [.unavailable(.noReply(.start)), .clearMarker(startTime: start)])
     }
 
-    /// 89q (c): the confirm path read "foreign" and fell back with the marker kept; then our `10 02 01`
-    /// (or a frame) arrives: proof our `02` started. Adopted, and a stored End honoured.
+    /// 89q (c): the confirm path read "foreign" and fell back with the marker kept; then our accepted
+    /// `10 02` arrives: the strap's own answer to OUR start request. Adopted, and a stored End honoured.
     func testOurStartReplyAfterAForeignReadIsAdopted() {
-        for evidence in [hex("10 02 01"), liveFrame(active: 12, hr: 120, kcal: 1, avg: 120, max: 120, swings: nil)] {
+        for foreign in [runningState(start + 40, sport: 0x11), runningState(start - 600, sport: 0x34)] {
             var m = startTimedOut()
-            XCTAssertEqual(m.receive(runningState(start + 40, sport: 0x11), now: at(9.7)).events, [.unavailable(.notIdle)])
+            XCTAssertEqual(m.receive(foreign, now: at(9.7)).events, [.unavailable(.notIdle)])
             XCTAssertEqual(m.end(activeSeconds: 11, now: at(11)), Machine.Output())
-            let out = m.receive(evidence, now: at(12))
+            let out = m.receive(hex("10 02 01"), now: at(12))
             XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00"),
                                           hex("03 02 04 00 00 00 0b 00 00 00"), hex("03 04 04 00 00 00 0b 00 00 00")],
-                           "\(evidence)")
+                           "\(foreign)")
         }
         var noEnd = startTimedOut()
         _ = noEnd.receive(runningState(start - 600, sport: 0x34), now: at(9.7))
         let out = noEnd.receive(hex("10 02 01"), now: at(12))
         XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00")], "on as a start")
         XCTAssertTrue(noEnd.isActive)
+    }
+
+    /// 89r (a), the fourth review's probe kept: after a `06 00` that read another workout running (another
+    /// sport, or ours out of the window), a frame may be THAT workout's. It proves nothing about our `02`:
+    /// nothing is sent to the strap, End included.
+    func testAFrameAfterAForeignReadIsNeverAdopted() {
+        for foreign in [runningState(start - 600, sport: 0x34), runningState(start + 40, sport: 0x11),
+                        runningState(start - 600, sport: 0x11)] {
+            var m = Machine()
+            _ = m.start(tennis, startTime: start, now: t0)
+            _ = m.receive(hex("10 01 01 03 01 01 01 03 00 00 00"), now: at(0.1))
+            _ = m.receive(idleState, now: at(0.2))
+            XCTAssertEqual(m.tick(now: at(8.3)).messages, [hex("06 00")])
+            XCTAssertEqual(m.receive(foreign, now: at(8.4)).events, [.unavailable(.notIdle)], "\(foreign)")
+            XCTAssertEqual(m.end(activeSeconds: 20, now: at(20)), Machine.Output())
+            var sent: [[UInt8]] = []
+            for s in stride(from: 21.0, through: 30.0, by: 1.0) {
+                sent += m.receive(liveFrame(active: UInt32(s), hr: 120, kcal: 2, avg: 118, max: 125, swings: 4), now: at(s)).messages
+                sent += m.tick(now: at(s + 0.5)).messages
+            }
+            XCTAssertEqual(sent, [], "\(foreign): no 03 01, no 03 02, no 03 04 to a workout that may not be ours")
+            XCTAssertFalse(m.isActive && m.phase == .running, "never carried on as ours")
+        }
     }
 
     func testEndAfterALostStartReplyEndsTheStrapsWorkoutOnlyIfItIsOurs() {

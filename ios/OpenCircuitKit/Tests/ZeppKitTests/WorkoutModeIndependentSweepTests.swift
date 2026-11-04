@@ -368,7 +368,10 @@ final class WorkoutModeIndependentSweepTests: XCTestCase {
         let window = ZeppWorkoutModeMarker.unconfirmedStartWindow
         XCTAssertTrue(cases.filter { window.contains($0.offset) }.allSatisfy { Sim($0).run().limit.isEmpty },
                       "inside the window nothing is left to the limit")
-        XCTAssertEqual(limit.count, 1_680, "the documented limit, pinned: 840 cases each at −3 s and +31 s")
+        // The documented limit, pinned: 844 cases each at −3 s and +31 s. 89r (a) moved 8 here (4 per
+        // offset): our workout out of the window read as foreign, and a frame that came after that read
+        // used to adopt it; a frame after a foreign read may be the other workout's, so it no longer does.
+        XCTAssertEqual(limit.count, 1_688, "the documented limit, pinned")
         print("INDEPENDENT SWEEP core by offset: " + [-3, -2, 0, 1, 30, 31].map { (o: Int64) in
             "\(o): \(limit.filter { $0.hasPrefix("off \(o) ") }.count) limit" }.joined(separator: ", "))
     }
