@@ -9,6 +9,7 @@
 // load is `TrainingLoad.workoutLoad(hrSamples:zones:sessionEnd:)`, exactly what the weekly load line
 // scores the same workout with.
 
+import CoreLocation
 import Foundation
 import HealthKit
 import OpenCircuitKit
@@ -235,6 +236,44 @@ enum WorkoutDetailContent {
         }
         return Row(title: "Average pace",
                    value: WorkoutTrainingMetricsSection.pace(meters / (movingSeconds / 60), unit: unit))
+    }
+
+    // MARK: Splits (#365)
+
+    struct SplitRow: Identifiable, Equatable {
+        let id: Int
+        /// "Km 3", "Mile 2"; a partial last split names its distance ("0.40 km").
+        let label: String
+        /// Pace over the split's moving time (speed for cycling).
+        let value: String
+        let isPartial: Bool
+    }
+
+    /// The workout's splits in the user's unit, from its saved route and pauses (`WorkoutSplits`,
+    /// the same boundaries the save writes as segment events). Empty — the card is left out — for a
+    /// workout without a timed route or one that never covered a whole unit.
+    static func splitRows(route: [CLLocation], item: WorkoutHistoryReader.Item, unit: DistanceUnit) -> [SplitRow] {
+        guard route.count >= 2, item.end > item.start else { return [] }
+        let unitMeters = unit == .metric ? WorkoutSplits.kilometerMeters : WorkoutSplits.mileMeters
+        let track = WorkoutRouteDetail.track(route, pauses: item.pauses, start: item.start, end: item.end)
+        let splits = WorkoutSplits.splits(track, every: unitMeters, start: item.start, end: item.end,
+                                          pauses: item.pauses)
+        guard splits.contains(where: { !$0.isPartial }) else { return [] }
+        let isCycling = item.activityType == .cycling
+        return splits.compactMap { split in
+            guard split.movingSeconds > 0 else { return nil }
+            let label = split.isPartial
+                ? UnitsFormatter.distance(split.meters, unit: unit, fractionDigits: 2)
+                : "\(unit == .metric ? "Km" : "Mile") \(split.index)"
+            let value: String
+            if isCycling {
+                let speed = unit.convert(fromMeters: split.meters) / (split.movingSeconds / 3600)
+                value = String(format: "%.1f %@", speed, unit == .metric ? "km/h" : "mph")
+            } else {
+                value = WorkoutTrainingMetricsSection.pace(split.meters / (split.movingSeconds / 60), unit: unit)
+            }
+            return SplitRow(id: split.index, label: label, value: value, isPartial: split.isPartial)
+        }
     }
 
     static func duration(_ seconds: TimeInterval) -> String {

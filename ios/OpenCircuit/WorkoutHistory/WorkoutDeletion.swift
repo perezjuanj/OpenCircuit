@@ -245,16 +245,17 @@ final class HealthKitWorkoutStore: WorkoutHealthDeleting {
     }
 
     /// The workout's GPS route, or [] when it has none.
-    func route(of workout: HKWorkout) async -> [CLLocationCoordinate2D] {
+    /// The workout's saved route fixes, timestamps kept (the splits need them; #365).
+    func route(of workout: HKWorkout) async -> [CLLocation] {
         guard let routes = try? await samples(of: HKSeriesType.workoutRoute(), predicate: Self.savedWith(workout))
             .compactMap({ $0 as? HKWorkoutRoute }), !routes.isEmpty else { return [] }
-        var coordinates: [CLLocationCoordinate2D] = []
+        var coordinates: [CLLocation] = []
         for route in routes {
-            let points: [CLLocationCoordinate2D] = await withCheckedContinuation { cont in
-                var collected: [CLLocationCoordinate2D] = []
+            let points: [CLLocation] = await withCheckedContinuation { cont in
+                var collected: [CLLocation] = []
                 var resumed = false
                 let query = HKWorkoutRouteQuery(route: route) { _, locations, done, error in
-                    collected += (locations ?? []).map(\.coordinate)
+                    collected += locations ?? []
                     guard !resumed, done || error != nil else { return }
                     resumed = true
                     cont.resume(returning: collected)

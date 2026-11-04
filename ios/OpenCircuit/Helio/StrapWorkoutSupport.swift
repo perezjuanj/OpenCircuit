@@ -123,11 +123,24 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
         var walkRunDistanceToCredit = 0.0
         if let distance = summary.distanceMeters, distance > 0, summary.hasRoute {
             let isCycling = summary.sport == .cyclingOutdoor
-            let sample = HKQuantitySample(
-                type: HKQuantityType(isCycling ? .distanceCycling : .distanceWalkingRunning),
-                quantity: HKQuantity(unit: .meter(), doubleValue: distance),
+            let type = HKQuantityType(isCycling ? .distanceCycling : .distanceWalkingRunning)
+            // #365: ~15 s samples from the route plus per-km / per-mile segment events, as the
+            // ring's writer; the one whole-workout sample when the route can't carry it. The split
+            // events are their own call so a refusal never drops the pause/resume events.
+            let track = WorkoutRouteDetail.track(write.route, pauses: write.summary.pauses,
+                                                 start: summary.startDate, end: summary.endDate)
+            let wholeWorkout = HKQuantitySample(
+                type: type, quantity: HKQuantity(unit: .meter(), doubleValue: distance),
                 start: summary.startDate, end: summary.endDate, metadata: [HKMetadataKeyWasUserEntered: false])
-            try? await builder.addSamples([sample])
+            if let detail = WorkoutRouteDetail.distanceSamples(
+                type: type, track: track, totalMeters: distance, metadata: [HKMetadataKeyWasUserEntered: false]) {
+                // A refused batch must not leave the workout with no distance: the one sample then.
+                do { try await builder.addSamples(detail) } catch { try? await builder.addSamples([wholeWorkout]) }
+            } else {
+                try? await builder.addSamples([wholeWorkout])
+            }
+            let splits = WorkoutRouteDetail.splitEvents(track: track, start: summary.startDate, end: summary.endDate)
+            if !splits.isEmpty { try? await builder.addWorkoutEvents(splits) }
             if !isCycling { walkRunDistanceToCredit = distance }
         } else if let indoor = write.indoorDistance, indoor.meters > 0,
                   IndoorStepWorkout.applies(to: summary.sport) {

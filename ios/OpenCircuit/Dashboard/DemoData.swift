@@ -224,6 +224,7 @@ enum DemoData {
 #endif
 
 #if DEBUG && targetEnvironment(simulator)
+import CoreLocation
 import SwiftUI
 
 /// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR`
@@ -261,6 +262,8 @@ struct DemoScreenModifier: ViewModifier {
             MetricDayView(metric: .stress, tempUnitRaw: tempUnitRaw)
         } else if id == "pastNights" {
             SleepNightsBrowserView()
+        } else if id == "workout-detail" {
+            DemoWorkoutDetail.view
         } else {
             DemoLiveCard()
         }
@@ -268,6 +271,34 @@ struct DemoScreenModifier: ViewModifier {
 }
 
 private struct DemoScreenID: Identifiable { let id: String }
+
+/// `-OCDemoScreen workout-detail` (#365): a SYNTHETIC 5.3 km outdoor run with a 2-minute pause and a
+/// varying pace, so the Splits card shows whole splits and a partial one.
+private enum DemoWorkoutDetail {
+    @MainActor static var view: some View {
+        let start = Date().addingTimeInterval(-3_600)
+        var fixes: [CLLocation] = []
+        var lat = 25.76, t = 0.0
+        let pause = DateInterval(start: start.addingTimeInterval(900), end: start.addingTimeInterval(1_020))
+        while t <= 1_800 {
+            let at = start.addingTimeInterval(t)
+            if !(pause.start...pause.end).contains(at) {
+                fixes.append(CLLocation(coordinate: CLLocationCoordinate2D(latitude: lat, longitude: -80.19),
+                                        altitude: 0, horizontalAccuracy: 5, verticalAccuracy: 5, timestamp: at))
+                let speed = 3.0 + 0.4 * sin(t / 240)          // ~5:00–6:20 /km
+                lat += speed * 2 / 111_000
+            }
+            t += 2
+        }
+        let meters = zip(fixes, fixes.dropFirst()).reduce(0.0) { sum, step in
+            step.1.timestamp.timeIntervalSince(step.0.timestamp) > 2 ? sum : sum + step.1.distance(from: step.0)
+        }
+        let item = WorkoutHistoryReader.Item(id: UUID(), activityType: .running, start: start,
+                                             end: start.addingTimeInterval(1_800), activeKcal: 412,
+                                             distanceMeters: meters, avgHR: 152, maxHR: 171, pauses: [pause])
+        return WorkoutDetailView(item: item, demoRoute: fixes)
+    }
+}
 
 private struct DemoLiveCard: View {
     @State private var buffer: LiveBuffer = {

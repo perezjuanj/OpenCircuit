@@ -1323,12 +1323,25 @@ final class WorkoutSessionManager: NSObject {
         if let dist = summary.distanceMeters, dist > 0, summary.hasRoute {
             let isCycling = summary.sport == .cyclingOutdoor
             let distType = HKQuantityType(isCycling ? .distanceCycling : .distanceWalkingRunning)
-            let q = HKQuantity(unit: .meter(), doubleValue: dist)
-            let distSample = HKQuantitySample(
-                type: distType, quantity: q,
+            // #365: the distance as ~15 s samples from the route (so Health has the per-km detail),
+            // plus a segment event per whole km and mile. Falls back to the one whole-workout
+            // sample when the route can't carry it. The split events go in their own call so a
+            // refusal never takes the pause/resume events with it.
+            let track = WorkoutRouteDetail.track(routeLocations, pauses: pauses,
+                                                 start: summary.startDate, end: summary.endDate)
+            let wholeWorkout = HKQuantitySample(
+                type: distType, quantity: HKQuantity(unit: .meter(), doubleValue: dist),
                 start: summary.startDate, end: summary.endDate,
                 metadata: [HKMetadataKeyWasUserEntered: false])
-            try? await builder.addSamples([distSample])
+            if let detail = WorkoutRouteDetail.distanceSamples(
+                type: distType, track: track, totalMeters: dist, metadata: [HKMetadataKeyWasUserEntered: false]) {
+                // A refused batch must not leave the workout with no distance: the one sample then.
+                do { try await builder.addSamples(detail) } catch { try? await builder.addSamples([wholeWorkout]) }
+            } else {
+                try? await builder.addSamples([wholeWorkout])
+            }
+            let splits = WorkoutRouteDetail.splitEvents(track: track, start: summary.startDate, end: summary.endDate)
+            if !splits.isEmpty { try? await builder.addWorkoutEvents(splits) }
             if !isCycling { walkRunDistanceToCredit = dist }
         } else if let indoor = indoorDistanceMeters, indoor > 0, IndoorStepWorkout.applies(to: summary.sport) {
             // An indoor run or walk (#339, decision 84f, 84j): the treadmill distance the person typed
