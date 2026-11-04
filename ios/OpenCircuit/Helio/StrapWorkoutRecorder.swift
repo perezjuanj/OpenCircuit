@@ -3,6 +3,7 @@ import Foundation
 import Observation
 import OpenCircuitKit
 import UIKit
+import ZeppKit
 
 // A workout recorded with the Amazfit Helio Strap (#227, decision 34): the strap's live heart rate
 // for the whole workout, the phone's GPS route for outdoor sports, pause and resume, and ONE
@@ -22,10 +23,15 @@ import UIKit
 //     reconnected session (HelioConnection's standing connect builds a new one) is adopted and its
 //     stream started again.
 //
-// This is the spec's "route 1" (ZEPP_PROTOCOL.md §18.1): the strap stays in its normal all-day mode.
-// Nothing is ever sent on the workout endpoint `0x0019` (no start/pause/end, which no permitted source
-// gives, and never the phone-GPS message of §18.5); the route is the phone's own location only. The
-// totals are OpenCircuit's own (§18.6): no training effect or recovery time is claimed, and the
+// The strap's own workout mode (#359, decision 89, ZEPP_PROTOCOL.md §18.9 "route 2"): for a sport with
+// a strap code (89b, `ZeppWorkoutSport`), OpenCircuit's start also starts the strap's workout, with the
+// same start time; pause, resume and End follow with OpenCircuit's active seconds, and End saves it
+// on the strap (`03 02` + `03 04`). The strap measures better in it, and the standard `0x2A37` stream
+// carries that, so heart rate, zones, load and the energy written to Health still come from `0x2A37`
+// exactly as before (89d); the mode's frames add only the swing count and the strap's kcal (89e), shown
+// and stored as `HKWorkout` metadata. Any failure keeps the workout phone-side ("route 1", §18.1),
+// quietly (89c). Outdoor GPS sports stay phone-side, and the phone-GPS message (§18.5) is never sent.
+// The totals are OpenCircuit's own (§18.6): no training effect or recovery time is claimed, and the
 // strap's own VO₂ max is never read. An outdoor run gets OpenCircuit's VO₂ max ESTIMATE (#232) from
 // the strap's heart rate and the phone's route, exactly the ring's method (docs/TRAINING_METRICS.md),
 // saved to Apple Health attributed to the strap.
@@ -82,6 +88,34 @@ protocol StrapWorkoutStepSource: AnyObject {
 }
 
 extension HelioSession: StrapWorkoutStepSource {}
+
+/// The strap's own workout mode (#359, decision 89): apart from `StrapWorkoutHeartRateSource` so a
+/// source without it simply records phone-side. `HelioSession` conforms; it hosts the §18.9 sequence
+/// (`ZeppWorkoutModeMachine`) and the persisted marker.
+@MainActor
+protocol StrapWorkoutModeSource: AnyObject {
+    var workoutModeObserver: (@MainActor (ZeppWorkoutModeMachine.Event) -> Void)? { get set }
+    /// §18.9's start for `sport` with OpenCircuit's start time. false when this connection can't
+    /// (no `0x0019`, not authenticated, no workout holding the link): nothing was sent.
+    @discardableResult func startWorkoutMode(_ sport: ZeppWorkoutSport, startTime: UInt32) -> Bool
+    func pauseWorkoutMode(activeSeconds: UInt32)
+    func resumeWorkoutMode(activeSeconds: UInt32)
+    /// `03 02` then `03 04`, every time (89a).
+    func endWorkoutMode(activeSeconds: UInt32)
+}
+
+extension HelioSession: StrapWorkoutModeSource {}
+
+/// Where the strap's workout mode stands for the workout on screen (decision 89c).
+enum StrapWorkoutModeStatus: Equatable {
+    /// Not tried: a sport without a strap code (89b), or a source without the mode.
+    case none
+    case starting
+    /// The strap's frames arrived: the mode runs.
+    case running
+    /// A fallback (89c): the workout records phone-side. The live screen says so in one quiet line.
+    case unavailable
+}
 
 /// What became of one heart-rate recovery write to Apple Health (decision 82c, 82e).
 enum HeartRateRecoveryHealthStatus: Equatable {
@@ -155,6 +189,9 @@ struct StrapWorkoutWrite {
     var indoorDistance: IndoorDistanceWrite? = nil
     /// A recovered indoor run's recovery-window writes, owed after its save (84l), nil otherwise.
     var pendingRecovery: StrapWorkoutPendingRecovery? = nil
+    /// What the strap's workout mode added (89e, 89h): stored as `HKWorkout` metadata. Never changes
+    /// the energy or heart rate written.
+    var workoutMode = StrapWorkoutModeExtras()
 }
 
 @MainActor
@@ -292,9 +329,22 @@ final class StrapWorkoutRecorder {
     private(set) var vo2MaxOutcome: VO2MaxEstimate.Outcome?
     /// What became of the estimate's Apple Health write: nil while it is in flight.
     private(set) var vo2MaxHealthStatus: VO2MaxHealthWriter.Status?
-    /// The finished workout's heart rate stayed below Zone 1 for most of it (#355, decision 88): the
-    /// summary shows `StrapWorkoutLowHeartRateNote.text`. Display only.
+    /// The finished workout's heart rate stayed below Zone 1 for most of it (#355, decision 88), and it
+    /// ran without the strap's workout mode (89h): the summary shows `StrapWorkoutLowHeartRateNote.text`.
+    /// Display only.
     private(set) var showsLowHeartRateNote = false
+    /// The strap's workout mode for this workout (decision 89c).
+    private(set) var workoutModeStatus: StrapWorkoutModeStatus = .none
+    /// The strap's swing count from its last frame that carried one (89e); nil without one.
+    private(set) var strapSwings: Int?
+    /// The strap's own kcal estimate from its last frame (89e); nil without one. Never written to
+    /// Health as energy: OpenCircuit's estimate is (89d).
+    private(set) var strapKilocalories: Int?
+    /// The mode ran for this workout: its first frame arrived (89h). Not undone by a later drop.
+    @ObservationIgnored private var ranWithWorkoutMode = false
+    @ObservationIgnored private weak var modeSource: (any StrapWorkoutModeSource)?
+    /// This workout's start as sent in `03 01` and kept in the marker (Unix s).
+    @ObservationIgnored private var workoutModeStart: UInt32?
     /// The +120 s mark of the open recovery window, for the countdown. nil when no window is open.
     private(set) var recoveryMarkAt: Date?
     /// An indoor run or walk (#339): steps per minute over the last 60 s, nil while paused or before any.
@@ -351,6 +401,21 @@ final class StrapWorkoutRecorder {
         return running.state == .active || running.state == .finishing || running.isMeasuringRecovery
     }
 
+    /// Decision 89f: OpenCircuit's strap workout running in THIS process (recording, paused included),
+    /// for a new connection's reconciliation. nil once End or Discard ran, and in a process that never
+    /// started it (a killed process's workout is not running).
+    static var workoutModeOwner: ZeppWorkoutModeMachine.Owner? {
+        guard let running, running.state == .active, let start = running.workoutModeStart,
+              let ledger = running.ledger else { return nil }
+        return ZeppWorkoutModeMachine.Owner(startTime: start, activeSeconds: Self.seconds(ledger.activeSeconds(until: running.clock())),
+                                            paused: ledger.isPaused)
+    }
+
+    /// Whole seconds for the strap (u32, never negative).
+    nonisolated static func seconds(_ interval: TimeInterval) -> UInt32 {
+        UInt32(clamping: Int(max(0, interval.rounded(.down))))
+    }
+
     /// The recovery window is open and the workout is saved (decision 82b). The hold lasts through it.
     var isMeasuringRecovery: Bool {
         if case .measuringRecovery = state { return true }
@@ -389,6 +454,7 @@ final class StrapWorkoutRecorder {
     /// Indoor runs' Health writes beyond the workout (#339). nil: none (a rig that didn't ask).
     @ObservationIgnored private let indoorHealth: (any IndoorRunHealthWriting)?
     @ObservationIgnored private let stepStreamFlag: StrapStepStreamFlag
+    @ObservationIgnored private let workoutModeMarker: StrapWorkoutModeMarkerStore
     @ObservationIgnored private let strideCalibrations: IndoorStrideCalibrations
     @ObservationIgnored private let userHeightCm: () -> Double?
 
@@ -469,6 +535,7 @@ final class StrapWorkoutRecorder {
          recoveryWindows: WorkoutRecoveryWindows = WorkoutRecoveryWindows(),
          indoorHealth: (any IndoorRunHealthWriting)? = nil,
          stepStreamFlag: StrapStepStreamFlag = StrapStepStreamFlag(),
+         workoutModeMarker: StrapWorkoutModeMarkerStore = StrapWorkoutModeMarkerStore(),
          strideCalibrations: IndoorStrideCalibrations = IndoorStrideCalibrations(),
          userHeightCm: @escaping () -> Double? = { IndoorRunProfile.userSetHeightCm() },
          clock: @escaping () -> Date = Date.init,
@@ -490,6 +557,7 @@ final class StrapWorkoutRecorder {
         self.recoveryWindows = recoveryWindows
         self.indoorHealth = indoorHealth
         self.stepStreamFlag = stepStreamFlag
+        self.workoutModeMarker = workoutModeMarker
         self.strideCalibrations = strideCalibrations
         self.userHeightCm = userHeightCm
         self.clock = clock
@@ -548,6 +616,7 @@ final class StrapWorkoutRecorder {
         vo2MaxOutcome = nil
         vo2MaxHealthStatus = nil
         showsLowHeartRateNote = false
+        clearWorkoutMode()
         clearHeartRateRecovery()
         rrIntervalCount = 0
         clearSteps()
@@ -572,6 +641,8 @@ final class StrapWorkoutRecorder {
         state = .active
         // Decision 84b: `05 01` at the start of an indoor workout, once the workout holds the link.
         turnStepsOn(session, now: now)
+        // Decision 89a: the strap's own workout mode, right after OpenCircuit's own start.
+        startWorkoutMode(session, sport: sport, start: now)
         helioLog.notice("helio: workout started (\(sport.rawValue, privacy: .public))")
         liveActivity?.start(sport: sport, startDate: now,
                             initial: WorkoutActivityAttributes.ContentState(
@@ -590,6 +661,8 @@ final class StrapWorkoutRecorder {
         location.setPaused(true)
         refresh(now: now)
         persistJournal(now: now)
+        // 89a: `03 02` with OpenCircuit's own active seconds.
+        modeSource?.pauseWorkoutMode(activeSeconds: Self.seconds(ledger.activeSeconds(until: now)))
         helioLog.notice("helio: workout paused")
         Task { await pushLiveActivity() }
     }
@@ -605,6 +678,8 @@ final class StrapWorkoutRecorder {
         location.setPaused(false)
         refresh(now: now)
         persistJournal(now: now)
+        // 89a: `03 03` with OpenCircuit's own active seconds.
+        modeSource?.resumeWorkoutMode(activeSeconds: Self.seconds(ledger.activeSeconds(until: now)))
         helioLog.notice("helio: workout resumed")
         Task { await pushLiveActivity() }
     }
@@ -671,6 +746,9 @@ final class StrapWorkoutRecorder {
             }
             stepSource?.stepCounterObserver = nil
             stepSource = nil
+            // 89f: the strap's workout keeps running; the reconnected session reconciles it.
+            modeSource?.workoutModeObserver = nil
+            modeSource = nil
         }
         if attached == nil, !ledger.isInGap {
             ledger.beginGap(at: now)
@@ -686,6 +764,12 @@ final class StrapWorkoutRecorder {
     private func attach(_ session: any StrapWorkoutHeartRateSource, now: Date) {
         attached = session
         session.heartRateObserver = { [weak self] bpm, at in self?.receive(bpm: bpm, at: at) }
+        if workoutModeStart != nil, let source = session as? any StrapWorkoutModeSource {
+            // A reconnected session carried our strap workout on (89f): its frames and later pause,
+            // resume and End go through it.
+            modeSource = source
+            source.workoutModeObserver = { [weak self] event in self?.receiveWorkoutMode(event) }
+        }
         rrIntervalsRead = session.rrIntervalsReceived
         session.startWorkoutHeartRate()
         if var ledger, ledger.isInGap {
@@ -779,6 +863,9 @@ final class StrapWorkoutRecorder {
         stepSource?.stepCounterObserver = nil
         stepSource = nil
         let indoorSteps = steps
+        // 89a: the strap's workout ends (and is saved on the strap) with the final active seconds.
+        endWorkoutMode(activeSeconds: Self.seconds(ledger.activeSeconds(until: end)))
+        let modeExtras = workoutModeExtras
         // 82a/82b: the stream keeps running after End for the recovery window; the workout below is
         // exactly today's. Without a window (no recovery writer) the stream stops here, as before.
         let windowOpen = openRecoveryWindow(end: end, now: now, timeline: timeline)
@@ -812,7 +899,8 @@ final class StrapWorkoutRecorder {
             flushReadings()
             journal.saveJournal(StrapWorkoutJournal(sport: selectedSport, ledger: ledger, lastAliveAt: end,
                                                     timelineRaw: timeline.rawValue, distanceMeters: nil,
-                                                    stepStreamOn: false, indoorEstimateMeters: estimate))
+                                                    stepStreamOn: false, indoorEstimateMeters: estimate,
+                                                    workoutMode: modeExtras))
         } else {
             // Queue the readings for LocalStore BEFORE dropping the journal, so a kill in between loses
             // nothing; then drop the journal BEFORE the Health write, as the ring drops its snapshot: a
@@ -830,7 +918,8 @@ final class StrapWorkoutRecorder {
             bpm: summary.summary.avgHR, hrIsStale: true))
 
         let write = StrapWorkoutWrite(summary: summary, samples: counted,
-                                      route: hasRoute ? location.route : [], timeline: timeline)
+                                      route: hasRoute ? location.route : [], timeline: timeline,
+                                      workoutMode: modeExtras)
         let saved: Bool
         if waitsForPrompt {
             pendingSave = PendingSave(write: write, estimate: estimate)
@@ -848,10 +937,11 @@ final class StrapWorkoutRecorder {
             : nil
         // Not saved: the workout isn't in Health, so neither is its estimate (the ring's rule).
         vo2MaxHealthStatus = saved ? nil : .failed
-        // Decision 88: over exactly the summary's active time, counted readings and zones.
+        // Decision 88: over exactly the summary's active time, counted readings and zones; 89h: only
+        // when the strap's workout mode didn't run.
         showsLowHeartRateNote = StrapWorkoutLowHeartRateNote.applies(
-            isStrapWorkout: true, sport: summary.summary.sport, activeSeconds: summary.activeSeconds,
-            activeReadings: counted, zones: activeZones)
+            isStrapWorkout: true, ranWithWorkoutMode: modeExtras.ranWithWorkoutMode, sport: summary.summary.sport,
+            activeSeconds: summary.activeSeconds, activeReadings: counted, zones: activeZones)
         if let indoorSteps {
             let finish = IndoorRunFinish(inputs: IndoorRunInputs(
                 sport: selectedSport, timeline: timeline, start: ledger.start, end: end,
@@ -1183,6 +1273,9 @@ final class StrapWorkoutRecorder {
         if Self.running === self { Self.running = nil }
         turnStepsOff()   // decision 84b: `05 00` at cancel
         clearSteps()
+        // 89f's reading for a discard: the strap's workout is ended and saved, as at End.
+        if let ledger { endWorkoutMode(activeSeconds: Self.seconds(ledger.activeSeconds(until: clock()))) }
+        clearWorkoutMode()
         attached?.stopWorkoutHeartRate()
         attached?.heartRateObserver = nil
         attached = nil
@@ -1217,9 +1310,96 @@ final class StrapWorkoutRecorder {
         vo2MaxOutcome = nil
         vo2MaxHealthStatus = nil
         showsLowHeartRateNote = false
+        clearWorkoutMode()
         clearHeartRateRecovery()
         rrIntervalCount = 0
         clearSteps()
+    }
+
+    // MARK: The strap's workout mode (decision 89)
+
+    /// What the mode added to this workout so far.
+    private var workoutModeExtras: StrapWorkoutModeExtras {
+        StrapWorkoutModeExtras(ranWithWorkoutMode: ranWithWorkoutMode, swings: strapSwings,
+                               strapKilocalories: strapKilocalories)
+    }
+
+    /// 89a/89b: start the strap's workout for a sport with a strap code, on a source that has the mode.
+    /// Anything else records phone-side exactly as before: nothing on `0x0019`.
+    private func startWorkoutMode(_ session: any StrapWorkoutHeartRateSource, sport: WorkoutSportType, start: Date) {
+        guard let code = ZeppWorkoutSport.forSport(sport), let source = session as? any StrapWorkoutModeSource else {
+            workoutModeStatus = .none
+            return
+        }
+        let startTime = UInt32(clamping: Int(start.timeIntervalSince1970.rounded(.down)))
+        workoutModeStart = startTime
+        modeSource = source
+        source.workoutModeObserver = { [weak self] event in self?.receiveWorkoutMode(event) }
+        workoutModeStatus = .starting
+        if !source.startWorkoutMode(code, startTime: startTime) {
+            // 89c: this connection can't (no 0x0019 offered): phone-side, one quiet line.
+            workoutModeStatus = .unavailable
+            source.workoutModeObserver = nil
+            modeSource = nil
+            workoutModeStart = nil
+        }
+    }
+
+    /// One event of the strap's workout mode, from the attached session.
+    private func receiveWorkoutMode(_ event: ZeppWorkoutModeMachine.Event) {
+        guard state == .active else { return }
+        switch event {
+        case .running:
+            ranWithWorkoutMode = true
+            workoutModeStatus = .running
+            if let ledger { recordWorkoutModeProgress(activeSeconds: Self.seconds(ledger.activeSeconds(until: clock()))) }
+            persistJournal(now: clock())
+        case .unavailable:
+            if !ranWithWorkoutMode { workoutModeStatus = .unavailable }
+        case .frame(let frame):
+            // 89e: the strap's running totals; heart rate keeps coming from 0x2A37 (89d).
+            strapKilocalories = Int(frame.kilocalories)
+            if let swings = frame.swings { strapSwings = Int(swings) }
+        case .reconciled(.idle), .reconciled(.foreign):
+            // The strap no longer holds our workout: phone-side from here, nothing more to send.
+            modeSource?.workoutModeObserver = nil
+            modeSource = nil
+            workoutModeStart = nil
+            if !ranWithWorkoutMode { workoutModeStatus = .unavailable }
+        default:
+            break
+        }
+    }
+
+    /// The marker's copy of OpenCircuit's active seconds (heartbeat, pause, resume), for an end sent
+    /// from another connection or process (89f).
+    private func recordWorkoutModeProgress(activeSeconds: UInt32) {
+        guard let start = workoutModeStart else { return }
+        workoutModeMarker.update(startTime: start) { $0.activeSeconds = activeSeconds }
+    }
+
+    /// End or Discard: the marker says the app's workout is over (so any later connection ends it on
+    /// the strap, 89f), then `03 02` + `03 04` on this connection if it is up.
+    private func endWorkoutMode(activeSeconds: UInt32) {
+        guard let start = workoutModeStart else { return }
+        workoutModeMarker.update(startTime: start) {
+            $0.activeSeconds = activeSeconds
+            $0.appEnded = true
+        }
+        modeSource?.endWorkoutMode(activeSeconds: activeSeconds)
+        modeSource?.workoutModeObserver = nil
+        modeSource = nil
+        workoutModeStart = nil
+    }
+
+    private func clearWorkoutMode() {
+        modeSource?.workoutModeObserver = nil
+        modeSource = nil
+        workoutModeStart = nil
+        workoutModeStatus = .none
+        ranWithWorkoutMode = false
+        strapSwings = nil
+        strapKilocalories = nil
     }
 
     // MARK: Journal
@@ -1230,7 +1410,9 @@ final class StrapWorkoutRecorder {
         journal.saveJournal(StrapWorkoutJournal(sport: selectedSport, ledger: ledger, lastAliveAt: now,
                                                 timelineRaw: timeline.rawValue,
                                                 distanceMeters: location.distanceMeters,
-                                                stepStreamOn: steps == nil ? nil : stepsStreaming))
+                                                stepStreamOn: steps == nil ? nil : stepsStreaming,
+                                                workoutMode: ranWithWorkoutMode ? workoutModeExtras : nil))
+        recordWorkoutModeProgress(activeSeconds: Self.seconds(ledger.activeSeconds(until: now)))
     }
 
     private func flushReadings() {
@@ -1324,7 +1506,8 @@ final class StrapWorkoutRecorder {
         // An indoor run killed while it waited for its distance prompt (84j): saved with its step estimate.
         let indoorDistance = recovered.indoorEstimateMeters.map { IndoorDistanceWrite(meters: $0) }
         return StrapWorkoutWrite(summary: summary, samples: counted, route: [], timeline: timeline,
-                                 indoorDistance: indoorDistance, pendingRecovery: recovered.pendingRecovery)
+                                 indoorDistance: indoorDistance, pendingRecovery: recovered.pendingRecovery,
+                                 workoutMode: recovered.workoutMode ?? StrapWorkoutModeExtras())
     }
 
     /// Save's async half: one `HKWorkout` over the recovered span, with its readings.

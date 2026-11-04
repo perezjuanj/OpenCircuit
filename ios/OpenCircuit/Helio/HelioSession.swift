@@ -84,6 +84,9 @@ enum HelioSessionEvent: Equatable {
     /// The realtime step stream a workout turned on was turned off, or its connection ended (decision
     /// 84c): counts and control bytes only, for the breadcrumb.
     case stepStream(StrapStepStreamReport)
+    /// An outcome of the strap's workout mode (decision 89c, 89f): control bytes and outcome words only,
+    /// never a value, for the breadcrumb.
+    case workoutMode(String)
 }
 
 /// What one connection's realtime step stream did (decision 84c): counts only, so a diagnostics bundle
@@ -128,6 +131,42 @@ struct StrapStepStreamFlag {
         turnedOn = false
         offOwed = false
     }
+}
+
+/// Decision 89f: "OpenCircuit started a strap workout" (`ZeppWorkoutModeMarker`), persisted beside the
+/// workout journal: it must outlive the process AND the journal, which End drops before the strap has
+/// confirmed its end. The session sets it before `02` goes out and clears it once the strap no longer
+/// holds that workout; the recorder records its active seconds and its end. Every write is one field
+/// on the marker of ONE start time, so neither writer can overwrite the other's newer fields, or a
+/// newer workout's marker.
+struct StrapWorkoutModeMarkerStore {
+    nonisolated static let key = "strapWorkout.workoutModeMarker.v1"
+    let defaults: UserDefaults
+    init(_ defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    var marker: ZeppWorkoutModeMarker? {
+        guard let data = defaults.data(forKey: Self.key) else { return nil }
+        return try? JSONDecoder().decode(ZeppWorkoutModeMarker.self, from: data)
+    }
+
+    func set(_ marker: ZeppWorkoutModeMarker) {
+        if let data = try? JSONEncoder().encode(marker) { defaults.set(data, forKey: Self.key) }
+    }
+
+    /// Changes the marker of `startTime`, if that is the one persisted.
+    func update(startTime: UInt32, _ body: (inout ZeppWorkoutModeMarker) -> Void) {
+        guard var current = marker, current.startTime == startTime else { return }
+        body(&current)
+        set(current)
+    }
+
+    /// Clears the marker of `startTime`, if that is the one persisted.
+    func clear(startTime: UInt32) {
+        guard marker?.startTime == startTime else { return }
+        defaults.removeObject(forKey: Self.key)
+    }
+
+    func clearAll() { defaults.removeObject(forKey: Self.key) }
 }
 
 /// Where fetched rounds go. `HelioStoreSink` is the `LocalStore` implementation.
@@ -224,8 +263,9 @@ final class HelioSession: WearableSession {
     /// How long after this session last sent to an endpoint a message there still counts as a reply
     /// rather than something the strap sent on its own (twice a setup step's timeout).
     static let replyWindow: TimeInterval = 10
-    /// The workout endpoint (§16.2 rows 8–9). The app sends nothing there; what arrives is logged.
-    static let workoutEndpoint: UInt16 = 0x0019
+    /// The workout endpoint (§16.2 rows 8–9, §18.9). Only the strap's workout mode is sent there
+    /// (decision 89, `ZeppWorkoutModeMachine`); anything else that arrives is logged.
+    static let workoutEndpoint: UInt16 = ZeppEndpoint.workout
     /// How long auth may take before the strap is reported busy.
     static let authTimeout: TimeInterval = 10
     /// How long a setup step waits for its reply (the same 5 s HelioVerify and ZeppKit use).
@@ -319,12 +359,19 @@ final class HelioSession: WearableSession {
     @ObservationIgnored private let autoSyncOnConnect: Bool
     /// True while the app records a workout on this strap (#227): history syncs wait until it ends.
     @ObservationIgnored private let workoutHoldsLink: @MainActor () -> Bool
+    /// OpenCircuit's strap workout running in this process, if any (decision 89f's reconciliation).
+    @ObservationIgnored private let workoutModeOwner: @MainActor () -> ZeppWorkoutModeMachine.Owner?
     /// Every valid heart-rate reading, as it arrives (the workout recorder, #227).
     @ObservationIgnored var heartRateObserver: (@MainActor (Int, Date) -> Void)?
     /// The `04 00` owed after an interrupted workout (#227, review-238 SF2).
     @ObservationIgnored var orphanStop = StrapWorkoutOrphanStop()
     /// The `05 00` owed for a step stream this app turned on (decision 84b).
     @ObservationIgnored var stepStreamFlag = StrapStepStreamFlag()
+    /// "OpenCircuit started a strap workout" (decision 89f).
+    @ObservationIgnored var workoutModeMarker = StrapWorkoutModeMarkerStore()
+    /// Every workout-mode event of this connection, after the session's own handling: the workout
+    /// recorder (swings, the strap's kcal, whether the mode runs).
+    @ObservationIgnored var workoutModeObserver: (@MainActor (ZeppWorkoutModeMachine.Event) -> Void)?
     /// Every realtime step frame of the workout's stream, as it arrives: the strap's running counter
     /// (the indoor-run recorder, decision 84c). Frames nothing on this connection asked for never reach it.
     @ObservationIgnored var stepCounterObserver: (@MainActor (Int, Date) -> Void)?
@@ -377,6 +424,8 @@ final class HelioSession: WearableSession {
     @ObservationIgnored private var stepStreamReport = StrapStepStreamReport()
     @ObservationIgnored private var stepStreamFirstOnAt: Date?
     @ObservationIgnored private var chunkedWriteSubscribed = false
+    /// The strap's workout mode on this connection (decision 89, §18.9).
+    @ObservationIgnored private(set) var workoutMode = ZeppWorkoutModeMachine()
 
     private enum NotifyPurpose { case auth, fetch }
 
@@ -402,7 +451,8 @@ final class HelioSession: WearableSession {
          onEvent: @escaping @MainActor (HelioSessionEvent) -> Void = { _ in },
          clock: @escaping () -> Date = Date.init, random: ZeppRandom = .system,
          autoTick: Bool = true, autoSyncOnConnect: Bool = true,
-         workoutHoldsLink: @escaping @MainActor () -> Bool = { false }) {
+         workoutHoldsLink: @escaping @MainActor () -> Bool = { false },
+         workoutModeOwner: @escaping @MainActor () -> ZeppWorkoutModeMachine.Owner? = { nil }) {
         self.transport = transport
         self.identityID = identityID
         self.model = model
@@ -417,6 +467,7 @@ final class HelioSession: WearableSession {
         self.autoTick = autoTick
         self.autoSyncOnConnect = autoSyncOnConnect
         self.workoutHoldsLink = workoutHoldsLink
+        self.workoutModeOwner = workoutModeOwner
         timeline = SyncDeviceID.timeline(for: .zeppOS(model: Self.displayName), identityID: identityID)
         findPhase = findState.machine.state
     }
@@ -619,6 +670,9 @@ final class HelioSession: WearableSession {
         findState.machine.connectionLost()
         findState.persist()
         findPhase = findState.machine.state
+        // Decision 89f: a dropped link doesn't end the strap's workout (§18.4); the persisted marker
+        // carries it to the next connection's reconciliation.
+        workoutMode.linkLost()
         if fetch != nil || phase == .syncing { finishFetch(interrupted: true) }
         liveHeartRateRunning = false
         liveHeartRateOwner = nil
@@ -705,6 +759,13 @@ final class HelioSession: WearableSession {
             let out = editor.tick(now: now)
             settingsEditor = editor
             performSettings(out)
+        }
+        if workoutMode.nextDeadline.map({ now >= $0 }) == true {
+            // The end 89c sends on its own (no frames) carries the active seconds OpenCircuit recorded.
+            if let active = workoutModeOwner()?.activeSeconds ?? workoutModeMarker.marker?.activeSeconds {
+                workoutMode.noteActiveSeconds(active)
+            }
+            performWorkoutMode(workoutMode.tick(now: now))
         }
         if let stepDeadline, now >= stepDeadline {
             helioLog.notice("helio: setup step \(String(describing: self.currentStep), privacy: .public) timed out")
@@ -903,6 +964,7 @@ final class HelioSession: WearableSession {
         helioLog.notice("helio: ready (clock \(self.clockSet ? "set" : "NOT set", privacy: .public), controls: find \(self.controlCapabilities.isSupported(.findDevice), privacy: .public), alarms \(self.controlCapabilities.isSupported(.alarms), privacy: .public))")
         sendOwedOrphanStop()   // before any stream or sync (review-238 SF2)
         sendOwedStepsOff()     // decision 84b: a step stream left on is turned off at every connect
+        reconcileWorkoutMode() // decision 89f: a strap workout OpenCircuit started may still be running
         if autoSyncOnConnect {
             syncHistory(manual: false)
             if !appInBackground { activationSyncSettled = true }
@@ -1020,6 +1082,10 @@ final class HelioSession: WearableSession {
                 stepStreamReport.ackEnabled = enabled
                 helioLog.notice("helio: realtime steps ack \(String(format: "06 %02x", status), privacy: .public)")
             }
+        case ZeppEndpoint.workout:
+            // §18.9: the strap's workout mode. Replies and frames for anything this connection doesn't
+            // drive change nothing (they are logged above as strap-initiated when unasked).
+            performWorkoutMode(workoutMode.receive(payload, now: clock()))
         case ZeppEndpoint.activityFetch:
             // Path B replies (§6.1). The app drives Path A, so this only arrives if the strap answers there.
             guard var fetch else { return }
@@ -1173,6 +1239,7 @@ final class HelioSession: WearableSession {
         case ZeppEndpoint.heartRate where first == 0x06: return true                     // sleep events, §16.2
         case ZeppEndpoint.connection where first == 0x03 || first == 0x02: return true   // ping, MTU, §16.2
         case ZeppEndpoint.realtimeSteps where first == 0x07: return !workoutStepsOn     // steps, §16.2 row 5 (unasked)
+        case Self.workoutEndpoint where first == 0x14 && workoutMode.isActive: return false  // our workout's frames, §18.9
         case Self.workoutEndpoint where first == 0x20 || first == 0x11: return true      // workout, §16.2 rows 8–9
         case ZeppEndpoint.alarms where first == 0x0f: return true                        // edited on the strap, §12.5
         case ZeppEndpoint.findDevice where [0x07, 0x11, 0x13].contains(first): return true  // §11.3, §11.5
@@ -1331,6 +1398,116 @@ final class HelioSession: WearableSession {
             helioLog.notice("helio: sent the 05 00 owed for a step stream left on")
         }
         stepStreamFlag.clear()
+    }
+
+    // MARK: The strap's workout mode (decision 89, §18.9)
+
+    /// The workout mode is possible on this connection: authenticated, up, and the services list has
+    /// `0x0019`. Nothing is ever sent there otherwise.
+    var canUseWorkoutMode: Bool {
+        isAuthenticated && isLinkConnected && services?.contains(ZeppEndpoint.workout) == true
+    }
+
+    /// Decision 89a: §18.9's start sequence for `sport`, right after OpenCircuit's own start, with the
+    /// start time OpenCircuit records. Refused (false, nothing sent) unless the connection can and a
+    /// workout holds the link; the recorder then records phone-side, as before.
+    @discardableResult
+    func startWorkoutMode(_ sport: ZeppWorkoutSport, startTime: UInt32) -> Bool {
+        guard canUseWorkoutMode, workoutHoldsLink() else { return false }
+        helioLog.notice("helio: workout mode start (01, 06 00, then 02 \(String(format: "%02x", sport.code), privacy: .public))")
+        performWorkoutMode(workoutMode.start(sport, startTime: startTime, now: clock()))
+        return true
+    }
+
+    /// `03 02` with OpenCircuit's active seconds, if the strap's workout is ours on this connection.
+    func pauseWorkoutMode(activeSeconds: UInt32) {
+        guard isLinkConnected else { return }
+        performWorkoutMode(workoutMode.pause(activeSeconds: activeSeconds, now: clock()))
+    }
+
+    /// `03 03` with OpenCircuit's active seconds.
+    func resumeWorkoutMode(activeSeconds: UInt32) {
+        guard isLinkConnected else { return }
+        performWorkoutMode(workoutMode.resume(activeSeconds: activeSeconds, now: clock()))
+    }
+
+    /// `03 02` then `03 04` (save) with the final active seconds (89a). On a link that is gone, the
+    /// marker (already marked ended by the recorder) carries it to the next connection.
+    func endWorkoutMode(activeSeconds: UInt32) {
+        guard isLinkConnected else { return }
+        performWorkoutMode(workoutMode.end(activeSeconds: activeSeconds, now: clock()))
+    }
+
+    /// Decision 89f, at this connection's first authenticated `ready`: a persisted marker is settled
+    /// with `06 00`. A strap whose services list lacks `0x0019` never got a `02`: cleared, nothing sent.
+    func reconcileWorkoutMode() {
+        guard isAuthenticated, let marker = workoutModeMarker.marker else { return }
+        guard services?.contains(ZeppEndpoint.workout) == true else {
+            workoutModeMarker.clear(startTime: marker.startTime)
+            return
+        }
+        helioLog.notice("helio: workout mode marker set; checking the strap's state (06 00)")
+        performWorkoutMode(workoutMode.reconcile(marker, owner: workoutModeOwner(), now: clock()))
+    }
+
+    private func performWorkoutMode(_ out: ZeppWorkoutModeMachine.Output) {
+        // The marker first: it is set before `02` goes out (89f).
+        for event in out.events {
+            switch event {
+            case .setMarker(let marker): workoutModeMarker.set(marker)
+            case .markStrapPaused(let paused):
+                if let start = workoutMode.marker?.startTime {
+                    workoutModeMarker.update(startTime: start) { $0.strapPaused = paused }
+                }
+            case .clearMarker(let start): workoutModeMarker.clear(startTime: start)
+            default: break
+            }
+        }
+        for payload in out.messages { send(ZeppEndpoint.workout, payload) }
+        for event in out.events {
+            if let line = Self.workoutModeBreadcrumb(event) {
+                helioLog.notice("helio: workout mode: \(line, privacy: .public)")
+                onEvent(.workoutMode(line))
+            }
+            workoutModeObserver?(event)
+        }
+    }
+
+    /// One breadcrumb line per outcome (89c: control bytes and outcome only, never values); nil for
+    /// the events that aren't outcomes (frames, marker bookkeeping).
+    nonisolated static func workoutModeBreadcrumb(_ event: ZeppWorkoutModeMachine.Event) -> String? {
+        switch event {
+        case .running: return "running (first 14 frame after 03 01)"
+        case .unavailable(let reason):
+            switch reason {
+            case .noReply(let step): return "fallback, phone-side: no reply to \(Self.stepBytes(step)) in 8 s"
+            case .refused(let step, let status): return String(format: "fallback, phone-side: %@ answered status %02x", Self.stepBytes(step), status)
+            case .notIdle: return "fallback, phone-side: 06 00 not idle; nothing started or touched"
+            case .noFrames: return "fallback, phone-side: no 14 frame in 15 s; ended 03 02 + 03 05 (not saved)"
+            case .unavailable: return "fallback, phone-side: another 0x0019 exchange in progress"
+            }
+        case .ended(let saved): return saved ? "ended 03 02 + 03 04 (saved), both 10 03 01" : "ended 03 02 + 03 05 (not saved), both 10 03 01"
+        case .endUnconfirmed: return "end not confirmed; the marker stays for the next connection"
+        case .reconciled(let outcome):
+            switch outcome {
+            case .carriedOn: return "reconnect: 06 00 ours and the app's workout runs; carried on"
+            case .endedForApp: return "reconnect: 06 00 ours and the app's workout ended; sending 03 02 + 03 04"
+            case .idle: return "reconnect: 06 00 idle; marker cleared"
+            case .foreign: return "reconnect: 06 00 running but not ours; not touched, marker cleared"
+            case .noReply: return "reconnect: no usable 06 00 reply; marker kept"
+            }
+        case .frame, .setMarker, .markStrapPaused, .clearMarker:
+            return nil
+        }
+    }
+
+    private nonisolated static func stepBytes(_ step: ZeppWorkoutModeMachine.Step) -> String {
+        switch step {
+        case .capability: return "01"
+        case .state: return "06 00"
+        case .start: return "02"
+        case .started: return "03 01"
+        }
     }
 
     func stopLiveHeartRate() {
