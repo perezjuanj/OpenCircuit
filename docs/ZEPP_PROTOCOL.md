@@ -48,6 +48,7 @@ Citations use these aliases. Line numbers are 1-based at the pinned commit.
 | `HW:2026-09-30 (hw 0.132.27.2)` | Our own HelioVerify run against Juan's Helio Strap: hardware revision 0.132.27.2 (his Zepp account lists firmware 3.3.6.5), macOS CoreBluetooth, every ack `03 09`. Control bytes and lengths only; results in §10.1 | 2026-09-30 |
 | `HW:2026-11-03 route 2` | Runtime capture of the Zepp app (10.10.5, Android) driving Juan's strap (fw 3.27.0.1, hw 0.132.27.2): Android framework hooks only (AES in/out, GATT writes and notifications), no Zepp code read; decrypted messages accepted only on a matching §3.3 CRC. Raw capture kept outside the repo (health data and session keys). Results in §18.9 | 2026-11-03 |
 | `HW:2026-11-03 HelioVerify` | HelioVerify `--workout-test` / `--workout-status` from the Mac against the same strap: start, live frames, pause, end (both end forms) and state queries for pickleball, tennis, strength and outdoor run. Results in §18.9 | 2026-11-03 |
+| `HW:2026-11-04 route 2` | A second runtime capture with the same method as `HW:2026-11-03 route 2`: tennis and pickleball started in Zepp once with each wrist, and Zepp's Workout Detection switched off and on and its sensitivity stepped through high, standard, low, standard. Results in §18.9 and §19.5 | 2026-11-04 |
 | `HW:2026-09-30 13:35` | Juan's read-only re-test of the same strap with HelioVerify at `293cd90`, every ack `03 09`: the activity CRC, a full 12 h round, the device-info firmware read and HEALTH arg `0x04`. Results in §10.1 | 2026-09-30 |
 
 HelioCore is the only reference known to run on a real Helio Strap from iOS; Gadgetbridge
@@ -2263,7 +2264,7 @@ phone command starts `10 <opcode> <status>`; status `01` = accepted (the only st
 | capability query | `01` | `10 01 01 03 01 01 01 03 00 00 00` | sent first; the fields after the status are unexplained 🔴 | 🟢 |
 | state query | `06 00` | idle: `10 06 01 00 00`; running: `10 06 01 00 01 <u32 start, Unix s> <u8 sport>` | Zepp sends it before starting; use it after a crash or reconnect to find a workout still running | 🟢 |
 | start request | `02 <sport> 00 00 01` | `10 02 01` | the 5-byte form; accepted for treadmill `02`, outdoor run `01`, tennis `11`, strength `34` | 🟢 |
-| start request, racket form | `02 e3 00 01 01 02 00 00 00 02` | `10 02 01` | what Zepp sent for pickleball (`e3`, missing from §18.2) after asking which arm; the extra bytes are probably the arm and racket options 🔴. Tennis also accepted the 5-byte form and counted swings | 🟢 bytes, 🔴 meaning |
+| start request, racket form | `02 <sport> 00 01 01 02 00 00 00 <wrist>` | `10 02 01` | what Zepp sends for tennis (`11`) and pickleball (`e3`, missing from §18.2) after asking which wrist the strap is on: **`<wrist>` `01` = left, `02` = right** (four starts, each wrist for each sport, `HW:2026-11-04 route 2`). Bytes 2-8 were the same in every start; their meaning is unknown 🔴, send them as shown. Tennis also accepted the 5-byte form and counted swings | 🟢 |
 | started | `03 01 06 00 00 00 <u32 start, Unix s> 00 00 00 00` | `10 03 01` | sent right after the start reply; the timestamp is the phone's wall clock | 🟢 |
 | pause | `03 02 04 00 00 00 <u32 active s>` | `10 03 01` | active seconds so far (Zepp's matched wall clock minus pauses) | 🟢 |
 | resume | `03 03 04 00 00 00 <u32 active s>` | `10 03 01` | | 🟢 |
@@ -2367,6 +2368,30 @@ version wasn't recorded (🔴, §10 item 25).
   `11 01`/`11 04`, §16.2 row 9, §10 item 26). OpenCircuit doesn't import the strap's workout
   records (#226), so detection only affects what the strap and the Zepp app record. The per-minute
   activity samples (§6.5) are recorded either way.
+
+### 19.5 Observed on our strap (route 2)
+
+`HW:2026-11-04 route 2` (fw 3.27.0.1). Every write below was answered `06 01`.
+
+| Zepp action | Message | Meaning |
+|---|---|---|
+| Workout Detection **off** | `05 09 01 00 01 40 11 00` | arg `40`, byte list, **n = 0** |
+| Workout Detection **on** | `05 09 01 00 01 40 11 01 df` | arg `40`, byte list, one entry `df` |
+| Sensitivity high / standard / low | `05 09 01 00 01 42 10 00` / `… 01` / `… 02` | arg `42`, as §19.1 |
+
+- **The on/off switch is arg `40`:** off = an empty category list, on = `[df]`. This answers §19.2's open
+  row and §10 item 27. `df` is the code Gadgetbridge met unmapped on a Helio (§18.2), so it is probably
+  “all detectable sports” 🟡. Writing `[df]` and `[]` is exactly what Zepp does, so §19.3's “don't write
+  `40`” is lifted for those two values only; never write any other list.
+- Arg `41` (detection alert) was not touched by Zepp in this capture.
+- On connect Zepp also writes `05 09 01 00 03 04 10 01 06 02 06 <6 × i16> 07 01 41 00`: arg `04` byte `01`,
+  arg `06` six HR-zone bounds, arg `07` short 65. A read of the whole group (`03 01 09 00`) returned args
+  `04`, `05`, `06`, `07` only (not `40`-`42`); each entry in that reply, as in HEALTH reads, is followed by two
+  `00` bytes. Meaning of `04` and `07`: 🔴.
+- Reading `40`/`42` back after a write was not observed: the app should keep its own last-written value
+  and re-send it, not rely on a read.
+- **Not yet observed:** what the strap sends when it actually detects a workout (a `0x0019` message
+  such as `20` or `11 01`, §16.2 rows 8-9). That needs a capture during a real auto-detected workout.
 
 ### 19.4 Worked example M: sensitivity to "standard", alert on (constructed)
 
@@ -2805,3 +2830,5 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   item 26 are marked superseded; the earlier `0x05` guess for Heart Rate Push is corrected.
 - 2026-11-03: §18.9 correction: `03 05` also saves the workout (it is not "don't save"); very short
   workouts (45 s) are not kept, 88 s and longer are. The app sends `03 04` only.
+- 2026-11-04: §18.9 racket start's last byte is the wrist (`01` left, `02` right); §19.5 Workout Detection
+  on/off is arg `40` (`[]` off, `[df]` on) and sensitivity `42` confirmed (route 2 capture).
