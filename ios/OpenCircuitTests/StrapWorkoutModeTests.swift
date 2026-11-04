@@ -1,5 +1,6 @@
 import CoreLocation
 import HealthKit
+import SwiftUI
 import UIKit
 import XCTest
 import OpenCircuitKit
@@ -38,6 +39,7 @@ private final class FakeModeSource: StrapWorkoutHeartRateSource, StrapWorkoutMod
     var workoutModeObserver: (@MainActor (ZeppWorkoutModeMachine.Event) -> Void)?
     var acceptsStart = true
     private(set) var starts: [(code: UInt8, start: UInt32)] = []
+    private(set) var startRequests: [[UInt8]] = []
     private(set) var pauses: [UInt32] = []
     private(set) var resumes: [UInt32] = []
     private(set) var ends: [UInt32] = []
@@ -49,6 +51,7 @@ private final class FakeModeSource: StrapWorkoutHeartRateSource, StrapWorkoutMod
     func startWorkoutMode(_ sport: ZeppWorkoutSport, startTime: UInt32) -> Bool {
         guard acceptsStart else { return false }
         starts.append((sport.code, startTime))
+        startRequests.append(sport.startRequest)
         return true
     }
     func pauseWorkoutMode(activeSeconds: UInt32) { pauses.append(activeSeconds) }
@@ -129,6 +132,7 @@ final class StrapWorkoutModeRecorderTests: XCTestCase {
     private var now = t0
     private let profile = UserProfile(age: 40, weightKg: 70, heightCm: 175, sex: .male)   // Zone 1 from 90 bpm
     private var marker = StrapWorkoutModeMarkerStore(freshDefaults())
+    private let wristDefaults = freshDefaults()
 
     private func makeRecorder(_ source: FakeModeSource, journal: Journal? = nil) -> (StrapWorkoutRecorder, Writes) {
         let journal = journal ?? Journal()
@@ -140,6 +144,7 @@ final class StrapWorkoutModeRecorderTests: XCTestCase {
             liveActivity: nil, profile: { profile }, indoorKeepAlive: { false },
             orphanStop: StrapWorkoutOrphanStop(defaults), tombstones: WorkoutTombstones(defaults),
             stepStreamFlag: StrapStepStreamFlag(defaults), workoutModeMarker: marker,
+            wristStore: StrapWristStore(wristDefaults),
             clock: { [unowned self] in self.now }, autoTick: false, managesIdleTimer: false)
         return (recorder, writes)
     }
@@ -167,6 +172,76 @@ final class StrapWorkoutModeRecorderTests: XCTestCase {
                        ZeppWorkoutModeMachine.Owner(startTime: 1_800_000_000, activeSeconds: 0, paused: false))
         recorder.cancel()
         XCTAssertNil(StrapWorkoutRecorder.workoutModeOwner, "a discarded workout no longer owns the strap's")
+    }
+
+    // MARK: Decision 90: the wrist
+
+    func testARacketWorkoutStartsWithTheLeftWristWhenNoneWasEverChosen() {
+        for (sport, code) in [(WorkoutSportType.tennis, UInt8(0x11)), (.pickleball, 0xe3)] {
+            let source = FakeModeSource()
+            let (recorder, _) = makeRecorder(source)
+            recorder.selectedSport = sport
+            recorder.start()
+            XCTAssertEqual(source.startRequests, [[0x02, code, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, 0x01]], "\(sport)")
+            recorder.cancel()
+        }
+    }
+
+    func testTheChosenWristIsTheLastByteOfTheRacketStart() {
+        for (sport, code) in [(WorkoutSportType.tennis, UInt8(0x11)), (.pickleball, 0xe3)] {
+            for (wrist, byte) in [(StrapWrist.left, UInt8(0x01)), (.right, 0x02)] {
+                let source = FakeModeSource()
+                let (recorder, _) = makeRecorder(source)
+                recorder.selectedSport = sport
+                recorder.strapWrist = wrist
+                recorder.start()
+                XCTAssertEqual(source.startRequests, [[0x02, code, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, byte]], "\(sport) \(wrist)")
+                recorder.cancel()
+            }
+        }
+    }
+
+    func testPickingAWristPersistsItAtOnceAndANewRecorderStartsWithIt() {
+        let (first, _) = makeRecorder(FakeModeSource())
+        XCTAssertEqual(first.strapWrist, .left)
+        first.strapWrist = .right
+        XCTAssertEqual(StrapWristStore(wristDefaults).wrist, .right, "persisted the moment it is picked, before any start")
+        let source = FakeModeSource()
+        let (second, _) = makeRecorder(source)
+        XCTAssertEqual(second.strapWrist, .right, "the control comes back preselected to the last choice")
+        second.selectedSport = .tennis
+        second.start()
+        XCTAssertEqual(source.startRequests.first?.last, 0x02)
+        second.cancel()
+    }
+
+    func testTheShortcutsStartUsesThePersistedWrist() {
+        // As ContentView's shortcut path: only `selectedSport` is set, then `start()`; the screen was never opened.
+        StrapWristStore(wristDefaults).wrist = .right
+        let source = FakeModeSource()
+        let (recorder, _) = makeRecorder(source)
+        recorder.selectedSport = .pickleball
+        recorder.start()
+        XCTAssertEqual(source.startRequests, [[0x02, 0xe3, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, 0x02]])
+        recorder.cancel()
+    }
+
+    func testTheWristDoesNotChangeAnyOtherSportsStartOrTheMarker() {
+        StrapWristStore(wristDefaults).wrist = .right
+        let source = FakeModeSource()
+        let (recorder, _) = makeRecorder(source)
+        recorder.selectedSport = .strengthTraining
+        recorder.start()
+        XCTAssertEqual(source.startRequests, [[0x02, 0x34, 0x00, 0x00, 0x01]])
+        recorder.cancel()
+        let racket = FakeModeSource()
+        let (second, _) = makeRecorder(racket)
+        second.selectedSport = .tennis
+        second.start()
+        XCTAssertEqual(StrapWorkoutRecorder.workoutModeOwner,
+                       ZeppWorkoutModeMachine.Owner(startTime: 1_800_000_000, activeSeconds: 0, paused: false),
+                       "90e: ownership is start time and sport, never the wrist")
+        second.cancel()
     }
 
     func testPauseResumeAndEndCarryOpenCircuitsActiveSeconds() async {
@@ -469,6 +544,7 @@ private final class ModeKeys: HelioKeyStoring {
 final class StrapWorkoutModeSessionTests: XCTestCase {
     private var now = t0
     private var marker = StrapWorkoutModeMarkerStore(freshDefaults())
+    private let wristDefaults = freshDefaults()
     private let profile = UserProfile(age: 40, weightKg: 70, heightCm: 175, sex: .male)
     private var current: HelioSession?
 
@@ -512,6 +588,7 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
             location: Location(), liveActivity: nil, profile: { profile }, indoorKeepAlive: { false },
             orphanStop: StrapWorkoutOrphanStop(defaults), tombstones: WorkoutTombstones(defaults),
             stepStreamFlag: StrapStepStreamFlag(defaults), workoutModeMarker: marker,
+            wristStore: StrapWristStore(wristDefaults),
             clock: { [unowned self] in self.now }, autoTick: false, managesIdleTimer: false)
         return (recorder, writes)
     }
@@ -545,7 +622,7 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
 
     func testTheSequenceGoesOutInOrderAndTheMarkerLivesUntilTheEndsSecondAck() async throws {
         let (recorder, writes, session, transport, device) = started()
-        XCTAssertEqual(device.workoutCommands, [[0x01], [0x06, 0x00], [0x02, 0x11, 0x00, 0x00, 0x01], startedMessage])
+        XCTAssertEqual(device.workoutCommands, [[0x01], [0x06, 0x00], [0x02, 0x11, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, 0x01], startedMessage])
         XCTAssertEqual(marker.marker, ZeppWorkoutModeMarker(startTime: 1_800_000_000, sportCode: 0x11))
         XCTAssertEqual(recorder.workoutModeStatus, .starting)
         frame(transport, device, kcal: 8, swings: 20)
@@ -589,13 +666,26 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
         XCTAssertNil(marker.marker)
     }
 
+    private func assertRightWristOnTheWire(_ sport: WorkoutSportType, code: UInt8) {
+        StrapWristStore(wristDefaults).wrist = .right
+        let (recorder, _, _, _, device) = started(sport)
+        XCTAssertEqual(Array(device.workoutCommands.prefix(3)),
+                       [[0x01], [0x06, 0x00], [0x02, code, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, 0x02]], "\(sport)")
+        XCTAssertEqual(marker.marker?.sportCode, code, "90e: the marker still holds the sport code only")
+        recorder.cancel()
+    }
+
+    func testTheRightWristGoesOutOnTheWireForTennis() { assertRightWristOnTheWire(.tennis, code: 0x11) }
+
+    func testTheRightWristGoesOutOnTheWireForPickleball() { assertRightWristOnTheWire(.pickleball, code: 0xe3) }
+
     // MARK: 89c fallbacks
 
     func testNoStartReplyAsksTheStrapAndFallsBackWhenItIsIdle() async {
         let device = makeStrap()
         device.workoutStartStatus = nil   // this strap ignores the `02` and starts nothing
         let (recorder, _, session, transport, _) = started(device: device)
-        XCTAssertEqual(device.workoutCommands, [[0x01], [0x06, 0x00], [0x02, 0x11, 0x00, 0x00, 0x01]])
+        XCTAssertEqual(device.workoutCommands, [[0x01], [0x06, 0x00], [0x02, 0x11, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, 0x01]])
         await tick(recorder, session, to: 7)
         XCTAssertEqual(recorder.workoutModeStatus, .starting)
         await tick(recorder, session, to: 9)
@@ -1015,6 +1105,107 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
             fields: 0x0e, activeSeconds: 60, heartRate: 140, kilocalories: 45, averageHeartRate: 130,
             maximumHeartRate: 150, swings: 42))), "never a value")
         XCTAssertFalse(lines.joined().contains("03 05"))
+    }
+}
+
+// MARK: - The wrist: store and start screen (decision 90b, 90c)
+
+final class StrapWristStoreTests: XCTestCase {
+
+    func testItIsTheLeftWristUntilOneIsChosen() {
+        XCTAssertEqual(StrapWristStore(freshDefaults()).wrist, .left)
+    }
+
+    func testTheChoiceRoundTripsUnderOneKey() {
+        let defaults = freshDefaults()
+        let store = StrapWristStore(defaults)
+        store.wrist = .right
+        XCTAssertEqual(StrapWristStore(defaults).wrist, .right)
+        XCTAssertEqual(defaults.integer(forKey: "strapWorkoutWrist"), 2)
+        store.wrist = .left
+        XCTAssertEqual(StrapWristStore(defaults).wrist, .left)
+        XCTAssertEqual(StrapWristStore.key, "strapWorkoutWrist")
+    }
+
+    func testAStaleOrUnknownStoredValueReadsAsLeft() {
+        for value in [0, 3, 255, -1, 1_000] {
+            let defaults = freshDefaults()
+            defaults.set(value, forKey: StrapWristStore.key)
+            XCTAssertEqual(StrapWristStore(defaults).wrist, .left, "\(value)")
+        }
+    }
+}
+
+@MainActor
+final class StrapWristControlHostedTests: XCTestCase {
+
+    private func makeRecorder(_ defaults: UserDefaults) -> StrapWorkoutRecorder {
+        StrapWorkoutRecorder(source: { nil }, health: Writes(), journal: Journal(), hrStore: { HRStore() },
+                             location: Location(), liveActivity: nil, indoorKeepAlive: { false },
+                             orphanStop: StrapWorkoutOrphanStop(defaults), tombstones: WorkoutTombstones(defaults),
+                             stepStreamFlag: StrapStepStreamFlag(defaults),
+                             workoutModeMarker: StrapWorkoutModeMarkerStore(defaults),
+                             wristStore: StrapWristStore(defaults), autoTick: false, managesIdleTimer: false)
+    }
+
+    private func segments(in view: UIView) -> [UISegmentedControl] {
+        if let control = view as? UISegmentedControl { return [control] }
+        return view.subviews.flatMap { segments(in: $0) }
+    }
+
+    private func titles(_ control: UISegmentedControl) -> [String] {
+        (0..<control.numberOfSegments).compactMap { control.titleForSegment(at: $0) }
+    }
+
+    /// The wrist control's segments on the start screen with `sport` picked, nil when it is not shown.
+    private func wristSegments(for sport: WorkoutSportType, wrist: StrapWrist = .left) -> (titles: [String], selected: Int)? {
+        let defaults = freshDefaults()
+        StrapWristStore(defaults).wrist = wrist
+        let recorder = makeRecorder(defaults)
+        recorder.selectedSport = sport
+        let vc = UIHostingController(rootView: StrapWorkoutView(recorder: recorder, session: nil))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 1_600))
+        window.rootViewController = vc
+        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene { window.windowScene = scene }
+        window.makeKeyAndVisible()
+        vc.view.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(1.0))
+        vc.view.layoutIfNeeded()
+        defer {
+            window.rootViewController = nil
+            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        }
+        guard let control = segments(in: vc.view).first(where: { titles($0) == ["Left wrist", "Right wrist"] }) else { return nil }
+        return (titles(control), control.selectedSegmentIndex)
+    }
+
+    func testTheControlShowsForTennisAndPickleballWithTheVerbatimCopy() {
+        for sport in [WorkoutSportType.tennis, .pickleball] {
+            let shown = wristSegments(for: sport)
+            XCTAssertEqual(shown?.titles, ["Left wrist", "Right wrist"], "\(sport)")
+        }
+        XCTAssertEqual(StrapWorkoutCopy.wristLabel, "Strap on")
+        XCTAssertEqual(StrapWorkoutCopy.leftWrist, "Left wrist")
+        XCTAssertEqual(StrapWorkoutCopy.rightWrist, "Right wrist")
+    }
+
+    func testTheControlIsPreselectedToThePersistedWrist() {
+        XCTAssertEqual(wristSegments(for: .tennis, wrist: .left)?.selected, 0)
+        XCTAssertEqual(wristSegments(for: .tennis, wrist: .right)?.selected, 1)
+    }
+
+    func testTheControlIsHiddenForEveryOtherSport() {
+        for sport in WorkoutSportType.allCases where sport != .tennis && sport != .pickleball {
+            XCTAssertNil(wristSegments(for: sport), "\(sport)")
+        }
+    }
+
+    func testTheRecorderOnlyAsksForTheRacketSports() {
+        let recorder = makeRecorder(freshDefaults())
+        for sport in WorkoutSportType.allCases {
+            recorder.selectedSport = sport
+            XCTAssertEqual(recorder.asksWrist, sport == .tennis || sport == .pickleball, "\(sport)")
+        }
     }
 }
 

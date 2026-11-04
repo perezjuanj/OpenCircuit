@@ -38,24 +38,54 @@ import OpenCircuitKit
 
 // MARK: - Sports (decision 89b: the one table)
 
+/// Which wrist the strap is on (decision 90b): the last byte of the racket start request (§18.9).
+public enum StrapWrist: UInt8, CaseIterable, Equatable, Hashable, Sendable {
+    case left = 0x01
+    case right = 0x02
+}
+
 /// The strap's sport code for an OpenCircuit sport, and the exact start request.
 public struct ZeppWorkoutSport: Equatable, Hashable, Sendable {
     public let code: UInt8
-    /// `02 <code> …`: the 5-byte form, or the racket form Zepp sent for pickleball (§18.9).
-    public let startRequest: [UInt8]
+    /// Tennis and pickleball: Zepp asks which wrist the strap is on and sends it in the start (§18.9).
+    public let asksWrist: Bool
+    /// The wrist sent when `asksWrist`; ignored otherwise.
+    public let wrist: StrapWrist
     /// Started and answered on our strap (§18.9: `02`, `34`, `11`, `e3`). The others are 🔴 and rely on
     /// the fallback (89c).
     public let isHardwareTested: Bool
 
-    init(code: UInt8, startRequest: [UInt8]? = nil, isHardwareTested: Bool) {
+    init(code: UInt8, asksWrist: Bool = false, wrist: StrapWrist = .left, isHardwareTested: Bool) {
         self.code = code
-        self.startRequest = startRequest ?? [0x02, code, 0x00, 0x00, 0x01]
+        self.asksWrist = asksWrist
+        self.wrist = wrist
         self.isHardwareTested = isHardwareTested
     }
 
-    /// Decision 89b. nil = no strap mode in this version: the outdoor sports (the strap sent no frame
-    /// for an outdoor run without phone GPS, §18.9) stay phone-side exactly as before.
+    /// `02 <code> …`: the racket form `02 <code> 00 01 01 02 00 00 00 <wrist>` for tennis and pickleball
+    /// (decision 90a; bytes 2-8 are unexplained 🔴, sent as Zepp sends them), else the 5-byte form.
+    /// The one place the start bytes are built.
+    public var startRequest: [UInt8] {
+        asksWrist
+            ? [0x02, code, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, wrist.rawValue]
+            : [0x02, code, 0x00, 0x00, 0x01]
+    }
+
+    /// Decision 90c: this sport asks which wrist the strap is on (the UI shows the control for it).
+    public static func asksWrist(_ sport: WorkoutSportType) -> Bool {
+        forSport(sport)?.asksWrist == true
+    }
+
+    /// `forSport(_:wrist:)` with the left wrist: for a caller that only needs the sport's code or whether
+    /// the strap has a mode for it, not the bytes that go on the wire.
     public static func forSport(_ sport: WorkoutSportType) -> ZeppWorkoutSport? {
+        forSport(sport, wrist: .left)
+    }
+
+    /// Decision 89b. nil = no strap mode in this version: the outdoor sports (the strap sent no frame
+    /// for an outdoor run without phone GPS, §18.9) stay phone-side exactly as before. `wrist` only
+    /// matters for tennis and pickleball (decision 90a).
+    public static func forSport(_ sport: WorkoutSportType, wrist: StrapWrist) -> ZeppWorkoutSport? {
         switch sport {
         case .runningIndoor: return ZeppWorkoutSport(code: 0x02, isHardwareTested: true)
         case .strengthTraining: return ZeppWorkoutSport(code: 0x34, isHardwareTested: true)
@@ -64,11 +94,8 @@ public struct ZeppWorkoutSport: Equatable, Hashable, Sendable {
         case .yoga: return ZeppWorkoutSport(code: 0x3c, isHardwareTested: false)
         case .walkingIndoor: return ZeppWorkoutSport(code: 0x28, isHardwareTested: false)
         case .other: return ZeppWorkoutSport(code: 0x05, isHardwareTested: false)
-        case .tennis: return ZeppWorkoutSport(code: 0x11, isHardwareTested: true)
-        case .pickleball:
-            // Byte for byte what Zepp sent (§18.9); the extra bytes are probably arm and racket options 🔴.
-            return ZeppWorkoutSport(code: 0xe3, startRequest: [0x02, 0xe3, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, 0x02],
-                                    isHardwareTested: true)
+        case .tennis: return ZeppWorkoutSport(code: 0x11, asksWrist: true, wrist: wrist, isHardwareTested: true)
+        case .pickleball: return ZeppWorkoutSport(code: 0xe3, asksWrist: true, wrist: wrist, isHardwareTested: true)
         case .walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .hiking: return nil
         }
     }

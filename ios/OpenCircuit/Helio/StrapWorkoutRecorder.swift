@@ -319,6 +319,12 @@ final class StrapWorkoutRecorder {
 
     private(set) var state: State = .idle
     var selectedSport: WorkoutSportType = .runningOutdoor
+    /// Which wrist the strap is on, for the sports that ask (decision 90): picking one persists it at once.
+    var strapWrist: StrapWrist {
+        didSet { wristStore.wrist = strapWrist }
+    }
+    /// Decision 90c: the start screen asks which wrist for this sport.
+    var asksWrist: Bool { ZeppWorkoutSport.asksWrist(selectedSport) }
     /// Running time so far, pauses left out (refreshed every second).
     private(set) var activeSeconds: TimeInterval = 0
     /// The last reading, shown live (also while paused; it is not RECORDED while paused).
@@ -466,6 +472,7 @@ final class StrapWorkoutRecorder {
     @ObservationIgnored private let indoorHealth: (any IndoorRunHealthWriting)?
     @ObservationIgnored private let stepStreamFlag: StrapStepStreamFlag
     @ObservationIgnored private let workoutModeMarker: StrapWorkoutModeMarkerStore
+    @ObservationIgnored private let wristStore: StrapWristStore
     @ObservationIgnored private let strideCalibrations: IndoorStrideCalibrations
     @ObservationIgnored private let userHeightCm: () -> Double?
 
@@ -547,6 +554,7 @@ final class StrapWorkoutRecorder {
          indoorHealth: (any IndoorRunHealthWriting)? = nil,
          stepStreamFlag: StrapStepStreamFlag = StrapStepStreamFlag(),
          workoutModeMarker: StrapWorkoutModeMarkerStore = StrapWorkoutModeMarkerStore(),
+         wristStore: StrapWristStore = StrapWristStore(),
          strideCalibrations: IndoorStrideCalibrations = IndoorStrideCalibrations(),
          userHeightCm: @escaping () -> Double? = { IndoorRunProfile.userSetHeightCm() },
          clock: @escaping () -> Date = Date.init,
@@ -569,6 +577,8 @@ final class StrapWorkoutRecorder {
         self.indoorHealth = indoorHealth
         self.stepStreamFlag = stepStreamFlag
         self.workoutModeMarker = workoutModeMarker
+        self.wristStore = wristStore
+        self.strapWrist = wristStore.wrist
         self.strideCalibrations = strideCalibrations
         self.userHeightCm = userHeightCm
         self.clock = clock
@@ -1339,7 +1349,8 @@ final class StrapWorkoutRecorder {
     /// 89a/89b: start the strap's workout for a sport with a strap code, on a source that has the mode.
     /// Anything else records phone-side exactly as before: nothing on `0x0019`.
     private func startWorkoutMode(_ session: any StrapWorkoutHeartRateSource, sport: WorkoutSportType, start: Date) {
-        guard let code = ZeppWorkoutSport.forSport(sport), let source = session as? any StrapWorkoutModeSource else {
+        // 90d: the persisted wrist, read here, so the shortcut's start and the screen's agree.
+        guard let code = ZeppWorkoutSport.forSport(sport, wrist: wristStore.wrist), let source = session as? any StrapWorkoutModeSource else {
             workoutModeStatus = .none
             return
         }
