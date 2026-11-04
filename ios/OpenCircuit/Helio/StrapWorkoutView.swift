@@ -632,7 +632,8 @@ enum StrapWorkoutCopy {
         let totals = "Duration, calories and zones are OpenCircuit's own, worked out on your phone from the strap's live heart rate\(hasRoute ? " and your phone's location" : "")."
         switch workoutMode {
         case .none: return totals + " The strap made no record of this workout."
-        case .running: return totals + " The strap's workout mode ran too, and the strap saved its own record of this workout."
+        // 89o (d), verbatim.
+        case .running: return totals + " The strap also recorded this workout in its workout mode."
         case .starting, .unavailable: return totals
         }
     }

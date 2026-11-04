@@ -17,6 +17,13 @@ import OpenCircuitKit
 final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
     private let hkStore = HKHealthStore()
 
+    /// What the workout carries besides its samples (89d, 89e, 89h, 89o c): the active energy written
+    /// is OpenCircuit's own estimate, NEVER the strap's kcal, and the metadata says whether the strap's
+    /// workout mode ran, with its swings and kcal when it sent them. `save` takes both from here.
+    static func energyAndMetadata(_ write: StrapWorkoutWrite) -> (activeKcal: Double?, metadata: [String: Int]) {
+        (write.summary.summary.estimatedActiveKcal, StrapWorkoutMetadata.metadata(write.workoutMode))
+    }
+
     func save(_ write: StrapWorkoutWrite) async -> Bool {
         guard HKHealthStore.isHealthDataAvailable() else { return false }
         let summary = write.summary.summary
@@ -55,7 +62,8 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
         // Energy: an ESTIMATE, labelled as the ring's is. Netted out of the daily estimate only if it
         // actually landed (see the ring's `energySampleWritten`).
         var energySampleWritten = false
-        if let kcal = summary.estimatedActiveKcal, kcal > 0 {
+        let content = Self.energyAndMetadata(write)
+        if let kcal = content.activeKcal, kcal > 0 {
             let sample = HKQuantitySample(
                 type: HKQuantityType(.activeEnergyBurned), quantity: HKQuantity(unit: .kilocalorie(), doubleValue: kcal),
                 start: summary.startDate, end: summary.endDate, device: strap,
@@ -96,7 +104,7 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
         // #359 (89e, 89h): whether the strap's workout mode ran, and its swings and kcal when it sent
         // them, as metadata on the workout. Optional: a refusal never fails the workout, and nothing
         // above (heart rate, energy, distance) depends on it.
-        try? await builder.addMetadata(StrapWorkoutMetadata.metadata(write.workoutMode))
+        try? await builder.addMetadata(content.metadata)
 
         do {
             try await builder.endCollection(at: summary.endDate)

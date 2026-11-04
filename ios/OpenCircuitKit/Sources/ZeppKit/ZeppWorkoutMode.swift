@@ -19,7 +19,10 @@
 //   • any failure falls back to the phone-side workout, quietly (89c); a start that was accepted but
 //     sent no frame is ended at about 15 s, under the length the strap or Zepp keeps (89j);
 //   • the marker ("OpenCircuit started a strap workout") is set before `02` goes out and cleared only
-//     once the strap is known not to hold our workout any more (89f).
+//     once the strap is known not to hold our workout any more (89f);
+//   • a pause, resume or End asked for while `06 00` is in flight is kept, and the reply is decided on
+//     the marker as it is when the reply arrives (89o a); End after an unanswered `02` asks `06 00`
+//     and ends only ours, and a frame there means the strap started ours (89o b).
 
 import Foundation
 import OpenCircuitKit
@@ -375,6 +378,14 @@ public struct ZeppWorkoutModeMachine: Equatable {
     private var endRequested: UInt32?
     /// The `03 xx` commands awaiting their `10 03`, oldest first.
     private var pendingControls: [ZeppWorkoutCommand.Control] = []
+    /// OpenCircuit's pause, resume and End asked for while `06 00` is in flight (89o a), in order,
+    /// with the active seconds of each. Decided on when the reply arrives; never dropped.
+    private enum Queued: Equatable {
+        case pause(UInt32)
+        case resume(UInt32)
+        case end(UInt32)
+    }
+    private var queued: [Queued] = []
     private var keepAliveAt: Date?
 
     public init(configuration: Configuration = Configuration()) {
@@ -443,6 +454,10 @@ public struct ZeppWorkoutModeMachine: Equatable {
         switch phase {
         case .awaitingFrames, .running:
             return sendPauseState(paused, activeSeconds: activeSeconds)
+        case .reconciling:
+            // 89o (a): kept for the reply, applied after a carry-on.
+            queued.append(paused ? .pause(activeSeconds) : .resume(activeSeconds))
+            return Output()
         default:
             // Before `03 01` it is sent once the start is confirmed; after a fallback, never.
             return Output()
@@ -474,7 +489,18 @@ public struct ZeppWorkoutModeMachine: Equatable {
             return Output()
         case .awaitingFrames, .running:
             return sendEnd(activeSeconds: activeSeconds, now: now)
-        case .idle, .ending, .fallback, .startTimedOut, .reconciling, .done:
+        case .reconciling:
+            // 89o (a): the reply decides; the End is kept for it.
+            queued.append(.end(activeSeconds))
+            return Output()
+        case .startTimedOut:
+            // 89o (b): `02` went unanswered, so whether the strap runs ours is unknown: ask, and end it
+            // only if the state reply says running with our start time and sport.
+            owner = nil
+            queued = [.end(activeSeconds)]
+            phase = .reconciling(deadline: now.addingTimeInterval(configuration.replyTimeout))
+            return Output(messages: [ZeppWorkoutCommand.stateQuery])
+        case .idle, .ending, .fallback, .done:
             return Output()
         }
     }
@@ -496,8 +522,19 @@ public struct ZeppWorkoutModeMachine: Equatable {
         self.marker = marker
         self.owner = owner
         pendingControls = []
+        queued = []
         phase = .reconciling(deadline: now.addingTimeInterval(configuration.replyTimeout))
         return Output(messages: [ZeppWorkoutCommand.stateQuery])
+    }
+
+    /// 89o (a): the CURRENT persisted marker and owner, given by the host right before a 0x0019
+    /// payload, so a `06 00` reply is decided on what is true when it arrives (an End, pause or resume
+    /// recorded during the round trip), not on what was true when `06 00` went out. Only a marker of
+    /// the same start time replaces the machine's copy.
+    public mutating func noteCurrent(marker current: ZeppWorkoutModeMarker?, owner: Owner?) {
+        guard case .reconciling = phase else { return }
+        if let current, current.startTime == marker?.startTime { marker = current }
+        self.owner = owner
     }
 
     /// The link dropped: nothing more can be sent on this connection. The marker stays as persisted.
@@ -586,6 +623,13 @@ public struct ZeppWorkoutModeMachine: Equatable {
         case .awaitingFrames:
             phase = .running
             out.events.append(.running)
+        case .startTimedOut:
+            // 89o (b): a frame is proof the strap started ours although its `10 02 01` was lost: the
+            // marker (set before `02`) is set again and the workout carries on as running.
+            phase = .running
+            keepAliveAt = now.addingTimeInterval(configuration.keepAliveInterval)
+            if let marker { out.events.append(.setMarker(marker)) }
+            out.events.append(.running)
         case .running:
             break
         default:
@@ -597,27 +641,41 @@ public struct ZeppWorkoutModeMachine: Equatable {
     }
 
     private mutating func reconciled(_ state: ZeppWorkoutState, now: Date) -> Output {
+        let queued = self.queued
+        self.queued = []
         guard let marker else { phase = .done; return Output() }
+        // 89o (a): an End during the round trip counts as the app's End, with its seconds.
+        let queuedEnd = queued.compactMap { item -> UInt32? in if case .end(let s) = item { return s }; return nil }.last
+        let appEnded = marker.appEnded || queuedEnd != nil
         switch state {
         case .idle:
             phase = .done
             self.marker = nil
             return Output(events: [.reconciled(.idle), .clearMarker(startTime: marker.startTime)])
         case .running where marker.isOurs(state):
-            if let owner, owner.startTime == marker.startTime, !marker.appEnded {
-                // 89f: OpenCircuit's workout is still running: carry on, keep-alive re-armed, and the
+            if let owner, owner.startTime == marker.startTime, !appEnded {
+                // 89f: OpenCircuit's workout is still running: carry on, keep-alive re-armed, the pause
+                // and resume asked for during the round trip applied in order (89o a), then the
                 // strap's pause state brought to the app's.
                 phase = .running
                 keepAliveAt = now.addingTimeInterval(configuration.keepAliveInterval)
                 appPaused = owner.paused
                 appActiveSeconds = owner.activeSeconds
                 var out = Output(events: [.reconciled(.carriedOn)])
+                for item in queued {
+                    switch item {
+                    case .pause(let seconds): out.append(sendPauseState(true, activeSeconds: seconds))
+                    case .resume(let seconds): out.append(sendPauseState(false, activeSeconds: seconds))
+                    case .end: break
+                    }
+                }
                 out.append(sendPauseState(owner.paused, activeSeconds: owner.activeSeconds))
                 return out
             }
-            // Ended or discarded meanwhile (or the process that ran it is gone): end it.
+            // Ended or discarded, before or during the query (or the process that ran it is gone): end
+            // it with the seconds OpenCircuit recorded.
             var out = Output(events: [.reconciled(.endedForApp)])
-            out.append(sendEnd(activeSeconds: marker.activeSeconds, now: now))
+            out.append(sendEnd(activeSeconds: queuedEnd ?? marker.activeSeconds, now: now))
             return out
         case .running:
             // 89f: someone else's workout. Never touched; ours is no longer on the strap.
@@ -654,6 +712,7 @@ public struct ZeppWorkoutModeMachine: Equatable {
             out.events.append(.endUnconfirmed)
         case .reconciling(let deadline) where now >= deadline:
             phase = .done
+            queued = []
             out.events.append(.reconciled(.noReply))
         default:
             break

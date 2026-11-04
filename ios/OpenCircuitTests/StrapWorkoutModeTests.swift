@@ -263,6 +263,30 @@ final class StrapWorkoutModeRecorderTests: XCTestCase {
         XCTAssertEqual(metadata[StrapWorkoutMetadata.activeEnergyKey], 25)
     }
 
+    /// 89o (c): at the real writer's seam, the energy written is OpenCircuit's estimate whatever the
+    /// strap's kcal says, and the metadata keys go with the workout.
+    func testTheHealthWriterWritesOpenCircuitsEnergyAndTheMetadata() async throws {
+        let source = FakeModeSource()
+        let (recorder, writes) = makeRecorder(source)
+        recorder.selectedSport = .tennis
+        recorder.start()
+        source.emit(.running)
+        await stream(recorder, source, from: 0, to: 900, bpm: 150)
+        source.frame(kcal: 999, swings: 42)
+        await recorder.end()
+        let write = try XCTUnwrap(writes.writes.first)
+        let estimate = try XCTUnwrap(write.summary.summary.estimatedActiveKcal)
+        XCTAssertNotEqual(Int(estimate.rounded()), 999)
+        let withMode = StrapWorkoutHealthWriter.energyAndMetadata(write)
+        XCTAssertEqual(withMode.activeKcal, estimate, "never the strap's 999 kcal (89d)")
+        XCTAssertEqual(withMode.metadata, ["OCStrapWorkoutMode": 1, "OCStrapSwingCount": 42, "OCStrapActiveEnergyKcal": 999])
+        var phoneSide = write
+        phoneSide.workoutMode = StrapWorkoutModeExtras()
+        let without = StrapWorkoutHealthWriter.energyAndMetadata(phoneSide)
+        XCTAssertEqual(without.activeKcal, estimate, "the same energy without the mode's extras")
+        XCTAssertEqual(without.metadata, ["OCStrapWorkoutMode": 0])
+    }
+
     func testTheEnergyWrittenToHealthIsTheSameWithAndWithoutFrames() async throws {
         func run(frames: Bool) async throws -> StrapWorkoutWrite {
             now = t0
@@ -367,6 +391,14 @@ private final class ModeTransport: HelioTransport {
     func push(_ notifications: [FakeZeppDevice.Notification]) {
         for n in notifications { inbox.append((n.characteristic, n.bytes, false)) }
     }
+    /// Deliver until `stop` holds: the rest stays queued, as if still in flight.
+    func drain(until stop: () -> Bool) {
+        while !inbox.isEmpty, !stop() {
+            let (characteristic, bytes, enabled) = inbox.removeFirst()
+            if let bytes { session?.received(characteristic, bytes) }
+            else { session?.notificationStateChanged(characteristic, enabled: enabled, failed: false) }
+        }
+    }
     func drain() {
         var guardCount = 0
         while !inbox.isEmpty, guardCount < 100_000 {
@@ -403,7 +435,7 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
         return device
     }
 
-    private func connect(_ device: FakeZeppDevice) -> (HelioSession, ModeTransport) {
+    private func connect(_ device: FakeZeppDevice, holdAfterReady: Bool = false) -> (HelioSession, ModeTransport) {
         let transport = ModeTransport(device: device)
         let keys = ModeKeys()
         let session = HelioSession(transport: transport, identityID: "5B1E4C2A-0000-4000-8000-0000000000C3",
@@ -418,7 +450,8 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
         transport.session = session
         current = session
         session.start()
-        transport.drain()
+        // `holdAfterReady`: setup is done and `06 00` went out, but its reply is still in flight.
+        if holdAfterReady { transport.drain(until: { session.ready }) } else { transport.drain() }
         return (session, transport)
     }
 
@@ -659,6 +692,123 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
         XCTAssertNil(marker.marker)
     }
 
+    // MARK: 89o (a): pause, resume and End while the reconnect's `06 00` is in flight
+
+    /// Tennis with frames, the link drops at +100 s, a new connection is set up at +130 s and its `06 00`
+    /// reply hasn't arrived yet.
+    private func reconnectingWithTheQueryInFlight(adopt: Bool, pauseAt: TimeInterval? = nil,
+                                                  strapAfterDrop: (FakeZeppDevice) -> Void = { _ in })
+        async -> (StrapWorkoutRecorder, HelioSession, ModeTransport, FakeZeppDevice, Int) {
+        let (recorder, _, session, transport, device) = started()
+        frame(transport, device)
+        if let pauseAt {
+            await tick(recorder, session, to: pauseAt)
+            recorder.pause()
+            transport.drain()
+        }
+        await tick(recorder, session, to: 100)
+        session.linkLost()
+        await tick(recorder, session, to: 101)
+        strapAfterDrop(device)
+        now = at(130)
+        let (next, nextTransport) = connect(device, holdAfterReady: true)
+        XCTAssertTrue(next.ready)
+        XCTAssertEqual(device.workoutCommands.last, [0x06, 0x00], "the query is out; its reply is not in yet")
+        if adopt { await recorder.tick(now: now) }
+        return (recorder, next, nextTransport, device, device.workoutCommands.count)
+    }
+
+    func testAnEndWhileTheReconnectsQueryIsInFlightEndsTheStrapsWorkout() async {
+        for adopt in [false, true] {
+            marker = StrapWorkoutModeMarkerStore(freshDefaults())
+            now = t0
+            let (recorder, next, nextTransport, device, sent) = await reconnectingWithTheQueryInFlight(adopt: adopt)
+            await recorder.end()
+            nextTransport.drain()
+            XCTAssertEqual(Array(device.workoutCommands.dropFirst(sent)), [control(0x02, 130), control(0x04, 130)],
+                           "adopted \(adopt): ended with the recorded seconds on this connection")
+            XCTAssertNil(device.workoutRunning)
+            XCTAssertNil(marker.marker)
+            for s in stride(from: 131.0, through: 431.0, by: 1.0) { now = at(s); next.tick(now: now); nextTransport.drain() }
+            XCTAssertEqual(device.workoutCommands.count, sent + 2, "adopted \(adopt): nothing more, no keep-alive")
+        }
+    }
+
+    func testAPauseWhileTheReconnectsQueryIsInFlightIsSentAfterCarryingOn() async {
+        let (recorder, next, nextTransport, device, sent) = await reconnectingWithTheQueryInFlight(adopt: true)
+        recorder.pause()
+        nextTransport.drain()
+        XCTAssertEqual(Array(device.workoutCommands.dropFirst(sent)), [control(0x02, 130)])
+        XCTAssertTrue(device.workoutPaused)
+        await tick(recorder, next, to: 136)
+        XCTAssertEqual(device.workoutCommands.last, [0x05], "carried on")
+    }
+
+    func testAResumeWhileTheReconnectsQueryIsInFlightIsSentAfterCarryingOn() async {
+        let (recorder, _, nextTransport, device, sent) = await reconnectingWithTheQueryInFlight(adopt: true, pauseAt: 50)
+        XCTAssertTrue(device.workoutPaused)
+        recorder.resume()
+        nextTransport.drain()
+        XCTAssertEqual(Array(device.workoutCommands.dropFirst(sent)), [control(0x03, 50)])
+        XCTAssertFalse(device.workoutPaused)
+    }
+
+    func testAnEndWhileTheQueryIsInFlightNeverTouchesAForeignWorkout() async {
+        let (recorder, _, nextTransport, device, sent) = await reconnectingWithTheQueryInFlight(
+            adopt: true, strapAfterDrop: { $0.workoutRunning = (1_800_000_060, 0x11) })
+        await recorder.end()
+        nextTransport.drain()
+        XCTAssertEqual(Array(device.workoutCommands.dropFirst(sent)), [])
+        XCTAssertNil(marker.marker)
+        XCTAssertNotNil(device.workoutRunning)
+    }
+
+    // MARK: 89o (b): the start reply lost
+
+    func testFramesAfterALostStartReplyCarryOnAsTheStrapsWorkoutMode() async throws {
+        let device = makeStrap()
+        device.workoutStartStatus = nil
+        let (recorder, writes, session, transport, _) = started(device: device)
+        await tick(recorder, session, to: 9)
+        XCTAssertEqual(recorder.workoutModeStatus, .unavailable)
+        device.workoutRunning = (1_800_000_000, 0x11)   // it did start; only the reply was lost
+        frame(transport, device, kcal: 3, swings: 6)
+        XCTAssertEqual(recorder.workoutModeStatus, .running)
+        XCTAssertEqual(recorder.strapSwings, 6)
+        XCTAssertNotNil(marker.marker)
+        await tick(recorder, session, to: 300)
+        await recorder.end()
+        transport.drain()
+        XCTAssertEqual(Array(device.workoutCommands.filter { $0 != [0x05] }.suffix(2)), [control(0x02, 300), control(0x04, 300)])
+        XCTAssertNil(device.workoutRunning)
+        XCTAssertTrue(try XCTUnwrap(writes.writes.first).workoutMode.ranWithWorkoutMode)
+    }
+
+    func testEndAfterALostStartReplyEndsTheStrapsWorkoutOnlyIfItIsOurs() async {
+        for strap in [(1_800_000_000 as UInt32, 0x11 as UInt8), nil, (1_799_999_000, 0x11)] {
+            marker = StrapWorkoutModeMarkerStore(freshDefaults())
+            now = t0
+            let device = makeStrap()
+            device.workoutStartStatus = nil
+            let (recorder, _, session, transport, _) = started(device: device)
+            await tick(recorder, session, to: 9)
+            device.workoutRunning = strap.map { ($0.0, $0.1) }
+            let sent = device.workoutCommands.count
+            await tick(recorder, session, to: 60)
+            await recorder.end()
+            transport.drain()
+            let after = Array(device.workoutCommands.dropFirst(sent))
+            if strap?.0 == 1_800_000_000 {
+                XCTAssertEqual(after, [[0x06, 0x00], control(0x02, 60), control(0x04, 60)], "ours: ended")
+                XCTAssertNil(device.workoutRunning)
+            } else {
+                XCTAssertEqual(after, [[0x06, 0x00]], "idle or foreign: only the question")
+                XCTAssertEqual(device.workoutRunning.map { $0.start }, strap?.0)
+            }
+            XCTAssertNil(marker.marker)
+        }
+    }
+
     func testBreadcrumbsCarryControlBytesAndOutcomesOnly() {
         let lines = [ZeppWorkoutModeMachine.Event.running, .unavailable(.noFrames), .unavailable(.noReply(.start)),
                      .unavailable(.refused(.start, status: 5)), .unavailable(.notIdle), .ended, .endUnconfirmed,
@@ -744,7 +894,8 @@ final class StrapWorkoutModeAppTests: XCTestCase {
     func testTheSummaryCopy() {
         XCTAssertEqual(StrapWorkoutCopy.strapEstimate(310), "Strap estimate · 310 kcal")
         XCTAssertTrue(StrapWorkoutCopy.totalsNote(hasRoute: false, workoutMode: .none).hasSuffix("The strap made no record of this workout."))
-        XCTAssertFalse(StrapWorkoutCopy.totalsNote(hasRoute: false, workoutMode: .running).contains("no record"))
+        XCTAssertTrue(StrapWorkoutCopy.totalsNote(hasRoute: false, workoutMode: .running)
+                        .hasSuffix(" The strap also recorded this workout in its workout mode."), "89o (d), verbatim")
         XCTAssertFalse(StrapWorkoutCopy.totalsNote(hasRoute: false, workoutMode: .unavailable).contains("record"),
                        "after a fallback, whether the strap kept anything is not claimed")
         XCTAssertTrue(StrapWorkoutCopy.idleInfo(.runningOutdoor).contains("keeps no workout record"))

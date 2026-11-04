@@ -1085,6 +1085,8 @@ final class HelioSession: WearableSession {
         case ZeppEndpoint.workout:
             // §18.9: the strap's workout mode. Replies and frames for anything this connection doesn't
             // drive change nothing (they are logged above as strap-initiated when unasked).
+            // 89o (a): a `06 00` reply is decided on the marker and the app's workout as they are NOW.
+            workoutMode.noteCurrent(marker: workoutModeMarker.marker, owner: workoutModeOwner())
             performWorkoutMode(workoutMode.receive(payload, now: clock()))
         case ZeppEndpoint.activityFetch:
             // Path B replies (§6.1). The app drives Path A, so this only arrives if the strap answers there.

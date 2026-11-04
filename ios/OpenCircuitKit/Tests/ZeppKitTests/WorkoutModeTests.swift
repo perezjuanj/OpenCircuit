@@ -310,7 +310,8 @@ final class WorkoutModeMachineTests: XCTestCase {
             XCTAssertFalse(m.isActive)
             XCTAssertEqual(m.tick(now: at(30)).messages, [], "\(step): no keep-alive, nothing else")
             XCTAssertEqual(m.pause(activeSeconds: 30, now: at(30)).messages, [])
-            XCTAssertEqual(m.end(activeSeconds: 30, now: at(40)).messages, [])
+            // 89o (b): after an unanswered `02` the strap may run ours, so End asks; before it, nothing.
+            XCTAssertEqual(m.end(activeSeconds: 30, now: at(40)).messages, step == .start ? [hex("06 00")] : [])
         }
     }
 
@@ -483,6 +484,128 @@ final class WorkoutModeMachineTests: XCTestCase {
         let out = m.start(tennis, startTime: start + 7200, now: at(1))
         XCTAssertEqual(out.messages, [])
         XCTAssertEqual(out.events, [.unavailable(.unavailable)])
+    }
+}
+
+// MARK: - 89o: requests during the reconnect's `06 00`, and End after a lost start reply
+
+final class WorkoutModeRound3Tests: XCTestCase {
+
+    private let tennis = ZeppWorkoutSport.forSport(.tennis)!
+    private let oursRunning = runningState(1_800_000_000, sport: 0x11)
+
+    private func reconciling(active: UInt32 = 900, paused: Bool = false,
+                             owner: Machine.Owner? = Machine.Owner(startTime: 1_800_000_000, activeSeconds: 950, paused: false)) -> Machine {
+        var m = Machine()
+        let marker = ZeppWorkoutModeMarker(startTime: start, sportCode: 0x11, activeSeconds: active, strapPaused: paused)
+        XCTAssertEqual(m.reconcile(marker, owner: owner, now: t0).messages, [hex("06 00")])
+        return m
+    }
+
+    func testAnEndDuringTheReconnectQueryEndsWithTheRecordedSecondsThenNothingMore() {
+        var m = reconciling()
+        XCTAssertEqual(m.end(activeSeconds: 960, now: at(0.3)), Machine.Output(), "kept for the reply, nothing sent yet")
+        let out = m.receive(oursRunning, now: at(0.5))
+        XCTAssertEqual(out.events, [.reconciled(.endedForApp)])
+        XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 c0 03 00 00"), hex("03 04 04 00 00 00 c0 03 00 00")])
+        _ = m.receive(ok03, now: at(0.6))
+        XCTAssertEqual(m.receive(ok03, now: at(0.7)).events, [.ended, .clearMarker(startTime: start)])
+        var later: [[UInt8]] = []
+        for s in stride(from: 1.0, through: 600.0, by: 1.0) { later += m.tick(now: at(s)).messages }
+        XCTAssertEqual(later, [], "no keep-alive for a workout that ended")
+    }
+
+    func testTheReplyIsDecidedOnTheMarkerAsItIsWhenTheReplyArrives() {
+        // The app ended while 06 00 was in flight, with no session to tell: only the persisted marker knows.
+        var m = reconciling()
+        m.noteCurrent(marker: ZeppWorkoutModeMarker(startTime: start, sportCode: 0x11, activeSeconds: 970, appEnded: true), owner: nil)
+        let out = m.receive(oursRunning, now: at(0.5))
+        XCTAssertEqual(out.events, [.reconciled(.endedForApp)])
+        XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 ca 03 00 00"), hex("03 04 04 00 00 00 ca 03 00 00")])
+    }
+
+    func testAMarkerOfAnotherStartTimeNeverReplacesTheOneBeingReconciled() {
+        var m = reconciling()
+        m.noteCurrent(marker: ZeppWorkoutModeMarker(startTime: start + 3600, sportCode: 0x34, appEnded: true),
+                      owner: Machine.Owner(startTime: start, activeSeconds: 950, paused: false))
+        XCTAssertEqual(m.receive(oursRunning, now: at(0.5)).events, [.reconciled(.carriedOn)])
+    }
+
+    func testAPauseDuringTheReconnectQueryIsAppliedAfterCarryingOn() {
+        var m = reconciling()
+        XCTAssertEqual(m.pause(activeSeconds: 955, now: at(0.3)), Machine.Output())
+        m.noteCurrent(marker: nil, owner: Machine.Owner(startTime: start, activeSeconds: 955, paused: true))
+        let out = m.receive(oursRunning, now: at(0.5))
+        XCTAssertEqual(out.events, [.reconciled(.carriedOn), .markStrapPaused(true)])
+        XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 bb 03 00 00")])
+        XCTAssertEqual(m.tick(now: at(5.5)).messages, [hex("05")], "carried on")
+    }
+
+    func testAResumeDuringTheReconnectQueryIsAppliedAfterCarryingOn() {
+        var m = reconciling(paused: true, owner: Machine.Owner(startTime: start, activeSeconds: 950, paused: true))
+        XCTAssertEqual(m.resume(activeSeconds: 950, now: at(0.3)), Machine.Output())
+        m.noteCurrent(marker: nil, owner: Machine.Owner(startTime: start, activeSeconds: 950, paused: false))
+        let out = m.receive(oursRunning, now: at(0.5))
+        XCTAssertEqual(out.events, [.reconciled(.carriedOn), .markStrapPaused(false)])
+        XCTAssertEqual(out.messages, [hex("03 03 04 00 00 00 b6 03 00 00")])
+    }
+
+    func testAPauseThenResumeDuringTheQueryGoOutInOrder() {
+        var m = reconciling()
+        _ = m.pause(activeSeconds: 955, now: at(0.2))
+        _ = m.resume(activeSeconds: 955, now: at(0.4))
+        let out = m.receive(oursRunning, now: at(0.5))
+        XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 bb 03 00 00"), hex("03 03 04 00 00 00 bb 03 00 00")])
+    }
+
+    func testAnEndDuringTheQueryWithAForeignReplyTouchesNothing() {
+        var m = reconciling()
+        _ = m.end(activeSeconds: 960, now: at(0.3))
+        let out = m.receive(runningState(start + 60, sport: 0x11), now: at(0.5))
+        XCTAssertEqual(out.messages, [], "89f unchanged: a workout that isn't ours is never touched")
+        XCTAssertEqual(out.events, [.reconciled(.foreign), .clearMarker(startTime: start)])
+        XCTAssertEqual(m.tick(now: at(30)).messages, [])
+    }
+
+    /// A machine whose `02` went unanswered.
+    private func startTimedOut() -> Machine {
+        var m = Machine()
+        _ = m.start(tennis, startTime: start, now: t0)
+        _ = m.receive(hex("10 01 01"), now: at(1))
+        _ = m.receive(idleState, now: at(1))
+        XCTAssertEqual(m.tick(now: at(9.5)).events, [.unavailable(.noReply(.start))])
+        return m
+    }
+
+    func testAFrameAfterALostStartReplyMeansTheStrapStartedOurs() {
+        var m = startTimedOut()
+        let out = m.receive(liveFrame(active: 12, hr: 120, kcal: 2, avg: 118, max: 125, swings: 4), now: at(12))
+        XCTAssertEqual(out.events.first, .setMarker(ZeppWorkoutModeMarker(startTime: start, sportCode: 0x11)))
+        XCTAssertEqual(out.events.dropFirst().first, .running)
+        XCTAssertEqual(out.events.count, 3, "and the frame itself")
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(m.tick(now: at(17)).messages, [hex("05")])
+        XCTAssertEqual(m.end(activeSeconds: 60, now: at(60)).messages,
+                       [hex("03 02 04 00 00 00 3c 00 00 00"), hex("03 04 04 00 00 00 3c 00 00 00")])
+    }
+
+    func testEndAfterALostStartReplyEndsTheStrapsWorkoutOnlyIfItIsOurs() {
+        var m = startTimedOut()
+        XCTAssertEqual(m.end(activeSeconds: 40, now: at(40)).messages, [hex("06 00")])
+        var out = m.receive(oursRunning, now: at(40.5))
+        XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 28 00 00 00"), hex("03 04 04 00 00 00 28 00 00 00")])
+
+        m = startTimedOut()
+        _ = m.end(activeSeconds: 40, now: at(40))
+        out = m.receive(idleState, now: at(40.5))
+        XCTAssertEqual(out.messages, [])
+        XCTAssertEqual(out.events, [.reconciled(.idle), .clearMarker(startTime: start)])
+
+        m = startTimedOut()
+        _ = m.end(activeSeconds: 40, now: at(40))
+        out = m.receive(runningState(start - 600, sport: 0x11), now: at(40.5))
+        XCTAssertEqual(out.messages, [], "not ours: never touched")
+        XCTAssertEqual(out.events, [.reconciled(.foreign), .clearMarker(startTime: start)])
     }
 }
 
