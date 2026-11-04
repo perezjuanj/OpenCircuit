@@ -205,8 +205,13 @@ final class WorkoutModeSweepTests: XCTestCase {
                 toStrap.removeAll()
                 toPhone.removeAll()
             }
-            if ms == nextConnectionMs - 50, oursSeenAfterEnd, strap.running?.ours == true {
-                failures.append("the phone saw the strap run ours after End, and the End waited for the next connection")
+            if ms == nextConnectionMs - 50, appEnded, strap.running?.ours == true {
+                if oursSeenAfterEnd {
+                    failures.append("the phone saw the strap run ours after End, and the End waited for the next connection")
+                } else if c.state != .none {
+                    // 89p (a), no limbo: a strap that answers `06 00` settles the start on this connection.
+                    failures.append("the strap answers, yet the End waited for the next connection")
+                }
             }
             if (c.reconnect && ms == reconnectMs) || (ms == nextConnectionMs && persisted != nil) {
                 linkUp = true
