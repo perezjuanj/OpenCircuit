@@ -73,6 +73,9 @@ struct StrapWorkoutView: View {
                         }
                     }
                 }
+                if recorder.asksWrist {
+                    StrapWristPicker(wrist: Binding(get: { recorder.strapWrist }, set: { recorder.strapWrist = $0 }))
+                }
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "info.circle").foregroundStyle(.secondary)
                     Text(StrapWorkoutCopy.idleInfo(recorder.selectedSport))
@@ -607,6 +610,11 @@ enum StrapWorkoutCopy {
     /// 89n, verbatim: a discard can't remove what the strap saved (its end always saves, 89j).
     static let strapMayKeepRecord = "The strap may still keep a record of this workout in Zepp."
 
+    /// 90c, verbatim: the wrist control for tennis and pickleball.
+    static let wristLabel = "Strap on"
+    static let leftWrist = "Left wrist"
+    static let rightWrist = "Right wrist"
+
     /// 89c, verbatim: the one quiet line of a fallback.
     static let workoutModeUnavailable = "Strap workout mode unavailable for this sport; recording continues."
 
@@ -635,6 +643,23 @@ enum StrapWorkoutCopy {
         // 89o (d), verbatim.
         case .running: return totals + " The strap also recorded this workout in its workout mode."
         case .starting, .unavailable: return totals
+        }
+    }
+}
+
+/// Decision 90c: which wrist the strap is on, before a tennis or pickleball workout starts.
+struct StrapWristPicker: View {
+    @Binding var wrist: StrapWrist
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(StrapWorkoutCopy.wristLabel)
+                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Picker(StrapWorkoutCopy.wristLabel, selection: $wrist) {
+                Text(StrapWorkoutCopy.leftWrist).tag(StrapWrist.left)
+                Text(StrapWorkoutCopy.rightWrist).tag(StrapWrist.right)
+            }
+            .pickerStyle(.segmented)
         }
     }
 }
