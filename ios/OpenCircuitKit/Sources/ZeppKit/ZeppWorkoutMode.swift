@@ -162,6 +162,17 @@ public struct ZeppWorkoutLiveFrame: Equatable, Sendable {
     /// nil when the frame doesn't carry them (fields bit `0x08` clear, or a fields value the spec
     /// doesn't place).
     public let swings: UInt16?
+
+    public init(fields: UInt8, activeSeconds: UInt32, heartRate: UInt8, kilocalories: UInt32, averageHeartRate: UInt8,
+                maximumHeartRate: UInt8, swings: UInt16?) {
+        self.fields = fields
+        self.activeSeconds = activeSeconds
+        self.heartRate = heartRate
+        self.kilocalories = kilocalories
+        self.averageHeartRate = averageHeartRate
+        self.maximumHeartRate = maximumHeartRate
+        self.swings = swings
+    }
 }
 
 public enum ZeppWorkoutFrame: Equatable, Sendable {
