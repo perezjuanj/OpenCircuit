@@ -57,7 +57,7 @@ final class WorkoutDetailLowHeartRateNoteTests: XCTestCase {
     }
 
     func testAnActivityTypeNoSportWritesShowsNoNote() {
-        XCTAssertFalse(shows(item(.tennis), readings(0, 1200, bpm: 80)))
+        XCTAssertFalse(shows(item(.swimming), readings(0, 1200, bpm: 80)))
     }
 
     func testPausedTimeIsNotActiveTime() {
