@@ -115,6 +115,11 @@ struct WorkoutDetailView: View {
     let item: WorkoutHistoryReader.Item
     /// Called with the workout's id once it has been deleted.
     var onDeleted: (UUID) -> Void = { _ in }
+    #if DEBUG
+    /// DEBUG demo only (`-OCDemoScreen workout-detail`): a route standing in for Health's, which a
+    /// simulator doesn't have.
+    var demoRoute: [CLLocation]? = nil
+    #endif
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage("units.distance") private var distUnitRaw = DistanceUnit.localeDefault.rawValue
@@ -123,7 +128,9 @@ struct WorkoutDetailView: View {
     @State private var hr: [HRSample] = []
     @State private var hrSource: WorkoutDetailContent.HeartRateSource = .none
     @State private var recovery: HeartRateRecovery.Outcome?
-    @State private var route: [CLLocationCoordinate2D] = []
+    @State private var route: [CLLocation] = []
+    /// Computed once per route and unit (#365), not on every body pass: a long ride has ~20k fixes.
+    @State private var splitRows: [WorkoutDetailContent.SplitRow] = []
     @State private var loaded = false
     @State private var confirming = false
     @State private var deleting = false
@@ -151,6 +158,7 @@ struct WorkoutDetailView: View {
                     if loaded {
                         heartRateCard
                         zonesCard
+                        splitsCard
                         routeCard
                     } else {
                         ProgressView().frame(maxWidth: .infinity)
@@ -164,6 +172,7 @@ struct WorkoutDetailView: View {
         .navigationTitle(WorkoutActivityDisplay.name(item.activityType))
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
+        .onChange(of: distUnitRaw) { recomputeSplits() }
         .task(id: "\(zoneMethodRaw)|\(zoneManualMaxHR)|\(zoneCustomBounds)") {
             zones = await HeartRateZoneDefaults.currentZones()
         }
@@ -267,12 +276,32 @@ struct WorkoutDetailView: View {
     }
 
     @ViewBuilder
+    private var splitsCard: some View {
+        let rows = splitRows
+        if !rows.isEmpty {
+            OCCard {
+                OCSectionHeader("Splits", systemImage: "flag.checkered", tint: .green)
+                ForEach(rows) { row in
+                    HStack {
+                        Text(row.label).font(.subheadline)
+                            .foregroundStyle(row.isPartial ? .secondary : .primary)
+                        Spacer()
+                        Text(row.value).font(.subheadline.weight(.semibold)).monospacedDigit()
+                    }
+                }
+                Text("From the GPS route, over moving time.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var routeCard: some View {
         if route.count >= 2 {
             OCCard {
                 OCSectionHeader("Route", systemImage: "map", tint: .blue)
                 Map(initialPosition: .automatic) {
-                    MapPolyline(coordinates: route).stroke(.blue, lineWidth: 4)
+                    MapPolyline(coordinates: route.map(\.coordinate)).stroke(.blue, lineWidth: 4)
                 }
                 .frame(height: 240)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -293,7 +322,12 @@ struct WorkoutDetailView: View {
     private func load() async {
         guard !loaded else { return }
         let store = HealthKitWorkoutStore()
+        #if DEBUG
+        // The demo has no Health (an unsigned simulator build throws on `HKSource.default()`).
+        let workout = demoRoute == nil ? try? await store.workout(item.id) : nil
+        #else
         let workout = try? await store.workout(item.id)
+        #endif
         var fromHealth: [HRSample] = []
         if let workout { fromHealth = await store.heartRate(of: workout) }
         let chosen = WorkoutDetailContent.heartRate(
@@ -318,7 +352,15 @@ struct WorkoutDetailView: View {
                 window: window, zones: userZones)
         }
         if let workout { route = await store.route(of: workout) }
+        #if DEBUG
+        if let demoRoute { route = demoRoute }
+        #endif
+        recomputeSplits()
         loaded = true
+    }
+
+    private func recomputeSplits() {
+        splitRows = WorkoutDetailContent.splitRows(route: route, item: item, unit: distanceUnit)
     }
 
     private func delete() async {

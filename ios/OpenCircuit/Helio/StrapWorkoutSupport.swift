@@ -123,12 +123,15 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
         var walkRunDistanceToCredit = 0.0
         if let distance = summary.distanceMeters, distance > 0, summary.hasRoute {
             let isCycling = summary.sport == .cyclingOutdoor
-            let sample = HKQuantitySample(
-                type: HKQuantityType(isCycling ? .distanceCycling : .distanceWalkingRunning),
-                quantity: HKQuantity(unit: .meter(), doubleValue: distance),
-                start: summary.startDate, end: summary.endDate, metadata: [HKMetadataKeyWasUserEntered: false])
-            try? await builder.addSamples([sample])
-            if !isCycling { walkRunDistanceToCredit = distance }
+            let type = HKQuantityType(isCycling ? .distanceCycling : .distanceWalkingRunning)
+            // #365: ~15 s samples plus split events, or the one sample, through the ring's own
+            // `WorkoutRouteDetail.addDistance`. Credit the day only for distance that landed.
+            let landed = await WorkoutRouteDetail.addDistance(
+                meters: distance, type: type, route: write.route, legStarts: write.routeLegStarts,
+                pauses: write.summary.pauses, start: summary.startDate, end: summary.endDate,
+                addSamples: { try await builder.addSamples($0) },
+                addEvents: { try await builder.addWorkoutEvents($0) })
+            if !isCycling, landed { walkRunDistanceToCredit = distance }
         } else if let indoor = write.indoorDistance, indoor.meters > 0,
                   IndoorStepWorkout.applies(to: summary.sport) {
             // An indoor run or walk (#339, decision 84f, 84j): the treadmill distance the person typed
@@ -345,6 +348,8 @@ final class StrapWorkoutLocation: NSObject, WorkoutLocationTracking, CLLocationM
     private(set) var distanceMeters: Double?
     private(set) var keepAliveUnavailable = false
     @ObservationIgnored private(set) var route: [CLLocation] = []
+    /// Indices into `route` where the live counter had no previous fix (#365): see the protocol.
+    @ObservationIgnored private(set) var routeLegStarts: [Int] = []
 
     @ObservationIgnored private var manager: CLLocationManager?
     @ObservationIgnored private var recordsRoute = false
@@ -358,6 +363,7 @@ final class StrapWorkoutLocation: NSObject, WorkoutLocationTracking, CLLocationM
         running = true
         paused = false
         route = []
+        routeLegStarts = []
         distanceMeters = nil
         lastLocation = nil
         keepAliveUnavailable = false
@@ -430,6 +436,7 @@ final class StrapWorkoutLocation: NSObject, WorkoutLocationTracking, CLLocationM
                 if let previous = self.lastLocation {
                     self.distanceMeters = (self.distanceMeters ?? 0) + location.distance(from: previous)
                 }
+                if self.lastLocation == nil { self.routeLegStarts.append(self.route.count) }
                 self.lastLocation = location
                 self.route.append(location)
             }
