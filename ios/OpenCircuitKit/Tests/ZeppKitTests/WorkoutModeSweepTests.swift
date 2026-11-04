@@ -149,6 +149,10 @@ final class WorkoutModeSweepTests: XCTestCase {
         var linkUp = true
         var appEnded = false
         var endsSent = 0
+        /// After End, the phone heard the strap run ours (a frame, a `10 02 01`, or a `06 00` reply while
+        /// ours ran) on a live connection: from then on the End can't be left to the next connection.
+        var oursSeenAfterEnd = false
+        var keepAlivesAfterEnd = 0
         let endMs: Int
         switch c.endAt {
         case .beforeTimeout: endMs = 4_000
@@ -176,6 +180,7 @@ final class WorkoutModeSweepTests: XCTestCase {
             }
             for m in out.messages {
                 if m.starts(with: [0x03, 0x04]) || m.starts(with: [0x03, 0x05]) { endsSent += 1 }
+                if appEnded, m == [0x05] { keepAlivesAfterEnd += 1 }
                 if linkUp { toStrap.append((ms + 100, m)) }
             }
         }
@@ -200,6 +205,9 @@ final class WorkoutModeSweepTests: XCTestCase {
                 toStrap.removeAll()
                 toPhone.removeAll()
             }
+            if ms == nextConnectionMs - 50, oursSeenAfterEnd, strap.running?.ours == true {
+                failures.append("the phone saw the strap run ours after End, and the End waited for the next connection")
+            }
             if (c.reconnect && ms == reconnectMs) || (ms == nextConnectionMs && persisted != nil) {
                 linkUp = true
                 machine = Machine()
@@ -216,6 +224,10 @@ final class WorkoutModeSweepTests: XCTestCase {
             let duePhone = toPhone.filter { $0.0 == ms }
             toPhone.removeAll { $0.0 == ms }
             for (_, payload) in duePhone where linkUp {
+                if appEnded, strap.running?.ours == true,
+                   payload.first == 0x14 || payload.starts(with: [0x10, 0x02, 0x01]) || payload.starts(with: [0x10, 0x06]) {
+                    oursSeenAfterEnd = true
+                }
                 machine.noteCurrent(marker: persisted, owner: owner(ms))
                 apply(machine.receive(payload, now: date(ms)), at: ms)
             }
@@ -230,6 +242,7 @@ final class WorkoutModeSweepTests: XCTestCase {
         if strap.controlsToForeign > 0 { failures.append("a foreign workout received \(strap.controlsToForeign) 03 xx") }
         if strap.oursEnded > 1 { failures.append("03 04 reached our workout \(strap.oursEnded) times") }
         if endsSent > 1 { failures.append("\(endsSent) end sequences were sent") }
+        if keepAlivesAfterEnd > 0 { failures.append("\(keepAlivesAfterEnd) keep-alives after End") }
         if persisted != nil { failures.append("a marker is left after the next connection: \(String(describing: persisted))") }
         return failures
     }
