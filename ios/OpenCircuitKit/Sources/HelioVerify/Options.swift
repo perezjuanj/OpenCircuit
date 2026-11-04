@@ -53,7 +53,7 @@ USAGE
 
 Without a key: scans, connects, reads the standard battery level (if the strap exposes 0x2A19)
 and firmware/hardware revision, and listens to standard heart-rate notifications (0x2A37; needs
-Zepp's "Heart Rate Push" switch on).
+the strap's Heart Rate Broadcast setting on: HEALTH 0x83, set in the Zepp app).
 
 With --key-file and no control flag: also authenticates, prints the services list, sends the
 read-only device-info request (01 on endpoint 0x0043) and prints the hardware and firmware

@@ -13,10 +13,12 @@ final class WorkoutShortcutIntentTests: XCTestCase {
         super.tearDown()
     }
 
-    /// Every type the app can record is offered, once, under the name the in-app picker uses.
+    /// Every type the app can record is offered, once, under the name the in-app picker uses, Tennis
+    /// and Pickleball included (#359, decision 89k).
     func testTheShortcutOffersEveryWorkoutTypeUnderItsInAppName() {
         XCTAssertEqual(WorkoutTypeChoice.allCases.count, WorkoutSportType.allCases.count)
         XCTAssertEqual(Set(WorkoutTypeChoice.allCases.map(\.sport)), Set(WorkoutSportType.allCases))
+        XCTAssertTrue(WorkoutTypeChoice.allCases.contains(.tennis) && WorkoutTypeChoice.allCases.contains(.pickleball))
         for choice in WorkoutTypeChoice.allCases {
             let rep = try? XCTUnwrap(WorkoutTypeChoice.caseDisplayRepresentations[choice])
             XCTAssertEqual(rep.map { String(localized: $0.title) }, choice.sport.displayName, choice.rawValue)

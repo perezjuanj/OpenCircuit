@@ -335,7 +335,8 @@ final class HelioConnection: NSObject {
             onEvent: { [weak self] event in self?.handle(event) },
             autoSyncOnConnect: syncOnConnect,
             // A strap workout holds the link (#227): syncs wait until it ends.
-            workoutHoldsLink: { StrapWorkoutRecorder.holdsStrapLink })
+            workoutHoldsLink: { StrapWorkoutRecorder.holdsStrapLink },
+            workoutModeOwner: { StrapWorkoutRecorder.workoutModeOwner })
         session.backgroundRunOwnsSyncs = backgroundRunAdoptsNewSessions
         session.appInBackground = !Self.appIsActive
         made.session = session
@@ -594,6 +595,8 @@ extension HelioConnection {
             break   // a breadcrumb only (the strap-message line above)
         case .stepStream(let report):
             breadcrumbs.stepStream(report)
+        case .workoutMode(let line):
+            breadcrumbs.workoutMode(line)
         }
     }
 

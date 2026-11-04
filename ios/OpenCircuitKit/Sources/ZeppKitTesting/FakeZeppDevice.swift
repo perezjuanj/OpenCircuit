@@ -72,6 +72,24 @@ public final class FakeZeppDevice {
     /// reads reflect it (e.g. by replacing `configReplies`).
     public var onConfigWrite: (([UInt8]) -> Void)?
 
+    // The strap's workout mode on 0x0019 (§18.9). Only reachable when a test lists 0x0019 in `services`.
+    /// The running workout; nil = idle. Like the real strap, an accepted `02` starts it at the strap's
+    /// own clock (`strapClock`), and `03 01` then replaces the start with the phone's time (89p d).
+    /// Persists across connections, as on a real strap (§18.4).
+    public var workoutRunning: (start: UInt32, sport: UInt8)?
+    /// The strap's own clock (Unix s), for the start of a workout an accepted `02` begins.
+    public var strapClock: () -> UInt32 = { UInt32(Date().timeIntervalSince1970) }
+    /// The strap accepts `02` and starts the workout, but its `10 02 01` never reaches the phone.
+    public var dropsStartReply = false
+    /// The reply to `01`; nil = the strap never answers it.
+    public var workoutCapabilityReply: [UInt8]? = hex("10 01 01 03 01 01 01 03 00 00 00")
+    /// The status of the `10 02` reply; nil = the strap never answers `02` (and starts nothing).
+    public var workoutStartStatus: UInt8? = 0x01
+    /// Whether `06 00` is answered.
+    public var answersWorkoutState = true
+    /// The status of every `10 03` reply; nil = never answered.
+    public var workoutControlStatus: UInt8? = 0x01
+
     // Observed state
     public private(set) var sessionKey: [UInt8]?
     public private(set) var authenticated = false
@@ -91,6 +109,9 @@ public final class FakeZeppDevice {
     public private(set) var realtimeStepsCommands: [[UInt8]] = []
     /// Whether the realtime step stream is on (it persists across connections on a real strap, §16.2).
     public private(set) var realtimeStepsOn = false
+    /// Every payload received on the workout endpoint `0x0019`, decrypted, in order.
+    public private(set) var workoutCommands: [[UInt8]] = []
+    public private(set) var workoutPaused = false
 
     private var expectedPhoneSequence: UInt32 = 0
     private var deviceSequence: UInt32 = 0
@@ -203,6 +224,8 @@ public final class FakeZeppDevice {
             realtimeStepsCommands.append(p)
             realtimeStepsOn = p[1] == 0x01
             return realtimeStepsAckStatus.map { send(endpoint: 0x0016, [0x06, $0, p[1]]) } ?? []
+        case 0x0019:
+            return workout(p)
         case 0x001A:
             return findDevice(p)
         case 0x000F:
@@ -259,6 +282,57 @@ public final class FakeZeppDevice {
         }
         if announcesAlarmChanges && alarmAckStatus == 0x01 { out += send(endpoint: 0x000F, [0x0f]) }
         return out
+    }
+
+    // MARK: Workout mode (§18.9)
+
+    private func workout(_ p: [UInt8]) -> [Notification] {
+        workoutCommands.append(p)
+        switch p.first {
+        case 0x01:
+            return workoutCapabilityReply.map { send(endpoint: 0x0019, $0) } ?? []
+        case 0x06 where p == [0x06, 0x00]:
+            guard answersWorkoutState else { return [] }
+            guard let running = workoutRunning else { return send(endpoint: 0x0019, hex("10 06 01 00 00")) }
+            return send(endpoint: 0x0019, hex("10 06 01 00 01") + le32(running.start) + [running.sport])
+        case 0x02 where p.count >= 5:
+            guard let status = workoutStartStatus else { return [] }
+            if status == 0x01, workoutRunning == nil {
+                workoutRunning = (strapClock(), p[1])
+                workoutPaused = false
+            }
+            return dropsStartReply ? [] : send(endpoint: 0x0019, [0x10, 0x02, status])
+        case 0x03 where p.count == 10 || p.count == 14:
+            guard let status = workoutControlStatus else { return [] }
+            if status == 0x01 {
+                switch p[1] {
+                case 0x01 where p.count == 14:
+                    // Adopts the phone's start time for the workout `02` started.
+                    if let running = workoutRunning { workoutRunning = (readLE32(p, 6), running.sport) }
+                case 0x02: workoutPaused = true
+                case 0x03: workoutPaused = false
+                case 0x04, 0x05:
+                    workoutRunning = nil
+                    workoutPaused = false
+                default: break
+                }
+            }
+            return send(endpoint: 0x0019, [0x10, 0x03, status])
+        case 0x05 where p.count == 1:
+            return []
+        default:
+            failures.append("unhandled workout message \(p)")
+            return []
+        }
+    }
+
+    /// One `14` live frame (§18.9): swings present (fields `0e`) when `swings` is given, else `06`.
+    public func workoutFrame(active: UInt32, heartRate: UInt8, kcal: UInt32, average: UInt8, maximum: UInt8,
+                             swings: UInt16? = nil) -> [Notification] {
+        var payload: [UInt8] = [0x14, 0x00, 0x24, 0x01, 0x00, swings == nil ? 0x06 : 0x0e]
+        payload += le32(active) + [heartRate] + le32(kcal) + [average, maximum]
+        if let swings { payload += le16(swings) }
+        return send(endpoint: 0x0019, payload)
     }
 
     /// A realtime step frame (§16.2 row 5): `07` + 13 bytes, the counter as u16 LE at offset 1 of the 13.

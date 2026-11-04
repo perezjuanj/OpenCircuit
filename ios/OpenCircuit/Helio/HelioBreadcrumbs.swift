@@ -293,6 +293,16 @@ final class HelioBreadcrumbs {
         return parts.joined(separator: ", ")
     }
 
+    /// Decision 89c/89f: one outcome of the strap's workout mode (start fallback, running, end,
+    /// reconnect reconciliation), control bytes and outcome words only. At most 4 lines per outcome
+    /// kind per 12 h window.
+    func workoutMode(_ line: String) {
+        let kind = line.split(separator: ":").first.map(String.init) ?? line
+        keyed("workout-mode-\(kind)", .message, perWindow: HelioBreadcrumbBudget.messageLinesPerKey) {
+            "workout mode (0x0019): \(line)"
+        }
+    }
+
     /// A notification on a standard characteristic nothing asked for (no bytes at all: it can be a
     /// heart-rate value).
     func strapNotification(characteristic: String) {

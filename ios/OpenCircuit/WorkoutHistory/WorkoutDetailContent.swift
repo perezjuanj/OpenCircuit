@@ -134,6 +134,42 @@ enum WorkoutDetailContent {
         }
     }
 
+    /// Whether the Helio Strap recorded the workout: it names the strap (`HKDevice`, decision 11), or
+    /// it is saved under the phone in time the strap owned (decision 28), as `recordedWith` decides.
+    static func isStrapWorkout(deviceName: String?, deviceManufacturer: String?,
+                               owner: DeviceOwnershipLog.Family) -> Bool {
+        if let name = deviceName, !name.isEmpty,
+           let maker = deviceManufacturer, !maker.localizedCaseInsensitiveContains("apple") {
+            return maker == WearableDeviceKind.zeppOS(model: "").brand
+        }
+        return owner == .zeppOS
+    }
+
+    // MARK: Heart rate below Zone 1 (#355)
+
+    /// Whether the detail shows `StrapWorkoutLowHeartRateNote.text` (decision 88): a strap workout only,
+    /// over its moving time and the workout-shaped readings (`end > start`) outside its pauses, with
+    /// the zones the detail shows. An activity type no OpenCircuit sport writes shows nothing. On the
+    /// main actor for `WorkoutSessionManager.hkActivityType(for:)`, the mapping the save uses. 89h: not
+    /// for a workout whose metadata says the strap's workout mode ran (a missing flag is phone-side).
+    @MainActor
+    static func showsLowHeartRateNote(_ item: WorkoutHistoryReader.Item, hr: [HRSample], zones: HeartRateZones,
+                                      isStrapWorkout: Bool) -> Bool {
+        guard let sport = WorkoutSportType.allCases.first(where: {
+            WorkoutSessionManager.hkActivityType(for: $0) == item.activityType
+        }) else { return false }
+        var ledger = WorkoutActivityLedger(start: item.start)
+        for pause in item.pauses.sorted(by: { $0.start < $1.start }) {
+            ledger.pause(at: pause.start)
+            ledger.resume(at: pause.end)
+        }
+        return StrapWorkoutLowHeartRateNote.applies(isStrapWorkout: isStrapWorkout,
+                                                    ranWithWorkoutMode: item.strapExtras.ranWithWorkoutMode,
+                                                    sport: sport, ledger: ledger,
+                                                    samples: hr.filter { $0.end > $0.start },
+                                                    end: item.end, zones: zones)
+    }
+
     // MARK: Rows
 
     struct Row: Identifiable, Equatable {
@@ -163,6 +199,11 @@ enum WorkoutDetailContent {
             rows.append(Row(title: "Active energy", value: "\(Int(kcal.rounded())) kcal",
                             caption: "Estimated from heart rate or distance, not measured."))
         }
+        // #359 (89e): the strap's own estimate, beside OpenCircuit's (which is the one in Apple Health).
+        if let strapKcal = item.strapExtras.strapKilocalories {
+            rows.append(Row(title: "Strap estimate", value: "\(strapKcal) kcal",
+                            caption: "The strap's own count from its workout mode. Apple Health has OpenCircuit's estimate."))
+        }
         if let avg = item.avgHR ?? mean(hr) { rows.append(Row(title: "Average heart rate", value: "\(avg) bpm")) }
         if let max = item.maxHR ?? hr.map(\.bpm).max() { rows.append(Row(title: "Maximum heart rate", value: "\(max) bpm")) }
         if let meters = item.distanceMeters, meters > 0 {
@@ -172,6 +213,7 @@ enum WorkoutDetailContent {
                 rows.append(pace)
             }
         }
+        if let swings = item.strapExtras.swings { rows.append(Row(title: "Swings", value: "\(swings)")) }
         if let load = TrainingLoad.workoutLoad(hrSamples: hr, zones: zones, sessionEnd: item.end) {
             rows.append(Row(title: "Training load", value: "\(Int(load.rounded()))",
                             caption: "Minutes in each heart-rate zone times the zone number (1 to 5)."))

@@ -1160,6 +1160,11 @@ struct ContentView: View {
             inbox.clear()
             _ = prepareShortcutWorkout(sport, on: device)
             openWorkoutSheet(device.linkTarget)
+        case .openWithoutType(let device):
+            // 89k: a strap-only sport with the ring chosen. Nothing starts and the shortcut selects
+            // nothing: the person picks a ring sport on the sheet.
+            inbox.clear()
+            openWorkoutSheet(device.linkTarget)
         }
     }
 

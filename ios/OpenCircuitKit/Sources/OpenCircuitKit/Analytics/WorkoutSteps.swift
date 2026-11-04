@@ -23,7 +23,7 @@ public enum IndoorStepWorkout {
         switch sport {
         case .runningIndoor, .walkingIndoor: return true
         case .walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .cyclingIndoor, .rowing, .hiking,
-             .strengthTraining, .yoga, .other: return false
+             .strengthTraining, .yoga, .other, .tennis, .pickleball: return false
         }
     }
 
@@ -154,7 +154,7 @@ public struct IndoorStride: Equatable, Sendable {
         case .walkingIndoor: return walkingHeightFactor
         case .runningIndoor: return runningHeightFactor
         case .walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .cyclingIndoor, .rowing, .hiking,
-             .strengthTraining, .yoga, .other: return nil
+             .strengthTraining, .yoga, .other, .tennis, .pickleball: return nil
         }
     }
 

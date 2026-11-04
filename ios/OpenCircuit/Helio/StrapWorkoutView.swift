@@ -1,5 +1,6 @@
 import SwiftUI
 import OpenCircuitKit
+import ZeppKit
 
 // The strap's workout screens (#227): the same layout as the ring's `WorkoutView` (sport picker →
 // live session → summary, with its `SportButton` and `ZoneBarRow`), plus pause/resume and the
@@ -74,7 +75,7 @@ struct StrapWorkoutView: View {
                 }
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "info.circle").foregroundStyle(.secondary)
-                    Text("OpenCircuit records this workout on your phone: heart rate from the strap once a second, and your phone's location outdoors. The strap keeps no workout record of its own. If the strap disconnects, the workout keeps running and the gap is shown; nothing is filled in.")
+                    Text(StrapWorkoutCopy.idleInfo(recorder.selectedSport))
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(10)
@@ -186,6 +187,26 @@ struct StrapWorkoutView: View {
                     .padding(.horizontal)
             }
 
+            // The strap's workout mode (#359, 89e): its swing count and its own kcal, when its frames
+            // carry them. Heart rate above stays the 0x2A37 stream (89d).
+            if recorder.strapSwings != nil || recorder.strapKilocalories != nil {
+                HStack(spacing: 16) {
+                    if let swings = recorder.strapSwings {
+                        VStack(spacing: 4) {
+                            Text("\(swings)").font(.title2.weight(.semibold)).monospacedDigit()
+                                .contentTransition(.numericText())
+                            Text("Swings").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    if let kcal = recorder.strapKilocalories {
+                        Text(StrapWorkoutCopy.strapEstimate(kcal)).font(.subheadline).foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+                .padding(.horizontal)
+            }
+
             Divider()
 
             VStack(alignment: .leading, spacing: 8) {
@@ -210,6 +231,14 @@ struct StrapWorkoutView: View {
                        "The strap is disconnected. The workout keeps running, and heart rate resumes when it reconnects.")
             } else if recorder.isPaused {
                 notice("pause.circle", "Paused. Time, heart rate and distance aren't counted until you resume.")
+            }
+            if recorder.workoutModeStatus == .unavailable {
+                // 89c: one quiet line, nothing alarming: live heart rate still flows.
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "info.circle").foregroundStyle(.secondary)
+                    Text(StrapWorkoutCopy.workoutModeUnavailable).font(.caption2).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal)
             }
             if recorder.location.keepAliveUnavailable {
                 notice("exclamationmark.triangle.fill",
@@ -276,6 +305,13 @@ struct StrapWorkoutView: View {
                     if let distance = summary.distanceMeters {
                         statCell("Distance", UnitsFormatter.distance(distance, unit: distanceUnit, fractionDigits: 2))
                     }
+                    // The strap's workout mode (#359, 89e), when its frames carried them.
+                    if let swings = recorder.strapSwings {
+                        statCell("Swings", "\(swings)")
+                    }
+                    if let kcal = recorder.strapKilocalories {
+                        statCell("Strap estimate", "\(kcal) kcal")
+                    }
                 }
                 .padding(.horizontal)
 
@@ -313,8 +349,11 @@ struct StrapWorkoutView: View {
                     .padding(.horizontal)
 
                 VStack(alignment: .leading, spacing: 6) {
-                    noteRow("iphone", .secondary,
-                            "Duration, calories and zones are OpenCircuit's own, worked out on your phone from the strap's live heart rate\(summary.hasRoute ? " and your phone's location" : ""). The strap made no record of this workout.")
+                    noteRow("iphone", .secondary, StrapWorkoutCopy.totalsNote(hasRoute: summary.hasRoute,
+                                                                             workoutMode: recorder.workoutModeStatus))
+                    if recorder.strapKilocalories != nil {
+                        noteRow("info.circle", .secondary, StrapWorkoutCopy.strapEstimateNote)
+                    }
                     if !result.pauses.isEmpty {
                         noteRow("pause.circle", .secondary,
                                 "Paused \(result.pauses.count) time\(result.pauses.count == 1 ? "" : "s") for \(Self.duration(result.pauses.reduce(0) { $0 + $1.duration })) in total; that time isn't counted.")
@@ -322,6 +361,10 @@ struct StrapWorkoutView: View {
                     if result.gapSeconds >= 1 {
                         noteRow("antenna.radiowaves.left.and.right.slash", .orange,
                                 "No heart rate for \(Self.duration(result.gapSeconds)) while the strap was disconnected. That time has no readings and no zone time.")
+                    }
+                    if recorder.showsLowHeartRateNote {
+                        // Decision 88: informational, display only.
+                        noteRow("info.circle", .secondary, StrapWorkoutLowHeartRateNote.text)
                     }
                     if summary.estimatedActiveKcal != nil {
                         noteRow("info.circle", .secondary, summary.hrSampleCount > 0
@@ -554,5 +597,44 @@ struct StrapWorkoutHooks: ViewModifier {
             + "\(recovered.sport.displayName), \(StrapWorkoutView.duration(recovered.activeSeconds)) long, "
             + "with \(readings) heart-rate reading\(readings == 1 ? "" : "s"). It ends at the last reading the "
             + "app received, so it may be short. The GPS route isn't kept."
+            // 89n: Discard can't take back what the strap saved in its own workout mode.
+            + (recovered.workoutMode?.ranWithWorkoutMode == true ? " " + StrapWorkoutCopy.strapMayKeepRecord : "")
+    }
+}
+
+/// The strap workout screen's copy that depends on the strap's workout mode (#359, decision 89).
+enum StrapWorkoutCopy {
+    /// 89n, verbatim: a discard can't remove what the strap saved (its end always saves, 89j).
+    static let strapMayKeepRecord = "The strap may still keep a record of this workout in Zepp."
+
+    /// 89c, verbatim: the one quiet line of a fallback.
+    static let workoutModeUnavailable = "Strap workout mode unavailable for this sport; recording continues."
+
+    /// 89e: the strap's own kcal, live and on the summary's line.
+    static func strapEstimate(_ kcal: Int) -> String { "Strap estimate · \(kcal) kcal" }
+
+    static let strapEstimateNote = "The strap estimate is the strap's own calorie count from its workout mode. "
+        + "Apple Health gets OpenCircuit's estimate above, not this one."
+
+    /// Before Start: what the workout does for the sport picked.
+    static func idleInfo(_ sport: WorkoutSportType) -> String {
+        let common = "OpenCircuit records this workout on your phone: heart rate from the strap once a second, and your phone's location outdoors."
+        let gap = "If the strap disconnects, the workout keeps running and the gap is shown; nothing is filled in."
+        guard ZeppWorkoutSport.forSport(sport) != nil else {
+            return "\(common) The strap keeps no workout record of its own. \(gap)"
+        }
+        return "\(common) It also starts the strap's own workout mode, which reads better during hard effort; "
+            + "the strap then saves its own record of the workout, which the Zepp app shows. \(gap)"
+    }
+
+    /// The summary's first note: whose totals these are, and what the strap kept.
+    static func totalsNote(hasRoute: Bool, workoutMode: StrapWorkoutModeStatus) -> String {
+        let totals = "Duration, calories and zones are OpenCircuit's own, worked out on your phone from the strap's live heart rate\(hasRoute ? " and your phone's location" : "")."
+        switch workoutMode {
+        case .none: return totals + " The strap made no record of this workout."
+        // 89o (d), verbatim.
+        case .running: return totals + " The strap also recorded this workout in its workout mode."
+        case .starting, .unavailable: return totals
+        }
     }
 }

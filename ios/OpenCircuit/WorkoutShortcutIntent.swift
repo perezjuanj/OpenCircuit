@@ -15,13 +15,14 @@ import OpenCircuitKit
 //
 // Listed in `OpenCircuitAppShortcuts` (HeadacheLogIntent.swift), the app's only provider.
 
-/// The workout types, as Shortcuts and Siri show them. Mirrors `WorkoutSportType` one to one; the
+/// The workout types, as Shortcuts and Siri show them. Mirrors `WorkoutSportType` one to one (Tennis
+/// and Pickleball are strap sports: with the ring chosen they start nothing, `WorkoutShortcutStart`); the
 /// titles are literals because the App Intents metadata is extracted at build time, and
 /// `WorkoutShortcutIntentTests` pins them to `WorkoutSportType.displayName` so the shortcut and the
 /// in-app picker can never name a type differently.
 enum WorkoutTypeChoice: String, AppEnum, CaseIterable {
     case walkingOutdoor, walkingIndoor, runningOutdoor, runningIndoor, cyclingOutdoor, cyclingIndoor
-    case rowing, hiking, strengthTraining, yoga, other
+    case rowing, hiking, strengthTraining, yoga, other, tennis, pickleball
 
     static let typeDisplayRepresentation: TypeDisplayRepresentation = "Workout Type"
     static let caseDisplayRepresentations: [WorkoutTypeChoice: DisplayRepresentation] = [
@@ -36,6 +37,8 @@ enum WorkoutTypeChoice: String, AppEnum, CaseIterable {
         .strengthTraining: DisplayRepresentation(title: "Strength", synonyms: ["Strength Training", "Weights"]),
         .yoga: DisplayRepresentation(title: "Yoga"),
         .other: DisplayRepresentation(title: "Other"),
+        .tennis: DisplayRepresentation(title: "Tennis"),
+        .pickleball: DisplayRepresentation(title: "Pickleball"),
     ]
 
     var sport: WorkoutSportType {
@@ -51,6 +54,8 @@ enum WorkoutTypeChoice: String, AppEnum, CaseIterable {
         case .strengthTraining: return .strengthTraining
         case .yoga: return .yoga
         case .other: return .other
+        case .tennis: return .tennis
+        case .pickleball: return .pickleball
         }
     }
 }

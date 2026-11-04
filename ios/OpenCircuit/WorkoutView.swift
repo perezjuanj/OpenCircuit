@@ -164,7 +164,7 @@ struct WorkoutView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 110))], spacing: 12) {
-                ForEach(WorkoutSportType.allCases, id: \.rawValue) { sport in
+                ForEach(WorkoutSportType.ringSports, id: \.rawValue) { sport in
                     SportButton(sport: sport, selected: manager.selectedSport == sport) {
                         manager.selectedSport = sport
                     }
@@ -250,7 +250,7 @@ struct WorkoutView: View {
                     Text("CONFIRM ACTIVITY")
                         .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 110))], spacing: 12) {
-                        ForEach(WorkoutSportType.allCases, id: \.rawValue) { sport in
+                        ForEach(WorkoutSportType.ringSports, id: \.rawValue) { sport in
                             SportButton(sport: sport, selected: manager.selectedSport == sport) {
                                 manager.selectedSport = sport
                             }

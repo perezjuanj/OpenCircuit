@@ -10,15 +10,69 @@ import OpenCircuitKit
 
 // MARK: - Apple Health
 
+/// The `HKWorkoutBuilder` calls a strap workout's save makes, so a test can run `save` itself
+/// (89p e). `HealthKitWorkoutBuilding` forwards them to a real builder.
+@MainActor
+protocol StrapWorkoutBuilding: AnyObject {
+    func beginCollection(at date: Date) async throws
+    func addWorkoutEvents(_ events: [HKWorkoutEvent]) async throws
+    func addSamples(_ samples: [HKSample]) async throws
+    func addMetadata(_ metadata: [String: Any]) async throws
+    func endCollection(at date: Date) async throws
+    func finishWorkout() async throws -> HKWorkout?
+}
+
+@MainActor
+private final class HealthKitWorkoutBuilding: StrapWorkoutBuilding {
+    private let builder: HKWorkoutBuilder
+    init(_ builder: HKWorkoutBuilder) { self.builder = builder }
+    func beginCollection(at date: Date) async throws { try await builder.beginCollection(at: date) }
+    func addWorkoutEvents(_ events: [HKWorkoutEvent]) async throws { try await builder.addWorkoutEvents(events) }
+    func addSamples(_ samples: [HKSample]) async throws { try await builder.addSamples(samples) }
+    func addMetadata(_ metadata: [String: Any]) async throws { try await builder.addMetadata(metadata) }
+    func endCollection(at date: Date) async throws { try await builder.endCollection(at: date) }
+    func finishWorkout() async throws -> HKWorkout? { try await builder.finishWorkout() }
+}
+
 /// One `HKWorkout` per strap workout, the way `WorkoutSessionManager.writeWorkout` writes the ring's,
 /// with two differences: the strap is named (the existing `HKDevice` attribution, decision 11), and
 /// the workout carries its pause/resume events so Health's duration is the running time.
 @MainActor
 final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
     private let hkStore = HKHealthStore()
+    private let isHealthDataAvailable: () -> Bool
+    /// nil: a real `HKWorkoutBuilder` (production). Tests give a recording one.
+    private let makeBuilder: ((HKWorkoutConfiguration, HKDevice?) -> any StrapWorkoutBuilding)?
+
+    init(isHealthDataAvailable: @escaping () -> Bool = { HKHealthStore.isHealthDataAvailable() },
+         makeBuilder: ((HKWorkoutConfiguration, HKDevice?) -> any StrapWorkoutBuilding)? = nil) {
+        self.isHealthDataAvailable = isHealthDataAvailable
+        self.makeBuilder = makeBuilder
+    }
+
+    /// What the workout carries besides its samples (89d, 89e, 89h, 89o c): the active energy written
+    /// is OpenCircuit's own estimate, NEVER the strap's kcal, and the metadata says whether the strap's
+    /// workout mode ran, with its swings and kcal when it sent them. `save` takes both from here.
+    static func energyAndMetadata(_ write: StrapWorkoutWrite) -> (activeKcal: Double?, metadata: [String: Int]) {
+        (write.summary.summary.estimatedActiveKcal, StrapWorkoutMetadata.metadata(write.workoutMode))
+    }
+
+    /// 89p (e): the workout's active-energy samples, built here only. `save` adds exactly these and
+    /// reads no other energy (the daily credit is their sum).
+    static func energySamples(_ write: StrapWorkoutWrite, device: HKDevice?) -> [HKQuantitySample] {
+        let summary = write.summary.summary
+        let content = energyAndMetadata(write)
+        if let kcal = content.activeKcal, kcal > 0 {
+            return [HKQuantitySample(
+                type: HKQuantityType(.activeEnergyBurned), quantity: HKQuantity(unit: .kilocalorie(), doubleValue: kcal),
+                start: summary.startDate, end: summary.endDate, device: device,
+                metadata: [HealthKitWriter.activeEnergyEstimateMetadataKey: true, HKMetadataKeyWasUserEntered: false])]
+        }
+        return []
+    }
 
     func save(_ write: StrapWorkoutWrite) async -> Bool {
-        guard HKHealthStore.isHealthDataAvailable() else { return false }
+        guard isHealthDataAvailable() else { return false }
         let summary = write.summary.summary
         let configuration = HKWorkoutConfiguration()
         configuration.activityType = WorkoutSessionManager.hkActivityType(for: summary.sport)
@@ -28,7 +82,8 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
         // Before the strap has an identity (#222's first-write guard) the workout is the phone's, as
         // the ring's workout always is.
         let strap = HealthKitWriter.wearableDevice(forTimeline: write.timeline, wearable: .shared)
-        let builder = HKWorkoutBuilder(healthStore: hkStore, configuration: configuration, device: strap ?? .local())
+        let builder: any StrapWorkoutBuilding = makeBuilder?(configuration, strap)
+            ?? HealthKitWorkoutBuilding(HKWorkoutBuilder(healthStore: hkStore, configuration: configuration, device: strap ?? .local()))
         do {
             try await builder.beginCollection(at: summary.startDate)
         } catch {
@@ -54,15 +109,13 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
 
         // Energy: an ESTIMATE, labelled as the ring's is. Netted out of the daily estimate only if it
         // actually landed (see the ring's `energySampleWritten`).
-        var energySampleWritten = false
-        if let kcal = summary.estimatedActiveKcal, kcal > 0 {
-            let sample = HKQuantitySample(
-                type: HKQuantityType(.activeEnergyBurned), quantity: HKQuantity(unit: .kilocalorie(), doubleValue: kcal),
-                start: summary.startDate, end: summary.endDate, device: strap,
-                metadata: [HealthKitWriter.activeEnergyEstimateMetadataKey: true, HKMetadataKeyWasUserEntered: false])
+        // 89p (e): exactly the seam's samples; their sum is what the day is credited with.
+        var creditedKcal = 0.0
+        let energy = Self.energySamples(write, device: strap)
+        if !energy.isEmpty {
             do {
-                try await builder.addSamples([sample])
-                energySampleWritten = true
+                try await builder.addSamples(energy)
+                creditedKcal = energy.reduce(0) { $0 + $1.quantity.doubleValue(for: .kilocalorie()) }
             } catch {}
         }
 
@@ -93,6 +146,11 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
             } catch {}
         }
 
+        // #359 (89e, 89h): whether the strap's workout mode ran, and its swings and kcal when it sent
+        // them, as metadata on the workout. Optional: a refusal never fails the workout, and nothing
+        // above (heart rate, energy, distance) depends on it.
+        try? await builder.addMetadata(Self.energyAndMetadata(write).metadata)
+
         do {
             try await builder.endCollection(at: summary.endDate)
         } catch { return false }
@@ -104,9 +162,8 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
 
         // Committed: only now credit the daily estimates, and only for today (the ring's rule).
         if walkRunDistanceToCredit > 0 { HealthKitWriter.recordWorkoutWalkRunDistance(walkRunDistanceToCredit) }
-        if energySampleWritten, let kcal = summary.estimatedActiveKcal, kcal > 0,
-           Calendar.current.isDateInToday(summary.endDate) {
-            HealthKitWriter.recordWorkoutActiveKcal(kcal, day: summary.endDate)
+        if creditedKcal > 0, Calendar.current.isDateInToday(summary.endDate) {
+            HealthKitWriter.recordWorkoutActiveKcal(creditedKcal, day: summary.endDate)
             HealthKitWriter.recordWorkoutCreditedSpan(start: summary.startDate, end: summary.endDate)
         }
         if !write.route.isEmpty, summary.hasRoute {

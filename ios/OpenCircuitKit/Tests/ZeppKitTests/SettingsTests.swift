@@ -34,6 +34,8 @@ private struct Health {
     var highHR: UInt8 = 0
     var highHRAllowed: [UInt8] = [0, 100, 110, 120]
     var relax = false
+    /// Heart Rate Broadcast (`83`); nil = the strap doesn't report it.
+    var broadcast: Bool? = nil
     var version: UInt8 = 0x03
 
     /// The entry for one arg, as the strap would send it.
@@ -49,13 +51,14 @@ private struct Health {
         case 0x03: return byteEntry(0x03, 0, allowed: [0, 40, 45, 50])
         case 0x14: return boolEntry(0x14, relax)
         case 0x32: return byteEntry(0x32, 0, allowed: [0, 80, 85, 90])
+        case 0x83: return broadcast.map { boolEntry(0x83, $0) } ?? []
         default: return []
         }
     }
 
     /// The reply to a read of `arguments`, in that order.
     func reply(_ arguments: [UInt8]) -> [UInt8] {
-        ZeppKitTests.reply(version: version, arguments.map(entry))
+        ZeppKitTests.reply(version: version, arguments.map(entry).filter { !$0.isEmpty })
     }
 
     var full: [UInt8] { reply(ZeppSettingsEditor.groupArguments(0x08)) }
@@ -94,16 +97,16 @@ final class SettingsTests: XCTestCase {
     // MARK: Requests and the snapshot
 
     func testRequestsAndWhatIsNeverOffered() {
-        XCTAssertEqual(ZeppSettingsEditor.readRequest(group: 0x08), hex("03 01 08 0a 01 04 11 12 13 31 02 03 14 32"))
+        XCTAssertEqual(ZeppSettingsEditor.readRequest(group: 0x08), hex("03 01 08 0b 01 04 11 12 13 31 02 03 14 32 83"))
         XCTAssertEqual(ZeppSettingsEditor.readRequest(group: 0x09), hex("03 01 09 03 40 41 42"), "worked example M's read")
         XCTAssertEqual(ZeppSettingsEditor.familyRequest(.lowSpO2Alert), hex("03 01 08 02 31 32"), "worked example J's read")
         XCTAssertEqual(ZeppSettingsEditor.familyRequest(.heartRateMonitoring), hex("03 01 08 01 01"), "worked example I's read")
         XCTAssertEqual(ZeppSettingsEditor.familyRequest(.relaxReminder), hex("03 01 08 02 13 14"))
         let arguments = ZeppSetting.allCases.map { ($0.group, $0.argument) }
-        XCTAssertFalse(arguments.contains { $0 == (0x08, 0x05) }, "heart-rate push is unsettled (§5.5)")
+        XCTAssertFalse(arguments.contains { $0 == (0x08, 0x05) }, "HEALTH 05 (sharing with third parties) is unsettled (§5.5)")
         XCTAssertFalse(arguments.contains { $0 == (0x09, 0x40) }, "categories are never written (§19.3)")
         XCTAssertFalse(arguments.contains { $0.0 == 0x08 && [0x41, 0x51].contains($0.1) }, "inactivity and goal alerts stay out")
-        XCTAssertEqual(Set(ZeppSetting.measurement + ZeppSetting.alerts + ZeppSetting.workoutDetection),
+        XCTAssertEqual(Set(ZeppSetting.measurement + ZeppSetting.alerts + ZeppSetting.workoutDetection + ZeppSetting.broadcast),
                        Set(ZeppSetting.allCases))
     }
 

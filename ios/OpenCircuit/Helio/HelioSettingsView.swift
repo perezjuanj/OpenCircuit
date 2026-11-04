@@ -8,8 +8,11 @@ import ZeppKit
 // reports, and the only thing kept on the phone is the last read, for display while the strap
 // can't be reached.
 //
+// Heart Rate Broadcast (Zepp's switch, formerly "Heart Rate Push") is HEALTH `83` (🟢 §5.5, §18.9;
+// #359, decision 89g): its own section on the Measurement screen, hidden when the strap doesn't report
+// it. HEALTH `05` (share with third parties, 🔴) is not it and stays out.
+//
 // Left out on purpose:
-// - Heart Rate Push: the spec can't say which arg it is (HEALTH `05` is 🔴 "probably", §5.5).
 // - Inactivity and goal alerts: whether they buzz on the Helio is 🔴 (§13.4, §20).
 // - A workout-detection on/off switch: no arg is known (§19.2); WORKOUT `40` (categories) is never
 //   written (§19.3).
@@ -77,6 +80,7 @@ enum HelioSettingsCopy {
         case .lowSpO2Alert: return "Low SpO₂"
         case .workoutDetectionAlert: return "Alert when a workout is detected"
         case .workoutDetectionSensitivity: return "Detection sensitivity"
+        case .heartRateBroadcast: return "Heart Rate Broadcast"
         }
     }
 
@@ -109,6 +113,9 @@ enum HelioSettingsCopy {
             return "Lets you know when the strap detects a workout. On the strap this is probably a buzz; that isn't confirmed yet."
         case .workoutDetectionSensitivity:
             return "Higher notices a workout sooner; lower waits longer."
+        case .heartRateBroadcast:
+            // Its section footer says it (`broadcastFooter`): no second caption under the switch.
+            return ""
         }
     }
 
@@ -207,8 +214,9 @@ enum HelioSettingsCopy {
         + "OpenCircuit doesn't import the strap's workout records, so these settings only change what the strap and the Zepp app record."
     static let workoutSwitchNote = "Turning detection itself on or off isn't here yet: which strap setting does that hasn't been identified."
     static let savedOnStrap = "Saved on the strap itself. OpenCircuit changes a setting only when you do."
-    static let heartRatePushNote = "Heart Rate Push isn't here yet: which strap setting it is hasn't been confirmed. "
-        + "OpenCircuit doesn't need it once the key is saved."
+    /// 89g, verbatim.
+    static let broadcastFooter = "Lets gym equipment, other apps and devices read your heart rate from the strap. "
+        + "Turning it on can use a little more battery."
 }
 
 private extension String {
@@ -269,8 +277,10 @@ private struct HelioSettingRow: View {
                 default:
                     control(current: current).disabled(!usable)
                 }
-                Text(HelioSettingsCopy.explanation(setting)).font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if !HelioSettingsCopy.explanation(setting).isEmpty {
+                    Text(HelioSettingsCopy.explanation(setting)).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 switch availability {
                 case .needs(let parent):
                     // §17.7: shown inactive, with its stored value visible.
@@ -316,6 +326,8 @@ private struct HelioSettingsList: View {
     let settings: [ZeppSetting]
     let header: String?
     let footer: String
+    /// Settings of the same group shown in a section of their own, each with its footer (89g).
+    var extraSections: [(settings: [ZeppSetting], footer: String)] = []
     @State private var hasKey = HelioKeyStore.shared.hasKey
     @State private var keyRejected = HelioKeyStore.shared.isRejected
 
@@ -348,6 +360,22 @@ private struct HelioSettingsList: View {
                         Text(footer)
                     }
                 }
+                ForEach(extraSections.indices, id: \.self) { index in
+                    let extra = extraSections[index]
+                    // Hidden when the strap doesn't report it (89g).
+                    let shown = extra.settings.filter { snapshot.value($0) != nil }
+                    if !shown.isEmpty {
+                        Section {
+                            ForEach(shown, id: \.self) { setting in
+                                HelioSettingRow(setting: setting, snapshot: snapshot, enabled: model.canChange && !model.isBusy) { from, to in
+                                    model.session?.changeStrapSetting(setting, from: from, to: to)
+                                }
+                            }
+                        } footer: {
+                            Text(extra.footer)
+                        }
+                    }
+                }
             } else if model.hasLiveRead {
                 Section { Text("The strap didn't report these settings.").foregroundStyle(.secondary) }
             } else if model.canRead, model.editor?.isOffered(group: group) == true {
@@ -362,7 +390,8 @@ private struct HelioSettingsList: View {
             }
             if model.isBusy, model.editor?.changeInFlight != nil {
                 Section { Text("Saving to the strap…").font(.caption) }
-            } else if model.canRead, let notice = model.session?.settingsNotice, notice.belongs(to: settings) {
+            } else if model.canRead, let notice = model.session?.settingsNotice,
+                      notice.belongs(to: settings + extraSections.flatMap(\.settings)) {
                 Section { Text(notice.text).font(.caption) }
             }
         }
@@ -391,7 +420,8 @@ struct HelioMeasurementSettingsView: View {
 
     var body: some View {
         HelioSettingsList(connection: connection, group: ZeppConfig.healthGroup, settings: ZeppSetting.measurement, header: nil,
-                          footer: HelioSettingsCopy.savedOnStrap + " " + HelioSettingsCopy.heartRatePushNote)
+                          footer: HelioSettingsCopy.savedOnStrap,
+                          extraSections: [(ZeppSetting.broadcast, HelioSettingsCopy.broadcastFooter)])
             .navigationTitle("Measurement")
             .navigationBarTitleDisplayMode(.inline)
     }

@@ -56,9 +56,55 @@ final class WorkoutShortcutStartTests: XCTestCase {
     }
 
     func testEveryWorkoutTypeCanBeStarted() {
-        for sport in WorkoutSportType.allCases {
+        for sport in WorkoutSportType.ringSports {
             let r = WorkoutShortcutStart.Request(sport: sport, requestedAt: t0)
             XCTAssertEqual(WorkoutShortcutStart.decide(r, context: context(), now: t0), .start(.ring, sport))
         }
+        for sport in WorkoutSportType.allCases {
+            let r = WorkoutShortcutStart.Request(sport: sport, requestedAt: t0)
+            XCTAssertEqual(WorkoutShortcutStart.decide(r, context: context(device: .strap), now: t0), .start(.strap, sport))
+        }
+    }
+
+    // MARK: Strap-only sports (#359, decision 89k)
+
+    private func decide(_ sport: WorkoutSportType, _ c: WorkoutShortcutStart.Context,
+                        after seconds: TimeInterval = 1) -> WorkoutShortcutStart.Action {
+        WorkoutShortcutStart.decide(.init(sport: sport, requestedAt: t0), context: c, now: t0.addingTimeInterval(seconds))
+    }
+
+    func testRingPlusTennisStartsNothingAndOpensTheSheetWithoutAType() {
+        XCTAssertEqual(decide(.tennis, context(device: .ring)), .openWithoutType(.ring))
+        XCTAssertEqual(decide(.tennis, context(device: .ring, ready: false)), .openWithoutType(.ring), "not queued for the ring")
+        XCTAssertEqual(decide(.tennis, context(device: .ring, ready: false), after: WorkoutShortcutStart.readyTimeout),
+                       .openWithoutType(.ring))
+    }
+
+    func testRingPlusPickleballStartsNothingAndOpensTheSheetWithoutAType() {
+        XCTAssertEqual(decide(.pickleball, context(device: .ring)), .openWithoutType(.ring))
+        XCTAssertEqual(decide(.pickleball, context(device: .ring, ready: false)), .openWithoutType(.ring))
+    }
+
+    func testStrapPlusTennisOrPickleballStartsLikeAnyStrapSport() {
+        for sport in [WorkoutSportType.tennis, .pickleball] {
+            XCTAssertEqual(decide(sport, context(device: .strap)), .start(.strap, sport))
+            XCTAssertEqual(decide(sport, context(device: .strap, ready: false)), .waitForDevice(.strap, sport))
+            XCTAssertEqual(decide(sport, context(device: .strap, ready: false), after: WorkoutShortcutStart.readyTimeout),
+                           .giveUp(.strap, sport))
+        }
+    }
+
+    func testARingSportStillStartsOnTheRing() {
+        for sport in WorkoutSportType.ringSports {
+            XCTAssertEqual(decide(sport, context(device: .ring)), .start(.ring, sport))
+            XCTAssertEqual(decide(sport, context(device: .ring, ready: false)), .waitForDevice(.ring, sport))
+        }
+    }
+
+    func testTheExistingRulesStillComeFirstForAStrapOnlySport() {
+        XCTAssertEqual(decide(.tennis, context(device: .ring, onboarding: false)), .hold)
+        XCTAssertEqual(decide(.tennis, context(device: .ring, recovery: true)), .hold)
+        XCTAssertEqual(decide(.tennis, context(device: .ring, ring: true)), .showRunning(.ring), "never doubles a running workout")
+        XCTAssertEqual(decide(.pickleball, context(device: .ring, strap: true)), .showRunning(.strap))
     }
 }

@@ -285,11 +285,15 @@ public enum ZeppConfig {
         /// gate recording: on the Helio it read off while every minute of a 12 h activity fetch
         /// carried a heart rate (§5.5). Informational only.
         public static let heartRateDuringActivity: UInt8 = 0x04
+        /// "Share HR with third parties" (🔴, §5.5). NOT Heart Rate Broadcast, which is `0x83`.
         public static let heartRateSharing: UInt8 = 0x05
         public static let highAccuracySleep: UInt8 = 0x11
         public static let sleepBreathingQuality: UInt8 = 0x12
         public static let stressMonitoring: UInt8 = 0x13
         public static let allDaySpO2: UInt8 = 0x31
+        /// Heart Rate Broadcast (Zepp's switch, formerly "Heart Rate Push"), bool: live heart rate to
+        /// other apps and devices (🟢 §5.5, §18.9). Not a recording switch.
+        public static let heartRateBroadcast: UInt8 = 0x83
     }
 
     /// The HEALTH arguments whose off state means a fetch type comes back empty.
@@ -491,7 +495,7 @@ public struct ZeppHealthSettings: Equatable {
     public var warnings: [String] {
         var out = [String]()
         if heartRateMonitoring == 0x00 { out.append("all-day heart-rate monitoring is off: activity HR, resting/max HR and HRV may be empty") }
-        if heartRateSharing == false { out.append("heart-rate sharing (probably Zepp's \"Heart Rate Push\") is off: standard live HR may not broadcast") }
+        if heartRateSharing == false { out.append("heart-rate sharing with third parties (HEALTH 05) is off; what it controls is unconfirmed, and it is not Heart Rate Broadcast (HEALTH 83)") }
         if highAccuracySleep == false { out.append("high-accuracy sleep monitoring is off: sleep staging may be missing") }
         if sleepBreathingQuality == false { out.append("sleep breathing-quality monitoring is off: sleep SpO2 / respiratory rate may be empty") }
         if stressMonitoring == false { out.append("stress monitoring is off: stress (auto) will be empty") }

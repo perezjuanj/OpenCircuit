@@ -15,6 +15,9 @@
 //     the strap authenticated and streaming). Starting during a ring sync is exactly what the Start
 //     button is disabled for (T1). So the request WAITS with the workout sheet open and the type
 //     already selected, and starts the moment the device is ready.
+//   • Tennis and Pickleball are strap sports only (#359, decision 89k). With the ring chosen, a
+//     shortcut for one of them starts nothing and queues nothing: the request is dropped and the ring's
+//     workout sheet opens without the shortcut selecting a type, so the person picks a ring sport.
 //   • A wait has an end. After `readyTimeout` the request is dropped and the sheet stays open with the
 //     type selected; the person taps Start when the device is back. A workout that begins by itself
 //     long after the shortcut ran, with the phone in a pocket, would be a surprise and a wrong record.
@@ -80,6 +83,9 @@ public enum WorkoutShortcutStart {
         case waitForDevice(Device, WorkoutSportType)
         /// The deadline passed: leave the sheet open with the type selected, drop the request.
         case giveUp(Device, WorkoutSportType)
+        /// The device can't record this type (the ring and a strap-only sport, 89k): drop the request
+        /// and open the device's sheet without selecting a type.
+        case openWithoutType(Device)
     }
 
     /// How long a request waits for its device. A cold launch has to reconnect, and the ring may run
@@ -93,6 +99,7 @@ public enum WorkoutShortcutStart {
         // whichever device is chosen now (the Activity tab keeps its card for the same reason).
         if c.strapRecording { return .showRunning(.strap) }
         if c.ringRecording { return .showRunning(.ring) }
+        if c.device == .ring, !WorkoutSportType.ringSports.contains(request.sport) { return .openWithoutType(.ring) }
         if c.deviceReady { return .start(c.device, request.sport) }
         if now.timeIntervalSince(request.requestedAt) >= readyTimeout { return .giveUp(c.device, request.sport) }
         return .waitForDevice(c.device, request.sport)

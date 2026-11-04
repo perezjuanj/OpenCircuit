@@ -44,6 +44,9 @@ struct WorkoutHistoryReader {
         var pauses: [DateInterval] = []
         var deviceName: String? = nil
         var deviceManufacturer: String? = nil
+        /// What the strap's workout mode stored on the workout (#359, 89e/89h). Phone-side (all nil)
+        /// when the metadata is missing: a ring workout, or a strap workout from before #359.
+        var strapExtras = StrapWorkoutModeExtras()
 
         var duration: TimeInterval { end.timeIntervalSince(start) }
         var pausedSeconds: TimeInterval { pauses.reduce(0) { $0 + $1.duration } }
@@ -52,7 +55,8 @@ struct WorkoutHistoryReader {
         init(id: UUID, activityType: HKWorkoutActivityType, start: Date, end: Date,
              activeKcal: Double?, distanceMeters: Double?, avgHR: Int?,
              walkRunMeters: Double? = nil, maxHR: Int? = nil, pauses: [DateInterval] = [],
-             deviceName: String? = nil, deviceManufacturer: String? = nil) {
+             deviceName: String? = nil, deviceManufacturer: String? = nil,
+             strapExtras: StrapWorkoutModeExtras = StrapWorkoutModeExtras()) {
             self.id = id
             self.activityType = activityType
             self.start = start
@@ -65,6 +69,7 @@ struct WorkoutHistoryReader {
             self.pauses = pauses
             self.deviceName = deviceName
             self.deviceManufacturer = deviceManufacturer
+            self.strapExtras = strapExtras
         }
 
         init(_ w: HKWorkout) {
@@ -98,7 +103,8 @@ struct WorkoutHistoryReader {
                       maxHR: maxBPM.map { Int($0.rounded()) },
                       pauses: WorkoutDetailContent.pauses(markers, end: w.endDate),
                       deviceName: w.device?.name,
-                      deviceManufacturer: w.device?.manufacturer)
+                      deviceManufacturer: w.device?.manufacturer,
+                      strapExtras: StrapWorkoutMetadata.extras(from: w.metadata))
         }
 
         /// What a deletion needs, read from the workout's own totals (see `WorkoutDeleter`).
@@ -179,6 +185,8 @@ enum WorkoutActivityDisplay {
         case .hiking:                       return "Hiking"
         case .traditionalStrengthTraining:  return "Strength"
         case .yoga:                         return "Yoga"
+        case .tennis:                       return "Tennis"
+        case .pickleball:                   return "Pickleball"
         default:                            return "Workout"
         }
     }
@@ -192,6 +200,8 @@ enum WorkoutActivityDisplay {
         case .hiking:                       return "mountain.2"
         case .traditionalStrengthTraining:  return "dumbbell"
         case .yoga:                         return "figure.yoga"
+        case .tennis:                       return "tennis.racket"
+        case .pickleball:                   return "figure.pickleball"
         default:                            return "heart.circle"
         }
     }

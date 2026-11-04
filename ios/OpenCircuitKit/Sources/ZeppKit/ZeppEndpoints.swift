@@ -13,6 +13,8 @@ public enum ZeppEndpoint {
     public static let userInfo: UInt16 = 0x0017
     /// Vibration patterns (§13.1). Never written in v1 (§14, §15.1).
     public static let vibrationPatterns: UInt16 = 0x0018
+    /// The strap's workout mode (§18.9) and phone GPS (§18.5). Encrypted (§3.5).
+    public static let workout: UInt16 = 0x0019
     /// Find device / find phone (§11).
     public static let findDevice: UInt16 = 0x001A
     public static let heartRate: UInt16 = 0x001D
@@ -33,6 +35,7 @@ public enum ZeppEndpoint {
         realtimeSteps: false,
         userInfo: true,
         vibrationPatterns: true,
+        workout: true,
         findDevice: true,
         heartRate: false,
         notifications: true,
@@ -53,6 +56,7 @@ public enum ZeppEndpoint {
         case realtimeSteps: return "realtime steps"
         case userInfo: return "user info"
         case vibrationPatterns: return "vibration patterns"
+        case workout: return "workout"
         case findDevice: return "find device"
         case heartRate: return "heart rate"
         case notifications: return "notifications"

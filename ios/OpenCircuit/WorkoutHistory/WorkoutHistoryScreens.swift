@@ -197,6 +197,12 @@ struct WorkoutDetailView: View {
         }
     }
 
+    /// Decision 88's note is for the strap's workouts only.
+    private var isStrapWorkout: Bool {
+        WorkoutDetailContent.isStrapWorkout(deviceName: item.deviceName, deviceManufacturer: item.deviceManufacturer,
+                                            owner: LocalStore.ownershipLog().owner(at: item.start))
+    }
+
     private var summary: some View {
         let recorder = WorkoutDetailContent.recordedWith(
             deviceName: item.deviceName, deviceManufacturer: item.deviceManufacturer,
@@ -233,6 +239,10 @@ struct WorkoutDetailView: View {
                 .frame(height: 160)
                 if hrSource == .appHistory {
                     Text("From OpenCircuit's stored readings: none were saved with this workout in Apple Health.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if WorkoutDetailContent.showsLowHeartRateNote(item, hr: hr, zones: zones, isStrapWorkout: isStrapWorkout) {
+                    Text(StrapWorkoutLowHeartRateNote.text)
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
