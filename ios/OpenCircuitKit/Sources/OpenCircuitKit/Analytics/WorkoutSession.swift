@@ -87,8 +87,8 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
         case .strengthTraining:  return "dumbbell"
         case .yoga:              return "figure.yoga"
         case .other:             return "heart.circle"
-        // No new icon (icons come only from keylineicons.com): the generic workout symbol.
-        case .tennis, .pickleball: return "heart.circle"
+        case .tennis:            return "tennis.racket"
+        case .pickleball:        return "figure.pickleball"
         }
     }
 

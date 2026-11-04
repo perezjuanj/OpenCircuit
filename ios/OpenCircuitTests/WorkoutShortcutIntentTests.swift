@@ -13,11 +13,12 @@ final class WorkoutShortcutIntentTests: XCTestCase {
         super.tearDown()
     }
 
-    /// Every type both wearables can record is offered, once, under the name the in-app picker uses.
-    /// The strap-only sports (tennis, pickleball, #359) are not: the shortcut can start the ring too.
+    /// Every type the app can record is offered, once, under the name the in-app picker uses, Tennis
+    /// and Pickleball included (#359, decision 89k).
     func testTheShortcutOffersEveryWorkoutTypeUnderItsInAppName() {
-        XCTAssertEqual(WorkoutTypeChoice.allCases.count, WorkoutSportType.ringSports.count)
-        XCTAssertEqual(Set(WorkoutTypeChoice.allCases.map(\.sport)), Set(WorkoutSportType.ringSports))
+        XCTAssertEqual(WorkoutTypeChoice.allCases.count, WorkoutSportType.allCases.count)
+        XCTAssertEqual(Set(WorkoutTypeChoice.allCases.map(\.sport)), Set(WorkoutSportType.allCases))
+        XCTAssertTrue(WorkoutTypeChoice.allCases.contains(.tennis) && WorkoutTypeChoice.allCases.contains(.pickleball))
         for choice in WorkoutTypeChoice.allCases {
             let rep = try? XCTUnwrap(WorkoutTypeChoice.caseDisplayRepresentations[choice])
             XCTAssertEqual(rep.map { String(localized: $0.title) }, choice.sport.displayName, choice.rawValue)

@@ -200,6 +200,8 @@ enum WorkoutActivityDisplay {
         case .hiking:                       return "mountain.2"
         case .traditionalStrengthTraining:  return "dumbbell"
         case .yoga:                         return "figure.yoga"
+        case .tennis:                       return "tennis.racket"
+        case .pickleball:                   return "figure.pickleball"
         default:                            return "heart.circle"
         }
     }

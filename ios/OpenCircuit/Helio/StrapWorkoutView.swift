@@ -597,11 +597,16 @@ struct StrapWorkoutHooks: ViewModifier {
             + "\(recovered.sport.displayName), \(StrapWorkoutView.duration(recovered.activeSeconds)) long, "
             + "with \(readings) heart-rate reading\(readings == 1 ? "" : "s"). It ends at the last reading the "
             + "app received, so it may be short. The GPS route isn't kept."
+            // 89n: Discard can't take back what the strap saved in its own workout mode.
+            + (recovered.workoutMode?.ranWithWorkoutMode == true ? " " + StrapWorkoutCopy.strapMayKeepRecord : "")
     }
 }
 
 /// The strap workout screen's copy that depends on the strap's workout mode (#359, decision 89).
 enum StrapWorkoutCopy {
+    /// 89n, verbatim: a discard can't remove what the strap saved (its end always saves, 89j).
+    static let strapMayKeepRecord = "The strap may still keep a record of this workout in Zepp."
+
     /// 89c, verbatim: the one quiet line of a fallback.
     static let workoutModeUnavailable = "Strap workout mode unavailable for this sport; recording continues."
 

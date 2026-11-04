@@ -1,4 +1,5 @@
 import CoreLocation
+import UIKit
 import XCTest
 import OpenCircuitKit
 import ZeppKit
@@ -714,6 +715,30 @@ final class StrapWorkoutModeAppTests: XCTestCase {
         let plain = WorkoutDetailContent.rows(item(StrapWorkoutModeExtras()), hr: [], zones: HeartRateZones(percentOfMax: 180),
                                               unit: .metric, recordedWith: "Helio Strap")
         XCTAssertFalse(plain.contains { $0.title == "Swings" || $0.title == "Strap estimate" })
+    }
+
+    func testTennisAndPickleballHaveTheirRacketSymbols() {
+        XCTAssertEqual(WorkoutSportType.tennis.systemImageName, "tennis.racket")
+        XCTAssertEqual(WorkoutSportType.pickleball.systemImageName, "figure.pickleball")
+        XCTAssertEqual(WorkoutActivityDisplay.symbol(.tennis), "tennis.racket")
+        XCTAssertEqual(WorkoutActivityDisplay.symbol(.pickleball), "figure.pickleball")
+        for name in ["tennis.racket", "figure.pickleball"] {
+            XCTAssertNotNil(UIImage(systemName: name), "\(name) exists on this iOS")
+        }
+    }
+
+    func testTheInterruptedWorkoutSaysTheStrapMayKeepItsRecordOnlyWhenTheModeRan() {
+        let samples = (1...600).map { HRSample(bpm: 140, start: at(Double($0) - 1), end: at(Double($0))) }
+        func recovered(_ mode: StrapWorkoutModeExtras?) -> RecoveredStrapWorkout? {
+            let journal = StrapWorkoutJournal(sport: .tennis, ledger: WorkoutActivityLedger(start: t0), lastAliveAt: at(600),
+                                              timelineRaw: "zeppos:STRAP", workoutMode: mode)
+            guard case .offer(let workout) = StrapWorkoutRecovery.decide(journal: journal, samples: samples, now: at(700)) else { return nil }
+            return workout
+        }
+        let phoneSide = try? XCTUnwrap(recovered(nil))
+        XCTAssertEqual(phoneSide.map { StrapWorkoutView.message($0).contains("Zepp") }, false, "phone-side: nothing on the strap")
+        let withMode = try? XCTUnwrap(recovered(StrapWorkoutModeExtras(ranWithWorkoutMode: true)))
+        XCTAssertEqual(withMode.map { StrapWorkoutView.message($0).hasSuffix(" The strap may still keep a record of this workout in Zepp.") }, true)
     }
 
     func testTheSummaryCopy() {
