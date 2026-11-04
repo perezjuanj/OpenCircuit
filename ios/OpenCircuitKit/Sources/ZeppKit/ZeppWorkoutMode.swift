@@ -13,9 +13,11 @@
 // Rules the machine enforces (§18.9 "Rules for OpenCircuit", decision 89):
 //   • never start without first reading `06 00` as idle, and never touch a running workout whose
 //     start time isn't ours (89f);
-//   • every end is `03 02` then `03 04` (save), even when already paused (89a);
+//   • every end is `03 02` then `03 04`, even when already paused (89a), fallbacks included (89j:
+//     `03 05` saves too on our strap, so its meaning is unknown and it is never sent; the builder
+//     doesn't exist);
 //   • any failure falls back to the phone-side workout, quietly (89c); a start that was accepted but
-//     sent no frame is ended without saving (`03 05`), so no empty workout lands in Zepp;
+//     sent no frame is ended at about 15 s, under the length the strap or Zepp keeps (89j);
 //   • the marker ("OpenCircuit started a strap workout") is set before `02` goes out and cleared only
 //     once the strap is known not to hold our workout any more (89f).
 
@@ -79,8 +81,8 @@ public enum ZeppWorkoutCommand {
         case started = 0x01
         case pause = 0x02
         case resume = 0x03
-        case endSave = 0x04
-        case endDiscard = 0x05
+        /// The only end the app sends (89j). §18.9's `03 05` is not built: on our strap it saved too.
+        case end = 0x04
     }
 
     /// `03 01 06 00 00 00 <u32 start, Unix s> 00 00 00 00`: the start time the phone records.
@@ -95,9 +97,8 @@ public enum ZeppWorkoutCommand {
     }
 
     /// Every end: pause first, then the end (§18.9, decision 89a), even when already paused.
-    public static func end(save: Bool, activeSeconds: UInt32) -> [[UInt8]] {
-        [control(.pause, activeSeconds: activeSeconds),
-         control(save ? .endSave : .endDiscard, activeSeconds: activeSeconds)]
+    public static func end(activeSeconds: UInt32) -> [[UInt8]] {
+        [control(.pause, activeSeconds: activeSeconds), control(.end, activeSeconds: activeSeconds)]
     }
 }
 
@@ -279,7 +280,7 @@ public struct ZeppWorkoutModeMachine: Equatable {
         case refused(Step, status: UInt8)
         /// `06 00` didn't read idle (a workout of someone else's is running, or a state we can't place).
         case notIdle
-        /// The start was accepted but no `14` frame came: ended without saving (`03 05`).
+        /// The start was accepted but no `14` frame came: ended at once (`03 02` + `03 04`, 89j).
         case noFrames
         /// The connection can't (no 0x0019, or another workout-mode exchange in progress).
         case unavailable
@@ -309,8 +310,8 @@ public struct ZeppWorkoutModeMachine: Equatable {
         case running
         case unavailable(Fallback)
         case frame(ZeppWorkoutLiveFrame)
-        /// The end's second `10 03 01`: the strap saved (or discarded) the workout.
-        case ended(saved: Bool)
+        /// The end's second `10 03 01`.
+        case ended
         /// The end wasn't confirmed; the marker stays, so the next connection reconciles.
         case endUnconfirmed
         case reconciled(Reconciliation)
@@ -339,11 +340,11 @@ public struct ZeppWorkoutModeMachine: Equatable {
         case awaitingFrames(deadline: Date)
         case running
         /// The end went out; waiting for its replies.
-        case ending(saved: Bool, deadline: Date)
+        case ending(deadline: Date)
         /// Phone-side for the rest of this workout, on this connection.
         case fallback
         /// `02` went unanswered: phone-side, but a late `10 02 01` still means the strap started one,
-        /// and it is ended without saving (89c).
+        /// and it is ended at once (89c, 89j).
         case startTimedOut
         /// `06 00` sent at connect for a persisted marker.
         case reconciling(deadline: Date)
@@ -373,7 +374,7 @@ public struct ZeppWorkoutModeMachine: Equatable {
     public var nextDeadline: Date? {
         var deadlines: [Date] = []
         switch phase {
-        case .starting(_, let deadline), .awaitingFrames(let deadline), .ending(_, let deadline),
+        case .starting(_, let deadline), .awaitingFrames(let deadline), .ending(let deadline),
              .reconciling(let deadline):
             deadlines.append(deadline)
         case .idle, .running, .fallback, .startTimedOut, .done:
@@ -461,17 +462,17 @@ public struct ZeppWorkoutModeMachine: Equatable {
             keepAliveAt = nil
             return Output()
         case .awaitingFrames, .running:
-            return sendEnd(save: true, activeSeconds: activeSeconds, now: now)
+            return sendEnd(activeSeconds: activeSeconds, now: now)
         case .idle, .ending, .fallback, .startTimedOut, .reconciling, .done:
             return Output()
         }
     }
 
-    private mutating func sendEnd(save: Bool, activeSeconds: UInt32, now: Date) -> Output {
+    private mutating func sendEnd(activeSeconds: UInt32, now: Date) -> Output {
         keepAliveAt = nil
-        pendingControls += [.pause, save ? .endSave : .endDiscard]
-        phase = .ending(saved: save, deadline: now.addingTimeInterval(configuration.replyTimeout))
-        return Output(messages: ZeppWorkoutCommand.end(save: save, activeSeconds: activeSeconds))
+        pendingControls += [.pause, .end]
+        phase = .ending(deadline: now.addingTimeInterval(configuration.replyTimeout))
+        return Output(messages: ZeppWorkoutCommand.end(activeSeconds: activeSeconds))
     }
 
     /// At an authenticated connect with a persisted marker (89f): `06 00`, then carry on, end it for
@@ -530,18 +531,18 @@ public struct ZeppWorkoutModeMachine: Equatable {
             var out = Output(messages: [ZeppWorkoutCommand.started(startTime: marker.startTime)])
             if let ending = endRequested {
                 endRequested = nil
-                out.append(sendEnd(save: true, activeSeconds: ending, now: now))
+                out.append(sendEnd(activeSeconds: ending, now: now))
             } else if appPaused {
                 out.append(sendPauseState(true, activeSeconds: appActiveSeconds))
             }
             return out
         case (.startTimedOut, ZeppWorkoutCommand.startOpcode):
             // The strap accepted the start after we stopped waiting: no frame will be ours, so it is
-            // started with our time and ended without saving at once (89c), the marker kept until then.
+            // started with our time and ended at once (89c, 89j), the marker kept until then.
             guard reply.isAccepted, let marker else { return Output() }
             pendingControls.append(.started)
             var out = Output(messages: [ZeppWorkoutCommand.started(startTime: marker.startTime)])
-            out.append(sendEnd(save: false, activeSeconds: appActiveSeconds, now: now))
+            out.append(sendEnd(activeSeconds: appActiveSeconds, now: now))
             return out
         case (.reconciling, ZeppWorkoutCommand.stateOpcode):
             return reconciled(ZeppWorkoutState.parse(payload) ?? .unknown, now: now)
@@ -557,13 +558,13 @@ public struct ZeppWorkoutModeMachine: Equatable {
     private mutating func receiveControlReply(_ reply: ZeppWorkoutReply, now: Date) -> Output {
         guard !pendingControls.isEmpty else { return Output() }
         let control = pendingControls.removeFirst()
-        guard case .ending(let saved, _) = phase, control == .endSave || control == .endDiscard else { return Output() }
+        guard case .ending = phase, control == .end else { return Output() }
         guard reply.isAccepted else {
             phase = .done
             return Output(events: [.endUnconfirmed])
         }
         phase = .done
-        var out = Output(events: [.ended(saved: saved)])
+        var out = Output(events: [.ended])
         if let start = marker?.startTime { out.events.append(.clearMarker(startTime: start)) }
         return out
     }
@@ -603,9 +604,9 @@ public struct ZeppWorkoutModeMachine: Equatable {
                 out.append(sendPauseState(owner.paused, activeSeconds: owner.activeSeconds))
                 return out
             }
-            // Ended or discarded meanwhile (or the process that ran it is gone): end it, saved.
+            // Ended or discarded meanwhile (or the process that ran it is gone): end it.
             var out = Output(events: [.reconciled(.endedForApp)])
-            out.append(sendEnd(save: true, activeSeconds: marker.activeSeconds, now: now))
+            out.append(sendEnd(activeSeconds: marker.activeSeconds, now: now))
             return out
         case .running:
             // 89f: someone else's workout. Never touched; ours is no longer on the strap.
@@ -633,10 +634,11 @@ public struct ZeppWorkoutModeMachine: Equatable {
                 out.append(fallBack(.noReply(step)))
             }
         case .awaitingFrames(let deadline) where now >= deadline:
-            // 89c: accepted, but no frame: end it without saving, so no empty workout lands in Zepp.
+            // 89c, 89j: accepted, but no frame: end it now (`03 02` + `03 04`), at about 15 s, under the
+            // length the strap or Zepp keeps, so no empty workout is expected in Zepp.
             out.events.append(.unavailable(.noFrames))
-            out.append(sendEnd(save: false, activeSeconds: appActiveSeconds, now: now))
-        case .ending(_, let deadline) where now >= deadline:
+            out.append(sendEnd(activeSeconds: appActiveSeconds, now: now))
+        case .ending(let deadline) where now >= deadline:
             phase = .done
             out.events.append(.endUnconfirmed)
         case .reconciling(let deadline) where now >= deadline:
@@ -658,7 +660,7 @@ public struct ZeppWorkoutModeMachine: Equatable {
     }
 
     /// The active seconds OpenCircuit last recorded, used by an end the machine sends on its own
-    /// (89c's `03 05`).
+    /// (89c's no-frames end).
     public mutating func noteActiveSeconds(_ seconds: UInt32) {
         appActiveSeconds = seconds
     }

@@ -1483,10 +1483,10 @@ final class HelioSession: WearableSession {
             case .noReply(let step): return "fallback, phone-side: no reply to \(Self.stepBytes(step)) in 8 s"
             case .refused(let step, let status): return String(format: "fallback, phone-side: %@ answered status %02x", Self.stepBytes(step), status)
             case .notIdle: return "fallback, phone-side: 06 00 not idle; nothing started or touched"
-            case .noFrames: return "fallback, phone-side: no 14 frame in 15 s; ended 03 02 + 03 05 (not saved)"
+            case .noFrames: return "fallback, phone-side: no 14 frame in 15 s; ended 03 02 + 03 04"
             case .unavailable: return "fallback, phone-side: another 0x0019 exchange in progress"
             }
-        case .ended(let saved): return saved ? "ended 03 02 + 03 04 (saved), both 10 03 01" : "ended 03 02 + 03 05 (not saved), both 10 03 01"
+        case .ended: return "ended 03 02 + 03 04, both 10 03 01"
         case .endUnconfirmed: return "end not confirmed; the marker stays for the next connection"
         case .reconciled(let outcome):
             switch outcome {

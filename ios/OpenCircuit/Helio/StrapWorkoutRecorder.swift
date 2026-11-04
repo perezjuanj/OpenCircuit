@@ -1273,7 +1273,7 @@ final class StrapWorkoutRecorder {
         if Self.running === self { Self.running = nil }
         turnStepsOff()   // decision 84b: `05 00` at cancel
         clearSteps()
-        // 89f's reading for a discard: the strap's workout is ended and saved, as at End.
+        // 89f/89j: a discard ends the strap's workout exactly as End does (03 02 + 03 04); there is no other path.
         if let ledger { endWorkoutMode(activeSeconds: Self.seconds(ledger.activeSeconds(until: clock()))) }
         clearWorkoutMode()
         attached?.stopWorkoutHeartRate()

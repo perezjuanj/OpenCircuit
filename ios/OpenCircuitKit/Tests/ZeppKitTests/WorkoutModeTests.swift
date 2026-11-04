@@ -39,13 +39,13 @@ final class WorkoutModeCodecTests: XCTestCase {
         XCTAssertEqual(ZeppWorkoutCommand.started(startTime: start), hex("03 01 06 00 00 00 \(startLE) 00 00 00 00"))
         XCTAssertEqual(ZeppWorkoutCommand.control(.pause, activeSeconds: 600), hex("03 02 04 00 00 00 58 02 00 00"))
         XCTAssertEqual(ZeppWorkoutCommand.control(.resume, activeSeconds: 600), hex("03 03 04 00 00 00 58 02 00 00"))
-        XCTAssertEqual(ZeppWorkoutCommand.control(.endSave, activeSeconds: 1800), hex("03 04 04 00 00 00 08 07 00 00"))
-        XCTAssertEqual(ZeppWorkoutCommand.control(.endDiscard, activeSeconds: 1800), hex("03 05 04 00 00 00 08 07 00 00"))
-        XCTAssertEqual(ZeppWorkoutCommand.end(save: true, activeSeconds: 1800),
+        XCTAssertEqual(ZeppWorkoutCommand.control(.end, activeSeconds: 1800), hex("03 04 04 00 00 00 08 07 00 00"))
+        XCTAssertNil(ZeppWorkoutCommand.Control(rawValue: 0x05), "89j: 03 05 saved too on our strap; the app never sends it")
+        XCTAssertEqual(ZeppWorkoutCommand.end(activeSeconds: 1800),
                        [hex("03 02 04 00 00 00 08 07 00 00"), hex("03 04 04 00 00 00 08 07 00 00")],
                        "every end is pause, then end (89a)")
-        XCTAssertEqual(ZeppWorkoutCommand.end(save: false, activeSeconds: 10),
-                       [hex("03 02 04 00 00 00 0a 00 00 00"), hex("03 05 04 00 00 00 0a 00 00 00")])
+        XCTAssertEqual(ZeppWorkoutCommand.end(activeSeconds: 10),
+                       [hex("03 02 04 00 00 00 0a 00 00 00"), hex("03 04 04 00 00 00 0a 00 00 00")])
     }
 
     // MARK: The 89b sport table
@@ -249,7 +249,7 @@ final class WorkoutModeMachineTests: XCTestCase {
         XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 08 07 00 00"), hex("03 04 04 00 00 00 08 07 00 00")])
         XCTAssertEqual(m.tick(now: at(1905)).messages, [], "no keep-alive once the end went out")
         XCTAssertEqual(m.receive(ok03, now: at(1900.2)).events, [], "the pause's ack does not clear the marker")
-        XCTAssertEqual(m.receive(ok03, now: at(1900.4)).events, [.ended(saved: true), .clearMarker(startTime: start)])
+        XCTAssertEqual(m.receive(ok03, now: at(1900.4)).events, [.ended, .clearMarker(startTime: start)])
         XCTAssertFalse(m.isActive)
     }
 
@@ -284,7 +284,7 @@ final class WorkoutModeMachineTests: XCTestCase {
                                       hex("03 02 04 00 00 00 03 00 00 00"), hex("03 04 04 00 00 00 03 00 00 00")])
         _ = m.receive(ok03, now: at(4.1))
         _ = m.receive(ok03, now: at(4.2))
-        XCTAssertEqual(m.receive(ok03, now: at(4.3)).events, [.ended(saved: true), .clearMarker(startTime: start)])
+        XCTAssertEqual(m.receive(ok03, now: at(4.3)).events, [.ended, .clearMarker(startTime: start)])
     }
 
     func testAnEndBeforeTheStrapReadIdleSendsNothing() {
@@ -342,7 +342,7 @@ final class WorkoutModeMachineTests: XCTestCase {
         }
     }
 
-    func testNoFramesWithinFifteenSecondsEndsItWithoutSaving() {
+    func testNoFramesWithinFifteenSecondsEndsItAtOnceWithPauseThenEnd() {
         var sent: [[UInt8]] = []
         var events: [Machine.Event] = []
         var m = started(sent: &sent, events: &events)
@@ -351,14 +351,14 @@ final class WorkoutModeMachineTests: XCTestCase {
         XCTAssertEqual(m.tick(now: at(15.5)).events, [], "15 s from 03 01 (sent at 0.6 s)")
         let out = m.tick(now: at(15.7))
         XCTAssertEqual(out.events, [.unavailable(.noFrames)])
-        XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 0f 00 00 00"), hex("03 05 04 00 00 00 0f 00 00 00")],
-                       "89c: 03 05, never 03 04, so no empty workout lands in Zepp")
+        XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 0f 00 00 00"), hex("03 04 04 00 00 00 0f 00 00 00")],
+                       "89c with 89j: ended at about 15 s with 03 02 + 03 04, never 03 05")
         _ = m.receive(ok03, now: at(16))
-        XCTAssertEqual(m.receive(ok03, now: at(16.1)).events, [.ended(saved: false), .clearMarker(startTime: start)])
+        XCTAssertEqual(m.receive(ok03, now: at(16.1)).events, [.ended, .clearMarker(startTime: start)])
         XCTAssertEqual(m.end(activeSeconds: 100, now: at(100)).messages, [], "the app's own End sends nothing more")
     }
 
-    func testALateStartReplyIsEndedWithoutSaving() {
+    func testALateStartReplyIsEndedAtOnce() {
         var m = Machine()
         _ = m.start(tennis, startTime: start, now: t0)
         _ = m.receive(hex("10 01 01"), now: at(1))
@@ -367,10 +367,10 @@ final class WorkoutModeMachineTests: XCTestCase {
         m.noteActiveSeconds(12)
         let out = m.receive(hex("10 02 01"), now: at(12))
         XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00"),
-                                      hex("03 02 04 00 00 00 0c 00 00 00"), hex("03 05 04 00 00 00 0c 00 00 00")])
+                                      hex("03 02 04 00 00 00 0c 00 00 00"), hex("03 04 04 00 00 00 0c 00 00 00")])
         _ = m.receive(ok03, now: at(12.1))
         _ = m.receive(ok03, now: at(12.2))
-        XCTAssertEqual(m.receive(ok03, now: at(12.3)).events, [.ended(saved: false), .clearMarker(startTime: start)])
+        XCTAssertEqual(m.receive(ok03, now: at(12.3)).events, [.ended, .clearMarker(startTime: start)])
     }
 
     func testAnUnconfirmedEndKeepsTheMarker() {
@@ -444,7 +444,7 @@ final class WorkoutModeMachineTests: XCTestCase {
             XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 84 03 00 00"), hex("03 04 04 00 00 00 84 03 00 00")],
                            "89f: 03 02 + 03 04 with the active seconds OpenCircuit recorded")
             _ = m.receive(ok03, now: at(1.1))
-            XCTAssertEqual(m.receive(ok03, now: at(1.2)).events, [.ended(saved: true), .clearMarker(startTime: start)])
+            XCTAssertEqual(m.receive(ok03, now: at(1.2)).events, [.ended, .clearMarker(startTime: start)])
         }
     }
 
