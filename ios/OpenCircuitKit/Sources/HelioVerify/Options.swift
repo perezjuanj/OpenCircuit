@@ -29,6 +29,15 @@ struct Options {
     var settings = false
     var setConfig: (setting: ZeppSetting, value: ZeppConfigValue)?
     var configProbe: ConfigProbe?
+    // Workout-mode test (Workout.swift, #358).
+    var workoutSeconds: Double?
+    var workoutEnd = WorkoutEnd.save
+    var workoutBaseline: Double = 20
+    var workoutStartBytes: [UInt8]?
+    var workoutEndOnly = false
+    var workoutStatus = false
+    var writesWorkout: Bool { workoutSeconds != nil || workoutEndOnly }
+    var runsWorkout: Bool { writesWorkout || workoutStatus }
 
     var writesAlarms: Bool { setAlarm != nil || deleteAlarmSlot != nil }
     var writesConfig: Bool { setConfig != nil || configProbe != nil }
@@ -75,6 +84,16 @@ OPTIONS
                       whose CRC matched, but only after it is durably written to --out. A round
                       without a CRC is kept (03 09). Requires --key-file and --out.
   --help              Show this help.
+
+WORKOUT MODE TEST (#358; needs --key-file and --allow-write)
+  --workout-test <s>  STARTS THE STRAP'S OWN WORKOUT (pickleball by default) after a standard live HR
+                      baseline, prints the strap's 1/s workout frames next to 0x2A37, then ends it.
+                      The workout is always ended on exit, Ctrl-C, SIGTERM, SIGHUP or timeout.
+  --workout-baseline <s>  Seconds of 0x2A37 before the start (default 20).
+  --workout-end save|discard  End with 03 04 (saved, default) or 03 05 (not saved).
+  --workout-start-hex <hex>   Raw start request instead of pickleball (must start 02).
+  --workout-status    Read-only: ask the strap whether a workout is running.
+  --workout-end-only  End a workout a crashed run left running (uses the saved start time).
 
 DEVICE CONTROLS (Helio Strap only; all need --key-file)
   Any of these runs the controls INSTEAD of live HR and the history fetch. After auth the strap's
@@ -194,6 +213,19 @@ func parseOptions(_ args: [String]) throws -> Options {
             }
             o.configProbe = probe
         case "--allow-write": o.allowWrite = true
+        case "--workout-test": o.workoutSeconds = try number("--workout-test")
+        case "--workout-baseline": o.workoutBaseline = try number("--workout-baseline")
+        case "--workout-end-only": o.workoutEndOnly = true
+        case "--workout-status": o.workoutStatus = true
+        case "--workout-end":
+            guard let end = WorkoutEnd(rawValue: try value("--workout-end")) else { throw fail("--workout-end takes save or discard") }
+            o.workoutEnd = end
+        case "--workout-start-hex":
+            let text = try value("--workout-start-hex")
+            guard text.count % 2 == 0, text.count >= 2, let bytes = Optional(stride(from: 0, to: text.count, by: 2).compactMap({ i -> UInt8? in
+                let s = text.index(text.startIndex, offsetBy: i); return UInt8(text[s..<text.index(s, offsetBy: 2)], radix: 16) })),
+                  bytes.count == text.count / 2, bytes.first == 0x02 else { throw fail("--workout-start-hex takes hex bytes starting 02, e.g. 02e30001010200000002") }
+            o.workoutStartBytes = bytes
         case "--set-alarm":
             guard let alarm = parseAlarmSpec(try value("--set-alarm")) else {
                 throw fail("--set-alarm takes HH:MM[,days], e.g. 06:30 or 07:30,weekdays or 08:00,mon+wed")
@@ -237,8 +269,15 @@ func parseOptions(_ args: [String]) throws -> Options {
     if o.writesConfig && !o.allowWrite {
         throw fail("--set-config and --config-probe write the strap's settings: add --allow-write to confirm")
     }
-    if o.allowWrite && !o.writesAlarms && !o.setTime && !o.writesConfig {
-        throw fail("--allow-write only applies to --set-time / --set-alarm / --delete-alarm / --set-config / --config-probe")
+    if o.writesWorkout && (o.keyFile == nil || !o.allowWrite) {
+        throw fail("--workout-test and --workout-end-only start or end a workout on the strap: they need --key-file and --allow-write")
+    }
+    if o.workoutStatus && o.keyFile == nil { throw fail("--workout-status needs --key-file") }
+    if o.runsWorkout && (o.hasControls || o.setTime) {
+        throw fail("--workout-test runs alone: drop the control and settings flags")
+    }
+    if o.allowWrite && !o.writesAlarms && !o.setTime && !o.writesConfig && !o.writesWorkout {
+        throw fail("--allow-write only applies to --set-time / --set-alarm / --delete-alarm / --set-config / --config-probe / --workout-test")
     }
     if o.setAlarm != nil && o.deleteAlarmSlot != nil {
         throw fail("one alarm write per run: use --set-alarm or --delete-alarm, not both")

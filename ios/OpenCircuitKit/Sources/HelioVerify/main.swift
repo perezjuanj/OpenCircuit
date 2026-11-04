@@ -69,7 +69,7 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     var services: ZeppServicesList?
     var fetch: ZeppHistoryFetch?
     var writeQueue: [ZeppWrite] = []
-    var hrTimer: Timer?
+    var hrTimer: DispatchSourceTimer?
     var outHandle: FileHandle?
     var roundsDelivered = 0
     var isFinishing = false
@@ -81,7 +81,7 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     var controlTasks: [ControlTask] = []
     var controlWait: ControlWait?
     var controlWaitToken = 0
-    var controlTimer: Timer?
+    var controlTimer: DispatchSourceTimer?
     var configCapabilities: ZeppConfigCapabilities?
     // Strap settings (Settings.swift).
     var settingsEditor: ZeppSettingsEditor?
@@ -89,6 +89,9 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     var rawGroupQueue: [UInt8] = []
     var rawGroupInFlight: UInt8?
     var probeRun: ProbeRun?
+    // Workout-mode test (Workout.swift).
+    var workout = WorkoutTestState()
+    var endStage = 0
     /// DIS 0x2A27, to cross-check the device-info hardware version.
     var disHardwareRevision: String?
 
@@ -114,8 +117,8 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
         guard !isFinishing else { return }
         isFinishing = true
         if let message { log(code == 0 ? message : "FAILED: \(message)") }
-        hrTimer?.invalidate()
-        controlTimer?.invalidate()
+        hrTimer?.cancel()
+        controlTimer?.cancel()
         if var fetch, fetch.phase != .finished && fetch.phase != .idle {
             // Never leave the strap mid-round; the abort ack is always 03 09 (keep).
             perform(fetch.abort())
@@ -124,7 +127,12 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
         try? outHandle?.close()
         // Never leave the strap buzzing: pair a running find or buzz with its stop, and give the
         // write a moment to go out before disconnecting.
-        let stopping = stopFindBeforeExit()
+        let stoppingFind = stopFindBeforeExit()
+        let endingWorkout = endWorkoutBeforeExit()
+        workout.keepAliveTimer?.cancel()
+        workout.endTimer?.cancel()
+        workout.hrKeepAlive?.cancel()
+        let stopping = stoppingFind || endingWorkout
         let central: CBCentralManager? = self.central
         let peripheral = self.peripheral
         DispatchQueue.main.asyncAfter(deadline: .now() + (stopping ? 0.5 : 0)) {
@@ -182,6 +190,10 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
         if find.isBuzzing {
             find.connectionLost()
             log("WARNING: the link dropped while the strap was buzzing; it may keep vibrating until its own timeout. Run --find 1 to send a stop.")
+        }
+        if workout.running {
+            log("WARNING: the link dropped while a strap workout was running; run with --workout-end-only to end it.")
+            workout.phase = .ended  // no link: finish() cannot send the end
         }
         finish("disconnected in step '\(step.rawValue)': \(error?.localizedDescription ?? "no error")", code: 3)
     }
@@ -355,6 +367,8 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
             performFind(find.receive(message.payload, now: Date()))
         case (_, ZeppEndpoint.alarms):
             receiveAlarmMessage(message.payload)
+        case (_, workoutEndpoint):
+            receiveWorkout(message.payload)
         case (.controls, ZeppEndpoint.config):
             receiveAlertsMessage(message.payload)
         case (.fetching, ZeppEndpoint.activityFetch):
@@ -435,6 +449,7 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
 
     /// Controls replace live HR and the history fetch when any control flag is given.
     func afterConfig() {
+        if options.runsWorkout { return startWorkoutTest() }
         options.hasControls ? startControls() : startAuthedHR()
     }
 
@@ -446,12 +461,12 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
             return listenToStandardHR { [weak self] in self?.enableFetch() }
         }
         send(ZeppEndpoint.heartRate, ZeppHeartRateControl.start)
-        hrTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        hrTimer = mainTimer(every: 1, after: 1) { [weak self] in
             self?.send(ZeppEndpoint.heartRate, ZeppHeartRateControl.keepRunning)
         }
         listenToStandardHR { [weak self] in
             guard let self else { return }
-            self.hrTimer?.invalidate()
+            self.hrTimer?.cancel()
             self.send(ZeppEndpoint.heartRate, ZeppHeartRateControl.stop)
             self.enableFetch()
         }
@@ -609,7 +624,9 @@ final class HelioVerifier: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
             disHardwareRevision = revision.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0")))
             log("hardware: \(revision)")
         case .heartRateMeasurement:
-            if let hr = ZeppHeartRateMeasurement.parse(bytes) {
+            if let hr = ZeppHeartRateMeasurement.parse(bytes), options.runsWorkout {
+                noteStandardHR(hr.beatsPerMinute)
+            } else if let hr = ZeppHeartRateMeasurement.parse(bytes) {
                 let rr = hr.rrIntervals.isEmpty ? "" : ", \(hr.rrIntervals.count) RR interval(s)"
                 log("  live HR: \(hr.beatsPerMinute) bpm\(rr)")
             }
