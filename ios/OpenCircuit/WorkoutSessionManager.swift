@@ -371,6 +371,9 @@ final class WorkoutSessionManager: NSObject {
         case .strengthTraining:  return .traditionalStrengthTraining
         case .yoga:              return .yoga
         case .other:             return .other
+        // Strap only (#359): the ring never offers them (`WorkoutSportType.ringSports`).
+        case .tennis:            return .tennis
+        case .pickleball:        return .pickleball
         }
     }
 

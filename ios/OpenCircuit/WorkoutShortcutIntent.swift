@@ -15,7 +15,8 @@ import OpenCircuitKit
 //
 // Listed in `OpenCircuitAppShortcuts` (HeadacheLogIntent.swift), the app's only provider.
 
-/// The workout types, as Shortcuts and Siri show them. Mirrors `WorkoutSportType` one to one; the
+/// The workout types, as Shortcuts and Siri show them. Mirrors `WorkoutSportType.ringSports` one to one
+/// (the strap-only sports of #359 are left out: a shortcut can start the ring's workout too); the
 /// titles are literals because the App Intents metadata is extracted at build time, and
 /// `WorkoutShortcutIntentTests` pins them to `WorkoutSportType.displayName` so the shortcut and the
 /// in-app picker can never name a type differently.

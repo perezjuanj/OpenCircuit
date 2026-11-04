@@ -615,7 +615,7 @@ final class HelioSession: WearableSession {
             if let level = ZeppBatteryLevelCharacteristic.parse(bytes), !isAuthenticated { batteryPercent = level }
         case .heartRateMeasurement:
             // With a key, `0x2A37` comes only from the stream this app starts (§7.1). Anything else
-            // (a Heart Rate Push setting, say) is the strap talking on its own: noted, never shown.
+            // (the Heart Rate Broadcast setting, HEALTH 83, say) is the strap talking on its own: noted, never shown.
             if !(liveHeartRateRunning || (tierZeroSubscribed && !isAuthenticated)),
                !within(Self.replyWindow, of: liveHRStoppedAt, now: now) {
                 onEvent(.strapNotification(.heartRateMeasurement))

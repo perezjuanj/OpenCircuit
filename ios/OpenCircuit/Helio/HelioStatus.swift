@@ -96,7 +96,7 @@ struct HelioStatus: Equatable {
 
     static let keyNeeded = HelioStatus(
         kind: .keyNeeded, title: "Key needed",
-        detail: "Without the key the strap shares only live heart rate, and only if Zepp's Heart Rate Push is on.",
+        detail: "Without the key the strap shares only live heart rate, and only if its Heart Rate Broadcast setting is on in the Zepp app.",
         tone: .attention)
 
     static let rejected = HelioStatus(

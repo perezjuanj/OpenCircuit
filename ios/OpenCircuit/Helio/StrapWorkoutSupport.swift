@@ -93,6 +93,11 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
             } catch {}
         }
 
+        // #359 (89e, 89h): whether the strap's workout mode ran, and its swings and kcal when it sent
+        // them, as metadata on the workout. Optional: a refusal never fails the workout, and nothing
+        // above (heart rate, energy, distance) depends on it.
+        try? await builder.addMetadata(StrapWorkoutMetadata.metadata(write.workoutMode))
+
         do {
             try await builder.endCollection(at: summary.endDate)
         } catch { return false }
