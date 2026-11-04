@@ -68,8 +68,48 @@ final class OptionsTests: XCTestCase {
 
     func testAllowWriteAloneNamesEveryWriteItApplies() {
         XCTAssertThrowsError(try parseOptions(key + ["--allow-write"])) {
-            XCTAssertEqual($0 as? OptionsError, .invalid("--allow-write only applies to --set-time / --set-alarm / --delete-alarm / --set-config / --config-probe"))
+            XCTAssertEqual($0 as? OptionsError, .invalid("--allow-write only applies to --set-time / --set-alarm / --delete-alarm / --set-config / --config-probe / --workout-test"))
         }
+    }
+
+    /// A strap workout is a write: starting or ending one needs the key and --allow-write, runs alone,
+    /// and a raw start must be a start request (opcode 02). The status read needs only the key.
+    func testWorkoutModesAreGatedAndRunAlone() {
+        assertRejected(["--workout-test", "60"])
+        assertRejected(key + ["--workout-test", "60"])
+        assertRejected(key + ["--workout-end-only"])
+        assertRejected(key + ["--allow-write", "--workout-test", "60", "--find", "2"])
+        assertRejected(key + ["--allow-write", "--workout-test", "60", "--set-time"])
+        assertRejected(key + ["--allow-write", "--workout-test", "60", "--workout-start-hex", "0134"])
+        assertRejected(key + ["--allow-write", "--workout-test", "60", "--workout-start-hex", "02e"])
+        assertRejected(key + ["--allow-write", "--workout-test", "60", "--workout-end", "maybe"])
+        assertRejected(["--workout-status"])
+        if let o = accepted(key + ["--allow-write", "--workout-test", "45", "--workout-end", "discard",
+                                   "--workout-start-hex", "0211000001", "--workout-baseline", "3"]) {
+            XCTAssertEqual(o.workoutSeconds, 45)
+            XCTAssertEqual(o.workoutEnd, .discard)
+            XCTAssertEqual(o.workoutStartBytes, [0x02, 0x11, 0x00, 0x00, 0x01])
+            XCTAssertEqual(o.workoutBaseline, 3)
+            XCTAssertTrue(o.writesWorkout)
+        }
+        if let o = accepted(key + ["--workout-status"]) {
+            XCTAssertTrue(o.runsWorkout)
+            XCTAssertFalse(o.writesWorkout)
+        }
+        if let o = accepted(key + ["--allow-write", "--workout-test", "30"]) {
+            XCTAssertEqual(o.workoutEnd, .save)
+            XCTAssertNil(o.workoutStartBytes)
+        }
+    }
+
+    /// HelioVerify's timers are dispatch timers on the main queue (Foundation Timers never fire under
+    /// dispatchMain()). This only shows the helper fires once; XCTest's wait spins the run loop, so it
+    /// can't tell the two kinds apart.
+    func testMainTimerFiresWithoutARunLoopTimer() {
+        let fired = expectation(description: "fired")
+        let t = mainTimer(every: nil, after: 0.05) { fired.fulfill() }
+        wait(for: [fired], timeout: 2)
+        t.cancel()
     }
 
     func testArgumentValidation() {

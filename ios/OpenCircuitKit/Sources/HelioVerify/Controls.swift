@@ -81,7 +81,7 @@ extension HelioVerifier {
         if let seconds = options.findSeconds { tasks.append(.find(seconds: seconds)) }
         if options.vibrate { tasks.append(.buzz) }
         controlTasks = tasks
-        controlTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        controlTimer = mainTimer(every: 0.1, after: 0.1) { [weak self] in
             self?.tickControls()
         }
         nextControl()
@@ -92,7 +92,7 @@ extension HelioVerifier {
         controlWait = nil
         controlWaitToken += 1
         guard !controlTasks.isEmpty else {
-            controlTimer?.invalidate()
+            controlTimer?.cancel()
             step = .done
             return finish("done: controls finished")
         }
