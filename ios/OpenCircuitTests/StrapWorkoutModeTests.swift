@@ -1,4 +1,5 @@
 import CoreLocation
+import HealthKit
 import UIKit
 import XCTest
 import OpenCircuitKit
@@ -95,6 +96,25 @@ private final class Location: WorkoutLocationTracking {
     func start(route: Bool) {}
     func setPaused(_ paused: Bool) {}
     func stop() {}
+}
+
+/// The `HKWorkoutBuilder` calls `StrapWorkoutHealthWriter.save` makes, recorded (89p e).
+@MainActor
+private final class RecordingBuilder: StrapWorkoutBuilding {
+    private(set) var samples: [HKSample] = []
+    private(set) var metadata: [String: Any] = [:]
+    func beginCollection(at date: Date) async throws {}
+    func addWorkoutEvents(_ events: [HKWorkoutEvent]) async throws {}
+    func addSamples(_ samples: [HKSample]) async throws { self.samples += samples }
+    func addMetadata(_ metadata: [String: Any]) async throws { self.metadata.merge(metadata) { $1 } }
+    func endCollection(at date: Date) async throws {}
+    func finishWorkout() async throws -> HKWorkout? { nil }
+
+    var energyKcal: [Double] {
+        samples.compactMap { $0 as? HKQuantitySample }
+            .filter { $0.quantityType == HKQuantityType(.activeEnergyBurned) }
+            .map { $0.quantity.doubleValue(for: .kilocalorie()) }
+    }
 }
 
 @MainActor
@@ -287,6 +307,32 @@ final class StrapWorkoutModeRecorderTests: XCTestCase {
         XCTAssertEqual(without.metadata, ["OCStrapWorkoutMode": 0])
     }
 
+    /// 89p (e): `save` itself, through a recording builder: the energy it adds is exactly OpenCircuit's
+    /// estimate, never the strap's kcal, and the metadata goes with the workout.
+    func testSaveAddsOpenCircuitsEnergyAndTheMetadataNeverTheStrapsKcal() async throws {
+        let source = FakeModeSource()
+        let (recorder, writes) = makeRecorder(source)
+        recorder.selectedSport = .tennis
+        recorder.start()
+        source.emit(.running)
+        await stream(recorder, source, from: 0, to: 900, bpm: 150)
+        source.frame(kcal: 999, swings: 42)
+        await recorder.end()
+        let write = try XCTUnwrap(writes.writes.first)
+        let estimate = try XCTUnwrap(write.summary.summary.estimatedActiveKcal)
+        for extras in [write.workoutMode, StrapWorkoutModeExtras()] {
+            var w = write
+            w.workoutMode = extras
+            let builder = RecordingBuilder()
+            let writer = StrapWorkoutHealthWriter(isHealthDataAvailable: { true }, makeBuilder: { _, _ in builder })
+            _ = await writer.save(w)
+            XCTAssertEqual(builder.energyKcal, [estimate], "one energy sample, OpenCircuit's estimate (strap kcal \(String(describing: extras.strapKilocalories)))")
+            XCTAssertEqual(builder.metadata[StrapWorkoutMetadata.workoutModeKey] as? Int, extras.ranWithWorkoutMode ? 1 : 0)
+            XCTAssertEqual(builder.metadata[StrapWorkoutMetadata.activeEnergyKey] as? Int, extras.strapKilocalories)
+            XCTAssertEqual(builder.metadata[StrapWorkoutMetadata.swingCountKey] as? Int, extras.swings)
+        }
+    }
+
     func testTheEnergyWrittenToHealthIsTheSameWithAndWithoutFrames() async throws {
         func run(frames: Bool) async throws -> StrapWorkoutWrite {
             now = t0
@@ -432,6 +478,8 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
         device.services = [(0x0000, 0), (0x000A, 1), (0x001D, 0), (0x0029, 0), (0x0043, 0), (0x0047, 0), (0x0082, 0)]
             + (workoutEndpoint ? [(0x0019, 1)] : [])
         device.deviceInfoReply = [0x02, 0x01, 0x0c, 0, 0, 0, 0, 0, 0, 0] + Array("9.9.9.9".utf8) + [0] + Array("1.2.3.4".utf8) + [0]
+        // 89p (d): the strap's own clock runs 2 s ahead of the phone's; an accepted `02` starts there.
+        device.strapClock = { [unowned self] in UInt32(self.now.timeIntervalSince1970) + 2 }
         return device
     }
 
@@ -543,16 +591,18 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
 
     // MARK: 89c fallbacks
 
-    func testNoStartReplyFallsBackAfterEightSeconds() async {
+    func testNoStartReplyAsksTheStrapAndFallsBackWhenItIsIdle() async {
         let device = makeStrap()
-        device.workoutStartStatus = nil
-        let (recorder, _, session, _, _) = started(device: device)
+        device.workoutStartStatus = nil   // this strap ignores the `02` and starts nothing
+        let (recorder, _, session, transport, _) = started(device: device)
         XCTAssertEqual(device.workoutCommands, [[0x01], [0x06, 0x00], [0x02, 0x11, 0x00, 0x00, 0x01]])
         await tick(recorder, session, to: 7)
         XCTAssertEqual(recorder.workoutModeStatus, .starting)
         await tick(recorder, session, to: 9)
+        transport.drain()
+        XCTAssertEqual(device.workoutCommands.last, [0x06, 0x00], "89p (a): asked at once")
         XCTAssertEqual(recorder.workoutModeStatus, .unavailable)
-        XCTAssertNotNil(marker.marker, "whether the strap started is unknown: the next connection settles it")
+        XCTAssertNil(marker.marker, "idle: nothing of ours runs")
     }
 
     func testARefusedStartFallsBack() {
@@ -767,46 +817,131 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
 
     func testFramesAfterALostStartReplyCarryOnAsTheStrapsWorkoutMode() async throws {
         let device = makeStrap()
-        device.workoutStartStatus = nil
+        device.dropsStartReply = true   // started, but the `10 02 01` never comes
         let (recorder, writes, session, transport, _) = started(device: device)
-        await tick(recorder, session, to: 9)
-        XCTAssertEqual(recorder.workoutModeStatus, .unavailable)
-        device.workoutRunning = (1_800_000_000, 0x11)   // it did start; only the reply was lost
+        await tick(recorder, session, to: 5)
         frame(transport, device, kcal: 3, swings: 6)
+        XCTAssertEqual(device.workoutCommands.last, startedMessage, "89p (a): our start time to the strap")
+        XCTAssertEqual(device.workoutRunning?.start, 1_800_000_000, "the strap adopted it")
         XCTAssertEqual(recorder.workoutModeStatus, .running)
         XCTAssertEqual(recorder.strapSwings, 6)
-        XCTAssertNotNil(marker.marker)
         await tick(recorder, session, to: 300)
         await recorder.end()
         transport.drain()
         XCTAssertEqual(Array(device.workoutCommands.filter { $0 != [0x05] }.suffix(2)), [control(0x02, 300), control(0x04, 300)])
         XCTAssertNil(device.workoutRunning)
+        XCTAssertNil(marker.marker)
         XCTAssertTrue(try XCTUnwrap(writes.writes.first).workoutMode.ranWithWorkoutMode)
     }
 
-    func testEndAfterALostStartReplyEndsTheStrapsWorkoutOnlyIfItIsOurs() async {
-        for strap in [(1_800_000_000 as UInt32, 0x11 as UInt8), nil, (1_799_999_000, 0x11)] {
+    /// B2 (89p a, b): `02` unanswered, End at +4 s, then the start times out. Whether the timeout's
+    /// `06 00` is answered (ours, by the strap's own start) or lost and a frame comes instead, the
+    /// strap's workout is ended exactly once and the persisted End is never erased.
+    func testAnEndWhileTheStartReplyIsMissingEndsTheStrapsWorkoutOnce() async {
+        for stateAnswered in [true, false] {
             marker = StrapWorkoutModeMarkerStore(freshDefaults())
             now = t0
             let device = makeStrap()
-            device.workoutStartStatus = nil
+            device.dropsStartReply = true
             let (recorder, _, session, transport, _) = started(device: device)
-            await tick(recorder, session, to: 9)
-            device.workoutRunning = strap.map { ($0.0, $0.1) }
-            let sent = device.workoutCommands.count
-            await tick(recorder, session, to: 60)
+            device.answersWorkoutState = stateAnswered
+            await tick(recorder, session, to: 4)
             await recorder.end()
             transport.drain()
-            let after = Array(device.workoutCommands.dropFirst(sent))
-            if strap?.0 == 1_800_000_000 {
-                XCTAssertEqual(after, [[0x06, 0x00], control(0x02, 60), control(0x04, 60)], "ours: ended")
-                XCTAssertNil(device.workoutRunning)
-            } else {
-                XCTAssertEqual(after, [[0x06, 0x00]], "idle or foreign: only the question")
-                XCTAssertEqual(device.workoutRunning.map { $0.start }, strap?.0)
-            }
+            XCTAssertEqual(marker.marker?.appEnded, true)
+            await tick(recorder, session, to: 9)
+            transport.drain()
+            XCTAssertEqual(marker.marker?.appEnded ?? true, true, "the timeout's marker never erases the End")
+            transport.push(device.workoutFrame(active: 9, heartRate: 120, kcal: 2, average: 120, maximum: 120, swings: 1))
+            transport.drain()
+            for s in stride(from: 10.0, through: 310.0, by: 1.0) { now = at(s); session.tick(now: now); transport.drain() }
+            let sent = device.workoutCommands
+            XCTAssertEqual(sent.filter { $0.starts(with: [0x03, 0x04]) }, [control(0x04, 4)], "answered \(stateAnswered): one end, our seconds")
+            XCTAssertTrue(sent.contains(startedMessage), "answered \(stateAnswered): our start time first")
+            XCTAssertFalse(sent.contains([0x05]), "answered \(stateAnswered): no keep-alive for an ended workout")
+            XCTAssertNil(device.workoutRunning)
             XCTAssertNil(marker.marker)
         }
+    }
+
+    /// B3 (89p a): `02` unanswered, its `06 00` unanswered too, End after the timeout, then the late
+    /// `10 02 01`: the strap is given our start time and its workout ended.
+    func testAnEndAfterTheStartTimeoutThenALateStartReplyEndsTheStrapsWorkout() async {
+        let device = makeStrap()
+        device.dropsStartReply = true
+        let (recorder, _, session, transport, _) = started(device: device)
+        device.answersWorkoutState = false
+        await tick(recorder, session, to: 9)
+        transport.drain()
+        XCTAssertEqual(device.workoutCommands.last, [0x06, 0x00])
+        XCTAssertEqual(device.workoutRunning?.start, 1_800_000_002, "the strap's own clock: not our start")
+        await tick(recorder, session, to: 12)
+        await recorder.end()
+        transport.drain()
+        let before = device.workoutCommands.count
+        transport.push(device.unsolicited(endpoint: 0x0019, [0x10, 0x02, 0x01]))
+        transport.drain()
+        XCTAssertEqual(Array(device.workoutCommands.dropFirst(before)), [startedMessage, control(0x02, 12), control(0x04, 12)])
+        XCTAssertNil(device.workoutRunning)
+        XCTAssertNil(marker.marker)
+    }
+
+    func testEndAfterALostStartReplyEndsTheStrapsWorkoutOnlyIfItIsOurs() async {
+        enum Strap { case ours, idle, foreign }
+        for strap in [Strap.ours, .idle, .foreign] {
+            marker = StrapWorkoutModeMarkerStore(freshDefaults())
+            now = t0
+            let device = makeStrap()
+            if strap == .ours { device.dropsStartReply = true } else { device.workoutStartStatus = nil }
+            let (recorder, _, session, transport, _) = started(device: device)
+            if strap == .foreign { device.workoutRunning = (1_800_000_001, 0x34) }   // someone else's, another sport
+            let sent = device.workoutCommands.count
+            await tick(recorder, session, to: 4)
+            await recorder.end()
+            await tick(recorder, session, to: 9)
+            transport.drain()
+            let after = Array(device.workoutCommands.dropFirst(sent))
+            switch strap {
+            case .ours:
+                XCTAssertEqual(after, [[0x06, 0x00], startedMessage, control(0x02, 4), control(0x04, 4)], "ours by the strap's own start")
+                XCTAssertNil(device.workoutRunning)
+                XCTAssertNil(marker.marker)
+            case .idle:
+                XCTAssertEqual(after, [[0x06, 0x00]])
+                XCTAssertNil(marker.marker)
+            case .foreign:
+                XCTAssertEqual(after, [[0x06, 0x00]], "never touched")
+                XCTAssertEqual(device.workoutRunning?.sport, 0x34)
+                XCTAssertEqual(marker.marker?.startUnconfirmed, true, "kept, flagged, for the next connection")
+                XCTAssertEqual(marker.marker?.appEnded, true)
+                _ = connect(device)
+                XCTAssertEqual(device.workoutCommands.last, [0x06, 0x00], "the next connection asks")
+                XCTAssertNil(marker.marker, "foreign there too: let go")
+                XCTAssertEqual(device.workoutRunning?.sport, 0x34)
+            }
+        }
+    }
+
+    /// 89p (b): the session merges, never overwrites. An End the recorder persisted (here with no
+    /// session to tell) survives the start timeout's marker update, and the frame that follows ends it.
+    func testAPersistedEndSurvivesTheStartTimeoutsMarker() async {
+        let device = makeStrap()
+        device.dropsStartReply = true
+        let (_, _, session, transport, _) = started(device: device)
+        device.answersWorkoutState = false
+        marker.update(startTime: 1_800_000_000) {
+            $0.appEnded = true
+            $0.activeSeconds = 4
+        }
+        now = at(9)
+        session.tick(now: now)
+        transport.drain()
+        XCTAssertEqual(marker.marker?.startUnconfirmed, true)
+        XCTAssertEqual(marker.marker?.appEnded, true, "merged over the persisted End")
+        XCTAssertEqual(marker.marker?.activeSeconds, 4)
+        frame(transport, device)
+        XCTAssertEqual(Array(device.workoutCommands.suffix(3)), [startedMessage, control(0x02, 4), control(0x04, 4)])
+        XCTAssertNil(device.workoutRunning)
     }
 
     func testBreadcrumbsCarryControlBytesAndOutcomesOnly() {

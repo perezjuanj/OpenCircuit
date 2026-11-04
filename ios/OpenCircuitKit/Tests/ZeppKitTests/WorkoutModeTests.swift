@@ -297,7 +297,8 @@ final class WorkoutModeMachineTests: XCTestCase {
     // MARK: 89c fallbacks
 
     func testNoReplyAtAnyStepFallsBackAndNeverSendsMore() {
-        for step in [Machine.Step.capability, .state, .start] {
+        // `02` unanswered is not a fallback but a question (89p a): `testALateStartReplyIsAdoptedWithOurStartTime`.
+        for step in [Machine.Step.capability, .state] {
             var m = Machine()
             _ = m.start(tennis, startTime: start, now: t0)
             if step != .capability { _ = m.receive(hex("10 01 01"), now: at(1)) }
@@ -310,8 +311,7 @@ final class WorkoutModeMachineTests: XCTestCase {
             XCTAssertFalse(m.isActive)
             XCTAssertEqual(m.tick(now: at(30)).messages, [], "\(step): no keep-alive, nothing else")
             XCTAssertEqual(m.pause(activeSeconds: 30, now: at(30)).messages, [])
-            // 89o (b): after an unanswered `02` the strap may run ours, so End asks; before it, nothing.
-            XCTAssertEqual(m.end(activeSeconds: 30, now: at(40)).messages, step == .start ? [hex("06 00")] : [])
+            XCTAssertEqual(m.end(activeSeconds: 30, now: at(40)).messages, [])
         }
     }
 
@@ -359,19 +359,19 @@ final class WorkoutModeMachineTests: XCTestCase {
         XCTAssertEqual(m.end(activeSeconds: 100, now: at(100)).messages, [], "the app's own End sends nothing more")
     }
 
-    func testALateStartReplyIsEndedAtOnce() {
+    func testALateStartReplyIsAdoptedWithOurStartTime() {
         var m = Machine()
         _ = m.start(tennis, startTime: start, now: t0)
         _ = m.receive(hex("10 01 01"), now: at(1))
         _ = m.receive(idleState, now: at(1))
-        XCTAssertEqual(m.tick(now: at(9.5)).events, [.unavailable(.noReply(.start))], "the marker is not cleared")
-        m.noteActiveSeconds(12)
+        let timeout = m.tick(now: at(9.5))
+        XCTAssertEqual(timeout.messages, [hex("06 00")], "89p (a): asked at once")
+        XCTAssertEqual(timeout.events, [.setMarker(ZeppWorkoutModeMarker(startTime: start, sportCode: 0x11, startUnconfirmed: true))])
         let out = m.receive(hex("10 02 01"), now: at(12))
-        XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00"),
-                                      hex("03 02 04 00 00 00 0c 00 00 00"), hex("03 04 04 00 00 00 0c 00 00 00")])
-        _ = m.receive(ok03, now: at(12.1))
-        _ = m.receive(ok03, now: at(12.2))
-        XCTAssertEqual(m.receive(ok03, now: at(12.3)).events, [.ended, .clearMarker(startTime: start)])
+        XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00")], "the strap gets our start; on as a start")
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(m.receive(runningState(start + 3, sport: 0x11), now: at(12.1)), Machine.Output(), "the 06 00 reply is moot now")
+        XCTAssertEqual(m.receive(liveFrame(active: 1, hr: 100, kcal: 0, avg: 100, max: 100, swings: nil), now: at(13)).events.first, .running)
     }
 
     func testAnUnconfirmedEndKeepsTheMarker() {
@@ -567,45 +567,73 @@ final class WorkoutModeRound3Tests: XCTestCase {
         XCTAssertEqual(m.tick(now: at(30)).messages, [])
     }
 
-    /// A machine whose `02` went unanswered.
+    /// A machine whose `02` went unanswered: the 89p (a) `06 00` is out, its reply not yet in.
     private func startTimedOut() -> Machine {
         var m = Machine()
         _ = m.start(tennis, startTime: start, now: t0)
         _ = m.receive(hex("10 01 01"), now: at(1))
         _ = m.receive(idleState, now: at(1))
-        XCTAssertEqual(m.tick(now: at(9.5)).events, [.unavailable(.noReply(.start))])
+        XCTAssertEqual(m.tick(now: at(9.5)).messages, [hex("06 00")])
         return m
     }
 
     func testAFrameAfterALostStartReplyMeansTheStrapStartedOurs() {
         var m = startTimedOut()
         let out = m.receive(liveFrame(active: 12, hr: 120, kcal: 2, avg: 118, max: 125, swings: 4), now: at(12))
-        XCTAssertEqual(out.events.first, .setMarker(ZeppWorkoutModeMarker(startTime: start, sportCode: 0x11)))
-        XCTAssertEqual(out.events.dropFirst().first, .running)
-        XCTAssertEqual(out.events.count, 3, "and the frame itself")
+        XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00")], "89p (a): our start time first")
+        XCTAssertEqual(out.events.first, .running)
+        XCTAssertEqual(out.events.count, 2, "and the frame itself")
         XCTAssertTrue(m.isActive)
         XCTAssertEqual(m.tick(now: at(17)).messages, [hex("05")])
         XCTAssertEqual(m.end(activeSeconds: 60, now: at(60)).messages,
                        [hex("03 02 04 00 00 00 3c 00 00 00"), hex("03 04 04 00 00 00 3c 00 00 00")])
     }
 
+    func testAnEndBeforeTheStartIsConfirmedIsHonouredByWhicheverEvidenceComes() {
+        // 89p (b): End is sticky. The strap's own clock started it 3 s after ours (start-unconfirmed window).
+        for evidence in [hex("10 02 01"), liveFrame(active: 9, hr: 120, kcal: 1, avg: 120, max: 120, swings: nil),
+                         runningState(start + 3, sport: 0x11)] {
+            var m = Machine()
+            _ = m.start(tennis, startTime: start, now: t0)
+            _ = m.receive(hex("10 01 01"), now: at(1))
+            _ = m.receive(idleState, now: at(1))
+            XCTAssertEqual(m.end(activeSeconds: 4, now: at(4)), Machine.Output(), "kept, nothing to say yet")
+            _ = m.tick(now: at(9.5))
+            let out = m.receive(evidence, now: at(10))
+            XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00"),
+                                          hex("03 02 04 00 00 00 04 00 00 00"), hex("03 04 04 00 00 00 04 00 00 00")],
+                           "\(evidence): our start, then the stored End")
+            var later: [[UInt8]] = []
+            for s in stride(from: 11.0, through: 300.0, by: 1.0) { later += m.tick(now: at(s)).messages }
+            XCTAssertEqual(later, [], "no keep-alive for a workout that ended")
+        }
+    }
+
     func testEndAfterALostStartReplyEndsTheStrapsWorkoutOnlyIfItIsOurs() {
         var m = startTimedOut()
-        XCTAssertEqual(m.end(activeSeconds: 40, now: at(40)).messages, [hex("06 00")])
-        var out = m.receive(oursRunning, now: at(40.5))
-        XCTAssertEqual(out.messages, [hex("03 02 04 00 00 00 28 00 00 00"), hex("03 04 04 00 00 00 28 00 00 00")])
+        XCTAssertEqual(m.end(activeSeconds: 40, now: at(40)), Machine.Output(), "the 06 00 already out decides")
+        var out = m.receive(runningState(start + 2, sport: 0x11), now: at(40.5))
+        XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00"),
+                                      hex("03 02 04 00 00 00 28 00 00 00"), hex("03 04 04 00 00 00 28 00 00 00")])
 
         m = startTimedOut()
         _ = m.end(activeSeconds: 40, now: at(40))
         out = m.receive(idleState, now: at(40.5))
         XCTAssertEqual(out.messages, [])
-        XCTAssertEqual(out.events, [.reconciled(.idle), .clearMarker(startTime: start)])
+        XCTAssertEqual(out.events, [.unavailable(.noReply(.start)), .clearMarker(startTime: start)])
+
+        for foreign in [runningState(start - 600, sport: 0x11), runningState(start + 2, sport: 0x34)] {
+            m = startTimedOut()
+            _ = m.end(activeSeconds: 40, now: at(40))
+            out = m.receive(foreign, now: at(40.5))
+            XCTAssertEqual(out.messages, [], "not ours: never touched")
+            XCTAssertEqual(out.events, [.unavailable(.notIdle)], "the flagged marker stays for the next connection")
+        }
 
         m = startTimedOut()
         _ = m.end(activeSeconds: 40, now: at(40))
-        out = m.receive(runningState(start - 600, sport: 0x11), now: at(40.5))
-        XCTAssertEqual(out.messages, [], "not ours: never touched")
-        XCTAssertEqual(out.events, [.reconciled(.foreign), .clearMarker(startTime: start)])
+        XCTAssertEqual(m.tick(now: at(18)).events, [.unavailable(.noReply(.start))], "no answer: the marker stays")
+        XCTAssertEqual(m.tick(now: at(60)).messages, [])
     }
 }
 

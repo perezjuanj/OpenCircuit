@@ -73,12 +73,17 @@ public final class FakeZeppDevice {
     public var onConfigWrite: (([UInt8]) -> Void)?
 
     // The strap's workout mode on 0x0019 (§18.9). Only reachable when a test lists 0x0019 in `services`.
-    /// The running workout (start time from `03 01`, sport from `02`); nil = idle. Persists across
-    /// connections, as on a real strap (§18.4).
+    /// The running workout; nil = idle. Like the real strap, an accepted `02` starts it at the strap's
+    /// own clock (`strapClock`), and `03 01` then replaces the start with the phone's time (89p d).
+    /// Persists across connections, as on a real strap (§18.4).
     public var workoutRunning: (start: UInt32, sport: UInt8)?
+    /// The strap's own clock (Unix s), for the start of a workout an accepted `02` begins.
+    public var strapClock: () -> UInt32 = { UInt32(Date().timeIntervalSince1970) }
+    /// The strap accepts `02` and starts the workout, but its `10 02 01` never reaches the phone.
+    public var dropsStartReply = false
     /// The reply to `01`; nil = the strap never answers it.
     public var workoutCapabilityReply: [UInt8]? = hex("10 01 01 03 01 01 01 03 00 00 00")
-    /// The status of the `10 02` reply; nil = the strap never answers `02`.
+    /// The status of the `10 02` reply; nil = the strap never answers `02` (and starts nothing).
     public var workoutStartStatus: UInt8? = 0x01
     /// Whether `06 00` is answered.
     public var answersWorkoutState = true
@@ -107,7 +112,6 @@ public final class FakeZeppDevice {
     /// Every payload received on the workout endpoint `0x0019`, decrypted, in order.
     public private(set) var workoutCommands: [[UInt8]] = []
     public private(set) var workoutPaused = false
-    private var acceptedSport: UInt8?
 
     private var expectedPhoneSequence: UInt32 = 0
     private var deviceSequence: UInt32 = 0
@@ -293,15 +297,18 @@ public final class FakeZeppDevice {
             return send(endpoint: 0x0019, hex("10 06 01 00 01") + le32(running.start) + [running.sport])
         case 0x02 where p.count >= 5:
             guard let status = workoutStartStatus else { return [] }
-            if status == 0x01 { acceptedSport = p[1] }
-            return send(endpoint: 0x0019, [0x10, 0x02, status])
+            if status == 0x01, workoutRunning == nil {
+                workoutRunning = (strapClock(), p[1])
+                workoutPaused = false
+            }
+            return dropsStartReply ? [] : send(endpoint: 0x0019, [0x10, 0x02, status])
         case 0x03 where p.count == 10 || p.count == 14:
             guard let status = workoutControlStatus else { return [] }
             if status == 0x01 {
                 switch p[1] {
                 case 0x01 where p.count == 14:
-                    workoutRunning = (readLE32(p, 6), acceptedSport ?? 0)
-                    workoutPaused = false
+                    // Adopts the phone's start time for the workout `02` started.
+                    if let running = workoutRunning { workoutRunning = (readLE32(p, 6), running.sport) }
                 case 0x02: workoutPaused = true
                 case 0x03: workoutPaused = false
                 case 0x04, 0x05:

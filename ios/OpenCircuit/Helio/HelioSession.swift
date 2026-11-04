@@ -1456,7 +1456,8 @@ final class HelioSession: WearableSession {
         // The marker first: it is set before `02` goes out (89f).
         for event in out.events {
             switch event {
-            case .setMarker(let marker): workoutModeMarker.set(marker)
+            // 89p (b): merged, never overwritten: an End the recorder persisted stays.
+            case .setMarker(let marker): workoutModeMarker.set(marker.merged(over: workoutModeMarker.marker))
             case .markStrapPaused(let paused):
                 if let start = workoutMode.marker?.startTime {
                     workoutModeMarker.update(startTime: start) { $0.strapPaused = paused }
