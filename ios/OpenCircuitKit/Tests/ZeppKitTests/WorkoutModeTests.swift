@@ -59,8 +59,8 @@ final class WorkoutModeCodecTests: XCTestCase {
         XCTAssertEqual(start(.yoga), hex("02 3c 00 00 01"))
         XCTAssertEqual(start(.walkingIndoor), hex("02 28 00 00 01"))
         XCTAssertEqual(start(.other), hex("02 05 00 00 01"))
-        XCTAssertEqual(start(.tennis), hex("02 11 00 00 01"))
-        XCTAssertEqual(start(.pickleball), hex("02 e3 00 01 01 02 00 00 00 02"), "Zepp's racket form, byte for byte")
+        XCTAssertEqual(start(.tennis), hex("02 11 00 01 01 02 00 00 00 01"), "90a: Zepp's racket form, left wrist unless told")
+        XCTAssertEqual(start(.pickleball), hex("02 e3 00 01 01 02 00 00 00 01"), "90a: Zepp's racket form, left wrist unless told")
         for sport in [WorkoutSportType.walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .hiking] {
             XCTAssertNil(ZeppWorkoutSport.forSport(sport), "\(sport): no strap mode for outdoor GPS sports (89b)")
         }
@@ -68,6 +68,55 @@ final class WorkoutModeCodecTests: XCTestCase {
         XCTAssertEqual(Set(tested), [0x02, 0x34, 0x11, 0xe3], "the codes tested on hardware (§18.9)")
         for sport in WorkoutSportType.allCases {
             XCTAssertEqual(ZeppWorkoutSport.forSport(sport)?.startRequest.prefix(2), ZeppWorkoutSport.forSport(sport).map { [0x02, $0.code] }.map { ArraySlice($0) })
+        }
+    }
+
+    // MARK: Decision 90: the wrist
+
+    func testTennisAndPickleballStartWithTheChosenWristInTheRacketForm() {
+        func start(_ sport: WorkoutSportType, _ wrist: StrapWrist) -> [UInt8]? {
+            ZeppWorkoutSport.forSport(sport, wrist: wrist)?.startRequest
+        }
+        XCTAssertEqual(start(.tennis, .left), hex("02 11 00 01 01 02 00 00 00 01"))
+        XCTAssertEqual(start(.tennis, .right), hex("02 11 00 01 01 02 00 00 00 02"))
+        XCTAssertEqual(start(.pickleball, .left), hex("02 e3 00 01 01 02 00 00 00 01"))
+        XCTAssertEqual(start(.pickleball, .right), hex("02 e3 00 01 01 02 00 00 00 02"))
+    }
+
+    func testTheWristByteValuesAreTheSpecsLeftOneRightTwo() {
+        XCTAssertEqual(StrapWrist.left.rawValue, 0x01)
+        XCTAssertEqual(StrapWrist.right.rawValue, 0x02)
+        XCTAssertEqual(Set(StrapWrist.allCases), [.left, .right])
+    }
+
+    func testNoOtherSportStartRequestChangesWithTheWrist() {
+        let expected: [WorkoutSportType: String] = [
+            .runningIndoor: "02 02 00 00 01", .strengthTraining: "02 34 00 00 01", .cyclingIndoor: "02 08 00 00 01",
+            .rowing: "02 17 00 00 01", .yoga: "02 3c 00 00 01", .walkingIndoor: "02 28 00 00 01", .other: "02 05 00 00 01",
+        ]
+        for (sport, bytes) in expected {
+            for wrist in StrapWrist.allCases {
+                XCTAssertEqual(ZeppWorkoutSport.forSport(sport, wrist: wrist)?.startRequest, hex(bytes), "\(sport) \(wrist)")
+            }
+        }
+        for sport in [WorkoutSportType.walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .hiking] {
+            XCTAssertNil(ZeppWorkoutSport.forSport(sport, wrist: .right), "\(sport): still no strap mode")
+        }
+    }
+
+    func testOnlyTennisAndPickleballAskWhichWrist() {
+        for sport in WorkoutSportType.allCases {
+            XCTAssertEqual(ZeppWorkoutSport.asksWrist(sport), sport == .tennis || sport == .pickleball, "\(sport)")
+        }
+    }
+
+    func testTheWristNeverReachesTheMarkerOrItsOwnership() {
+        for wrist in StrapWrist.allCases {
+            var m = Machine()
+            let out = m.start(ZeppWorkoutSport.forSport(.tennis, wrist: wrist)!, startTime: start, now: t0)
+            XCTAssertEqual(out.messages, [hex("01")])
+            XCTAssertEqual(m.marker, ZeppWorkoutModeMarker(startTime: start, sportCode: 0x11),
+                           "90e: the marker holds start time and sport code, never the wrist (\(wrist))")
         }
     }
 
@@ -204,7 +253,7 @@ final class WorkoutModeMachineTests: XCTestCase {
         out = m.receive(hex("10 01 01 03 01 01 01 03 00 00 00"), now: at(1))
         XCTAssertEqual(out.messages, [hex("06 00")])
         out = m.receive(idleState, now: at(2))
-        XCTAssertEqual(out.messages, [hex("02 e3 00 01 01 02 00 00 00 02")])
+        XCTAssertEqual(out.messages, [hex("02 e3 00 01 01 02 00 00 00 01")])
         XCTAssertEqual(out.events, [.setMarker(ZeppWorkoutModeMarker(startTime: start, sportCode: 0xe3, startUnconfirmed: true))],
                        "89f: set in the same output as 02, for the host to persist before sending; 89q (a): flagged")
         out = m.receive(hex("10 02 01"), now: at(3))
