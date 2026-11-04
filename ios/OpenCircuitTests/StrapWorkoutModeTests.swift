@@ -736,9 +736,9 @@ final class StrapWorkoutModeAppTests: XCTestCase {
             return workout
         }
         let phoneSide = try? XCTUnwrap(recovered(nil))
-        XCTAssertEqual(phoneSide.map { StrapWorkoutView.message($0).contains("Zepp") }, false, "phone-side: nothing on the strap")
+        XCTAssertEqual(phoneSide.map { StrapWorkoutHooks.message($0).contains("Zepp") }, false, "phone-side: nothing on the strap")
         let withMode = try? XCTUnwrap(recovered(StrapWorkoutModeExtras(ranWithWorkoutMode: true)))
-        XCTAssertEqual(withMode.map { StrapWorkoutView.message($0).hasSuffix(" The strap may still keep a record of this workout in Zepp.") }, true)
+        XCTAssertEqual(withMode.map { StrapWorkoutHooks.message($0).hasSuffix(" The strap may still keep a record of this workout in Zepp.") }, true)
     }
 
     func testTheSummaryCopy() {
