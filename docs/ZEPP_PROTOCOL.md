@@ -47,7 +47,7 @@ Citations use these aliases. Line numbers are 1-based at the pinned commit.
 | `AMZ-M` | Amazfit Helio Strap user manual, https://support.amazfit.com/us/amazfit_helio_strap/files/user-manual.pdf.pdf (PDF created 2025-08-07); `AMZ-M p.N` = printed page N | fetched 2026-09-30 |
 | `HW:2026-09-30 (hw 0.132.27.2)` | Our own HelioVerify run against Juan's Helio Strap: hardware revision 0.132.27.2 (his Zepp account lists firmware 3.3.6.5), macOS CoreBluetooth, every ack `03 09`. Control bytes and lengths only; results in §10.1 | 2026-09-30 |
 | `HW:2026-11-03 route 2` | Runtime capture of the Zepp app (10.10.5, Android) driving Juan's strap (fw 3.27.0.1, hw 0.132.27.2): Android framework hooks only (AES in/out, GATT writes and notifications), no Zepp code read; decrypted messages accepted only on a matching §3.3 CRC. Raw capture kept outside the repo (health data and session keys). Results in §18.9 | 2026-11-03 |
-| `HW:2026-11-03 HelioVerify` | HelioVerify `--workout-test` / `--workout-status` from the Mac against the same strap: start, live frames, pause, end (save and don't save) and state queries for pickleball, tennis, strength and outdoor run. Results in §18.9 | 2026-11-03 |
+| `HW:2026-11-03 HelioVerify` | HelioVerify `--workout-test` / `--workout-status` from the Mac against the same strap: start, live frames, pause, end (both end forms) and state queries for pickleball, tennis, strength and outdoor run. Results in §18.9 | 2026-11-03 |
 | `HW:2026-09-30 13:35` | Juan's read-only re-test of the same strap with HelioVerify at `293cd90`, every ack `03 09`: the activity CRC, a full 12 h round, the device-info firmware read and HEALTH arg `0x04`. Results in §10.1 | 2026-09-30 |
 
 HelioCore is the only reference known to run on a real Helio Strap from iOS; Gadgetbridge
@@ -2267,8 +2267,8 @@ phone command starts `10 <opcode> <status>`; status `01` = accepted (the only st
 | started | `03 01 06 00 00 00 <u32 start, Unix s> 00 00 00 00` | `10 03 01` | sent right after the start reply; the timestamp is the phone's wall clock | 🟢 |
 | pause | `03 02 04 00 00 00 <u32 active s>` | `10 03 01` | active seconds so far (Zepp's matched wall clock minus pauses) | 🟢 |
 | resume | `03 03 04 00 00 00 <u32 active s>` | `10 03 01` | | 🟢 |
-| end, save | `03 04 04 00 00 00 <u32 active s>` | `10 03 01` | Zepp sends pause first, then this. The workout is stored on the strap and appeared in Zepp's history at the next Zepp sync (a Mac-started pickleball workout did) | 🟢 |
-| end, don't save | `03 05 04 00 00 00 <u32 active s>` | `10 03 01` | a treadmill session Zepp ended this way never appeared in Zepp 🟡 (one sample; a Mac-started workout ended this way is the confirming check) | 🟢 bytes |
+| end | `03 04 04 00 00 00 <u32 active s>` | `10 03 01` | Zepp sends pause first, then this. The workout is stored on the strap and appears in Zepp's history at the next Zepp sync (Mac-started pickleball and strength workouts did) | 🟢 |
+| end, other form | `03 05 04 00 00 00 <u32 active s>` | `10 03 01` | **also saves**: two 90 s strength workouts started from the Mac, one ended `03 04` and one `03 05`, both appeared in Zepp. What distinguishes the two is unknown 🔴; send `03 04`. Whether a workout is kept depends on its length instead: four 45 s ones never appeared, 88 s and longer did (the threshold is between, 🔴) | 🟢 bytes and "both save" |
 | keep-alive | `05` | none | Zepp sends it about every 5 s, workout or not. **Not required**: a Mac-started workout with no `05` at all kept running and streaming for 215 s | 🟢 |
 | phone stats (treadmill only) | `04 00 f8 07 13 …` (41 B), about 1/s | none | only during Zepp's treadmill session; fields unexplained 🔴. Not needed for any sport tested | 🟢 bytes |
 
@@ -2300,7 +2300,7 @@ then:         14 00 24 01 00 <fields> <u32 active s> <u8 HR> <u32 kcal> <u8 avg 
                            ← 14 00 26 …  then 14 00 24 … every second
 → 03 02 04 00 00 00 <active>   (pause)               ← 10 03 01
 → 03 03 04 00 00 00 <active>   (resume)              ← 10 03 01
-→ 03 02 04 00 00 00 <active>, then 03 04 04 00 00 00 <active>   (end, save)
+→ 03 02 04 00 00 00 <active>, then 03 04 04 00 00 00 <active>   (end; the workout is kept if long enough)
                            ← 10 03 01, 10 03 01
 ```
 
@@ -2803,3 +2803,5 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   the 1 Hz live frames, Heart Rate Broadcast = HEALTH arg `0x83` (§5.5); observed in a runtime
   capture of the Zepp app and re-sent from the Mac by HelioVerify. §18.1's unknown row and capture
   item 26 are marked superseded; the earlier `0x05` guess for Heart Rate Push is corrected.
+- 2026-11-03: §18.9 correction: `03 05` also saves the workout (it is not "don't save"); very short
+  workouts (45 s) are not kept, 88 s and longer are. The app sends `03 04` only.
