@@ -46,6 +46,8 @@ Citations use these aliases. Line numbers are 1-based at the pinned commit.
 | `AMZ-S` | Amazfit support page for the Helio Strap, https://support.amazfit.com/us/amazfit_helio_strap/docs/OSUldKzExovDlRxnMyCcH10dnL0 (© 2025) | fetched 2026-09-30 |
 | `AMZ-M` | Amazfit Helio Strap user manual, https://support.amazfit.com/us/amazfit_helio_strap/files/user-manual.pdf.pdf (PDF created 2025-08-07); `AMZ-M p.N` = printed page N | fetched 2026-09-30 |
 | `HW:2026-09-30 (hw 0.132.27.2)` | Our own HelioVerify run against Juan's Helio Strap: hardware revision 0.132.27.2 (his Zepp account lists firmware 3.3.6.5), macOS CoreBluetooth, every ack `03 09`. Control bytes and lengths only; results in §10.1 | 2026-09-30 |
+| `HW:2026-11-03 route 2` | Runtime capture of the Zepp app (10.10.5, Android) driving Juan's strap (fw 3.27.0.1, hw 0.132.27.2): Android framework hooks only (AES in/out, GATT writes and notifications), no Zepp code read; decrypted messages accepted only on a matching §3.3 CRC. Raw capture kept outside the repo (health data and session keys). Results in §18.9 | 2026-11-03 |
+| `HW:2026-11-03 HelioVerify` | HelioVerify `--workout-test` / `--workout-status` from the Mac against the same strap: start, live frames, pause, end (save and don't save) and state queries for pickleball, tennis, strength and outdoor run. Results in §18.9 | 2026-11-03 |
 | `HW:2026-09-30 13:35` | Juan's read-only re-test of the same strap with HelioVerify at `293cd90`, every ack `03 09`: the activity CRC, a full 12 h round, the device-info firmware read and HEALTH arg `0x04`. Results in §10.1 | 2026-09-30 |
 
 HelioCore is the only reference known to run on a real Helio Strap from iOS; Gadgetbridge
@@ -556,7 +558,8 @@ written).
 |---|---|---|---|
 | `0x01` | byte | all-day HR monitoring: `00` off, `ff` "smart"/auto, `N` = every N minutes (Gadgetbridge caps at 120) | activity HR, resting/max HR, HRV 🔴 | 
 | `0x04` | bool | the vendor's **"Active heart rate monitoring"** switch: it only raises the HR sampling rate during detected activity. It does **not** gate recording: it read `false` in a complete (non-partial) config read, and every one of the 720 minutes of the same session's 12 h activity fetch carried a heart rate. Read it for information; never warn about it. | none: 🟢 does not gate recording `HW:2026-09-30 13:35` (§10.1); the sampling-boost meaning is the vendor's switch description, not measured 🟡 |
-| `0x05` | bool | share HR with third parties. 🔴 Probably the Zepp app's **"Heart Rate Push"** switch (Zepp › Device › Helio Strap › Health Monitoring), which the strap needs for standard-HR broadcast (§7) | live HR |
+| `0x83` | bool | **Heart Rate Broadcast** (Zepp's switch, formerly "Heart Rate Push"): read `03 00 08 01 83`, write `05 08 03 00 01 83 0b <00\|01>`, ack `06 01` (§18.9) | live HR to other devices; 🟢 `HW:2026-11-03 route 2` |
+| `0x05` | bool | share HR with third parties. 🔴 Not Heart Rate Broadcast (that is `0x83`, observed). Earlier guess: probably the Zepp app's **"Heart Rate Push"** switch (Zepp › Device › Helio Strap › Health Monitoring), which the strap needs for standard-HR broadcast (§7) | live HR |
 | `0x11` | bool | high-accuracy sleep monitoring (uses HR for sleep; needed for REM staging 🔴) | sleep session |
 | `0x12` | bool | sleep breathing-quality monitoring. Gadgetbridge notes it is required for **sleep SpO₂** (`FOP/Spo2Sleep:31-33`); 🔴 likely also for sleep respiratory rate | `0x26`, `0x38` 🔴 |
 | `0x13` | bool | stress monitoring | `0x13` 🟡 |
@@ -1034,7 +1037,9 @@ to connect (phone Bluetooth off) so that every message seen is the strap's.
     one more than the version read. Record exactly what came back (an ack status, nothing, or a
     value silently kept). Also record whether HEALTH arg `01` is present and its allowed values.
     Promotes §17.1, §17.3, §17.4, §17.7 and §17.9.
-26. **Workouts** (§18). No capture can reveal the phone's start/pause/resume/end commands:
+26. **Workouts** (§18). **Done 2026-11-03 by a different method (§18.9):** a runtime capture on Android
+    plus HelioVerify sends from the Mac. Still open: outdoor GPS sports (§18.5) and the racket start
+    bytes. Original item: no capture can reveal the phone's start/pause/resume/end commands:
     `0x0019` is encrypted with a session key that only the two ends can derive (§18.1). What can
     be observed: (a) with an idle link held as in item 22 and workout detection on, walk briskly
     until the strap auto-detects a workout: does anything arrive on `0x0019` (`11 01`, `11 04`,
@@ -2088,7 +2093,7 @@ doesn't specify them.
 | A workout can also start **without** the phone, by automatic workout detection (§19). | 🟡 `AMZ-M p.5` |
 | **Neither reference can start, pause, resume or end a workout from the phone.** Gadgetbridge's workout service only *reacts* to workouts the device starts on its own screen (`20`, `11 01`, `11 04`, §16.2 rows 8–9). It has no command in the other direction except phone GPS (§18.5). Its predecessor for pre-Zepp OS bands is the same. HelioCore has no workout code at all. | 🟡 `SVC/Workout:44-49,86-123`, `GB/service/devices/huami/HuamiSupport.java:1925-1945`; `HC` (no match for workout or sport) |
 | Gadgetbridge's maintainer confirms this for the Helio: it reads VO₂ max only from workouts, and a Helio user can't start one without the Zepp app. | 🟡 `GB#5986` (comments of 2026-04-17) |
-| So **the start, pause, resume and end commands are unknown** 🔴. The workout endpoint `0x0019` is encrypted on the Helio (§3.5), with a session key that needs one side's ECDH private key (§4.4). A passive capture of the Zepp app's traffic (a BLE sniffer or an Android HCI snoop log) therefore shows only ciphertext and **cannot reveal them**. | 🟢 encryption `HW:2026-09-30 (hw 0.132.27.2)`; 🔴 the commands |
+| **Superseded by §18.9 (route 2): the commands are now observed and tested on our strap.** Kept for the reasoning: so **the start, pause, resume and end commands are unknown** 🔴. The workout endpoint `0x0019` is encrypted on the Helio (§3.5), with a session key that needs one side's ECDH private key (§4.4). A passive capture of the Zepp app's traffic (a BLE sniffer or an Android HCI snoop log) therefore shows only ciphertext and **cannot reveal them**. | 🟢 encryption `HW:2026-09-30 (hw 0.132.27.2)`; 🔴 the commands |
 | Gadgetbridge can upload **workout templates** (structured intervals with pace, cadence, HR, speed or stroke-rate alerts) as a file to a watch's sport app, through the file-transfer endpoint `0x000D`. The user then starts them on the watch's screen. The Helio lists `0x000D`. 🔴 whether it accepts templates at all; a template doesn't start a workout either way. | 🟡 `GB/service/devices/huami/zeppos/workouts/ZeppOsWorkoutTemplateUploader.kt`, `ZeppOsWorkoutCodes.kt:62-68`; 🟢 `0x000D` listed `HW:2026-09-30 (hw 0.132.27.2)` |
 
 **Consequence for #227 (decision for Juan).** Starting the strap's own workout mode from
@@ -2099,7 +2104,8 @@ read. Two routes exist:
    outdoor sports, and the result is written to HealthKit as a workout. The strap stays in normal
    all-day mode. It records its usual per-minute activity, but makes no workout record, no
    strap-side training effect or VO₂ max, and no per-workout buzz alerts.
-2. **The strap's workout mode**: needs a new source for the commands (§10 item 26 lists what can
+2. **The strap's workout mode**: the commands come from a runtime capture of our own strap (§18.9, `HW:2026-11-03`).
+   Earlier text: needs a new source for the commands (§10 item 26 lists what can
    and can't be observed). Until then, §18.2–§18.6 give what is known around it.
 
 ### 18.2 Sport type codes
@@ -2237,6 +2243,84 @@ connection's 8th message (handle `0x08`), sequence number `0x2933d236`: `OC-vec`
 | AES-128-ECB(message key) | `88 54 5c 90 c5 6b 79 b8 aa bc 1a 6a 8b 74 d9 5c dd cd 04 84 ce c7 15 fe 8a 67 69 60 69 1d 29 89 5f 3d 07 75 38 ba bf 17 e5 01 a5 f5 c2 c4 39 30` |
 | one chunk at MTU 247 (59 B) | `03 0f 00 08 00 26 00 00 00 19 00` + the 48 ciphertext bytes |
 | next sequence number | `0x2933d237` |
+
+
+### 18.9 The strap's workout mode on `0x0019` (route 2, observed on our strap)
+
+Source: a runtime capture of the Zepp app (10.10.5, Android) driving Juan's strap, with
+hooks on Android framework APIs only (AES in/out, GATT writes and notifications; no Zepp code was
+read), decrypted with the per-connection keys the capture saw and accepted only when the §3.3
+CRC matched (1,529 messages, 0 failures). Every command below was then **sent from the Mac by
+HelioVerify** (`--workout-test`, `--workout-status`) and the strap answered as shown.
+`HW:2026-11-03 route 2` and `HW:2026-11-03 HelioVerify` (fw 3.27.0.1, hw 0.132.27.2). This
+supersedes the "unknown" rows of §18.1 and §18.3 for everything listed here.
+
+All messages are on endpoint `0x0019`, encrypted (§3.5), little-endian. Every strap reply to a
+phone command starts `10 <opcode> <status>`; status `01` = accepted (the only status seen).
+
+| Phone → strap | Bytes | Strap reply | Meaning | Tag |
+|---|---|---|---|---|
+| capability query | `01` | `10 01 01 03 01 01 01 03 00 00 00` | sent first; the fields after the status are unexplained 🔴 | 🟢 |
+| state query | `06 00` | idle: `10 06 01 00 00`; running: `10 06 01 00 01 <u32 start, Unix s> <u8 sport>` | Zepp sends it before starting; use it after a crash or reconnect to find a workout still running | 🟢 |
+| start request | `02 <sport> 00 00 01` | `10 02 01` | the 5-byte form; accepted for treadmill `02`, outdoor run `01`, tennis `11`, strength `34` | 🟢 |
+| start request, racket form | `02 e3 00 01 01 02 00 00 00 02` | `10 02 01` | what Zepp sent for pickleball (`e3`, missing from §18.2) after asking which arm; the extra bytes are probably the arm and racket options 🔴. Tennis also accepted the 5-byte form and counted swings | 🟢 bytes, 🔴 meaning |
+| started | `03 01 06 00 00 00 <u32 start, Unix s> 00 00 00 00` | `10 03 01` | sent right after the start reply; the timestamp is the phone's wall clock | 🟢 |
+| pause | `03 02 04 00 00 00 <u32 active s>` | `10 03 01` | active seconds so far (Zepp's matched wall clock minus pauses) | 🟢 |
+| resume | `03 03 04 00 00 00 <u32 active s>` | `10 03 01` | | 🟢 |
+| end, save | `03 04 04 00 00 00 <u32 active s>` | `10 03 01` | Zepp sends pause first, then this. The workout is stored on the strap and appeared in Zepp's history at the next Zepp sync (a Mac-started pickleball workout did) | 🟢 |
+| end, don't save | `03 05 04 00 00 00 <u32 active s>` | `10 03 01` | a treadmill session Zepp ended this way never appeared in Zepp 🟡 (one sample; a Mac-started workout ended this way is the confirming check) | 🟢 bytes |
+| keep-alive | `05` | none | Zepp sends it about every 5 s, workout or not. **Not required**: a Mac-started workout with no `05` at all kept running and streaming for 215 s | 🟢 |
+| phone stats (treadmill only) | `04 00 f8 07 13 …` (41 B), about 1/s | none | only during Zepp's treadmill session; fields unexplained 🔴. Not needed for any sport tested | 🟢 bytes |
+
+**Strap → phone while a workout runs, once per second** 🟢:
+
+```
+first frame:  14 00 26 01 00 <fields> <u32 start, Unix s> 00 …        (zero-filled, same length class)
+then:         14 00 24 01 00 <fields> <u32 active s> <u8 HR> <u32 kcal> <u8 avg HR> <u8 max HR> [<u16 swings>]
+```
+
+- `<fields>` seen: `0e` (pickleball, tennis: 19 bytes, swings present) and `06` (strength:
+  17 bytes, no swings). So bit `0x08` = the u16 swing count is present 🟡. Treat any
+  other value as unknown: keep the bytes you can place and never fail the workout on it.
+- The HR in these frames **equals the §7.1 `0x2A37` value in the same second** (214 consecutive
+  seconds compared, at rest and under effort). There is no separate "better" HR stream: what workout mode
+  changes is what the strap measures, and `0x2A37` carries it (§18.1, the tester A/B where a Zepp
+  workout started mid-session lifted the live stream).
+- kcal, avg and max are the strap's own running totals; avg/max start at the first reading.
+- **Outdoor run (`01`) was accepted but sent no frames at all** for 45 s. Probably the strap waits
+  for phone GPS (§18.5) 🔴. Until that is tested, start outdoor GPS sports phone-side only (route 1).
+
+**Sequence Zepp uses (and HelioVerify reproduces):**
+
+```
+→ 01                       ← 10 01 01 …
+→ 06 00                    ← 10 06 01 00 00            (idle)
+→ 02 <sport> 00 00 01      ← 10 02 01
+→ 03 01 06 00 00 00 <ts> 00 00 00 00                 ← 10 03 01
+                           ← 14 00 26 …  then 14 00 24 … every second
+→ 03 02 04 00 00 00 <active>   (pause)               ← 10 03 01
+→ 03 03 04 00 00 00 <active>   (resume)              ← 10 03 01
+→ 03 02 04 00 00 00 <active>, then 03 04 04 00 00 00 <active>   (end, save)
+                           ← 10 03 01, 10 03 01
+```
+
+**Rules for OpenCircuit** (🔴 recommendations from the above):
+- Never start a strap workout without first reading `06 00` as idle. If it reports running and no
+  OpenCircuit workout owns it, offer to end it (§18.4); never start a second one on top.
+- A dropped link does not end the workout (the 215 s run above, and §18.4). Persist "a strap
+  workout we started may be running" with its start time; on every reconnect read `06 00` and
+  reconcile (end it with the saved active seconds if the workout already ended in the app).
+- Every end sends pause, then end, even when already paused.
+- If the start reply is missing (8 s) or not `01`, fall back to the phone-side workout of §18.1
+  route 1 and say nothing alarming to the user: live HR still flows.
+
+**Heart Rate Broadcast** (the Zepp app's switch, called Heart Rate Push in older versions) is
+**config HEALTH group `0x08`, arg `0x83`, bool** (§5.5) 🟢 `HW:2026-11-03 route 2`. Zepp reads it
+with `03 00 08 01 83` (reply `04 01 08 03 00 01 83 0b <00|01> 00 00`) and writes it with
+`05 08 03 00 01 83 0b <00|01>` (ack `06 01`), once per toggle. Separately, at each new connection
+Zepp writes `d1` to characteristic `00001531-0000-3512-2118-0009af100700` (not chunked) with
+notifications on, gets `10 d1 01 00`, and turns notifications off again: purpose unknown 🔴, not
+needed for the setting.
 
 ---
 
@@ -2715,3 +2799,7 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
 - 2026-10-26: §21.6: a strap nap that only touches its night's in-bed window is rewritten when it
   moves (decision 80a), and the 76l prune is idempotent and retried on a kept-out re-delivery
   (decision 80b; #331 items 7 and 10). No tag was promoted.
+- 2026-11-03: §18.9, the strap's workout mode (route 2): start/pause/resume/end/state on `0x0019`,
+  the 1 Hz live frames, Heart Rate Broadcast = HEALTH arg `0x83` (§5.5); observed in a runtime
+  capture of the Zepp app and re-sent from the Mac by HelioVerify. §18.1's unknown row and capture
+  item 26 are marked superseded; the earlier `0x05` guess for Heart Rate Push is corrected.
