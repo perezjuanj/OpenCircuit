@@ -169,6 +169,6 @@ final class StrapWorkoutLowHeartRateNoteTests: XCTestCase {
 
     func testCopyIsDecision88bVerbatim() {
         XCTAssertEqual(StrapWorkoutLowHeartRateNote.text,
-                       "Heart rate stayed below Zone 1 for most of this workout. If you worked harder than that, the strap may not have held a good reading: fast, repeated arm movement (racket sports, boxing) can make its live heart rate read low. OpenCircuit reads the strap's everyday heart rate, not Zepp's workout mode. A snug fit helps.")
+                       "Heart rate stayed below Zone 1 for most of this workout. If you worked harder than that, the strap may not have held a good reading: fast, repeated arm movement (racket sports, boxing) can make its live heart rate read low. This workout ran without the strap's workout mode, which reads better during hard effort. A snug fit helps.")
     }
 }

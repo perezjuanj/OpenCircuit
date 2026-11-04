@@ -19,6 +19,9 @@ import Foundation
 /// Sport types the app supports. Each maps to an HKWorkoutActivityType on the app side.
 /// Outdoor types (walking, running, cycling, hiking) enable GPS route capture via
 /// CoreLocation; indoor types (strength, yoga, other) do not.
+///
+/// `tennis` and `pickleball` are strap-only (#359, decision 89b): the ring never offers them
+/// (`ringSports`), so every ring screen and the ring's workout stay exactly as before.
 public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     case walkingOutdoor
     case walkingIndoor
@@ -31,6 +34,17 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     case strengthTraining
     case yoga
     case other
+    /// Strap only (decision 89b). Not outdoor: no route, whatever the court.
+    case tennis
+    /// Strap only (decision 89b).
+    case pickleball
+
+    /// The sports the ring's workout offers: every sport except the strap-only ones, in the order the
+    /// ring's pickers have always shown (89i: ring behaviour byte-identical).
+    public static let ringSports: [WorkoutSportType] = allCases.filter { !$0.isStrapOnly }
+
+    /// Offered only for a strap workout (decision 89b).
+    public var isStrapOnly: Bool { self == .tennis || self == .pickleball }
 
     public var displayName: String {
         switch self {
@@ -45,6 +59,8 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
         case .strengthTraining: return "Strength"
         case .yoga:           return "Yoga"
         case .other:          return "Other"
+        case .tennis:         return "Tennis"
+        case .pickleball:     return "Pickleball"
         }
     }
 
@@ -53,7 +69,8 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     public var isOutdoor: Bool {
         switch self {
         case .walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .hiking: return true
-        case .walkingIndoor, .runningIndoor, .cyclingIndoor, .rowing, .strengthTraining, .yoga, .other: return false
+        case .walkingIndoor, .runningIndoor, .cyclingIndoor, .rowing, .strengthTraining, .yoga, .other,
+             .tennis, .pickleball: return false
         }
     }
 
@@ -70,6 +87,8 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
         case .strengthTraining:  return "dumbbell"
         case .yoga:              return "figure.yoga"
         case .other:             return "heart.circle"
+        // No new icon (icons come only from keylineicons.com): the generic workout symbol.
+        case .tennis, .pickleball: return "heart.circle"
         }
     }
 
@@ -88,6 +107,8 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
         case .yoga:             return SportType.yoga.rawValue             // 0x07
         case .hiking:           return SportType.outdoorWalking.rawValue   // ≈ outdoor walk
         case .strengthTraining, .other: return SportType.yoga.rawValue     // ≈ generic indoor
+        // Never sent: the ring doesn't offer them (`ringSports`). The generic indoor mode if it ever were.
+        case .tennis, .pickleball: return SportType.yoga.rawValue
         }
     }
 }

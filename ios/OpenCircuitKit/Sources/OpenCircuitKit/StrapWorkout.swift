@@ -225,10 +225,14 @@ public struct StrapWorkoutJournal: Codable, Equatable, Sendable {
     /// The heart-rate recovery window closed while that workout still waited (84l, review-indoor-run-b
     /// S2): its readings and Cardio Recovery value, written once after the recovered save. nil otherwise.
     public var pendingRecovery: StrapWorkoutPendingRecovery?
+    /// What the strap's workout mode added so far (#359, 89e/89h). nil in journals written before #359,
+    /// and for a workout the mode never ran for.
+    public var workoutMode: StrapWorkoutModeExtras?
 
     public init(sport: WorkoutSportType, ledger: WorkoutActivityLedger, lastAliveAt: Date,
                 timelineRaw: String, distanceMeters: Double? = nil, stepStreamOn: Bool? = nil,
-                indoorEstimateMeters: Double? = nil, pendingRecovery: StrapWorkoutPendingRecovery? = nil) {
+                indoorEstimateMeters: Double? = nil, pendingRecovery: StrapWorkoutPendingRecovery? = nil,
+                workoutMode: StrapWorkoutModeExtras? = nil) {
         self.sport = sport
         self.ledger = ledger
         self.lastAliveAt = lastAliveAt
@@ -237,6 +241,7 @@ public struct StrapWorkoutJournal: Codable, Equatable, Sendable {
         self.stepStreamOn = stepStreamOn
         self.indoorEstimateMeters = indoorEstimateMeters
         self.pendingRecovery = pendingRecovery
+        self.workoutMode = workoutMode
     }
 
     public func encoded() -> Data? { try? JSONEncoder().encode(self) }
@@ -299,6 +304,8 @@ public struct RecoveredStrapWorkout: Equatable, Sendable {
     public var indoorEstimateMeters: Double? = nil
     /// Its recovery window's writes still owed to Health (84l). nil otherwise.
     public var pendingRecovery: StrapWorkoutPendingRecovery? = nil
+    /// What the strap's workout mode added, as journaled (#359). nil = phone-side.
+    public var workoutMode: StrapWorkoutModeExtras? = nil
 
     public var activeSeconds: TimeInterval { ledger.activeSeconds(until: end) }
 }
@@ -330,6 +337,6 @@ public enum StrapWorkoutRecovery {
         return .offer(RecoveredStrapWorkout(sport: journal.sport, ledger: journal.ledger, end: end,
                                             samples: inSpan.filter { $0.end <= end }, timelineRaw: journal.timelineRaw,
                                             indoorEstimateMeters: journal.indoorEstimateMeters,
-                                            pendingRecovery: journal.pendingRecovery))
+                                            pendingRecovery: journal.pendingRecovery, workoutMode: journal.workoutMode))
     }
 }

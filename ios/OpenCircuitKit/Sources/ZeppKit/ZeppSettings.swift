@@ -22,8 +22,8 @@ import Foundation
 /// type below, in a constraints-included read on this connection (§14, §17.1).
 ///
 /// Left out on purpose:
-/// - HEALTH `05` (share heart rate, 🔴 "probably" Zepp's Heart Rate Push, §5.5): what it controls
-///   is unsettled.
+/// - HEALTH `05` (share heart rate with third parties, 🔴 §5.5): what it controls is unsettled. It is
+///   not Heart Rate Broadcast, which is `83` (🟢 §18.9) and is offered below.
 /// - HEALTH `41`–`46`, `51` (inactivity and goal alerts): whether they buzz on the Helio is 🔴
 ///   (§13.4, §20). Goals `52`–`57` are never written (§15.1).
 /// - WORKOUT `40` (detection categories): never written on the Helio, even if reported (§19.3).
@@ -56,6 +56,10 @@ public enum ZeppSetting: String, CaseIterable, Equatable, Hashable {
     case workoutDetectionAlert
     /// Byte: detection sensitivity, `00` high, `01` standard, `02` low; the allowed list decides.
     case workoutDetectionSensitivity
+    // HEALTH (`08`) again, §5.5, §18.9 (#359, decision 89g)
+    /// Bool: Heart Rate Broadcast (Zepp's switch, formerly "Heart Rate Push"): live heart rate to gym
+    /// equipment, other apps and devices. Read `03 00 08 01 83`, written `05 08 <v> 00 01 83 0b <00|01>`.
+    case heartRateBroadcast
 
     /// The recording and sampling settings (#228), in display order.
     public static let measurement: [ZeppSetting] = [
@@ -69,6 +73,9 @@ public enum ZeppSetting: String, CaseIterable, Equatable, Hashable {
     /// Workout detection (#229): the alert and the sensitivity only, as Gadgetbridge ships for the
     /// Helio (§19.2).
     public static let workoutDetection: [ZeppSetting] = [.workoutDetectionAlert, .workoutDetectionSensitivity]
+
+    /// Heart Rate Broadcast (#359, decision 89g): its own switch on the strap settings screen.
+    public static let broadcast: [ZeppSetting] = [.heartRateBroadcast]
 
     public var group: UInt8 {
         switch self {
@@ -91,6 +98,7 @@ public enum ZeppSetting: String, CaseIterable, Equatable, Hashable {
         case .lowSpO2Alert: return 0x32
         case .workoutDetectionAlert: return 0x41
         case .workoutDetectionSensitivity: return 0x42
+        case .heartRateBroadcast: return ZeppConfig.HealthArgument.heartRateBroadcast
         }
     }
 
@@ -299,7 +307,7 @@ public struct ZeppSettingsEditor {
         return group == ZeppConfig.workoutGroup ? [0x40] + settings : settings
     }
 
-    /// The full read of a group, with constraints: HEALTH `03 01 08 0a 01 04 11 12 13 31 02 03 14 32`,
+    /// The full read of a group, with constraints: HEALTH `03 01 08 0b 01 04 11 12 13 31 02 03 14 32 83`,
     /// WORKOUT `03 01 09 03 40 41 42`.
     public static func readRequest(group: UInt8) -> [UInt8] {
         ZeppConfig.readRequest(group: group, arguments: groupArguments(group), includeConstraints: true)
