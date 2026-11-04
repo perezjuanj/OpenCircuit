@@ -944,6 +944,67 @@ final class StrapWorkoutModeSessionTests: XCTestCase {
         XCTAssertNil(device.workoutRunning)
     }
 
+    /// B4, the third review's probe kept as a test (89q a): the strap starts our workout at its own clock
+    /// (one second after ours) and the `10 02 01` is lost; the link drops at +3 s, before the start
+    /// timeout. The reconnect's `06 00` reads running at the strap's start: the flagged marker's window
+    /// makes it ours. End at +60 s, then a later connection: the strap's workout is ended.
+    func testALinkDropWhileTheStartReplyIsMissingStillEndsTheStrapsWorkout() async {
+        let device = makeStrap()
+        device.dropsStartReply = true
+        device.strapClock = { 1_800_000_001 }
+        let (session, transport) = connect(device)
+        let (recorder, _) = makeRecorder()
+        recorder.selectedSport = .tennis
+        recorder.start()
+        transport.drain()
+        XCTAssertEqual(marker.marker?.startUnconfirmed, true, "89q (a): flagged before 02 goes out")
+        await tick(recorder, session, to: 3)
+        session.linkLost()
+        await tick(recorder, session, to: 4)
+        now = at(30)
+        let (next, nextTransport) = connect(device)
+        nextTransport.drain()
+        XCTAssertNotNil(marker.marker, "the window makes the strap's workout ours: never let go")
+        for s in stride(from: 31.0, through: 59.0, by: 1.0) { now = at(s); next.tick(now: now); nextTransport.drain() }
+        now = at(60)
+        await recorder.end()
+        nextTransport.drain()
+        for s in stride(from: 61.0, through: 400.0, by: 1.0) { now = at(s); next.tick(now: now); nextTransport.drain() }
+        now = at(1000)
+        let (third, thirdTransport) = connect(device)
+        thirdTransport.drain()
+        for s in stride(from: 1001.0, through: 1100.0, by: 1.0) { now = at(s); third.tick(now: now); thirdTransport.drain() }
+        XCTAssertNil(device.workoutRunning, "a strap workout our 02 started must be ended after End")
+        XCTAssertNil(marker.marker)
+    }
+
+    /// The same drop, with the recorder adopting the reconnected session as it does every second: the
+    /// reconnect carries on (ours by the window), and End ends the strap's workout on that connection.
+    func testALinkDropWhileTheStartReplyIsMissingThenEndOnTheNextConnection() async {
+        let device = makeStrap()
+        device.dropsStartReply = true
+        device.strapClock = { 1_800_000_001 }
+        let (session, transport) = connect(device)
+        let (recorder, _) = makeRecorder()
+        recorder.selectedSport = .tennis
+        recorder.start()
+        transport.drain()
+        await tick(recorder, session, to: 3)
+        session.linkLost()
+        await tick(recorder, session, to: 4)
+        now = at(30)
+        let (next, nextTransport) = connect(device)
+        nextTransport.drain()
+        await recorder.tick(now: now)
+        XCTAssertFalse(recorder.linkDown, "adopted")
+        await tick(recorder, next, to: 60)
+        await recorder.end()
+        nextTransport.drain()
+        XCTAssertEqual(Array(device.workoutCommands.filter { $0 != [0x05] }.suffix(2)), [control(0x02, 60), control(0x04, 60)])
+        XCTAssertNil(device.workoutRunning)
+        XCTAssertNil(marker.marker)
+    }
+
     func testBreadcrumbsCarryControlBytesAndOutcomesOnly() {
         let lines = [ZeppWorkoutModeMachine.Event.running, .unavailable(.noFrames), .unavailable(.noReply(.start)),
                      .unavailable(.refused(.start, status: 5)), .unavailable(.notIdle), .ended, .endUnconfirmed,

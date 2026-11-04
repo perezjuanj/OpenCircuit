@@ -205,12 +205,15 @@ final class WorkoutModeMachineTests: XCTestCase {
         XCTAssertEqual(out.messages, [hex("06 00")])
         out = m.receive(idleState, now: at(2))
         XCTAssertEqual(out.messages, [hex("02 e3 00 01 01 02 00 00 00 02")])
-        XCTAssertEqual(out.events, [.setMarker(ZeppWorkoutModeMarker(startTime: start, sportCode: 0xe3))],
-                       "89f: set in the same output as 02, for the host to persist before sending")
+        XCTAssertEqual(out.events, [.setMarker(ZeppWorkoutModeMarker(startTime: start, sportCode: 0xe3, startUnconfirmed: true))],
+                       "89f: set in the same output as 02, for the host to persist before sending; 89q (a): flagged")
         out = m.receive(hex("10 02 01"), now: at(3))
         XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00")],
                        "the started message carries OpenCircuit's own start time")
-        XCTAssertEqual(m.receive(ok03, now: at(3.2)), Machine.Output())
+        XCTAssertEqual(out.events, [], "89q (a): the 10 02 01 doesn't clear the flag")
+        XCTAssertEqual(m.marker?.startUnconfirmed, true, "until the strap acks our 03 01")
+        XCTAssertEqual(m.receive(ok03, now: at(3.2)).events, [.setMarker(ZeppWorkoutModeMarker(startTime: start, sportCode: 0xe3))],
+                       "89q (a): the ack of our 03 01 clears the flag, persisted")
         XCTAssertTrue(m.isActive)
 
         // Keep-alive every 5 s (from 10 02 01).
@@ -607,6 +610,38 @@ final class WorkoutModeRound3Tests: XCTestCase {
             for s in stride(from: 11.0, through: 300.0, by: 1.0) { later += m.tick(now: at(s)).messages }
             XCTAssertEqual(later, [], "no keep-alive for a workout that ended")
         }
+    }
+
+    /// 89q (b): a `06 00` reply that comes after the confirm deadline is decided like an on-time one.
+    func testALateStateReplyWhileTheStartIsUnconfirmedIsStillDecided() {
+        var m = startTimedOut()
+        XCTAssertEqual(m.tick(now: at(18)).events, [.unavailable(.noReply(.start))])
+        _ = m.end(activeSeconds: 20, now: at(20))
+        let out = m.receive(runningState(start + 2, sport: 0x11), now: at(21))
+        XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00"),
+                                      hex("03 02 04 00 00 00 14 00 00 00"), hex("03 04 04 00 00 00 14 00 00 00")])
+        var idle = startTimedOut()
+        _ = idle.tick(now: at(18))
+        XCTAssertEqual(idle.receive(idleState, now: at(21)).events, [.unavailable(.noReply(.start)), .clearMarker(startTime: start)])
+    }
+
+    /// 89q (c): the confirm path read "foreign" and fell back with the marker kept; then our `10 02 01`
+    /// (or a frame) arrives: proof our `02` started. Adopted, and a stored End honoured.
+    func testOurStartReplyAfterAForeignReadIsAdopted() {
+        for evidence in [hex("10 02 01"), liveFrame(active: 12, hr: 120, kcal: 1, avg: 120, max: 120, swings: nil)] {
+            var m = startTimedOut()
+            XCTAssertEqual(m.receive(runningState(start + 40, sport: 0x11), now: at(9.7)).events, [.unavailable(.notIdle)])
+            XCTAssertEqual(m.end(activeSeconds: 11, now: at(11)), Machine.Output())
+            let out = m.receive(evidence, now: at(12))
+            XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00"),
+                                          hex("03 02 04 00 00 00 0b 00 00 00"), hex("03 04 04 00 00 00 0b 00 00 00")],
+                           "\(evidence)")
+        }
+        var noEnd = startTimedOut()
+        _ = noEnd.receive(runningState(start - 600, sport: 0x34), now: at(9.7))
+        let out = noEnd.receive(hex("10 02 01"), now: at(12))
+        XCTAssertEqual(out.messages, [hex("03 01 06 00 00 00 \(startLE) 00 00 00 00")], "on as a start")
+        XCTAssertTrue(noEnd.isActive)
     }
 
     func testEndAfterALostStartReplyEndsTheStrapsWorkoutOnlyIfItIsOurs() {

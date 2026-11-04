@@ -28,6 +28,9 @@
 //     fallback with the marker kept and flagged start-unconfirmed for the next connection;
 //   • End is sticky (89p b): asked for in any phase, it is kept, and every "running, ours" conclusion
 //     ends the workout instead of carrying on.
+//   • the marker is persisted start-unconfirmed before `02` and the flag goes only with the ack of our
+//     `03 01` or an exact-start `06 00` (89q a); a late `06 00` reply is still decided, and our
+//     `10 02 01` or a frame after a "foreign" read is still adopted (89q b, c).
 
 import Foundation
 import OpenCircuitKit
@@ -625,8 +628,14 @@ public struct ZeppWorkoutModeMachine: Equatable {
                 phase = .fallback
                 return Output(events: [.unavailable(.notIdle)])
             }
+            // 89q (a): persisted start-unconfirmed. Until the strap acks our `03 01` (or a `06 00` shows
+            // our exact start), it may hold its own clock's start, so a link drop or a kill anywhere
+            // in between leaves the next connection the [−2 s, +30 s] window (89p c).
+            var flagged = marker
+            flagged.startUnconfirmed = true
+            self.marker = flagged
             phase = .starting(.start, deadline: now.addingTimeInterval(configuration.replyTimeout))
-            return Output(messages: [sport.startRequest], events: [.setMarker(marker)])
+            return Output(messages: [sport.startRequest], events: [.setMarker(flagged)])
         case (.starting(.start, _), ZeppWorkoutCommand.startOpcode):
             guard reply.isAccepted, marker != nil else {
                 // The strap said no: nothing is running for us.
@@ -650,7 +659,8 @@ public struct ZeppWorkoutModeMachine: Equatable {
                 return out
             }
             return adoptStart(now: now, frameArrived: false)
-        case (.confirmingStart, ZeppWorkoutCommand.stateOpcode):
+        case (.confirmingStart, ZeppWorkoutCommand.stateOpcode), (.startUnconfirmed, ZeppWorkoutCommand.stateOpcode):
+            // 89q (b): a late reply while the start is unconfirmed is decided like an on-time one.
             return startConfirmed(ZeppWorkoutState.parse(payload) ?? .unknown, now: now)
         case (.reconciling, ZeppWorkoutCommand.stateOpcode):
             return reconciled(ZeppWorkoutState.parse(payload) ?? .unknown, now: now)
@@ -705,8 +715,9 @@ public struct ZeppWorkoutModeMachine: Equatable {
             self.marker = nil
             return Output(events: [.unavailable(.noReply(.start)), .clearMarker(startTime: marker.startTime)])
         case .running:
-            // Not ours: never touched. The marker stays (flagged) for the next connection's `06 00`.
-            phase = .fallback
+            // Not ours: never touched. The marker stays (flagged) for the next connection's `06 00`,
+            // and a late `10 02 01` or a frame still proves our `02` started (89q c).
+            phase = .startUnconfirmed
             return Output(events: [.unavailable(.notIdle)])
         case .unknown:
             phase = .startUnconfirmed
@@ -717,6 +728,12 @@ public struct ZeppWorkoutModeMachine: Equatable {
     private mutating func receiveControlReply(_ reply: ZeppWorkoutReply, now: Date) -> Output {
         guard !pendingControls.isEmpty else { return Output() }
         let control = pendingControls.removeFirst()
+        if control == .started, reply.isAccepted, var marker, marker.startUnconfirmed {
+            // 89q (a): the strap holds our start time now: the flag goes, persisted.
+            marker.startUnconfirmed = false
+            self.marker = marker
+            return Output(events: [.setMarker(marker)])
+        }
         guard case .ending = phase, control == .end else { return Output() }
         guard reply.isAccepted else {
             phase = .done
