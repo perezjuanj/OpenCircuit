@@ -38,24 +38,46 @@ public struct WorkoutTrack: Equatable, Sendable {
     /// The track's total distance: the sum of every within-leg step.
     public var totalMeters: Double { legs.last?.last?.cumulativeMeters ?? 0 }
 
-    /// `fixes` in the order they were accepted; `pauses` the workout's paused stretches. A fix
-    /// starts a new leg when any pause overlaps the time since the previous fix — the same place the
-    /// live counter reset its last fix — so its `metersFromPrevious` is dropped.
+    /// The track exactly as the live counter added it: `legStarts` holds the index of every fix the
+    /// counter took with no previous fix (the workout's first, and the first after each resume), so
+    /// that fix's `metersFromPrevious` is dropped and every other one is added. The recorders note
+    /// those indices as they append, so the track's total IS the counter's.
+    public init(fixes: [WorkoutTrackFix], legStarts: Set<Int>) {
+        self.init(fixes: fixes) { index, _, _ in index == 0 || legStarts.contains(index) }
+    }
+
+    /// The track rebuilt from fix times alone (a saved route, which carries no leg marks): a fix
+    /// starts a new leg when a pause STARTED after the previous fix and by this one. That matches
+    /// the live counter except for a stale fix stamped before a short pause but delivered after its
+    /// resume; good enough to draw splits, not to replay the counter (use `legStarts` for that).
     public init(fixes: [WorkoutTrackFix], pauses: [DateInterval]) {
+        self.init(fixes: fixes) { index, previous, fix in
+            guard index > 0, fix.at >= previous.at else { return true }
+            return pauses.contains { $0.start > previous.at && $0.start <= fix.at }
+        }
+    }
+
+    private init(fixes: [WorkoutTrackFix],
+                 startsLeg: (Int, WorkoutTrackFix, WorkoutTrackFix) -> Bool) {
         var legs: [[Point]] = []
         var cumulative = 0.0
-        var previous: Date?
-        for fix in fixes {
-            if let prev = previous, fix.at >= prev,
-               !pauses.contains(where: { $0.start < fix.at && $0.end > prev }) {
+        for (index, fix) in fixes.enumerated() {
+            let previous = index > 0 ? fixes[index - 1] : fix
+            if legs.isEmpty || startsLeg(index, previous, fix) {
+                legs.append([Point(at: fix.at, cumulativeMeters: cumulative)])
+            } else {
                 cumulative += max(0, fix.metersFromPrevious)
                 legs[legs.count - 1].append(Point(at: fix.at, cumulativeMeters: cumulative))
-            } else {
-                legs.append([Point(at: fix.at, cumulativeMeters: cumulative)])
             }
-            previous = fix.at
         }
         self.legs = legs
+    }
+
+    private init(legs: [[Point]]) { self.legs = legs }
+
+    /// Every cumulative distance times `factor` (times unchanged).
+    public func scaled(by factor: Double) -> WorkoutTrack {
+        WorkoutTrack(legs: legs.map { $0.map { Point(at: $0.at, cumulativeMeters: $0.cumulativeMeters * factor) } })
     }
 }
 
@@ -66,6 +88,20 @@ public enum WorkoutSplits {
     public static let intervalSeconds: TimeInterval = 15
     /// A partial last split shorter than this is GPS noise at the finish, not a split.
     public static let minimumPartialMeters: Double = 50
+
+    /// How far a track's own total may sit from the workout's distance and still be trusted: 1 m,
+    /// or 0.5 % on a long workout.
+    public static func tolerance(_ totalMeters: Double) -> Double { max(1, totalMeters * 0.005) }
+
+    /// The track scaled to end exactly at `totalMeters` (the distance the workout's summary shows
+    /// and the day's estimate nets out), or nil when it can't stand for that distance: no distance,
+    /// or a total outside `tolerance`. Both the distance samples and the split events come from the
+    /// fitted track, so the splits line up with the samples written.
+    public static func fitted(_ track: WorkoutTrack, toMeters totalMeters: Double) -> WorkoutTrack? {
+        let own = track.totalMeters
+        guard totalMeters > 0, own > 0, abs(own - totalMeters) <= tolerance(totalMeters) else { return nil }
+        return track.scaled(by: totalMeters / own)
+    }
 
     /// A stretch of the track and the distance covered in it.
     public struct DistanceInterval: Equatable, Sendable {

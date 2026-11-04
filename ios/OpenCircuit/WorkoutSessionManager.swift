@@ -184,6 +184,9 @@ final class WorkoutSessionManager: NSObject {
     private var locationManager: CLLocationManager?
     /// Accumulated route locations (outdoor `.route` sessions only — never the keep-alive).
     private var routeLocations: [CLLocation] = []
+    /// Indices into `routeLocations` of every fix the live counter took with no previous fix (the
+    /// first, and the first after each resume), so the save replays the counter exactly (#365).
+    private var routeLegStarts: [Int] = []
     private var lastLocation: CLLocation?
 
     /// Why a location session is running this workout. `.route`: outdoor — store fixes for the
@@ -443,6 +446,7 @@ final class WorkoutSessionManager: NSObject {
         keepAliveUnavailable = false
         hrSampleCount = 0
         routeLocations = []
+        routeLegStarts = []
         lastLocation = nil
         liveCadence = nil
         liveEstimatedMeters = nil
@@ -763,6 +767,7 @@ final class WorkoutSessionManager: NSObject {
             saved = await writeWorkout(summary: summary,
                                        hrSamples: agg.collectedSamples,   // none recorded while paused
                                        routeLocations: hasRoute ? routeLocations : [],
+                                       routeLegStarts: hasRoute ? routeLegStarts : [],
                                        pauses: pauses)
             if !saved { unresolve() }   // not in Health → let its records be reviewed as detected
         }
@@ -1230,6 +1235,7 @@ final class WorkoutSessionManager: NSObject {
         summary: WorkoutSummary,
         hrSamples: [HRSample],
         routeLocations: [CLLocation],
+        routeLegStarts: [Int] = [],
         pauses: [DateInterval] = [],
         indoorDistanceMeters: Double? = nil,
         indoorDistanceTyped: Bool = false
@@ -1323,26 +1329,15 @@ final class WorkoutSessionManager: NSObject {
         if let dist = summary.distanceMeters, dist > 0, summary.hasRoute {
             let isCycling = summary.sport == .cyclingOutdoor
             let distType = HKQuantityType(isCycling ? .distanceCycling : .distanceWalkingRunning)
-            // #365: the distance as ~15 s samples from the route (so Health has the per-km detail),
-            // plus a segment event per whole km and mile. Falls back to the one whole-workout
-            // sample when the route can't carry it. The split events go in their own call so a
-            // refusal never takes the pause/resume events with it.
-            let track = WorkoutRouteDetail.track(routeLocations, pauses: pauses,
-                                                 start: summary.startDate, end: summary.endDate)
-            let wholeWorkout = HKQuantitySample(
-                type: distType, quantity: HKQuantity(unit: .meter(), doubleValue: dist),
+            // #365: ~15 s samples from the route plus per-km / per-mile split events, or the one
+            // whole-workout sample when the route can't carry them (`WorkoutRouteDetail.addDistance`,
+            // shared with the strap). Credit the day only for distance that landed.
+            let landed = await WorkoutRouteDetail.addDistance(
+                meters: dist, type: distType, route: routeLocations, legStarts: routeLegStarts, pauses: pauses,
                 start: summary.startDate, end: summary.endDate,
-                metadata: [HKMetadataKeyWasUserEntered: false])
-            if let detail = WorkoutRouteDetail.distanceSamples(
-                type: distType, track: track, totalMeters: dist, metadata: [HKMetadataKeyWasUserEntered: false]) {
-                // A refused batch must not leave the workout with no distance: the one sample then.
-                do { try await builder.addSamples(detail) } catch { try? await builder.addSamples([wholeWorkout]) }
-            } else {
-                try? await builder.addSamples([wholeWorkout])
-            }
-            let splits = WorkoutRouteDetail.splitEvents(track: track, start: summary.startDate, end: summary.endDate)
-            if !splits.isEmpty { try? await builder.addWorkoutEvents(splits) }
-            if !isCycling { walkRunDistanceToCredit = dist }
+                addSamples: { try await builder.addSamples($0) },
+                addEvents: { try await builder.addWorkoutEvents($0) })
+            if !isCycling, landed { walkRunDistanceToCredit = dist }
         } else if let indoor = indoorDistanceMeters, indoor > 0, IndoorStepWorkout.applies(to: summary.sport) {
             // An indoor run or walk (#339, decision 84f, 84j): the treadmill distance the person typed
             // (user-entered), else the ring's active steps × stride, an ESTIMATE.
@@ -1454,6 +1449,7 @@ extension WorkoutSessionManager: CLLocationManagerDelegate {
                     let delta = loc.distance(from: prev)
                     self.distanceMeters = (self.distanceMeters ?? 0) + delta
                 }
+                if self.lastLocation == nil { self.routeLegStarts.append(self.routeLocations.count) }
                 self.lastLocation = loc
                 self.routeLocations.append(loc)
             }

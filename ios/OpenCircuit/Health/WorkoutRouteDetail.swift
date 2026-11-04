@@ -1,7 +1,8 @@
 // WorkoutRouteDetail.swift — the Apple Health detail an outdoor GPS workout carries beyond its
 // totals (#365): fine-grained distance samples and per-km / per-mile split events. Both workout
 // writers (the ring's `WorkoutSessionManager.writeWorkout`, the strap's `StrapWorkoutHealthWriter`)
-// build them here from the route they already save, so the two devices write the same shape.
+// add their GPS distance through `addDistance` here, so every device writes the same shape and one
+// test covers them all.
 //
 // The math is `OpenCircuitKit.WorkoutSplits`; this file only turns the route into its track and the
 // results into HealthKit objects.
@@ -12,12 +13,13 @@ import OpenCircuitKit
 
 enum WorkoutRouteDetail {
 
-    /// The route as the live counter measured it: each fix's distance from the fix before it
-    /// (`CLLocation.distance(from:)`, the call the counter used), split into legs at the pauses.
-    /// Fix times are clamped into the workout (`start...end`): the first fix can be stamped a few
-    /// seconds before Start, and a sample outside the workout is not the builder's to take. Clamping
-    /// keeps every step, so the sum still matches the live counter.
-    static func track(_ route: [CLLocation], pauses: [DateInterval], start: Date, end: Date) -> WorkoutTrack {
+    /// The route as a track. With `legStarts` (the indices the recorder noted where its live counter
+    /// had no previous fix) the track replays the counter exactly; without them (a route read back
+    /// from Health) legs are rebuilt from the pauses. Each step is `CLLocation.distance(from:)`, the
+    /// counter's own call. Fix times are clamped into the workout (`start...end`): the first fix can
+    /// be stamped a few seconds before Start, and clamping keeps every step, so the sum is unchanged.
+    static func track(_ route: [CLLocation], legStarts: [Int]?, pauses: [DateInterval],
+                      start: Date, end: Date) -> WorkoutTrack {
         var fixes: [WorkoutTrackFix] = []
         fixes.reserveCapacity(route.count)
         var previous: CLLocation?
@@ -27,38 +29,75 @@ enum WorkoutRouteDetail {
                                          metersFromPrevious: previous.map { location.distance(from: $0) } ?? 0))
             previous = location
         }
+        if let legStarts, !legStarts.isEmpty {
+            return WorkoutTrack(fixes: fixes, legStarts: Set(legStarts))
+        }
         return WorkoutTrack(fixes: fixes, pauses: pauses)
     }
 
-    /// How far the track's own sum may sit from the workout's distance before the detail is
-    /// distrusted: 1 m, or 0.5 % on a long workout.
-    static func tolerance(_ totalMeters: Double) -> Double { max(1, totalMeters * 0.005) }
-
-    /// The workout's distance as samples about 15 s each (none across a pause), scaled to add up
-    /// EXACTLY to `totalMeters` — the total the summary shows and the daily estimate nets out. nil
-    /// when the track can't carry it (fewer than two intervals, or a sum outside `tolerance`): the
-    /// caller then writes the one whole-workout sample it always has.
-    static func distanceSamples(type: HKQuantityType, track: WorkoutTrack, totalMeters: Double,
+    /// The fitted track as distance samples about 15 s each, none across a pause. nil when there are
+    /// fewer than two (nothing finer than the whole workout) or they don't add up to the fitted total.
+    static func distanceSamples(type: HKQuantityType, fitted: WorkoutTrack,
                                 metadata: [String: Any]) -> [HKQuantitySample]? {
-        guard totalMeters > 0 else { return nil }
-        let intervals = WorkoutSplits.distanceIntervals(track)
+        let intervals = WorkoutSplits.distanceIntervals(fitted)
         let sum = intervals.reduce(0) { $0 + $1.meters }
-        guard intervals.count >= 2, sum > 0, abs(sum - totalMeters) <= tolerance(totalMeters) else { return nil }
-        let scale = totalMeters / sum
+        guard intervals.count >= 2, abs(sum - fitted.totalMeters) <= 1e-6 * max(1, fitted.totalMeters) else { return nil }
         return intervals.map {
-            HKQuantitySample(type: type, quantity: HKQuantity(unit: .meter(), doubleValue: $0.meters * scale),
+            HKQuantitySample(type: type, quantity: HKQuantity(unit: .meter(), doubleValue: $0.meters),
                              start: $0.start, end: $0.end, metadata: metadata)
         }
     }
 
-    /// One `.segment` event per whole kilometre and per whole mile, each from the previous boundary
-    /// (the workout's start for the first) to the moment the track crossed it — the split shape
-    /// Apple Watch running workouts carry. Kilometre and mile segments overlap by design.
-    static func splitEvents(track: WorkoutTrack, start: Date, end: Date) -> [HKWorkoutEvent] {
-        [WorkoutSplits.kilometerMeters, WorkoutSplits.mileMeters].flatMap { unit in
-            WorkoutSplits.segmentIntervals(track, every: unit, start: start, end: end).map {
-                HKWorkoutEvent(type: .segment, dateInterval: $0, metadata: nil)
+    /// One `.segment` event per whole kilometre and per whole mile of the fitted track, each from the
+    /// previous boundary (the workout's start for the first) to the moment the track crossed it: the
+    /// split shape Apple Watch running workouts carry. Kilometre and mile segments overlap by design;
+    /// the list is in start order, then end order.
+    static func splitEvents(fitted: WorkoutTrack, start: Date, end: Date) -> [HKWorkoutEvent] {
+        [WorkoutSplits.kilometerMeters, WorkoutSplits.mileMeters]
+            .flatMap { WorkoutSplits.segmentIntervals(fitted, every: $0, start: start, end: end) }
+            .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
+            .map { HKWorkoutEvent(type: .segment, dateInterval: $0, metadata: nil) }
+    }
+
+    /// Add a GPS workout's distance to its builder: the fine samples and the split events when the
+    /// route can carry them, else the one whole-workout sample (the shape before #365). Returns
+    /// whether a distance sample landed, so the caller credits the day only for distance that is
+    /// actually in the workout.
+    ///
+    /// - The route's own total must be within `WorkoutSplits.tolerance` of `meters`, or it is
+    ///   distrusted: one sample, no splits.
+    /// - A refused fine batch falls back to the one sample, and then no splits are added (they'd
+    ///   describe samples that aren't there).
+    /// - The split events are their own call: a refusal costs only the splits, never the pause and
+    ///   resume events the caller already added.
+    ///
+    /// The builder calls are closures so the ring's `HKWorkoutBuilder` and the strap's
+    /// `StrapWorkoutBuilding` (and a test's recorder) all go through this one function.
+    @discardableResult
+    static func addDistance(meters: Double, type: HKQuantityType, route: [CLLocation], legStarts: [Int]?,
+                            pauses: [DateInterval], start: Date, end: Date,
+                            addSamples: ([HKSample]) async throws -> Void,
+                            addEvents: ([HKWorkoutEvent]) async throws -> Void) async -> Bool {
+        let metadata: [String: Any] = [HKMetadataKeyWasUserEntered: false]
+        let fitted = WorkoutSplits.fitted(track(route, legStarts: legStarts, pauses: pauses, start: start, end: end),
+                                          toMeters: meters)
+        if let fitted, let detail = distanceSamples(type: type, fitted: fitted, metadata: metadata) {
+            do {
+                try await addSamples(detail)
+                let splits = splitEvents(fitted: fitted, start: start, end: end)
+                if !splits.isEmpty { try? await addEvents(splits) }
+                return true
+            } catch {
+                // Fall through to the one sample.
             }
+        }
+        let wholeWorkout = HKQuantitySample(type: type, quantity: HKQuantity(unit: .meter(), doubleValue: meters),
+                                            start: start, end: end, metadata: metadata)
+        do {
+            try await addSamples([wholeWorkout])
+            return true
+        } catch {
+            return false
         }
     }
 }

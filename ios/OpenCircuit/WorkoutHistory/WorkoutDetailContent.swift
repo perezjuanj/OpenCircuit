@@ -255,7 +255,7 @@ enum WorkoutDetailContent {
     static func splitRows(route: [CLLocation], item: WorkoutHistoryReader.Item, unit: DistanceUnit) -> [SplitRow] {
         guard route.count >= 2, item.end > item.start else { return [] }
         let unitMeters = unit == .metric ? WorkoutSplits.kilometerMeters : WorkoutSplits.mileMeters
-        let track = WorkoutRouteDetail.track(route, pauses: item.pauses, start: item.start, end: item.end)
+        let track = WorkoutRouteDetail.track(route, legStarts: nil, pauses: item.pauses, start: item.start, end: item.end)
         let splits = WorkoutSplits.splits(track, every: unitMeters, start: item.start, end: item.end,
                                           pauses: item.pauses)
         guard splits.contains(where: { !$0.isPartial }) else { return [] }

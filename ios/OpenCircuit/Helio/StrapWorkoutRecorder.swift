@@ -185,6 +185,9 @@ struct StrapWorkoutWrite {
     let samples: [HRSample]
     let route: [CLLocation]
     let timeline: SyncDeviceID
+    /// Indices into `route` where the live counter had no previous fix (#365); empty = unknown, and
+    /// the save rebuilds legs from the pauses.
+    var routeLegStarts: [Int] = []
     /// An indoor run or walk's step-based distance (#339), nil otherwise.
     var indoorDistance: IndoorDistanceWrite? = nil
     /// A recovered indoor run's recovery-window writes, owed after its save (84l), nil otherwise.
@@ -281,12 +284,20 @@ protocol WorkoutLocationTracking: AnyObject {
     var gpsActive: Bool { get }
     var distanceMeters: Double? { get }
     var route: [CLLocation] { get }
+    /// Indices into `route` of every fix the live distance counter took with no previous fix (the
+    /// first, and the first after each resume), so a save replays the counter exactly (#365).
+    var routeLegStarts: [Int] { get }
     var keepAliveUnavailable: Bool { get }
     /// `route == true`: record the route and distance. false: coarse fixes only to stay alive, never stored.
     func start(route: Bool)
     /// Paused: fixes are not stored and no distance accrues; the session keeps the app alive.
     func setPaused(_ paused: Bool)
     func stop()
+}
+
+extension WorkoutLocationTracking {
+    /// No leg marks: the save rebuilds legs from the pauses (a tracker that records no route).
+    var routeLegStarts: [Int] { [] }
 }
 
 @Observable
@@ -919,6 +930,7 @@ final class StrapWorkoutRecorder {
 
         let write = StrapWorkoutWrite(summary: summary, samples: counted,
                                       route: hasRoute ? location.route : [], timeline: timeline,
+                                      routeLegStarts: hasRoute ? location.routeLegStarts : [],
                                       workoutMode: modeExtras)
         let saved: Bool
         if waitsForPrompt {

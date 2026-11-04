@@ -126,4 +126,66 @@ final class WorkoutSplitsTests: XCTestCase {
         XCTAssertEqual(segments[0].start, at(0))
         XCTAssertEqual(segments[1].start, segments[0].end)
     }
+
+    func testTheFirstSplitRunsFromTheWorkoutStartNotTheFirstFix() {
+        // GPS locks 20 s after Start: the first km's time includes those 20 s (as the clock did).
+        let track = WorkoutTrack(fixes: steady(from: 20, to: 620, step: 10, meters: 40), pauses: [])
+        let splits = WorkoutSplits.splits(track, every: 1_000, start: at(0), end: at(620), pauses: [])
+        XCTAssertEqual(splits[0].start, at(0))
+        XCTAssertEqual(splits[0].end.timeIntervalSince(t0), 270, accuracy: 1e-6)
+        XCTAssertEqual(splits[0].movingSeconds, 270, accuracy: 1e-6)
+    }
+
+    // MARK: Leg marks (the live counter, replayed)
+
+    /// Review SF1 scenario A: a fix delivered just after Resume but stamped 0.4 s before it. The
+    /// counter starts a leg AT that fix and adds the next step; the pause-start rule agrees, and the
+    /// recorder's leg marks reproduce it exactly.
+    func testALaggingFirstFixAfterResume() {
+        let pause = DateInterval(start: at(100), end: at(200))
+        let fixes = [WorkoutTrackFix(at: at(90), metersFromPrevious: 0),
+                     WorkoutTrackFix(at: at(95), metersFromPrevious: 12),
+                     WorkoutTrackFix(at: at(199.6), metersFromPrevious: 300),   // counter: leg start
+                     WorkoutTrackFix(at: at(205), metersFromPrevious: 18)]      // counter: +18
+        let counter = 12.0 + 18.0
+        XCTAssertEqual(WorkoutTrack(fixes: fixes, legStarts: [0, 2]).totalMeters, counter, accuracy: 1e-9)
+        XCTAssertEqual(WorkoutTrack(fixes: fixes, pauses: [pause]).totalMeters, counter, accuracy: 1e-9)
+    }
+
+    /// Review SF1 scenario B: after a 6 s pause a stale fix stamped BEFORE the pause is delivered
+    /// after Resume. The counter starts a leg at it; only the recorder's leg marks know that.
+    func testAStaleFixDeliveredAfterAShortPauseNeedsTheLegMarks() {
+        let pause = DateInterval(start: at(100), end: at(106))
+        let fixes = [WorkoutTrackFix(at: at(95), metersFromPrevious: 0),
+                     WorkoutTrackFix(at: at(99), metersFromPrevious: 5),
+                     WorkoutTrackFix(at: at(99.5), metersFromPrevious: 1),    // stale, delivered after Resume
+                     WorkoutTrackFix(at: at(110), metersFromPrevious: 6)]
+        let counter = 5.0 + 6.0
+        XCTAssertEqual(WorkoutTrack(fixes: fixes, legStarts: [0, 2]).totalMeters, counter, accuracy: 1e-9)
+        XCTAssertNotEqual(WorkoutTrack(fixes: fixes, pauses: [pause]).totalMeters, counter,
+                          "timestamps alone can't see it; that's why the save uses the marks")
+    }
+
+    func testLegMarksAlwaysStartTheFirstFix() {
+        let fixes = [WorkoutTrackFix(at: at(0), metersFromPrevious: 50), WorkoutTrackFix(at: at(5), metersFromPrevious: 7)]
+        XCTAssertEqual(WorkoutTrack(fixes: fixes, legStarts: []).totalMeters, 7, accuracy: 1e-9)
+    }
+
+    // MARK: Fitting to the workout's distance
+
+    func testFittedScalesToTheExactTotalWithinTolerance() throws {
+        let track = WorkoutTrack(fixes: steady(from: 0, to: 300, step: 5, meters: 10), pauses: [])  // 600 m
+        let fitted = try XCTUnwrap(WorkoutSplits.fitted(track, toMeters: 600.5))
+        XCTAssertEqual(fitted.totalMeters, 600.5, accuracy: 1e-9)
+        let intervals = WorkoutSplits.distanceIntervals(fitted)
+        XCTAssertEqual(intervals.reduce(0) { $0 + $1.meters }, 600.5, accuracy: 1e-9)
+    }
+
+    func testFittedRefusesATrackOutsideTolerance() {
+        let track = WorkoutTrack(fixes: steady(from: 0, to: 300, step: 5, meters: 10), pauses: [])  // 600 m
+        XCTAssertNotNil(WorkoutSplits.fitted(track, toMeters: 602), "2 m off, inside 0.5 % of 602")
+        XCTAssertNil(WorkoutSplits.fitted(track, toMeters: 610))
+        XCTAssertNil(WorkoutSplits.fitted(track, toMeters: 0))
+        XCTAssertNil(WorkoutSplits.fitted(WorkoutTrack(fixes: [], pauses: []), toMeters: 100))
+    }
 }

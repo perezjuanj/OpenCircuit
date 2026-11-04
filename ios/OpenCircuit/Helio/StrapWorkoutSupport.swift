@@ -124,24 +124,14 @@ final class StrapWorkoutHealthWriter: StrapWorkoutHealthWriting {
         if let distance = summary.distanceMeters, distance > 0, summary.hasRoute {
             let isCycling = summary.sport == .cyclingOutdoor
             let type = HKQuantityType(isCycling ? .distanceCycling : .distanceWalkingRunning)
-            // #365: ~15 s samples from the route plus per-km / per-mile segment events, as the
-            // ring's writer; the one whole-workout sample when the route can't carry it. The split
-            // events are their own call so a refusal never drops the pause/resume events.
-            let track = WorkoutRouteDetail.track(write.route, pauses: write.summary.pauses,
-                                                 start: summary.startDate, end: summary.endDate)
-            let wholeWorkout = HKQuantitySample(
-                type: type, quantity: HKQuantity(unit: .meter(), doubleValue: distance),
-                start: summary.startDate, end: summary.endDate, metadata: [HKMetadataKeyWasUserEntered: false])
-            if let detail = WorkoutRouteDetail.distanceSamples(
-                type: type, track: track, totalMeters: distance, metadata: [HKMetadataKeyWasUserEntered: false]) {
-                // A refused batch must not leave the workout with no distance: the one sample then.
-                do { try await builder.addSamples(detail) } catch { try? await builder.addSamples([wholeWorkout]) }
-            } else {
-                try? await builder.addSamples([wholeWorkout])
-            }
-            let splits = WorkoutRouteDetail.splitEvents(track: track, start: summary.startDate, end: summary.endDate)
-            if !splits.isEmpty { try? await builder.addWorkoutEvents(splits) }
-            if !isCycling { walkRunDistanceToCredit = distance }
+            // #365: ~15 s samples plus split events, or the one sample, through the ring's own
+            // `WorkoutRouteDetail.addDistance`. Credit the day only for distance that landed.
+            let landed = await WorkoutRouteDetail.addDistance(
+                meters: distance, type: type, route: write.route, legStarts: write.routeLegStarts,
+                pauses: write.summary.pauses, start: summary.startDate, end: summary.endDate,
+                addSamples: { try await builder.addSamples($0) },
+                addEvents: { try await builder.addWorkoutEvents($0) })
+            if !isCycling, landed { walkRunDistanceToCredit = distance }
         } else if let indoor = write.indoorDistance, indoor.meters > 0,
                   IndoorStepWorkout.applies(to: summary.sport) {
             // An indoor run or walk (#339, decision 84f, 84j): the treadmill distance the person typed
@@ -358,6 +348,8 @@ final class StrapWorkoutLocation: NSObject, WorkoutLocationTracking, CLLocationM
     private(set) var distanceMeters: Double?
     private(set) var keepAliveUnavailable = false
     @ObservationIgnored private(set) var route: [CLLocation] = []
+    /// Indices into `route` where the live counter had no previous fix (#365): see the protocol.
+    @ObservationIgnored private(set) var routeLegStarts: [Int] = []
 
     @ObservationIgnored private var manager: CLLocationManager?
     @ObservationIgnored private var recordsRoute = false
@@ -371,6 +363,7 @@ final class StrapWorkoutLocation: NSObject, WorkoutLocationTracking, CLLocationM
         running = true
         paused = false
         route = []
+        routeLegStarts = []
         distanceMeters = nil
         lastLocation = nil
         keepAliveUnavailable = false
@@ -443,6 +436,7 @@ final class StrapWorkoutLocation: NSObject, WorkoutLocationTracking, CLLocationM
                 if let previous = self.lastLocation {
                     self.distanceMeters = (self.distanceMeters ?? 0) + location.distance(from: previous)
                 }
+                if self.lastLocation == nil { self.routeLegStarts.append(self.route.count) }
                 self.lastLocation = location
                 self.route.append(location)
             }
