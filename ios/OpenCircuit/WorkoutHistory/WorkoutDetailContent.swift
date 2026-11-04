@@ -134,6 +134,39 @@ enum WorkoutDetailContent {
         }
     }
 
+    /// Whether the Helio Strap recorded the workout: it names the strap (`HKDevice`, decision 11), or
+    /// it is saved under the phone in time the strap owned (decision 28), as `recordedWith` decides.
+    static func isStrapWorkout(deviceName: String?, deviceManufacturer: String?,
+                               owner: DeviceOwnershipLog.Family) -> Bool {
+        if let name = deviceName, !name.isEmpty,
+           let maker = deviceManufacturer, !maker.localizedCaseInsensitiveContains("apple") {
+            return maker == WearableDeviceKind.zeppOS(model: "").brand
+        }
+        return owner == .zeppOS
+    }
+
+    // MARK: Heart rate below Zone 1 (#355)
+
+    /// Whether the detail shows `StrapWorkoutLowHeartRateNote.text` (decision 88): a strap workout only,
+    /// over its moving time and the workout-shaped readings (`end > start`) outside its pauses, with
+    /// the zones the detail shows. An activity type no OpenCircuit sport writes shows nothing. On the
+    /// main actor for `WorkoutSessionManager.hkActivityType(for:)`, the mapping the save uses.
+    @MainActor
+    static func showsLowHeartRateNote(_ item: WorkoutHistoryReader.Item, hr: [HRSample], zones: HeartRateZones,
+                                      isStrapWorkout: Bool) -> Bool {
+        guard let sport = WorkoutSportType.allCases.first(where: {
+            WorkoutSessionManager.hkActivityType(for: $0) == item.activityType
+        }) else { return false }
+        var ledger = WorkoutActivityLedger(start: item.start)
+        for pause in item.pauses.sorted(by: { $0.start < $1.start }) {
+            ledger.pause(at: pause.start)
+            ledger.resume(at: pause.end)
+        }
+        return StrapWorkoutLowHeartRateNote.applies(isStrapWorkout: isStrapWorkout, sport: sport, ledger: ledger,
+                                                    samples: hr.filter { $0.end > $0.start },
+                                                    end: item.end, zones: zones)
+    }
+
     // MARK: Rows
 
     struct Row: Identifiable, Equatable {
