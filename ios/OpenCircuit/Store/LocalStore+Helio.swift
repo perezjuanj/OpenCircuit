@@ -315,10 +315,55 @@ final class HelioStoreSink: HelioHistorySink {
     /// Where the store's own sleep breadcrumbs go (`sleep-extend`, decision 58b).
     private let observability: ObservabilityStore
 
-    init(store: LocalStore, breadcrumbs: HelioBreadcrumbs? = nil, observability: ObservabilityStore = ObservabilityStore()) {
+    /// Where the strap's own workout records go (#226, decision 91c).
+    private let workouts: StrapDetectedWorkouts
+    /// This sync's walk cursor (91c): moved only over records judged for good.
+    private var workoutCursor: HelioWorkoutWalkCursor?
+
+    init(store: LocalStore, breadcrumbs: HelioBreadcrumbs? = nil, observability: ObservabilityStore = ObservabilityStore(),
+         workouts: StrapDetectedWorkouts? = nil) {
         self.store = store
         self.breadcrumbs = breadcrumbs
         self.observability = observability
+        self.workouts = workouts ?? .shared
+    }
+
+    // MARK: The strap's own workout records (#226, decision 91)
+
+    /// 91a: the walk starts at the cursor (two days back the first time), never before the strap's
+    /// current ownership start. No walk when the strap doesn't own the present (91f: nothing new is
+    /// fetched for time the ring owns).
+    func workoutWalkSince(timeline: SyncDeviceID, now: Date) -> Date? {
+        guard let owned = LocalStore.ownershipLog().currentStart(of: DeviceOwnershipLog.Family(timeline: timeline)),
+              owned <= now else { return nil }
+        let cursor = workouts.cursor(for: timeline)
+        workoutCursor = HelioWorkoutWalkCursor(previous: cursor)
+        return HelioWorkoutWalkPlan.since(cursor: cursor, now: now, notBefore: owned)
+    }
+
+    /// 91c: kept only when the strap owns the record's whole window (decision 28) and the pure rule
+    /// keeps it. Every record is "stored" once judged; nothing reaches `LocalStore` (no model change).
+    func persistWorkout(_ record: ZeppWorkoutRecord, timeline: SyncDeviceID, now: Date) -> Bool {
+        let window = record.summary.window
+        let owned = LocalStore.ownershipLog().ownsWholly(DeviceOwnershipLog.Family(timeline: timeline),
+                                                          from: window.start, to: window.end)
+        let verdict = workouts.judge(record, timeline: timeline, owned: owned, now: now)
+        workoutCursor?.judged(start: record.start, final: verdict.isFinal)
+        helioLog.notice("helio: workout record \(String(describing: verdict), privacy: .public)")
+        return true
+    }
+
+    /// 91a: a failed round is fetched again next sync, so the cursor stops before it.
+    func workoutRoundFailed(recordStart: Date?, timeline: SyncDeviceID, now: Date) {
+        workoutCursor?.failed()
+    }
+
+    func finishWorkoutWalk(timeline: SyncDeviceID, now: Date) {
+        workouts.setCursor(workoutCursor?.cursor, for: timeline, now: now)
+        workoutCursor = nil
+        guard !workouts.state.pending.isEmpty else { return }
+        let workouts = self.workouts
+        Task { @MainActor in await workouts.reconcile() }
     }
 
     func fetchCursors(timeline: SyncDeviceID, now: Date) -> [ZeppFetchType: Date] {

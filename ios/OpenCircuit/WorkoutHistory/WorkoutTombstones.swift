@@ -1,12 +1,12 @@
 // WorkoutTombstones.swift: the record that a workout the user deleted from the history screen
 // (#293) stays deleted.
 //
-// Nothing in the app writes an `HKWorkout` without the user asking for it: the Helio fetch imports no
-// workouts (`HelioFetchPlan.types`), and the ring's detected bouts become workouts only through
-// "Add to Apple Health". But three places OFFER a past workout back, and each is a way for a deleted
-// one to return:
+// Nothing in the app writes an `HKWorkout` without the user asking for it: the ring's detected bouts
+// and the strap's own workout records (#226) become workouts only through "Add to Apple Health". But
+// four places OFFER a past workout back, and each is a way for a deleted one to return:
 //   • the ring's detected-workout inbox (`RingSession.suppressedAutomaticWorkoutSpans`), whose own
 //     resolved-span bookkeeping is skipped when the ring session was gone at the moment of the save;
+//   • the strap's detected-workout inbox (`StrapDetectedWorkouts`, decision 91c);
 //   • the ring's crash-recovery offer (`WorkoutSessionManager.recoveryDecision`);
 //   • the strap's interrupted-workout offer (`StrapWorkoutRecorder.resolveOrphan`).
 // Each consults this list and treats a window overlapping a deleted workout as already decided.
