@@ -480,6 +480,18 @@ final class StrapOwnWindowLifecycleTests: XCTestCase {
         XCTAssertTrue(notified.isEmpty)
     }
 
+    /// A long phone-side workout the process dies in, during which the strap detected an activity of its
+    /// own that began ten minutes in: only the heartbeat-refreshed window reaches it, the start alone doesn't.
+    func testAKillAfterALongWorkoutCoversAStrapDetectionThatBeganLater() async throws {
+        let journal = OwnJournal()
+        let source = OwnStepSource(timeline: strapTimeline)
+        source.hasSteps = false
+        await killed(journal, source, from: 0, to: 3605)
+        let inbox = try await syncWith(Record.strap(start: at(600), minutes: 40), at: at(3605 + 900))
+        XCTAssertTrue(inbox.items.isEmpty, "the strap's detection inside OpenCircuit's own workout")
+        XCTAssertTrue(notified.isEmpty)
+    }
+
     func testNotNowThenASyncDoesNotOfferItAndTheOfferComesBack() async throws {
         let journal = OwnJournal()
         let source = OwnStepSource(timeline: strapTimeline)
