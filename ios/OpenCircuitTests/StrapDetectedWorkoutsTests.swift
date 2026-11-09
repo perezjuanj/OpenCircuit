@@ -333,6 +333,69 @@ final class StrapDetectedWorkoutsTests: XCTestCase {
         XCTAssertTrue(inbox.items.isEmpty)
     }
 
+    // MARK: BGTask-owned syncs (91g, option 2a)
+
+    /// A connected session, not yet synced.
+    private func connected(_ device: FakeZeppDevice, store: LocalStore, inbox: StrapDetectedWorkouts) -> (HelioSession, DetectedTransport) {
+        let transport = DetectedTransport(device: device)
+        let keys = DetectedKeys()
+        let session = HelioSession(transport: transport, identityID: strapID, key: keys.load(), keyStore: keys,
+                                   sink: HelioStoreSink(store: store, workouts: inbox), findState: HelioFindState(),
+                                   clock: { [unowned self] in self.now }, autoTick: false, autoSyncOnConnect: false)
+        session.orphanStop = StrapWorkoutOrphanStop(defaults)
+        session.stepStreamFlag = StrapStepStreamFlag(defaults)
+        transport.session = session
+        session.start()
+        transport.drain()
+        XCTAssertTrue(session.ready)
+        return (session, transport)
+    }
+
+    func testASyncABackgroundTaskOwnsSendsNoWorkoutFetchAndTheNextForegroundSyncDoes() throws {
+        let store = try makeStore()
+        let inbox = makeInbox()
+        let device = makeStrap()
+        device.workoutRecords = [Record.strap(start: at(-3 * 3600), minutes: 30)]
+        let (session, transport) = connected(device, store: store, inbox: inbox)
+
+        // What `HelioBackgroundSyncService` does to a session it adopts.
+        session.backgroundRunOwnsSyncs = true
+        session.syncHistory(manual: false)
+        transport.drain()
+        XCTAssertFalse(session.syncing)
+        XCTAssertEqual(session.lastSyncResult?.interrupted, false)
+        XCTAssertFalse(device.fetchStarts.isEmpty, "the history types were fetched")
+        XCTAssertTrue(walkStarts(device).isEmpty, "no 01 05 / 01 06 in a BGTask-owned sync")
+        XCTAssertTrue(inbox.state.pending.isEmpty)
+        XCTAssertEqual(Set(device.fetchAcks), [0x09])
+
+        // The run hands the session back; the next sync (the app in front) walks.
+        session.backgroundRunOwnsSyncs = false
+        now = at(600)
+        session.syncHistory(manual: true)
+        transport.drain()
+        XCTAssertEqual(walkStarts(device).first, ZeppWorkoutWalk.startCommand(.summary, since: at(600 - 2 * 86_400), timeZone: .current))
+        XCTAssertEqual(inbox.items.map(\.start), [at(-3 * 3600)])
+    }
+
+    func testASessionMadeForABackgroundRunNeverWalksAndAConnectInFrontDoes() throws {
+        let store = try makeStore()
+        let inbox = makeInbox()
+        let device = makeStrap()
+        device.workoutRecords = [Record.strap(start: at(-3 * 3600), minutes: 30)]
+        // `HelioConnection.makeSession` during a run: the session is the run's from its first sync.
+        let (background, bgTransport) = connected(device, store: store, inbox: inbox)
+        background.backgroundRunOwnsSyncs = true
+        background.syncHistory(manual: false)
+        bgTransport.drain()
+        XCTAssertTrue(walkStarts(device).isEmpty)
+
+        now = at(600)
+        sync(device, store: store, inbox: inbox)   // a new connection with the app in front
+        XCTAssertEqual(walkStarts(device).count, 3, "one record pair, then the zero-length summary")
+        XCTAssertEqual(inbox.items.count, 1)
+    }
+
     // MARK: Keep and persist (91c)
 
     func testTheWalkNeverStartsBeforeTheStrapsOwnership() throws {

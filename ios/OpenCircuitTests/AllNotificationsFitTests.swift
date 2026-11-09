@@ -84,6 +84,8 @@ final class AllNotificationsFitTests: XCTestCase {
                     let copy = RingSession.workoutDetectedCopy(kind: kind, duration: duration, start: start,
                                                                now: now, calendar: cal)
                     assertFits(copy.body, "workout detected")
+                    let strap = StrapDetectedWorkouts.notificationCopy(duration: duration, start: start, now: now, calendar: cal)
+                    assertFits(strap.body, "strap workout recorded")
                 }
             }
         }
@@ -102,6 +104,7 @@ final class AllNotificationsFitTests: XCTestCase {
         "OpenCircuit/Observability/ObservabilityStore.swift": 1,
         "OpenCircuit/RingAlarmController.swift": 1,
         "OpenCircuit/BLE/RingSession.swift": 2,
+        "OpenCircuit/Helio/StrapDetectedWorkouts.swift": 1,
     ]
 
     func testEveryNotificationPostingSiteIsCovered() throws {

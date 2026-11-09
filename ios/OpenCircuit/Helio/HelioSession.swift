@@ -1230,8 +1230,11 @@ final class HelioSession: WearableSession {
     // MARK: The strap's own workout records (§22, decision 91a)
 
     /// After every other type: the walk, when the sink asks for one. false = no walk this sync.
+    /// Decision 91g (2a): never in a sync a BGTask run owns. There the walk would come before the run's
+    /// Health flush, and a long walk could outlast the task's budget and cost the night (91a).
     private func startWorkoutWalk() -> Bool {
         let now = clock()
+        guard !backgroundRunOwnsSyncs else { return false }
         guard let sink, let since = sink.workoutWalkSince(timeline: timeline, now: now) else { return false }
         fetch = nil
         var walk = ZeppWorkoutWalk(since: since, now: now)
