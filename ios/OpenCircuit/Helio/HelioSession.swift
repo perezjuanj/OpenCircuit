@@ -183,6 +183,24 @@ protocol HelioHistorySink: AnyObject {
     func persist(_ round: ZeppFetchRound, timeline: SyncDeviceID, now: Date) -> Bool
     /// Every round of this sync is in: finish the per-night work and report.
     func finishSync(timeline: SyncDeviceID, now: Date) -> HelioSyncResult
+
+    // The strap's own workout records (#226, decision 91a), walked after every other type.
+    /// The first pass's *since*, or nil for no walk this sync.
+    func workoutWalkSince(timeline: SyncDeviceID, now: Date) -> Date?
+    /// Judge (and keep, or not) one delivered record. true when that is durably done.
+    func persistWorkout(_ record: ZeppWorkoutRecord, timeline: SyncDeviceID, now: Date) -> Bool
+    /// A round of the walk failed: its record delivered nothing.
+    func workoutRoundFailed(recordStart: Date?, timeline: SyncDeviceID, now: Date)
+    /// The walk is over (finished, stopped or interrupted).
+    func finishWorkoutWalk(timeline: SyncDeviceID, now: Date)
+}
+
+/// A sink that doesn't take workout records never starts the walk.
+extension HelioHistorySink {
+    func workoutWalkSince(timeline: SyncDeviceID, now: Date) -> Date? { nil }
+    func persistWorkout(_ record: ZeppWorkoutRecord, timeline: SyncDeviceID, now: Date) -> Bool { false }
+    func workoutRoundFailed(recordStart: Date?, timeline: SyncDeviceID, now: Date) {}
+    func finishWorkoutWalk(timeline: SyncDeviceID, now: Date) {}
 }
 
 /// The find-device machine outlives a connection: it carries a stop owed since the link dropped
@@ -386,6 +404,11 @@ final class HelioSession: WearableSession {
 
     @ObservationIgnored private var link: ZeppLink?
     @ObservationIgnored private var fetch: ZeppHistoryFetch?
+    /// The walk over the strap's workout records (decision 91a), once `fetch` has finished every type.
+    @ObservationIgnored private var workoutWalk: ZeppWorkoutWalk?
+    /// Every type of this sync's history fetch finished: an interrupted walk after it doesn't make the
+    /// sync an interrupted one (the walk can never cost a night or the day's samples, 91a).
+    @ObservationIgnored private var historyFetchFinished = false
     @ObservationIgnored private var pendingNotify = Set<ZeppCharacteristic>()
     @ObservationIgnored private var notifyPurpose: NotifyPurpose?
     @ObservationIgnored private var authDeadline: Date?
@@ -636,6 +659,12 @@ final class HelioSession: WearableSession {
             let out = link!.receive(bytes)
             handle(out)
         case .activityControl:
+            if workoutWalk != nil {
+                lastFetchProgressAt = now
+                let actions = workoutWalk!.receiveControl(bytes)
+                performWalk(actions)
+                return
+            }
             guard fetch != nil else {
                 if !within(Self.replyWindow, of: lastFetchProgressAt, now: now) { onEvent(.strapNotification(.activityControl)) }
                 return
@@ -644,6 +673,12 @@ final class HelioSession: WearableSession {
             let actions = fetch!.receiveControl(bytes)
             perform(actions)
         case .activityData:
+            if workoutWalk != nil {
+                lastFetchProgressAt = now
+                let actions = workoutWalk!.receiveData(bytes)
+                performWalk(actions)
+                return
+            }
             guard fetch != nil else {
                 if !within(Self.replyWindow, of: lastFetchProgressAt, now: now) { onEvent(.strapNotification(.activityData)) }
                 return
@@ -689,6 +724,12 @@ final class HelioSession: WearableSession {
     /// A user disconnect mid-sync: ack the open round `03 09` while the link is still up (the strap
     /// keeps the data either way), then let `linkLost` finish the sync as interrupted.
     func abortSync() {
+        if var walk = workoutWalk {
+            let actions = walk.abort()
+            workoutWalk = walk
+            performWalk(actions)
+            return
+        }
         guard var fetch else { return }
         let actions = fetch.abort()
         self.fetch = fetch
@@ -791,6 +832,11 @@ final class HelioSession: WearableSession {
                 let actions = fetch.abort()
                 self.fetch = fetch
                 perform(actions)
+            }
+            if var walk = workoutWalk {
+                let actions = walk.abort()
+                workoutWalk = walk
+                performWalk(actions)
             }
             finishFetch(interrupted: true)
         }
@@ -1090,6 +1136,13 @@ final class HelioSession: WearableSession {
             performWorkoutMode(workoutMode.receive(payload, now: clock()))
         case ZeppEndpoint.activityFetch:
             // Path B replies (§6.1). The app drives Path A, so this only arrives if the strap answers there.
+            if var walk = workoutWalk {
+                lastFetchProgressAt = clock()
+                let actions = walk.receiveControl(payload)
+                workoutWalk = walk
+                performWalk(actions)
+                return
+            }
             guard var fetch else { return }
             lastFetchProgressAt = clock()
             let actions = fetch.receiveControl(payload)
@@ -1140,6 +1193,7 @@ final class HelioSession: WearableSession {
                                        notBefore: sink.notBefore(timeline: timeline, now: now))
         sink.beginSync(timeline: timeline, now: now)
         syncCounts = (0, 0, 0)
+        historyFetchFinished = false
         var machine = ZeppHistoryFetch(plan: plan, now: now, configuration: .init(ackPolicy: Self.ackPolicy))
         let actions = machine.start()
         fetch = machine
@@ -1167,14 +1221,60 @@ final class HelioSession: WearableSession {
             case .noData:
                 syncCounts.empty += 1
             case .finished:
+                historyFetchFinished = true
+                if !startWorkoutWalk() { finishFetch(interrupted: false) }
+            }
+        }
+    }
+
+    // MARK: The strap's own workout records (§22, decision 91a)
+
+    /// After every other type: the walk, when the sink asks for one. false = no walk this sync.
+    private func startWorkoutWalk() -> Bool {
+        let now = clock()
+        guard let sink, let since = sink.workoutWalkSince(timeline: timeline, now: now) else { return false }
+        fetch = nil
+        var walk = ZeppWorkoutWalk(since: since, now: now)
+        let actions = walk.start()
+        workoutWalk = walk
+        lastFetchProgressAt = now
+        performWalk(actions)
+        return true
+    }
+
+    private func performWalk(_ actions: [ZeppWorkoutWalk.Action]) {
+        for action in actions {
+            switch action {
+            case .sendControl(let bytes):
+                if bytes.count == 2, bytes[0] == ZeppFetchCommand.ackMarker { fetchAcksSent.append(bytes[1]) }
+                transport?.write(ZeppWrite(.activityControl, bytes))
+            case .recordReady(let id, let record):
+                let stored = sink?.persistWorkout(record, timeline: timeline, now: clock()) ?? false
+                helioLog.notice("helio: workout record \(record.summary.durationSeconds / 60, privacy: .public) min, \(record.heartRate.count, privacy: .public) reading(s) \(stored ? "judged" : "NOT stored", privacy: .public); ack 03 09")
+                guard var walk = workoutWalk else { continue }
+                let next = walk.commit(recordID: id, stored: stored)
+                workoutWalk = walk
+                performWalk(next)
+            case .roundFailed(let type, let failure, let recordStart):
+                syncCounts.failed += 1
+                sink?.workoutRoundFailed(recordStart: recordStart, timeline: timeline, now: clock())
+                helioLog.error("helio: round \(type.displayName, privacy: .public) failed (\(String(describing: failure), privacy: .public)); kept on the strap")
+            case .finished(let end):
+                helioLog.notice("helio: workout walk finished (\(String(describing: end), privacy: .public))")
                 finishFetch(interrupted: false)
             }
         }
     }
 
     private func finishFetch(interrupted: Bool) {
-        guard phase == .syncing || fetch != nil else { return }
+        guard phase == .syncing || fetch != nil || workoutWalk != nil else { return }
         fetch = nil
+        if workoutWalk != nil {
+            workoutWalk = nil
+            sink?.finishWorkoutWalk(timeline: timeline, now: clock())
+        }
+        let interrupted = interrupted && !historyFetchFinished
+        historyFetchFinished = false
         pendingNotify.subtract([.activityControl, .activityData])
         if isLinkConnected {
             transport?.setNotify(.activityControl, enabled: false)
