@@ -12,6 +12,9 @@ struct StrapWorkoutView: View {
     @State private var confirmPause = false
     @State private var confirmEnd = false
     let session: HelioSession?
+    /// The strap's own workout records waiting for review (#226, decision 91d).
+    var detected: StrapDetectedWorkouts = .shared
+    @State private var reviewing: StrapDetectedWorkout?
     @Environment(\.dismiss) private var dismiss
 
     @ScaledMetric(relativeTo: .largeTitle) private var timerSize: CGFloat = 56
@@ -24,7 +27,11 @@ struct StrapWorkoutView: View {
             Group {
                 switch recorder.state {
                 case .idle:
-                    idleView
+                    if let reviewing {
+                        StrapDetectedWorkoutReview(item: reviewing, detected: detected) { self.reviewing = nil }
+                    } else {
+                        idleView
+                    }
                 case .active:
                     activeView
                 case .finishing:
@@ -63,6 +70,7 @@ struct StrapWorkoutView: View {
     private var idleView: some View {
         ScrollView {
             VStack(spacing: 24) {
+                StrapDetectedWorkoutSection(items: detected.items) { reviewing = $0 }
                 Text("SELECT SPORT")
                     .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -558,6 +566,8 @@ struct StrapWorkoutHooks: ViewModifier {
                 // history and Today's recent workouts once it is in Health, not when the sheet closed.
                 recorder.onDeferredWorkoutSaved = onWorkoutsChanged
                 ringManager.onDeferredWorkoutSaved = onWorkoutsChanged
+                // #226 (91d): a strap record saved from the review appears in the history.
+                StrapDetectedWorkouts.shared.onWorkoutsChanged = onWorkoutsChanged
             }
             .task {
                 recorder.resolveOrphan()
