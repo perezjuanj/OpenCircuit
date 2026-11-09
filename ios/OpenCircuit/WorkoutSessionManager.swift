@@ -1364,6 +1364,8 @@ final class WorkoutSessionManager: NSObject {
             guard let finished = try await builder.finishWorkout() else { return false }
             workout = finished
         } catch { return false }
+        // Decision 91h: the strap's detected-workout inbox never offers this window back.
+        OwnWorkoutWindows().record(start: summary.startDate, end: summary.endDate)
 
         // Workout is now COMMITTED to Health — only NOW record its foot-based GPS distance so the
         // daily steps×stride distance + active-energy estimates net out exactly what was written

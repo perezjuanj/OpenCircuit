@@ -7,11 +7,17 @@
 // `reconcile` re-reads the app's workout history from Apple Health, drops what it now covers, and
 // announces each newly kept record once (91e).
 //
+// Decision 91h: what guarantees the strap's record of OpenCircuit's OWN workout is never offered is the
+// local `OwnWorkoutWindows` list, not Apple Health. The Health read is fail-closed: a read that failed
+// (or a locked phone) keeps the previous cache and announces nothing; an empty read is not a failure.
+//
 // UserDefaults, not SwiftData, like the ring's inbox (`RingSession`'s `workout.automaticDetection.*`
 // keys): no model and no schema version. A record's heart rate is stored compactly (5 bytes a reading).
 
 import Foundation
+import HealthKit
 import Observation
+import UIKit
 import UserNotifications
 import OpenCircuitKit
 import ZeppKit
@@ -115,7 +121,9 @@ final class StrapDetectedWorkouts {
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let writer: any StrapWorkoutHealthWriting
-    @ObservationIgnored private let historyWindows: @MainActor (DateInterval) async -> [DateInterval]
+    /// nil = the read failed or Health can't be read now (91h): never taken as "no workouts".
+    @ObservationIgnored private let historyWindows: @MainActor (DateInterval) async -> [DateInterval]?
+    @ObservationIgnored private let ownWindows: OwnWorkoutWindows
     @ObservationIgnored private let notify: @MainActor (StrapDetectedWorkout) async -> Bool
     @ObservationIgnored private let zones: @MainActor () async -> HeartRateZones
     @ObservationIgnored private let clock: () -> Date
@@ -129,7 +137,7 @@ final class StrapDetectedWorkouts {
 
     init(defaults: UserDefaults = .standard,
          writer: (any StrapWorkoutHealthWriting)? = nil,
-         historyWindows: @escaping @MainActor (DateInterval) async -> [DateInterval] = StrapDetectedWorkouts.healthHistory,
+         historyWindows: @escaping @MainActor (DateInterval) async -> [DateInterval]? = StrapDetectedWorkouts.healthHistory,
          notify: @escaping @MainActor (StrapDetectedWorkout) async -> Bool = StrapDetectedWorkouts.postNotification,
          zones: @escaping @MainActor () async -> HeartRateZones = { await HeartRateZoneDefaults.currentZones() },
          isStrapChosen: @escaping @MainActor () -> Bool = { ActiveDeviceChoiceStore.shared.isHelio },
@@ -137,6 +145,7 @@ final class StrapDetectedWorkouts {
         self.defaults = defaults
         self.writer = writer ?? StrapWorkoutHealthWriter()
         self.historyWindows = historyWindows
+        ownWindows = OwnWorkoutWindows(defaults)
         self.notify = notify
         self.zones = zones
         self.clock = clock
@@ -162,7 +171,8 @@ final class StrapDetectedWorkouts {
     @discardableResult
     func judge(_ record: ZeppWorkoutRecord, timeline: SyncDeviceID, owned: Bool, now: Date) -> HelioStrapWorkoutKeep.Verdict {
         let verdict = HelioStrapWorkoutKeep.verdict(
-            window: record.summary.window, owned: owned, history: (state.history + state.saved).map(\.interval),
+            window: record.summary.window, owned: owned,
+            history: (state.history + state.saved).map(\.interval) + ownWindows.windows,
             deleted: WorkoutTombstones(defaults).entries.map { DateInterval(start: $0.start, end: max($0.start, $0.end)) },
             discarded: state.discarded.map(\.interval), now: now)
         switch verdict {
@@ -187,17 +197,21 @@ final class StrapDetectedWorkouts {
 
     // MARK: After a walk (91c, 91e)
 
-    /// Re-reads the app's workouts from Apple Health, drops the pending records they (or a deletion)
-    /// now cover, then announces each newly kept record once.
+    /// Re-reads the app's workouts from Apple Health, drops the pending records they, the app's own
+    /// windows or a deletion now cover, then announces each newly kept record once. A read that failed
+    /// (nil) keeps the previous cache and announces nothing (91h): that pass can't tell what is ours.
     func reconcile() async {
         let now = clock()
         let span = DateInterval(start: now.addingTimeInterval(-HelioStrapWorkoutKeep.retention - 86_400), end: now)
         let history = await historyWindows(span)
-        state.history = history.map { StrapWorkoutInboxState.Window(start: $0.start, end: $0.end) }
+        if let history {
+            state.history = history.map { StrapWorkoutInboxState.Window(start: $0.start, end: $0.end) }
+        }
         let deleted = WorkoutTombstones(defaults).entries.map { DateInterval(start: $0.start, end: max($0.start, $0.end)) }
-        let covered = (state.history + state.saved).map(\.interval) + deleted
+        let covered = (state.history + state.saved).map(\.interval) + ownWindows.windows + deleted
         state.pending.removeAll { item in covered.contains { HelioStrapWorkoutKeep.overlaps($0, item.window) } }
         persist(now: now)
+        guard history != nil else { return }
         await announce(now: now)
     }
 
@@ -237,6 +251,7 @@ final class StrapDetectedWorkouts {
         }
         state.pending.removeAll { $0.start == item.start }
         state.saved.append(.init(start: item.start, end: item.end))
+        ownWindows.record(start: item.start, end: item.end, now: clock())
         persist(now: clock())
         onWorkoutsChanged()
         return true
@@ -267,11 +282,24 @@ final class StrapDetectedWorkouts {
 
     // MARK: Production collaborators
 
-    /// The windows of the app's own workouts in Apple Health that end inside `span`.
-    static func healthHistory(_ span: DateInterval) async -> [DateInterval] {
-        await WorkoutHistoryReader().workouts(startingBefore: nil, limit: 100)
-            .filter { $0.end >= span.start && $0.start <= span.end }
-            .map { DateInterval(start: $0.start, end: max($0.start, $0.end)) }
+    /// The windows of the app's own workouts in Apple Health that overlap `span`. nil when Health can't
+    /// be read now (locked phone, no Health) or the query failed (91h); an empty list is a real answer.
+    /// Its own query, not `WorkoutHistoryReader.workouts`, which returns `[]` on any error.
+    static func healthHistory(_ span: DateInterval) async -> [DateInterval]? {
+        guard HKHealthStore.isHealthDataAvailable(), UIApplication.shared.isProtectedDataAvailable else { return nil }
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+            HKQuery.predicateForObjects(from: .default()),
+            HKQuery.predicateForSamples(withStart: span.start, end: span.end, options: []),
+        ])
+        let store = HKHealthStore()
+        return await withCheckedContinuation { (cont: CheckedContinuation<[DateInterval]?, Never>) in
+            let query = HKSampleQuery(sampleType: HKWorkoutType.workoutType(), predicate: predicate,
+                                      limit: HKObjectQueryNoLimit, sortDescriptors: nil) { _, samples, error in
+                guard error == nil else { return cont.resume(returning: nil) }
+                cont.resume(returning: (samples ?? []).map { DateInterval(start: $0.startDate, end: max($0.startDate, $0.endDate)) })
+            }
+            store.execute(query)
+        }
     }
 
     /// The notification's text, held to `NotificationBudget` like the ring's.

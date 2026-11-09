@@ -39,6 +39,8 @@ public struct ZeppWorkoutWalk {
         case refused
         /// The caller couldn't store a record: nothing more is fetched this sync.
         case storeFailed
+        /// The caller stopped the walk (`stop()`): no round was asked for after it.
+        case stopped
     }
 
     public enum Action: Equatable {
@@ -92,6 +94,8 @@ public struct ZeppWorkoutWalk {
     private var buffer: [UInt8] = []
     private var nextCounter: UInt8 = 0
     private var pendingID: Int?
+    /// `stop()` came while a start reply was due: that reply's round is acked `03 09` and nothing more is asked.
+    private var stopping = false
     private var afterAck: AfterAck = .end(.noMoreRecords)
 
     private enum AfterAck: Equatable {
@@ -158,6 +162,30 @@ public struct ZeppWorkoutWalk {
         return [.sendControl(ZeppFetchCommand.ack(.keep))]
     }
 
+    /// Ends the walk with the link staying up (decision 91h: a BGTask run adopted the sync). No round is
+    /// asked for after this. A round in progress gets `03 09` (its record delivers nothing); a start reply
+    /// still due is waited for and its round acked `03 09`; an ack already sent waits for its `10 03`. The
+    /// walk then emits `.finished(.stopped)`, at once when nothing is outstanding.
+    public mutating func stop() -> [Action] {
+        switch phase {
+        case .idle, .finished:
+            return finish(.stopped)
+        case .awaitingStartReply:
+            stopping = true
+            return []
+        case .receivingData, .awaitingCommit:
+            let failed = Action.roundFailed(type: type, failure: .round(.aborted), recordStart: recordStart)
+            pendingID = nil
+            buffer = []
+            afterAck = .end(.stopped)
+            phase = .awaitingAckReply
+            return [failed, .sendControl(ZeppFetchCommand.ack(.keep))]
+        case .awaitingAckReply:
+            afterAck = .end(.stopped)
+            return []
+        }
+    }
+
     /// Stops the walk. A round in progress gets `03 09`; one already acked gets nothing more.
     public mutating func abort() -> [Action] {
         var out = [Action]()
@@ -177,6 +205,13 @@ public struct ZeppWorkoutWalk {
     // MARK: Round steps
 
     private mutating func handleStartReply(_ bytes: [UInt8]) -> [Action] {
+        if stopping {
+            // The strap opened a round (or refused one) after `stop()`: keep its data and end there.
+            guard bytes.count >= 3, bytes[2] == 0x01 else { return finish(.stopped) }
+            afterAck = .end(.stopped)
+            phase = .awaitingAckReply
+            return [.sendControl(ZeppFetchCommand.ack(.keep))]
+        }
         guard bytes.count >= 3 else { return failRound(.round(.malformedStartReply)) }
         guard bytes[2] == 0x01 else {
             // Refused: no round was opened, so nothing is acked. A refused summary ends the walk; a

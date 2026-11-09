@@ -356,7 +356,10 @@ final class HelioSession: WearableSession {
     /// so a new session (a reconnect) starts unclaimed (review-225f SF-1).
     @ObservationIgnored var alertPassClaimedSync: Int?
     /// Set by a background run while it owns this connection's syncs (`HelioSyncResult.endedInBackgroundRun`).
-    @ObservationIgnored var backgroundRunOwnsSyncs = false
+    @ObservationIgnored var backgroundRunOwnsSyncs = false {
+        // Decision 91h (B2): a run that adopts this session mid-walk stops the walk at once.
+        didSet { if backgroundRunOwnsSyncs, !oldValue { stopWorkoutWalkForBackgroundRun() } }
+    }
     /// Set by a Sleep Focus run that hands its sync to the app (review-225b S-B): the time T that Focus
     /// ended. Carried into the next `HelioSyncResult.nightsFinalized`, then cleared, so later syncs
     /// don't inherit it.
@@ -1230,8 +1233,10 @@ final class HelioSession: WearableSession {
     // MARK: The strap's own workout records (§22, decision 91a)
 
     /// After every other type: the walk, when the sink asks for one. false = no walk this sync.
-    /// Decision 91g (2a): never in a sync a BGTask run owns. There the walk would come before the run's
-    /// Health flush, and a long walk could outlast the task's budget and cost the night (91a).
+    /// Decision 91g (2a): not started in a sync a BGTask run owns. There the walk would come before the
+    /// run's Health flush, and a long walk could outlast the task's budget and cost the night (91a). A run
+    /// that adopts the session once the walk is under way stops it (`stopWorkoutWalkForBackgroundRun`,
+    /// 91h), so no walk round is asked for after the adoption.
     private func startWorkoutWalk() -> Bool {
         let now = clock()
         guard !backgroundRunOwnsSyncs else { return false }
@@ -1244,6 +1249,23 @@ final class HelioSession: WearableSession {
         performWalk(actions)
         return true
     }
+
+    /// Decision 91h (B2): a BGTask run adopted this session while its walk ran. No walk round is asked
+    /// for after this: an open round gets its `03 09` (a start reply still due is waited for and acked),
+    /// the records already judged stay, the cursor stops before the open record (a later unowned sync
+    /// resumes there), and the sync ends uninterrupted (`.finished(.stopped)`): every history type had
+    /// finished.
+    private func stopWorkoutWalkForBackgroundRun() {
+        guard var walk = workoutWalk else { return }
+        helioLog.notice("helio: a background run adopted the sync; workout walk stopped")
+        let actions = walk.stop()
+        workoutWalk = walk
+        walkStoppedForBackgroundRun = true
+        performWalk(actions)
+    }
+
+    /// Set once a background run stopped the walk: its open round is not a failed round.
+    @ObservationIgnored private var walkStoppedForBackgroundRun = false
 
     private func performWalk(_ actions: [ZeppWorkoutWalk.Action]) {
         for action in actions {
@@ -1259,11 +1281,12 @@ final class HelioSession: WearableSession {
                 workoutWalk = walk
                 performWalk(next)
             case .roundFailed(let type, let failure, let recordStart):
-                syncCounts.failed += 1
+                if !walkStoppedForBackgroundRun { syncCounts.failed += 1 }
                 sink?.workoutRoundFailed(recordStart: recordStart, timeline: timeline, now: clock())
                 helioLog.error("helio: round \(type.displayName, privacy: .public) failed (\(String(describing: failure), privacy: .public)); kept on the strap")
             case .finished(let end):
                 helioLog.notice("helio: workout walk finished (\(String(describing: end), privacy: .public))")
+                walkStoppedForBackgroundRun = false
                 finishFetch(interrupted: false)
             }
         }
@@ -1276,6 +1299,7 @@ final class HelioSession: WearableSession {
             workoutWalk = nil
             sink?.finishWorkoutWalk(timeline: timeline, now: clock())
         }
+        walkStoppedForBackgroundRun = false
         let interrupted = interrupted && !historyFetchFinished
         historyFetchFinished = false
         pendingNotify.subtract([.activityControl, .activityData])

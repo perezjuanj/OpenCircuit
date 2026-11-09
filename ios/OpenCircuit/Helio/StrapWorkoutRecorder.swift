@@ -465,6 +465,8 @@ final class StrapWorkoutRecorder {
     @ObservationIgnored private let vo2: (any StrapVO2MaxProviding)?
     /// Workouts deleted from the history screen (#293): never offered back after a kill.
     @ObservationIgnored private let tombstones: WorkoutTombstones
+    /// Decision 91h: every workout recorded here, so the strap's inbox never offers its own record back.
+    @ObservationIgnored private let ownWindows: OwnWorkoutWindows
     /// Heart rate recovery's Apple Health writes. nil: no recovery window (End as before #337).
     @ObservationIgnored private let recoveryHealth: (any HeartRateRecoveryHealthWriting)?
     @ObservationIgnored private let recoveryWindows: WorkoutRecoveryWindows
@@ -549,6 +551,7 @@ final class StrapWorkoutRecorder {
          orphanStop: StrapWorkoutOrphanStop = StrapWorkoutOrphanStop(),
          vo2: (any StrapVO2MaxProviding)? = nil,
          tombstones: WorkoutTombstones = WorkoutTombstones(),
+         ownWindows: OwnWorkoutWindows = OwnWorkoutWindows(),
          recoveryHealth: (any HeartRateRecoveryHealthWriting)? = nil,
          recoveryWindows: WorkoutRecoveryWindows = WorkoutRecoveryWindows(),
          indoorHealth: (any IndoorRunHealthWriting)? = nil,
@@ -572,6 +575,7 @@ final class StrapWorkoutRecorder {
         self.orphanStop = orphanStop
         self.vo2 = vo2
         self.tombstones = tombstones
+        self.ownWindows = ownWindows
         self.recoveryHealth = recoveryHealth
         self.recoveryWindows = recoveryWindows
         self.indoorHealth = indoorHealth
@@ -907,6 +911,8 @@ final class StrapWorkoutRecorder {
             distanceMeters: hasRoute ? location.distanceMeters : nil, hasRoute: hasRoute,
             profile: profileSnapshot ?? profile(), zones: activeZones)
         let counted = StrapWorkoutSummaryBuilder.activeSamples(samples, ledger: ledger, end: end)
+        // Decision 91h: the workout is OpenCircuit's own from End, before any save (84j can defer it 10 min).
+        ownWindows.record(start: ledger.start, end: end, now: now)
         // Decision 84j: an indoor run or walk with steps waits for its distance prompt before the
         // `HKWorkout` is saved (answered, skipped, the summary dismissed, or 10 min after End). Every
         // other workout is saved below, at End, exactly as before (82a).
@@ -1535,6 +1541,8 @@ final class StrapWorkoutRecorder {
 
     /// Save's async half: one `HKWorkout` over the recovered span, with its readings.
     func writeRecovered(_ write: StrapWorkoutWrite) async -> Bool {
+        // Decision 91h: OpenCircuit's own workout, as at End.
+        ownWindows.record(start: write.summary.summary.startDate, end: write.summary.summary.endDate, now: clock())
         let saved = await health.save(write)
         helioLog.notice("helio: interrupted workout saved to Health \(saved, privacy: .public)")
         landPendingHeartRate()
