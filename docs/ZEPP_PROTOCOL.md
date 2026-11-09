@@ -732,7 +732,7 @@ support, and the strap inherits all Zepp OS defaults except display-dependent on
 | `0x48` | **sleep session** | **594-byte** records, see §6.6 | per night | minutes | sleep-session blob; stages overlaid on activity | yes | 🟢 594-byte record, CRC `HW:2026-09-30 (hw 0.132.27.2)`; fields 🟡 `FOP/SleepSession:59-85` |
 | `0x49` | **HRV** | 6 bytes: u32 ts, u8 unknown (🔴 probably the tz byte, as in the 6-byte HR records), u8 HRV | a few per day/night 🔴 | **ms**; statistic **RMSSD** 🟡: Amazfit documents that "Amazfit devices measure HRV using the RMSSD method" (https://us.amazfit.com/pages/amazfit-technology-page-health-technology; a product-line statement, the Helio Strap is not named), and a third-party Helio review says the same. Not compared with Zepp's display on our strap (§10 item 9); a capture that contradicts it wins | HRV value | yes (no display) | 🟢 6-byte records, CRC `HW:2026-09-30 (hw 0.132.27.2)`; fields 🟡 `FOP/Hrv:59-85`, `HC:1236-1245`; statistic 🟡 Amazfit product-line documentation (2026-10-01) |
 | `0x2c` | statistics | opaque files; fetched only so the strap frees memory | — | — | discarded | yes | 🟡 `FOP/Statistics` |
-| `0x05` / `0x06` | workout summary / detail | binary summary + track; **out of scope for v1**, not specified here | per workout | — | workouts | yes | 🟡 `FOP/SportsSummary`, `FOP/SportsDetails` |
+| `0x05` / `0x06` | workout summary / detail | **see §22**: a protobuf summary and a TLV detail track, one round pair per workout | per workout | s / ms epoch, bpm, kcal | workouts | yes | 🟢 `HW:2026-11-09 route 2` (§22); 🟡 `FOP/SportsSummary`, `FOP/SportsDetails` |
 | `0x07` | debug logs | — | — | — | — | no | 🟡 `GB/…/fetch/HuamiFetchDataType.java:24` |
 
 **Length unit of the start reply** (§6.2). The announced length counts **8-byte records
@@ -2770,6 +2770,146 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
 
 ---
 
+## 22. The strap's own workout records (`0x05` / `0x06`, #226)
+
+Source: a runtime capture of the Zepp app (Android) syncing our strap after five days without a
+phone, using the same method as §18.9: hooks on Android framework APIs only (AES in/out, GATT writes
+and notifications), with no Zepp code read. Fetch control on `0x004B` was decrypted per §3 and
+accepted only on a matching §3.3 CRC. The data rounds on `…0005` were checked against the §6.2
+transfer-done CRC-32 (79 of 80 rounds matched; see §22.5). `HW:2026-11-09 route 2` (fw 3.27.0.1,
+hw 0.132.27.2). Where this section and §6.5's `0x05`/`0x06` row disagree, this section wins.
+
+The strap keeps one record per workout, whoever started it: auto-detected workouts (§19), workouts
+started in the Zepp app, and workouts OpenCircuit starts in workout mode (§18.9). Each record is
+fetched as two rounds of the ordinary §6.2 history fetch: a **summary** (`0x05`) and a **detail**
+(`0x06`).
+
+### 22.1 Fetch sequence
+
+| Step | Phone → strap | Strap → phone | Tag |
+|---|---|---|---|
+| 1 | `01 05 <since>` (§6.2 start, 8-byte *since*) | `10 01 01 <len u32> <start>`: *start* = the **first record's start time** at or after *since*; *len* = the summary's size in **bytes** | 🟢 |
+| 2 | `02` | the summary on `…0005`, then `10 02 01 <crc32>` | 🟢 |
+| 3 | `03 01` | `10 03 01` | 🟢 (the ack Zepp sent) |
+| 4 | `01 06 <same since as step 1>` | `10 01 01 <len u32> <start>` (the same *start*) | 🟢 |
+| 5 | `02` | the detail on `…0005`, then `10 02 01 <crc32>` | 🟢 |
+| 6 | `03 01` | `10 03 01` | 🟢 |
+| 7 | repeat from step 1 with *since* = the **next record's start**, or (at the end) the last record's start + 1 s | a **zero-length** reply (§6.2 "empty start reply") ends the walk | 🟢 |
+
+- One record per round pair. After 31 records the walk ended on a zero-length summary reply (all-zero
+  *start*, §6.2's second empty form). 🟢
+- The *since* Zepp sent for each record was that record's own start, to the second. Zepp sends a
+  non-zero seconds byte here. §6.2's "second = `00`" default holds for every other type, but a
+  minute-precision *since* would re-deliver the record just read. So for `0x05`/`0x06`, send the
+  **seconds**. 🟢
+- How Zepp found each next record's start: the start reply of step 1 names the record it returns, and
+  Zepp asked for that exact start on the next pass. A phone that doesn't know the next start can send
+  the previous record's start + 1 s. The strap answers with the first record at or after it. 🟡 (Zepp's
+  own sequence used exact starts; +1 s is inferred from §6.2's "first record at or after *since*").
+- **The `03 01` ack did not remove the records.** A second walk minutes later, from an earlier *since*,
+  re-delivered the same records: 14 records came twice, and every copy with a matching CRC was byte-identical to the first. Workout records therefore look independent of §6.3's
+  delete semantics. 🟡 (one capture). OpenCircuit still follows §6.3: `03 09` (keep) until the record
+  is durably stored, and never `03 01` on a CRC mismatch.
+
+### 22.2 Summary record (`0x05`)
+
+Layout: two header bytes `00 80` 🔴 (the same in all 33 records seen), then a **protocol-buffers
+message** (standard wire format: varint tags, length-delimited sub-messages, fixed32 floats). Field
+paths below are `outer.inner` field numbers. Unknown fields must be skipped by wire type, never
+rejected.
+
+| Path | Wire type | Meaning | Tag |
+|---|---|---|---|
+| `1` | bytes | format version, the ASCII string `"2.1"` (`0a 03 32 2e 31`) on every record | 🟢 seen; 🔴 meaning |
+| `2.1` | varint | **start**, Unix epoch seconds (UTC) | 🟢 matched the Zepp app's record |
+| `2.3` | varint | `39` on every record | 🔴 |
+| `2.13` | varint | `257` (`0x101`) on every auto-detected (`df`) record; `1` on workouts started from a phone | 🟡 auto-detected flag |
+| `3.1` | varint | **sport**: the §18.2 code space. `df` = auto-detected generic activity (Zepp shows it as "Activity"); phone-started workouts carry their real sport (`34` strength, `e3` pickleball seen) | 🟢 codes; 🟡 `df` meaning |
+| `7.1` | varint | **duration, seconds** (equals `7.2` on every record) | 🟢 matched Zepp's "workout time" to the second |
+| `7.4` | varint | present on the two longer phone-started records, a little under `7.1` (probably active time without pauses) | 🔴 |
+| `16.1` | varint | **active energy, kcal** | 🟢 matched Zepp |
+| `19.1` / `19.2` / `19.3` | varint | **average / maximum / minimum heart rate, bpm** | 🟢 matched Zepp |
+| `22.2` | bytes | packed varints, six ascending bpm values: the HR zone bounds in force | 🟡 |
+| `21.4`, `21.5` | fixed32 float | training-effect-like values (aerobic, anaerobic?) | 🔴 do not show |
+| `21.6` | varint | a load-like integer | 🔴 do not show |
+| `11.1`, `11.2` | fixed32 float | present on auto-detected records only | 🔴 |
+| others (`15`, `22.1`, `22.3`) | | seen, unknown | 🔴 skip |
+
+**End** = start + `7.1` seconds. The summary carries no end field of its own. 🟢 (the end Zepp showed).
+
+Worked example N (constructed, made-up values): an auto-detected activity, start 1790000000
+(2026-09-21T14:13:20Z), 1500 s, 150 kcal, HR 110 / 130 / 90. `OC-vec`
+
+```
+00 80                                   header
+0a 03 32 2e 31                          field 1: "2.1"
+12 0d 08 80 f7 c4 d5 06 10 00 18 27 68 81 02
+                                        field 2 { 1: 1790000000, 2: 0, 3: 39, 13: 257 }
+1a 05 08 df 01 10 01                    field 3 { 1: 0xdf, 2: 1 }
+3a 06 08 dc 0b 10 dc 0b                 field 7 { 1: 1500, 2: 1500 }
+82 01 03 08 96 01                       field 16 { 1: 150 }
+9a 01 07 08 6e 10 82 01 18 5a           field 19 { 1: 110, 2: 130, 3: 90 }
+```
+
+### 22.3 Detail record (`0x06`)
+
+Not protobuf. A flat run of **TLV entries**: u8 type, u8 length *n*, *n* bytes of value. Walk the
+whole round and skip unknown types by their length. 🟢 (31 of 33 records consumed exactly; the other
+two are §22.5).
+
+| Type | Length | Meaning | Tag |
+|---|---|---|---|
+| `01` | 12 | **block header**: bytes 0-3 constant (`70 73 6d 68`) 🔴; bytes 4-9 = the block's start, **Unix epoch milliseconds, u48 LE**; bytes 10-11 `00 00` 🔴. A new block every ~33 s | 🟢 |
+| `08` | 3 | **heart-rate sample**: u16 LE offset in ms from the current block's start, then u8 bpm. About 1 per second | 🟢 |
+| `04` | 4 | u32, two or three per record | 🔴 |
+| `05` | 8 | two u32 (second always 0), on auto-detected records | 🔴 |
+| `0f`, `1f`, `05` (30 B), `fa`, `00` (length 0) | | on phone-started records only, mostly at the end | 🔴 skip |
+
+- **Sample time** = the enclosing block's start + the entry's offset. 🟢
+- **The detail runs past the workout.** It can carry minutes of heart rate before the start or after
+  the end (one record: 33 min of workout, 45 min of detail). **Trim to `[start, start + 7.1)`.**
+  Trimmed this way, the detail's own average/max/min equalled the summary's `19.x` on 28 of 33
+  records, and was 1 bpm off on the other 5 (rounding). 🟢
+- No HR value of `00` or `ff` appeared in 65,908 samples. Still drop both as "no reading", as
+  everywhere else in this document. 🟡
+- An entry whose length runs past the end of the round ends the walk: keep the samples before it
+  and treat the record as truncated. 🟡
+
+Worked example O (constructed): a block starting at 1790000000000 ms with three samples.
+`OC-vec`
+
+```
+01 0c 70 73 6d 68 00 6c 50 c4 a0 01 00 00   block header, start 1790000000000 ms
+08 03 00 00 64                               +0 ms     100 bpm
+08 03 e8 03 65                               +1000 ms  101 bpm
+08 03 d0 07 67                               +2000 ms  103 bpm
+```
+
+### 22.4 What a workout record does NOT carry
+
+- No distance or route (the strap has no GPS). No step count was identified. 🟡
+- No time-zone offset: start (s) and block starts (ms) are UTC epoch values. Display them in the
+  phone's zone. 🟢
+- The sport of an auto-detected record is always the generic `df`: the strap doesn't say what kind
+  of activity it was. 🟡
+
+### 22.5 Integrity
+
+- Check every round against its transfer-done CRC-32 (§6.2). One detail round of 80 failed it, and its
+  TLV walk then produced junk types. On a mismatch, ack `03 09` (keep) and re-fetch the record on the
+  next sync. Never parse a failed round into stored data. 🟢
+- Two consecutive rounds can both start with packet counter `00`. Split rounds by the control
+  messages (`10 01` … `10 02`), never by a counter reset. 🟢
+- A workout started in workout mode (§18.9) that is still running: unseen. 🔴 Don't import a record
+  whose end is in the future or within a few minutes of now.
+
+### 22.6 Capture checklist (open questions)
+
+- 🔴 Whether `03 01` on workout records ever frees strap storage, and how many records the strap keeps.
+- 🔴 The meaning of `2.13`, `7.4`, `11.x`, `21.x`, and the detail types `04`/`05`.
+- 🔴 A record for a workout OpenCircuit started in workout mode (§18.9): expected with the real sport
+  and `2.13` = 1, like the phone-started ones above. Confirm before relying on it for de-duplication.
+
 ## Changelog
 
 - 2026-09-30: first version (zepp-spec agent, #215 Phase 0). All claims 🟡/🔴.
@@ -2832,3 +2972,7 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   workouts (45 s) are not kept, 88 s and longer are. The app sends `03 04` only.
 - 2026-11-04: §18.9 racket start's last byte is the wrist (`01` left, `02` right); §19.5 Workout Detection
   on/off is arg `40` (`[]` off, `[df]` on) and sensitivity `42` confirmed (route 2 capture).
+- 2026-11-09: §22, the strap's own workout records (`0x05` summary, `0x06` detail, #226) from a route-2
+  capture of a Zepp sync: fetch walk, protobuf summary fields (start, duration, kcal, HR avg/max/min checked
+  against the Zepp app), TLV detail with 1 Hz heart rate, integrity rules; worked examples N and O. §6.5's
+  `0x05`/`0x06` row now points to §22.
