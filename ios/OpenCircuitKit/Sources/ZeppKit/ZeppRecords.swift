@@ -7,8 +7,9 @@
 
 import Foundation
 
-/// The history types this module parses. Workouts (`0x05`/`0x06`), statistics (`0x2c`) and debug
-/// logs (`0x07`) are out of scope for v1 (§6.5).
+/// The history types `ZeppHistoryFetch` fetches and this parser decodes. Statistics (`0x2c`) and debug
+/// logs (`0x07`) are out of scope for v1 (§6.5). The workout records (`0x05`/`0x06`, §22) are walked one
+/// record at a time by `ZeppWorkoutWalk` (`ZeppWorkoutFetchType`, `ZeppWorkoutRecords.swift`).
 public enum ZeppFetchType: UInt8, CaseIterable, Equatable {
     case activity = 0x01
     case manualHeartRate = 0x02
