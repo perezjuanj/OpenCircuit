@@ -369,6 +369,24 @@ final class StrapOwnWorkoutDedupTests: XCTestCase {
         XCTAssertFalse(inbox.items.contains { $0.start == at(-2 * 3600) }, "W's own strap record is offered for review")
         XCTAssertFalse(notified.contains(at(-2 * 3600)), "and announced as a new strap workout")
         XCTAssertEqual(inbox.items.map(\.start), [at(-6 * 3600)])
+        // N-3: with Health's cache empty, the judge alone keeps W out, from the app's own window list.
+        XCTAssertTrue(inbox.state.history.isEmpty)
+        XCTAssertEqual(inbox.judge(try Record.parsed(start: at(-2 * 3600), minutes: 45, sport: 0x34), timeline: strapTimeline,
+                                   owned: true, now: now), .drop(.inHistory))
+    }
+
+    // MARK: N-4: the ring's save writes its window to the manager's injected list
+
+    func testARingWorkoutsSaveWritesItsWindowToTheInjectedListNotTheStandardDefaults() {
+        let standardBefore = UserDefaults.standard.data(forKey: OwnWorkoutWindows.key)
+        let manager = WorkoutSessionManager()
+        manager.ownWindows = OwnWorkoutWindows(defaults)
+        let summary = WorkoutSummary(sport: .runningOutdoor, startDate: at(-3 * 3600), endDate: at(-2 * 3600), avgHR: nil,
+                                     maxHR: nil, estimatedActiveKcal: nil, zoneBreakdown: WorkoutZoneBreakdown(),
+                                     distanceMeters: nil, hasRoute: false, hrSampleCount: 0)
+        manager.noteOwnWorkout(summary)
+        XCTAssertEqual(OwnWorkoutWindows(defaults).windows, [DateInterval(start: at(-3 * 3600), end: at(-2 * 3600))])
+        XCTAssertEqual(UserDefaults.standard.data(forKey: OwnWorkoutWindows.key), standardBefore, "nothing in .standard")
     }
 
     /// Q1b: the first sync to see W's record runs while Health can't be read.

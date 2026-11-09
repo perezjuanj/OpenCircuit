@@ -4,13 +4,18 @@
 // The strap keeps its own record of every workout it measured, including the ones OpenCircuit started
 // in its workout mode (`ZEPP_PROTOCOL.md` §22). The strap's detected-workout inbox (`StrapDetectedWorkouts`)
 // must never offer that record back: saving it would put the same workout, heart rate and energy in
-// Apple Health twice. Reading Apple Health can't be what guarantees that (a locked phone, a failed
-// query, or no read access all return nothing), so every workout the app records adds its window here:
-//   • a strap workout at End (`StrapWorkoutRecorder.end`), before any deferred save (84j's indoor run
-//     can wait up to 10 min for its distance prompt);
-//   • a recovered strap workout, at its save (`StrapWorkoutRecorder.writeRecovered`);
-//   • a ring workout, when it is saved (`WorkoutSessionManager.writeWorkout`, the detected-bout import too);
+// Apple Health twice, and offering one the person cancelled or discarded would bring it back with a
+// notification. Reading Apple Health can't be what guarantees that (a locked phone, a failed query, or
+// no read access all return nothing), so this list does. Where windows are written:
+//   • a strap workout from the moment it STARTS (decision 91i; `StrapWorkoutRecorder.start`, once the
+//     start is in the journal), its end refreshed at each journal heartbeat (~10 s) and at every exit:
+//     End, Cancel, a new start parking an interrupted journal, and the recovery offer, Not now, Discard
+//     and Save. So a workout the process dies in is covered too, before any relaunch decision;
+//   • a ring workout, when it is saved (`WorkoutSessionManager.writeWorkout`, the detected-bout import
+//     too). A ring workout whose save never committed adds nothing: the ring keeps no record of its own
+//     for the strap's inbox to offer back;
 //   • a strap record saved from the inbox (`StrapDetectedWorkouts.save`).
+// A window is never removed: a Cancel or a recovery Discard throws the workout away, not the dedup.
 // The inbox treats a record overlapping any of them as already in the history.
 //
 // UserDefaults, not SwiftData, like `WorkoutTombstones`: a few dozen bytes per entry, no schema version.
@@ -39,12 +44,19 @@ struct OwnWorkoutWindows {
 
     var windows: [DateInterval] { entries.map { DateInterval(start: $0.start, end: max($0.start, $0.end)) } }
 
-    /// Remember that OpenCircuit recorded a workout over `[start, end]`; entries past `retention` go.
+    /// Remember that OpenCircuit recorded a workout over `[start, end]`. A window with the same start
+    /// is the same workout: its end only ever moves later (a heartbeat or an exit), never back, and no
+    /// call removes it. Entries past `retention` go.
     func record(start: Date, end: Date, now: Date = Date()) {
         let cutoff = now.addingTimeInterval(-Self.retention)
         var all = entries.filter { $0.end >= cutoff }
-        guard !all.contains(where: { $0.start == start && $0.end == end }) else { return }
-        all.append(Entry(start: start, end: max(start, end)))
+        let end = max(start, end)
+        if let i = all.firstIndex(where: { $0.start == start }) {
+            guard end > all[i].end else { return }
+            all[i] = Entry(start: start, end: end)
+        } else {
+            all.append(Entry(start: start, end: end))
+        }
         if let data = try? JSONEncoder().encode(all) { defaults.set(data, forKey: Self.key) }
     }
 }

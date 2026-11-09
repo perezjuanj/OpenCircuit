@@ -465,7 +465,8 @@ final class StrapWorkoutRecorder {
     @ObservationIgnored private let vo2: (any StrapVO2MaxProviding)?
     /// Workouts deleted from the history screen (#293): never offered back after a kill.
     @ObservationIgnored private let tombstones: WorkoutTombstones
-    /// Decision 91h: every workout recorded here, so the strap's inbox never offers its own record back.
+    /// Decisions 91h/91i: every workout recorded here, from its start, so the strap's inbox never offers
+    /// its own record back (see `OwnWorkoutWindows`).
     @ObservationIgnored private let ownWindows: OwnWorkoutWindows
     /// Heart rate recovery's Apple Health writes. nil: no recovery window (End as before #337).
     @ObservationIgnored private let recoveryHealth: (any HeartRateRecoveryHealthWriting)?
@@ -654,7 +655,14 @@ final class StrapWorkoutRecorder {
         // aside, never deleted; the next launch offers it again. A put-off offer's slot no longer points
         // at it once it is parked, so nothing may answer it in this process any more.
         if recoverable == nil { offer = nil }
-        if journal.loadJournal() != nil { journal.parkRunning() } else { journal.clearRunning() }
+        if let interrupted = journal.loadJournal() {
+            // 91i: the window of the workout set aside stays covered (its last heartbeat).
+            ownWindows.record(start: interrupted.ledger.start, end: interrupted.lastAliveAt, now: now)
+            journal.parkRunning()
+        } else {
+            journal.clearRunning()
+        }
+        // 91i: the window is written by the journal's first heartbeat, right after the start is in the journal.
         persistJournal(now: now)
         attach(session, now: now)
         if sport.isOutdoor {
@@ -911,7 +919,7 @@ final class StrapWorkoutRecorder {
             distanceMeters: hasRoute ? location.distanceMeters : nil, hasRoute: hasRoute,
             profile: profileSnapshot ?? profile(), zones: activeZones)
         let counted = StrapWorkoutSummaryBuilder.activeSamples(samples, ledger: ledger, end: end)
-        // Decision 91h: the workout is OpenCircuit's own from End, before any save (84j can defer it 10 min).
+        // Decision 91i: the window written at the start, refreshed to End (84j can defer the save 10 min).
         ownWindows.record(start: ledger.start, end: end, now: now)
         // Decision 84j: an indoor run or walk with steps waits for its distance prompt before the
         // `HKWorkout` is saved (answered, skipped, the summary dismissed, or 10 min after End). Every
@@ -1303,6 +1311,8 @@ final class StrapWorkoutRecorder {
         clearSteps()
         // 89f/89j: a discard ends the strap's workout exactly as End does (03 02 + 03 04); there is no other path.
         if let ledger { endWorkoutMode(activeSeconds: Self.seconds(ledger.activeSeconds(until: clock()))) }
+        // Decision 91i: the strap keeps its record of the discarded workout; its window stays (refreshed, never removed).
+        if let ledger { ownWindows.record(start: ledger.start, end: clock(), now: clock()) }
         clearWorkoutMode()
         attached?.stopWorkoutHeartRate()
         attached?.heartRateObserver = nil
@@ -1441,6 +1451,9 @@ final class StrapWorkoutRecorder {
                                                 distanceMeters: location.distanceMeters,
                                                 stepStreamOn: steps == nil ? nil : stepsStreaming,
                                                 workoutMode: ranWithWorkoutMode ? workoutModeExtras : nil))
+        // Decision 91i: written at the start (the first call), its end refreshed at every heartbeat, so even
+        // a process kill leaves a window over the workout for the strap's inbox.
+        ownWindows.record(start: ledger.start, end: now, now: now)
         recordWorkoutModeProgress(activeSeconds: Self.seconds(ledger.activeSeconds(until: now)))
     }
 
@@ -1477,6 +1490,7 @@ final class StrapWorkoutRecorder {
             case .offer(let recovered):
                 helioLog.notice("helio: offering an interrupted workout back")
                 found = RecoveryOffer(workout: recovered, slot: .running)
+                noteOwnWindow(recovered)
             }
         }
         if found == nil {
@@ -1488,6 +1502,7 @@ final class StrapWorkoutRecorder {
                 if case .offer(let recovered) = tombstones.filter(StrapWorkoutRecovery.decide(journal: first.journal, samples: first.samples, now: now)) {
                     helioLog.notice("helio: offering a postponed interrupted workout back")
                     found = RecoveryOffer(workout: recovered, slot: .parked(0))
+                    noteOwnWindow(recovered)
                     break
                 }
                 parked.removeFirst()
@@ -1497,6 +1512,11 @@ final class StrapWorkoutRecorder {
         if orphanStop.owed, let session = source(), session.ready { session.sendOwedOrphanStop() }
         if stepStreamFlag.owesOff, let session = source(), session.ready,
            let steps = session as? any StrapWorkoutStepSource { steps.sendOwedStepsOff() }
+    }
+
+    /// Decision 91i: an interrupted workout's window, refreshed at its offer and at each answer. Never removed.
+    private func noteOwnWindow(_ recovered: RecoveredStrapWorkout) {
+        ownWindows.record(start: recovered.ledger.start, end: recovered.end, now: clock())
     }
 
     /// Take the offer on screen (or put off by the alert's dismissal a moment ago) as answered.
@@ -1524,6 +1544,7 @@ final class StrapWorkoutRecorder {
     func takeRecoveredForSave() -> StrapWorkoutWrite? {
         guard let offer = takeOffer() else { return nil }
         let recovered = offer.workout
+        noteOwnWindow(recovered)
         let timeline = SyncDeviceID(rawValue: recovered.timelineRaw)
         let savedProfile = profile()
         let summary = StrapWorkoutSummaryBuilder.summarize(
@@ -1541,7 +1562,7 @@ final class StrapWorkoutRecorder {
 
     /// Save's async half: one `HKWorkout` over the recovered span, with its readings.
     func writeRecovered(_ write: StrapWorkoutWrite) async -> Bool {
-        // Decision 91h: OpenCircuit's own workout, as at End.
+        // Decision 91i: OpenCircuit's own workout (its window was written at its start and at its offer).
         ownWindows.record(start: write.summary.summary.startDate, end: write.summary.summary.endDate, now: clock())
         let saved = await health.save(write)
         helioLog.notice("helio: interrupted workout saved to Health \(saved, privacy: .public)")
@@ -1568,12 +1589,15 @@ final class StrapWorkoutRecorder {
 
     func discardRecovered() {
         guard let offer = takeOffer() else { return }
+        // Decision 91i: the workout is discarded, not its window (the strap still has its record).
+        noteOwnWindow(offer.workout)
         clear(offer.slot)
     }
 
     /// "Not now", and any dismissal of the alert: hidden now, asked again at the next launch. The offer
     /// stays answerable, so a Save or Discard of the same alert that SwiftUI runs after this still wins.
     func postponeRecovered() {
+        if let recovered = recoverable { noteOwnWindow(recovered) }   // 91i
         recoverable = nil
     }
 

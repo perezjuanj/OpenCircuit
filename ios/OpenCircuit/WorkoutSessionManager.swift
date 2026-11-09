@@ -147,6 +147,8 @@ final class WorkoutSessionManager: NSObject {
     /// Test seam: replaces `writeWorkout` for the deferred and recovered saves only (the save at End,
     /// every other sport's, never goes through it).
     var deferredWriteOverride: ((WorkoutSummary, [HRSample], [DateInterval], Double?, Bool) async -> Bool)?
+    /// Decision 91h: where a saved ring workout's window goes (`OwnWorkoutWindows`); tests inject a suite.
+    @ObservationIgnored var ownWindows = OwnWorkoutWindows()
     /// Called once a deferred save has finished (review-indoor-run-b S3): ContentView reloads the history.
     var onDeferredWorkoutSaved: (() -> Void)?
 
@@ -1229,6 +1231,12 @@ final class WorkoutSessionManager: NSObject {
 
     // MARK: - HealthKit write
 
+    /// Decision 91h: a committed ring workout's window, so the strap's detected-workout inbox never offers
+    /// it back. Called by `writeWorkout` once the workout is in Health.
+    func noteOwnWorkout(_ summary: WorkoutSummary) {
+        ownWindows.record(start: summary.startDate, end: summary.endDate)
+    }
+
     /// Write the completed workout to Apple Health. Best-effort: silent on auth/API failures.
     /// Writes HKWorkout, HR quantity samples, and optional HKWorkoutRoute.
     private func writeWorkout(
@@ -1364,8 +1372,7 @@ final class WorkoutSessionManager: NSObject {
             guard let finished = try await builder.finishWorkout() else { return false }
             workout = finished
         } catch { return false }
-        // Decision 91h: the strap's detected-workout inbox never offers this window back.
-        OwnWorkoutWindows().record(start: summary.startDate, end: summary.endDate)
+        noteOwnWorkout(summary)
 
         // Workout is now COMMITTED to Health — only NOW record its foot-based GPS distance so the
         // daily steps×stride distance + active-energy estimates net out exactly what was written
