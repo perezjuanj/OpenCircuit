@@ -65,6 +65,11 @@ struct HeartRateZonesSettingsView: View {
                      + "heart-rate readings with the zones you have set now. A maximum heart rate you set "
                      + "also replaces 220 minus your age in the calorie, strain and exercise-minute estimates.")
                     .font(.footnote).foregroundStyle(.secondary)
+                NavigationLink {
+                    HealthSourcesView(focus: .heartRate)
+                } label: {
+                    Label("Sources & methods", systemImage: "book.closed")
+                }
             }
         }
         .navigationTitle("Heart Rate Zones")

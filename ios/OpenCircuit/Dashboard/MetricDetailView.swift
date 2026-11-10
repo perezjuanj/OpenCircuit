@@ -168,8 +168,20 @@ struct MetricDetailView: View {
             Text(Self.what(tile.metric)).font(.footnote).foregroundStyle(.secondary)
             Text("Your usual range is the average of the earlier days in this window, widened by half their day-to-day spread (and never narrower than a small fixed margin). A value inside it counts as usual. It needs \(BaselineTrend.defaultMinBaselineDays) earlier days before it's shown. On-device estimate — not a medical device.")
                 .font(.caption).foregroundStyle(.tertiary)
+            HealthSourcesButton(topic: Self.sourceTopic(tile.metric))
         }
         .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// The Sources & methods topic behind each metric's numbers (and its usual-range comparison).
+    static func sourceTopic(_ m: TodayTile.Metric) -> HealthSourceTopic {
+        switch m {
+        case .hrv:                     return .hrv
+        case .restingHR:               return .restingHR
+        case .skinTemp:                return .skinTemperature
+        case .steps:                   return .activity
+        case .spo2, .respiratoryRate:  return .illness
+        }
     }
 
     /// What the metric's number is, in plain words. Internal so a test can hold it to the math.

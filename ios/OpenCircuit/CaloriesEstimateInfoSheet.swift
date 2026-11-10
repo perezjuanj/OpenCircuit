@@ -29,6 +29,13 @@ struct CaloriesEstimateInfoSheet: View {
                 Section {
                     ForEach(Self.bullets, id: \.self) { Text($0).font(.subheadline) }
                 }
+                Section {
+                    NavigationLink {
+                        HealthSourcesView(focus: .calories)
+                    } label: {
+                        Label("Sources & methods", systemImage: "book.closed")
+                    }
+                }
             }
             .navigationTitle("About These Estimates")
             .navigationBarTitleDisplayMode(.inline)

@@ -155,6 +155,13 @@ struct StrainInfoSheet: View {
                                        value: "\(reading.maxHR) bpm" + (ageIsDefault ? " (default age)" : ""))
                     }
                 }
+                Section {
+                    NavigationLink {
+                        HealthSourcesView(focus: .strain)
+                    } label: {
+                        Label("Sources & methods", systemImage: "book.closed")
+                    }
+                }
             }
             .navigationTitle("About Strain")
             .navigationBarTitleDisplayMode(.inline)
