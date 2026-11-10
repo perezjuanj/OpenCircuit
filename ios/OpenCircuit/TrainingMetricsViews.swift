@@ -34,6 +34,8 @@ struct WorkoutTrainingMetricsSection: View {
                 Divider()
                 vo2Row(vo2Outcome ?? .skipped(.noStepData))
             }
+            HealthSourcesButton(topic: summary.sport == .runningOutdoor || summary.sport == .runningIndoor
+                                ? .vo2Max : .strain)
         }
     }
 

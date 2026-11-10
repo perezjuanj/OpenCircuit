@@ -509,6 +509,7 @@ struct UserProfileSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Text(Self.medicalDisclaimer)
                     .font(.caption2).foregroundStyle(.secondary)
+                HealthSourcesButton(topic: .illness)
             }
             .task {
             await refreshNotifAuthState()
@@ -662,6 +663,11 @@ struct UserProfileSettingsView: View {
             Section("About") {
                 LabeledContent("App", value: "OpenCircuit")
                 LabeledContent("Version", value: appVersion)
+                NavigationLink {
+                    HealthSourcesView()
+                } label: {
+                    Label("Sources & methods", systemImage: "book.closed")
+                }
                 Button {
                     showOnboarding = true
                 } label: {

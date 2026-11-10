@@ -173,6 +173,7 @@ struct CycleCalendarView: View {
                 predictionSection
                 loggedPeriodsSection
                 disclaimerFooter
+                HealthSourcesButton(topic: .cycle)
             }
             .padding()
         }

@@ -125,6 +125,7 @@ private struct HeadacheSignalsBody: View {
 
             Section {
                 HeadacheImportControl()
+                HealthSourcesButton(topic: .headache)
             } header: {
                 Text("Apple Health")
             } footer: {

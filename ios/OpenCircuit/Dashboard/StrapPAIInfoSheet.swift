@@ -24,6 +24,13 @@ struct StrapPAIInfoSheet: View {
                 Section {
                     ForEach(Self.bullets, id: \.self) { Text($0).font(.subheadline) }
                 }
+                Section {
+                    NavigationLink {
+                        HealthSourcesView(focus: .pai)
+                    } label: {
+                        Label("Sources & methods", systemImage: "book.closed")
+                    }
+                }
             }
             .navigationTitle("About PAI")
             .navigationBarTitleDisplayMode(.inline)

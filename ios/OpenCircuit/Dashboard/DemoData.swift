@@ -227,7 +227,8 @@ enum DemoData {
 import CoreLocation
 import SwiftUI
 
-/// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR`
+/// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR |
+/// sources | sources-<topic>`
 /// presents that screen full-screen on launch, so a screenshot run can reach it without UI
 /// automation. `liveHR` renders the live-measure card's composition over a SYNTHETIC buffer — a
 /// simulator has no ring to measure.
@@ -264,6 +265,10 @@ struct DemoScreenModifier: ViewModifier {
             SleepNightsBrowserView()
         } else if id == "workout-detail" {
             DemoWorkoutDetail.view
+        } else if id == "sources" {
+            HealthSourcesView()
+        } else if id.hasPrefix("sources-"), let t = HealthSourceTopic(rawValue: String(id.dropFirst(8))) {
+            HealthSourcesView(focus: t)
         } else {
             DemoLiveCard()
         }

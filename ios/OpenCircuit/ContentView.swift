@@ -574,6 +574,9 @@ struct ContentView: View {
                     sectionView(section)
                 }
                 .onMove(perform: moveSection)
+                // Where every number on this tab comes from (App Review 1.4.1): one tap from Today.
+                HealthSourcesButton(title: "How these numbers are worked out: sources & methods")
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
@@ -823,6 +826,20 @@ struct ContentView: View {
                                 Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
                             }
                             Text("Sync history and Apple Health activity")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    // Where every health number comes from (App Review 1.4.1), one tap from Profile.
+                    DetailLink { HealthSourcesView() } label: {
+                        card {
+                            HStack(spacing: 8) {
+                                Image(systemName: "book.closed.fill").foregroundStyle(Theme.accent)
+                                Text("SOURCES & METHODS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                            }
+                            Text("How each health number is worked out, with links to the published research")
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                     }
