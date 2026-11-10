@@ -47,6 +47,34 @@ public final class FakeZeppDevice {
     /// responding in the middle of a fetch.
     public var unansweredAckTypes: Set<ZeppFetchType> = []
 
+    // The strap's own workout records (§22.1). A `01 05` / `01 06` start is answered with the first
+    // record whose start is at or after the *since* (decoded here, seconds included), or a zero-length
+    // reply with an all-zero start when there is none.
+    public struct WorkoutRecord: Equatable {
+        public var start: UInt32
+        public var summary: [UInt8]
+        /// nil = the strap has no detail for this record (a zero-length detail reply).
+        public var detail: [UInt8]?
+        public init(start: UInt32, summary: [UInt8], detail: [UInt8]?) {
+            self.start = start
+            self.summary = summary
+            self.detail = detail
+        }
+    }
+    public struct WorkoutRound: Hashable {
+        public var type: UInt8
+        public var start: UInt32
+        public init(type: UInt8, start: UInt32) {
+            self.type = type
+            self.start = start
+        }
+    }
+    public var workoutRecords: [WorkoutRecord] = []
+    /// Workout rounds whose transfer-done CRC is flipped.
+    public var corruptWorkoutRounds: Set<WorkoutRound> = []
+    /// Every workout round the strap sent data for, in order.
+    public private(set) var workoutRoundsServed: [WorkoutRound] = []
+
     // Device controls (§11–§13). Only reachable when a test lists their endpoints in `services`.
     /// The find-device capabilities reply (§11.2); nil = the strap never answers `01`.
     public var findCapabilitiesReply: [UInt8]? = hex("02 01 02")
@@ -118,6 +146,7 @@ public final class FakeZeppDevice {
     private var outgoingHandle: UInt8 = 0
     private var inbox: (endpoint: UInt16, handle: UInt8, encrypted: Bool, declared: Int, body: [UInt8], next: Int)?
     private var currentFetch: ZeppFetchType?
+    private var currentWorkout: (round: WorkoutRound, data: [UInt8])?
 
     public init(authKey: [UInt8], privateKey: [UInt8], random: [UInt8], writeLength: Int = 20) {
         self.authKey = authKey
@@ -392,6 +421,7 @@ public final class FakeZeppDevice {
         switch c.first {
         case 0x01:
             fetchStarts.append(c)
+            if c.count == 10, c[1] == 0x05 || c[1] == 0x06 { return workoutStart(c) }
             guard c.count == 10, let type = ZeppFetchType(rawValue: c[1]) else { return [control([0x10, 0x01, 0x02])] }
             if refuseTypes.contains(type) { return [control([0x10, 0x01, 0x04])] }
             currentFetch = type
@@ -402,6 +432,10 @@ public final class FakeZeppDevice {
             let trailer: [UInt8] = startReplyTrailingZero ? [0x00] : []
             return [control([0x10, 0x01, 0x01] + le32(UInt32(length)) + entry.start + trailer)]
         case 0x02:
+            if let workout = currentWorkout {
+                workoutRoundsServed.append(workout.round)
+                return dataPackets(workout.data, corrupt: corruptWorkoutRounds.contains(workout.round))
+            }
             guard let type = currentFetch else { return [] }
             let data = fetchData[type]?.data ?? []
             var out = [Notification]()
@@ -426,11 +460,71 @@ public final class FakeZeppDevice {
             fetchAcks.append(c[1])
             let acked = currentFetch
             currentFetch = nil
+            currentWorkout = nil
             if let acked, unansweredAckTypes.contains(acked) { return [] }
             return [control([0x10, 0x03, 0x01])]
         default:
             return []
         }
+    }
+}
+
+// MARK: - Workout records (§22.1)
+
+extension FakeZeppDevice {
+    private func workoutStart(_ c: [UInt8]) -> [Notification] {
+        func control(_ bytes: [UInt8]) -> Notification { Notification(characteristic: .activityControl, bytes: bytes) }
+        let trailer: [UInt8] = startReplyTrailingZero ? [0x00] : []
+        guard let since = Self.decodeSince(Array(c[2..<10])) else { return [control([0x10, 0x01, 0x02])] }
+        let offset = Int8(bitPattern: c[9])
+        guard let record = workoutRecords.filter({ Int64($0.start) >= since }).min(by: { $0.start < $1.start }) else {
+            currentWorkout = nil
+            return [control([0x10, 0x01, 0x01, 0, 0, 0, 0] + [UInt8](repeating: 0, count: 8) + trailer)]
+        }
+        let data = c[1] == 0x05 ? record.summary : (record.detail ?? [])
+        currentWorkout = data.isEmpty ? nil : (WorkoutRound(type: c[1], start: record.start), data)
+        return [control([0x10, 0x01, 0x01] + le32(UInt32(data.count)) + Self.encodeStart(record.start, offset: offset) + trailer)]
+    }
+
+    /// The data packets and transfer done of one round, as `fetchControl`'s `02` sends them.
+    fileprivate func dataPackets(_ data: [UInt8], corrupt: Bool) -> [Notification] {
+        var out = [Notification]()
+        var counter: UInt8 = 0
+        var offset = 0
+        while offset < data.count {
+            let take = min(dataPacketLength - 1, data.count - offset)
+            out.append(Notification(characteristic: .activityData, bytes: [counter] + data[offset..<(offset + take)]))
+            counter &+= 1
+            offset += take
+        }
+        var crc = ZeppCRC32.checksum(data)
+        if corrupt || corruptCRC { crc ^= 1 }
+        out.append(Notification(characteristic: .activityControl, bytes: [0x10, 0x02, 0x01] + (includeCRC ? le32(crc) : [])))
+        return out
+    }
+
+    /// The 8-byte *since* (§6.2) as Unix seconds: local fields minus the quarter-hour offset. Written here,
+    /// not through ZeppKit's decoder, so the walk's encoding is checked against the spec.
+    static func decodeSince(_ b: [UInt8]) -> Int64? {
+        guard b.count == 8 else { return nil }
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let year = Int(b[0]) | Int(b[1]) << 8
+        let components = DateComponents(year: year, month: Int(b[2]), day: Int(b[3]),
+                                        hour: Int(b[4]), minute: Int(b[5]), second: Int(b[6]))
+        guard (1...12).contains(b[2]), (1...31).contains(b[3]), b[4] < 24, b[5] < 60, b[6] < 60,
+              let local = utc.date(from: components) else { return nil }
+        return Int64(local.timeIntervalSince1970) - Int64(Int8(bitPattern: b[7])) * 900
+    }
+
+    static func encodeStart(_ unix: UInt32, offset: Int8) -> [UInt8] {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let local = Date(timeIntervalSince1970: TimeInterval(Int64(unix) + Int64(offset) * 900))
+        let c = utc.dateComponents([.year, .month, .day, .hour, .minute, .second], from: local)
+        let year = UInt16(c.year ?? 0)
+        return le16(year) + [UInt8(c.month ?? 0), UInt8(c.day ?? 0), UInt8(c.hour ?? 0), UInt8(c.minute ?? 0),
+                             UInt8(c.second ?? 0), UInt8(bitPattern: offset)]
     }
 }
 

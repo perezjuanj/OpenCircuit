@@ -99,6 +99,14 @@ public struct ZeppWorkoutSport: Equatable, Hashable, Sendable {
         case .walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .hiking: return nil
         }
     }
+
+    /// The table above read backwards, for a workout record's sport (`3.1`, §22.2; decision 91d): the
+    /// sport whose strap code is `code`, else `.other`. The auto-detected `df` has no sport of its own,
+    /// so it is `.other` too, and so is every code the table doesn't list.
+    public static func sport(forCode code: UInt64?) -> WorkoutSportType {
+        guard let code, code <= UInt64(UInt8.max) else { return .other }
+        return WorkoutSportType.allCases.first { forSport($0)?.code == UInt8(code) } ?? .other
+    }
 }
 
 // MARK: - Phone → strap
