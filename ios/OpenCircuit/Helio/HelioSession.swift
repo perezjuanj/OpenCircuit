@@ -87,6 +87,11 @@ enum HelioSessionEvent: Equatable {
     /// An outcome of the strap's workout mode (decision 89c, 89f): control bytes and outcome words only,
     /// never a value, for the breadcrumb.
     case workoutMode(String)
+    /// The strap accepted the key (`10 05 01`).
+    case authenticated
+    /// The strap answered `10 05 25` on a session that passes a wrong key on (`passesWrongKeyOn`,
+    /// #372): this strap isn't the key's strap, and the key was NOT marked rejected.
+    case keyRefusedByStrap
 }
 
 /// What one connection's realtime step stream did (decision 84c): counts only, so a diagnostics bundle
@@ -355,6 +360,12 @@ final class HelioSession: WearableSession {
     /// The sync whose body-alert pass was claimed (`StrapSyncAlertPass`, review-236 S1). On the session,
     /// so a new session (a reconnect) starts unclaimed (review-225f SF-1).
     @ObservationIgnored var alertPassClaimedSync: Int?
+    /// #372: every Helio Strap advertises the same name, so a foreground connect can reach someone
+    /// else's strap. Set by `HelioConnection` for a connect made with the app in front: a `10 05 25`
+    /// then means "not this key's strap", so the key is not marked rejected, nothing else is started,
+    /// and `.keyRefusedByStrap` lets the connection look for another strap. Off (decision 7 unchanged)
+    /// for every background path, which can't search.
+    @ObservationIgnored var passesWrongKeyOn = false
     /// Set by a background run while it owns this connection's syncs (`HelioSyncResult.endedInBackgroundRun`).
     @ObservationIgnored var backgroundRunOwnsSyncs = false {
         // Decision 91h (B2): a run that adopts this session mid-walk stops the walk at once.
@@ -880,7 +891,15 @@ final class HelioSession: WearableSession {
                     chunkedWriteSubscribed = false
                     transport?.setNotify(.chunkedWrite, enabled: false)
                 }
+                onEvent(.authenticated)
                 beginSetup()
+            case .authenticationFailed(.wrongAuthKey) where passesWrongKeyOn:
+                // #372: maybe another strap nearby, not a bad key. Nothing is retried here, and Tier 0
+                // isn't started: the connection drops this link and searches for the key's strap.
+                authDeadline = nil
+                link = nil
+                helioLog.error("helio: auth failed (10 05 25); this strap isn't the key's, looking for another")
+                onEvent(.keyRefusedByStrap)
             case .authenticationFailed(.wrongAuthKey):
                 // Decision 7: "key rejected", never a retry loop. The mark stays until the key changes.
                 keyStore?.markRejected()
