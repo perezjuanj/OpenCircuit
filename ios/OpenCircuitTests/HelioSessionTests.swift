@@ -414,6 +414,57 @@ final class HelioSessionTests: XCTestCase {
         XCTAssertFalse(keys.isRejected)
     }
 
+    // MARK: #372 another strap nearby: a foreground connect passes a wrong key on
+
+    /// A session made for a foreground connect, started and drained.
+    private func foregroundSession(_ device: FakeZeppDevice, keys: MemoryKeyStore,
+                                   events: @escaping (HelioSessionEvent) -> Void) -> (HelioSession, FakeStrapTransport) {
+        let transport = FakeStrapTransport(device: device)
+        let session = HelioSession(transport: transport, identityID: strapID, key: keys.load(), keyStore: keys,
+                                   sink: nil, findState: HelioFindState(), onEvent: events,
+                                   clock: { [unowned self] in self.clock }, autoTick: false, autoSyncOnConnect: false)
+        session.passesWrongKeyOn = true
+        transport.session = session
+        session.start()
+        transport.drain()
+        return (session, transport)
+    }
+
+    func testAForegroundConnectToAnotherStrapLeavesTheKeyUnrejected() {
+        let someoneElses = makeStrap(authKey: "ffeeddccbbaa99887766554433221100")
+        let keys = MemoryKeyStore(keyHex)
+        var events: [HelioSessionEvent] = []
+        let (session, transport) = foregroundSession(someoneElses, keys: keys) { events.append($0) }
+        XCTAssertFalse(keys.isRejected, "a refusal by some strap is not proof the key is wrong")
+        XCTAssertEqual(events.filter { $0 == .keyRefusedByStrap }.count, 1)
+        XCTAssertFalse(events.contains(.authenticated))
+        XCTAssertFalse(someoneElses.authenticated)
+        XCTAssertFalse(transport.notifyChanges.contains { $0 == (.heartRateMeasurement, true) },
+                       "nothing else starts on a link the connection is about to drop")
+        let authMessages = someoneElses.receivedEndpoints.filter { $0 == 0x0082 }.count
+        XCTAssertEqual(authMessages, 2, "one 04 and one 05")
+
+        // Time passes: no retry and no busy verdict on this connection.
+        clock = clock.addingTimeInterval(HelioSession.authTimeout + 3600)
+        session.tick(now: clock)
+        transport.drain()
+        XCTAssertEqual(someoneElses.receivedEndpoints.filter { $0 == 0x0082 }.count, authMessages)
+        XCTAssertNotEqual(session.phase, .strapBusy)
+        XCTAssertNotEqual(session.phase, .keyRejected)
+    }
+
+    func testTheKeysOwnStrapAuthenticatesAndSaysSo() {
+        let own = makeStrap()
+        let keys = MemoryKeyStore(keyHex)
+        var events: [HelioSessionEvent] = []
+        let (session, _) = foregroundSession(own, keys: keys) { events.append($0) }
+        XCTAssertTrue(own.authenticated)
+        XCTAssertEqual(events.filter { $0 == .authenticated }.count, 1)
+        XCTAssertFalse(events.contains(.keyRefusedByStrap))
+        XCTAssertNotEqual(session.phase, .keyRejected)
+        XCTAssertFalse(keys.isRejected)
+    }
+
     func testAStrapThatNeverAnswersIsReportedBusy() throws {
         let device = makeStrap()
         let transport = FakeStrapTransport(device: device)
@@ -709,7 +760,10 @@ final class HelioSessionTests: XCTestCase {
     func testTheStrapsOwnMessagesAreReportedWithTheirOpcodeOnlyAndRepliesAreNot() async throws {
         let store = try makeStore()
         var events: [HelioSessionEvent] = []
-        let rig = connect(makeStrap(), store: store, onEvent: { events.append($0) })
+        // `.authenticated` is the link's own milestone (#372), not the strap talking: counted apart.
+        var authenticated = 0
+        let rig = connect(makeStrap(), store: store, onEvent: { if $0 == .authenticated { authenticated += 1 } else { events.append($0) } })
+        XCTAssertEqual(authenticated, 1)
         XCTAssertEqual(rig.session.phase, .ready)
         XCTAssertEqual(events, [.syncStarted], "setup, fetch and battery replies are not the strap talking on its own")
         events = []
@@ -735,7 +789,10 @@ final class HelioSessionTests: XCTestCase {
     /// nothing asked for is (without its bytes), and the stream this app starts is not.
     func testRepliesAndTheAppsOwnHeartRateStreamAreNotReported() async throws {
         var events: [HelioSessionEvent] = []
-        let rig = connect(makeStrap(), store: nil, autoSync: false, onEvent: { events.append($0) })
+        var authenticated = 0
+        let rig = connect(makeStrap(), store: nil, autoSync: false,
+                          onEvent: { if $0 == .authenticated { authenticated += 1 } else { events.append($0) } })
+        XCTAssertEqual(authenticated, 1)
         XCTAssertEqual(rig.session.phase, .ready)
         let device = rig.transport.device
         rig.transport.push(device.unsolicited(endpoint: 0x0029, [0x04, 0x00, 0x57]))

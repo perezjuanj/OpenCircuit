@@ -95,6 +95,8 @@ final class HelioConnection: NSObject {
     @ObservationIgnored private var idleTraffic = HelioIdleTrafficGate()
     /// Review-225e SF-1: the activation sync's throttle (`HelioActivationSync`).
     @ObservationIgnored private var activationSync = HelioActivationSync()
+    /// #372: straps that refused the key in this foreground connect (`HelioStrapSearch`).
+    @ObservationIgnored private(set) var strapSearch = HelioStrapSearch()
 
     private enum PendingAction { case scan, reconnect, resumeRestored }
 
@@ -150,6 +152,7 @@ final class HelioConnection: NSObject {
     /// Connect: to the saved strap by identifier, else by a foreground search.
     func connect() {
         endedBusyAt = nil
+        strapSearch.reset()
         wantConnection = true
         if Self.hasSavedStrap, reconnectKnown() { return }
         scan()
@@ -173,7 +176,7 @@ final class HelioConnection: NSObject {
             try? await Task.sleep(for: .seconds(Self.scanTimeout))
             guard let self, !Task.isCancelled, self.state == .searching else { return }
             self.central?.stopScan()
-            self.state = .notFound
+            self.searchRanOut()
         }
     }
 
@@ -184,6 +187,8 @@ final class HelioConnection: NSObject {
         guard ActiveDeviceChoiceStore.persisted() == .helioStrap,
               let id = Self.savedPeripheralID, let uuid = UUID(uuidString: id) else { return false }
         if state == .connecting || (state == .connected && session != nil) { return true }
+        // #372: a search past a refusing strap is running; the saved strap is the one that refused.
+        if state == .searching && strapSearch.isPassingOver { return true }
         if state == .connected, let peripheral, peripheral.state == .connected, central?.state == .poweredOn {
             // Linked but no session (a discovery that never finished): discover again.
             characteristics = [:]
@@ -247,6 +252,7 @@ final class HelioConnection: NSObject {
     /// Forget the strap on this phone (its stored history stays).
     func forgetStrap() {
         disconnect()
+        strapSearch.reset()
         peripheral = nil
         // Its timeline is retired: nothing will flush it again, so its workout exclusions go too
         // (review-238b N-1). Its stored rows stay, as every other forget leaves them.
@@ -258,6 +264,7 @@ final class HelioConnection: NSObject {
     func reconnectNow() {
         let wasFinding = session?.isFinding == true || session?.syncing == true
         disconnect()
+        strapSearch.reset()
         let reopen = { [weak self] in
             guard let self else { return }
             // A saved strap the system no longer knows falls back to a search.
@@ -273,6 +280,62 @@ final class HelioConnection: NSObject {
         } else {
             reopen()
         }
+    }
+
+    // MARK: Another strap nearby (#372)
+
+    /// The strap on this link refused the key in a foreground connect: drop it, skip it, and search
+    /// for the key's own strap. Deferred one turn: this runs from inside the session's event handling.
+    private func passOverRefusingStrap() {
+        guard let refusing = peripheral else { return }
+        strapSearch.refusedBy(refusing.identifier)
+        helioLog.notice("helio: this strap refused the key; searching for another (\(self.strapSearch.refused.count, privacy: .public) passed over)")
+        Task { @MainActor [weak self] in
+            guard let self, self.peripheral === refusing else { return }
+            self.disconnect()
+            // Detached first, so the refusing strap's disconnect callback can't re-arm a connect to it.
+            self.peripheral = nil
+            self.scan()
+        }
+    }
+
+    /// A search timed out. Nothing refused: "not found", as before. Only refusing straps nearby: the
+    /// key really is wrong for all of them, so decision 7's end state: the key is marked rejected and
+    /// the app goes back to the first refusing strap (standard heart rate only).
+    private func searchRanOut() {
+        guard let first = strapSearch.ranOut() else {
+            state = .notFound
+            return
+        }
+        keyStore.markRejected()
+        helioLog.notice("helio: no strap nearby accepted the key; key marked rejected")
+        guard central?.state == .poweredOn,
+              let known = central?.retrievePeripherals(withIdentifiers: [first]).first else {
+            state = .notFound
+            return
+        }
+        wantConnection = true
+        adopt(known)
+        state = .connecting
+        central?.connect(known, options: nil)
+    }
+
+    /// The strap on this link accepted the key. Reached while passing others over, it is saved now
+    /// (it wasn't at link-up), and the previous strap's timeline is retired as for any strap change.
+    private func keyAccepted() {
+        guard strapSearch.isPassingOver, let peripheral else { return }
+        strapSearch.reset()
+        saveStrap(peripheral)
+        helioLog.notice("helio: another strap accepted the key; saved it")
+    }
+
+    /// Save `peripheral` as the strap. A different strap (or the same one re-added, which gets a new
+    /// identity): the old timeline is retired, so its workout exclusions go (review-238b N-1).
+    private func saveStrap(_ peripheral: CBPeripheral) {
+        if let previous = Self.savedTimeline, previous != peripheral.strapTimeline {
+            StrapWorkoutHealthExclusions.retire(timeline: previous)
+        }
+        UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: Self.savedPeripheralKey)
     }
 
     // MARK: RSSI (Find My Strap's distance hint)
@@ -339,6 +402,8 @@ final class HelioConnection: NSObject {
             workoutModeOwner: { StrapWorkoutRecorder.workoutModeOwner })
         session.backgroundRunOwnsSyncs = backgroundRunAdoptsNewSessions
         session.appInBackground = !Self.appIsActive
+        session.passesWrongKeyOn = HelioStrapSearch.passesWrongKeyOn(
+            appIsActive: Self.appIsActive, backgroundRunActive: backgroundRunAdoptsNewSessions || activeBackgroundRuns > 0)
         made.session = session
         self.session = session
         // Shortcuts' wake alarm (#260, decision 52b): a request saved while the strap was away is
@@ -597,6 +662,10 @@ extension HelioConnection {
             breadcrumbs.stepStream(report)
         case .workoutMode(let line):
             breadcrumbs.workoutMode(line)
+        case .authenticated:
+            keyAccepted()
+        case .keyRefusedByStrap:
+            passOverRefusingStrap()
         }
     }
 
@@ -824,6 +893,8 @@ extension HelioConnection: CBCentralManagerDelegate {
             let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? ""
             // §14 device gate: the Helio Strap only (the Helio Ring shares the protocol, untested).
             guard ZeppDeviceModel.match(advertisedName: name) == .helioStrap else { return }
+            // #372: a strap that already refused the key in this connect is someone else's.
+            guard !strapSearch.skips(peripheral.identifier) else { return }
             scanTimeoutTask?.cancel()
             central.stopScan()
             adopt(peripheral)
@@ -840,12 +911,9 @@ extension HelioConnection: CBCentralManagerDelegate {
             linkUpAt = Date()
             breadcrumbs.linkUp(restoredThisLaunch ? "connected after a restoration relaunch" : "connected",
                                appActive: Self.appIsActive)
-            // A different strap (or the same one re-added, which gets a new identity): the old
-            // timeline is retired, so its workout exclusions go (review-238b N-1).
-            if let previous = Self.savedTimeline, previous != peripheral.strapTimeline {
-                StrapWorkoutHealthExclusions.retire(timeline: previous)
-            }
-            UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: Self.savedPeripheralKey)
+            // #372: a strap reached while passing a refusing one over is saved only once it accepts
+            // the key (`keyAccepted`); every other link saves its strap now, as before.
+            if !strapSearch.isPassingOver { saveStrap(peripheral) }
             characteristics = [:]
             peripheral.discoverServices(nil)
             linkCameBackInBackground()
