@@ -159,30 +159,36 @@ struct SplitTab<Primary: View, EmptyDetail: View>: View {
     }
 }
 
-// MARK: - Viewport pin (compact only)
+// MARK: - Viewport-pinned scroll view (compact only)
 
-private struct PinnedToViewportWhenCompact: ViewModifier {
+/// A vertical `ScrollView` whose content is pinned to exactly the scroll view's own width, so
+/// fractional-point rounding can never let it pan SIDEWAYS. Measured on device (iPhone 15 Pro,
+/// 393pt): the NavigationStack is 393.00, the ScrollView 393.33 and the content 393.67 — SwiftUI
+/// rounds a fractional row width UP to the 1/3pt pixel grid, one step per nesting level, and two
+/// physical pixels is enough for UIScrollView to allow a horizontal drag that rubber-banding turns
+/// into ~77pt (the Sleep tab, commit 87d2911). No subview is over-wide, so there is nothing to
+/// narrow; the content simply has to be told it is exactly viewport-width.
+///
+/// The width is MEASURED from the scroll view, not taken from `containerRelativeFrame`: on iOS 27
+/// that frame kept the portrait width after the phone turned, so the Sleep tab stayed a narrow
+/// column in landscape while every other tab filled the screen. A measured width follows rotation,
+/// Split View and fold changes. Skipped in a wide split-view column, which proposes the right width
+/// already.
+struct ViewportPinnedScrollView<Content: View>: View {
     @Environment(\.isWideSplit) private var isWide
+    @State private var viewportWidth: CGFloat = 0
+    private let content: Content
 
-    func body(content: Content) -> some View {
-        if isWide {
-            // Wide: this view lives in a split-view column. `containerRelativeFrame` would size it
-            // against the WHOLE window instead of the column, so a detail pane overran its column
-            // and was clipped (the Sleep tab on an unfolded foldable / iPad). The column already
-            // proposes the right width.
-            content
-        } else {
-            content.containerRelativeFrame(.horizontal)
-        }
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
     }
-}
 
-extension View {
-    /// Pins a vertical `ScrollView`'s content to exactly the viewport width, so fractional-point
-    /// rounding can never let it pan sideways (see the Sleep tab, commit 87d2911). Compact width
-    /// only: in a wide split-view column the pin is skipped, because it resolves against the window.
-    func pinnedToViewportWhenCompact() -> some View {
-        modifier(PinnedToViewportWhenCompact())
+    var body: some View {
+        ScrollView {
+            content.frame(width: !isWide && viewportWidth > 0 ? viewportWidth : nil)
+        }
+        .frame(maxWidth: .infinity)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewportWidth = $0 }
     }
 }
 

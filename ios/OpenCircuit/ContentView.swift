@@ -226,6 +226,17 @@ struct ContentView: View {
                                        "trends": .trends, "profile": .profile]
             if let tab = tabs[raw] { selectedTab = tab }
         }
+        .task {
+            // `-OCDemoRotate landscape|portrait`: a few seconds after launch, rotate the scene the way
+            // turning the phone does, so a layout that only breaks on rotation (not on a landscape
+            // launch) can be screenshotted without UI automation. Simulator + DEBUG only.
+            guard DemoData.isRequested, let raw = UserDefaults.standard.string(forKey: "OCDemoRotate"),
+                  let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
+            else { return }
+            try? await Task.sleep(for: .seconds(6))
+            let mask: UIInterfaceOrientationMask = raw == "portrait" ? .portrait : .landscapeRight
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
+        }
 #endif
             // Shared trends cache: load once, then refresh on foreground return and after each sync.
             // Every hook goes through `TrendsRefreshPolicy` — at a cold launch `.task` and
@@ -615,7 +626,7 @@ struct ContentView: View {
     /// Sleep Focus setup shortcut.
     private var sleepTab: some View {
         SplitTab {
-            ScrollView {
+            ViewportPinnedScrollView {
                 VStack(spacing: Theme.sectionSpacing) {
                     let sleepHours = heroPoints { $0.sleepMinutes.map { Double($0) / 60.0 } }
                     if sleepHours.count >= 2, let last = sleepHours.last {
@@ -673,16 +684,6 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                 }
                 .padding()
-                // Pin the content to the scroll view's own width so a vertical ScrollView can never
-                // pan SIDEWAYS. Measured on device (iPhone 15 Pro, 393pt): the NavigationStack is
-                // 393.00, the ScrollView 393.33 and this content 393.67 — SwiftUI rounds a fractional
-                // row width UP to the 1/3pt pixel grid, and the rounding compounds one step per
-                // nesting level. Two thirds of a point is two physical pixels, and that is enough for
-                // UIScrollView to allow horizontal dragging, which rubber-banding then amplifies into
-                // a ~77pt drag. No subview is actually over-wide — every row measured at or under its
-                // 329.33pt proposal (widest: 329.33 `hints`, 308.00 `stageLegend`) — so there is
-                // nothing to narrow; the content simply has to be told it is exactly viewport-width.
-                .pinnedToViewportWhenCompact()
             }
             .background(Theme.pageBackground)
             .navigationTitle("Sleep")
