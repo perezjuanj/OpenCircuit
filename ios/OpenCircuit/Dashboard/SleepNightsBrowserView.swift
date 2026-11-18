@@ -40,7 +40,7 @@ struct SleepNightsBrowserView: View {
     }
 
     var body: some View {
-        ScrollView {
+        ViewportPinnedScrollView {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 if usable.isEmpty {
                     OCCard {
@@ -63,7 +63,6 @@ struct SleepNightsBrowserView: View {
                 }
             }
             .padding(16)
-            .pinnedToViewportWhenCompact()
         }
         .background(Theme.pageBackground)
         .navigationTitle("Past Nights")
