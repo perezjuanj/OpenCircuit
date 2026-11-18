@@ -130,11 +130,13 @@ struct VitalsStatusCardView: View {
             let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
             let fbSkinTempOffsetC = healthBaselineReport?.skinTempOffsetC
             report = await Task.detached {
-                let own = Self.ownSamples([history.heartRate, history.spo2, history.hrv], log: log)
+                let own = Self.ownSamples([history.heartRate, history.spo2, history.hrv,
+                                           history.restingHeartRate], log: log)
                 let hr = own[0].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+                let reported = own[3].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
                 let spo2 = own[1].map { (start: $0.start, value: $0.value) }
                 let hrv = own[2].map { (start: $0.start, value: $0.value) }
-                return Self.computeReport(hr: hr, spo2: spo2, hrv: hrv, nights: nights,
+                return Self.computeReport(hr: hr, restingReported: reported, spo2: spo2, hrv: hrv, nights: nights,
                                           fallbackRestingHR: fbRestingHR, fallbackSpO2: fbSpO2,
                                           fallbackHRV: fbHRV, fallbackSkinTempOffsetC: fbSkinTempOffsetC)
             }.value
@@ -195,6 +197,7 @@ struct VitalsStatusCardView: View {
     /// callers below pass the exact same rows, just pre-snapshotted to value tuples on the main actor.
     nonisolated static func computeReport(
         hr: [HRSample],
+        restingReported: [HRSample] = [],
         spo2: [(start: Date, value: Double)],
         hrv: [(start: Date, value: Double)],
         nights: [(night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date)],
@@ -205,7 +208,7 @@ struct VitalsStatusCardView: View {
     ) -> VitalsBaseline.Report? {
         let config = VitalsBaseline.Config()
         var inputs: [VitalsBaseline.VitalInput] = []
-        if let i = vitalInput(.restingHR, localDays: restingHRDaily(hr),
+        if let i = vitalInput(.restingHR, localDays: restingHRDaily(hr, reported: restingReported),
                               fallback: fallbackRestingHR,
                               config: config) { inputs.append(i) }
         if let i = vitalInput(.overnightSpO2, localDays: dailyMeans(spo2, scale: 100),
@@ -258,8 +261,11 @@ struct VitalsStatusCardView: View {
     /// below `RestingHR.dayCoverage` has no value (#298), so a few awake readings synced so far today
     /// are never judged as today's resting HR; the latest day WITH a value is judged instead, as when
     /// today has no readings at all.
-    nonisolated static func restingHRDaily(_ hr: [HRSample]) -> [(day: Date, value: Double)] {
-        RestingHR.dailyValues(hr: hr, daytimeCoverage: RestingHR.dayCoverage).map { (day: $0.day, value: $0.bpm) }
+    /// Decision 92: a day the device reported its own resting HR for (`reported`) takes that value.
+    nonisolated static func restingHRDaily(_ hr: [HRSample],
+                                           reported: [HRSample] = []) -> [(day: Date, value: Double)] {
+        RestingHR.dailyValues(hr: hr, daytimeCoverage: RestingHR.dayCoverage, reported: reported)
+            .map { (day: $0.day, value: $0.bpm) }
     }
 
     /// Per-calendar-day mean of a sample kind (SpO₂ fraction → percent via `scale`).

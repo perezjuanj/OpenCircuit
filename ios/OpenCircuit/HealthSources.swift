@@ -95,7 +95,8 @@ enum HealthSources {
         // RestingHR.swift
         HealthSource(
             topic: .restingHR, title: "Resting heart rate",
-            method: "Worked out from your heart rate at rest: the average while you sleep, or the day's lowest "
+            method: "On a day your strap reports its own resting heart rate, that value is used. Otherwise it's "
+                + "worked out from your heart rate at rest: the average while you sleep, or the day's lowest "
                 + "sustained heart rate. A day without enough readings has no value.",
             citations: [
                 HealthCitation(

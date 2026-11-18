@@ -28,7 +28,7 @@ their spec tags until checked on a real strap.
 |---|---|---|---|
 | `0x01` activity: per-minute HR byte | `.heartRate` → `.heartRate` | bpm as-is; drop `0x00`/`0xFF` (no reading) | none |
 | `0x01` activity: per-minute steps | `.steps` → `.stepCount` | one sample per minute (or folded per quarter-hour), count as-is | the strap reports **true per-minute counts with a backlog**, unlike the ring's quarter-hour bucket (#192). Don't route these through `StepAccumulator`. Double-counting with the phone is the same trade-off as the ring |
-| `0x3A` resting HR | `.restingHeartRate` → `.restingHeartRate` | bpm, one per day | **device-reported**, unlike the ring's derived `RestingHR`. Write it as-is; skip `RestingHR` derivation for this device |
+| `0x3A` resting HR | `.restingHeartRate` → `.restingHeartRate` | bpm, one per day | **device-reported**, unlike the ring's derived `RestingHR`. Written as the day's value (decision 92); the derivation is the fallback for a day without one |
 | `0x3D` max HR | none | — | **gap**: no HealthKit type. Keep it local (or drop it) |
 | `0x49` HRV (RMSSD) | `.hrvSDNN` → `.heartRateVariabilitySDNN` (+ Recovery HRV on iOS 27+) | ms | strap reports **RMSSD** 🟡 (Amazfit's product-line documentation, which doesn't name the strap; not compared with Zepp's display, `ZEPP_PROTOCOL.md` §6.5); written into the SDNN field and **tagged via metadata** (`OpenCircuitHRVStatistic = "RMSSD"`, no fake conversion), exactly like the ring's — see "HRV: RMSSD stored in the SDNN field" below |
 | `0x25` SpO₂ (auto + manual) | `.spo2` → `.oxygenSaturation` | % ÷ 100 (fraction), from the low 7 bits of the value byte | none. `0x26` sleep SpO₂ is optional (Gadgetbridge doesn't store it) |
@@ -57,8 +57,8 @@ rules are in `ZeppKit/HelioSyncPolicy.swift`, tested by `HelioSyncPolicyTests`.
 | SpO₂ (`0x25`), respiratory rate (`0x38`) | `.spo2`, `.respiratoryRate` | yes |
 | Skin temperature (`0x2e`) | `.temperature`, **gated**: 30–42 °C, the minute's activity record known and not `0x73`/`0x76`, inside the strap's own sleep window | yes, as the ring's nightly readings (`.bodyTemperature`); the night's mean goes to the Sleep summary via the ring's `SkinTempBaseline.nightlyVerdict` |
 | Steps (activity per-minute) | `StoredStepSample` per minute + `StoredDaily` | yes, additive deltas over their real minute, through the ring's step writer (watermark advances only after the save) |
-| Active / basal energy, resting HR, exercise minutes | derived from the stored HR, as for the ring | yes, the ring's derived writers |
-| Resting HR (`0x3a`, strap-reported) | `.restingHeartRate` (local only) | no: the ring's derived daily writer already writes one per day, and writing both would double it |
+| Active / basal energy, exercise minutes | derived from the stored HR, as for the ring | yes, the ring's derived writers |
+| Resting HR (`0x3a`, strap-reported) | `.restingHeartRate` | yes, **as the day's value** (decision 92): the one daily resting-HR write uses the strap's latest record for a day it reported, and the derivation only for a day it didn't. One sample per day, never both. See "Resting HR: derived daily, idempotent" |
 | HRV (`0x49`, RMSSD 🟡) | `.hrvSDNN` | yes, per reading (`HelioHealthPolicy.writesHRV`, decision 44): the RMSSD value in the SDNN field, tagged `OpenCircuitHRVStatistic = "RMSSD"` like the ring's. Readings stored before this shipped backfill on the next flush (the strap's `hk:hrvSDNN` watermark was never advanced), back to the 30-day raw-sample retention. On iOS 27+ also Recovery HRV, through the same gates (decision 59; see "HRV: RMSSD stored in the SDNN field") |
 | Sleep (`0x48`) | the strap's own stages (each ending a minute after its inclusive end minute, decision 70e) → Sleep summary + hypnogram, plus one `.inBed` segment per session over the union of its stage span and its record span (`HelioSleepSelection.inBedSpan`, decisions 70a/70b; a stitched night has one per fragment, the gap stays out). Time in bed is the sum of those segments; the layer never counts as asleep or awake. Plus the in-bed lead-in before the first fragment (decision 77, #328): one `.awake` and one `.inBed` segment over the minutes before sleep where the strap's STORED rows show it worn, still and near the sleeping heart rate (an estimate, not the record's span; below) | yes, through `mirrorStrapNight` (`mirrorSettledNight`): the stages and **`inBed`**, as the ring's nights. Forward-only (decisions 70c, 70h): a night already in Health is not rewritten when its only differences from the written night are the `inBed` layer and/or the stage end's minute; a re-delivery still replaces it only under 28f/58b. A manually edited night is never overwritten. Strap naps carry the same `inBed` envelope as the ring's naps (decision 70g). No `SleepStaging` fallback yet (DECISION-GAP, see `HelioSleepSelection`) |
 | Stress (`0x13`) | `.stress`, one 0–100 sample per minute (`ff` skipped), charted through the day (#239). A backfill moves only its fetch watermark back, up to 7 days and never before the strap's ownership start, and only when another build advanced that watermark without storing the minutes (builds 59/60) | **no**: no Health type (`HealthKitWriter.quantityType(for: .stress)` is nil; not in any mirrored-kind list; not exported) |
@@ -485,6 +485,29 @@ and never at night (a short ring session, a strap worn only for a workout) gets 
 written: the lowest HR of a short awake or exercising stretch is not a resting heart rate. The
 watermark moves only onto a written day, so a thin day after the last written one is written
 later with its full value if its readings fill in (within the 7-day lookback).
+
+**Device-reported resting HR wins its day (decision 92).** The Helio Strap reports its own resting
+HR (`0x3a`), computed on the strap from HR denser than the per-minute readings the app receives,
+so for a day the strap reported one, that is the day's value everywhere: the Apple Health write,
+the Resting HR tile and Trends, Vitals Status, the fever / illness / headache baselines, % of
+reserve zones and the VO2 max input (`RestingHR.dailyValues(…, reported:)`). The derivation above
+is the fallback for any other day, and stays the only source for the ring. The night score's HR
+factor still reads the sleep mean (`StoredNightScore`), and basal-energy scaling keeps its uniform
+lowest-sustained series (see `dailyRestingHR`).
+
+- **Filing:** a record before noon belongs to its own day, from noon on to the next
+  (`RestingHR.reportedDay`, the night key's `wakeWindowEndHour`): the strap stamps some records
+  the evening before the morning they describe.
+- **Value:** the day's LATEST record (the strap revises overnight: 14 of 28 days in Juan's
+  2026-11-18 pull carried 2–4 records).
+- **Floor:** a reported day is never held back by `dayCoverage`; it isn't an awake estimate.
+- **Finalization and watermark unchanged:** a day is written 12 h after its start. Its records
+  are all stamped before its noon, so with the strap's hourly sync the written value is the final
+  one; a strap that hasn't synced since its last revision gets the newest value the phone has. A
+  day already in Health is not rewritten.
+- **Measured** on the same pull, 28 strap days: the sleep mean read 1.6–2.6 bpm above the
+  strap's own value (r 0.94–0.97 filed by the noon rule, 0.85–0.89 by calendar day). Switching
+  shows as a one-time step of about 2 bpm down in the Health trend.
 
 ### Calories: passive (BMR) + active (TRIMP), idempotent (#37)
 

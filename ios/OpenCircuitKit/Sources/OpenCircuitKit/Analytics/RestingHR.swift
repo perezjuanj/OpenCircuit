@@ -165,6 +165,8 @@ public enum RestingHR {
     /// by the local day of each reading's start; `sleep` segments are matched to a day by
     /// temporal overlap (so an early-morning night lands on the day you woke). Days with no
     /// readings are omitted, and so are days below `daytimeCoverage` when one is given.
+    /// `reported` are the device's own resting-HR records (the Helio Strap's `0x3a`, decision 92):
+    /// a day with one takes it instead of the derived value, whatever `daytimeCoverage` says.
     public struct DailyValue: Equatable, Sendable {
         public let day: Date    // start-of-day (in `calendar`)
         public let bpm: Double
@@ -177,7 +179,23 @@ public enum RestingHR {
         calendar: Calendar = .current,
         window: TimeInterval = sustainedWindow,
         minSleepSamples: Int = minSleepSamples,
-        daytimeCoverage: DaytimeCoverage? = nil
+        daytimeCoverage: DaytimeCoverage? = nil,
+        reported: [HRSample] = []
+    ) -> [DailyValue] {
+        let derived = derivedDailyValues(hr: hr, sleep: sleep, calendar: calendar, window: window,
+                                         minSleepSamples: minSleepSamples, daytimeCoverage: daytimeCoverage)
+        guard !reported.isEmpty else { return derived }
+        return preferringReported(derived, reported: reportedDailyValues(reported, calendar: calendar))
+    }
+
+    /// `dailyValues` without device-reported values: the on-device derivation alone.
+    static func derivedDailyValues(
+        hr: [HRSample],
+        sleep: [SleepSegment],
+        calendar: Calendar,
+        window: TimeInterval,
+        minSleepSamples: Int,
+        daytimeCoverage: DaytimeCoverage?
     ) -> [DailyValue] {
         guard !hr.isEmpty else { return [] }
         let byDay = Dictionary(grouping: hr) { calendar.startOfDay(for: $0.start) }
@@ -193,6 +211,48 @@ public enum RestingHR {
             }
         }
         return out
+    }
+
+    // MARK: Device-reported resting HR (decision 92)
+    //
+    // The Helio Strap reports its own resting HR (`0x3a`), computed on the strap from its own HR,
+    // which is denser than the per-minute HR the app receives. For a day the strap reported one, that
+    // value is THE day's resting HR: in Apple Health, on the tile and in every baseline. The
+    // derivation above stays the fallback for every other day, and the only source for the ring
+    // (which reports none).
+    //
+    // A strap revises its value during the night (about half the days of a 28-day pull carry 2–4
+    // records, a few bpm apart), and stamps some records the evening BEFORE (22:00–23:59). So a
+    // record is filed by the night key's rule: before noon it belongs to its own day, from noon on to
+    // the next one (`SleepNightKey.wakeWindowEndHour`). The day's value is its LATEST record, the
+    // strap's own final answer. Measured on Juan's 28 strap days against the sleep mean: filing by the
+    // noon rule gave r 0.94 (MAE 2.3 bpm), filing by calendar day r 0.85 (MAE 3.0).
+
+    /// The day a device-reported resting-HR record belongs to (start-of-day in `calendar`).
+    public static func reportedDay(of start: Date, calendar: Calendar = .current) -> Date {
+        let day = calendar.startOfDay(for: start)
+        guard calendar.component(.hour, from: start) >= SleepNightKey.wakeWindowEndHour else { return day }
+        return calendar.date(byAdding: .day, value: 1, to: day) ?? day.addingTimeInterval(86_400)
+    }
+
+    /// One value per day from device-reported records, oldest day first: each day's LATEST record
+    /// (by `start`). Readings outside `LiveHR.validBPM` are dropped first, like `value(hr:)` does.
+    public static func reportedDailyValues(_ readings: [HRSample],
+                                           calendar: Calendar = .current) -> [DailyValue] {
+        let valid = readings.filter { LiveHR.validBPM.contains($0.bpm) }
+        let byDay = Dictionary(grouping: valid) { reportedDay(of: $0.start, calendar: calendar) }
+        return byDay.keys.sorted().compactMap { day in
+            byDay[day]?.max { $0.start < $1.start }.map { DailyValue(day: day, bpm: Double($0.bpm)) }
+        }
+    }
+
+    /// `derived` with every day the device reported replaced by (or, for a day `derived` lacks, added
+    /// as) the reported value; oldest day first. With no reported days this is `derived`, sorted.
+    public static func preferringReported(_ derived: [DailyValue], reported: [DailyValue]) -> [DailyValue] {
+        guard !reported.isEmpty else { return derived.sorted { $0.day < $1.day } }
+        var byDay = Dictionary(derived.map { ($0.day, $0) }, uniquingKeysWith: { a, _ in a })
+        for r in reported { byDay[r.day] = r }
+        return byDay.values.sorted { $0.day < $1.day }
     }
 
     private static func isAsleep(_ stage: SleepStage) -> Bool {

@@ -148,6 +148,8 @@ enum DashboardReads {
         var heartRate: [SampleSnapshot]
         var spo2: [SampleSnapshot]
         var hrv: [SampleSnapshot]
+        /// The device's own resting-HR records (decision 92: the strap's `0x3a`).
+        var restingHeartRate: [SampleSnapshot] = []
     }
 
     /// Today's heart rate and the step deltas since yesterday's start: what the Goals, Readiness and
@@ -198,7 +200,8 @@ enum DashboardReads {
             func rows(_ kind: MetricKind) throws -> [SampleSnapshot] {
                 try fetch(vitalsHistoryDescriptor(kind, since: since), in: context).map { interned.snapshot($0) }
             }
-            return VitalsHistory(heartRate: try rows(.heartRate), spo2: try rows(.spo2), hrv: try rows(.hrvSDNN))
+            return VitalsHistory(heartRate: try rows(.heartRate), spo2: try rows(.spo2), hrv: try rows(.hrvSDNN),
+                                 restingHeartRate: try rows(.restingHeartRate))
         }
     }
 

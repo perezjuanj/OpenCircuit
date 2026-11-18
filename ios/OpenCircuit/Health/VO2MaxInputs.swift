@@ -40,7 +40,10 @@ enum VO2MaxInputs {
         let history = ((try? store.recentSamples(kind: .heartRate, since: since)) ?? [])
             .filter { !window.contains($0.start) }
             .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        return VO2MaxEstimate.restingHR(daily: RestingHR.dailyValues(hr: history),
+        // Decision 92: the device's own resting-HR records win their day.
+        let reported = ((try? store.ownedSamples(kind: .restingHeartRate, from: since, to: workoutStart)) ?? [])
+            .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+        return VO2MaxEstimate.restingHR(daily: RestingHR.dailyValues(hr: history, reported: reported),
                                         runStart: workoutStart)
     }
 }

@@ -133,6 +133,68 @@ final class RestingHRHealthWriteTests: XCTestCase {
         XCTAssertEqual(plan(hr, lastWritten: day(-2), now: weekLater), [])
     }
 
+    // MARK: The device's own resting HR (decision 92)
+
+    private func flushReported(_ hr: [HRSample], reported: [HRSample], lastWritten: Date? = nil,
+                               now: Date? = nil) async -> (writes: [(bpm: Double, day: Date)], watermark: Date) {
+        let from = lastWritten ?? never
+        var writes: [(bpm: Double, day: Date)] = []
+        let plan = HealthKitWriter.restingHRWritePlan(hr: hr, reported: reported, sleepSegments: [],
+                                                      lastWritten: from, now: now ?? self.now, calendar: cal)
+        let outcome = await HealthKitWriter.writeRestingHRDays(plan, lastWritten: from) { writes.append(($0, $1)) }
+        XCTAssertFalse(outcome.failed)
+        return (writes, outcome.watermark)
+    }
+
+    func testAStrapDayIsWrittenWithTheStrapsLatestValue() async {
+        // The derivation says 52; the strap revised its own value overnight to 57, the latest record.
+        let reported = [HRSample(bpm: 63, start: day(-2).addingTimeInterval(22 * 3600)),
+                        HRSample(bpm: 59, start: day(-1).addingTimeInterval(2 * 3600)),
+                        HRSample(bpm: 57, start: day(-1).addingTimeInterval(7 * 3600))]
+        let r = await flushReported(fullDay(day(-1)), reported: reported)
+        XCTAssertEqual(r.writes.map(\.day), [day(-1)])
+        XCTAssertEqual(r.writes.map(\.bpm), [57])
+        XCTAssertEqual(r.watermark, day(-1))
+    }
+
+    func testADayWithoutAStrapRecordFallsBackToTheDerivation() async {
+        let reported = [HRSample(bpm: 57, start: day(-1).addingTimeInterval(3 * 3600))]
+        let r = await flushReported(fullDay(day(-2), usual: 54) + fullDay(day(-1)), reported: reported)
+        XCTAssertEqual(r.writes.map(\.day), [day(-2), day(-1)])
+        XCTAssertEqual(r.writes.map(\.bpm), [54, 57])
+    }
+
+    func testAStrapValueIsWrittenOnAThinDay() async {
+        // The derivation holds a thin day back (#298); the strap's own value is not an awake estimate.
+        let reported = [HRSample(bpm: 55, start: day(-1).addingTimeInterval(4 * 3600))]
+        let r = await flushReported(thinDay(day(-1)), reported: reported)
+        XCTAssertEqual(r.writes.map(\.bpm), [55])
+    }
+
+    func testAStrapDayIsWrittenOnlyAfterTheDelay() async {
+        // Today's record exists, but today isn't 12 h old yet at 08:00: nothing for today.
+        let morning = today.addingTimeInterval(8 * 3600)
+        let reported = [HRSample(bpm: 55, start: today.addingTimeInterval(3 * 3600))]
+        let r = await flushReported([], reported: reported, lastWritten: day(-1), now: morning)
+        XCTAssertTrue(r.writes.isEmpty)
+        XCTAssertEqual(r.watermark, day(-1))
+    }
+
+    func testAnEveningBeforeRecordIsNotLostToTheWatermark() async {
+        // Day −2 is written. Day −1's only record was stamped on day −2 at 23:00 (before the
+        // watermark's day ended), and still belongs to day −1.
+        let reported = [HRSample(bpm: 61, start: day(-2).addingTimeInterval(23 * 3600))]
+        let r = await flushReported([], reported: reported, lastWritten: day(-2))
+        XCTAssertEqual(r.writes.map(\.day), [day(-1)])
+        XCTAssertEqual(r.writes.map(\.bpm), [61])
+    }
+
+    func testAWrittenDayIsNotRewrittenWhenAStrapRecordArrivesLater() async {
+        let reported = [HRSample(bpm: 57, start: day(-1).addingTimeInterval(3 * 3600))]
+        let r = await flushReported(fullDay(day(-1)), reported: reported, lastWritten: day(-1))
+        XCTAssertTrue(r.writes.isEmpty)
+    }
+
     func testAlreadyWrittenDaysAreNeverRewritten() async {
         let r = await flush(fullDay(day(-2)) + fullDay(day(-1), usual: 56), lastWritten: day(-1))
         XCTAssertTrue(r.writes.isEmpty)
