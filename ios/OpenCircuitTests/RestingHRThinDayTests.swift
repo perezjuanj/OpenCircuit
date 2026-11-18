@@ -92,6 +92,50 @@ final class RestingHRThinDayTests: XCTestCase {
         XCTAssertEqual(tile.rangeText, "No data yet")
     }
 
+    // MARK: The strap's own resting HR (decision 92)
+
+    private func reportedRows(_ records: [(bpm: Int, at: Date)]) -> [QuantitySample] {
+        records.map { QuantitySample(kind: .restingHeartRate, start: $0.at, value: Double($0.bpm)) }
+    }
+
+    func testTheTileShowsTheStrapsOwnValueForADayItReported() {
+        let hr = (1...6).reversed().flatMap { fullDay(day(-$0), usual: 58) }
+        // Yesterday the strap revised its value overnight: 63 the evening before, then 55. 55 stands.
+        let reported = reportedRows([(63, day(-2).addingTimeInterval(22 * 3600)),
+                                     (55, day(-1).addingTimeInterval(4 * 3600))])
+        let tile = restingTile(TrendsData.restingHRDaily(quantity(hr), reported: reported, calendar: utc))
+        XCTAssertEqual(tile.valueText, "55")
+        XCTAssertEqual(tile.valueDate, day(-1))
+        // A day the strap didn't report keeps the derivation.
+        let series = TrendsData.restingHRDaily(quantity(hr), reported: reported, calendar: utc)
+        XCTAssertEqual(series.first { $0.day == day(-3) }?.bpm, 58)
+    }
+
+    func testTheTileShowsTheStrapsValueOnAThinToday() {
+        // Today's derivation is thin (held back), but the strap has reported today's value.
+        let hr = history(fullDays: 6, last: today, calendar: utc)
+        let reported = reportedRows([(54, today.addingTimeInterval(3 * 3600))])
+        let tile = restingTile(TrendsData.restingHRDaily(quantity(hr), reported: reported, calendar: utc))
+        XCTAssertEqual(tile.valueText, "54")
+        XCTAssertEqual(tile.freshnessText(now: now, calendar: utc), "today")
+    }
+
+    func testVitalsStatusJudgesTheStrapsOwnValue() {
+        // Ten derived days at 58 and a full day today at 58: no signal. The strap says today was 75.
+        let cal = Calendar.current
+        let hr = (1...10).reversed().flatMap { fullDay(cal.date(byAdding: .day, value: -$0, to: localToday)!, usual: 58) }
+            + fullDay(localToday, usual: 58)
+        let quiet = VitalsStatusCardView.computeReport(
+            hr: hr, spo2: [], hrv: [], nights: [], fallbackRestingHR: nil, fallbackSpO2: nil,
+            fallbackHRV: nil, fallbackSkinTempOffsetC: nil)
+        XCTAssertFalse(quiet?.signals.contains { $0.vital == .restingHR } ?? true)
+        let reported = [HRSample(bpm: 75, start: localToday.addingTimeInterval(3 * 3600))]
+        let report = VitalsStatusCardView.computeReport(
+            hr: hr, restingReported: reported, spo2: [], hrv: [], nights: [], fallbackRestingHR: nil,
+            fallbackSpO2: nil, fallbackHRV: nil, fallbackSkinTempOffsetC: nil)
+        XCTAssertEqual(report?.signals.first { $0.vital == .restingHR }?.direction, .rise)
+    }
+
     func testAFullTodayStillHeadlinesToday() {
         let hr = (1...6).reversed().flatMap { fullDay(day(-$0), usual: 58) } + fullDay(today, usual: 60)
         let tile = restingTile(TrendsData.restingHRDaily(quantity(hr), calendar: utc))

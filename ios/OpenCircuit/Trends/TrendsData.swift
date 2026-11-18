@@ -92,6 +92,8 @@ struct TrendsData {
         var summaryByNight: [Date: SleepRow]
         var stepsByDay: [Date: Int]
         var hr, hrv, spo2, rr: [QuantitySample]
+        /// The device's own resting-HR records (decision 92: the strap's `0x3a`), same ownership filter.
+        var restingReported: [QuantitySample] = []
         var temps: [TempRow]
         var stepDeltas: [StepRow]
         var naps: [NapRow]
@@ -140,7 +142,7 @@ struct TrendsData {
         let points = await Task.detached { computePoints(inputs) }.value
         let goalDays = await Task.detached { computeGoalDays(inputs, points: points) }.value
         let recentRows = await buildRecentMetricRows(inputs)
-        let restingHR = await Task.detached { restingHRDaily(inputs.hr) }.value
+        let restingHR = await Task.detached { restingHRDaily(inputs.hr, reported: inputs.restingReported) }.value
         let nightOwners = inputs.summaryByNight.mapValues {
             ownership.owner(ofNightFrom: $0.inBedStart, to: $0.inBedEnd)
         }
@@ -154,11 +156,14 @@ struct TrendsData {
     /// The per-day resting-HR series (`restingHR` above) from the window's HR rows. #298: a day below
     /// `RestingHR.dayCoverage` has no value, so the tile falls back to the last day that has one
     /// (labelled with that day) and today's strain to the newest earlier day.
-    nonisolated static func restingHRDaily(_ hr: [QuantitySample],
+    /// Decision 92: a day the device reported its own resting HR for (`reported`) shows that value.
+    nonisolated static func restingHRDaily(_ hr: [QuantitySample], reported: [QuantitySample] = [],
                                            calendar: Calendar = .current) -> [RestingHR.DailyValue] {
-        RestingHR.dailyValues(hr: hr.filter { $0.value > 0 }
-            .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) },
-                              calendar: calendar, daytimeCoverage: RestingHR.dayCoverage)
+        func bpm(_ rows: [QuantitySample]) -> [HRSample] {
+            rows.filter { $0.value > 0 }.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+        }
+        return RestingHR.dailyValues(hr: bpm(hr), calendar: calendar, daytimeCoverage: RestingHR.dayCoverage,
+                                     reported: bpm(reported))
     }
 
     /// Today's strain so far (#216): midnight → now, from the HR this load already fetched (already
@@ -237,6 +242,7 @@ struct TrendsData {
         return Inputs(summaryByNight: summaryByNight, stepsByDay: stepsByDay,
                       hr: samples(.heartRate), hrv: samples(.hrvSDNN),
                       spo2: samples(.spo2), rr: samples(.respiratoryRate),
+                      restingReported: samples(.restingHeartRate),
                       temps: temps, stepDeltas: stepDeltas, naps: naps,
                       activityIntervals: RingActivityEventLedger.load().corroboratingIntervals(now: now),
                       profile: profile, goals: goals, tempUnitRaw: tempUnitRaw)

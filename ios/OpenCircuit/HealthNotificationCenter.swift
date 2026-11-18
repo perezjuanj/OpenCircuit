@@ -645,7 +645,13 @@ struct HealthNotificationCenter {
             let context = ModelContext(container)
             let hr = ((try? LocalStore.recentOwnSamples(in: context, kind: .heartRate, since: since, log: log)) ?? [])
                 .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-            return RestingHR.dailyValues(hr: hr, daytimeCoverage: RestingHR.dayCoverage).sorted { $0.day < $1.day }
+            // Decision 92: the device's own resting-HR records win their day. Read from 12 h earlier,
+            // since a record stamped the evening before files to the next day (`RestingHR.reportedDay`).
+            let reported = ((try? LocalStore.recentOwnSamples(in: context, kind: .restingHeartRate,
+                                                                since: since.addingTimeInterval(-12 * 3600), log: log)) ?? [])
+                .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+            return RestingHR.dailyValues(hr: hr, daytimeCoverage: RestingHR.dayCoverage, reported: reported)
+                .sorted { $0.day < $1.day }
         }.value
     }
 
