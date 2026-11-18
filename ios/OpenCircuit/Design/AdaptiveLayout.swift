@@ -169,14 +169,16 @@ struct SplitTab<Primary: View, EmptyDetail: View>: View {
 /// into ~77pt (the Sleep tab, commit 87d2911). No subview is over-wide, so there is nothing to
 /// narrow; the content simply has to be told it is exactly viewport-width.
 ///
-/// The width is MEASURED from the scroll view, not taken from `containerRelativeFrame`: on iOS 27
-/// that frame kept the portrait width after the phone turned, so the Sleep tab stayed a narrow
-/// column in landscape while every other tab filled the screen. A measured width follows rotation,
-/// Split View and fold changes. Skipped in a wide split-view column, which proposes the right width
+/// The width is the space the PARENT offers (a `GeometryReader` around the scroll view), never the
+/// scroll view's own size and never `containerRelativeFrame`. On iOS 27 both of those follow the
+/// content: `containerRelativeFrame` kept the portrait width after the phone turned (Sleep stayed a
+/// narrow column in landscape, #374), and measuring the scroll view kept the LANDSCAPE width after
+/// turning back, because the scroll view hugged the content it had just pinned. A GeometryReader's
+/// size comes only from its proposal, so there is no loop: it follows rotation both ways, Split
+/// View and fold changes. Skipped in a wide split-view column, which proposes the right width
 /// already.
 struct ViewportPinnedScrollView<Content: View>: View {
     @Environment(\.isWideSplit) private var isWide
-    @State private var viewportWidth: CGFloat = 0
     private let content: Content
 
     init(@ViewBuilder content: () -> Content) {
@@ -184,11 +186,15 @@ struct ViewportPinnedScrollView<Content: View>: View {
     }
 
     var body: some View {
-        ScrollView {
-            content.frame(width: !isWide && viewportWidth > 0 ? viewportWidth : nil)
+        if isWide {
+            ScrollView { content }
+        } else {
+            GeometryReader { viewport in
+                ScrollView {
+                    content.frame(width: viewport.size.width)
+                }
+            }
         }
-        .frame(maxWidth: .infinity)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewportWidth = $0 }
     }
 }
 
