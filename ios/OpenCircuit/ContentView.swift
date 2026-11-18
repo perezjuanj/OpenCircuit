@@ -227,15 +227,18 @@ struct ContentView: View {
             if let tab = tabs[raw] { selectedTab = tab }
         }
         .task {
-            // `-OCDemoRotate landscape|portrait`: a few seconds after launch, rotate the scene the way
-            // turning the phone does, so a layout that only breaks on rotation (not on a landscape
-            // launch) can be screenshotted without UI automation. Simulator + DEBUG only.
+            // `-OCDemoRotate landscape|portrait[,…]`: a few seconds after launch, rotate the scene the
+            // way turning the phone does (each step 4 s after the last, e.g. `landscape,portrait`), so
+            // a layout that only breaks on rotation can be screenshotted. Simulator + DEBUG only.
             guard DemoData.isRequested, let raw = UserDefaults.standard.string(forKey: "OCDemoRotate"),
                   let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
             else { return }
             try? await Task.sleep(for: .seconds(6))
-            let mask: UIInterfaceOrientationMask = raw == "portrait" ? .portrait : .landscapeRight
-            scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
+            for (i, step) in raw.split(separator: ",").enumerated() {
+                if i > 0 { try? await Task.sleep(for: .seconds(4)) }
+                let mask: UIInterfaceOrientationMask = step == "portrait" ? .portrait : .landscapeRight
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
+            }
         }
 #endif
             // Shared trends cache: load once, then refresh on foreground return and after each sync.
