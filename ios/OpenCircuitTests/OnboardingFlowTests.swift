@@ -142,7 +142,7 @@ final class OnboardingFlowTests: XCTestCase {
 
     func testTheStrapBulletsAreHelioStatussOwnCopy() {
         let steps = ActiveDeviceChoice.helioStrap.firstSteps
-        XCTAssertEqual(Array(steps.suffix(2)), [HelioStatus.dontUnpairCopy, HelioStatus.zeppBluetoothCopy])
+        XCTAssertEqual(Array(steps.suffix(2)), [HelioStatus.dontUnpairCopy, HelioStatus.zeppCoexistCopy])
         XCTAssertEqual(steps.first, HelioStatus.keyOriginCopy)
         XCTAssertEqual(ActiveDeviceChoice.helioStrap.setupGuide?.url, HelioStatus.keyGuideURL)
         XCTAssertEqual(ActiveDeviceChoice.helioStrap.setupGuide?.title, "How to get the key")

@@ -269,6 +269,8 @@ struct DemoScreenModifier: ViewModifier {
             HealthSourcesView()
         } else if id.hasPrefix("sources-"), let t = HealthSourceTopic(rawValue: String(id.dropFirst(8))) {
             HealthSourcesView(focus: t)
+        } else if id == "helio-setup" {
+            HelioSetupView()
         } else {
             DemoLiveCard()
         }
