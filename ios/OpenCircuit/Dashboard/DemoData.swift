@@ -270,11 +270,11 @@ struct DemoScreenModifier: ViewModifier {
         } else if id.hasPrefix("sources-"), let t = HealthSourceTopic(rawValue: String(id.dropFirst(8))) {
             HealthSourcesView(focus: t)
         } else if id == "breathing" || id == "breathing-exhale" {
-            // A box-breathing session frozen in its inhale (2 s) or exhale (10 s), over a synthetic HR.
+            // A box-breathing session frozen in its inhale (3 s) or exhale (11 s), over a synthetic HR.
             BreathingSessionView(source: VitalMeasureSource(demoState: VitalMeasureState(
                                      control: .ring(active: true, enabled: true), streaming: true,
                                      liveValue: 64, latestFrame: 64)),
-                                 demoFrozenElapsed: id == "breathing" ? 2 : 10)
+                                 demoFrozenElapsed: id == "breathing" ? 3 : 11)
         } else {
             DemoLiveCard()
         }
