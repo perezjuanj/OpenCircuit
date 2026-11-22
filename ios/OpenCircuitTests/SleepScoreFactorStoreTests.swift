@@ -1,6 +1,7 @@
 import SwiftData
 import XCTest
 import OpenCircuitKit
+import ZeppKit
 @testable import OpenCircuit
 
 // Each night's Sleep Score factors are saved by the writer that writes the score, and the Sleep card
