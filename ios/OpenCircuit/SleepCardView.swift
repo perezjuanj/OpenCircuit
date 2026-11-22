@@ -71,6 +71,8 @@ struct SleepCardView: View {
     /// validator uses — the picker must never offer a time `applySleepEdit` would reject (#188).
     var sleepEditDataCoverage: ((Date, Date) -> ClosedRange<Date>?)? = nil
     @State private var editTarget: EditTarget?
+    /// The "How this score is made" sheet (the factors behind the badge).
+    @State private var showScoreBreakdown = false
     /// Runs a manual nap add/edit (#nap-parity) → success. nil originalStart = add, else edit.
     /// Injected by ContentView (→ RingSession.applyNapEdit). nil hides the nap edit/add affordance.
     var onNap: ((Date?, NapEdit.Window) async -> Bool)? = nil
@@ -501,6 +503,9 @@ struct SleepCardView: View {
         .task(id: StageProvenanceKey(night, liveCount: liveSegments.count)) {
             await refreshStageProvenance()
         }
+        .sheet(isPresented: $showScoreBreakdown) {
+            if let breakdown = latest?.scoreBreakdown { SleepScoreBreakdownView(breakdown: breakdown) }
+        }
         .sheet(item: $editTarget) { target in
             EditSleepView(
                 night: target.night,
@@ -556,7 +561,25 @@ struct SleepCardView: View {
                     .font(.caption).foregroundStyle(.secondary).monospacedDigit()
             }
             Spacer()
-            if let score = latest?.sleepScore, score > 0 { scoreBadge(score) }
+            if let score = latest?.sleepScore, score > 0 {
+                if latest?.scoreBreakdown != nil {
+                    Button { showScoreBreakdown = true } label: { scoreBadge(score) }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Shows how this score is made")
+                } else {
+                    scoreBadge(score)
+                }
+            }
+        }
+        if latest?.scoreBreakdown != nil {
+            Button { showScoreBreakdown = true } label: {
+                HStack(spacing: 4) {
+                    Text("How this score is made")
+                    Image(systemName: "chevron.right").font(.caption2.weight(.semibold))
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
         }
         stageTimeline(night)
         stageBar(night, m)
