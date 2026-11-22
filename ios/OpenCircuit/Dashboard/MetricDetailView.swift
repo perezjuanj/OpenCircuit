@@ -82,6 +82,10 @@ struct MetricDetailView: View {
                 if let measure, let vital = metric.measuredVital {
                     VitalMeasureCard(vital: vital, source: measure)
                 }
+                // Guided breathing, heart-rate detail only. Works with no device; the live readout joins when one is ready.
+                if metric.measuredVital == .heartRate {
+                    BreathingEntryRow(source: measure ?? VitalMeasureSource())
+                }
             }
             .padding(16)
         }
