@@ -88,6 +88,17 @@ enum DemoData {
                 skinTempC: 33.55 + 0.22 * wiggle(i, 0.9),
                 sleepScore: Int(74 + 8 * progress + 5 * wiggle(i, 0.5)),
                 stressScore: Int(44 - 10 * progress + 4 * wiggle(i, 1.7)))
+            // Last night's score is written the way a sync writes it: one composite call, its factors
+            // saved with it, so the Sleep card offers "How this score is made" (`-OCDemoScreen sleep-score`).
+            if n == 0 {
+                let scored = SleepScoreFactors.scored(.init(
+                    totalAsleep: TimeInterval(asleep * 60), timeAwake: TimeInterval(awake * 60),
+                    efficiency: summary.efficiency, deep: TimeInterval(deep * 60),
+                    light: TimeInterval((asleep - deep - rem) * 60), rem: TimeInterval(rem * 60),
+                    restingHR: 54, tempOffsetC: 0.2), producer: .ring)
+                summary.sleepScore = scored.score
+                SleepScoreFactorStore.shared.set(scored, night: summary.night)
+            }
             // A synthetic stage timeline: ~90-minute cycles, deeper early and more REM late, with a
             // couple of brief wakes. The oldest nights get none, so the "timeline isn't stored"
             // state is on screen too.
@@ -225,6 +236,7 @@ enum DemoData {
 
 #if DEBUG && targetEnvironment(simulator)
 import CoreLocation
+import SwiftData
 import SwiftUI
 
 /// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR |
@@ -283,6 +295,8 @@ struct DemoScreenModifier: ViewModifier {
                 HelioSetupView().frame(width: geo.size.width / 0.45, height: geo.size.height / 0.45)
                     .scaleEffect(0.45, anchor: .topLeading)
             }
+        } else if id == "sleep-score" {
+            DemoSleepScoreSheet()
         } else {
             DemoLiveCard()
         }
@@ -290,6 +304,19 @@ struct DemoScreenModifier: ViewModifier {
 }
 
 private struct DemoScreenID: Identifiable { let id: String }
+
+/// `-OCDemoScreen sleep-score`: the Sleep Score breakdown sheet over the seeded demo night.
+private struct DemoSleepScoreSheet: View {
+    @Query(sort: \StoredSleepSummary.night, order: .reverse) private var nights: [StoredSleepSummary]
+
+    var body: some View {
+        if let breakdown = nights.first?.scoreBreakdown {
+            SleepScoreBreakdownView(breakdown: breakdown)
+        } else {
+            Text("No score breakdown for this night").foregroundStyle(.secondary)
+        }
+    }
+}
 
 /// `-OCDemoScreen workout-detail` (#365): a SYNTHETIC 5.3 km outdoor run with a 2-minute pause and a
 /// varying pace, so the Splits card shows whole splits and a partial one.

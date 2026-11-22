@@ -2259,12 +2259,15 @@ final class RingSession: NSObject {
         }
         let restingHR = RestingHR.value(hr: nightHR, sleep: stagedSegments)
 
-        // Composite 0–100 Sleep Score (#70).
-        let composite = SleepScore.composite(.init(
+        // Composite 0–100 Sleep Score (#70), with the factors it was made of from the same call: the
+        // resting HR above comes from raw records that are not kept, so this is the only moment the
+        // breakdown behind the badge can be recorded exactly (`SleepScoreFactors`).
+        let scored = SleepScoreFactors.scored(.init(
             totalAsleep: summary.totalAsleep, timeAwake: summary.awake, efficiency: summary.efficiency,
             deep: summary.deep, light: summary.light, rem: summary.rem,
-            restingHR: restingHR, tempOffsetC: tempOffset))
-        extras.sleepScore = composite.score
+            restingHR: restingHR, tempOffsetC: tempOffset), producer: .ring)
+        extras.sleepScore = scored.score
+        extras.scoreFactors = scored
         return extras
     }
 

@@ -80,7 +80,10 @@ extension LocalStore {
             priorNights: strapPriorNightTemperatures(excluding: SleepNightKey.night(inBedStart: window.start,
                                                                                     inBedEnd: window.end),
                                                      log: log)))
-        if let score = scores.sleepScore { extras.sleepScore = score }
+        if let score = scores.sleepScore {
+            extras.sleepScore = score
+            extras.scoreFactors = scores.factors
+        }
         if let stress = scores.stressScore { extras.stressScore = stress }
     }
 
@@ -161,6 +164,7 @@ extension LocalStore {
         }()
 
         var scored: [Date] = []
+        var scoredFactors: [(night: Date, factors: SleepScoreFactors?)] = []
         for row in targets {
             let segments = SleepHypnogramCodec.decode(row.hypnogramData)
             // Decision 77d: the save path's window, without the in-bed lead-in.
@@ -200,6 +204,7 @@ extension LocalStore {
             var changed = false
             if needsSleep, let score = scores.sleepScore {
                 row.sleepScore = score
+                scoredFactors.append((row.night, scores.factors))
                 changed = true
             }
             if row.stressScore == 0, let stress = scores.stressScore {
@@ -213,6 +218,10 @@ extension LocalStore {
 
         guard !scored.isEmpty else { return [] }
         try context.save()
+        // After the save: each newly scored night's factors, from the same call as its score.
+        for item in scoredFactors {
+            Self.commitScoreFactors(item.factors.map { .save($0) } ?? .clear, night: item.night)
+        }
 
         let newestFirst = scored.sorted(by: >)
         // ONE summary breadcrumb per pass (#259) — a breadcrumb per night cost ~135 ms on the main

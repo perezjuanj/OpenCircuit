@@ -1746,6 +1746,10 @@ struct LocalStore {
         /// because every later, better-judged pass looks identical to "we didn't look".
         var skinTempWithheld: Bool = false
         var sleepScore: Int = 0
+        /// The factors behind `sleepScore`, from the same composite call (`SleepScoreFactors.scored`).
+        /// Saved with the score by `saveSleepSummary`; nil clears the night's entry when a score is
+        /// written, so a writer that forgets them leaves no breakdown rather than a stale one.
+        var scoreFactors: SleepScoreFactors?
         var stressScore: Int = 0
         var hrByStage: [SleepStage: Int] = [:]
         var movementLevels: [Int] = []
@@ -1981,6 +1985,7 @@ struct LocalStore {
         // would have been INTRODUCED by end-anchoring.) Overlap resolution heals it instead: the
         // completed night finds the partial's row and grows it, exactly as it always did.
         let existingRow = resolveSleepRow(dayStart: dayStart, inBedStart: inBedStart, inBedEnd: inBedEnd)
+        let factorsUpdate: (update: ScoreFactorsUpdate, row: StoredSleepSummary)
         if let existing = existingRow {
             // ⚠️ COLLISION GUARD — applies to EDITED AND UNEDITED ROWS ALIKE.
             //
@@ -2165,7 +2170,7 @@ struct LocalStore {
             existing.sleepOnset = sleepOnset
             existing.sleepWake = sleepWake
             existing.updatedAt = Date()
-            applyExtras(extras, to: existing)   // feelScore deliberately preserved
+            factorsUpdate = (applyExtras(extras, to: existing), existing)   // feelScore deliberately preserved
         } else {
             let row = StoredSleepSummary(
                 night: dayStart,
@@ -2180,10 +2185,12 @@ struct LocalStore {
                 sleepOnset: sleepOnset,
                 sleepWake: sleepWake
             )
-            applyExtras(extras, to: row)
+            factorsUpdate = (applyExtras(extras, to: row), row)
             context.insert(row)
         }
         try context.save()
+        // Only now that the score is persisted, under the key the row was saved with.
+        Self.commitScoreFactors(factorsUpdate.update, night: factorsUpdate.row.night)
         // The night just grew (or appeared) over this span — any AUTO-detected nap inside it is now
         // the same sleep counted twice (🟢 2026-08-16: a split night's 09:04–10:30 tail was stored
         // as an 86-min nap; once scoping re-absorbs the tail, night + nap overlap). Manual naps are
@@ -2279,7 +2286,26 @@ struct LocalStore {
             detail: "night=\(Self.stamp(night)) removed=\(removed) span=[\(Self.stamp(start))..\(Self.stamp(end))]")
     }
 
-    private func applyExtras(_ extras: SleepNightExtras, to row: StoredSleepSummary) {
+    /// What `applyExtras` decided for the night's saved score factors. Committed by the caller only
+    /// after the row's `context.save()` succeeded (`commitScoreFactors`).
+    enum ScoreFactorsUpdate: Equatable {
+        case keep
+        case save(SleepScoreFactors)
+        case clear
+    }
+
+    /// Apply a `ScoreFactorsUpdate` to the side store under the row's CURRENT key. Called after the
+    /// save, so a re-keyed row files its entry under the key it was saved with.
+    static func commitScoreFactors(_ update: ScoreFactorsUpdate, night: Date) {
+        switch update {
+        case .keep: break
+        case let .save(entry): SleepScoreFactorStore.shared.set(entry, night: night)
+        case .clear: SleepScoreFactorStore.shared.set(nil, night: night)
+        }
+    }
+
+    @discardableResult
+    private func applyExtras(_ extras: SleepNightExtras, to row: StoredSleepSummary) -> ScoreFactorsUpdate {
         // 0 = "not computed this pass" — keep any previously stored value rather than wiping it
         // (a quick daytime live-read might re-stage the night with no temp/HRV coverage).
         //
@@ -2306,7 +2332,17 @@ struct LocalStore {
         } else if extras.skinTempWithheld, row.skinTempC > 0 {
             row.skinTempC = 0
         }
-        if extras.sleepScore > 0 { row.sleepScore = extras.sleepScore }
+        // The score and its factors travel together: an entry whose score is not the one written is
+        // never saved, and a score written without one clears the night's entry.
+        var factorsUpdate = ScoreFactorsUpdate.keep
+        if extras.sleepScore > 0 {
+            row.sleepScore = extras.sleepScore
+            if let f = extras.scoreFactors, f.score == extras.sleepScore {
+                factorsUpdate = .save(f)
+            } else {
+                factorsUpdate = .clear
+            }
+        }
         if extras.stressScore > 0 { row.stressScore = extras.stressScore }
         if let v = extras.hrByStage[.asleepDeep] { row.hrDeep = v }
         if let v = extras.hrByStage[.asleepCore] { row.hrLight = v }
@@ -2334,6 +2370,7 @@ struct LocalStore {
         row.longestGapSeconds = extras.hypnogram.isEmpty ? -1 : staged.longestUnmeasuredGap
         row.measuredEfficiency = extras.hypnogram.isEmpty ? -1 : (staged.efficiency ?? -1)
         row.sleepBasis = extras.hypnogram.isEmpty ? "" : SleepBasis.measuredOnly.rawValue
+        return factorsUpdate
     }
 
     /// ONE-SHOT BACKFILL for the reversibility columns. Runs after the container opens, never inside
@@ -2659,12 +2696,17 @@ struct LocalStore {
         // and the Sleep card's caveat line all still say how much of this night was measured, and
         // `SleepProvenanceBreakdown.isScorable` is still published in the export
         // (`ExportEngine.swift:1015`) for anyone who wants to weigh the score themselves.
-        row.sleepScore = SleepScore.composite(.init(
+        //
+        // The factors come from the same composite call and are saved with the score (after the save),
+        // so the edited night's "How this score is made" describes the edit, not the recording.
+        let scored = SleepScoreFactors.scored(.init(
             totalAsleep: summary.totalAsleep, timeAwake: summary.awake,
             efficiency: summary.efficiency,
-            deep: summary.deep, light: summary.light, rem: summary.rem)).score
+            deep: summary.deep, light: summary.light, rem: summary.rem), producer: .edited)
+        row.sleepScore = scored.score
         row.updatedAt = Date()
         try context.save()
+        Self.commitScoreFactors(scored.score > 0 ? .save(scored) : .clear, night: row.night)
         return true
     }
 
@@ -2832,6 +2874,7 @@ struct LocalStore {
     func healWithheldSleepScores() throws -> [Date] {
         let rows = try context.fetch(FetchDescriptor<StoredSleepSummary>())
         var healed: [(night: Date, score: Int)] = []
+        var healedFactors: [(night: Date, factors: SleepScoreFactors)] = []
         // ⚠️ THE BASIS CLAUSE IS `!= .unknown`, NOT `== .assertedTagged`, and the difference is a
         // measured bug rather than a preference. The withhold's own predicate was
         // `breakdown.isScorable == false`, which is COVERAGE-based and says nothing about the basis
@@ -2854,13 +2897,16 @@ struct LocalStore {
             // are not an acceptable substitute — leave it for the wearer's next edit.
             guard !row.hypnogramData.isEmpty else { continue }
             let segments = SleepHypnogramCodec.decode(row.hypnogramData)
-            guard let score = SleepScoreHeal.healedScore(hypnogram: segments) else { continue }
-            row.sleepScore = score
+            guard let scored = SleepScoreHeal.healedFactors(hypnogram: segments) else { continue }
+            row.sleepScore = scored.score
             row.updatedAt = Date()
-            healed.append((row.night, score))
+            healed.append((row.night, scored.score))
+            healedFactors.append((row.night, scored))
         }
 
         if !healed.isEmpty { try context.save() }
+        // After the save: each healed night's factors, from the same call as its score.
+        for item in healedFactors { Self.commitScoreFactors(.save(item.factors), night: item.night) }
 
         for item in healed.sorted(by: { $0.night > $1.night }) {
             // Night KEY and score only — no clock time — matching the granularity of the sleep
@@ -2931,6 +2977,9 @@ struct LocalStore {
         MirroredNightOverlay.rename(from: oldKey, to: newKey)
         PendingSleepReconcileStore.rekey(from: oldKey, to: newKey)
         Self.renameMorningNotificationLedger(from: oldKey, to: newKey)
+        // The night's saved Sleep Score factors follow the row; left behind they would show for no
+        // night (or, at a key another row later takes, be checked against the wrong score).
+        SleepScoreFactorStore.shared.rename(from: oldKey, to: newKey)
     }
 
     /// `morning.lastNotifiedNight` (RingSession) dedups the one-per-night lock-screen summary by the

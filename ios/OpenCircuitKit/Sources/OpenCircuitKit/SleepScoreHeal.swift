@@ -76,12 +76,18 @@ public enum SleepScoreHeal {
     /// recomputed score is itself 0. A 0 result would write the sentinel back and achieve nothing,
     /// and it is the one case where "repaired" and "still broken" are indistinguishable afterwards.
     public static func healedScore(hypnogram segments: [SleepSegment]) -> Int? {
+        healedFactors(hypnogram: segments)?.score
+    }
+
+    /// `healedScore` with the factors it was made of, from the same composite call, so the repair
+    /// pass saves the entry with the score it writes (`SleepScoreFactors`). Same nil rules.
+    public static func healedFactors(hypnogram segments: [SleepSegment]) -> SleepScoreFactors? {
         guard let s = summary(from: segments) else { return nil }
-        let score = SleepScore.composite(.init(
+        let scored = SleepScoreFactors.scored(.init(
             totalAsleep: s.totalAsleep, timeAwake: s.awake,
             efficiency: s.efficiency,
-            deep: s.deep, light: s.light, rem: s.rem)).score
-        return score > 0 ? score : nil
+            deep: s.deep, light: s.light, rem: s.rem), producer: .edited)
+        return scored.score > 0 ? scored : nil
     }
 
     // NOTE ON THE ROW PREDICATE. "Is this row a scar?" is `isManuallyEdited && sleepScore == 0 &&

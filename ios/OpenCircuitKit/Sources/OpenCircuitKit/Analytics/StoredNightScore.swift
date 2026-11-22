@@ -71,6 +71,18 @@ public enum StoredNightScore {
         /// The skin-temp offset the composite's temperature factor was given, nil without BOTH a
         /// nightly mean and a same-device baseline.
         public let tempOffsetC: Double?
+        /// The factors behind `sleepScore`, from the same composite call; nil exactly when
+        /// `sleepScore` is nil. The caller saves it with the score (`SleepScoreFactors`).
+        public let factors: SleepScoreFactors?
+
+        public init(sleepScore: Int?, stressScore: Int?, restingHR: Double?, tempOffsetC: Double?,
+                    factors: SleepScoreFactors? = nil) {
+            self.sleepScore = sleepScore
+            self.stressScore = stressScore
+            self.restingHR = restingHR
+            self.tempOffsetC = tempOffsetC
+            self.factors = factors
+        }
     }
 
     /// Score one stored night. Pure.
@@ -106,11 +118,12 @@ public enum StoredNightScore {
         // EXACTLY the ring's argument list (`RingSession.computeSleepExtras`), including its default
         // `sleepGoal`: the two paths must produce the same number for the same night, so neither may
         // grow an argument the other doesn't pass.
-        let composite = SleepScore.composite(.init(
+        let scored = SleepScoreFactors.scored(.init(
             totalAsleep: summary.totalAsleep, timeAwake: summary.awake, efficiency: summary.efficiency,
             deep: summary.deep, light: summary.light, rem: summary.rem,
-            restingHR: restingHR, tempOffsetC: tempOffsetC))
-        return Scores(sleepScore: composite.score > 0 ? composite.score : nil,
-                      stressScore: stressScore, restingHR: restingHR, tempOffsetC: tempOffsetC)
+            restingHR: restingHR, tempOffsetC: tempOffsetC), producer: .strap)
+        return Scores(sleepScore: scored.score > 0 ? scored.score : nil,
+                      stressScore: stressScore, restingHR: restingHR, tempOffsetC: tempOffsetC,
+                      factors: scored.score > 0 ? scored : nil)
     }
 }
