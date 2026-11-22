@@ -94,7 +94,10 @@ enum HeartRateZoneRestingHR {
         let since = now.addingTimeInterval(-Double(lookbackDays) * 86_400)
         let hr = ((try? store.recentOwnSamples(kind: .heartRate, since: since)) ?? [])
             .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-        return RestingHR.dailyValues(hr: hr, daytimeCoverage: RestingHR.dayCoverage)
+        // Decision 92: the device's own resting-HR records win their day (the alert passes' series).
+        let reported = ((try? store.recentOwnSamples(kind: .restingHeartRate, since: since)) ?? [])
+            .map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+        return RestingHR.dailyValues(hr: hr, daytimeCoverage: RestingHR.dayCoverage, reported: reported)
             .sorted { $0.day < $1.day }.last?.bpm
     }
 

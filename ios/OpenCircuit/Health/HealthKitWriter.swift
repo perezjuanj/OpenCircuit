@@ -761,7 +761,12 @@ final class HealthKitWriter {
         // Derived daily resting HR — one sample per finalized day (#18, #37). Idempotency is a
         // UserDefaults day-watermark, NOT the store cursor: RHR isn't a stored sample, and the
         // `hk:` cursor rows belong to the raw-sample mirror above.
-        result.restingDays = await flushRestingHR(prefetchedHR: basalHR, sleepSegments: sleepSegments)
+        // Decision 92: the strap's own resting-HR records (owned rows only), which the day's value
+        // prefers over the derivation. The ring stores none, so for it this is empty.
+        let reportedRHR = await Self.prefetchHRSamples(local: store, lookbackDays: Self.reportedRHRLookbackDays,
+                                                        now: Date(), kind: .restingHeartRate)
+        result.restingDays = await flushRestingHR(prefetchedHR: basalHR, reported: reportedRHR,
+                                                  sleepSegments: sleepSegments)
         if result.restingDays > 0 { writtenKinds.insert(.restingHeartRate) }
 
         // Energy: passive (hourly BMR) + active (HR-derived or steps-derived estimate).
@@ -1759,14 +1764,14 @@ final class HealthKitWriter {
     /// do: 32 days of minute HR is tens of thousands of rows, and materialising them on the main
     /// context after every sync froze the UI for as long as the fetch took. A background context sees
     /// only saved rows, so with unsaved main-context changes this falls back to the main-context read.
-    private static func prefetchHRSamples(local: LocalStore, lookbackDays: Int,
-                                           now: Date) async -> [HRSample] {
+    private static func prefetchHRSamples(local: LocalStore, lookbackDays: Int, now: Date,
+                                           kind: MetricKind = .heartRate) async -> [HRSample] {
         let cal = Calendar.current
         let from = cal.date(byAdding: .day, value: -lookbackDays, to: cal.startOfDay(for: now))
             ?? now.addingTimeInterval(-Double(lookbackDays) * 86_400)
         // Decision 28: only HR recorded by the device that owned its time feeds derived values.
         guard !local.context.hasChanges else {
-            guard let stored = try? local.ownedSamples(kind: .heartRate, from: from, to: now),
+            guard let stored = try? local.ownedSamples(kind: kind, from: from, to: now),
                   !stored.isEmpty else { return [] }
             return stored.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
         }
@@ -1774,7 +1779,7 @@ final class HealthKitWriter {
         let log = LocalStore.ownershipLog()
         return await Task.detached(priority: .utility) {
             let context = ModelContext(container)
-            guard let stored = try? LocalStore.ownedSamples(in: context, kind: .heartRate, from: from,
+            guard let stored = try? LocalStore.ownedSamples(in: context, kind: kind, from: from,
                                                             to: now, log: log),
                   !stored.isEmpty else { return [] }
             return stored.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
@@ -1785,10 +1790,11 @@ final class HealthKitWriter {
     /// day whose value would come from too few daytime readings (`RestingHR.dayCoverage`, #298).
     /// Uses pre-fetched HR samples (shared with `flushPassiveCalories`) to avoid a redundant
     /// LocalStore query.
-    private func flushRestingHR(prefetchedHR: [HRSample], sleepSegments: [SleepSegment]) async -> Int {
+    private func flushRestingHR(prefetchedHR: [HRSample], reported: [HRSample],
+                                sleepSegments: [SleepSegment]) async -> Int {
         let defaults = UserDefaults.standard
         let lastWritten = Date(timeIntervalSince1970: defaults.double(forKey: Self.rhrWatermarkKey))
-        let plan = Self.restingHRWritePlan(hr: prefetchedHR, sleepSegments: sleepSegments,
+        let plan = Self.restingHRWritePlan(hr: prefetchedHR, reported: reported, sleepSegments: sleepSegments,
                                            lastWritten: lastWritten, now: Date(), calendar: .current)
         let outcome = await Self.writeRestingHRDays(plan, lastWritten: lastWritten) {
             try await self.writeRestingHR(bpm: $0, day: $1)
@@ -1813,7 +1819,16 @@ final class HealthKitWriter {
     /// on fewer readings, or a shorter span, than `RestingHR.dayCoverage` is NOT written: a few awake
     /// readings synced before the night are not that day's resting HR. Days the sleep-mean tier
     /// answers are unchanged, and so is every value that is written.
-    static func restingHRWritePlan(hr prefetchedHR: [HRSample], sleepSegments: [SleepSegment],
+    ///
+    /// Decision 92: a day the device reported its own resting HR for (`reported`, the Helio Strap's
+    /// `0x3a` records) is written with that value (the day's latest record, `RestingHR.reportedDailyValues`)
+    /// instead of the derived one, and is never held back by the coverage floor. Finalization is
+    /// unchanged: a day's records are all stamped before its noon, and a day is written only 12 h after
+    /// its start, so with the strap's hourly sync the written value is its final one. A strap that
+    /// hasn't synced since its last revision gets the newest value the phone has, and a day already
+    /// written stays as written (the watermark), exactly like a late night on the derived path.
+    static func restingHRWritePlan(hr prefetchedHR: [HRSample], reported: [HRSample] = [],
+                                   sleepSegments: [SleepSegment],
                                    lastWritten: Date, now: Date, calendar cal: Calendar) -> [RestingHRPlanDay] {
         let cutoff = now.addingTimeInterval(-Self.restingFinalizationDelay)
         // Bound the scan: never re-read already-written days, and look back at most a week so a
@@ -1822,10 +1837,13 @@ final class HealthKitWriter {
             ?? now.addingTimeInterval(-7 * 86_400)
         let scanStart = max(lookback, lastWritten)
         let hr = prefetchedHR.filter { $0.start >= scanStart }
-        guard !hr.isEmpty else { return [] }
-        let all = RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal)
+        // A record filed to a day after `scanStart` can be stamped the evening before it (noon rule),
+        // so filter reported records by the day they belong to, not by their own time.
+        let reported = reported.filter { RestingHR.reportedDay(of: $0.start, calendar: cal) >= scanStart }
+        guard !hr.isEmpty || !reported.isEmpty else { return [] }
+        let all = RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal, reported: reported)
         let covered = RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal,
-                                            daytimeCoverage: RestingHR.dayCoverage)
+                                            daytimeCoverage: RestingHR.dayCoverage, reported: reported)
         let coveredBpm = Dictionary(covered.map { ($0.day, $0.bpm) }, uniquingKeysWith: { a, _ in a })
         return all.filter { $0.day > lastWritten && $0.day <= cutoff }   // days ascend
             .map { RestingHRPlanDay(day: $0.day, bpm: coveredBpm[$0.day]) }
@@ -1858,6 +1876,10 @@ final class HealthKitWriter {
     /// How far back the basal-energy path reads daily resting HR: enough to hold the personal
     /// baseline window plus the couple of days an hourly backfill can touch. Bounds the query.
     private static let basalRHRLookbackDays = 32
+
+    /// How far back the resting-HR write reads the device's own resting-HR records (decision 92): the
+    /// write plan's 7-day lookback plus the evening-before record of its first day, with slack.
+    private static let reportedRHRLookbackDays = 9
 
     /// Write basal (passive) energy for each completed hour since the watermark, returning the
     /// count. First run starts the meter at the current hour (no historical flood); a long gap
