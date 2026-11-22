@@ -545,6 +545,7 @@ struct SleepCardView: View {
     private func content(_ night: Night) -> some View {
         let s = night.summary
         let m = s.minutes
+        let hasScoreBreakdown = latest?.scoreBreakdown != nil
         // Headline: time ASLEEP, with TIME IN BED beneath it (the two-window model) + the
         // composite Sleep Score badge (#70). Asleep and in-bed are deliberately distinct — the
         // ring's "asleep" excludes the pre-sleep wind-down and any in-bed wake.
@@ -562,7 +563,7 @@ struct SleepCardView: View {
             }
             Spacer()
             if let score = latest?.sleepScore, score > 0 {
-                if latest?.scoreBreakdown != nil {
+                if hasScoreBreakdown {
                     Button { showScoreBreakdown = true } label: { scoreBadge(score) }
                         .buttonStyle(.plain)
                         .accessibilityHint("Shows how this score is made")
@@ -571,7 +572,7 @@ struct SleepCardView: View {
                 }
             }
         }
-        if latest?.scoreBreakdown != nil {
+        if hasScoreBreakdown {
             Button { showScoreBreakdown = true } label: {
                 HStack(spacing: 4) {
                     Text("How this score is made")

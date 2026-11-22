@@ -723,12 +723,17 @@ struct OpenCircuitApp: App {
 
     /// The destructive FOREGROUND-ONLY recovery: back up durable rollups, wipe the store files,
     /// rebuild a fresh store, restore the rollups, and raise `historyResetDefaultsKey`. Only reached
-    /// from `resolveContainer` when `isBackground == false`. (#40/#131)
-    private static func wipeAndRecoverForeground(schema: Schema, config: ModelConfiguration) -> ModelContainer {
+    /// from `resolveContainer` when `isBackground == false`. (#40/#131) Internal, not private, so a
+    /// test can run it on a scratch store and check what it clears.
+    static func wipeAndRecoverForeground(schema: Schema, config: ModelConfiguration) -> ModelContainer {
         // The app-support directory was already created by the failed `makeContainerOrThrow()`, so
         // `exportBeforeWipe` (which won't create it) can still read the old store.
         let backup = RollupBackup.exportBeforeWipe(config: config)
         removeStoreFiles(at: config.url)
+        // The saved Sleep Score factors describe rows that are gone. The rollup restore brings the
+        // scores back but not their factors, so those nights show the badge alone, like any night
+        // scored before factors were saved.
+        SleepScoreFactorStore.shared.removeAll()
         let fresh: ModelContainer
         do {
             fresh = try ModelContainer(for: schema, migrationPlan: MigrationPlan.self,

@@ -88,16 +88,16 @@ enum DemoData {
                 skinTempC: 33.55 + 0.22 * wiggle(i, 0.9),
                 sleepScore: Int(74 + 8 * progress + 5 * wiggle(i, 0.5)),
                 stressScore: Int(44 - 10 * progress + 4 * wiggle(i, 1.7)))
-            // Last night is a wearer-edited night, so its score is the four-factor kind that can be
-            // rebuilt from the row and the Sleep card offers "How this score is made".
+            // Last night's score is written the way a sync writes it: one composite call, its factors
+            // saved with it, so the Sleep card offers "How this score is made" (`-OCDemoScreen sleep-score`).
             if n == 0 {
-                summary.isManuallyEdited = true
-                summary.editedInBedStart = bed
-                summary.editedInBedEnd = wake
-                summary.sleepScore = SleepScore.composite(.init(
+                let scored = SleepScoreFactors.scored(.init(
                     totalAsleep: TimeInterval(asleep * 60), timeAwake: TimeInterval(awake * 60),
                     efficiency: summary.efficiency, deep: TimeInterval(deep * 60),
-                    light: TimeInterval((asleep - deep - rem) * 60), rem: TimeInterval(rem * 60))).score
+                    light: TimeInterval((asleep - deep - rem) * 60), rem: TimeInterval(rem * 60),
+                    restingHR: 54, tempOffsetC: 0.2), producer: .ring)
+                summary.sleepScore = scored.score
+                SleepScoreFactorStore.shared.set(scored, night: summary.night)
             }
             // A synthetic stage timeline: ~90-minute cycles, deeper early and more REM late, with a
             // couple of brief wakes. The oldest nights get none, so the "timeline isn't stored"

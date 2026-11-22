@@ -15,14 +15,14 @@
 // from the night's stored inputs and returns nil unless that equals the stored score exactly. A
 // breakdown that disagrees with the number beside it is worse than none.
 //
-// ⚠️ NOT EVERY PRODUCER CAN BE REBUILT FROM THE ROW, AND `isReproducible` SAYS WHICH. Measured on one
-// real phone store (counts only, `reports/sleep-score-breakdown.md`): a night edited by the wearer
-// reproduces on every night, but a RING night's resting HR is derived from raw records that are not
-// kept (only the rounded per-stage averages are), and a STRAP night's HR/HRV rows were still arriving
-// after the score was written. Those producers reproduce on well under 90 % of nights, so `make` —
-// the one entry point the UI uses — returns nil for them. `rebuild` stays available so the arithmetic
-// is tested for every shape, and so the gate can be opened by persisting the factor inputs at scoring
-// time (a schema change, deliberately NOT done here — see the report).
+// TWO SOURCES, ONE RULE. The primary source is the night's SAVED entry (`SleepScoreFactors`), taken by
+// the writer in the same call that produced the score: `make(saved:storedScore:)` shows it only while
+// its score is still the row's. The fallback is a REBUILD from the row, and only where that was
+// measured to be exact: a night edited by the wearer reproduced on every night of one real phone store
+// (counts only, `reports/sleep-score-breakdown.md`). A ring night's resting HR comes from raw records
+// that are not kept, and a strap night's HR rows keep arriving after the score is written, so those
+// producers reproduced on well under 90 % of nights and `make(_:)` declines them
+// (`Producer.isReproducible`). Old ring/strap nights, scored before entries were saved, show nothing.
 //
 // Pure value-type math; nothing here changes the score, the weights or the mappings.
 
@@ -31,13 +31,13 @@ import Foundation
 public struct SleepScoreBreakdown: Equatable, Sendable {
 
     /// Which code produced the stored score, i.e. which optional inputs it was given.
-    public enum Producer: String, Equatable, Sendable, CaseIterable {
+    public enum Producer: String, Codable, Equatable, Sendable, CaseIterable {
         case ring       // `RingSession.computeSleepExtras`: HR + temperature offset when present
         case strap      // `StoredNightScore`: HR + temperature offset when present
         case edited     // `applySleepEdit` / `SleepScoreHeal`: never HR, never temperature
 
-        /// Whether a night from this producer can be rebuilt from its stored row closely enough to
-        /// be shown. Decided by measurement, not by argument: see the file header.
+        /// Whether a night from this producer can be REBUILT from its stored row closely enough to be
+        /// shown without a saved entry. Decided by measurement, not by argument: see the file header.
         public var isReproducible: Bool {
             switch self {
             case .edited: return true
@@ -117,8 +117,20 @@ public struct SleepScoreBreakdown: Equatable, Sendable {
 
     // MARK: - Entry points
 
-    /// The breakdown the UI may show: nil unless the producer is reproducible AND the rebuilt score
-    /// equals the stored one.
+    /// The breakdown for a night's SAVED entry: nil unless there is one, its score is still the row's
+    /// `storedScore`, and its own factors add up to that score. A night re-scored by a path that saved
+    /// nothing therefore shows nothing, never the previous score's factors.
+    public static func make(saved: SleepScoreFactors?, storedScore: Int) -> SleepScoreBreakdown? {
+        guard let saved, storedScore > 0,
+              saved.score == storedScore,               // still the row's score
+              saved.recomputedScore == saved.score      // and its own factors add up to it
+        else { return nil }
+        return breakdown(factors: saved.factors, weights: saved.weights,
+                         input: saved.inputs.compositeInput, score: saved.score)
+    }
+
+    /// The REBUILD the UI may show for a night with no saved entry: nil unless the producer is
+    /// reproducible AND the rebuilt score equals the stored one.
     public static func make(_ night: Night) -> SleepScoreBreakdown? {
         night.producer.isReproducible ? rebuild(night) : nil
     }
@@ -137,40 +149,46 @@ public struct SleepScoreBreakdown: Equatable, Sendable {
             restingHR: usesOptional ? night.restingHR : nil,
             tempOffsetC: usesOptional ? night.tempOffsetC : nil,
             sleepGoal: night.sleepGoal)
-        let composite = SleepScore.composite(input)
-        guard composite.score == night.storedScore else { return nil }
+        let entry = SleepScoreFactors.scored(input, producer: night.producer)
+        guard entry.score == night.storedScore else { return nil }
+        return breakdown(factors: entry.factors, weights: entry.weights, input: input, score: entry.score)
+    }
 
-        let total = composite.factors.keys.reduce(0.0) { $0 + (SleepScore.factorWeights[$1] ?? 0) }
+    /// Rows in weight order, each weight renormalised over the PRESENT factors.
+    private static func breakdown(factors: [String: Double], weights: [String: Double],
+                                  input: SleepScore.CompositeInput, score: Int) -> SleepScoreBreakdown? {
+        let present = SleepScore.Composite.Factor.allCases.filter { factors[$0.rawValue] != nil }
+        let total = present.reduce(0.0) { $0 + (weights[$1.rawValue] ?? 0) }
         guard total > 0 else { return nil }
-        let rows = SleepScore.Composite.Factor.allCases.compactMap { factor -> Row? in
-            guard let value = composite.factors[factor] else { return nil }
-            return Row(factor: factor,
-                       weight: (SleepScore.factorWeights[factor] ?? 0) / total,
-                       subScore: Int((value * 100).rounded()),
-                       valueText: valueText(factor, night: night, input: input))
+        let rows = present.map { factor in
+            Row(factor: factor,
+                weight: (weights[factor.rawValue] ?? 0) / total,
+                subScore: Int(((factors[factor.rawValue] ?? 0) * 100).rounded()),
+                valueText: valueText(factor, input: input))
         }
-        return SleepScoreBreakdown(rows: rows.sorted { $0.weight > $1.weight }, score: composite.score)
+        return SleepScoreBreakdown(rows: rows.sorted { $0.weight > $1.weight }, score: score)
     }
 
     // MARK: - Value text
 
-    private static func valueText(_ factor: SleepScore.Composite.Factor, night: Night,
+    private static func valueText(_ factor: SleepScore.Composite.Factor,
                                   input: SleepScore.CompositeInput) -> String {
+        func minutes(_ t: TimeInterval) -> Int { Int((t / 60).rounded()) }
         switch factor {
         case .timeAsleep:
-            return "\(duration(minutes: night.asleepMin)) of \(duration(minutes: Int((input.sleepGoal / 60).rounded()))) goal"
+            return "\(duration(minutes: minutes(input.totalAsleep))) of \(duration(minutes: minutes(input.sleepGoal))) goal"
         case .stages:
             let asleep = max(input.deep + input.light + input.rem, 1)
             return "\(Int(((input.deep + input.rem) / asleep * 100).rounded()))% deep + REM"
         case .efficiency:
-            return "\(Int((night.efficiency * 100).rounded()))% efficiency"
+            return "\(Int((input.efficiency * 100).rounded()))% efficiency"
         case .heartRate:
             return "\(Int((input.restingHR ?? 0).rounded())) bpm"
         case .temperature:
             let off = input.tempOffsetC ?? 0
             return abs(off) < 0.05 ? "0.0 °C" : String(format: "%+.1f °C", off)
         case .timeAwake:
-            return "\(duration(minutes: night.awakeMin, short: true)) awake"
+            return "\(duration(minutes: minutes(input.timeAwake), short: true)) awake"
         }
     }
 

@@ -1,6 +1,7 @@
 // "How this score is made": the factors behind the Sleep Score badge, opened from the Sleep card.
-// The rows come from `SleepScoreBreakdown` (Kit), which is only built when it adds up to the stored
-// score, so a night whose score cannot be rebuilt from its row simply has no sheet.
+// The rows come from `SleepScoreBreakdown` (Kit): the night's factors saved when its score was written,
+// or, for an edited night, a rebuild from the row. Either is shown only when it adds up to the badge,
+// so a night with neither simply has no sheet.
 
 import SwiftUI
 import OpenCircuitKit
@@ -8,13 +9,18 @@ import OpenCircuitKit
 extension StoredSleepSummary {
     /// The breakdown for this row's badge, nil when it cannot be shown (see `SleepScoreBreakdown`).
     ///
-    /// Only an edited night is rebuilt: its score was made from the stored minutes alone. A ring or
-    /// strap night's resting HR and temperature offset are not stored, so those producers are
-    /// declined by the Kit gate (`Producer.isReproducible`); `.ring` stands for both here and is
-    /// given no optional inputs, so it can never invent them.
+    /// First the factors SAVED when the score was written (`SleepScoreFactorStore`), shown only while
+    /// their score is still this row's. Without one, an EDITED night is rebuilt from its stored
+    /// minutes (measured exact on every edited night), and only if the rebuild equals the badge. A
+    /// ring or strap night scored before factors were saved has neither and shows the badge alone.
     var scoreBreakdown: SleepScoreBreakdown? {
-        SleepScoreBreakdown.make(.init(
-            storedScore: sleepScore, producer: isManuallyEdited ? .edited : .ring,
+        if let saved = SleepScoreBreakdown.make(saved: SleepScoreFactorStore.shared.entry(night: night),
+                                                storedScore: sleepScore) {
+            return saved
+        }
+        guard isManuallyEdited else { return nil }
+        return SleepScoreBreakdown.make(.init(
+            storedScore: sleepScore, producer: .edited,
             asleepMin: deepMin + lightMin + remMin, awakeMin: awakeMin,
             deepMin: deepMin, lightMin: lightMin, remMin: remMin, efficiency: efficiency))
     }
