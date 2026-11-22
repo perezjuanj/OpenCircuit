@@ -281,6 +281,20 @@ struct DemoScreenModifier: ViewModifier {
             HealthSourcesView()
         } else if id.hasPrefix("sources-"), let t = HealthSourceTopic(rawValue: String(id.dropFirst(8))) {
             HealthSourcesView(focus: t)
+        } else if id == "breathing" || id == "breathing-exhale" {
+            // A box-breathing session frozen in its inhale (3 s) or exhale (11 s), over a synthetic HR.
+            BreathingSessionView(source: VitalMeasureSource(demoState: VitalMeasureState(
+                                     control: .ring(active: true, enabled: true), streaming: true,
+                                     liveValue: 64, latestFrame: 64)),
+                                 demoFrozenElapsed: id == "breathing" ? 3 : 11)
+        } else if id == "helio-setup" {
+            HelioSetupView()
+        } else if id == "helio-setup-full" {
+            // The whole page in one frame (a simulator can't scroll unattended): tall, then scaled down.
+            GeometryReader { geo in
+                HelioSetupView().frame(width: geo.size.width / 0.45, height: geo.size.height / 0.45)
+                    .scaleEffect(0.45, anchor: .topLeading)
+            }
         } else if id == "sleep-score" {
             DemoSleepScoreSheet()
         } else {

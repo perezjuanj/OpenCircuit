@@ -25,6 +25,16 @@ After that OpenCircuit talks only to the strap. Nothing is sent to Zepp.
 strap's health data. Don't post it in bug reports or screenshots. OpenCircuit keeps it in
 the iOS Keychain.
 
+## Good to know
+
+- **Zepp can stay installed.** While Zepp is running it can take the strap's link, and a sync in
+  OpenCircuit then reports the strap busy. If that happens, close Zepp or turn off its Bluetooth
+  (Settings ▸ Zepp ▸ Bluetooth). Start workouts in OpenCircuit (Activity tab ▸ Workout).
+- **Never unpair the strap in Zepp.** It invalidates the key (see below).
+- **The first sync shows what the strap still holds**, often about a week. History then builds up
+  day by day, so a short first sync is not a fault.
+- Firmware updates for the strap are done in the Zepp app. OpenCircuit is iPhone only.
+
 ## What invalidates the key
 
 | Action | Effect | Source |
