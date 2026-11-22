@@ -31,7 +31,14 @@ struct HelioStatus: Equatable {
 
     /// Decision 6's coexistence copy, verbatim.
     static let dontUnpairCopy = "Don't unpair the strap in the Zepp app; unpairing makes the key stop working."
+    /// The direct instruction for a strap that is actually held (strap busy / not found / searching).
     static let zeppBluetoothCopy = "To let OpenCircuit connect, turn off Bluetooth for Zepp (Settings ▸ Zepp ▸ Bluetooth) or delete the Zepp app."
+
+    /// Setup and onboarding copy: Zepp can stay installed, and what to do if it takes the strap's link.
+    /// The status lines keep `zeppBluetoothCopy` as the direct instruction.
+    static let zeppCoexistCopy = "Zepp can stay installed. While Zepp is running it can take the strap's link, and a sync then "
+        + "reports the strap busy. If that happens, close Zepp or turn off its Bluetooth (Settings ▸ Zepp ▸ Bluetooth). "
+        + "Start workouts in OpenCircuit (Activity tab ▸ Workout)."
 
     /// - Parameters:
     ///   - connection: `HelioConnection.state`.

@@ -275,6 +275,14 @@ struct DemoScreenModifier: ViewModifier {
                                      control: .ring(active: true, enabled: true), streaming: true,
                                      liveValue: 64, latestFrame: 64)),
                                  demoFrozenElapsed: id == "breathing" ? 3 : 11)
+        } else if id == "helio-setup" {
+            HelioSetupView()
+        } else if id == "helio-setup-full" {
+            // The whole page in one frame (a simulator can't scroll unattended): tall, then scaled down.
+            GeometryReader { geo in
+                HelioSetupView().frame(width: geo.size.width / 0.45, height: geo.size.height / 0.45)
+                    .scaleEffect(0.45, anchor: .topLeading)
+            }
         } else {
             DemoLiveCard()
         }

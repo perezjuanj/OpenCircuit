@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import ZeppKit
 
 /// Profile ▸ Device (#215, decision 1): which wearable the app drives. One at a time; switching
@@ -62,6 +63,7 @@ struct HelioSetupView: View {
     @State private var keyText = ""
     @State private var editingKey = false
     @State private var saveError: String?
+    @State private var snippetCopied = false
     @State private var confirmForget = false
     /// Re-read after every key action: the Keychain isn't observable.
     @State private var hasKey = HelioKeyStore.shared.hasKey
@@ -90,8 +92,12 @@ struct HelioSetupView: View {
             Section {
                 bullet(HelioStatus.keyOriginCopy)
                 Link("How to get the key", destination: HelioStatus.keyGuideURL)
+                Button(snippetCopied ? "Copied" : "Copy key snippet") { copySnippet() }
+                Text("Paste it in the browser console on watchface.zepp.com while signed in on a computer. "
+                     + "Universal Clipboard can carry it to a Mac.")
+                    .font(.caption).foregroundStyle(.secondary)
                 bullet(HelioStatus.dontUnpairCopy)
-                bullet(HelioStatus.zeppBluetoothCopy)
+                bullet(HelioStatus.zeppCoexistCopy)
             } header: {
                 Text("Before you start")
             }
@@ -147,6 +153,13 @@ struct HelioSetupView: View {
                     }
                 }
             }
+
+            Section("Good to know") {
+                bullet(Self.firstSyncNote)
+                bullet(Self.reinstallNote)
+                bullet(Self.firmwareNote)
+                bullet(Self.iPhoneOnlyNote)
+            }
         }
         .navigationTitle("Amazfit Helio Strap")
         .navigationBarTitleDisplayMode(.inline)
@@ -159,6 +172,22 @@ struct HelioSetupView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("History stops syncing until a key is saved again. Stored history stays.")
+        }
+    }
+
+    static let firstSyncNote = "The first sync brings in only what the strap still holds, often about a week. "
+        + "History then builds up day by day."
+    static let reinstallNote = "OpenCircuit's own history lives on this phone and is removed if you delete the app. "
+        + "What was already written to Apple Health stays there."
+    static let firmwareNote = "Firmware updates for the strap are done in the Zepp app. OpenCircuit doesn't update firmware."
+    static let iPhoneOnlyNote = "OpenCircuit is iPhone only."
+
+    private func copySnippet() {
+        UIPasteboard.general.string = HelioKeySnippet.text
+        snippetCopied = true
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            snippetCopied = false
         }
     }
 

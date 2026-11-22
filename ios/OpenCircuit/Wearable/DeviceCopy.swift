@@ -82,11 +82,11 @@ extension ActiveDeviceChoice {
                 "Charge the ring as usual; OpenCircuit picks up where it left off.",
             ]
         case .helioStrap:
-            // `HelioSetupView`'s "Before you start", all three by reference.
+            // `HelioSetupView`'s "Before you start", all three by reference (the setup variant of the Zepp copy).
             return [
                 HelioStatus.keyOriginCopy,
                 HelioStatus.dontUnpairCopy,
-                HelioStatus.zeppBluetoothCopy,
+                HelioStatus.zeppCoexistCopy,
             ]
         }
     }
