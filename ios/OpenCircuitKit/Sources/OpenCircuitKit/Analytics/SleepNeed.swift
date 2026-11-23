@@ -14,24 +14,24 @@ import Foundation
 //   (Hirshkowitz 2015, Watson 2015).
 // - That restricted sleep accumulates (Van Dongen 2003) and takes several nights to repay (Kitamura
 //   2016) is the published basis for carrying debt at all.
-// - The 0.55 carry, the 14-night window, the 10-minute floor, the -60 / +120 minute bounds on need and the
+// - The 0.55 carry, the 14-night window, the 10-minute floor, the 18-hour nap bound, the -60 / +120 minute bounds on need and the
 //   15-minute default onset latency are OpenCircuit estimates, not published constants.
 //
 // The rule (decision 92i, superseding 92b-92d):
 // 1. A night is KNOWN when it has a stored row with `asleepMin > 0`. An unknown night is skipped
 //    entirely: never zero-filled, even if it had naps.
-// 2. Credited sleep for a night = its asleep minutes + the asleep minutes of the naps that START
-//    after that night's wake and before the earlier of the NEXT stored night's in-bed start and the end
-//    of the wake day (local midnight; decision 92k). Naps after the most
-//    recent stored night's wake are TODAY's naps: they lower tonight's need (below) and are not also
-//    credited to that night, so a nap is never counted twice.
+// 2. Every nap is counted once. A nap is TONIGHT's when it starts after the most recent stored night's
+//    wake and less than 18 hours before now: it lowers tonight's need (rule 4) and is never credited to a
+//    night. Every other nap is credited to the night it follows: its asleep minutes join that night's, when
+//    it STARTS after that night's wake and before the earlier of the next stored night's in-bed start and the
+//    end of that wake day (local midnight; decision 92k). The most recent stored night is credited like any
+//    other. A nap on a day with no stored night ending on it is counted nowhere.
 // 3. Debt is a recurrence over the most recent 14 KNOWN nights, oldest first, from 0:
 //    `debt = 0.55 * max(0, goal(night) + debt - credited(night))`; a result under 10 minutes clears
 //    to 0. Surplus sleep never makes a negative debt. With fewer than 3 known nights the debt is
 //    "not enough nights yet" and contributes 0.
 //    `goal(night)` is the weekday or weekend goal of the day the night ENDS on (decision 92a).
-// 4. Need tonight = goal + debt - today's nap minutes, clamped to [goal - 60, goal + 120] minutes.
-//    Today's naps start after the later of the last stored night's wake and today's local midnight.
+// 4. Need tonight = goal + debt - tonight's nap minutes, clamped to [goal - 60, goal + 120] minutes.
 // 5. Bedtime = next wake - need - onset latency; no wake time, no bedtime.
 // 6. Onset latency = median of (sleep onset - in-bed start) over the 14 most recent nights where both
 //    are recorded, clamped to 0...60 minutes; 15 minutes when fewer than 3 such nights.
@@ -47,6 +47,8 @@ public enum SleepNeed {
     public static let maxAboveGoalMin = 120
     public static let latencyWindowNights = 14
     public static let minLatencyNights = 3
+    /// A nap this recent (and after the last stored night's wake) is tonight's, not a past night's.
+    public static let tonightNapWindow: TimeInterval = 18 * 3600
     public static let defaultLatencyMin = 15
     public static let latencyRangeMin = 0...60
 
@@ -116,7 +118,7 @@ public enum SleepNeed {
         /// Known nights the debt was worked out over: at most 14, 0 when there are not enough.
         public var nightsUsed: Int
         public var debtMin: Int
-        /// Asleep minutes of the naps after the last stored night's wake and before now.
+        /// Asleep minutes of tonight's naps (after the last stored night's wake, under 18 hours before now).
         public var napMin: Int
         /// goal + debt - naps before the clamp.
         public var unclampedNeedMin: Int
@@ -140,23 +142,25 @@ public enum SleepNeed {
         let enough = known.count >= minKnownNights
         var debt = 0.0
         let window = enough ? Array(known.suffix(debtWindowNights)) : []
+        let lastWake = ordered.last?.wake
+        func isTonights(_ nap: Nap) -> Bool {
+            (lastWake.map { nap.start > $0 } ?? true)
+                && nap.start > input.now.addingTimeInterval(-tonightNapWindow) && nap.start < input.now
+        }
+        // A nap that has not started yet counts nowhere.
+        let pastNaps = input.naps.filter { $0.start < input.now && !isTonights($0) }
         for night in window {
             let goal = goalMin(endingOn: night.wake, input)
-            let credited = night.asleepMin + napCredit(for: night, in: ordered, naps: input.naps, calendar: cal)
+            let credited = night.asleepMin + napCredit(for: night, in: ordered, naps: pastNaps, calendar: cal)
             debt = carry * max(0, Double(goal) + debt - Double(credited))
             if debt < Double(debtFloorMin) { debt = 0 }
         }
         let debtMin = Int(debt.rounded())
 
-        // Today's naps: after the later of the last stored night's wake and today's local midnight, and
-        // before now (decision 92k).
-        let midnight = cal.startOfDay(for: input.now)
-        let boundary = max(ordered.last?.wake ?? midnight, midnight)
-        let napMin = input.naps
-            .filter { $0.start > boundary && $0.start < input.now }
-            .reduce(0) { $0 + max(0, $1.asleepMin) }
+        // Tonight's naps (decision 92l): after the last stored night's wake, within the last 18 hours.
+        let napMin = input.naps.filter(isTonights).reduce(0) { $0 + max(0, $1.asleepMin) }
 
-        let goal = goalMin(endingOn: tonightEndDay(input, lastWake: ordered.last?.wake), input)
+        let goal = goalMin(endingOn: tonightEndDay(input, lastWake: lastWake), input)
         let unclamped = goal + debtMin - napMin
         let need = min(max(unclamped, goal - maxBelowGoalMin), goal + maxAboveGoalMin)
 
@@ -186,14 +190,14 @@ public enum SleepNeed {
         GoalDefaults.isWeekend(wake, calendar: input.calendar) ? input.weekendGoalMin : input.workdayGoalMin
     }
 
-    /// Asleep minutes of the naps credited to `night` (decision 92k): those starting after its wake and
+    /// Asleep minutes of the naps credited to `night` (decisions 92k, 92l): those starting after its wake and
     /// before the EARLIER of the next stored night's in-bed start and the end of the wake day (the local
     /// midnight after the wake). A nap on a day with no stored night ending that day credits nothing. The
-    /// most recent stored night credits none (those naps are today's, and lower tonight's need instead).
+    /// most recent stored night is credited like any other; `naps` must already exclude tonight's naps.
     static func napCredit(for night: Night, in ordered: [Night], naps: [Nap], calendar: Calendar) -> Int {
-        guard let idx = ordered.firstIndex(where: { $0.wake == night.wake && $0.inBedStart == night.inBedStart }),
-              idx + 1 < ordered.count else { return 0 }
-        let nextBed = ordered[idx + 1].inBedStart
+        guard let idx = ordered.firstIndex(where: { $0.wake == night.wake && $0.inBedStart == night.inBedStart })
+        else { return 0 }
+        let nextBed = idx + 1 < ordered.count ? ordered[idx + 1].inBedStart : Date.distantFuture
         let endOfWakeDay = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: night.wake))
             ?? .distantFuture
         let until = min(nextBed, endOfWakeDay)

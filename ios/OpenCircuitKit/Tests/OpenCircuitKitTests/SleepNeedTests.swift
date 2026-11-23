@@ -265,16 +265,16 @@ final class SleepNeedTests: XCTestCase {
         XCTAssertEqual(nap(at(2, 15)), 0)                 // yesterday's nap (credited to its own night)
     }
 
-    func testWithNoStoredNightTodayMeansAfterLocalMidnight() {
+    func testWithNoStoredNightTonightsNapsAreTheLast18Hours() {
         let now = at(2, 15)
         func nap(_ start: Date) -> Int {
             SleepNeed.compute(.init(nights: [], naps: [.init(start: start, asleepMin: 25)], now: now,
                                     workdayGoalMin: workday, weekendGoalMin: weekend,
                                     nextWake: at(3, 7), calendar: cal)).napMin
         }
-        XCTAssertEqual(nap(at(2, 0, 1)), 25)
-        XCTAssertEqual(nap(at(2, 0)), 0)
-        XCTAssertEqual(nap(at(1, 23, 59)), 0)
+        XCTAssertEqual(nap(at(1, 21, 1)), 25)             // 17 h 59 m before now
+        XCTAssertEqual(nap(at(1, 21)), 0)                 // exactly 18 h
+        XCTAssertEqual(nap(at(1, 20, 59)), 0)
     }
 
     func testNeedIsGoalPlusDebtMinusNaps() {
@@ -529,16 +529,17 @@ final class SleepNeedRound2Tests: XCTestCase {
 
     // MARK: Tonight's naps
 
-    func testTonightsNapsNeverReachBackBeforeTodaysMidnight() {
-        // The last stored night woke yesterday at 06:40; a nap yesterday afternoon is not tonight's.
+    func testTonightsNapsNeverReachBackMoreThan18Hours() {
+        // The last stored night woke yesterday at 06:40; a nap 28 hours ago is not tonight's.
         let nights = [n(1, 450), n(2, 450), n(3, 450)]
         let now = at(4, 18)
         func nap(_ start: Date) -> Int {
             run(nights, naps: [.init(start: start, asleepMin: 40)], now: now, wake: at(5, 6, 40)).napMin
         }
-        XCTAssertEqual(nap(at(3, 14)), 0)                  // yesterday: after the last wake, before midnight
-        XCTAssertEqual(nap(at(4, 0)), 0)                   // exactly local midnight
-        XCTAssertEqual(nap(at(4, 0, 1)), 40)
+        XCTAssertEqual(nap(at(3, 14)), 0)                  // 28 h before now
+        XCTAssertEqual(nap(at(3, 23, 59)), 0)              // 18 h 1 m
+        XCTAssertEqual(nap(at(4, 0)), 0)                   // exactly 18 h before now
+        XCTAssertEqual(nap(at(4, 0, 1)), 40)               // 17 h 59 m
         XCTAssertEqual(nap(at(4, 13)), 40)
     }
 
@@ -549,6 +550,89 @@ final class SleepNeedRound2Tests: XCTestCase {
         }
         XCTAssertEqual(nap(at(4, 6, 39)), 0)               // before the 06:40 wake
         XCTAssertEqual(nap(at(4, 6, 41)), 40)
+    }
+
+    // MARK: S2 (decision 92l): one nap rule, nothing counted twice or nowhere
+
+    // The reviewer's probe parameters, asserting the fixed behaviour.
+    func testUnsyncedLastNightCreditsFridaysNightNotTonight() {
+        // The night ending Saturday is not synced yet. Fri 15:00 nap, now Sat 18:00 (27 h later): not
+        // tonight's, so it is credited to Friday's night (390 + 60 = 450 = the goal: no debt).
+        let r = run([n(1, 450), n(2, 450), n(3, 390)], naps: [.init(start: at(3, 15), asleepMin: 60)],
+                    now: at(4, 18), wake: nil)
+        XCTAssertEqual(r.napMin, 0)
+        XCTAssertEqual(r.debtMin, 0)
+        XCTAssertEqual(r.needMin, 510)                     // goal for Sunday, nothing owed, no nap to take off
+        let without = run([n(1, 450), n(2, 450), n(3, 390)], now: at(4, 18), wake: nil)
+        XCTAssertEqual(without.debtMin, 33)                // the same night without the nap
+    }
+
+    func testNoJumpAtLocalMidnightForAnEveningNap() {
+        let nights = [n(1, 450), n(2, 450), n(3, 450)]
+        let nap: [SleepNeed.Nap] = [.init(start: at(3, 15), asleepMin: 60)]
+        let before = run(nights, naps: nap, now: at(3, 23, 30), wake: nil)
+        let after = run(nights, naps: nap, now: at(4, 0, 30), wake: nil)
+        XCTAssertEqual(before.napMin, 60)
+        XCTAssertEqual(after.napMin, 60)
+        XCTAssertEqual(before.needMin, 450)
+        XCTAssertEqual(after.needMin, 450)                 // was 510 when midnight dropped the nap
+        XCTAssertEqual(before.goalMin, 510)
+        XCTAssertEqual(after.goalMin, 510)
+    }
+
+    func testASaturdayAfternoonNapWithSaturdaysNightUnsyncedIsTonights() {
+        // Last stored night woke Friday. Sat 15:00 nap, now Sat 18:00: 3 h before now, after the last wake.
+        let r = run([n(1, 450), n(2, 450), n(3, 450)], naps: [.init(start: at(4, 15), asleepMin: 60)],
+                    now: at(4, 18), wake: nil)
+        XCTAssertEqual(r.napMin, 60)
+        XCTAssertEqual(r.debtMin, 0)
+        XCTAssertEqual(r.needMin, 450)                     // Sunday goal 510 - 60
+    }
+
+    func testTheEighteenHourBoundaryAndOneMinuteEitherSide() {
+        // Last stored night woke Fri 06:40. Now Sat 12:00; a nap at Fri 18:00 is exactly 18 h before now.
+        let nights = [n(1, 450), n(2, 450), n(3, 390)]
+        let now = at(4, 12)
+        func r(_ start: Date) -> SleepNeed.Result {
+            run(nights, naps: [.init(start: start, asleepMin: 60)], now: now, wake: nil)
+        }
+        // 17 h 59 m: tonight's; need takes it off and Friday's night is not credited.
+        XCTAssertEqual(r(at(3, 18, 1)).napMin, 60)
+        XCTAssertEqual(r(at(3, 18, 1)).debtMin, 33)
+        // Exactly 18 h: not tonight's; credited to Friday's night (still on Friday's wake day).
+        XCTAssertEqual(r(at(3, 18)).napMin, 0)
+        XCTAssertEqual(r(at(3, 18)).debtMin, 0)
+        // 18 h 1 m: credited the same way.
+        XCTAssertEqual(r(at(3, 17, 59)).napMin, 0)
+        XCTAssertEqual(r(at(3, 17, 59)).debtMin, 0)
+    }
+
+    func testANapIsNeverCountedTwice() {
+        // Tonight's nap lowers need and does not also credit the last stored night's debt.
+        let nights = [n(1, 450), n(2, 450), n(3, 390)]
+        let with = run(nights, naps: [.init(start: at(3, 15), asleepMin: 60)], now: at(3, 20), wake: nil)
+        let without = run(nights, now: at(3, 20), wake: nil)
+        XCTAssertEqual(with.napMin, 60)
+        XCTAssertEqual(with.debtMin, without.debtMin)
+        XCTAssertEqual(with.needMin, without.needMin - 60)
+    }
+
+    func testANapOlderThan18HoursOnNoNightsWakeDayIsCountedNowhere() {
+        // Fri 15:00 nap, last stored night ended Thursday; now Sat 18:00 (27 h). Not tonight's, and Friday
+        // is no stored night's wake day.
+        let nights = [n(0, 450), n(1, 450), n(2, 390)]
+        let with = run(nights, naps: [.init(start: at(3, 15), asleepMin: 60)], now: at(4, 18), wake: nil)
+        let without = run(nights, now: at(4, 18), wake: nil)
+        XCTAssertEqual(with.napMin, 0)
+        XCTAssertEqual(with.debtMin, without.debtMin)
+    }
+
+    func testANapThatHasNotStartedYetCountsNowhere() {
+        let nights = [n(1, 450), n(2, 450), n(3, 390)]
+        let future = run(nights, naps: [.init(start: at(3, 21), asleepMin: 99)], now: at(3, 20), wake: nil)
+        let none = run(nights, now: at(3, 20), wake: nil)
+        XCTAssertEqual(future.napMin, 0)
+        XCTAssertEqual(future.debtMin, none.debtMin)
     }
 
     // MARK: N1: tonight's goal day without a wake time

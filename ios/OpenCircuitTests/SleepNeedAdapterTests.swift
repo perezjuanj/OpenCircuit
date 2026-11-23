@@ -70,8 +70,8 @@ final class SleepNeedAdapterTests: XCTestCase {
         XCTAssertEqual(result.bedtime, at(4, 6, 30).addingTimeInterval(-501 * 60))
     }
 
-    func testAnEnabledScheduleWithRecordedSleepAroundUsesTheManualWakeOnly() {
-        // The recorded rows (a mirrored nap window included) never decide the wake: only the manual schedule.
+    func testTheManualWakeIsUsedWhateverNapsAndNightsAreStored() {
+        // Stored nights and a nap ending at 14:45 are present; the wake is the manual 07:15, nothing else.
         let defaults = suite()
         defaults.set(true, forKey: SleepScheduleDefaults.enabled)
         defaults.set(23 * 60, forKey: SleepScheduleDefaults.bedMinutes)
@@ -95,6 +95,37 @@ final class SleepNeedAdapterTests: XCTestCase {
                           "scheduledWakeMinutes", "import HealthKit"] {
             XCTAssertFalse(code.contains(forbidden), "SleepNeedAdapter must not use \(forbidden)")
         }
+    }
+
+    /// The files that name the recorded-sleep reader or the swap point, measured on master (line counts, so
+    /// a new use in an existing file moves the number). The Sleep need files are never in it: a bedtime must
+    /// not come from sleep samples read back from Health (decision 92k/92l). A change here is deliberate.
+    private static let namedOnMaster: [String: Int] = [
+        "OpenCircuit/BLE/RingSession.swift": 2,
+        "OpenCircuit/Export/ExportBuilder.swift": 1,
+        "OpenCircuit/Health/HealthKitWriter.swift": 1,
+        "OpenCircuit/SleepSchedule.swift": 5,
+    ]
+
+    func testOnlyTheMeasuredFilesNameTheRecordedSleepReaders() throws {
+        let appDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("OpenCircuit")
+        let files = try XCTUnwrap(FileManager.default.enumerator(at: appDir, includingPropertiesForKeys: nil))
+        var found: [String: Int] = [:]
+        var scanned = 0
+        for case let url as URL in files where url.pathExtension == "swift" {
+            scanned += 1
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+                .filter { $0.contains("SleepSchedule.current") || $0.contains("HealthKitSleepSchedule") }
+            if !lines.isEmpty {
+                found[String(url.path.dropFirst(appDir.deletingLastPathComponent().path.count + 1))] = lines.count
+            }
+        }
+        XCTAssertGreaterThan(scanned, 100, "the scan must see the app's source files")
+        XCTAssertEqual(found, Self.namedOnMaster)
+        XCTAssertNil(found["OpenCircuit/SleepNeedAdapter.swift"])
+        XCTAssertNil(found["OpenCircuit/SleepNeedView.swift"])
     }
 
     // MARK: Row mapping

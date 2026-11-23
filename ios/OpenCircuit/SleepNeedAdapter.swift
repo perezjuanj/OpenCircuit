@@ -3,7 +3,7 @@
 //
 // The wake time comes ONLY from the manual sleep schedule set in OpenCircuit's Profile, and only while it is
 // switched on (decision 92k, the `ExportBuilder.manualScheduleWake` precedent). It never comes from the
-// schedule swap point, `HealthKitSleepSchedule` (that reads RECORDED sleep from any source, this app's own
+// schedule swap point or its HealthKit reader (that reads RECORDED sleep from any source, this app's own
 // mirrored nights and naps included, so it is not a schedule), `LocalStore.scheduledWakeMinutes()` or the
 // registered bed/wake defaults: those would show a bedtime the person never chose.
 
