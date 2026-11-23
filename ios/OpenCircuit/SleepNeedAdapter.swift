@@ -1,9 +1,11 @@
 // Sleep need on the Sleep card (#382, decision 92): reads the stored nights, naps, goals and the sleep
 // schedule, and hands plain values to the pure `SleepNeed` in OpenCircuitKit. Nothing here is persisted.
 //
-// The wake time comes ONLY from `SleepSchedule.current` (the iOS Sleep schedule, else the manual one when
-// it is switched on). It never comes from `LocalStore.scheduledWakeMinutes()` or from the registered
-// bed/wake defaults: with no schedule, those would show a bedtime the person never chose.
+// The wake time comes ONLY from the manual sleep schedule set in OpenCircuit's Profile, and only while it is
+// switched on (decision 92k, the `ExportBuilder.manualScheduleWake` precedent). It never comes from the
+// schedule swap point, `HealthKitSleepSchedule` (that reads RECORDED sleep from any source, this app's own
+// mirrored nights and naps included, so it is not a schedule), `LocalStore.scheduledWakeMinutes()` or the
+// registered bed/wake defaults: those would show a bedtime the person never chose.
 
 import Foundation
 import OpenCircuitKit
@@ -13,12 +15,12 @@ enum SleepNeedAdapter {
     /// Days of naps read for the per-night credit: the 14 known nights can span a few weeks of gaps.
     static let napLookbackDays = 45
 
-    /// The next wake time from the schedule, nil when there is no schedule.
-    static func nextWake(now: Date,
-                         calendar: Calendar = .current,
-                         healthKit: SleepScheduleProviding = HealthKitSleepSchedule(),
-                         manual: SleepScheduleProviding = ManualSleepSchedule.fromDefaults()) async -> Date? {
-        guard let window = await SleepSchedule.current(forNightEndingNear: now, healthKit: healthKit, manual: manual)
+    /// The next wake time from the manual schedule, nil when it is off. The schedule is injected so tests
+    /// never touch `UserDefaults.standard`.
+    static func nextWake(now: Date, calendar: Calendar = .current, schedule: ManualSleepSchedule) -> Date? {
+        guard schedule.enabled,
+              let window = SleepWindow.interval(bedMinutes: schedule.bedMinutes, wakeMinutes: schedule.wakeMinutes,
+                                                nightEndingNear: now, calendar: calendar)
         else { return nil }
         return SleepNeed.nextOccurrence(clockTimeOf: window.end, after: now, calendar: calendar)
     }
@@ -48,10 +50,9 @@ enum SleepNeedAdapter {
     static func compute(nights rows: [StoredSleepSummary], naps napRows: [StoredNap], now: Date,
                         calendar: Calendar = .current,
                         defaults: UserDefaults = .standard,
-                        healthKit: SleepScheduleProviding = HealthKitSleepSchedule(),
-                        manual: SleepScheduleProviding? = nil) async -> SleepNeed.Result {
-        let wake = await nextWake(now: now, calendar: calendar, healthKit: healthKit,
-                                  manual: manual ?? ManualSleepSchedule.fromDefaults(defaults))
+                        schedule: ManualSleepSchedule? = nil) -> SleepNeed.Result {
+        let wake = nextWake(now: now, calendar: calendar,
+                            schedule: schedule ?? ManualSleepSchedule.fromDefaults(defaults))
         let goal = goals(defaults: defaults)
         return SleepNeed.compute(.init(nights: nights(rows), naps: naps(napRows), now: now,
                                        workdayGoalMin: goal.workday, weekendGoalMin: goal.weekend,
@@ -80,7 +81,12 @@ enum SleepNeedText {
     }
 
     static func debt(_ result: SleepNeed.Result) -> String {
-        result.hasEnoughNights ? (result.debtMin > 0 ? duration(result.debtMin) : "none") : "not enough nights yet"
+        result.hasEnoughNights ? debtValue(result) : "not enough nights yet"
+    }
+
+    /// The debt figure once there are enough nights; zero reads "none" everywhere (line and sheet).
+    static func debtValue(_ result: SleepNeed.Result) -> String {
+        result.debtMin > 0 ? duration(result.debtMin) : "none"
     }
 
     /// "Need tonight 8 h 10 m · debt 45 m · in bed by 22:40".

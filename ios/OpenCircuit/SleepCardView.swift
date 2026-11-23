@@ -78,6 +78,7 @@ struct SleepCardView: View {
     @State private var sleepNeed: (result: SleepNeed.Result, at: Date)?
     /// The "How sleep need is worked out" sheet.
     @State private var showSleepNeed = false
+    @Environment(\.scenePhase) private var scenePhase
     /// Runs a manual nap add/edit (#nap-parity) → success. nil originalStart = add, else edit.
     /// Injected by ContentView (→ RingSession.applyNapEdit). nil hides the nap edit/add affordance.
     var onNap: ((Date?, NapEdit.Window) async -> Bool)? = nil
@@ -509,7 +510,8 @@ struct SleepCardView: View {
             await refreshStageProvenance()
         }
         .task(id: SleepNeedKey(version: refresh.version, night: storedSleep.first?.night,
-                               updatedAt: storedSleep.first?.updatedAt, rows: storedSleep.count)) {
+                               updatedAt: storedSleep.first?.updatedAt, rows: storedSleep.count,
+                               active: scenePhase == .active)) {
             await refreshSleepNeed()
         }
         .sheet(isPresented: $showSleepNeed) {
@@ -566,6 +568,9 @@ struct SleepCardView: View {
         let night: Date?
         let updatedAt: Date?
         let rows: Int
+        /// The app is in the foreground: the line is worked out again on becoming active, so a bedtime
+        /// that has passed drops without waiting for a store change.
+        let active: Bool
     }
 
     /// Works out sleep need from the stored nights and recent naps. Read in a task, never in `body`.
@@ -574,7 +579,7 @@ struct SleepCardView: View {
         let cutoff = Calendar.current.date(byAdding: .day, value: -SleepNeedAdapter.napLookbackDays, to: now) ?? now
         let naps = (try? modelContext.fetch(FetchDescriptor<StoredNap>(
             predicate: #Predicate { $0.start >= cutoff }))) ?? []
-        let result = await SleepNeedAdapter.compute(nights: storedSleep, naps: naps, now: now)
+        let result = SleepNeedAdapter.compute(nights: storedSleep, naps: naps, now: now)
         guard !Task.isCancelled else { return }
         sleepNeed = (result, now)
     }

@@ -18,7 +18,7 @@ struct SleepNeedView: View {
                 Section {
                     row("Sleep goal", SleepNeedText.duration(result.goalMin),
                         "Your goal for the day tonight's sleep ends on, weekday or weekend. Change it in Profile.")
-                    row("Sleep debt", result.hasEnoughNights ? SleepNeedText.duration(result.debtMin) : "none yet",
+                    row("Sleep debt", result.hasEnoughNights ? SleepNeedText.debtValue(result) : "none yet",
                         result.hasEnoughNights
                             ? "Worked out over your last \(result.nightsUsed) recorded nights. A night with no recording is left out, not counted as no sleep."
                             : "Debt needs at least 3 recorded nights; you have \(result.knownNights). Until then it adds nothing.")
@@ -32,8 +32,8 @@ struct SleepNeedView: View {
                 Section {
                     row("Wake time", result.nextWake.map(SleepNeedText.clock) ?? "not set",
                         result.nextWake == nil
-                            ? "No sleep schedule is set, so there is no bedtime to suggest. Turn on a sleep schedule in Profile to get one."
-                            : "From your sleep schedule.")
+                            ? "No sleep schedule is set in OpenCircuit, so there is no bedtime to suggest. Turn on a sleep schedule in Profile to get one."
+                            : "From the sleep schedule you set in OpenCircuit (Profile).")
                     row("Time to fall asleep", SleepNeedText.duration(result.latencyMin),
                         result.latencyIsDefault
                             ? "Assumed until 3 nights record when you fell asleep."

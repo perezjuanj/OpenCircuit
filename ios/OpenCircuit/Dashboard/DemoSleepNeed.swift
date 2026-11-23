@@ -34,13 +34,17 @@ enum DemoSleepNeed {
             row.deepMin = Int(Double(asleep) * 0.19)
             row.remMin = Int(Double(asleep) * 0.23)
             row.lightMin = asleep - row.deepMin - row.remMin
-            row.awakeMin = max(0, Int(row.inBedEnd.timeIntervalSince(row.inBedStart) / 60) - asleep)
+            row.awakeMin = 40
             row.hypnogramData = Data()
+            // The in-bed window agrees with the minutes: asleep plus 40 awake, ending at the same wake.
+            row.inBedStart = row.inBedEnd.addingTimeInterval(-Double(asleep + row.awakeMin) * 60)
+            row.sleepOnset = row.inBedStart.addingTimeInterval(12 * 60)
+            row.sleepWake = row.inBedEnd.addingTimeInterval(-6 * 60)
         }
         // A nap after this morning's wake and before now, so it counts toward today.
         if let wake = rows.first?.inBedEnd {
             let start = max(wake.addingTimeInterval(30 * 60), now.addingTimeInterval(-90 * 60))
-            if start < now {
+            if start.addingTimeInterval(45 * 60) <= now {
                 context.insert(StoredNap(start: start, end: start.addingTimeInterval(45 * 60), asleepMin: 40))
             }
         }
@@ -64,7 +68,7 @@ struct DemoSleepNeedSheet: View {
         }
         .task(id: nights.count + naps.count) {
             let now = Date()
-            result = (await SleepNeedAdapter.compute(nights: nights, naps: naps, now: now), now)
+            result = (SleepNeedAdapter.compute(nights: nights, naps: naps, now: now), now)
         }
     }
 }
