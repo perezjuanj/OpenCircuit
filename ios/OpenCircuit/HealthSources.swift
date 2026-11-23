@@ -29,7 +29,7 @@ struct HealthCitation: Hashable {
 }
 
 enum HealthSourceTopic: String, CaseIterable, Identifiable, Hashable {
-    case heartRate, restingHR, hrv, sleep, sleepScore, readiness, strain, calories, activity, vo2Max,
+    case heartRate, restingHR, hrv, sleep, sleepScore, sleepNeed, readiness, strain, calories, activity, vo2Max,
          heartRateRecovery, skinTemperature, illness, cycle, headache, pai
 
     var id: String { rawValue }
@@ -73,6 +73,12 @@ enum HealthSources {
     private static let watson = HealthCitation(
         "Watson NF et al. (2015). Recommended amount of sleep for a healthy adult: a joint consensus statement of the American Academy of Sleep Medicine and Sleep Research Society. Sleep 38(6):843–844.",
         doi: "10.5665/sleep.4716")
+    private static let vanDongen = HealthCitation(
+        "Van Dongen HPA, Maislin G, Mullington JM, Dinges DF (2003). The cumulative cost of additional wakefulness: dose-response effects on neurobehavioral functions and sleep physiology from chronic sleep restriction and total sleep deprivation. Sleep 26(2):117–126.",
+        doi: "10.1093/sleep/26.2.117")
+    private static let kitamura = HealthCitation(
+        "Kitamura S et al. (2016). Estimating individual optimal sleep duration and potential sleep debt. Scientific Reports 6:35812.",
+        doi: "10.1038/srep35812")
     private static let borresen = HealthCitation(
         "Borresen J, Lambert MI (2009). The quantification of training load, the training response and the effect on performance. Sports Medicine 39(9):779–795. (Describes Edwards' heart-rate-zone training impulse, TRIMP.)",
         doi: "10.2165/11317780-000000000-00000")
@@ -141,6 +147,18 @@ enum HealthSources {
                     "Ohayon M et al. (2017). National Sleep Foundation's sleep quality recommendations: first report. Sleep Health 3(1):6–19.",
                     doi: "10.1016/j.sleh.2016.11.006"),
             ]),
+        // SleepNeed.swift (OpenCircuitKit), SleepNeedAdapter.swift
+        HealthSource(
+            topic: .sleepNeed, title: "Sleep need, sleep debt and bedtime",
+            method: "Your sleep goal is the one you set (weekday or weekend, adults are advised 7–9 hours). "
+                + "A short night leaves a shortfall, and research finds that restricted sleep accumulates and "
+                + "takes several nights to repay, so OpenCircuit carries part of each shortfall into the next "
+                + "night over your last 14 recorded nights. Tonight's need is your goal plus that debt, "
+                + "less any naps you have slept today. The carry share (0.55), the 14-night window, the "
+                + "10-minute floor and the limits on need (1 hour under to 2 hours over your goal) are "
+                + "OpenCircuit's own choices, not published figures. Bedtime is your wake time minus need "
+                + "and the time you usually take to fall asleep.",
+            citations: [vanDongen, kitamura, hirshkowitz, watson]),
         // SleepStress.swift, WellnessBalance.swift, BaselineTrend.swift
         HealthSource(
             topic: .readiness, title: "Overnight stress and readiness",
