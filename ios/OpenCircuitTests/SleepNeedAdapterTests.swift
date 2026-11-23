@@ -104,7 +104,7 @@ final class SleepNeedAdapterTests: XCTestCase {
         "OpenCircuit/BLE/RingSession.swift": 2,
         "OpenCircuit/Export/ExportBuilder.swift": 1,
         "OpenCircuit/Health/HealthKitWriter.swift": 1,
-        "OpenCircuit/SleepSchedule.swift": 5,
+        "OpenCircuit/SleepSchedule.swift": 11,
     ]
 
     func testOnlyTheMeasuredFilesNameTheRecordedSleepReaders() throws {
@@ -117,7 +117,10 @@ final class SleepNeedAdapterTests: XCTestCase {
             scanned += 1
             let text = try String(contentsOf: url, encoding: .utf8)
             let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-                .filter { $0.contains("SleepSchedule.current") || $0.contains("HealthKitSleepSchedule") }
+                // `forNightEndingNear` catches a call that dodges the two type names (an unqualified
+                // `current(` inside `extension SleepSchedule`): every route to the window takes that label.
+                .filter { $0.contains("SleepSchedule.current") || $0.contains("HealthKitSleepSchedule")
+                    || $0.contains("forNightEndingNear") }
             if !lines.isEmpty {
                 found[String(url.path.dropFirst(appDir.deletingLastPathComponent().path.count + 1))] = lines.count
             }

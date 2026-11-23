@@ -154,8 +154,8 @@ enum HealthSources {
                 + "A short night leaves a shortfall, and research finds that restricted sleep accumulates and "
                 + "takes several nights to repay, so OpenCircuit carries part of each shortfall into the next "
                 + "night over your last 14 recorded nights. Tonight's need is your goal plus that debt, "
-                + "less any naps you have slept today. The carry share (0.55), the 14-night window, the "
-                + "10-minute floor and the limits on need (1 hour under to 2 hours over your goal) are "
+                + "less any naps since you last woke in the past 18 hours. The carry share (0.55), the 14-night "
+                + "window, the 10-minute floor, the 18-hour nap window and the limits on need (1 hour under to 2 hours over your goal) are "
                 + "OpenCircuit's own choices, not published figures. Bedtime is your wake time minus need "
                 + "and the time you usually take to fall asleep.",
             citations: [vanDongen, kitamura, hirshkowitz, watson]),

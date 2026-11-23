@@ -22,8 +22,8 @@ struct SleepNeedView: View {
                         result.hasEnoughNights
                             ? "Worked out over your last \(result.nightsUsed) recorded nights. A night with no recording is left out, not counted as no sleep."
                             : "Debt needs at least 3 recorded nights; you have \(result.knownNights). Until then it adds nothing.")
-                    row("Naps today", result.napMin > 0 ? "−\(SleepNeedText.duration(result.napMin))" : "none",
-                        "Sleep from naps since you woke, taken off tonight's need.")
+                    row("Recent naps", result.napMin > 0 ? "−\(SleepNeedText.duration(result.napMin))" : "none",
+                        "Naps since you last woke, in the past 18 hours, taken off tonight's need.")
                     row("Need tonight", SleepNeedText.duration(result.needMin), needNote)
                 } header: {
                     Text("Tonight")
@@ -54,8 +54,8 @@ struct SleepNeedView: View {
                          + "extra sleep never builds a credit. Need is held between 1 hour under and 2 hours over "
                          + "your goal.")
                         .font(.footnote)
-                    Text("The 55% carry, the 14-night window, the 10-minute floor, the limits on need and the "
-                         + "15-minute default for falling asleep are OpenCircuit estimates, not published figures. "
+                    Text("The 55% carry, the 14-night window, the 10-minute floor, the 18-hour window for recent "
+                         + "naps, the limits on need and the 15-minute default for falling asleep are OpenCircuit estimates, not published figures. "
                          + "This is an estimate to plan around, not medical advice.")
                         .font(.footnote).foregroundStyle(.secondary)
                 } header: {
