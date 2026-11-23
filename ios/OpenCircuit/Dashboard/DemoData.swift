@@ -145,6 +145,7 @@ enum DemoData {
             context.insert(StoredDaily(day: wakeDay, steps: daySteps, updatedAt: dayEnd))
         }
         try? context.save()
+        DemoSleepNeed.applyIfRequested(context, now: now)
     }
 
     /// The synthetic strap's afternoon: per-minute heart rate and all-day stress from the switch to
@@ -297,6 +298,8 @@ struct DemoScreenModifier: ViewModifier {
             }
         } else if id == "sleep-score" {
             DemoSleepScoreSheet()
+        } else if id == "sleep-need" {
+            DemoSleepNeedSheet()
         } else {
             DemoLiveCard()
         }

@@ -73,6 +73,12 @@ struct SleepCardView: View {
     @State private var editTarget: EditTarget?
     /// The "How this score is made" sheet (the factors behind the badge).
     @State private var showScoreBreakdown = false
+    /// Sleep need, debt and bedtime (#382), worked out off the render path from the stored nights and
+    /// naps. nil until the task has run; nil renders no line. Carries the time it was worked out at.
+    @State private var sleepNeed: (result: SleepNeed.Result, at: Date)?
+    /// The "How sleep need is worked out" sheet.
+    @State private var showSleepNeed = false
+    @Environment(\.scenePhase) private var scenePhase
     /// Runs a manual nap add/edit (#nap-parity) → success. nil originalStart = add, else edit.
     /// Injected by ContentView (→ RingSession.applyNapEdit). nil hides the nap edit/add affordance.
     var onNap: ((Date?, NapEdit.Window) async -> Bool)? = nil
@@ -503,6 +509,14 @@ struct SleepCardView: View {
         .task(id: StageProvenanceKey(night, liveCount: liveSegments.count)) {
             await refreshStageProvenance()
         }
+        .task(id: SleepNeedKey(version: refresh.version, night: storedSleep.first?.night,
+                               updatedAt: storedSleep.first?.updatedAt, rows: storedSleep.count,
+                               active: scenePhase == .active)) {
+            await refreshSleepNeed()
+        }
+        .sheet(isPresented: $showSleepNeed) {
+            if let sleepNeed { SleepNeedView(result: sleepNeed.result, computedAt: sleepNeed.at) }
+        }
         .sheet(isPresented: $showScoreBreakdown) {
             if let breakdown = latest?.scoreBreakdown { SleepScoreBreakdownView(breakdown: breakdown) }
         }
@@ -518,6 +532,56 @@ struct SleepCardView: View {
                     await onEditSleep?(target.night, window, coverage) ?? nil
                 })
         }
+    }
+
+    /// The rows under the score: the "How this score is made" link (unchanged from #378) and the sleep
+    /// need line (#382). One ViewBuilder child, because `content` is at the child limit.
+    @ViewBuilder
+    private func scoreFooter(hasScoreBreakdown: Bool) -> some View {
+        if hasScoreBreakdown {
+            Button { showScoreBreakdown = true } label: {
+                HStack(spacing: 4) {
+                    Text("How this score is made")
+                    Image(systemName: "chevron.right").font(.caption2.weight(.semibold))
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        if let sleepNeed {
+            Button { showSleepNeed = true } label: {
+                HStack(spacing: 4) {
+                    Text(SleepNeedText.line(sleepNeed.result, now: sleepNeed.at))
+                        .multilineTextAlignment(.leading)
+                    Image(systemName: "chevron.right").font(.caption2.weight(.semibold))
+                }
+                .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Shows how sleep need is worked out")
+        }
+    }
+
+    /// `.task(id:)` key for the sleep need line: the store-change signal plus the newest night.
+    private struct SleepNeedKey: Equatable {
+        let version: Int
+        let night: Date?
+        let updatedAt: Date?
+        let rows: Int
+        /// The app is in the foreground: the line is worked out again on becoming active, so a bedtime
+        /// that has passed drops without waiting for a store change.
+        let active: Bool
+    }
+
+    /// Works out sleep need from the stored nights and recent naps. Read in a task, never in `body`.
+    private func refreshSleepNeed() async {
+        let now = Date()
+        let cutoff = Calendar.current.date(byAdding: .day, value: -SleepNeedAdapter.napLookbackDays, to: now) ?? now
+        let naps = (try? modelContext.fetch(FetchDescriptor<StoredNap>(
+            predicate: #Predicate { $0.start >= cutoff }))) ?? []
+        let result = SleepNeedAdapter.compute(nights: storedSleep, naps: naps, now: now)
+        guard !Task.isCancelled else { return }
+        sleepNeed = (result, now)
     }
 
     private func makeEditTarget(_ row: StoredSleepSummary) -> EditTarget {
@@ -572,16 +636,7 @@ struct SleepCardView: View {
                 }
             }
         }
-        if hasScoreBreakdown {
-            Button { showScoreBreakdown = true } label: {
-                HStack(spacing: 4) {
-                    Text("How this score is made")
-                    Image(systemName: "chevron.right").font(.caption2.weight(.semibold))
-                }
-                .font(.caption).foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-        }
+        scoreFooter(hasScoreBreakdown: hasScoreBreakdown)
         stageTimeline(night)
         stageBar(night, m)
         stageLegend(night, m)
