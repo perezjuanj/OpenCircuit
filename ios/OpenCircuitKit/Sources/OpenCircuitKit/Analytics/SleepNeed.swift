@@ -21,7 +21,8 @@ import Foundation
 // 1. A night is KNOWN when it has a stored row with `asleepMin > 0`. An unknown night is skipped
 //    entirely: never zero-filled, even if it had naps.
 // 2. Credited sleep for a night = its asleep minutes + the asleep minutes of the naps that START
-//    after that night's wake and before the NEXT stored night's in-bed start. Naps after the most
+//    after that night's wake and before the earlier of the NEXT stored night's in-bed start and the end
+//    of the wake day (local midnight; decision 92k). Naps after the most
 //    recent stored night's wake are TODAY's naps: they lower tonight's need (below) and are not also
 //    credited to that night, so a nap is never counted twice.
 // 3. Debt is a recurrence over the most recent 14 KNOWN nights, oldest first, from 0:
@@ -30,6 +31,7 @@ import Foundation
 //    "not enough nights yet" and contributes 0.
 //    `goal(night)` is the weekday or weekend goal of the day the night ENDS on (decision 92a).
 // 4. Need tonight = goal + debt - today's nap minutes, clamped to [goal - 60, goal + 120] minutes.
+//    Today's naps start after the later of the last stored night's wake and today's local midnight.
 // 5. Bedtime = next wake - need - onset latency; no wake time, no bedtime.
 // 6. Onset latency = median of (sleep onset - in-bed start) over the 14 most recent nights where both
 //    are recorded, clamped to 0...60 minutes; 15 minutes when fewer than 3 such nights.
@@ -140,22 +142,21 @@ public enum SleepNeed {
         let window = enough ? Array(known.suffix(debtWindowNights)) : []
         for night in window {
             let goal = goalMin(endingOn: night.wake, input)
-            let credited = night.asleepMin + napCredit(for: night, in: ordered, naps: input.naps)
+            let credited = night.asleepMin + napCredit(for: night, in: ordered, naps: input.naps, calendar: cal)
             debt = carry * max(0, Double(goal) + debt - Double(credited))
             if debt < Double(debtFloorMin) { debt = 0 }
         }
         let debtMin = Int(debt.rounded())
 
-        // Today's naps: after the last stored night's wake (local midnight with none), before now.
-        let boundary = ordered.last?.wake ?? cal.startOfDay(for: input.now)
+        // Today's naps: after the later of the last stored night's wake and today's local midnight, and
+        // before now (decision 92k).
+        let midnight = cal.startOfDay(for: input.now)
+        let boundary = max(ordered.last?.wake ?? midnight, midnight)
         let napMin = input.naps
             .filter { $0.start > boundary && $0.start < input.now }
             .reduce(0) { $0 + max(0, $1.asleepMin) }
 
-        // Tonight's goal is the one for the day the night ends: the next wake's day, else tomorrow.
-        let endDay = input.nextWake
-            ?? cal.date(byAdding: .day, value: 1, to: input.now) ?? input.now
-        let goal = goalMin(endingOn: endDay, input)
+        let goal = goalMin(endingOn: tonightEndDay(input, lastWake: ordered.last?.wake), input)
         let unclamped = goal + debtMin - napMin
         let need = min(max(unclamped, goal - maxBelowGoalMin), goal + maxAboveGoalMin)
 
@@ -169,19 +170,34 @@ public enum SleepNeed {
                       nextWake: input.nextWake, bedtime: bedtime)
     }
 
+    /// The day tonight's sleep ends on: the next wake's day when there is one. Without a wake time
+    /// (decision 92k): tomorrow if the last stored night's wake is today, otherwise today before noon
+    /// (a night in progress after midnight), otherwise tomorrow.
+    static func tonightEndDay(_ input: Input, lastWake: Date?) -> Date {
+        if let wake = input.nextWake { return wake }
+        let cal = input.calendar
+        let tomorrow = cal.date(byAdding: .day, value: 1, to: input.now) ?? input.now
+        if let lastWake, cal.isDate(lastWake, inSameDayAs: input.now) { return tomorrow }
+        return cal.component(.hour, from: input.now) < 12 ? input.now : tomorrow
+    }
+
     /// The goal for a night that ends at `wake`: weekend or weekday by the wake day.
     static func goalMin(endingOn wake: Date, _ input: Input) -> Int {
         GoalDefaults.isWeekend(wake, calendar: input.calendar) ? input.weekendGoalMin : input.workdayGoalMin
     }
 
-    /// Asleep minutes of the naps credited to `night`: those starting after its wake and before the
-    /// next stored night's in-bed start. The most recent stored night credits none (those naps are
-    /// today's, and lower tonight's need instead).
-    static func napCredit(for night: Night, in ordered: [Night], naps: [Nap]) -> Int {
+    /// Asleep minutes of the naps credited to `night` (decision 92k): those starting after its wake and
+    /// before the EARLIER of the next stored night's in-bed start and the end of the wake day (the local
+    /// midnight after the wake). A nap on a day with no stored night ending that day credits nothing. The
+    /// most recent stored night credits none (those naps are today's, and lower tonight's need instead).
+    static func napCredit(for night: Night, in ordered: [Night], naps: [Nap], calendar: Calendar) -> Int {
         guard let idx = ordered.firstIndex(where: { $0.wake == night.wake && $0.inBedStart == night.inBedStart }),
               idx + 1 < ordered.count else { return 0 }
         let nextBed = ordered[idx + 1].inBedStart
-        return naps.filter { $0.start > night.wake && $0.start < nextBed }
+        let endOfWakeDay = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: night.wake))
+            ?? .distantFuture
+        let until = min(nextBed, endOfWakeDay)
+        return naps.filter { $0.start > night.wake && $0.start < until }
             .reduce(0) { $0 + max(0, $1.asleepMin) }
     }
 
