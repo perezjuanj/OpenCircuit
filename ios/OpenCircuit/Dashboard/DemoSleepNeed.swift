@@ -28,8 +28,14 @@ enum DemoSleepNeed {
         recent.fetchLimit = week.count
         guard let rows = try? context.fetch(recent), rows.count == week.count else { return }
         for (row, asleep) in zip(rows.reversed(), week) {
+            // The card's headline comes from the stage timeline when there is one, so drop it for these
+            // nights and keep the stored minutes consistent with `asleepMin`.
             row.asleepMin = asleep
+            row.deepMin = Int(Double(asleep) * 0.19)
+            row.remMin = Int(Double(asleep) * 0.23)
+            row.lightMin = asleep - row.deepMin - row.remMin
             row.awakeMin = max(0, Int(row.inBedEnd.timeIntervalSince(row.inBedStart) / 60) - asleep)
+            row.hypnogramData = Data()
         }
         // A nap after this morning's wake and before now, so it counts toward today.
         if let wake = rows.first?.inBedEnd {
