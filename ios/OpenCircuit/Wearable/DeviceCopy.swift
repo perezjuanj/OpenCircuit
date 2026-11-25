@@ -41,14 +41,16 @@ extension ActiveDeviceChoice {
 
     /// What the device needs besides OpenCircuit, for onboarding's welcome. The strap's facts are
     /// `docs/HELIO_KEY_EXTRACTION.md`'s: the key comes from the Zepp account the strap is paired to,
-    /// once, and every method needs a computer; OpenCircuit never signs in to Zepp.
+    /// once. The in-app lookup needs an email-and-password account; every other method needs a
+    /// computer. Syncing never signs in to Zepp.
     var accountSentence: String {
         switch self {
         case .ringConn: return "The ring needs no account."
         case .helioStrap:
-            return "The strap needs a Zepp account once: pairing it in the Zepp app has Zepp's servers create its key, "
-                + "which you copy out on a computer. After that, OpenCircuit talks only to the strap and never signs "
-                + "in to Zepp."
+            return "The strap needs a Zepp account once: pairing it in the Zepp app has Zepp's servers create its key. "
+                + "OpenCircuit can read the key from your account if you sign in to Zepp with an email and password; "
+                + "otherwise you copy it out on a computer. After that, OpenCircuit talks only to the strap and syncing "
+                + "never signs in to Zepp."
         }
     }
 

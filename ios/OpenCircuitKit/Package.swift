@@ -15,6 +15,7 @@ let package = Package(
     products: [
         .library(name: "OpenCircuitKit", targets: ["OpenCircuitKit"]),
         .library(name: "ZeppKit", targets: ["ZeppKit"]),
+        .library(name: "ZeppAccountKit", targets: ["ZeppAccountKit"]),
         // Test-only: the simulated strap shared by ZeppKitTests and the app's OpenCircuitTests.
         .library(name: "ZeppKitTesting", targets: ["ZeppKitTesting"]),
     ],
@@ -46,5 +47,11 @@ let package = Package(
         .executableTarget(name: "HelioVerify", dependencies: ["ZeppKit"]),
         // HelioVerify's command-line parsing (write gating), without Bluetooth.
         .testTarget(name: "HelioVerifyTests", dependencies: ["HelioVerify"]),
+        // The optional in-app key lookup: sign in to the user's own Zepp account once, read the
+        // strap's key, sign out. Ported from huami-token (MIT, docs/THIRD_PARTY_NOTICES.md), NOT
+        // from docs/ZEPP_PROTOCOL.md, so it stays out of ZeppKit's clean-room boundary. Foundation +
+        // CommonCrypto only. The only OpenCircuit code that contacts a vendor server.
+        .target(name: "ZeppAccountKit"),
+        .testTarget(name: "ZeppAccountKitTests", dependencies: ["ZeppAccountKit"]),
     ]
 )

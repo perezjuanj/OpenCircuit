@@ -128,8 +128,11 @@ nothing live. It never shows made-up data.
 **Getting the key**
 
 The key is created by Zepp's servers when you pair the strap in the Zepp app, so you need the
-Zepp app once. The one-time steps (a computer is needed) are in
-[`docs/HELIO_KEY_EXTRACTION.md`](docs/HELIO_KEY_EXTRACTION.md). Paste the key's 32
+Zepp app once. If you sign in to Zepp with an **email and password**, tap **Get the key from my
+Zepp account** in the strap's setup screen: OpenCircuit signs in once, reads the key, saves it and
+signs out (your email and password aren't saved). Accounts that use Google, Apple or another
+sign-in can't use that button; their one-time steps (a computer is needed) are in
+[`docs/HELIO_KEY_EXTRACTION.md`](docs/HELIO_KEY_EXTRACTION.md). Or paste the key's 32
 hexadecimal characters into OpenCircuit (spaces, colons and a leading `0x` are fine). It is
 kept in the iOS Keychain on this phone only, and never shown again, logged or exported.
 
@@ -183,7 +186,8 @@ The Helio Strap's data, HRV included, reaches Apple Health the same way.
 - **Nothing leaves your phone** except the data you choose to write into Apple Health.
 - **No RingConn cloud account, no subscription, no third-party server** — the ring talks
   BLE straight to a client you control. The Helio Strap needs a Zepp account once, to get its
-  key; after that OpenCircuit talks only to the strap.
+  key (the optional in-app lookup is the only time OpenCircuit contacts Zepp); after that
+  OpenCircuit talks only to the strap.
 - All decoding and analytics run **on-device**; raw BLE captures used for protocol
   reverse-engineering are gitignored and never committed — only decoded *findings* live
   in [`docs/PROTOCOL.md`](docs/PROTOCOL.md) (RingConn) and

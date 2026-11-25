@@ -41,14 +41,19 @@ final class DeviceCopyTests: XCTestCase {
     func testTheAccountBulletStatesTheStrapsKeyStepHonestly() {
         XCTAssertEqual(DeviceCopy.accounts,
                        "No subscription. The ring needs no account. The strap needs a Zepp account once: pairing it "
-                       + "in the Zepp app has Zepp's servers create its key, which you copy out on a computer. After "
-                       + "that, OpenCircuit talks only to the strap and never signs in to Zepp.")
-        // HELIO_KEY_EXTRACTION.md: the account, once, Zepp's servers create the key, a computer, no sign-in.
-        for fact in ["Zepp account", "once", "Zepp's servers", "computer", "never signs in"] {
+                       + "in the Zepp app has Zepp's servers create its key. OpenCircuit can read the key from your "
+                       + "account if you sign in to Zepp with an email and password; otherwise you copy it out on a "
+                       + "computer. After that, OpenCircuit talks only to the strap and syncing never signs in to Zepp.")
+        // HELIO_KEY_EXTRACTION.md: the account, once, Zepp's servers create the key, the in-app lookup's
+        // email-and-password limit, the computer fallback, and syncing never signs in.
+        for fact in ["Zepp account", "once", "Zepp's servers", "email and password", "computer", "never signs in"] {
             XCTAssertTrue(ActiveDeviceChoice.helioStrap.accountSentence.contains(fact), fact)
             XCTAssertTrue(HelioStatus.keyOriginCopy.contains(fact), "the key bullet: \(fact)")
         }
         XCTAssertFalse(DeviceCopy.accounts.contains("no cloud"), "the key step goes through Zepp's servers")
+        // The in-app lookup shipped: the old absolute claim must not come back.
+        XCTAssertFalse(HelioStatus.keyOriginCopy.contains("OpenCircuit never signs in to Zepp"))
+        XCTAssertFalse(ActiveDeviceChoice.helioStrap.accountSentence.contains("which you copy out on a computer"))
     }
 
     func testTheOneAtATimeLine() {
@@ -66,8 +71,9 @@ final class DeviceCopyTests: XCTestCase {
     func testTheKeyBulletIsOneConstantSharedWithTheSetupScreen() {
         XCTAssertEqual(HelioStatus.keyOriginCopy,
                        "The strap talks only to an app that knows its 16-byte key. Zepp's servers create the key once, "
-                       + "when you pair the strap in the Zepp app; you copy it from your Zepp account on a computer. "
-                       + "OpenCircuit never signs in to Zepp.")
+                       + "when you pair the strap in the Zepp app. If you sign in to Zepp with an email and password, "
+                       + "OpenCircuit can read the key from your Zepp account for you; otherwise you copy it out on a "
+                       + "computer. Syncing never signs in to Zepp.")
         XCTAssertEqual(ActiveDeviceChoice.helioStrap.firstSteps.first, HelioStatus.keyOriginCopy, "by reference")
     }
 

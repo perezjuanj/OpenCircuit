@@ -79,7 +79,11 @@ declaration, a setting that has no API, or something that needs a phone and a we
 4. **App Privacy label**: *owner* (no API). "Data Not Collected": App Privacy, Data Types, "No, we
    do not collect data from this app", Save, then **Publish** (top right). Until it is published
    Apple refuses the submission with `STATE_ERROR.APP_DATA_USAGES_REQUIRED`. True as long as
-   nothing leaves the device without the user choosing to share a file.
+   nothing leaves the device without the user choosing to share a file. **Owner to re-confirm
+   once the Zepp key lookup ships:** "Get the key from my Zepp account" sends the email and
+   password the user types straight to Zepp's servers (the user's own account provider, not a
+   partner of ours), once, on a tap, and keeps nothing but the strap's key on the phone. Our
+   reading is that this is not "collection" by us, but it's the owner's call.
 5. **Age rating**: *done*, **9+**. Answers: no medical or treatment information (the app gives no
    diagnosis, treatment or medication guidance), health or wellness topics yes, every other
    question none or no. Apple's age-rating table puts that at 9+; "infrequent" medical or
@@ -155,7 +159,7 @@ declaration, a setting that has no API, or something that needs a phone and a we
 
 ## 3. Review notes (as saved in ASC)
 
-> OpenCircuit reads health data from the user's own wearable (a RingConn Gen 2/Gen 3 smart ring or an Amazfit Helio Strap) over Bluetooth Low Energy and writes it to Apple Health. It has no account, no server and no analytics; all data stays on the device and in the user's HealthKit store. Because the app needs the wearable to show data, a screen recording from a real device is attached: the ring connecting, the Apple Health permission sheet, the Today screen with a live heart-rate measurement, the Sync from Ring and Sync to Apple Health buttons, and the Sleep tab. The Apple Health permission sheet in the recording lists Blood Pressure; the App Store build does not request Blood Pressure (that request exists only in development builds).
+> OpenCircuit reads health data from the user's own wearable (a RingConn Gen 2/Gen 3 smart ring or an Amazfit Helio Strap) over Bluetooth Low Energy and writes it to Apple Health. It has no account, no server and no analytics; all data stays on the device and in the user's HealthKit store. Helio Strap owners can optionally sign in to their own Zepp account once (email and password, sent directly to Zepp) so the app can read the strap's pairing key; the credentials are not stored, and nothing is sent to us. Because the app needs the wearable to show data, a screen recording from a real device is attached: the ring connecting, the Apple Health permission sheet, the Today screen with a live heart-rate measurement, the Sync from Ring and Sync to Apple Health buttons, and the Sleep tab. The Apple Health permission sheet in the recording lists Blood Pressure; the App Store build does not request Blood Pressure (that request exists only in development builds).
 >
 > Background modes:
 > - bluetooth-central: the wearable syncs its stored history when it reconnects, so Apple Health stays current without opening the app.
@@ -207,7 +211,9 @@ declaration, a setting that has no API, or something that needs a phone and a we
 
 ## 5. Export compliance
 
-What the binary contains: AES-128 through CommonCrypto (`ZeppAES`), NIST B-163 elliptic-curve
+What the binary contains: AES-128 through CommonCrypto (`ZeppAES`, and `ZeppPayloadCipher` in
+ZeppAccountKit, which wraps the optional Zepp sign-in form under a fixed public key before it goes
+over HTTPS: authentication to the user's own account, no confidentiality claim), NIST B-163 elliptic-curve
 Diffie-Hellman implemented in the app (`B163.swift`, a port of the public-domain
 tiny-ECDH-c, because CryptoKit has no binary curves), and SM3 for the ring's challenge
 response (`RingAuth`). All three are published standards; none is proprietary. They only
