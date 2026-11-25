@@ -53,9 +53,10 @@ struct DeviceChoiceView: View {
     }
 }
 
-/// Amazfit Helio Strap setup (#215 decisions 4–7): what works, the key (pasted, or read once from an
-/// email-and-password Zepp account through `ZeppSignInSheet`; Keychain either way), the Zepp
-/// coexistence warnings, then connect and the first sync.
+/// Amazfit Helio Strap setup (#215 decisions 4–7): what works, the Zepp coexistence warnings, the key
+/// (read once from an email-and-password Zepp account through `ZeppSignInSheet`; the computer guide,
+/// snippet and paste field sit in the small Troubleshooting section at the bottom; Keychain either
+/// way), then connect and the first sync.
 struct HelioSetupView: View {
     @State private var choice = ActiveDeviceChoiceStore.shared
     /// Read only while the strap is the chosen device: a ring user browsing this screen never
@@ -93,11 +94,6 @@ struct HelioSetupView: View {
 
             Section {
                 bullet(HelioStatus.keyOriginCopy)
-                Link("How to get the key", destination: HelioStatus.keyGuideURL)
-                Button(snippetCopied ? "Copied" : "Copy key snippet") { copySnippet() }
-                Text("Paste it in the browser console on watchface.zepp.com while signed in on a computer. "
-                     + "Universal Clipboard can carry it to a Mac.")
-                    .font(.caption).foregroundStyle(.secondary)
                 bullet(HelioStatus.dontUnpairCopy)
                 bullet(HelioStatus.zeppCoexistCopy)
             } header: {
@@ -119,31 +115,20 @@ struct HelioSetupView: View {
                 } else {
                     Button(ZeppSignInCopy.buttonTitle) { showZeppSignIn = true }
                     Text(ZeppSignInCopy.accountLimit).font(.caption).foregroundStyle(.secondary)
-                    SecureField("Or paste it: 32 characters, 0–9 and a–f", text: $keyText)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.body.monospaced())
-                    PasteButton(payloadType: String.self) { strings in
-                        if let first = strings.first { keyText = first }
-                    }
-                    Text(keyHint).font(.caption).foregroundStyle(normalized == nil ? Color.secondary : Theme.accent)
-                    Button(choice.isHelio ? "Save key and reconnect" : "Save key and use the Helio Strap") { saveAndConnect() }
-                        .disabled(normalized == nil)
                     if hasKey { Button("Cancel", role: .cancel) { editingKey = false; keyText = "" } }
                 }
                 if let saveError { Text(saveError).font(.caption).foregroundStyle(.red) }
             } header: {
                 Text("Key")
             } footer: {
-                Text("Stored in this phone's Keychain only. It's never shown again, logged or exported. "
-                     + "Spaces, colons and a leading 0x are fine.")
+                Text(Self.keyStorageNote)
             }
 
             if choice.isHelio {
                 Section("Status") {
                     HelioStatusRow(status: status)
                     if status.kind == .keyRejected || status.kind == .keyNeeded {
-                        Link("Get the key again", destination: HelioStatus.keyGuideURL)
+                        Button("Get the key again") { showZeppSignIn = true }
                     }
                     // Not offered for a rejected key: reconnecting would not retry it (decision 7).
                     if [.strapBusy, .notFound, .disconnected].contains(status.kind) {
@@ -164,6 +149,8 @@ struct HelioSetupView: View {
                 bullet(Self.firmwareNote)
                 bullet(Self.iPhoneOnlyNote)
             }
+
+            troubleshooting
         }
         .navigationTitle("Amazfit Helio Strap")
         .navigationBarTitleDisplayMode(.inline)
@@ -191,9 +178,47 @@ struct HelioSetupView: View {
         + "What was already written to Apple Health stays there."
     static let firmwareNote = "Firmware updates for the strap are done in the Zepp app. OpenCircuit doesn't update firmware."
     static let iPhoneOnlyNote = "OpenCircuit is iPhone only."
+    static let keyStorageNote = "Stored in this phone's Keychain only. It's never shown again, logged or exported."
+
+    /// The computer route (`docs/HELIO_KEY_EXTRACTION.md` Methods 1–2), for accounts the sign-in can't
+    /// use (Google/Apple/other sign-in) or when Zepp's sign-in breaks. Kept last and small: the button
+    /// in the Key section is the way we show.
+    static let troubleshootingIntro = "Zepp account uses Google, Apple or another sign-in, or the sign-in above "
+        + "doesn't work? Copy the key from your Zepp account on a computer, then paste it here."
+    static let snippetNote = "Paste the snippet in the browser console on watchface.zepp.com while signed in on a "
+        + "computer. Universal Clipboard can carry it to a Mac."
+    static let pasteNote = "Spaces, colons and a leading 0x are fine."
     /// Syncing never contacts a server; the only exception is the optional, one-time Zepp account lookup.
     static let noServerNote = "Syncing sends nothing to Zepp or any other server. The only time OpenCircuit contacts "
         + "Zepp is if you use \u{201C}\(ZeppSignInCopy.buttonTitle)\u{201D}, once."
+
+    /// Small print, at the bottom: the guide, the console snippet and the paste field.
+    private var troubleshooting: some View {
+        Section {
+            Text(Self.troubleshootingIntro).font(.footnote).foregroundStyle(.secondary)
+            Link("How to get the key", destination: HelioStatus.keyGuideURL).font(.footnote)
+            Button(snippetCopied ? "Copied" : "Copy key snippet") { copySnippet() }.font(.footnote)
+            Text(Self.snippetNote).font(.caption).foregroundStyle(.secondary)
+            SecureField("Paste the key: 32 characters, 0–9 and a–f", text: $keyText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.footnote.monospaced())
+            PasteButton(payloadType: String.self) { strings in
+                if let first = strings.first { keyText = first }
+            }
+            .controlSize(.small)
+            Text(keyHint).font(.caption).foregroundStyle(normalized == nil ? Color.secondary : Theme.accent)
+            Button(choice.isHelio ? "Save pasted key and reconnect" : "Save pasted key and use the Helio Strap") {
+                saveAndConnect()
+            }
+            .font(.footnote)
+            .disabled(normalized == nil)
+        } header: {
+            Text("Troubleshooting")
+        } footer: {
+            Text(Self.pasteNote)
+        }
+    }
 
     private func copySnippet() {
         UIPasteboard.general.string = HelioKeySnippet.text

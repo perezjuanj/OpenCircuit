@@ -10,8 +10,7 @@ final class ZeppSignInCopyTests: XCTestCase {
         let limit = ZeppSignInCopy.accountLimit
         XCTAssertTrue(limit.contains("email and password"))
         for provider in ["Google", "Apple"] { XCTAssertTrue(limit.contains(provider), provider) }
-        XCTAssertTrue(limit.contains("computer method"), "the limit points at the fallback")
-        XCTAssertTrue(limit.contains("How to get the key"), "by the link's own title on the setup screen")
+        XCTAssertTrue(limit.contains("Troubleshooting"), "the limit points at the fallback section")
     }
 
     func testThePrivacyLineSaysOnceNotSavedAndSignedOut() {
@@ -32,11 +31,21 @@ final class ZeppSignInCopyTests: XCTestCase {
         let messages = errors.map(ZeppSignInCopy.message(for:))
         XCTAssertEqual(Set(messages).count, errors.count)
         XCTAssertTrue(ZeppSignInCopy.message(for: ZeppAccountError.credentialsRejected).contains("Google, Apple"))
-        XCTAssertTrue(ZeppSignInCopy.message(for: ZeppAccountError.credentialsRejected).contains("computer method"))
-        XCTAssertTrue(ZeppSignInCopy.message(for: ZeppAccountError.unexpectedResponse(step: "tokens")).contains("computer method"))
+        XCTAssertTrue(ZeppSignInCopy.message(for: ZeppAccountError.credentialsRejected).contains("Troubleshooting"))
+        XCTAssertTrue(ZeppSignInCopy.message(for: ZeppAccountError.unexpectedResponse(step: "tokens")).contains("Troubleshooting"))
+        XCTAssertTrue(ZeppSignInCopy.mayStopWorking.contains("Troubleshooting"))
         XCTAssertTrue(ZeppSignInCopy.message(for: ZeppAccountError.noKeyOnAccount).contains("Pair the strap"))
         XCTAssertEqual(ZeppSignInCopy.message(for: URLError(.badURL)),
                        ZeppSignInCopy.message(for: ZeppAccountError.unexpectedResponse(step: "x")), "unknown errors read as unexpected")
+    }
+
+    /// The computer route is small print under Troubleshooting, not in Before you start or the Key section.
+    func testTheTroubleshootingCopyCarriesTheComputerRoute() {
+        XCTAssertTrue(HelioSetupView.troubleshootingIntro.contains("Google, Apple"))
+        XCTAssertTrue(HelioSetupView.troubleshootingIntro.contains("computer"))
+        XCTAssertTrue(HelioSetupView.snippetNote.contains("watchface.zepp.com"))
+        XCTAssertFalse(HelioSetupView.keyStorageNote.contains("Spaces, colons"), "paste hints moved to Troubleshooting")
+        XCTAssertTrue(HelioSetupView.pasteNote.contains("0x"))
     }
 
     func testTheDeviceRowShowsOnlyTheAddressEnding() {
