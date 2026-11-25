@@ -53,8 +53,9 @@ struct DeviceChoiceView: View {
     }
 }
 
-/// Amazfit Helio Strap setup (#215 decisions 4–7): what works, the key (paste-only, Keychain), the
-/// Zepp coexistence warnings, then connect and the first sync.
+/// Amazfit Helio Strap setup (#215 decisions 4–7): what works, the key (pasted, or read once from an
+/// email-and-password Zepp account through `ZeppSignInSheet`; Keychain either way), the Zepp
+/// coexistence warnings, then connect and the first sync.
 struct HelioSetupView: View {
     @State private var choice = ActiveDeviceChoiceStore.shared
     /// Read only while the strap is the chosen device: a ring user browsing this screen never
@@ -65,6 +66,7 @@ struct HelioSetupView: View {
     @State private var saveError: String?
     @State private var snippetCopied = false
     @State private var confirmForget = false
+    @State private var showZeppSignIn = false
     /// Re-read after every key action: the Keychain isn't observable.
     @State private var hasKey = HelioKeyStore.shared.hasKey
     @State private var keyRejected = HelioKeyStore.shared.isRejected
@@ -86,7 +88,7 @@ struct HelioSetupView: View {
                        + "measure HRV as RMSSD. Apple Health files it under its only HRV type (SDNN).")
                 bullet("Stress and PAI are shown in the app only. Apple Health has no type for them.")
                 bullet("Find My Strap, a short buzz, and the strap's alarms.")
-                bullet("Nothing is sent to Zepp or any other server.")
+                bullet(Self.noServerNote)
             }
 
             Section {
@@ -115,7 +117,9 @@ struct HelioSetupView: View {
                     Button("Replace Key") { editingKey = true; keyText = "" }
                     Button("Forget Key", role: .destructive) { confirmForget = true }
                 } else {
-                    SecureField("32 characters, 0–9 and a–f", text: $keyText)
+                    Button(ZeppSignInCopy.buttonTitle) { showZeppSignIn = true }
+                    Text(ZeppSignInCopy.accountLimit).font(.caption).foregroundStyle(.secondary)
+                    SecureField("Or paste it: 32 characters, 0–9 and a–f", text: $keyText)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.body.monospaced())
@@ -163,6 +167,12 @@ struct HelioSetupView: View {
         }
         .navigationTitle("Amazfit Helio Strap")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showZeppSignIn) {
+            ZeppSignInSheet { key in
+                keyText = key
+                saveAndConnect()
+            }
+        }
         .confirmationDialog("Forget the key?", isPresented: $confirmForget, titleVisibility: .visible) {
             Button("Forget Key", role: .destructive) {
                 HelioKeyStore.shared.forget()
@@ -181,6 +191,9 @@ struct HelioSetupView: View {
         + "What was already written to Apple Health stays there."
     static let firmwareNote = "Firmware updates for the strap are done in the Zepp app. OpenCircuit doesn't update firmware."
     static let iPhoneOnlyNote = "OpenCircuit is iPhone only."
+    /// Syncing never contacts a server; the only exception is the optional, one-time Zepp account lookup.
+    static let noServerNote = "Syncing sends nothing to Zepp or any other server. The only time OpenCircuit contacts "
+        + "Zepp is if you use \u{201C}\(ZeppSignInCopy.buttonTitle)\u{201D}, once."
 
     private func copySnippet() {
         UIPasteboard.general.string = HelioKeySnippet.text

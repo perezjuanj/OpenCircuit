@@ -241,7 +241,7 @@ import SwiftData
 import SwiftUI
 
 /// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR |
-/// sources | sources-<topic>`
+/// sources | sources-<topic> | helio-setup | helio-setup-full | zepp-signin`
 /// presents that screen full-screen on launch, so a screenshot run can reach it without UI
 /// automation. `liveHR` renders the live-measure card's composition over a SYNTHETIC buffer — a
 /// simulator has no ring to measure.
@@ -296,6 +296,8 @@ struct DemoScreenModifier: ViewModifier {
                 HelioSetupView().frame(width: geo.size.width / 0.45, height: geo.size.height / 0.45)
                     .scaleEffect(0.45, anchor: .topLeading)
             }
+        } else if id == "zepp-signin" {
+            ZeppSignInSheet { _ in }
         } else if id == "sleep-score" {
             DemoSleepScoreSheet()
         } else if id == "sleep-need" {

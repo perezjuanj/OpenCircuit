@@ -56,6 +56,10 @@ targets:
       # Zepp OS protocol core for the Amazfit Helio Strap (#215 phase 3). Pure Swift + CommonCrypto.
       - package: OpenCircuitKit
         product: ZeppKit
+      # The optional "Get the key from my Zepp account" lookup (ported from huami-token, MIT). The
+      # only code that contacts a vendor server, and only when the person taps it.
+      - package: OpenCircuitKit
+        product: ZeppAccountKit
       # liveline-swift charts (live vitals line + hero sparklines). See the `packages:` note above.
       - package: Liveline
         product: Liveline
@@ -85,8 +89,9 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         # Export compliance → declare no non-exempt encryption, so uploads skip the manual prompt.
         # The app's crypto: SM3 hashing for ring auth, and AES-128 + B-163 ECDH for the Helio
-        # Strap's pairing and its encrypted BLE messages (ZeppKit). All of it only authenticates to
-        # and talks with the user's own wearable; the app's primary function is health tracking,
+        # Strap's pairing and its encrypted BLE messages (ZeppKit), plus HTTPS and a fixed-key AES
+        # wrapper on the optional Zepp account sign-in that reads the strap's key (ZeppAccountKit).
+        # All of it only authenticates to the user's own wearable and account; the app's primary function is health tracking,
         # not information security or communications, which is the basis for the exemption.
         # Owner to confirm in App Store Connect (docs/APP_STORE_SUBMISSION.md §Export compliance).
         ITSAppUsesNonExemptEncryption: false

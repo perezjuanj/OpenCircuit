@@ -16,10 +16,11 @@ app. There is no known way to create it on the phone or on the strap.
 So the one-time cost of using a Helio Strap with OpenCircuit is:
 
 1. pair the strap in the official Zepp app once;
-2. copy the key out of your Zepp account (this page);
-3. paste it into OpenCircuit.
+2. get the key from your Zepp account: in the app if you sign in to Zepp with an email and
+   password (Method 0), otherwise on a computer (Methods 1 and 2);
+3. paste it into OpenCircuit (Method 0 saves it for you).
 
-After that OpenCircuit talks only to the strap. Nothing is sent to Zepp.
+After that OpenCircuit talks only to the strap. Syncing sends nothing to Zepp.
 
 **Treat the key like a password.** Anyone with it and physical Bluetooth range can read your
 strap's health data. Don't post it in bug reports or screenshots. OpenCircuit keeps it in
@@ -52,12 +53,36 @@ That is why the last step below says **delete** the Zepp app rather than "remove
 - **Pair, sync and update the strap in the Zepp app first.** The key only exists on Zepp's
   servers after pairing. The huami-token README asks for "pair, sync and update" before
   fetching.
-- **Know how you log in to Zepp.** Method 2 needs a Zepp/Amazfit account with an **email and
-  password**. If you signed up with Apple, Google or another social login, Method 2 won't
+- **Know how you log in to Zepp.** Methods 0 and 2 need a Zepp/Amazfit account with an **email and
+  password**. If you signed up with Apple, Google or another social login, Methods 0 and 2 won't
   work. The huami-token README says to create an email/password account in that case. Method 1
   uses the Zepp website's own login, which may support social login. We could not confirm that.
-- **You need a computer (Mac, Windows or Linux) with a desktop web browser.** No method works
-  from an iPhone alone (see "Methods compared" below).
+- **Methods 1 and 2 need a computer (Mac, Windows or Linux).** Only Method 0 works from an
+  iPhone alone, and only for email-and-password accounts (see "Methods compared" below).
+
+## Method 0 (easiest): in the app, with an email-and-password Zepp account
+
+_No computer, under a minute. Last confirmed: 2026-11-25, against a real Helio Strap account._
+
+1. In OpenCircuit, open **Profile ▸ Device ▸ Amazfit Helio Strap**.
+2. Tap **Get the key from my Zepp account** and sign in with the **email and password** of the
+   Zepp account your strap is paired to.
+3. OpenCircuit reads the strap's key, saves it in the Keychain, signs out of Zepp and connects.
+   If the account has more than one device with a key, pick the Helio Strap from the list (only
+   the last part of each Bluetooth address is shown).
+
+**Limits, stated in the app too:**
+
+- **Email and password accounts only.** If you sign in to Zepp with Google, Apple, Facebook or
+  another account, there's no password this can use. Use Method 1 instead.
+- Your email and password go **straight from the phone to Zepp's servers, once**. OpenCircuit
+  doesn't save them, and signs out of Zepp right after. It is the only time OpenCircuit contacts
+  any vendor server, and only when you tap the button.
+- It uses the same sign-in requests as the Zepp app (ported from
+  [huami-token](https://codeberg.org/argrento/huami-token), used with its author's permission).
+  If Zepp changes them, it stops working; Method 1 still works then.
+- It talks to Zepp's US servers, as huami-token does. We haven't confirmed EU or China accounts;
+  if sign-in fails for yours, use Method 1.
 
 ## Method 1 (recommended): Zepp website + Gadgetbridge's console snippet
 
@@ -172,6 +197,7 @@ sign in. **Don't** re-pair unless it forces you to. If it does, fetch a new key 
 
 | Method | Needs | Account type | Strap paired in Zepp first | Works from iPhone only | Breaks Zepp pairing | Last seen working |
 |---|---|---|---|---|---|---|
+| 0. In the app ("Get the key from my Zepp account") | iPhone only | **email + password** Zepp/Amazfit account | yes | **yes** | no | 2026-11-25 (real account) |
 | 1. watchface.zepp.com + console snippet | computer + desktop browser | whatever the website accepts (social login unconfirmed) | yes | no (iPhone Safari has no console without a Mac) | no | listed as current 2026-09-30; no dated user report found |
 | 2. `huami-token` (`--method amazfit`) | computer + Python 3.10+ + `uv` | **email + password** Zepp/Amazfit account | yes | no | no | README fix 2026-02-24 (one open failure report 2026-02-26) |
 | 3. Rooted Android: read the key from the Zepp app's database | rooted Android phone | any | yes | no | no | undated (long-standing technique) |
@@ -179,9 +205,9 @@ sign in. **Don't** re-pair unless it forces you to. If it does, fetch a new key 
 | `huafetcher` | listed by Gadgetbridge; steps not verified | ? | yes | ? | no | not verified |
 | Mi Fitness log grep / Xiaomi cloud token extractor | Xiaomi account + Android | Xiaomi | — | — | — | **not applicable**: those cover Xiaomi-ecosystem devices, not Zepp |
 
-OpenCircuit deliberately does **not** log in to Zepp itself, even though that would make
-onboarding easier (HelioCore shows it's possible). That keeps the promise that OpenCircuit
-never talks to a vendor server (plan of record §3).
+OpenCircuit used to refuse to sign in to Zepp at all (plan of record §3). Since 2026-11-25 it
+offers Method 0 as an **opt-in, one-time** lookup: syncing still never contacts Zepp, nothing is
+saved but the key, and the paste-a-key path stays for everyone else.
 
 ## Sources (fetched 2026-09-30)
 
