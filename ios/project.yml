@@ -13,8 +13,8 @@ options:
 # $(MARKETING_VERSION)/$(CURRENT_PROJECT_VERSION).
 settings:
   base:
-    MARKETING_VERSION: "1.0.2"
-    CURRENT_PROJECT_VERSION: "103"
+    MARKETING_VERSION: "1.0.3"
+    CURRENT_PROJECT_VERSION: "104"
 
 packages:
   OpenCircuitKit:
