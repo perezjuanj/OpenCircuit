@@ -1,6 +1,6 @@
 # Privacy Policy — OpenCircuit
 
-_Last updated: 2026-10-03_
+_Last updated: 2026-11-25_
 
 OpenCircuit is an independent, **local-first** app that reads health metrics from a
 compatible wearable (a RingConn Gen 2 or Gen 3 smart ring, or an Amazfit Helio Strap)
@@ -10,7 +10,8 @@ what the app does and does not do with your data.
 ## The short version
 
 - **OpenCircuit has no servers and no account.** Nothing you record is uploaded
-  anywhere by this app.
+  anywhere by this app. Its only network request is the optional, one-time Zepp sign-in
+  for the Helio Strap's key (below), and only when you tap it.
 - Your health data stays **on your device**: in the app's local storage and, if you
   authorize it, in **Apple Health**.
 - We do **not** collect, sell, share, or use your data for advertising or analytics.
@@ -27,8 +28,9 @@ what the app does and does not do with your data.
 - **Things you enter yourself**: profile inputs (age, height, weight, sex, goals),
   and optional period logs and headache logs. These are used only for on-device
   calculations and, if you allow it, written to Apple Health.
-- **Your Helio Strap's pairing key**, which you enter once. It is stored in the
-  iOS Keychain on your device and is only ever sent to your own strap.
+- **Your Helio Strap's pairing key**, which the app reads from your Zepp account when
+  you sign in (see "Optional Zepp sign-in" below) or which you paste in. It is stored
+  in the iOS Keychain on your device and is only ever sent to your own strap.
 - **Bluetooth** is used to connect to your wearable. **Location** is used **only
   during an active workout**: to map outdoor routes, and, if you turn on "Keep
   tracking when screen is off", to keep indoor workouts recording while your phone is
@@ -36,6 +38,16 @@ what the app does and does not do with your data.
   are not uploaded.
 - **Notifications** (if you allow them) are scheduled on your device for the health
   alerts and reminders you turn on.
+
+## Optional Zepp sign-in (Helio Strap only)
+
+If you tap **Get the key from my Zepp account** in the strap's setup, the app sends the
+email and password you type **directly from your device to Zepp's servers** over HTTPS,
+once, to read your strap's pairing key from your own Zepp account's device list. It then
+signs out of Zepp. Your email and password are **not stored or logged** by the app, and no
+health data is sent. They never reach OpenCircuit or anyone other than Zepp, whose own
+privacy policy covers how Zepp handles that sign-in. If you don't use the button, the app
+never contacts Zepp.
 
 ## Where the data goes
 
@@ -54,7 +66,8 @@ what the app does and does not do with your data.
 
 - No analytics, tracking, advertising, or third-party data SDKs.
 - No transmission of your health data to OpenCircuit or any third party.
-- No cloud account or sign-in.
+- No OpenCircuit account. The only sign-in is the optional one to your own Zepp account
+  described above.
 - No use of HealthKit data for advertising, marketing, or data mining, and no
   storage of HealthKit data in iCloud by the app.
 

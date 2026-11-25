@@ -156,6 +156,14 @@ declaration, a setting that has no API, or something that needs a phone and a we
     manifest are identical to build 58 (`git diff 2ceda5f origin/master` touches only the build number
     in `ios/project.yml`); the archive has no `OCDemoData`, no Blood Pressure request and the same
     export answer. Release is after approval. Withdraw with `canceled: true` on the review submission.
+19. **1.0.3 (build 105, `v1.0-b105`, master `fb30883`)**: the optional in-app Zepp key lookup (#386,
+    #387) and a strap-settings copy fix (#385). Store-visible changes, made 2026-11-25: What's New,
+    two description lines (the key no longer needs a computer for email-and-password Zepp accounts;
+    "nothing leaves it" names the one-time Zepp sign-in; the old text is kept as
+    `asc_description.before-1.0.3.txt` in the release scripts), the review notes' "since build"
+    paragraph (now describing the sign-in as the app's only network request) and closing line, the
+    demo video re-attached, and `docs/PRIVACY.md` gaining an "Optional Zepp sign-in" section. App
+    Privacy label left at Data Not Collected (the credentials go to Zepp, not to us); owner to confirm.
 
 ## 3. Review notes (as saved in ASC)
 
