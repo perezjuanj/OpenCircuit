@@ -144,9 +144,9 @@ final class OnboardingFlowTests: XCTestCase {
         let steps = ActiveDeviceChoice.helioStrap.firstSteps
         XCTAssertEqual(Array(steps.suffix(2)), [HelioStatus.dontUnpairCopy, HelioStatus.zeppCoexistCopy])
         XCTAssertEqual(steps.first, HelioStatus.keyOriginCopy)
-        XCTAssertEqual(ActiveDeviceChoice.helioStrap.setupGuide?.url, HelioStatus.keyGuideURL)
-        XCTAssertEqual(ActiveDeviceChoice.helioStrap.setupGuide?.title, "How to get the key")
-        XCTAssertNil(ActiveDeviceChoice.ringConn.setupGuide)
+        for step in steps {
+            XCTAssertFalse(step.contains("computer") || step.contains("watchface"), "onboarding shows only the in-app sign-in")
+        }
     }
 
     func testTheRingStepsAreTodaysFour() {

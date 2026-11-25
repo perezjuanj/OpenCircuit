@@ -196,17 +196,12 @@ struct OnboardingView: View {
 
     // MARK: Device steps
 
-    /// A device's first steps, its guide link after the first one, and where it's set up.
+    /// A device's first steps and where it's set up. The strap's key comes from the in-app Zepp sign-in;
+    /// the computer guide is only in the setup screen's Troubleshooting, never here.
     @ViewBuilder
     private func steps(for device: ActiveDeviceChoice) -> some View {
-        let steps = device.firstSteps
-        ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
+        ForEach(Array(device.firstSteps.enumerated()), id: \.offset) { _, step in
             bullet(step)
-            if index == 0, let guide = device.setupGuide {
-                Link(guide.title, destination: guide.url)
-                    .font(.body)
-                    .padding(.leading, 28)
-            }
         }
         if let hint = flow.setupHint(for: device, pick: pick) {
             Text(hint).font(.subheadline).foregroundStyle(.secondary)

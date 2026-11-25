@@ -41,16 +41,15 @@ extension ActiveDeviceChoice {
 
     /// What the device needs besides OpenCircuit, for onboarding's welcome. The strap's facts are
     /// `docs/HELIO_KEY_EXTRACTION.md`'s: the key comes from the Zepp account the strap is paired to,
-    /// once. The in-app lookup needs an email-and-password account; every other method needs a
-    /// computer. Syncing never signs in to Zepp.
+    /// once, read in the app with the account's email and password (the computer route is the setup
+    /// screen's Troubleshooting, not shown here). Syncing never signs in to Zepp.
     var accountSentence: String {
         switch self {
         case .ringConn: return "The ring needs no account."
         case .helioStrap:
-            return "The strap needs a Zepp account once: pairing it in the Zepp app has Zepp's servers create its key. "
-                + "OpenCircuit can read the key from your account if you sign in to Zepp with an email and password; "
-                + "otherwise you copy it out on a computer. After that, OpenCircuit talks only to the strap and syncing "
-                + "never signs in to Zepp."
+            return "The strap needs a Zepp account once: pairing it in the Zepp app has Zepp's servers create its key, "
+                + "and OpenCircuit reads it when you sign in with your Zepp email and password. After that, OpenCircuit "
+                + "talks only to the strap and syncing never signs in to Zepp."
         }
     }
 
@@ -93,13 +92,6 @@ extension ActiveDeviceChoice {
         }
     }
 
-    /// A guide link shown after the first step, if the device has one.
-    var setupGuide: (title: String, url: URL)? {
-        switch self {
-        case .ringConn: return nil
-        case .helioStrap: return ("How to get the key", HelioStatus.keyGuideURL)
-        }
-    }
 
     /// Profile ▸ Apple Health, before Health is connected: what this device writes. Matches the code:
     /// the strap's mirrored kinds are `HelioHealthPolicy.healthMirroredKinds()`, so its HRV is named

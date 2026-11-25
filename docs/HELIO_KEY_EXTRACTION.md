@@ -84,9 +84,10 @@ _No computer, under a minute. Last confirmed: 2026-11-25, against a real Helio S
 - It talks to Zepp's US servers, as huami-token does. We haven't confirmed EU or China accounts;
   if sign-in fails for yours, use Method 1.
 
-## Method 1 (recommended): Zepp website + Gadgetbridge's console snippet
+## Method 1 (Google/Apple sign-in, or if Method 0 fails): Zepp website + Gadgetbridge's console snippet
 
-_No installs, about 5 minutes. Last confirmed: listed as a current method on Gadgetbridge's
+_In the app, this lives under **Troubleshooting** at the bottom of the strap's setup screen
+(the guide link, **Copy key snippet** and the paste field). No installs, about 5 minutes. Last confirmed: listed as a current method on Gadgetbridge's
 pairing page, fetched 2026-09-30. The page itself carries no date._
 
 1. On the computer, open **https://watchface.zepp.com/** and sign in with the **same Zepp
