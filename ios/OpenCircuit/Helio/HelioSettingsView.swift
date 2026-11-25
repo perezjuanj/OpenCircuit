@@ -208,10 +208,10 @@ enum HelioSettingsCopy {
     /// §20.1: no message tells the phone when the strap buzzes.
     static let alertsHeader = "Your strap buzzes on its own when one of these triggers, even when your phone isn't nearby. "
         + "OpenCircuit isn't notified when it buzzes, and these are separate from OpenCircuit's own notifications."
-    /// §19, decision 34.
+    /// §19; decision 91 (#226) superseded decision 34: the strap's own records are imported for review.
     static let workoutHeader = "The strap can notice a workout from your heart rate and record it by itself. "
         + "Amazfit says workout detection greatly reduces battery life. "
-        + "OpenCircuit doesn't import the strap's workout records, so these settings only change what the strap and the Zepp app record."
+        + "OpenCircuit picks up these workouts when it syncs and asks you to review each one before it's saved to Apple Health."
     static let workoutSwitchNote = "Turning detection itself on or off isn't here yet: which strap setting does that hasn't been identified."
     static let savedOnStrap = "Saved on the strap itself. OpenCircuit changes a setting only when you do."
     /// 89g, verbatim.
