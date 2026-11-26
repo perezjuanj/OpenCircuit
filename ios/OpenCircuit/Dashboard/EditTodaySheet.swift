@@ -72,12 +72,23 @@ struct EditTodaySheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { finish(.cancel) }
+                    Button("Cancel") { finish(Self.outcome(for: .cancel)) }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { finish(.done) }
+                    Button("Done") { finish(Self.outcome(for: .done)) }
                 }
             }
+        }
+    }
+
+    /// The sheet's two toolbar buttons. Swiping the sheet away calls neither, so nothing is written.
+    enum ToolbarButton { case cancel, done }
+
+    /// What each toolbar button keeps: Done the draft, Cancel the layout the sheet opened on.
+    static func outcome(for button: ToolbarButton) -> TodayLayoutEdit.Outcome {
+        switch button {
+        case .cancel: return .cancel
+        case .done:   return .done
         }
     }
 
@@ -97,21 +108,26 @@ struct EditTodaySheet: View {
         }
     }
 
-    /// A card or tile with its Show switch, which VoiceOver reads as "Show <name>". At the accessibility
-    /// sizes the switch goes under the name, so a long name wraps between words, not inside one.
-    @ViewBuilder
+    /// A card or tile with its Show switch. At the accessibility sizes the switch goes under the name,
+    /// so a long name wraps between words, not inside one. At every size the row is ONE accessibility
+    /// element: "Show <name>", on or off, double-tap to switch, and the Move up / Move down actions the
+    /// call site adds, so VoiceOver never lands on a bare title or a switch without its actions.
     private func switchRow(title: String, spokenTitle: String, isOn: Binding<Bool>) -> some View {
-        if dynamicTypeSize.isAccessibilitySize {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(title).accessibilityHidden(true)
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title)
+                    Toggle(isOn: isOn) { Text(title) }.labelsHidden()
+                }
+            } else {
                 Toggle(isOn: isOn) { Text(title) }
-                    .labelsHidden()
-                    .accessibilityLabel("Show \(spokenTitle)")
             }
-        } else {
-            Toggle(isOn: isOn) { Text(title) }
-                .accessibilityLabel("Show \(spokenTitle)")
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Show \(spokenTitle)")
+        .accessibilityValue(isOn.wrappedValue ? "On" : "Off")
+        .accessibilityAddTraits(.isToggle)
+        .accessibilityAction { isOn.wrappedValue.toggle() }
     }
 
     /// A row that can't be switched off: the title, then why, with a lock glyph. Stacked at the

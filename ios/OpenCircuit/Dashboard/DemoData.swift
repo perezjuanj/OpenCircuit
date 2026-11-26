@@ -36,7 +36,7 @@ enum DemoData {
     /// `-OCDemoTodayLayout hidden | all-hidden` (decision 94): Today drawn with a SYNTHETIC Edit Today
     /// layout instead of the saved one, for this launch only (nothing is written). `hidden` hides
     /// Calories, Daily Goals and the Steps and Skin temp tiles; `all-hidden` hides every card and tile
-    /// that can be hidden, leaving the date, the scores card, the connection card, History & Sync and
+    /// that can be hidden, leaving the date, the scores card, the connection card, History & Sleep and
     /// the sources link.
     static let todayLayoutKey = "OCDemoTodayLayout"
     static var todayLayoutOverride: TodayLayout? {

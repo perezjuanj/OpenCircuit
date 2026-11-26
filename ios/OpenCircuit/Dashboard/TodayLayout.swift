@@ -8,13 +8,20 @@
 //
 // Everything here is pure (no UserDefaults, no clock), so the rules are pinned by tests:
 // - Today's scores card is pinned above these sections and is not one of them, so it can't be hidden.
-// - History & Sync can't be hidden: it holds the manual sync and Health-push buttons.
-// - A feature gate (women's health for Cycle, the headache log) and the hidden flag both apply.
-// - Hiding is display-only. The Today sentence is built from every tile whatever is hidden
-//   (`synthesisTiles`), and the Vitals Status report that feeds it keeps running while its card is
-//   hidden (`runsHiddenVitalsReport`). Alerts, Health writes and background work never read these keys.
+// - History & Sleep (the `sync` section) can't be hidden: it holds the manual sync and Health-push
+//   buttons.
+// - A feature gate (women's health for Cycle, the headache log) and the hidden flag both apply. A gated
+//   card's hidden flag lives only while its feature is on (`droppingHiddenFlags(gatedOffBy:)`), so
+//   turning the feature back on shows the card.
+// - Hiding is display-only. The Today sentence's input is built here from the whole trends load, every
+//   tile included, whatever is hidden (`sentenceInput`), and the Vitals Status report that feeds it
+//   keeps running while its card is hidden (`vitalsReport`). Alerts, Health writes and background work
+//   never read these keys.
+// - A part of the layout left at its default is stored as "" (no override), so a later build's new ids
+//   land in their canonical place.
 
 import Foundation
+import OpenCircuitKit
 
 /// One Your Numbers tile: the six `TodayTile` metrics, then the strap's Stress and PAI tiles.
 /// `rawValue` is the persistence key written to `dashboard.tileOrder` / `dashboard.hiddenTiles`, so keep
@@ -86,7 +93,7 @@ extension DashboardSection {
         case .goals:        return "Daily Goals"
         case .cycle:        return "Cycle"
         case .headache:     return "Headache log"
-        case .sync:         return "History & Sync"
+        case .sync:         return "History & Sleep"
         }
     }
 }
@@ -164,10 +171,12 @@ struct TodayLayout: Equatable {
                   hiddenTiles: Self.decodeSet(stored.hiddenTiles))
     }
 
+    /// The four strings to write. A part left at its default is written as "", so the standard layout
+    /// (after Reset) stores no override at all.
     var stored: Stored {
-        Stored(sectionOrder: DashboardSectionOrder.encode(sections),
+        Stored(sectionOrder: sections == Self.standard.sections ? "" : DashboardSectionOrder.encode(sections),
                hiddenSections: Self.encodeSet(hiddenSections.filter { Self.canHide($0) }),
-               tileOrder: tiles.map(\.rawValue).joined(separator: ","),
+               tileOrder: tiles == Self.standard.tiles ? "" : tiles.map(\.rawValue).joined(separator: ","),
                hiddenTiles: Self.encodeSet(hiddenTiles))
     }
 
@@ -179,7 +188,7 @@ struct TodayLayout: Equatable {
         case section(DashboardSection)
     }
 
-    /// Today's scores card is pinned and never hidden, and History & Sync is always shown (decision
+    /// Today's scores card is pinned and never hidden, and History & Sleep is always shown (decision
     /// 94a). Every other section can be hidden.
     static func canHide(_ card: Card) -> Bool {
         switch card {
@@ -212,13 +221,21 @@ struct TodayLayout: Equatable {
     /// grid checks that at render, so a reading that ages out while the app is open drops its tile.
     var shownTiles: [TodayTileID] { tiles.filter(isShown) }
 
-    /// The tiles Today's sentence is built from: ALL of them, whatever this layout hides (decision 94c).
-    /// Hiding a tile changes what is drawn, never what the sentence says.
-    func synthesisTiles(_ all: [TodayTile]) -> [TodayTile] { all }
+    /// Today's sentence input (decision 94c): built from the whole trends load, every tile included,
+    /// whatever this layout hides. The layout is a parameter only so a test can prove it changes
+    /// nothing; hiding a tile or a card changes what is drawn, never what the sentence says.
+    func sentenceInput(trends: TrendsData, tempUnit: TemperatureUnit, readiness: ReadinessReport?,
+                       feverSuspected: Bool, lastSyncAt: Date?, now: Date = Date()) -> TodaySynthesis.Input {
+        TodaySynthesis.input(trends: trends, tiles: TodayTiles.build(trends: trends, tempUnit: tempUnit, now: now),
+                             readiness: readiness, feverSuspected: feverSuspected,
+                             lastSyncAt: lastSyncAt, now: now)
+    }
 
-    /// Whether the Vitals Status card's report must run without its card: the card is hidden, and its
-    /// fever verdict is one of the sentence's inputs.
-    var runsHiddenVitalsReport: Bool { !isShown(.vitalsStatus) }
+    /// Where the Vitals Status card's report runs. Its fever verdict is one of the sentence's inputs,
+    /// so exactly one copy always runs: the card itself while shown, a hidden copy while it is hidden.
+    enum VitalsReport: Equatable { case card, hiddenRunner }
+
+    var vitalsReport: VitalsReport { isShown(.vitalsStatus) ? .card : .hiddenRunner }
 
     // MARK: Edits
 
@@ -251,6 +268,15 @@ struct TodayLayout: Equatable {
 
     mutating func reset() { self = .standard }
 
+    /// The layout without hidden flags on cards whose feature is off. Applied whenever a feature is seen
+    /// off (at launch, when its switch changes, and on Done), so a card hidden while its feature was on
+    /// comes back shown when the feature is turned on again, instead of staying hidden with no hint.
+    func droppingHiddenFlags(gatedOffBy gates: TodayFeatureGates) -> TodayLayout {
+        var copy = self
+        copy.hiddenSections = hiddenSections.filter { gates.allows($0) }
+        return copy
+    }
+
     // MARK: Decode / encode
 
     /// An order: unknown and duplicate ids dropped in place, missing ids appended in canonical order.
@@ -274,6 +300,13 @@ struct TodayLayout: Equatable {
     static func encodeSet<ID: CaseIterable & RawRepresentable & Hashable>(_ set: Set<ID>) -> String
     where ID.RawValue == String {
         ID.allCases.filter(set.contains).map(\.rawValue).joined(separator: ",")
+    }
+}
+
+extension TodayTiles {
+    /// All six tiles from a trends load: what Your Numbers draws from and what the sentence reads.
+    static func build(trends: TrendsData, tempUnit: TemperatureUnit, now: Date = Date()) -> [TodayTile] {
+        build(points: trends.points, restingHR: trends.restingHR, tempUnit: tempUnit, now: now, scope: .from(trends))
     }
 }
 

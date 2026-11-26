@@ -528,6 +528,9 @@ struct ContentView: View {
                 quickLogCorrectionSheet(onset: logged.onset)
             }
             // Battery: TTE + charging-complete notification (#86).
+            // Edit Today (decision 94): a gated card's hidden flag lives only while its feature is on.
+            .onAppear { dropHiddenFlagsForFeaturesOff() }
+            .onChange(of: todayGates) { _, _ in dropHiddenFlagsForFeaturesOff() }
             .onChange(of: session?.batteryPercent) { _, pct in
                 guard let pct else { return }
                 let charging = session?.inferredCharging ?? false
@@ -603,11 +606,7 @@ struct ContentView: View {
                 TodayDateRow()
                     // A hidden Vitals Status card still reports its fever verdict to the sentence
                     // (decision 94c): the card runs, unseen, behind the date row.
-                    .background {
-                        if todayLayout.runsHiddenVitalsReport {
-                            vitalsStatusCard.hidden().accessibilityHidden(true).allowsHitTesting(false)
-                        }
-                    }
+                    .background { HiddenVitalsReport(layout: todayLayout) { vitalsStatusCard } }
                 todayScoresCard
                 if ringActive {
                     connectionCard
@@ -1035,13 +1034,18 @@ struct ContentView: View {
     /// build no longer has, `vitals` among them) lives in `DashboardSectionOrder` so a test can pin it.
     private var sectionOrder: [DashboardSection] { todayLayout.sections }
 
-    /// The saved Edit Today layout (decision 94), decoded from its four keys by `TodayLayout`.
+    /// The Edit Today layout Today draws (decision 94): the saved one, or a demo override.
     private var todayLayout: TodayLayout {
 #if DEBUG && targetEnvironment(simulator)
         if let demo = DemoData.todayLayoutOverride { return demo }
 #endif
-        return TodayLayout(stored: .init(sectionOrder: sectionOrderRaw, hiddenSections: hiddenSectionsRaw,
-                                         tileOrder: tileOrderRaw, hiddenTiles: hiddenTilesRaw))
+        return savedTodayLayout
+    }
+
+    /// The saved Edit Today layout, decoded from its four keys by `TodayLayout`.
+    private var savedTodayLayout: TodayLayout {
+        TodayLayout(stored: .init(sectionOrder: sectionOrderRaw, hiddenSections: hiddenSectionsRaw,
+                                  tileOrder: tileOrderRaw, hiddenTiles: hiddenTilesRaw))
     }
 
     /// The opt-in features that decide whether the Cycle and Headache cards exist at all.
@@ -1059,7 +1063,21 @@ struct ContentView: View {
     /// Done in the Edit sheet: write the keys back, only when something changed (Cancel hands back the
     /// layout the sheet opened on, which writes nothing).
     private func saveTodayLayout(_ layout: TodayLayout) {
-        guard layout != todayLayout else { return }
+        writeTodayLayout(layout.droppingHiddenFlags(gatedOffBy: todayGates))
+    }
+
+    /// A card hidden while its feature was on must come back shown when the feature is turned on again:
+    /// its hidden flag is dropped whenever the feature is seen off (launch and every switch change).
+    private func dropHiddenFlagsForFeaturesOff() {
+        writeTodayLayout(savedTodayLayout.droppingHiddenFlags(gatedOffBy: todayGates))
+    }
+
+    private func writeTodayLayout(_ layout: TodayLayout) {
+#if DEBUG && targetEnvironment(simulator)
+        // A demo layout is for this launch only: never written.
+        if DemoData.todayLayoutOverride != nil { return }
+#endif
+        guard layout != savedTodayLayout else { return }
         let stored = layout.stored
         sectionOrderRaw = stored.sectionOrder
         hiddenSectionsRaw = stored.hiddenSections
@@ -1069,8 +1087,7 @@ struct ContentView: View {
 
     /// The Today metric tiles (#216), built from the shared trends load.
     private var todayTiles: [TodayTile] {
-        TodayTiles.build(points: trends.points, restingHR: trends.restingHR,
-                         tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius, scope: .from(trends))
+        TodayTiles.build(trends: trends, tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius)
     }
 
     /// The Today synthesis sentence (#216) — deterministic rules in `TodaySynthesis`, about the
@@ -1079,11 +1096,12 @@ struct ContentView: View {
         // Before the first trends load there is nothing to judge — and "no ring data yet" would be
         // a false claim to a wearer who has plenty.
         guard trendsHaveLoaded else { return "Gathering today's numbers…" }
-        return TodaySynthesis.sentence(TodaySynthesis.input(trends: trends,
-                                                             tiles: todayLayout.synthesisTiles(todayTiles),
-                                                             readiness: report,
-                                                             feverSuspected: vitalsFeverSuspected,
-                                                             lastSyncAt: lastSyncAt))
+        // Built from the whole trends load, whatever the Edit Today layout hides (decision 94c).
+        return TodaySynthesis.sentence(todayLayout.sentenceInput(trends: trends,
+                                                                 tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
+                                                                 readiness: report,
+                                                                 feverSuspected: vitalsFeverSuspected,
+                                                                 lastSyncAt: lastSyncAt))
     }
 
     /// The sections actually rendered right now — `sectionOrder` minus any feature-gated card that's

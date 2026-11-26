@@ -111,7 +111,7 @@ final class TodayLayoutTests: XCTestCase {
         XCTAssertNil(DashboardSection(rawValue: "readiness"))
     }
 
-    func testHistoryAndSyncCanNeverBeHidden() {
+    func testHistoryAndSleepCanNeverBeHidden() {
         XCTAssertFalse(TodayLayout.canHide(.sync))
         var l = layout(hidden: "sync")
         XCTAssertTrue(l.isShown(.sync), "a stored sync id is ignored")
@@ -128,7 +128,7 @@ final class TodayLayoutTests: XCTestCase {
         }
     }
 
-    func testHidingEverythingOptionalStillLeavesHistoryAndSync() {
+    func testHidingEverythingOptionalStillLeavesHistoryAndSleep() {
         var l = TodayLayout.standard
         for s in DashboardSection.allCases { l.setShown(s, false) }
         for t in TodayTileID.allCases { l.setShown(t, false) }
@@ -171,48 +171,96 @@ final class TodayLayoutTests: XCTestCase {
 
     // MARK: Display-only
 
-    /// Hiding tiles and the whole Your Numbers card never changes the sentence's input: it is built from
-    /// every tile (decision 94c).
-    func testHidingTilesNeverChangesTheSentence() {
+    /// Hiding tiles, Your Numbers or Vitals Status never changes the sentence's input: `sentenceInput`,
+    /// the one function Today calls, builds it from the whole trends load (decision 94c).
+    func testHidingNeverChangesTheSentence() {
         // The sentence judges staleness on the device calendar, so the fixture uses it too: local noon.
         let cal = Calendar.current
         let now = cal.date(from: DateComponents(year: 2026, month: 9, day: 30, hour: 12))!
         let today = cal.startOfDay(for: now)
         func day(_ offset: Int) -> Date { cal.date(byAdding: .day, value: offset, to: today)! }
-        let points = (0..<6).map { i in
+        var trends = TrendsData()
+        trends.points = (0..<6).map { i in
             TrendsEngine.DailyPoint(date: day(i - 5), skinTempC: i == 5 ? 33.9 : 33.5, sleepHRVAvg: i == 5 ? 40 : 50)
         }
-        let rhr = (0..<6).map { RestingHR.DailyValue(day: day($0 - 5), bpm: $0 == 5 ? 61 : 58) }
-        let all = TodayTiles.build(points: points, restingHR: rhr, tempUnit: .celsius, now: now, calendar: cal)
-        var trends = TrendsData()
-        trends.points = points
+        trends.restingHR = (0..<6).map { RestingHR.DailyValue(day: day($0 - 5), bpm: $0 == 5 ? 61 : 58) }
         trends.newestSampleAt = now.addingTimeInterval(-3600)
-        func input(_ l: TodayLayout) -> TodaySynthesis.Input {
-            TodaySynthesis.input(trends: trends, tiles: l.synthesisTiles(all), readiness: nil,
-                                 lastSyncAt: now, now: now)
+        func input(_ l: TodayLayout, fever: Bool = false) -> TodaySynthesis.Input {
+            l.sentenceInput(trends: trends, tempUnit: .celsius, readiness: nil, feverSuspected: fever,
+                            lastSyncAt: now, now: now)
         }
 
         let baseline = input(.standard)
         XCTAssertEqual(baseline.hrv, .below, "the fixture must reach the sentence, or this test proves nothing")
         XCTAssertEqual(baseline.restingHR, .above)
         XCTAssertEqual(baseline.skinTemp, .above)
+        // Every tile, as Your Numbers builds them.
+        XCTAssertEqual(baseline, TodaySynthesis.input(trends: trends,
+                                                      tiles: TodayTiles.build(trends: trends, tempUnit: .celsius, now: now),
+                                                      readiness: nil, lastSyncAt: now, now: now))
 
         var hidden = TodayLayout.standard
-        for t in TodayTileID.allCases { hidden.setShown(t, false) }
+        for t in TodayTileID.allCases {
+            var one = TodayLayout.standard
+            one.setShown(t, false)
+            XCTAssertEqual(input(one), baseline, "hiding \(t)")
+            hidden.setShown(t, false)
+        }
         XCTAssertEqual(input(hidden), baseline)
-        hidden.setShown(.metrics, false)
-        hidden.setShown(.vitalsStatus, false)
+        for s in DashboardSection.allCases { hidden.setShown(s, false) }
         XCTAssertEqual(input(hidden), baseline)
         XCTAssertEqual(TodaySynthesis.sentence(input(hidden)), TodaySynthesis.sentence(baseline))
-        XCTAssertEqual(hidden.synthesisTiles(all).map(\.metric), TodayTile.Metric.allCases)
+        // The fever verdict passes through whatever is hidden.
+        XCTAssertEqual(input(hidden, fever: true), input(.standard, fever: true))
+        XCTAssertTrue(input(hidden, fever: true).feverSuspected)
     }
 
-    /// The Vitals Status fever verdict is a sentence input, so its report keeps running while the card
-    /// is hidden.
-    func testAHiddenVitalsStatusStillReportsToTheSentence() {
-        XCTAssertFalse(TodayLayout.standard.runsHiddenVitalsReport)
-        XCTAssertTrue(layout(hidden: "vitalsStatus").runsHiddenVitalsReport)
-        XCTAssertFalse(layout(hidden: "calories,goals,metrics").runsHiddenVitalsReport)
+    /// The Vitals Status fever verdict is a sentence input, so exactly one copy of its report always runs:
+    /// the card while it is drawn, the hidden runner while it isn't.
+    func testExactlyOneVitalsReportRunsWhateverTheLayout() {
+        XCTAssertEqual(TodayLayout.standard.vitalsReport, .card)
+        XCTAssertEqual(layout(hidden: "vitalsStatus").vitalsReport, .hiddenRunner)
+        XCTAssertEqual(layout(hidden: "calories,goals,metrics").vitalsReport, .card)
+        for hidden in ["", "vitalsStatus", "metrics,vitalsStatus,calories,goals,cycle,headache,sync", "goals"] {
+            for gates in [allOn, allOff] {
+                let l = layout(hidden: hidden)
+                let cardDrawn = l.shownSections(gates: gates).contains(.vitalsStatus)
+                XCTAssertNotEqual(cardDrawn, l.vitalsReport == .hiddenRunner, "hidden: \(hidden)")
+            }
+        }
+    }
+
+    // MARK: Gated cards (review S-2)
+
+    /// A card hidden while its feature was on comes back shown when the feature is turned on again: its
+    /// hidden flag is dropped while the feature is off.
+    func testAGatedCardsHiddenFlagIsDroppedWhileItsFeatureIsOff() {
+        let hidden = layout(hidden: "cycle,headache,calories")
+        let cycleOff = hidden.droppingHiddenFlags(gatedOffBy: TodayFeatureGates(womensHealth: false, headache: true))
+        XCTAssertEqual(cycleOff.hiddenSections, [.headache, .calories])
+        XCTAssertTrue(cycleOff.shownSections(gates: allOn).contains(.cycle), "back on: Cycle shows")
+        XCTAssertEqual(hidden.droppingHiddenFlags(gatedOffBy: allOff).hiddenSections, [.calories])
+        XCTAssertEqual(hidden.droppingHiddenFlags(gatedOffBy: allOn), hidden, "features on: nothing changes")
+        XCTAssertEqual(hidden.droppingHiddenFlags(gatedOffBy: allOff).stored.hiddenSections, "calories")
+    }
+
+    // MARK: Stored defaults (review N-1)
+
+    /// Reset then Done stores no override: all four keys empty, so a later build's new ids land in their
+    /// canonical place.
+    func testTheDefaultLayoutWritesFourEmptyKeys() {
+        var l = layout(order: "sync,goals", hidden: "goals", tiles: "pai,steps", hiddenTiles: "steps")
+        var edit = TodayLayoutEdit(l)
+        edit.draft.reset()
+        XCTAssertEqual(edit.result(.done).stored, TodayLayout.Stored())
+        XCTAssertEqual(TodayLayout.standard.stored, TodayLayout.Stored(sectionOrder: "", hiddenSections: "",
+                                                                       tileOrder: "", hiddenTiles: ""))
+        // A non-default order is still written in full, canonical ids in place.
+        l.reset()
+        l.moveSections(from: [0], to: 2, gates: allOn)
+        XCTAssertEqual(l.stored.sectionOrder, "vitalsStatus,metrics,calories,goals,cycle,headache,sync")
+        XCTAssertEqual(l.stored.tileOrder, "", "tiles untouched: no tile override")
+        XCTAssertEqual(TodayLayout(stored: l.stored), l)
     }
 
     // MARK: Order
@@ -289,7 +337,7 @@ final class TodayLayoutTests: XCTestCase {
     func testRowNamesAndSpokenNames() {
         XCTAssertEqual(DashboardSection.allCases.map(\.editTitle),
                        ["Your Numbers", "Vitals Status", "Calories", "Daily Goals", "Cycle", "Headache log",
-                        "History & Sync"])
+                        "History & Sleep"])
         XCTAssertEqual(TodayTileID.respiratoryRate.spokenTitle, "respiratory rate")
         for t in TodayTileID.allCases { XCTAssertFalse(t.title.isEmpty) }
     }
