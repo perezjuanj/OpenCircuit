@@ -20,8 +20,22 @@ enum ZeppSignInCopy {
         + "OpenCircuit doesn't save them and signs out of Zepp right after. Syncing never contacts Zepp."
     static let mayStopWorking = "This uses the same sign-in as the Zepp app. If Zepp changes it, it can stop "
         + "working; Troubleshooting on the setup screen has another way."
-    static let pickHeader = "More than one device on this account"
-    static let pickFooter = "Pick the Helio Strap. The address ending is shown so you can tell devices apart."
+    static let severalStrapsHeader = "More than one Helio Strap on this account"
+    static let severalStrapsFooter = "Pick the strap you're setting up. The address ending is shown so you can tell "
+        + "them apart."
+    static let noStrapHeader = "No Helio Strap on this account"
+    static let noStrapFooter = "None of these is marked as a Helio Strap. Pick one only if you're sure it's your "
+        + "strap. If the strap isn't here, pair it in the Zepp app, then try again. A wrong key is refused by the "
+        + "strap, and OpenCircuit tells you."
+
+    /// The question's header and footer: several straps, or no strap among the account's devices.
+    static func pickHeader(for devices: [ZeppAccountDevice]) -> String {
+        devices.contains(where: \.isHelioStrap) ? severalStrapsHeader : noStrapHeader
+    }
+
+    static func pickFooter(for devices: [ZeppAccountDevice]) -> String {
+        devices.contains(where: \.isHelioStrap) ? severalStrapsFooter : noStrapFooter
+    }
 
     static func message(for error: Error) -> String {
         switch error as? ZeppAccountError {
@@ -39,19 +53,30 @@ enum ZeppSignInCopy {
         }
     }
 
-    /// Which of the account's devices gives the strap's key: one device, or exactly one Helio Strap among
-    /// several, needs no question; anything else (two straps, no strap among several) asks the user.
-    /// Shared by this sheet and onboarding's strap sheet, so neither can save another device's key.
+    /// Which of the account's devices gives the strap's key. Only an unambiguous Helio Strap is used
+    /// without a question: exactly one strap once exact duplicates are dropped. Two or more straps ask
+    /// among the straps only; no strap at all asks among everything, even when the account has just one
+    /// other device (a watch's key never goes to the strap on its own). Shared by this sheet and
+    /// onboarding's strap sheet through `lookUp`, so neither can save another device's key.
     enum Pick: Equatable {
         case use(ZeppAccountDevice)
         case ask([ZeppAccountDevice])
     }
 
     static func pick(from devices: [ZeppAccountDevice]) -> Pick {
-        let straps = devices.filter(\.isHelioStrap)
-        if devices.count == 1 { return .use(devices[0]) }
+        var unique: [ZeppAccountDevice] = []
+        for device in devices where !unique.contains(device) { unique.append(device) }
+        let straps = unique.filter(\.isHelioStrap)
         if straps.count == 1 { return .use(straps[0]) }
-        return .ask(devices)
+        return .ask(straps.isEmpty ? unique : straps)
+    }
+
+    /// Sign in, read the account's keys, decide. Both sheets call this and nothing else, so the rule
+    /// above is the only way a key from the account reaches `saveKeyAndUseStrap`.
+    static func lookUp(_ lookup: ZeppAccountKeyLookup, email: String, password: String) async throws -> Pick {
+        let result = pick(from: try await lookup.devicesWithKeys(email: email, password: password))
+        if case .ask(let devices) = result, devices.isEmpty { throw ZeppAccountError.noKeyOnAccount }
+        return result
     }
 
     static func deviceName(_ device: ZeppAccountDevice) -> String {
@@ -117,7 +142,9 @@ struct ZeppSignInSheet: View {
 
                 if !choices.isEmpty {
                     Section {
-                        ForEach(choices, id: \.macAddress) { device in
+                        // By position: Zepp can list two entries with the same (or an empty) address,
+                        // and a shared id lets SwiftUI hand a tap to the wrong row.
+                        ForEach(Array(choices.enumerated()), id: \.offset) { _, device in
                             Button {
                                 finish(with: device)
                             } label: {
@@ -128,9 +155,9 @@ struct ZeppSignInSheet: View {
                             }
                         }
                     } header: {
-                        Text(ZeppSignInCopy.pickHeader)
+                        Text(ZeppSignInCopy.pickHeader(for: choices))
                     } footer: {
-                        Text(ZeppSignInCopy.pickFooter)
+                        Text(ZeppSignInCopy.pickFooter(for: choices))
                     }
                 }
             }
@@ -154,9 +181,9 @@ struct ZeppSignInSheet: View {
         Task {
             defer { working = false }
             do {
-                let devices = try await lookup.devicesWithKeys(email: email, password: password)
+                let pick = try await ZeppSignInCopy.lookUp(lookup, email: email, password: password)
                 self.password = ""
-                switch ZeppSignInCopy.pick(from: devices) {
+                switch pick {
                 case .use(let device): finish(with: device)
                 case .ask(let devices): choices = devices
                 }
