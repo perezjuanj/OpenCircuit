@@ -165,11 +165,76 @@ final class OnboardingFlowTests: XCTestCase {
     }
 
     func testTheSharedPagesHaveNoRingOnlyWording() {
-        for text in OnboardingCopy.welcome + [DeviceCopy.bluetoothPermission] {
+        for text in [DeviceCopy.welcomeLead, DeviceCopy.bluetoothPurpose, DeviceCopy.bluetoothPermission] {
             XCTAssertNil(text.range(of: "your ring\\b(?! or)", options: .regularExpression), text)
             XCTAssertFalse(text.contains("RingConn Gen 2's"), text)
         }
-        XCTAssertTrue(DeviceCopy.bluetoothPermission.contains("your ring or strap"))
+        XCTAssertTrue(DeviceCopy.welcomeLead.contains("your ring or strap"))
+        XCTAssertTrue(DeviceCopy.bluetoothPurpose.contains("your ring or strap"))
+    }
+
+    // MARK: the redesigned flow's copy
+
+    func testEveryDeviceHasATitleForEachFirstStep() {
+        for device in ActiveDeviceChoice.allCases {
+            XCTAssertEqual(device.firstStepTitles.count, device.firstSteps.count, "\(device)")
+            XCTAssertEqual(device.onboardingSteps.map(\.detail), device.firstSteps, "\(device)")
+        }
+    }
+
+    /// The strap's key comes from a Zepp sign-in and Health can sync to iCloud, so onboarding makes
+    /// no absolute "nothing leaves the phone" or "no account" claim (#387's sweep).
+    func testOnboardingMakesNoAbsoluteLocalOrAccountClaim() {
+        let model = OnboardingViewModel()
+        let footnotes = OnboardingViewModel.Step.allCases.map { step -> String in
+            model.start(at: step, device: nil)
+            return model.footnote
+        }
+        let texts = [OnboardingCopy.welcomeHeadline, DeviceCopy.welcomeLead, OnboardingCopy.permissionsLead,
+                     OnboardingCopy.permissionsNote] + OnboardingCopy.ticks + footnotes
+        for text in texts {
+            for banned in ["Nowhere else", "Nothing is sent", "No account needed", "keeps every reading"] {
+                XCTAssertFalse(text.contains(banned), "\(banned) in: \(text)")
+            }
+        }
+        XCTAssertFalse(OnboardingCopy.ticks.contains("No account"))
+        XCTAssertEqual(DeviceCopy.disclaimer, DeviceCopy.notAffiliated + " " + DeviceCopy.notMedical,
+                       "onboarding's two panels are exactly Profile ▸ About's disclaimer")
+    }
+
+    /// The permissions step prompts on Continue, so its copy must say so, not "when you connect".
+    func testThePermissionsCopyMatchesWhenTheStepPrompts() {
+        XCTAssertTrue(OnboardingCopy.permissionsLead.contains("Continue"))
+        XCTAssertFalse(OnboardingCopy.permissionsLead.contains("first time you connect"))
+    }
+
+    // MARK: the redesigned flow's state
+
+    func testAFreshInstallPicksNothingAndTheDeviceStepWaitsForAPick() {
+        let model = OnboardingViewModel(initialStep: .device, flow: flow())
+        XCTAssertNil(model.device)
+        XCTAssertFalse(model.canAdvance)
+        model.select(.helioStrap)
+        XCTAssertTrue(model.canAdvance)
+        XCTAssertEqual(model.shownSetupDevice, .helioStrap)
+        XCTAssertEqual(model.otherSetupDevices, ActiveDeviceChoice.allCases.filter { $0 != .helioStrap })
+    }
+
+    func testTheLastStepEndsOnTheStrapsSetupOnlyWhenTheStrapIsntSetUp() {
+        let model = OnboardingViewModel(initialStep: .legal, flow: flow(), device: .helioStrap)
+        XCTAssertEqual(model.primaryCTATitle, "Set Up Strap")
+        model.flow = flow(.helioStrap, key: true)
+        XCTAssertEqual(model.primaryCTATitle, "Get Started")
+        model.select(.ringConn)
+        XCTAssertEqual(model.primaryCTATitle, "Get Started")
+        model.start(at: .permissions, device: .helioStrap)
+        XCTAssertEqual(model.primaryCTATitle, "Continue")
+    }
+
+    func testEveryStepMapsToItsFlowPage() {
+        for page in OnboardingFlow.Page.allCases {
+            XCTAssertEqual(OnboardingViewModel.Step(page).rawValue, page.rawValue, "\(page)")
+        }
     }
 
 #if DEBUG && targetEnvironment(simulator)

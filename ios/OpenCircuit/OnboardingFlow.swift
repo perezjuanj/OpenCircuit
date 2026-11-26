@@ -151,17 +151,19 @@ struct OnboardingFlow: Equatable {
 
 /// Onboarding's own copy. Device copy is the device's (`ActiveDeviceChoice` fields, `DeviceCopy`),
 /// so a new device needs no edit here.
+///
+/// No absolute "nothing leaves the phone" claim: the strap's key comes from a one-time Zepp sign-in,
+/// and Apple Health may sync to iCloud. What stays true is said instead: no OpenCircuit account, and
+/// syncing works offline.
 enum OnboardingCopy {
-    static var welcome: [String] {
-        [
-            DeviceCopy.worksWith,
-            "It reads your wearable's metrics over Bluetooth — heart rate, HRV, SpO₂, sleep, skin "
-                + "temperature and more.",
-            "It's local-first: your data stays on your device and is written only to Apple Health. "
-                + "Nothing is sent to any server.",
-            DeviceCopy.accounts,
-        ]
-    }
+    static let welcomeHeadline = "Your device.\nYour data.\nYour iPhone."
+
+    /// The permissions step asks iOS for both on Continue (`OnboardingPermissions`).
+    static let permissionsLead = "Tap Continue and iOS asks for both."
+    static let permissionsNote = "You can change either one later in iOS Settings."
+
+    /// The last step's ticks.
+    static let ticks = ["No subscription", "No OpenCircuit account", "Syncs offline"]
 
     static let changeLater = "You can change it later in Profile ▸ Device."
 }
