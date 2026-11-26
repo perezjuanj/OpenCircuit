@@ -434,7 +434,6 @@ private struct DemoLiveCard: View {
         .navigationTitle("Today")
     }
 }
-#endif
 
 /// `-OCDemoScreen recovery | strain` (decision 93): the Recovery or Strain detail over the seeded demo
 /// data, built from the same trends load and night row Today uses.
@@ -530,3 +529,4 @@ private struct DemoTodayScoresStates: View {
         ]
     }
 }
+#endif
