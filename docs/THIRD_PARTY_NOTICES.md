@@ -8,9 +8,9 @@ The third-party components below keep their own licenses, reproduced here.
 The Today dashboard's and onboarding's icons (`ios/OpenCircuit/Assets.xcassets/Keyline/*.imageset`) are unmodified
 24×24 stroke SVGs from [Keyline Icons](https://keylineicons.com)
 ([github.com/keyline-icons/keyline-icons](https://github.com/keyline-icons/keyline-icons), taken at
-commit `2dc0f0c`): `activity`, `arrow-down-right`, `arrow-up-right`, `bluetooth`, `calendar`, `chevron-left`,
-`chevron-right`, `circle`, `circle-alert`, `circle-check`, `droplet`, `heart`, `minus`, `route`, `sparkles`,
-`thermometer`, `wind`.
+commit `2dc0f0c`): `activity`, `arrow-down-right`, `arrow-up-right`, `bluetooth`, `calendar`, `check`,
+`chevron-left`, `chevron-right`, `circle`, `circle-alert`, `circle-check`, `droplet`, `heart`, `info`, `minus`,
+`route`, `sparkles`, `thermometer`, `wind`.
 
 ```
 MIT License

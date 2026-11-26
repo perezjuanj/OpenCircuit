@@ -320,6 +320,10 @@ struct ContentView: View {
                 get: { !onboardingCompleted },
                 set: { _ in }),   // only onDone finishes: a forced dismissal never marks it seen (F2)
                 onDismiss: {
+                    // Onboarding's permissions step may have just granted Health: show it on Today.
+                    healthAuthorized = health.isShareAuthorized
+                    if healthAuthorized { observability.markHealthEverAuthorized() }
+                    refreshHealthShareState()
                     resolveOrphanedWorkoutSnapshot()   // the orphan check waited for it (F2)
                     replayPendingWorkoutLink()         // then the link it held (#258)
                     surfaceHistoryResetNotice()        // and the reset notice (#243)

@@ -69,6 +69,26 @@ extension ActiveDeviceChoice {
         }
     }
 
+    /// A short title for each of `firstSteps`, in the same order (onboarding shows the step as a
+    /// title over its detail). Same count as `firstSteps`; a test pins it.
+    var firstStepTitles: [String] {
+        switch self {
+        case .ringConn:
+            return [
+                "No account, no official app",
+                "Close the RingConn app first",
+                "Keep your phone nearby overnight",
+                "Charge it as usual",
+            ]
+        case .helioStrap:
+            return [
+                "Sign in once with your Zepp account",
+                "Keep it paired in Zepp",
+                "Zepp can stay installed",
+            ]
+        }
+    }
+
     /// The first steps onboarding shows for this device, in order.
     var firstSteps: [String] {
         switch self {
@@ -245,14 +265,32 @@ enum DeviceCopy {
 
     /// The not-affiliated and not-a-medical-device text, shared by onboarding's last page and
     /// Profile ▸ About so they can't drift apart. Names match the README's (#225).
-    static var disclaimer: String {
+    static var disclaimer: String { notAffiliated + " " + notMedical }
+
+    /// The disclaimer's first half: independent, compatible with every device, not affiliated with
+    /// any maker. Onboarding's last page shows the two halves as separate panels.
+    static var notAffiliated: String {
         let marks = all.flatMap(\.trademarks).map { "\"\($0)\"" }
         let markVerb = marks.count == 1 ? "is a trademark of its respective owner"
                                         : "are trademarks of their respective owners"
         return "OpenCircuit is an independent, local-first app compatible with \(list(all.map(\.compatibilityPhrase), "and")). "
             + "It is not affiliated with, authorized, or endorsed by \(list(all.flatMap(\.makers))); "
-            + "\(list(marks, "and")) \(markVerb). OpenCircuit is not a medical device. Its readings are estimates "
-            + "for personal insight, not diagnosis. Talk to a clinician about any health concern."
+            + "\(list(marks, "and")) \(markVerb)."
+    }
+
+    /// The disclaimer's second half.
+    static let notMedical = "OpenCircuit is not a medical device. Its readings are estimates for personal insight, "
+        + "not diagnosis. Talk to a clinician about any health concern."
+
+    /// Onboarding's welcome line: what is read, from which devices, and where it goes.
+    static var welcomeLead: String {
+        "Reads heart rate, HRV, SpO₂, sleep and skin temperature from your \(list(all.map(\.noun))) over "
+            + "Bluetooth, and writes them to Apple Health on this iPhone."
+    }
+
+    /// Onboarding's permissions page: what Bluetooth is for.
+    static var bluetoothPurpose: String {
+        "Finds and connects to your \(list(all.map(\.noun))). Without it, nothing can sync."
     }
 }
 

@@ -14,7 +14,7 @@ enum KeylineIcon: String, CaseIterable {
     case chevronRight = "chevron-right"
     case circleAlert = "circle-alert"
     case circleCheck = "circle-check"
-    case circle, bluetooth
+    case circle, bluetooth, info, check
 
     /// The asset-catalog name (the `Keyline` folder provides a namespace).
     var assetName: String { "Keyline/\(rawValue)" }
