@@ -494,8 +494,21 @@ private struct ScoreDial: View {
                 .lineLimit(1).minimumScaleFactor(0.6)
                 .padding(.horizontal, 2)
         }
-        .frame(maxWidth: size, maxHeight: size)
-        .aspectRatio(1, contentMode: .fit)
-        .frame(width: stacked ? size : nil)
+        .modifier(DialFrame(size: size, fixed: stacked))
+    }
+}
+
+/// Side by side the dial is a fixed square, so a long status line beside it can never squeeze it (and
+/// truncate its value). In a column it may shrink to the column's width, as a square.
+private struct DialFrame: ViewModifier {
+    let size: CGFloat
+    let fixed: Bool
+
+    func body(content: Content) -> some View {
+        if fixed {
+            content.frame(width: size, height: size).fixedSize()
+        } else {
+            content.frame(maxWidth: size, maxHeight: size).aspectRatio(1, contentMode: .fit)
+        }
     }
 }

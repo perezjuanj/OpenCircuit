@@ -430,14 +430,18 @@ private struct DemoTodayScoresDetail: View {
 private struct DemoTodayScoresStates: View {
     var body: some View {
         GeometryReader { geo in
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(Array(Self.states().enumerated()), id: \.offset) { _, state in
-                    Text(state.title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
-                    TodayScoresCard(scores: state.scores, sentence: state.sentence)
+            // A scroll container, so the stack is never squeezed to the screen's height (the dials
+            // are flexible and would collapse); then the whole thing is scaled down to fit one shot.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(Self.states().enumerated()), id: \.offset) { _, state in
+                        Text(state.title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                        TodayScoresCard(scores: state.scores, sentence: state.sentence)
+                    }
                 }
+                .padding()
             }
-            .padding()
-            .frame(width: geo.size.width / Self.scale, alignment: .topLeading)
+            .frame(width: geo.size.width / Self.scale, height: geo.size.height / Self.scale)
             .scaleEffect(Self.scale, anchor: .topLeading)
         }
         .background(Theme.pageBackground)
