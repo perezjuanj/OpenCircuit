@@ -38,16 +38,17 @@ third-party server.
 ## See it in action
 
 <p align="center">
-  <img src="docs/images/dashboard-vitals.jpg" alt="OpenCircuit dashboard showing ring connection, readiness, and vitals" width="31%" />
-  <img src="docs/images/sleep-insights.jpg" alt="OpenCircuit sleep insights with sleep stages, overnight vitals, and stress" width="31%" />
-  <img src="docs/images/activity-goals.jpg" alt="OpenCircuit daily activity goals, calories, and workout entry point" width="31%" />
+  <img src="docs/images/onboarding.jpg" alt="OpenCircuit onboarding welcome screen with a RingConn ring and an Amazfit Helio Strap" width="31%" />
+  <img src="docs/images/today-numbers.jpg" alt="OpenCircuit Today tab with HRV, resting heart rate, SpO2, respiratory rate, skin temperature and steps against your usual range" width="31%" />
+  <img src="docs/images/sleep.jpg" alt="OpenCircuit Sleep tab with last night's stages, sleep score and sleep need" width="31%" />
 </p>
 <p align="center">
-  <img src="docs/images/workout-picker.jpg" alt="OpenCircuit workout picker with supported activity types" width="31%" />
-  <img src="docs/images/live-workout.jpg" alt="OpenCircuit live outdoor running workout with heart-rate zones" width="31%" />
+  <img src="docs/images/sleep-score.jpg" alt="OpenCircuit sleep score breakdown listing each factor and its weight" width="31%" />
+  <img src="docs/images/breathing.jpg" alt="OpenCircuit guided breathing exercise with live heart rate" width="31%" />
+  <img src="docs/images/trends.jpg" alt="OpenCircuit Trends tab with daily breakdown and all-day heart rate" width="31%" />
 </p>
 
-<p align="center"><em>Dashboard, sleep and activity insights, and live workout tracking — all from data decoded locally from your RingConn.</em></p>
+<p align="center"><em>Onboarding, Today, sleep and its score breakdown, guided breathing and trends. Screenshots use the app's built-in demo data, not a real person's.</em></p>
 
 ## What you get with a RingConn ring
 
