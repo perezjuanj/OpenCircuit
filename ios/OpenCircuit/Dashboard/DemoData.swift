@@ -143,6 +143,17 @@ enum DemoData {
                 d = d.addingTimeInterval(900); j += 1
             }
             context.insert(StoredDaily(day: wakeDay, steps: daySteps, updatedAt: dayEnd))
+            // Today's brisk morning walk, per minute, so the Strain dial has a real score (decision 93)
+            // rather than the 0.0 an all-easy day reads: about 8 on the 0–21 scale once it has ended.
+            if n == 0 {
+                let walk = wakeDay.addingTimeInterval(8 * 3600 + 60)
+                for m in 0..<22 where walk.addingTimeInterval(Double(m + 1) * 60) <= now {
+                    let t = walk.addingTimeInterval(Double(m) * 60)
+                    let bpm = m < 6 ? 125.0 : m < 18 ? 140 + 2 * wiggle(m, 0.4) : 122
+                    context.insert(StoredSample(kindRaw: MetricKind.heartRate.rawValue, start: t,
+                                                end: t.addingTimeInterval(60), value: bpm.rounded()))
+                }
+            }
         }
         try? context.save()
         DemoSleepNeed.applyIfRequested(context, now: now)
@@ -241,7 +252,8 @@ import SwiftData
 import SwiftUI
 
 /// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR |
-/// sources | sources-<topic> | helio-setup | helio-setup-full | zepp-signin`
+/// sources | sources-<topic> | helio-setup | helio-setup-full | zepp-signin | recovery | strain |
+/// today-scores-states`
 /// presents that screen full-screen on launch, so a screenshot run can reach it without UI
 /// automation. `liveHR` renders the live-measure card's composition over a SYNTHETIC buffer — a
 /// simulator has no ring to measure.
@@ -302,6 +314,10 @@ struct DemoScreenModifier: ViewModifier {
             DemoSleepScoreSheet()
         } else if id == "sleep-need" {
             DemoSleepNeedSheet()
+        } else if id == "recovery" || id == "strain" {
+            DemoTodayScoresDetail(showsStrain: id == "strain")
+        } else if id == "today-scores-states" {
+            DemoTodayScoresStates()
         } else {
             DemoLiveCard()
         }
@@ -375,3 +391,94 @@ private struct DemoLiveCard: View {
     }
 }
 #endif
+
+/// `-OCDemoScreen recovery | strain` (decision 93): the Recovery or Strain detail over the seeded demo
+/// data, built from the same trends load and night row Today uses.
+private struct DemoTodayScoresDetail: View {
+    let showsStrain: Bool
+    @Environment(\.modelContext) private var modelContext
+    @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
+    @State private var trends = TrendsData()
+    @State private var loaded = false
+
+    var body: some View {
+        Group {
+            if showsStrain {
+                StrainDetailView(reading: loaded ? trends.todayStrain : nil, onHeartRate: {})
+            } else {
+                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: loaded) { scores in
+                    RecoveryDetailView(scores: scores,
+                                       tiles: TodayTiles.build(points: trends.points, restingHR: trends.restingHR,
+                                                               tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
+                                                               scope: .from(trends)))
+                }
+            }
+        }
+        .task {
+            trends = await TrendsData.loadAsync(container: modelContext.container, tempUnitRaw: tempUnitRaw)
+            loaded = true
+        }
+    }
+}
+
+/// `-OCDemoScreen today-scores-states` (decision 93): the scores card in its honest states, from
+/// SYNTHETIC inputs only: (A) morning, last night not synced; (B) a night stored without a score;
+/// (C) sleep alone with a hard day; then a fully scored day. Scaled to fit one screenshot.
+private struct DemoTodayScoresStates: View {
+    var body: some View {
+        GeometryReader { geo in
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array(Self.states().enumerated()), id: \.offset) { _, state in
+                    Text(state.title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                    TodayScoresCard(scores: state.scores, sentence: state.sentence)
+                }
+            }
+            .padding()
+            .frame(width: geo.size.width / Self.scale, alignment: .topLeading)
+            .scaleEffect(Self.scale, anchor: .topLeading)
+        }
+        .background(Theme.pageBackground)
+    }
+
+    private static let scale: CGFloat = 0.62
+
+    private struct Sample {
+        let title: String
+        let scores: TodayScores
+        let sentence: String
+    }
+
+    private static func states(now: Date = Date()) -> [Sample] {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        func night(daysAgo: Int, score: Int, stress: Int, asleep: Int) -> TodayScores.Night {
+            let wake = today.addingTimeInterval(Double(-daysAgo) * 86_400 + 6.75 * 3600)
+            let bed = wake.addingTimeInterval(-Double(asleep + 40) * 60)
+            return .init(nightKey: cal.startOfDay(for: wake), inBedStart: bed, inBedEnd: wake,
+                         sleepScore: score, stressScore: stress, asleepMin: asleep)
+        }
+        func strain(_ value: Double?, minutes: Int) -> DailyStrain.Reading {
+            DailyStrain.Reading(strain: value, coveredSeconds: minutes * 60, latestSampleAt: now,
+                                maxHR: 185, restingHR: 54)
+        }
+        func sentence(_ s: TodayScores, hrv: BaselineTrend.Direction? = nil, rhr: BaselineTrend.Direction? = nil) -> String {
+            TodaySynthesis.sentence(.init(readiness: s.report.readiness, hrv: hrv, restingHR: rhr,
+                                          lastNightSleepMinutes: s.report.lastNightAsleepMin,
+                                          newestDataAt: now, now: now))
+        }
+        let a = TodayScores.build(night: night(daysAgo: 1, score: 81, stress: 40, asleep: 430),
+                                  strain: strain(1.2, minutes: 90), trendsLoaded: true, now: now)
+        let b = TodayScores.build(night: night(daysAgo: 0, score: 0, stress: 0, asleep: 401),
+                                  strain: strain(nil, minutes: 4), trendsLoaded: true, now: now)
+        let c = TodayScores.build(night: night(daysAgo: 0, score: 52, stress: 0, asleep: 308),
+                                  strain: strain(15.2, minutes: 400), trendsLoaded: true, now: now)
+        let d = TodayScores.build(night: night(daysAgo: 0, score: 85, stress: 33, asleep: 437),
+                                  strain: strain(8.4, minutes: 300), trendsLoaded: true, now: now)
+        return [
+            Sample(title: "A · Morning, last night not synced yet", scores: a, sentence: sentence(a)),
+            Sample(title: "B · Night stored without a score", scores: b, sentence: sentence(b)),
+            Sample(title: "C · Sleep alone and a hard day", scores: c, sentence: sentence(c)),
+            Sample(title: "Scored", scores: d, sentence: sentence(d, hrv: .within, rhr: .within)),
+        ]
+    }
+}

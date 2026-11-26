@@ -20,18 +20,50 @@ struct RecoveryDetailView: View {
     private var recovery: TodayScores.Recovery { scores.recovery }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                hero
-                if let r = recovery.result {
-                    factors(r)
+        List {
+            Section { hero }
+                .listRowBackground(Color.clear)
+            if let r = recovery.result {
+                Section("What went into it") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        if let sleep = r.factors[.sleep] {
+                            ReadinessFactorBar(label: TodayScoresCopy.detailSleepFactor, value: sleep,
+                                               tint: r.tier.ringColor)
+                        }
+                        if let hrv = r.factors[.recovery] {
+                            ReadinessFactorBar(label: TodayScoresCopy.detailHRVFactor, value: hrv,
+                                               tint: r.tier.ringColor)
+                        }
+                        Text(recovery.isLowConfidence ? TodayScoresCopy.detailSleepAlone : TodayScoresCopy.detailShares())
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, 4)
                 }
-                method
-                lastNight
             }
-            .padding()
+            Section("How it's worked out") {
+                Text(TodayScoresCopy.detailMethod)
+                    .font(.subheadline).foregroundStyle(.secondary)
+                NavigationLink {
+                    HealthSourcesView(focus: .readiness)
+                } label: {
+                    HStack(spacing: 10) {
+                        KeylineGlyph(.info, size: 16).foregroundStyle(Theme.accent)
+                        Text("Sources & methods")
+                    }
+                }
+            }
+            let rows = lastNightTiles
+            if !rows.isEmpty {
+                Section("Last night") {
+                    ForEach(rows) { tile in
+                        Button { onMetric(tile.metric) } label: { row(tile) }
+                            .buttonStyle(.plain)
+                    }
+                }
+            }
         }
-        .background(Theme.pageBackground)
+        .listStyle(.insetGrouped)
         .navigationTitle("Recovery")
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -66,52 +98,9 @@ struct RecoveryDetailView: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(TodayScoresCopy.recoveryAccessibility(recovery)
                             + (TodayScoresCopy.detailGap(recovery).map { ". \($0)" } ?? ""))
-    }
-
-    // MARK: What went into it
-
-    private func factors(_ r: WellnessBalance.Result) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            sectionTitle("WHAT WENT INTO IT")
-            if let sleep = r.factors[.sleep] {
-                ReadinessFactorBar(label: TodayScoresCopy.detailSleepFactor, value: sleep, tint: r.tier.ringColor)
-            }
-            if let hrv = r.factors[.recovery] {
-                ReadinessFactorBar(label: TodayScoresCopy.detailHRVFactor, value: hrv, tint: r.tier.ringColor)
-            }
-            Text(recovery.isLowConfidence ? TodayScoresCopy.detailSleepAlone : TodayScoresCopy.detailShares())
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .ocCardSurface()
-    }
-
-    // MARK: How it's worked out
-
-    private var method: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionTitle("HOW IT'S WORKED OUT")
-            Text(TodayScoresCopy.detailMethod)
-                .font(.subheadline).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            NavigationLink {
-                HealthSourcesView(focus: .readiness)
-            } label: {
-                HStack(spacing: 4) {
-                    Text("Sources & methods").font(.subheadline.weight(.medium))
-                    KeylineGlyph(.chevronRight, size: 12, relativeTo: .caption)
-                }
-                .foregroundStyle(Theme.accent)
-                .frame(minHeight: 44)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-        }
-        .ocCardSurface()
     }
 
     // MARK: Last night
@@ -124,32 +113,17 @@ struct RecoveryDetailView: View {
         }
     }
 
-    @ViewBuilder
-    private var lastNight: some View {
-        let rows = lastNightTiles
-        if !rows.isEmpty {
-            VStack(alignment: .leading, spacing: 0) {
-                sectionTitle("LAST NIGHT").padding(.bottom, 4)
-                ForEach(Array(rows.enumerated()), id: \.element.id) { index, tile in
-                    if index > 0 { Divider() }
-                    Button { onMetric(tile.metric) } label: { row(tile) }
-                        .buttonStyle(.plain)
-                }
-            }
-            .ocCardSurface()
-        }
-    }
-
     private func row(_ tile: TodayTile) -> some View {
         HStack(spacing: 10) {
             KeylineGlyph(tile.icon, size: 16).foregroundStyle(tile.tint)
-            Text(tile.title).font(.body)
+            Text(tile.title)
             Spacer(minLength: 8)
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(tile.valueText ?? TodayScoresCopy.missing)
-                    .font(.body.weight(.semibold)).monospacedDigit()
-                if !tile.unit.isEmpty {
-                    Text(tile.unit).font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+            VStack(alignment: .trailing, spacing: 1) {
+                HStack(alignment: .firstTextBaseline, spacing: 3) {
+                    Text(tile.valueText ?? TodayScoresCopy.missing).fontWeight(.semibold).monospacedDigit()
+                    if !tile.unit.isEmpty {
+                        Text(tile.unit).font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                    }
                 }
                 if let delta = tile.deltaText {
                     Text(delta).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -163,10 +137,5 @@ struct RecoveryDetailView: View {
         .accessibilityLabel(tile.accessibilityLabel)
         .accessibilityHint("Opens today's \(tile.title) chart and its trend")
         .accessibilityAddTraits(.isButton)
-    }
-
-    private func sectionTitle(_ s: String) -> some View {
-        Text(s).font(.caption.weight(.semibold)).tracking(1.2).foregroundStyle(.secondary)
-            .accessibilityAddTraits(.isHeader)
     }
 }

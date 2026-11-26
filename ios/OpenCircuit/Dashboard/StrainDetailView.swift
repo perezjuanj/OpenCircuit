@@ -40,16 +40,27 @@ struct StrainDetailView: View {
     private var valueText: String? { StrainTileText.value(reading) }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                hero
-                zones
-                about
-                links
+        List {
+            Section { hero }
+                .listRowBackground(Color.clear)
+            zones
+            Section("About strain") {
+                ForEach(Self.bullets, id: \.self) { Text($0).font(.subheadline) }
             }
-            .padding()
+            Section {
+                if let onHeartRate {
+                    Button(action: onHeartRate) { linkRow("Today's heart rate", icon: .heart, tint: Theme.hr) }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Opens today's heart-rate chart")
+                }
+                NavigationLink {
+                    HealthSourcesView(focus: .strain)
+                } label: {
+                    linkRow("Sources & methods", icon: .info, tint: Theme.accent, chevron: false)
+                }
+            }
         }
-        .background(Theme.pageBackground)
+        .listStyle(.insetGrouped)
         .navigationTitle("Strain")
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -84,7 +95,6 @@ struct StrainDetailView: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(StrainTileText.accessibilityLabel(reading))
     }
@@ -94,64 +104,28 @@ struct StrainDetailView: View {
     private var zones: some View {
         let rhr = reading?.restingHR
         if rhr != nil || ageIsDefault {
-            VStack(alignment: .leading, spacing: 10) {
-                sectionTitle("TODAY'S ZONES USE")
+            Section("Today's zones use") {
                 if let reading, let rhr {
                     LabeledContent("Resting heart rate", value: "\(rhr) bpm")
                     LabeledContent("Estimated maximum",
                                    value: "\(reading.maxHR) bpm" + (ageIsDefault ? " (default age)" : ""))
                 }
-                if ageIsDefault {
-                    Text(Self.defaultAgeNote).font(.subheadline).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                if ageIsDefault { Text(Self.defaultAgeNote).font(.subheadline) }
             }
-            .font(.subheadline)
-            .ocCardSurface()
         }
     }
 
-    private var about: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionTitle("ABOUT STRAIN")
-            ForEach(Self.bullets, id: \.self) {
-                Text($0).font(.subheadline).fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .ocCardSurface()
-    }
-
-    private var links: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let onHeartRate {
-                Button(action: onHeartRate) { linkRow("Today's heart rate", icon: .heart, tint: Theme.hr) }
-                    .buttonStyle(.plain)
-                    .accessibilityHint("Opens today's heart-rate chart")
-                Divider()
-            }
-            NavigationLink {
-                HealthSourcesView(focus: .strain)
-            } label: {
-                linkRow("Sources & methods", icon: .info, tint: Theme.accent)
-            }
-            .buttonStyle(.plain)
-        }
-        .ocCardSurface()
-    }
-
-    private func linkRow(_ title: String, icon: KeylineIcon, tint: Color) -> some View {
+    /// A NavigationLink draws its own disclosure chevron; a plain button row gets a Keyline one.
+    private func linkRow(_ title: String, icon: KeylineIcon, tint: Color, chevron: Bool = true) -> some View {
         HStack(spacing: 10) {
             KeylineGlyph(icon, size: 16).foregroundStyle(tint)
             Text(title).font(.body)
             Spacer()
-            KeylineGlyph(.chevronRight, size: 12, relativeTo: .caption).foregroundStyle(.tertiary)
+            if chevron {
+                KeylineGlyph(.chevronRight, size: 12, relativeTo: .caption).foregroundStyle(.tertiary)
+            }
         }
         .frame(minHeight: 44)
         .contentShape(Rectangle())
-    }
-
-    private func sectionTitle(_ s: String) -> some View {
-        Text(s).font(.caption.weight(.semibold)).tracking(1.2).foregroundStyle(.secondary)
-            .accessibilityAddTraits(.isHeader)
     }
 }

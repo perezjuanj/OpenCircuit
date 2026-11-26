@@ -123,6 +123,11 @@ public enum WellnessBalance {
     public struct RecoveryShares: Equatable, Sendable {
         public let sleep: Int
         public let hrv: Int
+
+        public init(sleep: Int, hrv: Int) {
+            self.sleep = sleep
+            self.hrv = hrv
+        }
     }
 
     public static var recoveryShares: RecoveryShares {
