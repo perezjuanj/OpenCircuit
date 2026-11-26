@@ -1,5 +1,12 @@
 // Wellness Balance / readiness home headline (#97).
 //
+// ⚠️ NO LONGER ON TODAY (decision 93, #391). Today's scores card (`TodayScoresCard`) and the Recovery
+// detail replaced it, with Recovery = `WellnessBalance.recoveryScore` (no activity term). Nothing in
+// the app builds this view any more. It is kept only because two existing tests host it
+// (`StoreRefreshSignalTests.testADayChangeReKeysTheTodayReads`, which counts its activity read, and
+// `SyncSaveMainThreadBenchmarkTests`), and changing them was not pre-authorised for #391. Delete it
+// together with those two amendments.
+//
 // Weight-combines last night's Sleep Score and overnight recovery (the inverse of overnight
 // stress) — both already stored on the latest StoredSleepSummary — with today's Activity Score
 // (#95, computed here OFF the render path from steps + HR, exactly as GoalsCardView does, so the

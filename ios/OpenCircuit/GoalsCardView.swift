@@ -144,8 +144,7 @@ private struct GoalsCardBody: View {
     /// surfaces can never disagree about what counts as last night.
     private var sleepCredited: Bool {
         guard let s = latestSleep.first else { return false }
-        let inBedEnd = s.inBedEnd > s.inBedStart ? s.inBedEnd : nil
-        return MissedNight.endedToday(inBedEnd: inBedEnd, nightKey: s.night)
+        return LastNight.isCredited(s)
     }
 
     /// Asleep minutes credited to today's ring — the stored night's `asleepMin` only when it ended
