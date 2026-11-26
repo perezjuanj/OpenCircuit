@@ -147,6 +147,28 @@ final class EditTodayHostedTests: XCTestCase {
             .contains { $0.accessibilityActivate() }
     }
 
+    // MARK: Today's call sites (the same source check TodayScoresTests uses for todayList)
+
+    private func contentView() throws -> String {
+        let app = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("OpenCircuit")
+        return try String(contentsOf: app.appendingPathComponent("ContentView.swift"), encoding: .utf8)
+    }
+
+    /// Today draws the hidden Vitals runner (tested above) and builds its sentence through
+    /// `sentenceInput` (tested in TodayLayoutTests), never from a tile list of its own.
+    func testTodayWiresTheRunnerAndTheSentenceThroughTheTestedSeams() throws {
+        let content = try contentView()
+        let list = try XCTUnwrap(content.range(of: "private var todayList: some View {"))
+        XCTAssertTrue(String(content[list.upperBound...].prefix(1_500))
+                        .contains("HiddenVitalsReport(layout: todayLayout) { vitalsStatusCard }"),
+                      "the hidden Vitals Status runner left todayList")
+        let sentence = try XCTUnwrap(content.range(of: "private func synthesisSentence("))
+        let body = String(content[sentence.upperBound...].prefix(900))
+        XCTAssertTrue(body.contains("todayLayout.sentenceInput("), "the sentence no longer goes through sentenceInput")
+        XCTAssertFalse(body.contains("TodaySynthesis.input("), "the sentence builds its own input again")
+    }
+
     func testTheToolbarButtonsMapToTheirOutcomes() {
         XCTAssertEqual(EditTodaySheet.outcome(for: .cancel), .cancel)
         XCTAssertEqual(EditTodaySheet.outcome(for: .done), .done)
