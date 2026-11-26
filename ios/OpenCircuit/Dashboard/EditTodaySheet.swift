@@ -48,11 +48,9 @@ struct EditTodaySheet: View {
                 Section {
                     let rows = edit.draft.editableTiles(available: tiles)
                     ForEach(rows) { tile in
-                        Toggle(isOn: Binding(get: { edit.draft.isShown(tile) },
-                                             set: { edit.draft.setShown(tile, $0) })) {
-                            Text(tile.title)
-                        }
-                        .accessibilityLabel("Show \(tile.spokenTitle)")
+                        switchRow(title: tile.title, spokenTitle: tile.spokenTitle,
+                                  isOn: Binding(get: { edit.draft.isShown(tile) },
+                                                set: { edit.draft.setShown(tile, $0) }))
                         .accessibilityActions { moveActions(index: rows.firstIndex(of: tile), count: rows.count) { from, to in
                             edit.draft.moveTiles(from: [from], to: to, available: tiles)
                         } }
@@ -91,13 +89,28 @@ struct EditTodaySheet: View {
     @ViewBuilder
     private func sectionRow(_ section: DashboardSection) -> some View {
         if TodayLayout.canHide(section) {
-            Toggle(isOn: Binding(get: { edit.draft.isShown(section) },
-                                 set: { edit.draft.setShown(section, $0) })) {
-                Text(section.editTitle)
-            }
-            .accessibilityLabel("Show \(section.editTitle)")
+            switchRow(title: section.editTitle, spokenTitle: section.editTitle,
+                      isOn: Binding(get: { edit.draft.isShown(section) },
+                                    set: { edit.draft.setShown(section, $0) }))
         } else {
             lockedRow(title: section.editTitle, note: "Always shown", leadingLock: false)
+        }
+    }
+
+    /// A card or tile with its Show switch, which VoiceOver reads as "Show <name>". At the accessibility
+    /// sizes the switch goes under the name, so a long name wraps between words, not inside one.
+    @ViewBuilder
+    private func switchRow(title: String, spokenTitle: String, isOn: Binding<Bool>) -> some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).accessibilityHidden(true)
+                Toggle(isOn: isOn) { Text(title) }
+                    .labelsHidden()
+                    .accessibilityLabel("Show \(spokenTitle)")
+            }
+        } else {
+            Toggle(isOn: isOn) { Text(title) }
+                .accessibilityLabel("Show \(spokenTitle)")
         }
     }
 
