@@ -83,19 +83,11 @@ struct HelioSetupView: View {
     var body: some View {
         List {
             Section("What you get") {
-                bullet("Heart rate, HRV, steps, sleep stages, SpO₂, respiratory rate and skin temperature from the strap's own history, "
-                       + "saved on this phone and written to Apple Health.")
-                bullet("The strap's HRV is labelled RMSSD, like the ring's, based on Amazfit's statement that its devices "
-                       + "measure HRV as RMSSD. Apple Health files it under its only HRV type (SDNN).")
-                bullet("Stress and PAI are shown in the app only. Apple Health has no type for them.")
-                bullet("Find My Strap, a short buzz, and the strap's alarms.")
-                bullet(Self.noServerNote)
+                ForEach(Self.whatYouGet, id: \.self) { bullet($0) }
             }
 
             Section {
-                bullet(HelioStatus.keyOriginCopy)
-                bullet(HelioStatus.dontUnpairCopy)
-                bullet(HelioStatus.zeppCoexistCopy)
+                ForEach(Self.beforeYouStart, id: \.self) { bullet($0) }
             } header: {
                 Text("Before you start")
             }
@@ -144,10 +136,7 @@ struct HelioSetupView: View {
             }
 
             Section("Good to know") {
-                bullet(Self.firstSyncNote)
-                bullet(Self.reinstallNote)
-                bullet(Self.firmwareNote)
-                bullet(Self.iPhoneOnlyNote)
+                ForEach(Self.goodToKnow, id: \.self) { bullet($0) }
             }
 
             troubleshooting
@@ -171,6 +160,21 @@ struct HelioSetupView: View {
             Text("History stops syncing until a key is saved again. Stored history stays.")
         }
     }
+
+    /// The three blocks of this screen, also onboarding's strap sheet, so the two can't drift apart.
+    static var whatYouGet: [String] {
+        [
+            "Heart rate, HRV, steps, sleep stages, SpO₂, respiratory rate and skin temperature from the strap's own history, "
+                + "saved on this phone and written to Apple Health.",
+            "The strap's HRV is labelled RMSSD, like the ring's, based on Amazfit's statement that its devices "
+                + "measure HRV as RMSSD. Apple Health files it under its only HRV type (SDNN).",
+            "Stress and PAI are shown in the app only. Apple Health has no type for them.",
+            "Find My Strap, a short buzz, and the strap's alarms.",
+            noServerNote,
+        ]
+    }
+    static let beforeYouStart = [HelioStatus.keyOriginCopy, HelioStatus.dontUnpairCopy, HelioStatus.zeppCoexistCopy]
+    static let goodToKnow = [firstSyncNote, reinstallNote, firmwareNote, iPhoneOnlyNote]
 
     static let firstSyncNote = "The first sync brings in only what the strap still holds, often about a week. "
         + "History then builds up day by day."
@@ -236,25 +240,33 @@ struct HelioSetupView: View {
     }
 
     private func saveAndConnect() {
-        do {
-            guard try HelioKeyStore.shared.save(pasted: keyText) else {
-                saveError = "That isn't a 32-character key."
-                return
-            }
-        } catch {
-            saveError = "Couldn't save the key in the Keychain."
+        if let error = Self.saveKeyAndUseStrap(keyText) {
+            saveError = error
             return
         }
         keyText = ""
         editingKey = false
         saveError = nil
         refreshKeyState()
-        if choice.isHelio {
-            connection.reconnectNow()
+    }
+
+    /// Save a key (pasted or read from the Zepp account) to the Keychain, then use the strap: reconnect
+    /// when it's already the device in use, else switch to it through `DeviceSwitcher` and connect.
+    /// Returns the error to show, or nil once saved. Shared with onboarding's strap sheet.
+    @MainActor
+    static func saveKeyAndUseStrap(_ text: String) -> String? {
+        do {
+            guard try HelioKeyStore.shared.save(pasted: text) else { return "That isn't a 32-character key." }
+        } catch {
+            return "Couldn't save the key in the Keychain."
+        }
+        if ActiveDeviceChoiceStore.shared.isHelio {
+            HelioConnection.shared.reconnectNow()
         } else {
             DeviceSwitcher.activate(.helioStrap)
-            connection.connect()
+            HelioConnection.shared.connect()
         }
+        return nil
     }
 
     private func refreshKeyState() {

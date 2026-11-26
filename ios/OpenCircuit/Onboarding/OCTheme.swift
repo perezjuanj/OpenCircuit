@@ -47,6 +47,8 @@ enum OCColor {
     static let panelHigh = Color.white.opacity(0.14)
     static let panelSoft = Color.white.opacity(0.05)
     static let rim       = Color.white.opacity(0.24)
+    /// The strap key sheet's background.
+    static let sheet     = Color(hex: 0x0C0D11)
 
     /// Text on the white pill.
     static let actionInk = Color(hex: 0x0A0A0C)
