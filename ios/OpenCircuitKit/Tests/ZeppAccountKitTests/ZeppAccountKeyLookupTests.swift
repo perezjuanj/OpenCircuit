@@ -222,6 +222,10 @@ final class ZeppAccountKeyLookupTests: XCTestCase {
         XCTAssertFalse(devices.isEmpty)
         XCTAssertTrue(devices[0].isHelioStrap, "the strap sorts first")
         XCTAssertEqual(devices[0].authKeyHex, expected, "the account's key is the one the strap accepts")
+        // The app uses a key without asking only when exactly one Helio Strap is listed
+        // (ZeppSignInCopy.pick): this account must be that case, with no other strap's key to confuse.
+        XCTAssertEqual(devices.filter(\.isHelioStrap).count, 1, "exactly one strap on the account")
+        XCTAssertEqual(devices.filter { $0.authKeyHex == expected }.count, 1, "the strap's key belongs to it alone")
         // A made-up account must come back as rejected credentials, not as an unexpected response.
         do {
             _ = try await ZeppAccountKeyLookup().devicesWithKeys(email: "nobody-\(UUID().uuidString.prefix(8))@example.com",

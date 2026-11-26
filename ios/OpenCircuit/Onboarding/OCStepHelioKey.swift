@@ -7,7 +7,7 @@
 //  (guide, snippet, paste) lives only on the strap's full setup screen, reached from the small
 //  Troubleshooting link at the bottom (the setup-shows-one-way rule).
 //
-//  No logic of its own: the device pick is `ZeppSignInCopy.pick(from:)` and the save is
+//  No logic of its own: sign-in and device pick are `ZeppSignInCopy.lookUp` and the save is
 //  `HelioSetupView.saveKeyAndUseStrap`, the same two the setup screen uses.
 //
 
@@ -271,10 +271,11 @@ struct HelioKeySheet: View {
     /// More than one candidate on the account: the user picks (never the first one silently).
     private var deviceChoices: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(ZeppSignInCopy.pickHeader)
+            Text(ZeppSignInCopy.pickHeader(for: choices))
                 .font(.system(.footnote, weight: .semibold))
                 .foregroundStyle(Color.white)
-            ForEach(choices, id: \.macAddress) { device in
+            // By position, not address: see ZeppSignInSheet.
+            ForEach(Array(choices.enumerated()), id: \.offset) { _, device in
                 Button { save(device) } label: {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(ZeppSignInCopy.deviceName(device))
@@ -291,7 +292,7 @@ struct HelioKeySheet: View {
                 }
                 .buttonStyle(OCPressStyle())
             }
-            Text(ZeppSignInCopy.pickFooter)
+            Text(ZeppSignInCopy.pickFooter(for: choices))
                 .font(.caption)
                 .foregroundStyle(Color.white.opacity(0.45))
                 .fixedSize(horizontal: false, vertical: true)
@@ -314,9 +315,9 @@ struct HelioKeySheet: View {
         Task { @MainActor in
             defer { isSigningIn = false }
             do {
-                let devices = try await lookup.devicesWithKeys(email: email, password: password)
+                let pick = try await ZeppSignInCopy.lookUp(lookup, email: email, password: password)
                 self.password = ""
-                switch ZeppSignInCopy.pick(from: devices) {
+                switch pick {
                 case .use(let device): save(device)
                 case .ask(let devices): choices = devices
                 }
