@@ -99,8 +99,7 @@ struct RecoveryDetailView: View {
         }
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(TodayScoresCopy.recoveryAccessibility(recovery)
-                            + (TodayScoresCopy.detailGap(recovery).map { ". \($0)" } ?? ""))
+        .accessibilityLabel(TodayScoresCopy.detailAccessibility(recovery))
     }
 
     // MARK: Last night

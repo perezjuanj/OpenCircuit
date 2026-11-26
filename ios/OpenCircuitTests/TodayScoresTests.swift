@@ -1,3 +1,6 @@
+import SwiftData
+import SwiftUI
+import UIKit
 import XCTest
 import OpenCircuitKit
 @testable import OpenCircuit
@@ -126,6 +129,52 @@ final class TodayScoresTests: XCTestCase {
         XCTAssertEqual(build(old).sleep, .noNight)
     }
 
+    // MARK: Midnight
+
+    /// The card follows the calendar day (#297): the same stored night that is "last night" at 23:55
+    /// is yesterday's two minutes after midnight, so Sleep and Recovery go back to "No night yet"
+    /// without waiting for a sync or a relaunch.
+    @MainActor
+    func testTheCardReJudgesLastNightAfterMidnight() throws {
+        let container = try ModelContainer(for: StoredSleepSummary.self,
+                                           configurations: ModelConfiguration(isStoredInMemoryOnly: true))
+        let n = night(wake: thisMorning, score: 85, stress: 33)
+        container.mainContext.insert(StoredSleepSummary(night: n.nightKey, asleepMin: n.asleepMin,
+                                                        inBedStart: n.inBedStart, inBedEnd: n.inBedEnd,
+                                                        sleepScore: n.sleepScore, stressScore: n.stressScore))
+        try container.mainContext.save()
+
+        final class Seen { var now: Date = .distantPast; var scores: [TodayScores] = [] }
+        let seen = Seen()
+        seen.now = today.addingTimeInterval(23 * 3600 + 55 * 60)
+        let cal = self.cal
+        let vc = UIHostingController(rootView: AnyView(
+            TodayScoresSource(strain: nil, trendsLoaded: true) { scores in
+                Color.clear
+                    .onAppear { seen.scores.append(scores) }
+                    .onChange(of: scores) { _, new in seen.scores.append(new) }
+            }
+            .environment(\.dayClock, DayClock(now: { seen.now }, calendar: { cal }))
+            .modelContainer(container)))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 600))
+        window.rootViewController = vc
+        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene { window.windowScene = scene }
+        window.makeKeyAndVisible()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+
+        XCTAssertEqual(seen.scores.last?.sleep, .scored(score: 85, asleepMin: 437), "23:55, same day")
+        XCTAssertEqual(seen.scores.last?.recovery.result?.score, 82)
+
+        seen.now = today.addingTimeInterval(86_400 + 120)
+        NotificationCenter.default.post(name: .currentDayMayHaveChanged, object: nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+
+        XCTAssertEqual(seen.scores.last?.sleep, .noNight, "00:02 the next day: \(seen.scores.map(\.sleep))")
+        XCTAssertEqual(seen.scores.last?.recovery, .noNight)
+        window.rootViewController = nil
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+    }
+
     // MARK: I1 — one night, one rule
 
     /// The credit rule is the Kit's `MissedNight.endedToday`, the one the Goals Sleep ring and the
@@ -182,6 +231,15 @@ final class TodayScoresTests: XCTestCase {
         XCTAssertEqual(DashboardSection.allCases.first, .metrics)
         XCTAssertEqual(Array(DashboardSectionOrder.decode("readiness,goals,sync").prefix(3)), [.metrics, .goals, .sync],
                        "a saved order naming readiness loads with the tiles first")
+    }
+
+    /// A saved order naming a live section twice loads it once: the sections feed a `ForEach` of
+    /// `Identifiable` cards, where a duplicate id is undefined behaviour.
+    func testALiveDuplicateInASavedOrderIsDropped() {
+        let order = DashboardSectionOrder.decode("goals,sync,goals,metrics,sync")
+        XCTAssertEqual(Array(order.prefix(3)), [.goals, .sync, .metrics], "the first of each keeps its place")
+        XCTAssertEqual(order.count, Set(order).count, "no section twice: \(order)")
+        XCTAssertEqual(Set(order), Set(DashboardSection.allCases))
     }
 
     func testTheStrainTileIsGoneFromYourNumbers() throws {

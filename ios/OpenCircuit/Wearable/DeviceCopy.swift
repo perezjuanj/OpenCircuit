@@ -177,8 +177,8 @@ extension ActiveDeviceChoice {
 /// Background Activity. A line about what the ACTIVE device does takes it; a line about stored data,
 /// which can hold every device's, takes nothing and composes over `allCases`.
 enum SharedScreenCopy {
-    /// Today and Activity ▸ Goals footnote. "Not your device app's own" matches the readiness card
-    /// (`WellnessBalanceCardView`).
+    /// Today and Activity ▸ Goals footnote. "Not your device app's own" matches the Recovery detail
+    /// (`TodayScoresCopy.detailMethod`).
     static func goalsFootnote(_ device: ActiveDeviceChoice) -> String {
         let base = "\u{B9} Activity Score is an on-device estimate — the weighted attainment of your step, "
             + "active-calorie & elevated-HR goals, not your device app's own number. Elevated HR counts time "

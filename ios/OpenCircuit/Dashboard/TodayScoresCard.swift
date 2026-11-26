@@ -272,6 +272,11 @@ enum TodayScoresCopy {
         "Sleep score counts \(shares.sleep)%, sleeping HRV \(shares.hrv)%."
     }
 
+    /// The Recovery detail's hero for VoiceOver: the dial's label, then the empty state in full.
+    static func detailAccessibility(_ r: TodayScores.Recovery) -> String {
+        [recoveryAccessibility(r), detailGap(r)].compactMap { $0 }.joined(separator: " ")
+    }
+
     /// The detail's empty state, in full. Only the no-night case advises a sync.
     static func detailGap(_ r: TodayScores.Recovery) -> String? {
         switch r {

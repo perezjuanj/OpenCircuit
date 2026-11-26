@@ -28,9 +28,9 @@ final class DashboardSectionOrderTests: XCTestCase {
 
     /// The decode drops ids this build no longer has WITHOUT disturbing the rest — including the
     /// tab-move ids (`sleep`, `workout`, `trends`) that predate `vitals`, `readiness` (now the pinned
-    /// scores card, decision 93), and a duplicate.
+    /// scores card, decision 93), and duplicates, both retired (`readiness`) and live (`goals`).
     func testUnknownAndDuplicateIdsAreDroppedInPlace() {
-        let order = DashboardSectionOrder.decode("sleep,readiness,vitals,workout,goals,readiness,trends")
+        let order = DashboardSectionOrder.decode("sleep,readiness,vitals,workout,goals,readiness,goals,trends")
         XCTAssertFalse(order.contains { $0.rawValue == "readiness" })
         XCTAssertEqual(Array(order.prefix(3)), [.metrics, .goals, .vitalsStatus],
                        "a missing metrics goes first; the retired ids leave no gap")

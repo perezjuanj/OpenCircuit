@@ -162,6 +162,23 @@ final class TodayScoresCopyTests: XCTestCase {
         }
     }
 
+    /// VoiceOver never reads a doubled stop (".."), on the card or the Recovery detail.
+    func testNoAccessibilityTextHasADoubledPeriod() throws {
+        let recoveries: [TodayScores.Recovery] = [try recovery(85, 33), try recovery(52, nil), .noNight, .noScore]
+        var spoken = recoveries.flatMap { [TodayScoresCopy.recoveryAccessibility($0), TodayScoresCopy.detailAccessibility($0)] }
+        for s: TodayScores.Sleep in [.scored(score: 85, asleepMin: 437), .scored(score: 70, asleepMin: 0), .noNight, .noScore] {
+            spoken.append(TodayScoresCopy.sleepAccessibility(s))
+        }
+        let strains: [TodayScores.Strain] = [.loading, .scored(reading(8.4, seconds: 5_400)), .noHeartRate,
+                                              .needsMinutes(soFar: 4), .needsRestingHR]
+        spoken += strains.map(TodayScoresCopy.strainAccessibility)
+        spoken.append(TodayScoresCopy.footerAccessibility)
+        for s in spoken { XCTAssertFalse(s.contains(".."), s) }
+        XCTAssertEqual(TodayScoresCopy.detailAccessibility(.noNight),
+                       "Recovery unavailable. Last night hasn't synced yet. Sync last night's sleep to see today's recovery.")
+        XCTAssertEqual(TodayScoresCopy.detailAccessibility(try recovery(85, 33)), "Recovery, estimate, 82 out of 100, Good")
+    }
+
     // MARK: Recovery detail
 
     func testTheSharesLineComesFromTheWeights() {
