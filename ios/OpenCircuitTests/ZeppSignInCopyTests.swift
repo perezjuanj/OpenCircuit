@@ -55,4 +55,42 @@ final class ZeppSignInCopyTests: XCTestCase {
         XCTAssertEqual(ZeppSignInCopy.deviceDetail(strap), "Address ending EE:FF · in use in Zepp")
         XCTAssertFalse(ZeppSignInCopy.deviceDetail(strap).contains("0011"))
     }
+
+    // MARK: which device's key is used (shared by the setup screen and onboarding's sheet)
+
+    private func device(_ source: Int?, _ suffix: String) -> ZeppAccountDevice {
+        ZeppAccountDevice(deviceSource: source, macAddress: "AA:BB:CC:DD:\(suffix)", isActive: false,
+                          authKeyHex: String(repeating: "0", count: 32))
+    }
+
+    func testOneDeviceOrOneStrapAmongSeveralIsUsedWithoutAsking() {
+        let strap = device(ZeppAccountDevice.helioStrapSource, "00:01")
+        let watch = device(1, "00:02")
+        XCTAssertEqual(ZeppSignInCopy.pick(from: [strap]), .use(strap))
+        XCTAssertEqual(ZeppSignInCopy.pick(from: [watch, strap]), .use(strap), "the strap, not the first device")
+    }
+
+    func testTwoStrapsOrNoStrapAmongSeveralAsks() {
+        let a = device(ZeppAccountDevice.helioStrapSource, "00:01")
+        let b = device(ZeppAccountDevice.helioStrapSource, "00:02")
+        let watch = device(1, "00:03"), band = device(2, "00:04")
+        XCTAssertEqual(ZeppSignInCopy.pick(from: [a, b]), .ask([a, b]))
+        XCTAssertEqual(ZeppSignInCopy.pick(from: [watch, band]), .ask([watch, band]), "never another device's key silently")
+    }
+
+    // MARK: onboarding's strap sheet shows one way
+
+    func testTheOnboardingSheetShowsOnlyTheSignInAndPointsAtTroubleshooting() {
+        let shown = [HelioKeySheetCopy.intro, HelioKeySheetCopy.troubleshootingNote, ZeppSignInCopy.accountLimitShort,
+                     ZeppSignInCopy.pairFirst]
+        for text in shown {
+            for fallback in ["computer", "snippet", "console", "paste", "Paste"] {
+                XCTAssertFalse(text.contains(fallback), "\(fallback) in: \(text)")
+            }
+        }
+        XCTAssertTrue(ZeppSignInCopy.accountLimitShort.contains("Troubleshooting"))
+        XCTAssertTrue(ZeppSignInCopy.accountLimitShort.contains("email and password"))
+        XCTAssertEqual(HelioSetupView.beforeYouStart,
+                       [HelioStatus.keyOriginCopy, HelioStatus.dontUnpairCopy, HelioStatus.zeppCoexistCopy])
+    }
 }

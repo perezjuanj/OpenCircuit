@@ -12,6 +12,9 @@ enum ZeppSignInCopy {
     static let accountLimit = "Works only if you sign in to Zepp with an email and password. If your Zepp account "
         + "uses Google, Apple, Facebook or another sign-in, this can't sign in: see Troubleshooting at the bottom "
         + "of the strap's setup screen."
+    /// The same limit where Troubleshooting is at the bottom of the same sheet (onboarding's strap sheet).
+    static let accountLimitShort = "Works only if you sign in to Zepp with an email and password. If your Zepp account "
+        + "uses Google, Apple, Facebook or another sign-in, this can't sign in: see Troubleshooting at the bottom."
     static let pairFirst = "Pair the strap in the Zepp app first. The key only exists after pairing."
     static let privacy = "Your email and password go straight from this phone to Zepp, once, to read the strap's key. "
         + "OpenCircuit doesn't save them and signs out of Zepp right after. Syncing never contacts Zepp."
@@ -34,6 +37,21 @@ enum ZeppSignInCopy {
             return "Zepp answered in a way OpenCircuit doesn't understand. Zepp may have changed its sign-in; "
                 + "see Troubleshooting on the setup screen."
         }
+    }
+
+    /// Which of the account's devices gives the strap's key: one device, or exactly one Helio Strap among
+    /// several, needs no question; anything else (two straps, no strap among several) asks the user.
+    /// Shared by this sheet and onboarding's strap sheet, so neither can save another device's key.
+    enum Pick: Equatable {
+        case use(ZeppAccountDevice)
+        case ask([ZeppAccountDevice])
+    }
+
+    static func pick(from devices: [ZeppAccountDevice]) -> Pick {
+        let straps = devices.filter(\.isHelioStrap)
+        if devices.count == 1 { return .use(devices[0]) }
+        if straps.count == 1 { return .use(straps[0]) }
+        return .ask(devices)
     }
 
     static func deviceName(_ device: ZeppAccountDevice) -> String {
@@ -138,14 +156,9 @@ struct ZeppSignInSheet: View {
             do {
                 let devices = try await lookup.devicesWithKeys(email: email, password: password)
                 self.password = ""
-                // One device, or exactly one Helio Strap among several: no question to ask.
-                let straps = devices.filter(\.isHelioStrap)
-                if devices.count == 1 {
-                    finish(with: devices[0])
-                } else if straps.count == 1 {
-                    finish(with: straps[0])
-                } else {
-                    choices = devices
+                switch ZeppSignInCopy.pick(from: devices) {
+                case .use(let device): finish(with: device)
+                case .ask(let devices): choices = devices
                 }
             } catch {
                 errorText = ZeppSignInCopy.message(for: error)

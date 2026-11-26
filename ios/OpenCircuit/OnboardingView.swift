@@ -6,7 +6,9 @@ import SwiftUI
 /// The decisions are `OnboardingFlow`'s (preselection, "In use", how the guide ends) and the copy is
 /// the device descriptor's (`DeviceCopy.swift`), so a new wearable needs no edit here. The permissions
 /// step asks iOS for Bluetooth and Apple Health when the user taps Continue there
-/// (`OnboardingPermissions`); nothing else here prompts, connects or switches the device in use.
+/// (`OnboardingPermissions`). With the strap picked and no key, the last step opens `HelioKeySheet`,
+/// whose saved key switches to the strap like the setup screen's; nothing else here prompts, connects
+/// or switches the device in use.
 /// Shown once on first launch via `completedKey` (see ContentView), and re-openable from Profile ▸ About.
 struct OnboardingView: View {
     /// Persisted flag: set once the user finishes/skips so the flow doesn't show again on launch.
@@ -19,7 +21,11 @@ struct OnboardingView: View {
     var onDone: () -> Void
 
     @StateObject private var model = OnboardingViewModel()
-    @State private var showStrapSetup = false
+    @State private var showKeySheet = false
+    /// Set by the key sheet's Done or a saved key: onboarding finishes once the sheet is gone, never
+    /// while it's still on screen over the cover.
+    @State private var finishAfterSheet = false
+    @State private var debugSheetMode = HelioKeySheet.Mode.choose
     /// The live read (UserDefaults + Keychain) has run. It runs once, on appear, not in `init`: the
     /// presenter re-renders often (a live device streams), and each render re-runs `init` (review-256 F5).
     @State private var readInstalled = false
@@ -35,6 +41,14 @@ struct OnboardingView: View {
         let live = OnboardingFlow(installed: .live())
         model.flow = live
 #if DEBUG && targetEnvironment(simulator)
+        // `strap-sheet` / `strap-signin`: the last step with the strap's key sheet open (screenshots).
+        if let id = UserDefaults.standard.string(forKey: OnboardingFlow.debugPageArgumentKey),
+           let mode = ["strap-sheet": HelioKeySheet.Mode.choose, "strap-signin": .signIn][id] {
+            model.start(at: .legal, device: .helioStrap)
+            debugSheetMode = mode
+            showKeySheet = true
+            return
+        }
         if let id = UserDefaults.standard.string(forKey: OnboardingFlow.debugPageArgumentKey),
            let start = live.debugStart(id) {
             model.start(at: .init(start.page), device: start.pick)
@@ -50,7 +64,7 @@ struct OnboardingView: View {
                 model: model,
                 onFinish: {
                     if model.finish == .setUpStrap {
-                        showStrapSetup = true
+                        showKeySheet = true
                     } else {
                         onDone()
                     }
@@ -59,20 +73,19 @@ struct OnboardingView: View {
             )
             .toolbar(.hidden, for: .navigationBar)
             .onAppear(perform: readInstalledOnce)
-            // The strap's existing setup screen, unchanged: its in-app Zepp sign-in gets the key, and
-            // its "Save key and use the Helio Strap" is what switches. Done finishes onboarding.
-            .navigationDestination(isPresented: $showStrapSetup) {
-                HelioSetupView()
-                    .toolbar(.visible, for: .navigationBar)
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Done", action: onDone)
-                        }
-                    }
-            }
-            .onChange(of: showStrapSetup) { _, showing in
-                // Back from setup: a saved key or a switch changes what's in use.
-                if !showing { model.flow = OnboardingFlow(installed: .live()) }
+            // The strap's key sheet: the in-app Zepp sign-in, saved and switched exactly as the setup
+            // screen does (`HelioSetupView.saveKeyAndUseStrap`). Done or a saved key finishes onboarding;
+            // swiping it away goes back to the last step.
+            .sheet(isPresented: $showKeySheet, onDismiss: {
+                // A saved key or a switch changes what's in use.
+                model.flow = OnboardingFlow(installed: .live())
+                if finishAfterSheet { onDone() }
+            }) {
+                HelioKeySheet(
+                    onSaved: { finishAfterSheet = true; showKeySheet = false },
+                    onDone: { finishAfterSheet = true; showKeySheet = false },
+                    initialMode: debugSheetMode
+                )
             }
         }
     }
