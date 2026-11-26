@@ -33,6 +33,30 @@ enum DemoData {
     static let demoStrapTimeline = SyncDeviceID.timeline(for: .zeppOS(model: "Helio Strap"),
                                                          identityID: "00000000-0000-4000-8000-00000000DE70")
 
+    /// `-OCDemoTodayLayout hidden | all-hidden` (decision 94): Today drawn with a SYNTHETIC Edit Today
+    /// layout instead of the saved one, for this launch only (nothing is written). `hidden` hides
+    /// Calories, Daily Goals and the Steps and Skin temp tiles; `all-hidden` hides every card and tile
+    /// that can be hidden, leaving the date, the scores card, the connection card, History & Sync and
+    /// the sources link.
+    static let todayLayoutKey = "OCDemoTodayLayout"
+    static var todayLayoutOverride: TodayLayout? {
+        guard isRequested, let raw = UserDefaults.standard.string(forKey: todayLayoutKey) else { return nil }
+        var layout = TodayLayout.standard
+        switch raw {
+        case "hidden":
+            layout.setShown(.calories, false)
+            layout.setShown(.goals, false)
+            layout.setShown(TodayTileID.steps, false)
+            layout.setShown(TodayTileID.skinTemp, false)
+        case "all-hidden":
+            for s in DashboardSection.allCases { layout.setShown(s, false) }
+            for t in TodayTileID.allCases { layout.setShown(t, false) }
+        default:
+            return nil
+        }
+        return layout
+    }
+
     static func demoStrapSwitch(now: Date, calendar: Calendar = .current) -> Date {
         calendar.startOfDay(for: now).addingTimeInterval(10.5 * 3600)
     }
@@ -256,7 +280,7 @@ import SwiftUI
 
 /// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR |
 /// sources | sources-<topic> | helio-setup | helio-setup-full | zepp-signin | recovery | strain |
-/// today-scores-states`
+/// today-scores-states | today-edit`
 /// presents that screen full-screen on launch, so a screenshot run can reach it without UI
 /// automation. `liveHR` renders the live-measure card's composition over a SYNTHETIC buffer — a
 /// simulator has no ring to measure.
@@ -268,7 +292,12 @@ struct DemoScreenModifier: ViewModifier {
         content
             .fullScreenCover(item: Binding(get: { screen.map(DemoScreenID.init) },
                                            set: { screen = $0?.id })) { id in
-                NavigationStack { destination(id.id) }
+                if id.id == "today-edit" {
+                    // The sheet brings its own NavigationStack.
+                    DemoEditToday()
+                } else {
+                    NavigationStack { destination(id.id) }
+                }
             }
             .task {
                 guard DemoData.isRequested, let s = UserDefaults.standard.string(forKey: "OCDemoScreen") else { return }
@@ -328,6 +357,18 @@ struct DemoScreenModifier: ViewModifier {
 }
 
 private struct DemoScreenID: Identifiable { let id: String }
+
+/// `-OCDemoScreen today-edit` (decision 94): the Edit Today sheet over a SYNTHETIC layout: the headache
+/// log on but its card hidden, women's health off (so no Cycle row), a ring install (no strap tiles).
+/// Done and Cancel only close it; nothing is saved.
+private struct DemoEditToday: View {
+    var body: some View {
+        var layout = TodayLayout.standard
+        layout.setShown(.headache, false)
+        return EditTodaySheet(layout: layout, gates: TodayFeatureGates(womensHealth: false, headache: true),
+                              tiles: .ringOnly, onFinish: { _ in })
+    }
+}
 
 /// `-OCDemoScreen sleep-score`: the Sleep Score breakdown sheet over the seeded demo night.
 private struct DemoSleepScoreSheet: View {

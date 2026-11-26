@@ -91,7 +91,14 @@ struct ContentView: View {
     /// as a comma-joined list of `DashboardSection.rawValue`; unknown/duplicate entries are ignored
     /// and any newly-added sections are appended in canonical order, so a saved order survives app
     /// updates. See `sectionOrder` / `moveSection`.
-    @AppStorage("dashboard.sectionOrder") private var sectionOrderRaw = ""
+    @AppStorage(TodayLayout.Keys.sectionOrder) private var sectionOrderRaw = ""
+    /// The rest of the Edit Today layout (#394, decision 94): hidden cards, tile order, hidden tiles.
+    /// Display-only: nothing but Today's rendering reads them. See `todayLayout`.
+    @AppStorage(TodayLayout.Keys.hiddenSections) private var hiddenSectionsRaw = ""
+    @AppStorage(TodayLayout.Keys.tileOrder) private var tileOrderRaw = ""
+    @AppStorage(TodayLayout.Keys.hiddenTiles) private var hiddenTilesRaw = ""
+    /// The Edit Today sheet.
+    @State private var showEditToday = false
     // Release builds hide the ring RE surfaces until unlocked from the Profile footer (DeveloperTools).
     @AppStorage(DeveloperTools.unlockedKey) private var developerToolsUnlocked = false
     /// First-run onboarding gate (#103): false until the user finishes/skips the welcome flow, then
@@ -549,6 +556,7 @@ struct ContentView: View {
                 NavigationSplitView(columnVisibility: .constant(.doubleColumn)) {
                     todayList
                         .navigationTitle("Today")
+                        .toolbar { editTodayButton }
                         .navigationSplitViewColumnWidth(min: 340, ideal: 390, max: 440)
                 } detail: {
                     NavigationStack {
@@ -565,12 +573,25 @@ struct ContentView: View {
                 NavigationStack(path: $path) {
                     todayList
                         .navigationTitle("Today")
+                        .toolbar { editTodayButton }
                         .navigationDestination(for: Route.self) { route in destination(for: route) }
                 }
             }
         }
         // What PAI is, from the strap's PAI tile (decision 49): a sheet, as there is nothing to chart.
         .sheet(isPresented: $showPAIInfo) { StrapPAIInfoSheet() }
+        .sheet(isPresented: $showEditToday) {
+            EditTodaySheet(layout: todayLayout, gates: todayGates, tiles: todayTileAvailability,
+                           onFinish: saveTodayLayout)
+        }
+    }
+
+    /// Today's trailing Edit button (decision 94): opens the Edit Today sheet.
+    private var editTodayButton: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button("Edit") { showEditToday = true }
+                .accessibilityHint("Show, hide and reorder Today's cards and tiles")
+        }
     }
 
     /// The Today list itself (the reorderable cards), shared by the compact stack and the wide
@@ -580,6 +601,13 @@ struct ContentView: View {
             Group {
                 // The date, then Sleep · Recovery · Strain with the day's sentence (decision 93), first.
                 TodayDateRow()
+                    // A hidden Vitals Status card still reports its fever verdict to the sentence
+                    // (decision 94c): the card runs, unseen, behind the date row.
+                    .background {
+                        if todayLayout.runsHiddenVitalsReport {
+                            vitalsStatusCard.hidden().accessibilityHidden(true).allowsHitTesting(false)
+                        }
+                    }
                 todayScoresCard
                 if ringActive {
                     connectionCard
@@ -1005,7 +1033,39 @@ struct ContentView: View {
 
     /// The full canonical-or-saved order of reorderable sections. The decode (which drops ids this
     /// build no longer has, `vitals` among them) lives in `DashboardSectionOrder` so a test can pin it.
-    private var sectionOrder: [DashboardSection] { DashboardSectionOrder.decode(sectionOrderRaw) }
+    private var sectionOrder: [DashboardSection] { todayLayout.sections }
+
+    /// The saved Edit Today layout (decision 94), decoded from its four keys by `TodayLayout`.
+    private var todayLayout: TodayLayout {
+#if DEBUG && targetEnvironment(simulator)
+        if let demo = DemoData.todayLayoutOverride { return demo }
+#endif
+        return TodayLayout(stored: .init(sectionOrder: sectionOrderRaw, hiddenSections: hiddenSectionsRaw,
+                                         tileOrder: tileOrderRaw, hiddenTiles: hiddenTilesRaw))
+    }
+
+    /// The opt-in features that decide whether the Cycle and Headache cards exist at all.
+    private var todayGates: TodayFeatureGates {
+        TodayFeatureGates(womensHealth: womensHealthEnabled, headache: headacheEnabled)
+    }
+
+    /// Which strap tiles would show right now, so the Edit sheet lists only those.
+    private var todayTileAvailability: TodayTileAvailability {
+        let now = Date()
+        return TodayTileAvailability(stress: strapStress?.isFresh(now: now) == true,
+                                     pai: MetricTilesSection.paiTile(strapPAI, now: now) != nil)
+    }
+
+    /// Done in the Edit sheet: write the keys back, only when something changed (Cancel hands back the
+    /// layout the sheet opened on, which writes nothing).
+    private func saveTodayLayout(_ layout: TodayLayout) {
+        guard layout != todayLayout else { return }
+        let stored = layout.stored
+        sectionOrderRaw = stored.sectionOrder
+        hiddenSectionsRaw = stored.hiddenSections
+        tileOrderRaw = stored.tileOrder
+        hiddenTilesRaw = stored.hiddenTiles
+    }
 
     /// The Today metric tiles (#216), built from the shared trends load.
     private var todayTiles: [TodayTile] {
@@ -1019,19 +1079,17 @@ struct ContentView: View {
         // Before the first trends load there is nothing to judge — and "no ring data yet" would be
         // a false claim to a wearer who has plenty.
         guard trendsHaveLoaded else { return "Gathering today's numbers…" }
-        return TodaySynthesis.sentence(TodaySynthesis.input(trends: trends, tiles: todayTiles,
+        return TodaySynthesis.sentence(TodaySynthesis.input(trends: trends,
+                                                             tiles: todayLayout.synthesisTiles(todayTiles),
                                                              readiness: report,
                                                              feverSuspected: vitalsFeverSuspected,
                                                              lastSyncAt: lastSyncAt))
     }
 
     /// The sections actually rendered right now — `sectionOrder` minus any feature-gated card that's
-    /// switched off (the women's-health cycle calendar and the headache log, both opt-in).
-    private var visibleSections: [DashboardSection] {
-        sectionOrder.filter {
-            ($0 != .cycle || womensHealthEnabled) && ($0 != .headache || headacheEnabled)
-        }
-    }
+    /// switched off (the women's-health cycle calendar and the headache log, both opt-in) and any card
+    /// hidden in Edit Today.
+    private var visibleSections: [DashboardSection] { todayLayout.shownSections(gates: todayGates) }
 
     /// Apply a long-press-drag reorder and persist the result. The merge rule is
     /// `DashboardSectionOrder.reordered`, so what is written back is pinned by a test.
@@ -1046,7 +1104,8 @@ struct ContentView: View {
     @ViewBuilder
     private func sectionView(_ section: DashboardSection) -> some View {
         switch section {
-        case .metrics:      MetricTilesSection(tiles: todayTiles, isLoading: !trendsHaveLoaded,
+        case .metrics:      MetricTilesSection(tiles: todayTiles, order: todayLayout.shownTiles,
+                                               isLoading: !trendsHaveLoaded,
                                                onSelect: { path.append(.metric($0)) },
                                                onTimeline: { path.append(.timeline) },
                                                strapStress: strapStress,
