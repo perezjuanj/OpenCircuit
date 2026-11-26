@@ -143,15 +143,18 @@ enum DemoData {
                 d = d.addingTimeInterval(900); j += 1
             }
             context.insert(StoredDaily(day: wakeDay, steps: daySteps, updatedAt: dayEnd))
-            // Today's brisk morning walk, per minute, so the Strain dial has a real score (decision 93)
-            // rather than the 0.0 an all-easy day reads: about 8 on the 0–21 scale once it has ended.
+            // Today's brisk morning walk, so the Strain dial has a real score (decision 93) rather than
+            // the 0.0 an all-easy day reads: about 9 on the 0–21 scale once it has ended. Six 5-minute
+            // readings, each covering its own span, on the 5-minute marks between the quarter-hour
+            // readings above: no reading starts within 5 minutes of another, so none forms a
+            // `RestingHR` sustained window and the walk can never become today's resting heart rate.
             if n == 0 {
-                let walk = wakeDay.addingTimeInterval(8 * 3600 + 60)
-                for m in 0..<22 where walk.addingTimeInterval(Double(m + 1) * 60) <= now {
-                    let t = walk.addingTimeInterval(Double(m) * 60)
-                    let bpm = m < 6 ? 125.0 : m < 18 ? 140 + 2 * wiggle(m, 0.4) : 122
+                let walk: [(minute: Double, bpm: Double)] = [(5, 126), (10, 140), (20, 142), (25, 141), (35, 139), (40, 122)]
+                for (minute, bpm) in walk {
+                    let t = wakeDay.addingTimeInterval(8 * 3600 + minute * 60)
+                    guard t.addingTimeInterval(300) <= now else { break }
                     context.insert(StoredSample(kindRaw: MetricKind.heartRate.rawValue, start: t,
-                                                end: t.addingTimeInterval(60), value: bpm.rounded()))
+                                                end: t.addingTimeInterval(300), value: bpm))
                 }
             }
         }
