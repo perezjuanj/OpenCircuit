@@ -1,7 +1,7 @@
 // Today synthesis (#216) — the one plain-language sentence at the top of the Today tab.
 //
-// Deterministic templates over numbers the app already computes: the Wellness Balance readiness
-// (exactly as `WellnessBalanceCardView` produces it — this type never re-scores anything) and the
+// Deterministic templates over numbers the app already computes: Recovery (decision 93: exactly as
+// Today's scores card produces it — this type never re-scores anything) and the
 // tiles' `BaselineTrend` directions. No model, no randomness, no advice beyond "an easier day may
 // help" / "take today gently" — and every missing input degrades to a sentence that SAYS it is
 // missing rather than one that guesses around it.
@@ -9,7 +9,7 @@
 // Rule order (first match wins, then clauses are composed):
 //   1. no data at all               → say so, point at connect + sync
 //   2. newest data older than 36 h  → say how old, point at sync
-//   3. readiness states             → lead with readiness (or why there is none), then the most
+//   3. readiness states             → lead with Recovery (or why there is none), then the most
 //                                     notable vitals clause: concerns first, then positives, then
 //                                     "in your usual range"
 // Possible fever signs are surfaced ahead of any other clause, but ONLY when Vitals Status itself
@@ -23,7 +23,8 @@ import Foundation
 
 public enum TodaySynthesis {
 
-    /// Readiness as the Wellness Balance card ended up showing it.
+    /// Recovery as Today's scores card ended up showing it (the type keeps its old name; every
+    /// user-facing word says "Recovery", decision 93a).
     public enum Readiness: Equatable, Sendable {
         /// A score was computed. `factorCount` is how many sub-scores went into it (1 = sleep alone).
         case scored(score: Int, tier: WellnessBalance.Tier, factorCount: Int)
@@ -100,9 +101,9 @@ public enum TodaySynthesis {
         case let .scored(score, tier, factorCount):
             var lead: String
             switch tier {
-            case .excellent:        lead = "Readiness is excellent at \(score)"
-            case .good:             lead = "Readiness is good at \(score)"
-            case .needsImprovement: lead = "Readiness needs improvement at \(score)"
+            case .excellent:        lead = "Recovery is excellent at \(score)"
+            case .good:             lead = "Recovery is good at \(score)"
+            case .needsImprovement: lead = "Recovery needs improvement at \(score)"
             }
             if factorCount <= 1 { lead += " based on last night's sleep alone" }
             if feverPair { return "\(lead), but \(feverClause), so take today gently." }
@@ -119,8 +120,8 @@ public enum TodaySynthesis {
 
         case .noNight, .noScore:
             let lead = input.readiness == .noNight
-                ? "Last night's sleep hasn't synced yet, so there's no readiness score"
-                : "Last night has no sleep score, so there's no readiness today"
+                ? "Last night's sleep hasn't synced yet, so there's no recovery score"
+                : "Last night has no sleep score, so there's no recovery today"
             if feverPair { return "\(lead), but \(feverClause)." }
             if let c = concerns.first ?? positives.first { return "\(lead), but \(c)." }
             if let s = steady { return "\(lead), but \(s.subject) \(s.verb) in your usual range." }
@@ -130,7 +131,7 @@ public enum TodaySynthesis {
             if feverPair { return capitalized(feverClause) + ", so take today gently." }
             if let c = concerns.first ?? positives.first { return capitalized(c) + "." }
             if let s = steady { return capitalized(s.subject) + " \(s.verb) in your usual range." }
-            return "Working out today's readiness."
+            return "Working out today's recovery."
         }
     }
 

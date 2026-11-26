@@ -107,6 +107,30 @@ public enum WellnessBalance {
         input.sleepScore == nil ? nil : score(input)
     }
 
+    // MARK: - Recovery (#391, decision 93a)
+
+    /// Recovery, the middle score of Today's card: last night's sleep score and overnight recovery
+    /// (sleeping HRV, through overnight stress) at the existing weights. No activity and no vitals, so
+    /// it is fixed once last night is scored and never dips in the morning or double-counts strain.
+    /// It is `anchoredScore` over exactly those two inputs: nil without a sleep score, and low
+    /// confidence (`factors.count <= 1`) when it rests on sleep alone. Pure; unit-tested.
+    public static func recoveryScore(sleepScore: Int?, overnightStress: Int?) -> Result? {
+        anchoredScore(.init(sleepScore: sleepScore, overnightStress: overnightStress))
+    }
+
+    /// What each Recovery input counts for, in whole percent, computed from `factorWeights` so the
+    /// copy can never drift from the maths. The two always sum to 100.
+    public struct RecoveryShares: Equatable, Sendable {
+        public let sleep: Int
+        public let hrv: Int
+    }
+
+    public static var recoveryShares: RecoveryShares {
+        let s = factorWeights[.sleep] ?? 0, r = factorWeights[.recovery] ?? 0
+        let sleep = s + r > 0 ? Int((s / (s + r) * 100).rounded()) : 0
+        return RecoveryShares(sleep: sleep, hrv: 100 - sleep)
+    }
+
     /// Vitals Status → recovery factor. A clean baseline is full credit; a "watch" halves it; an
     /// anomaly (a Significant outlier or a suspected fever) zeroes it.
     static func vitalsFactor(_ status: VitalsBaseline.Status) -> Double {

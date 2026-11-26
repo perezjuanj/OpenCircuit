@@ -16,10 +16,14 @@ final class TodaySynthesisTests: XCTestCase {
                      fever: Bool = false,
                      sleep: Int? = nil, usualSleep: Double? = nil,
                      newest: Date?? = .none) -> String {
-        TodaySynthesis.sentence(.init(readiness: readiness, hrv: hrv, restingHR: rhr, skinTemp: temp,
-                                      feverSuspected: fever,
-                                      lastNightSleepMinutes: sleep, usualSleepMinutes: usualSleep,
-                                      newestDataAt: newest ?? fresh, now: now))
+        let sentence = TodaySynthesis.sentence(.init(readiness: readiness, hrv: hrv, restingHR: rhr, skinTemp: temp,
+                                                     feverSuspected: fever,
+                                                     lastNightSleepMinutes: sleep, usualSleepMinutes: usualSleep,
+                                                     newestDataAt: newest ?? fresh, now: now))
+        // Decision 93a: the score is called Recovery everywhere a user reads it. Every case goes through here.
+        XCTAssertFalse(sentence.contains("Readiness"), sentence)
+        XCTAssertFalse(sentence.contains("readiness"), sentence)
+        return sentence
     }
 
     // MARK: Missing / stale data
@@ -43,57 +47,57 @@ final class TodaySynthesisTests: XCTestCase {
     }
 
     func testThirtyFiveHoursIsNotStale() {
-        XCTAssertEqual(say(newest: now.addingTimeInterval(-35 * 3600)), "Working out today's readiness.")
+        XCTAssertEqual(say(newest: now.addingTimeInterval(-35 * 3600)), "Working out today's recovery.")
     }
 
     // MARK: Scored readiness
 
     func testExcellentWithPositive() {
         XCTAssertEqual(say(.scored(score: 88, tier: .excellent, factorCount: 3), hrv: .above, rhr: .within),
-                       "Readiness is excellent at 88, and HRV is above your usual.")
+                       "Recovery is excellent at 88, and HRV is above your usual.")
     }
 
     func testGoodWithConcernUsesThough() {
         XCTAssertEqual(say(.scored(score: 74, tier: .good, factorCount: 3), hrv: .above, sleep: 320),
-                       "Readiness is good at 74, though last night's sleep was short.")
+                       "Recovery is good at 74, though last night's sleep was short.")
     }
 
     func testGoodSteady() {
         XCTAssertEqual(say(.scored(score: 74, tier: .good, factorCount: 2), hrv: .within, rhr: .within),
-                       "Readiness is good at 74, with HRV and resting heart rate in your usual range.")
+                       "Recovery is good at 74, with HRV and resting heart rate in your usual range.")
         XCTAssertEqual(say(.scored(score: 74, tier: .good, factorCount: 2), rhr: .within),
-                       "Readiness is good at 74, with resting heart rate in your usual range.")
+                       "Recovery is good at 74, with resting heart rate in your usual range.")
     }
 
     func testGoodWithNothingElseKnown() {
-        XCTAssertEqual(say(.scored(score: 70, tier: .good, factorCount: 3)), "Readiness is good at 70.")
+        XCTAssertEqual(say(.scored(score: 70, tier: .good, factorCount: 3)), "Recovery is good at 70.")
     }
 
     func testSleepAloneIsDisclosed() {
         XCTAssertEqual(say(.scored(score: 81, tier: .good, factorCount: 1)),
-                       "Readiness is good at 81 based on last night's sleep alone.")
+                       "Recovery is good at 81 based on last night's sleep alone.")
     }
 
     func testNeedsImprovement() {
         XCTAssertEqual(say(.scored(score: 52, tier: .needsImprovement, factorCount: 3), hrv: .below),
-                       "Readiness needs improvement at 52, and HRV is below your usual, so an easier day may help.")
+                       "Recovery needs improvement at 52, and HRV is below your usual, so an easier day may help.")
         XCTAssertEqual(say(.scored(score: 52, tier: .needsImprovement, factorCount: 3), hrv: .above),
-                       "Readiness needs improvement at 52, so an easier day may help.")
+                       "Recovery needs improvement at 52, so an easier day may help.")
     }
 
     func testShortNightRelativeToUsual() {
         // 400 min is over 6 h, but 80 min under a 480-min usual → short.
         XCTAssertEqual(say(.scored(score: 75, tier: .good, factorCount: 3), sleep: 400, usualSleep: 480),
-                       "Readiness is good at 75, though last night's sleep was short.")
+                       "Recovery is good at 75, though last night's sleep was short.")
         // 440 vs 480 is within the 60-min allowance → not short.
         XCTAssertEqual(say(.scored(score: 75, tier: .good, factorCount: 3), sleep: 440, usualSleep: 480),
-                       "Readiness is good at 75.")
+                       "Recovery is good at 75.")
     }
 
     func testFeverPairTakesPrecedence() {
         XCTAssertEqual(say(.scored(score: 80, tier: .good, factorCount: 3), hrv: .above, rhr: .above, temp: .above,
                            fever: true),
-                       "Readiness is good at 80, but skin temperature and resting heart rate are both above your usual, so take today gently.")
+                       "Recovery is good at 80, but skin temperature and resting heart rate are both above your usual, so take today gently.")
         XCTAssertEqual(say(rhr: .above, temp: .above, fever: true),
                        "Skin temperature and resting heart rate are both above your usual, so take today gently.")
     }
@@ -101,10 +105,10 @@ final class TodaySynthesisTests: XCTestCase {
     /// Both tiles above their usual is NOT the fever pairing: only Vitals Status's own verdict is.
     func testBothTilesAboveWithoutVitalsStatusFeverIsOrdinaryClauses() {
         XCTAssertEqual(say(.scored(score: 80, tier: .good, factorCount: 3), rhr: .above, temp: .above),
-                       "Readiness is good at 80, though resting heart rate is above your usual.")
+                       "Recovery is good at 80, though resting heart rate is above your usual.")
         XCTAssertEqual(say(rhr: .above, temp: .above), "Resting heart rate is above your usual.")
         XCTAssertEqual(say(.noNight, rhr: .above, temp: .above),
-                       "Last night's sleep hasn't synced yet, so there's no readiness score, but resting heart rate is above your usual.")
+                       "Last night's sleep hasn't synced yet, so there's no recovery score, but resting heart rate is above your usual.")
     }
 
     // MARK: Agreement with Vitals Status (review #220 S3)
@@ -130,12 +134,12 @@ final class TodaySynthesisTests: XCTestCase {
         XCTAssertFalse(noFever)
         let s = say(.scored(score: 80, tier: .good, factorCount: 3), rhr: rhr?.direction, temp: temp?.direction,
                     fever: noFever)
-        XCTAssertEqual(s, "Readiness is good at 80, though resting heart rate is above your usual.")
+        XCTAssertEqual(s, "Recovery is good at 80, though resting heart rate is above your usual.")
 
         let fever = VitalsBaseline.suspectedFever(restingHRToday: 67, restingHRPrior: rhrPrior, skinTempOffsetC: 1.2)
         XCTAssertTrue(fever)
         XCTAssertEqual(say(.scored(score: 80, tier: .good, factorCount: 3), rhr: .above, temp: .above, fever: fever),
-                       "Readiness is good at 80, but skin temperature and resting heart rate are both above your usual, so take today gently.")
+                       "Recovery is good at 80, but skin temperature and resting heart rate are both above your usual, so take today gently.")
     }
 
     /// The reviewer's second probe. Resting HR 58 → 61 reads "above your usual" on the tile (allowed:
@@ -160,21 +164,21 @@ final class TodaySynthesisTests: XCTestCase {
     // MARK: No readiness
 
     func testNoNightSaysSyncHasntHappened() {
-        XCTAssertEqual(say(.noNight), "Last night's sleep hasn't synced yet, so there's no readiness score.")
+        XCTAssertEqual(say(.noNight), "Last night's sleep hasn't synced yet, so there's no recovery score.")
         XCTAssertEqual(say(.noNight, hrv: .below),
-                       "Last night's sleep hasn't synced yet, so there's no readiness score, but HRV is below your usual.")
+                       "Last night's sleep hasn't synced yet, so there's no recovery score, but HRV is below your usual.")
     }
 
     func testNoScoreNeverSuggestsSync() {
         let s = say(.noScore, hrv: .within)
-        XCTAssertEqual(s, "Last night has no sleep score, so there's no readiness today, but HRV is in your usual range.")
+        XCTAssertEqual(s, "Last night has no sleep score, so there's no recovery today, but HRV is in your usual range.")
         XCTAssertFalse(s.localizedCaseInsensitiveContains("sync"))
     }
 
     func testPendingFallsBackToVitals() {
         XCTAssertEqual(say(hrv: .above), "HRV is above your usual.")
         XCTAssertEqual(say(hrv: .within, rhr: .within), "HRV and resting heart rate are in your usual range.")
-        XCTAssertEqual(say(), "Working out today's readiness.")
+        XCTAssertEqual(say(), "Working out today's recovery.")
     }
 
     func testEverySentenceIsOneSentence() {
