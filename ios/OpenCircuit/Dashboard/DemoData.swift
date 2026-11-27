@@ -443,17 +443,23 @@ private struct DemoTodayScoresDetail: View {
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
     @State private var trends = TrendsData()
     @State private var loaded = false
+    @State private var vitals: VitalsBaseline.Report?
 
     var body: some View {
         Group {
             if showsStrain {
                 StrainDetailView(reading: loaded ? trends.todayStrain : nil, onHeartRate: {})
             } else {
-                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: loaded) { scores in
+                // The Vitals Status card runs unseen, as Today's hidden runner does, for Recovery's verdict.
+                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: loaded, vitals: vitals) { scores in
                     RecoveryDetailView(scores: scores,
                                        tiles: TodayTiles.build(points: trends.points, restingHR: trends.restingHR,
                                                                tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
                                                                scope: .from(trends)))
+                }
+                .background {
+                    VitalsStatusCardView(onReport: { vitals = $0 })
+                        .hidden().accessibilityHidden(true).allowsHitTesting(false)
                 }
             }
         }

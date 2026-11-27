@@ -144,6 +144,9 @@ struct ContentView: View {
     /// Whether the Vitals Status card's last report flagged possible fever signs, so the synthesis
     /// line only pairs skin temperature with resting HR when that card does.
     @State private var vitalsFeverSuspected = false
+    /// Today's Vitals Status report, Recovery's third factor (decision 95a). Reported by the card,
+    /// shown or hidden, like the fever flag above.
+    @State private var vitalsReport: VitalsBaseline.Report?
 
     // Display units (#83) — SI is stored; only the display layer converts. Shared keys with settings.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
@@ -640,7 +643,7 @@ struct ContentView: View {
     /// Today's scores card (decision 93): one model from the newest night and today's strain. The
     /// sentence is built from that same model's Recovery, and the model is kept for the Recovery detail.
     private var todayScoresCard: some View {
-        TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded) { scores in
+        TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded, vitals: vitalsReport) { scores in
             TodayScoresCard(scores: scores, sentence: synthesisSentence(scores.report),
                             onSleep: { selectedTab = .sleep },
                             onRecovery: { path.append(.recovery) },
@@ -1158,7 +1161,7 @@ struct ContentView: View {
                 RecoveryDetailView(scores: todayScores, tiles: todayTiles,
                                    onMetric: { path.append(.metric($0)) })
             } else {
-                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded) {
+                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded, vitals: vitalsReport) {
                     RecoveryDetailView(scores: $0, tiles: todayTiles, onMetric: { path.append(.metric($0)) })
                 }
             }
@@ -2220,7 +2223,10 @@ struct ContentView: View {
     /// skin temp to the user's PERSONAL 7–30 day baseline and surfaces normal / watch / anomaly with
     /// the contributing signals (incl. suspected fever). Self-contained view (its own @Query).
     private var vitalsStatusCard: some View {
-        VitalsStatusCardView(onReport: { vitalsFeverSuspected = $0?.feverSuspected == true })
+        VitalsStatusCardView(onReport: {
+            vitalsFeverSuspected = $0?.feverSuspected == true
+            vitalsReport = $0
+        })
     }
 
     /// Dedicated, always-visible sleep section below vitals. Reads the persisted nightly summary

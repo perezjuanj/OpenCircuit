@@ -5,8 +5,9 @@
 //   - Sleep is the stored score of the newest night, credited only when that night ended today
 //     (`LastNight`, the same rule the Goals Sleep ring uses; the Sleep tab's badge reads the same
 //     row through the same `LastNight.score`).
-//   - Recovery is `WellnessBalance.recoveryScore` over that night's sleep score and overnight stress,
-//     computed here synchronously and handed up (`ReadinessReport`, for the sentence) and down (the
+//   - Recovery is `WellnessBalance.recoveryScore` over that night's sleep score, overnight stress and
+//     today's Vitals Status verdict when the card has one (decision 95a; no verdict is the two-factor
+//     score, never a 0), computed here synchronously and handed up (`ReadinessReport`, for the sentence) and down (the
 //     Recovery detail), so the ring, the sentence and the detail can never disagree.
 //   - Strain is `TrendsData.todayStrain`, the reading the Strain detail shows.
 //
@@ -110,8 +111,13 @@ struct TodayScores: Equatable {
     let strain: Strain
     /// What the sentence speaks about: the same Recovery the ring shows.
     let report: ReadinessReport
+    /// The Vitals Status report Recovery counted (decision 95a), for the detail's Vitals row. Nil when
+    /// Recovery didn't count one: no verdict yet, or no scored night.
+    var vitals: VitalsBaseline.Report? = nil
 
+    /// `vitals` is Today's Vitals Status report (shown or hidden card alike); nil until it has a verdict.
     static func build(night: Night?, strain reading: DailyStrain.Reading?, trendsLoaded: Bool,
+                      vitals: VitalsBaseline.Report? = nil,
                       now: Date = Date(), calendar: Calendar = .current) -> TodayScores {
         let credited = night.map {
             LastNight.isCredited(nightKey: $0.nightKey, inBedStart: $0.inBedStart, inBedEnd: $0.inBedEnd,
@@ -126,7 +132,8 @@ struct TodayScores: Equatable {
             if let score = LastNight.score(night.sleepScore) {
                 sleep = .scored(score: score, asleepMin: night.asleepMin)
                 let r = WellnessBalance.recoveryScore(sleepScore: score,
-                                                      overnightStress: night.stressScore > 0 ? night.stressScore : nil)
+                                                      overnightStress: night.stressScore > 0 ? night.stressScore : nil,
+                                                      vitalsStatus: vitals?.status)
                 // Never nil with a sleep score; the fallback only keeps the type honest.
                 recovery = r.map(Recovery.scored) ?? .noScore
                 report = ReadinessReport(readiness: r.map { .scored(score: $0.score, tier: $0.tier,
@@ -144,7 +151,8 @@ struct TodayScores: Equatable {
         }
 
         return TodayScores(sleep: sleep, recovery: recovery,
-                           strain: strainState(reading, trendsLoaded: trendsLoaded), report: report)
+                           strain: strainState(reading, trendsLoaded: trendsLoaded), report: report,
+                           vitals: recovery.result?.factors[.vitals] == nil ? nil : vitals)
     }
 
     /// The same order of reasons as `StrainTileText.status`.
@@ -227,6 +235,8 @@ enum TodayScoresCopy {
         case let .scored(result):
             return "Recovery, estimate, \(result.score) out of 100, \(tier(result.tier))"
                 + (r.isLowConfidence ? ", based on last night's sleep alone" : "")
+                + (r.result?.factors[.vitals] != nil && r.result?.factors[.recovery] == nil
+                    ? ", based on last night's sleep and your vitals" : "")
         case .noNight: return "Recovery unavailable. Last night hasn't synced yet."
         case .noScore: return "Recovery unavailable. Last night has no score."
         }
@@ -261,15 +271,85 @@ enum TodayScoresCopy {
 
     // Recovery detail
     static let detailBasis = "From last night's sleep"
+    static let detailBasisWithVitals = "From last night's sleep and your vitals"
     static let detailSleepFactor = "Sleep score"
     static let detailHRVFactor = "Sleeping HRV vs your usual"
+    static let detailVitalsFactor = "Vitals vs your range"
     static let detailSleepAlone = "Based on last night's sleep alone: no sleeping HRV was recorded."
-    static let detailMethod = "An OpenCircuit estimate from last night's sleep score and your sleeping HRV "
-        + "against your usual. Not your device app's own score, and not medical advice."
+    static let detailSleepAndVitals = "Based on last night's sleep and your vitals: no sleeping HRV was recorded."
+    static let detailNoVitals = "Vitals Status has no verdict yet, so your vitals aren't counted."
+    static let detailMethod = "An OpenCircuit estimate from last night's sleep score, your sleeping HRV "
+        + "against your usual, and your vitals against your own range once Vitals Status has a verdict. "
+        + "Not your device app's own score, and not medical advice."
+
+    /// The hero's caption: what the score rests on.
+    static func detailBasis(_ r: TodayScores.Recovery) -> String {
+        r.result?.factors[.vitals] == nil ? detailBasis : detailBasisWithVitals
+    }
 
     /// "Sleep score counts 62%, sleeping HRV 38%." from the Kit's weights, never typed.
     static func detailShares(_ shares: WellnessBalance.RecoveryShares = WellnessBalance.recoveryShares) -> String {
         "Sleep score counts \(shares.sleep)%, sleeping HRV \(shares.hrv)%."
+    }
+
+    /// "Sleep score counts 47%, sleeping HRV 29%, vitals 24%." from the Kit's weights, never typed.
+    static func detailVitalsShares(_ shares: WellnessBalance.RecoveryVitalsShares = WellnessBalance.recoveryVitalsShares) -> String {
+        "Sleep score counts \(shares.sleep)%, sleeping HRV \(shares.hrv)%, vitals \(shares.vitals)%."
+    }
+
+    /// The note under the factor bars: the shares that applied, or what was missing.
+    static func detailFactorNote(_ r: TodayScores.Recovery) -> String? {
+        guard let result = r.result else { return nil }
+        switch (result.factors[.recovery] != nil, result.factors[.vitals] != nil) {
+        case (true, true):   return detailVitalsShares()
+        case (true, false):  return detailShares()
+        case (false, true):  return detailSleepAndVitals
+        case (false, false): return detailSleepAlone
+        }
+    }
+
+    // Vitals row (decision 95a): the verdict Recovery counted, with the values behind it.
+
+    /// The Vitals Status card's own words for a verdict.
+    static func vitalsVerdict(_ status: VitalsBaseline.Status) -> String {
+        switch status {
+        case .normal:  return "Normal"
+        case .watch:   return "Watch"
+        case .anomaly: return "Anomaly"
+        }
+    }
+
+    /// One line per value behind the verdict, no trailing stop. A normal verdict has none outside its
+    /// range, so it says so.
+    static func vitalsValues(_ report: VitalsBaseline.Report, tempUnit: TemperatureUnit) -> [String] {
+        var lines: [String] = []
+        if report.feverSuspected { lines.append("Possible fever signs") }
+        for signal in report.signals {
+            lines.append(vitalsValue(signal, tempUnit: tempUnit))
+        }
+        if lines.isEmpty { lines.append("All tracked vitals within your range") }
+        return lines
+    }
+
+    static func vitalsValue(_ signal: VitalsBaseline.Signal, tempUnit: TemperatureUnit) -> String {
+        if signal.isTemperature {
+            return "Skin temperature \(UnitsFormatter.temperatureDelta(signal.delta, unit: tempUnit)) vs your usual"
+        }
+        let name: String, unit: String
+        switch signal.vital {
+        case .restingHR:     (name, unit) = ("Resting heart rate", " bpm")
+        case .overnightSpO2: (name, unit) = ("Overnight SpO₂", "%")
+        case .overnightHRV:  (name, unit) = ("Overnight HRV", " ms")
+        case .none:          return "A vital outside your usual range"
+        }
+        guard let base = signal.baselineMean else { return "\(name) outside your usual range" }
+        return String(format: "%@ %+.0f%@ vs your usual %.0f%@", name, signal.delta, unit, base, unit)
+    }
+
+    /// The Vitals row for VoiceOver: the factor, the verdict, then each value.
+    static func vitalsAccessibility(_ report: VitalsBaseline.Report, tempUnit: TemperatureUnit) -> String {
+        "\(detailVitalsFactor), \(vitalsVerdict(report.status)). "
+            + vitalsValues(report, tempUnit: tempUnit).joined(separator: ", ") + "."
     }
 
     /// The Recovery detail's hero for VoiceOver: the dial's label, then the empty state in full.
@@ -294,11 +374,13 @@ enum TodayScoresCopy {
 struct TodayScoresSource<Content: View>: View {
     let strain: DailyStrain.Reading?
     let trendsLoaded: Bool
+    /// Today's Vitals Status report (decision 95a); nil until the card has a verdict.
+    var vitals: VitalsBaseline.Report? = nil
     @ViewBuilder let content: (TodayScores) -> Content
 
     var body: some View {
         CurrentDayView("todayScores") { _ in
-            TodayScoresQuery(strain: strain, trendsLoaded: trendsLoaded, content: content)
+            TodayScoresQuery(strain: strain, trendsLoaded: trendsLoaded, vitals: vitals, content: content)
         }
     }
 }
@@ -306,14 +388,17 @@ struct TodayScoresSource<Content: View>: View {
 private struct TodayScoresQuery<Content: View>: View {
     let strain: DailyStrain.Reading?
     let trendsLoaded: Bool
+    let vitals: VitalsBaseline.Report?
     let content: (TodayScores) -> Content
 
     @Query private var latestSleep: [StoredSleepSummary]
     @Environment(\.dayClock) private var clock
 
-    init(strain: DailyStrain.Reading?, trendsLoaded: Bool, content: @escaping (TodayScores) -> Content) {
+    init(strain: DailyStrain.Reading?, trendsLoaded: Bool, vitals: VitalsBaseline.Report?,
+         content: @escaping (TodayScores) -> Content) {
         self.strain = strain
         self.trendsLoaded = trendsLoaded
+        self.vitals = vitals
         self.content = content
         var d = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
         d.fetchLimit = 1
@@ -322,7 +407,7 @@ private struct TodayScoresQuery<Content: View>: View {
 
     var body: some View {
         content(TodayScores.build(night: latestSleep.first.map(TodayScores.Night.init), strain: strain,
-                                  trendsLoaded: trendsLoaded, now: clock.now(), calendar: clock.calendar()))
+                                  trendsLoaded: trendsLoaded, vitals: vitals, now: clock.now(), calendar: clock.calendar()))
     }
 }
 

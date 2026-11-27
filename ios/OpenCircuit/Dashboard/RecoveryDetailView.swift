@@ -1,6 +1,7 @@
 // The Recovery detail (#391, decision 93c), opened from the Recovery dial on Today's scores card. It
-// absorbs the old Readiness card: the score with its tier, what went into it (sleep score and sleeping
-// HRV, with the shares computed from the Kit's weights), the low-confidence note, the estimate
+// absorbs the old Readiness card: the score with its tier, what went into it (sleep score, sleeping
+// HRV and, once Vitals Status has a verdict, the vitals row with its values (decision 95a); the shares
+// computed from the Kit's weights), the low-confidence note, the estimate
 // disclaimer with the sources one tap away, and last night's HRV and resting heart rate from the same
 // tiles Your Numbers shows.
 //
@@ -16,6 +17,7 @@ struct RecoveryDetailView: View {
     var onMetric: (TodayTile.Metric) -> Void = { _ in }
 
     @ScaledMetric(relativeTo: .largeTitle) private var ringSize: CGFloat = 150
+    @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
 
     private var recovery: TodayScores.Recovery { scores.recovery }
 
@@ -34,9 +36,12 @@ struct RecoveryDetailView: View {
                             ReadinessFactorBar(label: TodayScoresCopy.detailHRVFactor, value: hrv,
                                                tint: r.tier.ringColor)
                         }
-                        Text(recovery.isLowConfidence ? TodayScoresCopy.detailSleepAlone : TodayScoresCopy.detailShares())
-                            .font(.caption).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                        vitalsRow(r)
+                        if let note = TodayScoresCopy.detailFactorNote(recovery) {
+                            Text(note)
+                                .font(.caption).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                     .padding(.vertical, 4)
                 }
@@ -89,7 +94,7 @@ struct RecoveryDetailView: View {
             .frame(width: ringSize, height: ringSize)
             if let r = recovery.result {
                 Text(TodayScoresCopy.tier(r.tier)).font(.title3.weight(.semibold))
-                Text(TodayScoresCopy.detailBasis).font(.caption).foregroundStyle(.secondary)
+                Text(TodayScoresCopy.detailBasis(recovery)).font(.caption).foregroundStyle(.secondary)
             } else if let gap = TodayScoresCopy.detailGap(recovery) {
                 Text(gap)
                     .font(.callout).foregroundStyle(.secondary)
@@ -100,6 +105,31 @@ struct RecoveryDetailView: View {
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(TodayScoresCopy.detailAccessibility(recovery))
+    }
+
+    // MARK: Vitals
+
+    /// The verdict Recovery counted, as a factor bar with the values behind it. Without a verdict the
+    /// row says so in words: no bar, never a 0.
+    @ViewBuilder private func vitalsRow(_ r: WellnessBalance.Result) -> some View {
+        if let value = r.factors[.vitals], let report = scores.vitals {
+            let unit = TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius
+            VStack(alignment: .leading, spacing: 4) {
+                ReadinessFactorBar(label: TodayScoresCopy.detailVitalsFactor, value: value, tint: r.tier.ringColor)
+                Text(TodayScoresCopy.vitalsVerdict(report.status))
+                    .font(.caption.weight(.semibold))
+                ForEach(TodayScoresCopy.vitalsValues(report, tempUnit: unit), id: \.self) { line in
+                    Text(line).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(TodayScoresCopy.vitalsAccessibility(report, tempUnit: unit))
+        } else {
+            Text(TodayScoresCopy.detailNoVitals)
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     // MARK: Last night

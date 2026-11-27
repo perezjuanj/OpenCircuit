@@ -159,13 +159,16 @@ enum HealthSources {
                 + "OpenCircuit's own choices, not published figures. Bedtime is your wake time minus need "
                 + "and the time you usually take to fall asleep.",
             citations: [vanDongen, kitamura, hirshkowitz, watson]),
-        // SleepStress.swift, WellnessBalance.swift, BaselineTrend.swift
+        // SleepStress.swift, WellnessBalance.swift, BaselineTrend.swift, VitalsBaseline.swift
         HealthSource(
             topic: .readiness, title: "Overnight stress and recovery",
             method: "Overnight stress is read from your sleeping HRV: lower HRV than usual reads as more "
-                + "stress. Recovery combines last night's sleep score with overnight stress, with OpenCircuit's "
-                + "own weighting. It is not a published or clinically validated score; the sources cover its inputs.",
-            citations: [shaffer, taskForce, hirshkowitz]),
+                + "stress. Recovery combines last night's sleep score with overnight stress and, once Vitals "
+                + "Status has a verdict, with your vitals against your own range (resting heart rate, "
+                + "overnight SpO₂, overnight HRV and skin temperature). Until then it uses the first two alone. "
+                + "The weighting is OpenCircuit's own. It is not a published or clinically validated score; "
+                + "the sources cover its inputs.",
+            citations: [shaffer, taskForce, hirshkowitz, smarr]),
         // Strain.swift, DailyStrain.swift, TrainingLoad.swift
         HealthSource(
             topic: .strain, title: "Strain and training load",
