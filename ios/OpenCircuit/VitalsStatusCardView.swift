@@ -345,11 +345,8 @@ struct VitalsStatusLoader: View {
     private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
     /// Trailing nights for the canonical skin-temp baseline/offset (#69).
     @Query private var sleepNights: [StoredSleepSummary]
-    /// Decision 29: the Apple Health fallback keeps to the current device once a switch is on record.
-    private var healthBaselineReader: HealthKitVitalsBaselineReader {
-        let log = LocalStore.ownershipLog()
-        return HealthKitVitalsBaselineReader(device: log.isEmpty ? nil : log.currentFamily)
-    }
+    /// The Apple Health fallback read and the start hook (tests inject both).
+    @Environment(\.vitalsStatusLoader) private var dependencies
     @State private var healthBaselineReport: HealthKitVitalsBaselineReader.Report?
 
     /// The Apple Health fallback has been tried (loaded or failed).
@@ -395,9 +392,15 @@ struct VitalsStatusLoader: View {
         Color.clear
             .accessibilityHidden(true)
             .allowsHitTesting(false)
+            .onAppear { dependencies.onStart?() }
         .task {
             guard healthBaselineReport == nil else { return }
-            healthBaselineReport = try? await healthBaselineReader.loadReport(lookbackDays: Self.historyDays)
+            // Decision 29: the Apple Health fallback keeps to the current device once a switch is on record.
+            let log = LocalStore.ownershipLog()
+            let fallback = try? await dependencies.healthFallback(log.isEmpty ? nil : log.currentFamily, Self.historyDays)
+            // A read cut short by leaving the screen hasn't been tried: it runs again when the loader reappears.
+            guard !Task.isCancelled else { return }
+            healthBaselineReport = fallback
             healthBaselineTried = true
         }
         // Recompute the report OFF THE MAIN ACTOR whenever an input changes (0x8BADF00D fix). d338484
@@ -420,6 +423,9 @@ struct VitalsStatusLoader: View {
         }
         .task(id: reportInputsKey) {
             guard let history else { return }
+            // Whether THIS analysis has the fallback, fixed before it runs: the live flag may change while
+            // the detached work is in flight, and that change starts a newer analysis anyway.
+            let complete = healthBaselineTried
             // Decision 29: "today" is the current device's, so its readings and nights are the only
             // baseline (a new device shows "Building your baseline"). Every row with an empty log.
             let log = LocalStore.ownershipLog()
@@ -428,7 +434,7 @@ struct VitalsStatusLoader: View {
             let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
             let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
             let fbSkinTempOffsetC = healthBaselineReport?.skinTempOffsetC
-            report = await Task.detached {
+            let computed = await Task.detached {
                 let own = VitalsStatusCardView.ownSamples([history.heartRate, history.spo2, history.hrv,
                                            history.restingHeartRate], log: log)
                 let hr = own[0].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
@@ -439,7 +445,34 @@ struct VitalsStatusLoader: View {
                                           fallbackRestingHR: fbRestingHR, fallbackSpO2: fbSpO2,
                                           fallbackHRV: fbHRV, fallbackSkinTempOffsetC: fbSkinTempOffsetC)
             }.value
-            onResult(Result(report: report, isComplete: healthBaselineTried))
+            // Superseded (an input changed, so a newer analysis is running) or the loader left the screen:
+            // the detached work isn't cancelled with this task, so drop its result rather than publish it.
+            guard !Task.isCancelled else { return }
+            report = computed
+            onResult(Result(report: computed, isComplete: complete))
         }
+    }
+}
+
+/// `VitalsStatusLoader`'s two outside dependencies, injectable through the environment (#396 review round 2).
+/// The app uses the defaults: Apple Health for the fallback, and no start hook.
+struct VitalsStatusLoaderDependencies {
+    /// Reads the Apple Health fallback for the current device (nil: no switch on record), over `lookbackDays`.
+    var healthFallback: @Sendable (_ device: DeviceOwnershipLog.Family?, _ lookbackDays: Int) async throws
+        -> HealthKitVitalsBaselineReader.Report = { device, lookbackDays in
+            try await HealthKitVitalsBaselineReader(device: device).loadReport(lookbackDays: lookbackDays)
+        }
+    /// Called each time a loader appears and starts its reads, so a test can count the copies running.
+    var onStart: (@MainActor () -> Void)?
+}
+
+private struct VitalsStatusLoaderKey: EnvironmentKey {
+    static let defaultValue = VitalsStatusLoaderDependencies()
+}
+
+extension EnvironmentValues {
+    var vitalsStatusLoader: VitalsStatusLoaderDependencies {
+        get { self[VitalsStatusLoaderKey.self] }
+        set { self[VitalsStatusLoaderKey.self] = newValue }
     }
 }

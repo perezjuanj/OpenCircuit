@@ -231,14 +231,6 @@ struct TodayLayout: Equatable {
                              lastSyncAt: lastSyncAt, now: now)
     }
 
-    /// Where the Vitals Status card's report runs. Its fever verdict is one of the sentence's inputs,
-    /// so exactly one copy always runs: the card itself while shown, a hidden copy while it is hidden.
-    /// Whether the Vitals Status card is drawn (`.card`) or not. Since decision 95a the report itself
-    /// no longer depends on it: `TodayVitalsRunner` computes it once for every layout.
-    enum VitalsReport: Equatable { case card, hiddenRunner }
-
-    var vitalsReport: VitalsReport { isShown(.vitalsStatus) ? .card : .hiddenRunner }
-
     // MARK: Edits
 
     mutating func setShown(_ section: DashboardSection, _ shown: Bool) {
