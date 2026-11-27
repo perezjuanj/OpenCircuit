@@ -434,7 +434,9 @@ struct VitalsStatusLoader: View {
             let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
             let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
             let fbSkinTempOffsetC = healthBaselineReport?.skinTempOffsetC
+            let beforeAnalysis = dependencies.beforeAnalysis
             let computed = await Task.detached {
+                if let beforeAnalysis { await beforeAnalysis(complete) }
                 let own = VitalsStatusCardView.ownSamples([history.heartRate, history.spo2, history.hrv,
                                            history.restingHeartRate], log: log)
                 let hr = own[0].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
@@ -464,6 +466,9 @@ struct VitalsStatusLoaderDependencies {
         }
     /// Called each time a loader appears and starts its reads, so a test can count the copies running.
     var onStart: (@MainActor () -> Void)?
+    /// Awaited at the start of each off-main analysis, with whether it has the fallback, so a test can hold
+    /// one in flight while the fallback lands. Nil in the app.
+    var beforeAnalysis: (@Sendable (_ hasFallback: Bool) async -> Void)?
 }
 
 private struct VitalsStatusLoaderKey: EnvironmentKey {

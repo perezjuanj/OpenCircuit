@@ -230,24 +230,32 @@ final class TodayVitalsLoaderTests: XCTestCase {
 
     // MARK: A fallback landing mid-analysis (review round 2, SUSPICION 1)
 
-    /// The fallback lands at a range of moments, including while the first (local-only) analysis is still
-    /// running over a dense night of HRV. Whenever a report is published as complete it must be the
-    /// fallback-informed one, never the superseded local-only analysis.
-    func testACompleteReportAlwaysReflectsAFallbackThatLandedMidAnalysis() throws {
-        for delay in [0, 5, 15, 30, 60, 120] {
-            let results = Log<VitalsStatusLoader.Result>()
-            let window = host(VitalsStatusLoader { results.items.append($0) },
-                              store: try store(lastNightHRV: 60, hrvEvery: 30),
-                              dependencies: dependencies(after: .milliseconds(delay), returning: raisedRestingHR))
-            wait(8) { results.items.contains { $0.isComplete } }
-            pump(0.5)
-            close(window)
-            let complete = results.items.filter(\.isComplete)
-            XCTAssertFalse(complete.isEmpty, "delay \(delay) ms: never complete")
-            for r in complete {
-                XCTAssertEqual(r.report?.status, .anomaly, "delay \(delay) ms: a complete report without the fallback: \(results.items)")
-            }
-            XCTAssertEqual(results.items.last?.report?.status, .anomaly, "delay \(delay) ms: the newest report has the fallback")
+    /// The first, local-only analysis is held in flight until the fallback has landed and the newer,
+    /// fallback-informed analysis has published. The held one must then be dropped, not published as
+    /// complete (or at all) over the newer report.
+    func testAFallbackLandingMidAnalysisSupersedesTheAnalysisInFlight() throws {
+        let results = Log<VitalsStatusLoader.Result>()
+        let gate = Gate()
+        var d = dependencies(gate: gate, returning: raisedRestingHR)
+        d.beforeAnalysis = { hasFallback in
+            guard !hasFallback else { return }
+            gate.release()
+            // Long enough for the fallback to land and the newer analysis to finish first.
+            try? await Task.sleep(for: .milliseconds(1_200))
         }
+        let window = host(VitalsStatusLoader { results.items.append($0) }, store: try store(lastNightHRV: 60), dependencies: d)
+        wait(5) { results.items.contains { $0.isComplete } }
+        pump(2.5) // past the held analysis
+        close(window)
+
+        let complete = try XCTUnwrap(results.items.first { $0.isComplete }, "never complete: \(results.items)")
+        XCTAssertEqual(complete.report?.status, .anomaly, "the complete report reflects the fallback")
+        for r in results.items where r.isComplete {
+            XCTAssertEqual(r.report?.status, .anomaly, "a complete report without the fallback: \(results.items)")
+        }
+        XCTAssertEqual(results.items.last?.report?.status, .anomaly,
+                       "the held local-only analysis was published over the newer report: \(results.items)")
+        XCTAssertFalse(results.items.contains { $0.report?.status == .normal },
+                       "the superseded local-only analysis was published at all: \(results.items)")
     }
 }
