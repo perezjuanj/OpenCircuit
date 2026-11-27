@@ -68,6 +68,9 @@ struct HelioKeySheet: View {
         entry == .setupScreen ? ZeppSignInCopy.accountLimit : ZeppSignInCopy.accountLimitShort
     }
 
+    /// The Troubleshooting link opens the full setup screen: only useful when the sheet didn't come from it.
+    static func showsTroubleshootingLink(_ entry: Entry) -> Bool { entry == .onboarding }
+
     /// Cancel on the sign-in step: back to choose in onboarding, closes the sheet from the setup screen.
     private func cancelSignIn() {
         clear()
@@ -289,9 +292,14 @@ struct HelioKeySheet: View {
                     .font(.caption)
                     .foregroundStyle(Color.white.opacity(0.45))
                     .fixedSize(horizontal: false, vertical: true)
+                    .padding(.bottom, Self.showsTroubleshootingLink(entry) ? 0 : 24)
 
-                troubleshooting
-                    .padding(.bottom, 24)
+                // From the setup screen the link would stack a second setup screen inside this sheet;
+                // the limit text above already points at that screen's own Troubleshooting section.
+                if Self.showsTroubleshootingLink(entry) {
+                    troubleshooting
+                        .padding(.bottom, 24)
+                }
             }
             .padding(.horizontal, 20)
             .padding(.top, 16)

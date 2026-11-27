@@ -197,7 +197,10 @@ final class ZeppSignInCopyTests: XCTestCase {
                      "OpenCircuit/Dashboard/DemoData.swift", "OpenCircuit/OnboardingView.swift"] {
             let code = try codeOnly(path)
             XCTAssertFalse(code.contains("ZeppSignInSheet"), "the old sheet is back in \(path)")
-            XCTAssertFalse(code.contains("devicesWithKeys("), "\(path) signs in on its own")
+            // ZeppSignInCopy.swift holds `lookUp` itself, the one allowed caller.
+            if !path.hasSuffix("ZeppSignInCopy.swift") {
+                XCTAssertFalse(code.contains("devicesWithKeys("), "\(path) signs in on its own")
+            }
         }
     }
 
@@ -208,6 +211,8 @@ final class ZeppSignInCopyTests: XCTestCase {
         XCTAssertEqual(HelioKeySheet.accountLimit(for: .setupScreen), ZeppSignInCopy.accountLimit)
         XCTAssertTrue(HelioKeySheet.accountLimit(for: .setupScreen).contains("strap's setup screen"))
         XCTAssertEqual(HelioKeySheet.accountLimit(for: .onboarding), ZeppSignInCopy.accountLimitShort)
+        XCTAssertFalse(HelioKeySheet.showsTroubleshootingLink(.setupScreen), "no setup screen inside the setup screen")
+        XCTAssertTrue(HelioKeySheet.showsTroubleshootingLink(.onboarding))
     }
 
     // MARK: onboarding's strap sheet shows one way
