@@ -1,6 +1,6 @@
 # Privacy Policy — OpenCircuit
 
-_Last updated: 2026-11-25_
+_Last updated: 2026-11-26_
 
 OpenCircuit is an independent, **local-first** app that reads health metrics from a
 compatible wearable (a RingConn Gen 2 or Gen 3 smart ring, or an Amazfit Helio Strap)
@@ -48,6 +48,17 @@ signs out of Zepp. Your email and password are **not stored or logged** by the a
 health data is sent. They never reach OpenCircuit or anyone other than Zepp, whose own
 privacy policy covers how Zepp handles that sign-in. If you don't use the button, the app
 never contacts Zepp.
+
+## Optional on-device sleep summary (Apple Intelligence)
+
+On an iPhone with Apple Intelligence turned on (iOS 26 or later), the Sleep card can show
+**Summarize this night**. When you tap it, the app gives that night's numbers (time asleep,
+stages, score, and how they compare with your recent nights) to Apple's **on-device**
+language model, which writes a short summary. The model runs **on your iPhone**: nothing
+is sent to OpenCircuit, Apple, or anyone else, and the summary is not stored. The app
+never uses Apple's server-side (Private Cloud Compute) model. If you don't tap the
+button, the model is never used. The summary describes your numbers. It is not medical
+advice.
 
 ## Where the data goes
 

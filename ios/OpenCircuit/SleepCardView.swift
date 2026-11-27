@@ -534,10 +534,11 @@ struct SleepCardView: View {
         }
     }
 
-    /// The rows under the score: the "How this score is made" link (unchanged from #378) and the sleep
-    /// need line (#382). One ViewBuilder child, because `content` is at the child limit.
+    /// The rows under the score: the "How this score is made" link (unchanged from #378), the sleep
+    /// need line (#382) and the on-device recap. One ViewBuilder child, because `content` is at the
+    /// child limit.
     @ViewBuilder
-    private func scoreFooter(hasScoreBreakdown: Bool) -> some View {
+    private func scoreFooter(_ night: Night, hasScoreBreakdown: Bool) -> some View {
         if hasScoreBreakdown {
             Button { showScoreBreakdown = true } label: {
                 HStack(spacing: 4) {
@@ -560,6 +561,29 @@ struct SleepCardView: View {
             .buttonStyle(.plain)
             .accessibilityHint("Shows how sleep need is worked out")
         }
+        if SleepRecapModel.isAvailable,
+           SleepRecapAdapter.mayHaveBaseline(storedSleep, excluding: night.nightKey) {
+            SleepRecapRow { recapFacts(night) }
+                .id(RecapKey(night: night.nightKey, asleep: night.summary.minutes.asleep,
+                             edited: night.isManuallyEdited, updatedAt: latest?.updatedAt))
+        }
+    }
+
+    /// The recap row's identity: a different night, a re-stage or an edit starts it over.
+    private struct RecapKey: Hashable {
+        let night: Date
+        let asleep: Int
+        let edited: Bool
+        let updatedAt: Date?
+    }
+
+    /// The facts for the on-device recap, from the night on screen and this device's earlier nights.
+    /// Called on the tap only (the rows are the `@Query` results already in memory). nil = too few
+    /// earlier nights from this device.
+    private func recapFacts(_ night: Night) -> SleepRecap.Facts? {
+        let sameDevice = latest.map { LocalStore.sameDevice(storedSleep, as: $0) } ?? storedSleep
+        return SleepRecap.facts(for: SleepRecapAdapter.night(night, row: latest),
+                                prior: SleepRecapAdapter.prior(sameDevice, excluding: night.nightKey))
     }
 
     /// `.task(id:)` key for the sleep need line: the store-change signal plus the newest night.
@@ -636,7 +660,7 @@ struct SleepCardView: View {
                 }
             }
         }
-        scoreFooter(hasScoreBreakdown: hasScoreBreakdown)
+        scoreFooter(night, hasScoreBreakdown: hasScoreBreakdown)
         stageTimeline(night)
         stageBar(night, m)
         stageLegend(night, m)
