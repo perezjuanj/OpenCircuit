@@ -35,7 +35,7 @@ private let light: UInt8 = 0x04, deep: UInt8 = 0x05, rem: UInt8 = 0x08
 /// One strap sleep session record over hours of the fixture day, recorded on the local midnight
 /// `hour(midnight)` (0 for the fixture day, 24 for the next one; the minute fields count from the
 /// midnight before it, `ZeppSleepSession.absolute`).
-private func record(_ stages: [(Double, Double, UInt8)], midnight: Double = 0) -> [UInt8] {
+private func sleepRecord(_ stages: [(Double, Double, UInt8)], midnight: Double = 0) -> [UInt8] {
     var r = [UInt8](repeating: 0, count: ZeppSleepSession.recordLength)
     func put(_ bytes: [UInt8], at offset: Int) { for (i, b) in bytes.enumerated() { r[offset + i] = b } }
     func minute(_ h: Double) -> UInt16 { UInt16(((h - midnight + 24) * 60).rounded()) }
@@ -129,10 +129,11 @@ private final class Transport: HelioTransport {
 /// A stub key store, so no test reaches the keychain (unsigned runs fail every `SecItem` call).
 @MainActor
 private final class Keys: HelioKeyStoring {
+    var isRejected = false
     func load() -> ZeppAuthKey? { HelioKeyText.parse(lKeyHex) }
     func save(pasted text: String) throws -> Bool { true }
     func forget() {}
-    func markRejected() {}
+    func markRejected() { isRejected = true }
 }
 
 // MARK: - Tests
@@ -273,7 +274,7 @@ final class StrapLateMainSleepTests: XCTestCase {
     /// flush and written once (an hour after its end, past the settle margin); no nap.
     func testASleepFromFiveToThreeIsStoredAsThatDaysNightAndReachesHealth() async throws {
         let store = try makeStore()
-        let (result, written) = try await syncAndFlush([record(reported)], at: hour(16), store: store)
+        let (result, written) = try await syncAndFlush([sleepRecord(reported)], at: hour(16), store: store)
         XCTAssertEqual(result.nights.map(\.window), [span(5, 15)], "handed to the flush")
         XCTAssertEqual(try nightWindows(store), [span(5, 15)])
         XCTAssertEqual(try rows(store).first?.night, hour(0), "filed under the day it ends on")
@@ -281,7 +282,7 @@ final class StrapLateMainSleepTests: XCTestCase {
         XCTAssertEqual(written, [span(5, 15)], "written once, after the margin")
         XCTAssertEqual(mirrorSpan(store, key: hour(0)), span(5, 15))
 
-        let again = try await syncAndFlush([record(reported)], at: hour(16.5), store: store)
+        let again = try await syncAndFlush([sleepRecord(reported)], at: hour(16.5), store: store)
         XCTAssertEqual(again.written, [], "the same night again writes nothing")
         XCTAssertEqual(try nightWindows(store), [span(5, 15)])
     }
@@ -289,10 +290,10 @@ final class StrapLateMainSleepTests: XCTestCase {
     /// The same record, synced inside the settle margin: stored, not written until the margin has passed.
     func testTheLateMainSleepWaitsForTheSettleMarginLikeAnyStrapNight() async throws {
         let store = try makeStore()
-        let early = try await syncAndFlush([record(reported)], at: hour(15 + 10.0 / 60), store: store)
+        let early = try await syncAndFlush([sleepRecord(reported)], at: hour(15 + 10.0 / 60), store: store)
         XCTAssertEqual(try nightWindows(store), [span(5, 15)])
         XCTAssertEqual(early.written, [], "inside its margin")
-        let later = try await syncAndFlush([record(reported)], at: hour(15.5), store: store)
+        let later = try await syncAndFlush([sleepRecord(reported)], at: hour(15.5), store: store)
         XCTAssertEqual(later.written, [span(5, 15)])
     }
 
@@ -302,7 +303,7 @@ final class StrapLateMainSleepTests: XCTestCase {
     /// later sleep, starting after 08:00, is a nap (97a(3)), never a night.
     func testANormalNightStaysAndASleepStartingAfterEightIsANap() throws {
         let store = try makeStore()
-        _ = try sync([record(asleep(-1, 7)), record(asleep(9, 15))], at: hour(16.5), store: store)
+        _ = try sync([sleepRecord(asleep(-1, 7)), sleepRecord(asleep(9, 15))], at: hour(16.5), store: store)
         XCTAssertEqual(try nightWindows(store), [span(-1, 7)])
         XCTAssertEqual(try napWindows(store), [span(9, 15)])
     }
@@ -312,11 +313,11 @@ final class StrapLateMainSleepTests: XCTestCase {
     /// row is untouched.
     func testAStoredNightOnTheKeyKeepsALaterMorningSleepOutAndItIsANap() throws {
         let store = try makeStore()
-        _ = try sync([record(asleep(0, 2))], at: hour(2.5), store: store)
+        _ = try sync([sleepRecord(asleep(0, 2))], at: hour(2.5), store: store)
         let before = try XCTUnwrap(try rows(store).first)
         let (hypnogram, asleepMin) = (before.hypnogramData, before.asleepMin)
 
-        let result = try sync([record(asleep(7, 11.5))], at: hour(12.75), store: store)
+        let result = try sync([sleepRecord(asleep(7, 11.5))], at: hour(12.75), store: store)
         XCTAssertEqual(try nightWindows(store), [span(0, 2)], "the stored night keeps its key")
         let after = try XCTUnwrap(try rows(store).first)
         XCTAssertEqual(after.hypnogramData, hypnogram)
@@ -332,7 +333,7 @@ final class StrapLateMainSleepTests: XCTestCase {
     /// would have replaced the shorter 00:00–02:00 night.
     func testAnOvernightSleepOfTheSameSyncKeepsALaterMorningSleepOutAndItIsANap() throws {
         let store = try makeStore()
-        let result = try sync([record(asleep(0, 2)), record(asleep(7, 11.5))], at: hour(12.75), store: store)
+        let result = try sync([sleepRecord(asleep(0, 2)), sleepRecord(asleep(7, 11.5))], at: hour(12.75), store: store)
         XCTAssertEqual(try nightWindows(store), [span(0, 2)])
         XCTAssertEqual(try napWindows(store), [span(7, 11.5)])
         XCTAssertEqual(result.nights.map(\.window), [span(0, 2)])
@@ -342,8 +343,8 @@ final class StrapLateMainSleepTests: XCTestCase {
     /// 97c(ii): a stored night 00:00–04:00, then a record 06:00–15:00: kept out, stored as a (long) nap.
     func testAStoredNightToFourKeepsASleepFromSixToThreeOutAndItIsALongNap() throws {
         let store = try makeStore()
-        _ = try sync([record(asleep(0, 4))], at: hour(4.5), store: store)
-        _ = try sync([record(asleep(6, 15))], at: hour(16.5), store: store)
+        _ = try sync([sleepRecord(asleep(0, 4))], at: hour(4.5), store: store)
+        _ = try sync([sleepRecord(asleep(6, 15))], at: hour(16.5), store: store)
         XCTAssertEqual(try nightWindows(store), [span(0, 4)])
         XCTAssertEqual(try napWindows(store), [span(6, 15)])
     }
@@ -359,7 +360,7 @@ final class StrapLateMainSleepTests: XCTestCase {
         XCTAssertEqual(try store.saveSleepSummary(SleepStaging.summary(segments), night: SleepNightKey.night(inBedStart: hour(0), inBedEnd: hour(2)),
                                                   inBedStart: hour(0), inBedEnd: hour(2), sleepOnset: hour(0), sleepWake: hour(2),
                                                   extras: extras), .inserted)
-        let result = try sync([record(asleep(7, 11.5))], at: hour(12.75), store: store)
+        let result = try sync([sleepRecord(asleep(7, 11.5))], at: hour(12.75), store: store)
         XCTAssertEqual(try nightWindows(store), [span(0, 2)])
         XCTAssertEqual(try rows(store).first?.asleepMin, 120, "the ring's night is untouched")
         XCTAssertEqual(result.nights.count, 0)
@@ -372,10 +373,10 @@ final class StrapLateMainSleepTests: XCTestCase {
     /// night 23:00–13:00 (a late main sleep), rewritten once as a 58b extension; no second row, no nap.
     func testANightStitchedToALieInEndingAfterNoonExtendsTheWrittenNightOnce() async throws {
         let store = try makeStore()
-        let first = try await syncAndFlush([record(asleep(-1, 6))], at: hour(6 + 40.0 / 60), store: store)
+        let first = try await syncAndFlush([sleepRecord(asleep(-1, 6))], at: hour(6 + 40.0 / 60), store: store)
         XCTAssertEqual(first.written, [span(-1, 6)], "the night is in Health")
 
-        let lieIn = [record(asleep(-1, 6)), record(asleep(6.5, 13))]
+        let lieIn = [sleepRecord(asleep(-1, 6)), sleepRecord(asleep(6.5, 13))]
         var written = try await syncAndFlush(lieIn, at: hour(13.5), store: store).written
         XCTAssertEqual(try nightWindows(store), [span(-1, 13)], "one row, the joined night")
         XCTAssertEqual(try napWindows(store), [])
@@ -401,8 +402,8 @@ final class StrapLateMainSleepTests: XCTestCase {
             let at = 5.5 + Double(step) * 0.5
             let end = min(at - 3.0 / 60, 15)
             let label = "sync at \(at)"
-            let sync = try await syncAndFlush([record(inProgress(until: end))], at: hour(at), store: store)
-            written += sync.written
+            let round = try await syncAndFlush([sleepRecord(inProgress(until: end))], at: hour(at), store: store)
+            written += round.written
             let onKey = try rows(store).filter { $0.night == hour(0) }
             XCTAssertLessThanOrEqual(onKey.count, 1, label)
             XCTAssertEqual(try rows(store).count, onKey.count, "\(label): no other row")
@@ -426,7 +427,7 @@ final class StrapLateMainSleepTests: XCTestCase {
     func testTheRingsTimeIsNeverAStrapLateMainSleep() throws {
         ownership.install(DeviceOwnershipLog(entries: [.init(family: .zeppOS, since: hour(6))]))
         let store = try makeStore()
-        let result = try sync([record(reported)], at: hour(16), store: store)
+        let result = try sync([sleepRecord(reported)], at: hour(16), store: store)
         XCTAssertEqual(try nightWindows(store), [])
         XCTAssertEqual(try napWindows(store), [])
         XCTAssertEqual(result.nights.count, 0)
@@ -438,7 +439,7 @@ final class StrapLateMainSleepTests: XCTestCase {
     /// under its own key.
     func testALateMainSleepAndTheNextNightAreBothStoredUnderTheirOwnKeys() throws {
         let store = try makeStore()
-        _ = try sync([record(reported), record(asleep(23, 31), midnight: 24)], at: hour(32), store: store)
+        _ = try sync([sleepRecord(reported), sleepRecord(asleep(23, 31), midnight: 24)], at: hour(32), store: store)
         XCTAssertEqual(try nightWindows(store), [span(5, 15), span(23, 31)])
         XCTAssertEqual(try rows(store).map(\.night), [hour(0), hour(24)])
         XCTAssertEqual(try napWindows(store), [])
@@ -449,13 +450,13 @@ final class StrapLateMainSleepTests: XCTestCase {
     /// The `sleep round:` line counts late main sleeps offered as nights, those kept out by 97c and the
     /// sleeps that are neither shape, digits only.
     func testTheSleepRoundLineCountsLateMainSleepsWithNoClockTime() throws {
-        let offered = try sync([record(reported)], at: hour(16), store: try makeStore())
+        let offered = try sync([sleepRecord(reported)], at: hour(16), store: try makeStore())
         let offeredLine = try XCTUnwrap(offered.sleepRound?.text)
         XCTAssertTrue(offeredLine.contains("; late main sleeps: offered=1 keptOut=0 neither=0; "), offeredLine)
 
         let store = try makeStore()
-        _ = try sync([record(asleep(0, 2))], at: hour(2.5), store: store)
-        let keptOut = try sync([record(asleep(7, 11.5)), record(asleep(13, 16.5))], at: hour(18), store: store)
+        _ = try sync([sleepRecord(asleep(0, 2))], at: hour(2.5), store: store)
+        let keptOut = try sync([sleepRecord(asleep(7, 11.5)), sleepRecord(asleep(13, 16.5))], at: hour(18), store: store)
         let keptOutLine = try XCTUnwrap(keptOut.sleepRound?.text)
         XCTAssertTrue(keptOutLine.contains("; late main sleeps: offered=0 keptOut=1 neither=1; "), keptOutLine)
         XCTAssertEqual(keptOut.sleepRound?.neitherOvernightNorLateMainSleep, 1, "the afternoon sleep")
