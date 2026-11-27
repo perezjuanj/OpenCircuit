@@ -1,17 +1,18 @@
 // The Today tab's reorderable sections and the saved order's decode/encode (#245).
 //
 // Lifted out of `ContentView` so a test can pin the one rule that matters across releases: a layout
-// saved by an older build names sections that no longer exist — `vitals` (its card left Today with
-// decision 47), and before it `sleep` / `workout` / `trends` (moved to their own tabs) — and those
-// ids must be dropped WITHOUT disturbing the order of the sections that remain.
+// saved by an older build names sections that no longer exist — `readiness` (its card became Today's
+// pinned scores card, decision 93), `vitals` (its card left Today with decision 47), and before them
+// `sleep` / `workout` / `trends` (moved to their own tabs) — and those ids must be dropped WITHOUT
+// disturbing the order of the sections that remain.
 
 import Foundation
 
 /// The reorderable Today-tab sections. `rawValue` is the persistence key written to
 /// `dashboard.sectionOrder`, so keep these stable across releases; `allCases` order is the default
-/// (first-run) layout.
+/// (first-run) layout. Today's scores card is pinned above these and is not one of them.
 enum DashboardSection: String, CaseIterable, Identifiable, Hashable {
-    case readiness, metrics, vitalsStatus, calories, goals, cycle, headache, sync
+    case metrics, vitalsStatus, calories, goals, cycle, headache, sync
     var id: String { rawValue }
 }
 
@@ -29,10 +30,11 @@ enum DashboardSectionOrder {
             }
         }
         for s in DashboardSection.allCases where !seen.contains(s) {
-            // The metric tiles (#216) are new since most saved orders: put them straight under
-            // readiness, where they belong, rather than at the bottom of an existing layout.
-            if s == .metrics, let i = result.firstIndex(of: .readiness) {
-                result.insert(s, at: i + 1)
+            // The metric tiles (#216) are new since some saved orders: put them first, straight under
+            // the pinned scores card where Readiness used to sit, rather than at the bottom of an
+            // existing layout.
+            if s == .metrics {
+                result.insert(s, at: 0)
             } else {
                 result.append(s)
             }

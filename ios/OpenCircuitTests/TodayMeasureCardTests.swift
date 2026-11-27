@@ -22,16 +22,18 @@ final class DashboardSectionOrderTests: XCTestCase {
         let order = DashboardSectionOrder.decode(saved)
 
         XCTAssertFalse(order.contains { $0.rawValue == "vitals" })
-        XCTAssertEqual(order, [.sync, .goals, .readiness, .metrics, .vitalsStatus, .calories, .cycle, .headache])
+        XCTAssertEqual(order, [.sync, .goals, .metrics, .vitalsStatus, .calories, .cycle, .headache])
         XCTAssertEqual(Set(order), Set(DashboardSection.allCases), "every live section still loads")
     }
 
     /// The decode drops ids this build no longer has WITHOUT disturbing the rest — including the
-    /// tab-move ids (`sleep`, `workout`, `trends`) that predate `vitals`, and a duplicate.
+    /// tab-move ids (`sleep`, `workout`, `trends`) that predate `vitals`, `readiness` (now the pinned
+    /// scores card, decision 93), and duplicates, both retired (`readiness`) and live (`goals`).
     func testUnknownAndDuplicateIdsAreDroppedInPlace() {
-        let order = DashboardSectionOrder.decode("sleep,readiness,vitals,workout,goals,readiness,trends")
-        XCTAssertEqual(Array(order.prefix(3)), [.readiness, .metrics, .goals],
-                       "metrics is inserted under readiness; the retired ids leave no gap")
+        let order = DashboardSectionOrder.decode("sleep,readiness,vitals,workout,goals,readiness,goals,trends")
+        XCTAssertFalse(order.contains { $0.rawValue == "readiness" })
+        XCTAssertEqual(Array(order.prefix(3)), [.metrics, .goals, .vitalsStatus],
+                       "a missing metrics goes first; the retired ids leave no gap")
     }
 
     /// First run (and any store with no saved layout): the canonical order, which no longer has a

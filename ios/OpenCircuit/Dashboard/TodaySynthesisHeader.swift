@@ -1,11 +1,12 @@
-// The Today synthesis line (#216): today's date and one plain-language sentence at the top of the
-// Today tab. The sentence is `TodaySynthesis.sentence` (OpenCircuitKit, unit-tested); this file
-// only gathers its inputs from what the tab already holds and draws it.
+// The Today synthesis line (#216): today's date at the top of the Today tab, and the inputs of the one
+// plain-language sentence. The sentence is `TodaySynthesis.sentence` (OpenCircuitKit, unit-tested) and
+// since decision 93 it sits inside Today's scores card, under the dials; this file only gathers its
+// inputs from what the tab already holds, and draws the date.
 
 import SwiftUI
 import OpenCircuitKit
 
-/// What the readiness card is showing, handed up so the synthesis line agrees with it.
+/// What Today's scores card is showing for Recovery, handed up so the synthesis line agrees with it.
 struct ReadinessReport: Equatable {
     var readiness: TodaySynthesis.Readiness
     /// Last night's asleep minutes, when a night that ended today is stored.
@@ -16,7 +17,7 @@ extension TodaySynthesis {
     /// Assemble the synthesis input from the Today tab's state.
     ///
     /// - `trends`: the shared two-week load (tiles are built from the same data).
-    /// - `readiness`: what the readiness card reported; nil until it has.
+    /// - `readiness`: what the scores card reported for Recovery; nil until it has.
     /// - `feverSuspected`: the Vitals Status card's own fever verdict; false until it has reported.
     ///   The only thing that lets this line pair skin temperature with resting HR as fever signs.
     /// - `lastSyncAt`: only used to tell "never had data" from "nothing in the last two weeks".
@@ -48,30 +49,16 @@ extension TodaySynthesis {
     }
 }
 
-struct TodaySynthesisHeader: View {
-    let sentence: String
+/// Today's date above the scores card ("THURSDAY, NOVEMBER 26").
+struct TodayDateRow: View {
     var date: Date = Date()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(date.formatted(.dateTime.weekday(.wide).day().month(.wide)).uppercased())
-                .font(.caption.weight(.semibold)).tracking(1.2)
-                .foregroundStyle(.secondary)
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                KeylineGlyph(.sparkles, size: 18, relativeTo: .title3)
-                    .foregroundStyle(Theme.accent)
-                    .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 3 }
-                Text(sentence)
-                    .font(.system(.title3, design: .rounded).weight(.medium))
-                    .foregroundStyle(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .contentTransition(.opacity)
-                    .animation(.default, value: sentence)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.top, 4)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Today, \(date.formatted(.dateTime.weekday(.wide).day().month(.wide))). \(sentence)")
+        Text(date.formatted(.dateTime.weekday(.wide).day().month(.wide)).uppercased())
+            .font(.caption.weight(.semibold)).tracking(1.2)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+            .accessibilityLabel("Today, \(date.formatted(.dateTime.weekday(.wide).day().month(.wide)))")
     }
 }

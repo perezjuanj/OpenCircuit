@@ -1,9 +1,9 @@
 // The readiness ring (#216) — a thick, glanceable dial for the Wellness Balance score, in the
 // card's existing tier colours (the same green / teal / orange the score number always used).
 //
-// Pure drawing: it fills to exactly the fraction it's given and says nothing of its own. The card
-// (`WellnessBalanceCardView`) decides the number, the tier and the empty/low-confidence states;
-// this only renders them. A value change animates unless Reduce Motion is on; the first frame
+// Pure drawing: it fills to exactly the fraction it's given and says nothing of its own. Today's
+// scores card and the Recovery and Strain details (decision 93) decide the number, the tier and the
+// empty/low-confidence states; this only renders them. A value change animates unless Reduce Motion is on; the first frame
 // always shows the real value (so screenshots and VoiceOver never see a half-drawn ring).
 
 import SwiftUI

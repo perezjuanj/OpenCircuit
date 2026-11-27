@@ -131,8 +131,9 @@ struct ContentView: View {
     /// Low / high of every reading in the current on-demand measurement (the buffer is trimmed to
     /// the chart's window, this isn't). Reset with the buffer.
     @State private var liveRange = LiveSessionRange()
-    /// What the readiness card last showed, so the Today synthesis line (#216) agrees with it.
-    @State private var readinessReport: ReadinessReport?
+    /// What Today's scores card last showed (decision 93), so the Recovery detail shows the card's
+    /// own number rather than computing another one.
+    @State private var todayScores: TodayScores?
     /// Whether the Vitals Status card's last report flagged possible fever signs, so the synthesis
     /// line only pairs skin temperature with resting HR when that card does.
     @State private var vitalsFeverSuspected = false
@@ -535,8 +536,9 @@ struct ContentView: View {
 
     // MARK: - Tabs (five-tab bottom navigation)
 
-    /// TODAY — the glanceable "now": connection, the live-measure hero, then the reorderable
-    /// readiness / vitals / calories / goals / cycle / sync cards. Middle sections stay
+    /// TODAY — the glanceable "now": the date, the pinned scores card (Sleep · Recovery · Strain),
+    /// connection, the live-measure strip, then the reorderable tiles / vitals / calories / goals /
+    /// cycle / sync cards. Middle sections stay
     /// long-press-draggable (the reorder QoL), so this tab keeps a `List`.
     private var todayTab: some View {
         Group {
@@ -576,8 +578,9 @@ struct ContentView: View {
     private var todayList: some View {
         List {
             Group {
-                // One plain-language sentence about today (#216), above everything else.
-                TodaySynthesisHeader(sentence: synthesisSentence)
+                // The date, then Sleep · Recovery · Strain with the day's sentence (decision 93), first.
+                TodayDateRow()
+                todayScoresCard
                 if ringActive {
                     connectionCard
                 } else {
@@ -605,6 +608,19 @@ struct ContentView: View {
         .background(Theme.pageBackground)
         // Pull-to-refresh mirrors the "Sync from ring" button (same guards). See `forceSync`.
         .refreshable { await forceSync() }
+    }
+
+    /// Today's scores card (decision 93): one model from the newest night and today's strain. The
+    /// sentence is built from that same model's Recovery, and the model is kept for the Recovery detail.
+    private var todayScoresCard: some View {
+        TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded) { scores in
+            TodayScoresCard(scores: scores, sentence: synthesisSentence(scores.report),
+                            onSleep: { selectedTab = .sleep },
+                            onRecovery: { path.append(.recovery) },
+                            onStrain: { path.append(.strain) })
+                .onAppear { todayScores = scores }
+                .onChange(of: scores) { _, new in todayScores = new }
+        }
     }
 
     /// The liveline live-vitals hero — shown ONLY during an on-demand HR/SpO₂ measurement, when the
@@ -997,13 +1013,14 @@ struct ContentView: View {
                          tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius, scope: .from(trends))
     }
 
-    /// The Today synthesis sentence (#216) — deterministic rules in `TodaySynthesis`.
-    private var synthesisSentence: String {
+    /// The Today synthesis sentence (#216) — deterministic rules in `TodaySynthesis`, about the
+    /// Recovery the scores card shows (`report`).
+    private func synthesisSentence(_ report: ReadinessReport) -> String {
         // Before the first trends load there is nothing to judge — and "no ring data yet" would be
         // a false claim to a wearer who has plenty.
         guard trendsHaveLoaded else { return "Gathering today's numbers…" }
         return TodaySynthesis.sentence(TodaySynthesis.input(trends: trends, tiles: todayTiles,
-                                                             readiness: readinessReport,
+                                                             readiness: report,
                                                              feverSuspected: vitalsFeverSuspected,
                                                              lastSyncAt: lastSyncAt))
     }
@@ -1029,15 +1046,13 @@ struct ContentView: View {
     @ViewBuilder
     private func sectionView(_ section: DashboardSection) -> some View {
         switch section {
-        case .readiness:    card { WellnessBalanceCardView(onReport: { readinessReport = $0 }) }
         case .metrics:      MetricTilesSection(tiles: todayTiles, isLoading: !trendsHaveLoaded,
                                                onSelect: { path.append(.metric($0)) },
                                                onTimeline: { path.append(.timeline) },
                                                strapStress: strapStress,
                                                onStress: { path.append(.strapStress) },
                                                strapPAI: strapPAI,
-                                               onPAI: { showPAIInfo = true },
-                                               strain: trends.todayStrain)
+                                               onPAI: { showPAIInfo = true })
         case .vitalsStatus: vitalsStatusCard
         case .calories:     caloriesCard
         case .goals:        card { GoalsCardView() }
@@ -1059,6 +1074,19 @@ struct ContentView: View {
                                              measure: measureSource)
         case .timeline:      DayDetailView(day: Date())
         case .dayMetric(let m): MetricDayView(metric: m, tempUnitRaw: tempUnitRaw)
+        case .recovery:
+            // The card's own model (I2). It is always set before the dial can be tapped; the fallback
+            // builds the same model from the same row rather than guessing an empty state.
+            if let todayScores {
+                RecoveryDetailView(scores: todayScores, tiles: todayTiles,
+                                   onMetric: { path.append(.metric($0)) })
+            } else {
+                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded) {
+                    RecoveryDetailView(scores: $0, tiles: todayTiles, onMetric: { path.append(.metric($0)) })
+                }
+            }
+        case .strain:
+            StrainDetailView(reading: trends.todayStrain, onHeartRate: { path.append(.metric(.restingHR)) })
         }
     }
 
@@ -2928,6 +2956,10 @@ enum Route: Hashable {
     case timeline
     /// One metric's day chart: the strap's stress (#239).
     case dayMetric(DayTimeline.Metric)
+    /// What went into today's Recovery, from the scores card (decision 93).
+    case recovery
+    /// Today's strain, from the scores card (decision 93).
+    case strain
 
     /// Where the strap's Stress tile and its card reading go: today's stress chart (#239, steer 3).
     static let strapStress = Route.dayMetric(.stress)

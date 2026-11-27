@@ -161,11 +161,10 @@ enum HealthSources {
             citations: [vanDongen, kitamura, hirshkowitz, watson]),
         // SleepStress.swift, WellnessBalance.swift, BaselineTrend.swift
         HealthSource(
-            topic: .readiness, title: "Overnight stress and readiness",
+            topic: .readiness, title: "Overnight stress and recovery",
             method: "Overnight stress is read from your sleeping HRV: lower HRV than usual reads as more "
-                + "stress. Readiness combines last night's sleep score, overnight stress, your vitals against "
-                + "your usual range and the day's activity score, with OpenCircuit's own weighting. It is not a "
-                + "published or clinically validated score; the sources cover its inputs.",
+                + "stress. Recovery combines last night's sleep score with overnight stress, with OpenCircuit's "
+                + "own weighting. It is not a published or clinically validated score; the sources cover its inputs.",
             citations: [shaffer, taskForce, hirshkowitz]),
         // Strain.swift, DailyStrain.swift, TrainingLoad.swift
         HealthSource(
