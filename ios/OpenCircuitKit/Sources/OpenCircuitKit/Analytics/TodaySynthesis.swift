@@ -50,6 +50,9 @@ public enum TodaySynthesis {
         /// Time of the newest stored wearable data of any kind (either device's); nil when there is none.
         public var newestDataAt: Date?
         public var now: Date
+        /// Recovery counted Vitals Status but no sleeping HRV (decision 95a): the low-confidence caveat
+        /// names both inputs instead of "sleep alone".
+        public var withoutSleepingHRV: Bool
 
         public init(readiness: Readiness = .pending,
                     hrv: BaselineTrend.Direction? = nil,
@@ -59,7 +62,8 @@ public enum TodaySynthesis {
                     lastNightSleepMinutes: Int? = nil,
                     usualSleepMinutes: Double? = nil,
                     newestDataAt: Date?,
-                    now: Date) {
+                    now: Date,
+                    withoutSleepingHRV: Bool = false) {
             self.readiness = readiness
             self.hrv = hrv
             self.restingHR = restingHR
@@ -69,6 +73,7 @@ public enum TodaySynthesis {
             self.usualSleepMinutes = usualSleepMinutes
             self.newestDataAt = newestDataAt
             self.now = now
+            self.withoutSleepingHRV = withoutSleepingHRV
         }
     }
 
@@ -105,7 +110,11 @@ public enum TodaySynthesis {
             case .good:             lead = "Recovery is good at \(score)"
             case .needsImprovement: lead = "Recovery needs improvement at \(score)"
             }
-            if factorCount <= 1 { lead += " based on last night's sleep alone" }
+            if factorCount <= 1 {
+                lead += " based on last night's sleep alone"
+            } else if input.withoutSleepingHRV {
+                lead += " based on last night's sleep and vitals alone"
+            }
             if feverPair { return "\(lead), but \(feverClause), so take today gently." }
             switch tier {
             case .excellent, .good:

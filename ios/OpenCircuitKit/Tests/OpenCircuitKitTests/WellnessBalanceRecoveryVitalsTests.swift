@@ -57,13 +57,22 @@ final class WellnessBalanceRecoveryVitalsTests: XCTestCase {
 
     // MARK: A missing verdict
 
-    func testNoVerdictIsExactlyTheTwoFactorScore() {
+    /// Against the two-input blend itself (not `recoveryScore` again, whose default would hide a change)
+    /// and against pinned numbers.
+    func testNoVerdictIsExactlyTheTwoFactorScore() throws {
         for sleep in stride(from: 0, through: 100, by: 7) {
             for stress: Int? in [nil, 15, 33, 50, 75, 90] {
+                let twoFactor = WellnessBalance.anchoredScore(.init(sleepScore: sleep, overnightStress: stress))
                 XCTAssertEqual(WellnessBalance.recoveryScore(sleepScore: sleep, overnightStress: stress, vitalsStatus: nil),
-                               WellnessBalance.recoveryScore(sleepScore: sleep, overnightStress: stress))
+                               twoFactor, "sleep \(sleep), stress \(String(describing: stress))")
+                XCTAssertEqual(WellnessBalance.recoveryScore(sleepScore: sleep, overnightStress: stress), twoFactor)
+                XCTAssertNil(twoFactor?.factors[.vitals])
             }
         }
+        XCTAssertEqual(try recovery(85, 33, nil).score, 82)
+        XCTAssertEqual(try recovery(85, 33, nil).factors, [.sleep: 0.85, .recovery: 0.76])
+        XCTAssertEqual(try recovery(52, nil, nil).score, 52)
+        XCTAssertEqual(try recovery(52, nil, nil).factors.count, 1)
     }
 
     func testAVerdictWithoutASleepScoreIsNoRecovery() {
