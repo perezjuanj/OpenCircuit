@@ -50,7 +50,7 @@ struct DemoScoresWidgets: View {
         .background(Theme.pageBackground)
     }
 
-    private static let scale: CGFloat = 0.58
+    private static let scale: CGFloat = 0.53
 
     private func tile(_ content: some View, width: CGFloat, height: CGFloat) -> some View {
         content.padding(16).frame(width: width, height: height)

@@ -286,6 +286,26 @@ final class ScoresWidgetTests: XCTestCase {
         }
     }
 
+    /// N-3: redacted on a locked screen, the ring's arc would still give the score away, so it is hidden:
+    /// two dials with the same text and different fills draw identically once redacted, and differently
+    /// when not.
+    @MainActor
+    func testPrivacyRedactionHidesTheArcToo() throws {
+        func dial(_ fill: Double) -> ScoresWidgetDial {
+            ScoresWidgetDial(kind: .sleep, label: "SLEEP", value: "81", fill: fill, status: "7h 10m",
+                             tint: .sleep, dashed: false, spoken: "Sleep score")
+        }
+        func png(_ d: ScoresWidgetDial, redacted: Bool) throws -> Data {
+            let view = ScoresWidgetCircularView(dial: d).frame(width: 76, height: 76)
+                .redacted(reason: redacted ? .privacy : [])
+            let renderer = ImageRenderer(content: view)
+            renderer.scale = 2
+            return try XCTUnwrap(renderer.uiImage?.pngData())
+        }
+        XCTAssertNotEqual(try png(dial(0.2), redacted: false), try png(dial(0.9), redacted: false))
+        XCTAssertEqual(try png(dial(0.2), redacted: true), try png(dial(0.9), redacted: true))
+    }
+
     // MARK: Deep links
 
     func testDeepLinksOpenEachDialsScreen() throws {

@@ -134,13 +134,16 @@ struct ScoresWidgetRing: View {
     let lineWidth: CGFloat
     var showsLabelInside = false
 
+    /// When iOS redacts a locked screen, the arc would still give the score away: draw the track only.
+    @Environment(\.redactionReasons) private var redaction
+
     var body: some View {
         ZStack {
             Circle()
                 .stroke(Color.primary.opacity(0.14),
                         style: StrokeStyle(lineWidth: lineWidth, lineCap: .round,
                                            dash: dial.dashed ? [2, lineWidth * 0.55] : []))
-            if let fill = dial.fill, fill > 0 {
+            if let fill = dial.fill, fill > 0, !redaction.contains(.privacy) {
                 Circle()
                     .trim(from: 0, to: min(fill, 1))
                     .stroke(ScoresWidgetPalette.color(dial.tint),
