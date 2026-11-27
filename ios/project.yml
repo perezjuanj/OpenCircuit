@@ -221,7 +221,7 @@ targets:
   # The Today scores widgets (#398, decision 95c): Sleep, Recovery and Strain on the home screen (small,
   # medium) and lock screen (rectangular, one circle per score). It READS the snapshot the app writes to
   # the App Group and draws it: no OpenCircuitKit dependency on purpose, so it cannot compute a score
-  # (OpenCircuitTests/ScoresWidgetSourceTests checks this target's sources and dependencies).
+  # (OpenCircuitTests/ScoresWidgetTests checks this target's sources and dependencies).
   # SIGNING: deliberately no DEVELOPMENT_TEAM here. It builds unsigned for the simulator; the bundle id,
   # App Group and profiles must be created in the developer portal and the team set by the owner before
   # any device or TestFlight build (the PR lists the steps).
