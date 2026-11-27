@@ -169,22 +169,50 @@ final class ZeppSignInCopyTests: XCTestCase {
         }
     }
 
-    /// Both sheets go through `lookUp`; neither calls the lookup or `pick` on its own, so a future edit
-    /// can't give one sheet a looser rule.
-    func testBothSheetsDecideThroughTheSharedLookUp() throws {
+    private func codeOnly(_ path: String) throws -> String {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-        for path in ["OpenCircuit/Helio/ZeppSignInSheet.swift", "OpenCircuit/Onboarding/OCStepHelioKey.swift"] {
-            let source = try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
-                .split(separator: "\n", omittingEmptySubsequences: false)
-                .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }   // code only
-                .joined(separator: "\n")
-            XCTAssertTrue(source.contains("ZeppSignInCopy.lookUp(lookup"), path)
-            let body = path.hasSuffix("ZeppSignInSheet.swift")
-                ? String(source[source.range(of: "struct ZeppSignInSheet")!.lowerBound...]) : source
-            XCTAssertFalse(body.contains("devicesWithKeys("), "\(path) reads devices outside lookUp")
-            XCTAssertFalse(body.contains("pick(from:"), "\(path) decides outside lookUp")
-            XCTAssertFalse(body.contains("id: \\.macAddress"), "\(path) keys rows by address")
+        return try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }   // code only
+            .joined(separator: "\n")
+    }
+
+    /// The app has one sign-in sheet and it decides only through `lookUp`, so a future edit can't give
+    /// one screen a looser rule.
+    func testTheOneSheetDecidesThroughTheSharedLookUp() throws {
+        let sheet = try codeOnly("OpenCircuit/Onboarding/OCStepHelioKey.swift")
+        XCTAssertTrue(sheet.contains("ZeppSignInCopy.lookUp(lookup"))
+        XCTAssertFalse(sheet.contains("devicesWithKeys("), "reads devices outside lookUp")
+        XCTAssertFalse(sheet.contains("pick(from:"), "decides outside lookUp")
+        XCTAssertFalse(sheet.contains("id: \\.macAddress"), "keys rows by address")
+    }
+
+    /// The setup screen opens the same sheet as onboarding (Afsal's design), and no second sign-in
+    /// UI is left anywhere in the app.
+    func testTheSetupScreenOpensTheSameSheetAndNoOtherSignInExists() throws {
+        let setup = try codeOnly("OpenCircuit/Helio/HelioSetupView.swift")
+        XCTAssertTrue(setup.contains("HelioKeySheet("), "setup screen presents the strap key sheet")
+        XCTAssertTrue(setup.contains("entry: .setupScreen"))
+        for path in ["OpenCircuit/Helio/HelioSetupView.swift", "OpenCircuit/Helio/ZeppSignInCopy.swift",
+                     "OpenCircuit/Dashboard/DemoData.swift", "OpenCircuit/OnboardingView.swift"] {
+            let code = try codeOnly(path)
+            XCTAssertFalse(code.contains("ZeppSignInSheet"), "the old sheet is back in \(path)")
+            // ZeppSignInCopy.swift holds `lookUp` itself, the one allowed caller.
+            if !path.hasSuffix("ZeppSignInCopy.swift") {
+                XCTAssertFalse(code.contains("devicesWithKeys("), "\(path) signs in on its own")
+            }
         }
+    }
+
+    func testFromTheSetupScreenTheSheetOpensOnSignInAndPointsAtThatScreen() {
+        XCTAssertEqual(HelioKeySheet.startMode(.setupScreen, requested: .choose), .signIn)
+        XCTAssertEqual(HelioKeySheet.startMode(.onboarding, requested: .choose), .choose)
+        XCTAssertEqual(HelioKeySheet.startMode(.onboarding, requested: .signIn), .signIn)
+        XCTAssertEqual(HelioKeySheet.accountLimit(for: .setupScreen), ZeppSignInCopy.accountLimit)
+        XCTAssertTrue(HelioKeySheet.accountLimit(for: .setupScreen).contains("strap's setup screen"))
+        XCTAssertEqual(HelioKeySheet.accountLimit(for: .onboarding), ZeppSignInCopy.accountLimitShort)
+        XCTAssertFalse(HelioKeySheet.showsTroubleshootingLink(.setupScreen), "no setup screen inside the setup screen")
+        XCTAssertTrue(HelioKeySheet.showsTroubleshootingLink(.onboarding))
     }
 
     // MARK: onboarding's strap sheet shows one way
