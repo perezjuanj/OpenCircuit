@@ -1,17 +1,12 @@
-// The Today synthesis line (#216): today's date and one plain-language sentence at the top of the
-// Today tab. The sentence is `TodaySynthesis.sentence` (OpenCircuitKit, unit-tested); this file
-// only gathers its inputs from what the tab already holds and draws it.
-//
-// With Apple Intelligence on (iOS 26+), the template sentence is shown first and then replaced by a
-// brief written by the ON-DEVICE model from the same input (`TodaySynthesis.briefFacts`), once the
-// reply passes `TodaySynthesis.vetBrief`. Unavailable, slow, refused or rejected: the template stays.
-// The last accepted brief is kept in UserDefaults with the prompt it answered, so reopening the app
-// shows it at once while the input is unchanged.
+// The Today synthesis line (#216): today's date at the top of the Today tab, and the inputs of the one
+// plain-language sentence. The sentence is `TodaySynthesis.sentence` (OpenCircuitKit, unit-tested) and
+// since decision 93 it sits inside Today's scores card, under the dials; this file only gathers its
+// inputs from what the tab already holds, and draws the date.
 
 import SwiftUI
 import OpenCircuitKit
 
-/// What the readiness card is showing, handed up so the synthesis line agrees with it.
+/// What Today's scores card is showing for Recovery, handed up so the synthesis line agrees with it.
 struct ReadinessReport: Equatable {
     var readiness: TodaySynthesis.Readiness
     /// Last night's asleep minutes, when a night that ended today is stored.
@@ -22,7 +17,7 @@ extension TodaySynthesis {
     /// Assemble the synthesis input from the Today tab's state.
     ///
     /// - `trends`: the shared two-week load (tiles are built from the same data).
-    /// - `readiness`: what the readiness card reported; nil until it has.
+    /// - `readiness`: what the scores card reported for Recovery; nil until it has.
     /// - `feverSuspected`: the Vitals Status card's own fever verdict; false until it has reported.
     ///   The only thing that lets this line pair skin temperature with resting HR as fever signs.
     /// - `lastSyncAt`: only used to tell "never had data" from "nothing in the last two weeks".
@@ -54,6 +49,28 @@ extension TodaySynthesis {
     }
 }
 
+/// Today's date above the scores card ("THURSDAY, NOVEMBER 26").
+struct TodayDateRow: View {
+    var date: Date = Date()
+
+    var body: some View {
+        Text(date.formatted(.dateTime.weekday(.wide).day().month(.wide)).uppercased())
+            .font(.caption.weight(.semibold)).tracking(1.2)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+            .accessibilityLabel("Today, \(date.formatted(.dateTime.weekday(.wide).day().month(.wide)))")
+    }
+}
+
+// MARK: - On-device brief
+
+// With Apple Intelligence on (iOS 26+), the scores card's fixed sentence is shown first and then
+// replaced by a brief written by the ON-DEVICE model from the same input (`TodaySynthesis.briefFacts`),
+// once the reply passes `TodaySynthesis.vetBrief`. Unavailable, slow, refused or rejected: the fixed
+// sentence stays. The last accepted brief is kept in UserDefaults with the prompt it answered, so
+// reopening the app shows it at once while the input is unchanged.
+
 /// The Today brief's words. Tests pin them.
 enum TodayBriefCopy {
     static let byline = "Written on this iPhone by Apple Intelligence"
@@ -79,15 +96,15 @@ struct TodayBrief: Equatable {
     let text: String
 }
 
-struct TodaySynthesisHeader: View {
+/// The scores card's sentence: the fixed `sentence`, or the vetted on-device brief for `briefFacts`.
+struct TodayBriefSentence: View {
     let sentence: String
-    /// The facts for the on-device brief; nil keeps the template (missing data, still loading).
+    /// The facts for the on-device brief; nil keeps the fixed sentence (missing data, still loading).
     var briefFacts: SleepRecap.Facts? = nil
-    var date: Date = Date()
 
     @State private var brief: TodayBrief? = TodayBriefCache.load()
 
-    /// The brief only while it answers the CURRENT facts: a new sync or score shows the template
+    /// The brief only while it answers the CURRENT facts: a new sync or score shows the fixed sentence
     /// until the brief for the new numbers is ready, never a stale one.
     private var currentBrief: String? {
         guard let brief, let briefFacts, brief.prompt == briefFacts.prompt, SleepRecapModel.isAvailable else { return nil }
@@ -96,33 +113,19 @@ struct TodaySynthesisHeader: View {
     private var shown: String { currentBrief ?? sentence }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(date.formatted(.dateTime.weekday(.wide).day().month(.wide)).uppercased())
-                .font(.caption.weight(.semibold)).tracking(1.2)
-                .foregroundStyle(.secondary)
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                KeylineGlyph(.sparkles, size: 18, relativeTo: .title3)
-                    .foregroundStyle(Theme.accent)
-                    .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 3 }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(shown)
-                        .font(.system(.title3, design: .rounded).weight(.medium))
-                        .foregroundStyle(.primary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .contentTransition(.opacity)
-                    if currentBrief != nil {
-                        Text(TodayBriefCopy.byline)
-                            .font(.caption2).foregroundStyle(.tertiary)
-                            .transition(.opacity)
-                    }
-                }
-                .animation(.easeInOut(duration: 0.35), value: shown)
+        VStack(alignment: .leading, spacing: 4) {
+            Text(shown)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .contentTransition(.opacity)
+            if currentBrief != nil {
+                Text(TodayBriefCopy.byline)
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .transition(.opacity)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.top, 4)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Today, \(date.formatted(.dateTime.weekday(.wide).day().month(.wide))). \(shown)")
+        .animation(.easeInOut(duration: 0.35), value: shown)
         .task(id: briefFacts?.prompt) { await refreshBrief() }
     }
 

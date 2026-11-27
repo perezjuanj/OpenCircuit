@@ -33,6 +33,30 @@ enum DemoData {
     static let demoStrapTimeline = SyncDeviceID.timeline(for: .zeppOS(model: "Helio Strap"),
                                                          identityID: "00000000-0000-4000-8000-00000000DE70")
 
+    /// `-OCDemoTodayLayout hidden | all-hidden` (decision 94): Today drawn with a SYNTHETIC Edit Today
+    /// layout instead of the saved one, for this launch only (nothing is written). `hidden` hides
+    /// Calories, Daily Goals and the Steps and Skin temp tiles; `all-hidden` hides every card and tile
+    /// that can be hidden, leaving the date, the scores card, the connection card, History & Sleep and
+    /// the sources link.
+    static let todayLayoutKey = "OCDemoTodayLayout"
+    static var todayLayoutOverride: TodayLayout? {
+        guard isRequested, let raw = UserDefaults.standard.string(forKey: todayLayoutKey) else { return nil }
+        var layout = TodayLayout.standard
+        switch raw {
+        case "hidden":
+            layout.setShown(.calories, false)
+            layout.setShown(.goals, false)
+            layout.setShown(TodayTileID.steps, false)
+            layout.setShown(TodayTileID.skinTemp, false)
+        case "all-hidden":
+            for s in DashboardSection.allCases { layout.setShown(s, false) }
+            for t in TodayTileID.allCases { layout.setShown(t, false) }
+        default:
+            return nil
+        }
+        return layout
+    }
+
     static func demoStrapSwitch(now: Date, calendar: Calendar = .current) -> Date {
         calendar.startOfDay(for: now).addingTimeInterval(10.5 * 3600)
     }
@@ -143,6 +167,20 @@ enum DemoData {
                 d = d.addingTimeInterval(900); j += 1
             }
             context.insert(StoredDaily(day: wakeDay, steps: daySteps, updatedAt: dayEnd))
+            // Today's brisk morning walk, so the Strain dial has a real score (decision 93) rather than
+            // the 0.0 an all-easy day reads: about 9 on the 0–21 scale once it has ended. Six 5-minute
+            // readings, each covering its own span, on the 5-minute marks between the quarter-hour
+            // readings above: no reading starts within 5 minutes of another, so none forms a
+            // `RestingHR` sustained window and the walk can never become today's resting heart rate.
+            if n == 0 {
+                let walk: [(minute: Double, bpm: Double)] = [(5, 126), (10, 140), (20, 142), (25, 141), (35, 139), (40, 122)]
+                for (minute, bpm) in walk {
+                    let t = wakeDay.addingTimeInterval(8 * 3600 + minute * 60)
+                    guard t.addingTimeInterval(300) <= now else { break }
+                    context.insert(StoredSample(kindRaw: MetricKind.heartRate.rawValue, start: t,
+                                                end: t.addingTimeInterval(300), value: bpm))
+                }
+            }
         }
         try? context.save()
         DemoSleepNeed.applyIfRequested(context, now: now)
@@ -241,7 +279,8 @@ import SwiftData
 import SwiftUI
 
 /// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR |
-/// sources | sources-<topic> | helio-setup | helio-setup-full | zepp-signin`
+/// sources | sources-<topic> | helio-setup | helio-setup-full | zepp-signin | recovery | strain |
+/// today-scores-states | today-edit`
 /// presents that screen full-screen on launch, so a screenshot run can reach it without UI
 /// automation. `liveHR` renders the live-measure card's composition over a SYNTHETIC buffer — a
 /// simulator has no ring to measure.
@@ -253,7 +292,12 @@ struct DemoScreenModifier: ViewModifier {
         content
             .fullScreenCover(item: Binding(get: { screen.map(DemoScreenID.init) },
                                            set: { screen = $0?.id })) { id in
-                NavigationStack { destination(id.id) }
+                if id.id == "today-edit" {
+                    // The sheet brings its own NavigationStack.
+                    DemoEditToday()
+                } else {
+                    NavigationStack { destination(id.id) }
+                }
             }
             .task {
                 guard DemoData.isRequested, let s = UserDefaults.standard.string(forKey: "OCDemoScreen") else { return }
@@ -297,11 +341,15 @@ struct DemoScreenModifier: ViewModifier {
                     .scaleEffect(0.45, anchor: .topLeading)
             }
         } else if id == "zepp-signin" {
-            ZeppSignInSheet { _ in }
+            HelioKeySheet(onSaved: {}, onDone: {}, entry: .setupScreen)
         } else if id == "sleep-score" {
             DemoSleepScoreSheet()
         } else if id == "sleep-need" {
             DemoSleepNeedSheet()
+        } else if id == "recovery" || id == "strain" {
+            DemoTodayScoresDetail(showsStrain: id == "strain")
+        } else if id == "today-scores-states" {
+            DemoTodayScoresStates()
         } else {
             DemoLiveCard()
         }
@@ -309,6 +357,18 @@ struct DemoScreenModifier: ViewModifier {
 }
 
 private struct DemoScreenID: Identifiable { let id: String }
+
+/// `-OCDemoScreen today-edit` (decision 94): the Edit Today sheet over a SYNTHETIC layout: the headache
+/// log on but its card hidden, women's health off (so no Cycle row), a ring install (no strap tiles).
+/// Done and Cancel only close it; nothing is saved.
+private struct DemoEditToday: View {
+    var body: some View {
+        var layout = TodayLayout.standard
+        layout.setShown(.headache, false)
+        return EditTodaySheet(layout: layout, gates: TodayFeatureGates(womensHealth: false, headache: true),
+                              tiles: .ringOnly, onFinish: { _ in })
+    }
+}
 
 /// `-OCDemoScreen sleep-score`: the Sleep Score breakdown sheet over the seeded demo night.
 private struct DemoSleepScoreSheet: View {
@@ -372,6 +432,101 @@ private struct DemoLiveCard: View {
         }
         .background(Theme.pageBackground)
         .navigationTitle("Today")
+    }
+}
+
+/// `-OCDemoScreen recovery | strain` (decision 93): the Recovery or Strain detail over the seeded demo
+/// data, built from the same trends load and night row Today uses.
+private struct DemoTodayScoresDetail: View {
+    let showsStrain: Bool
+    @Environment(\.modelContext) private var modelContext
+    @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
+    @State private var trends = TrendsData()
+    @State private var loaded = false
+
+    var body: some View {
+        Group {
+            if showsStrain {
+                StrainDetailView(reading: loaded ? trends.todayStrain : nil, onHeartRate: {})
+            } else {
+                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: loaded) { scores in
+                    RecoveryDetailView(scores: scores,
+                                       tiles: TodayTiles.build(points: trends.points, restingHR: trends.restingHR,
+                                                               tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
+                                                               scope: .from(trends)))
+                }
+            }
+        }
+        .task {
+            trends = await TrendsData.loadAsync(container: modelContext.container, tempUnitRaw: tempUnitRaw)
+            loaded = true
+        }
+    }
+}
+
+/// `-OCDemoScreen today-scores-states` (decision 93): the scores card in its honest states, from
+/// SYNTHETIC inputs only: (A) morning, last night not synced; (B) a night stored without a score;
+/// (C) sleep alone with a hard day; then a fully scored day. Scaled to fit one screenshot.
+private struct DemoTodayScoresStates: View {
+    var body: some View {
+        GeometryReader { geo in
+            // A scroll container, so the stack is never squeezed to the screen's height (the dials
+            // are flexible and would collapse); then the whole thing is scaled down to fit one shot.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(Self.states().enumerated()), id: \.offset) { _, state in
+                        Text(state.title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                        TodayScoresCard(scores: state.scores, sentence: state.sentence)
+                    }
+                }
+                .padding()
+            }
+            .frame(width: geo.size.width / Self.scale, height: geo.size.height / Self.scale)
+            .scaleEffect(Self.scale, anchor: .topLeading)
+        }
+        .background(Theme.pageBackground)
+    }
+
+    private static let scale: CGFloat = 0.62
+
+    private struct Sample {
+        let title: String
+        let scores: TodayScores
+        let sentence: String
+    }
+
+    private static func states(now: Date = Date()) -> [Sample] {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        func night(daysAgo: Int, score: Int, stress: Int, asleep: Int) -> TodayScores.Night {
+            let wake = today.addingTimeInterval(Double(-daysAgo) * 86_400 + 6.75 * 3600)
+            let bed = wake.addingTimeInterval(-Double(asleep + 40) * 60)
+            return .init(nightKey: cal.startOfDay(for: wake), inBedStart: bed, inBedEnd: wake,
+                         sleepScore: score, stressScore: stress, asleepMin: asleep)
+        }
+        func strain(_ value: Double?, minutes: Int) -> DailyStrain.Reading {
+            DailyStrain.Reading(strain: value, coveredSeconds: minutes * 60, latestSampleAt: now,
+                                maxHR: 185, restingHR: 54)
+        }
+        func sentence(_ s: TodayScores, hrv: BaselineTrend.Direction? = nil, rhr: BaselineTrend.Direction? = nil) -> String {
+            TodaySynthesis.sentence(.init(readiness: s.report.readiness, hrv: hrv, restingHR: rhr,
+                                          lastNightSleepMinutes: s.report.lastNightAsleepMin,
+                                          newestDataAt: now, now: now))
+        }
+        let a = TodayScores.build(night: night(daysAgo: 1, score: 81, stress: 40, asleep: 430),
+                                  strain: strain(1.2, minutes: 90), trendsLoaded: true, now: now)
+        let b = TodayScores.build(night: night(daysAgo: 0, score: 0, stress: 0, asleep: 401),
+                                  strain: strain(nil, minutes: 4), trendsLoaded: true, now: now)
+        let c = TodayScores.build(night: night(daysAgo: 0, score: 52, stress: 0, asleep: 308),
+                                  strain: strain(15.2, minutes: 400), trendsLoaded: true, now: now)
+        let d = TodayScores.build(night: night(daysAgo: 0, score: 85, stress: 33, asleep: 437),
+                                  strain: strain(8.4, minutes: 300), trendsLoaded: true, now: now)
+        return [
+            Sample(title: "A · Morning, last night not synced yet", scores: a, sentence: sentence(a)),
+            Sample(title: "B · Night stored without a score", scores: b, sentence: sentence(b)),
+            Sample(title: "C · Sleep alone and a hard day", scores: c, sentence: sentence(c)),
+            Sample(title: "Scored", scores: d, sentence: sentence(d, hrv: .within, rhr: .within)),
+        ]
     }
 }
 #endif

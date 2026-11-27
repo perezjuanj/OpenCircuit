@@ -9,8 +9,8 @@
 // machinery, the Today sentence, or the 14/30-day detail. Tapping it opens today's stress chart.
 // The strap's PAI tile (decision 49) sits next to it on the same terms, with even less: no band and no
 // sparkline, because PAI is one rolling number a day. Tapping it explains PAI; there is nothing to chart.
-// The Strain tile (#216) is on every install, ring or strap: today's running strain with a gauge, and
-// likewise outside the "vs your usual" machinery (see `StrainTile.swift`). Tapping it explains strain.
+// Today's strain is not a tile any more: it is the Strain dial on Today's scores card (decision 93).
+// Which tiles show, and in what order, is the person's Edit Today layout (decision 94): `order`.
 //
 // The delta arrow is deliberately colour-neutral (secondary): "above usual" is good news for HRV and
 // bad news for resting HR, and the tile has no business deciding which on the user's behalf — the
@@ -23,6 +23,9 @@ import OpenCircuitKit
 
 struct MetricTilesSection: View {
     let tiles: [TodayTile]
+    /// The tiles to draw, in order (`TodayLayout.shownTiles`). The strap's Stress and PAI still draw
+    /// only while their reading is fresh.
+    var order: [TodayTileID] = TodayTileID.allCases
     /// The shared trends load hasn't landed yet: draw placeholders, not "No data yet".
     var isLoading = false
     var onSelect: (TodayTile.Metric) -> Void = { _ in }
@@ -36,12 +39,6 @@ struct MetricTilesSection: View {
     var strapPAI: StrapPAIReading?
     /// Explains what PAI is (a sheet: there is nothing to chart).
     var onPAI: () -> Void = {}
-    /// Today's strain so far (#216), from the trends load; nil before it lands. Always a tile: with no
-    /// heart rate it says so.
-    var strain: DailyStrain.Reading?
-
-    /// The Strain tile's explanation sheet. Local, since nothing outside the grid opens it.
-    @State private var showStrainInfo = false
 
     /// The PAI reading the grid shows a tile for at `now`, or nil for no tile. Freshness is checked
     /// here, at render, so a reading that ages past 48 h while the app stays open drops the tile. A
@@ -65,25 +62,8 @@ struct MetricTilesSection: View {
             let columns = Array(repeating: GridItem(.flexible(), spacing: 12, alignment: .top),
                                 count: dynamicTypeSize.isAccessibilitySize ? 1 : 2)
             LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
-                ForEach(tiles) { tile in
-                    Button { onSelect(tile.metric) } label: { MetricTileView(tile: tile) }
-                        .buttonStyle(.plain)
-                        .disabled(isLoading)
-                }
-                Button { showStrainInfo = true } label: { StrainTileView(reading: strain) }
-                    .buttonStyle(.plain)
-                    .disabled(isLoading)
-                // Freshness is checked at render, not only at load, so a reading that ages past 24 h
-                // while the app stays open drops the tile.
-                if let strapStress, strapStress.isFresh(now: Date()) {
-                    Button(action: onStress) { StrapStressTileView(tile: strapStress) }
-                        .buttonStyle(.plain)
-                        .disabled(isLoading)
-                }
-                if let strapPAI = Self.paiTile(strapPAI, now: Date()) {
-                    Button(action: onPAI) { StrapPAITileView(reading: strapPAI) }
-                        .buttonStyle(.plain)
-                        .disabled(isLoading)
+                ForEach(order) { id in
+                    tileButton(id)
                 }
             }
             .redacted(reason: isLoading ? .placeholder : [])
@@ -92,7 +72,32 @@ struct MetricTilesSection: View {
                     .buttonStyle(.plain)
             }
         }
-        .sheet(isPresented: $showStrainInfo) { StrainInfoSheet(reading: strain) }
+    }
+
+    @ViewBuilder
+    private func tileButton(_ id: TodayTileID) -> some View {
+        switch id {
+        case .stress:
+            // Freshness is checked at render, not only at load, so a reading that ages past 24 h
+            // while the app stays open drops the tile.
+            if let strapStress, strapStress.isFresh(now: Date()) {
+                Button(action: onStress) { StrapStressTileView(tile: strapStress) }
+                    .buttonStyle(.plain)
+                    .disabled(isLoading)
+            }
+        case .pai:
+            if let strapPAI = Self.paiTile(strapPAI, now: Date()) {
+                Button(action: onPAI) { StrapPAITileView(reading: strapPAI) }
+                    .buttonStyle(.plain)
+                    .disabled(isLoading)
+            }
+        default:
+            if let tile = tiles.first(where: { TodayTileID($0.metric) == id }) {
+                Button { onSelect(tile.metric) } label: { MetricTileView(tile: tile) }
+                    .buttonStyle(.plain)
+                    .disabled(isLoading)
+            }
+        }
     }
 }
 

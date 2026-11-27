@@ -543,6 +543,9 @@ final class StoreRefreshSignalTests: XCTestCase {
 
     // MARK: Day change (#297)
 
+    /// Today's cards follow the calendar day: Goals and Calories read today's activity again for the
+    /// new day, and the scores card (decision 93, which replaced Readiness and reads no activity) is
+    /// rebuilt for the new day, so "last night" is judged again.
     func testADayChangeReKeysTheTodayReads() throws {
         let store = try makeStore()
         let container = store.context.container
@@ -550,20 +553,29 @@ final class StoreRefreshSignalTests: XCTestCase {
         let day4 = cal.date(from: DateComponents(year: 2026, month: 5, day: 4))!
         let day5 = cal.date(byAdding: .day, value: 1, to: day4)!
         var now = day4.addingTimeInterval(23 * 3_600 + 55 * 60)
-        let clock = DayClock(now: { now }, calendar: { cal })
+        final class Builds { var days: [Date] = [] }
+        let scoresBuilds = Builds()
+        let clock = DayClock(now: { now }, calendar: { cal },
+                             onBuild: { name, day in if name == "todayScores" { scoresBuilds.days.append(day) } })
         _ = DashboardReads.fetchThreadLog.takeTodayActivityDays(of: container)
         let (window, _) = host(
-            VStack { GoalsCardView(); CaloriesCardView(); WellnessBalanceCardView() }
+            VStack {
+                GoalsCardView(); CaloriesCardView()
+                TodayScoresSource(strain: nil, trendsLoaded: true) { TodayScoresCard(scores: $0, sentence: "") }
+            }
                 .environment(\.dayClock, clock)
                 .environment(\.storeRefreshSignal, StoreRefreshSignal(interval: 60))
                 .modelContainer(container))
         XCTAssertEqual(Set(DashboardReads.fetchThreadLog.takeTodayActivityDays(of: container)), [day4], "built for the injected day")
+        XCTAssertEqual(scoresBuilds.days.last, DayRollover.dayKey(at: now, calendar: cal), "the scores card is built for the injected day")
         now = day5.addingTimeInterval(120)
         NotificationCenter.default.post(name: .currentDayMayHaveChanged, object: nil)
         pump(1.0)
         let after = DashboardReads.fetchThreadLog.takeTodayActivityDays(of: container)
-        XCTAssertGreaterThanOrEqual(after.count, 3, "each card read again: \(after)")
+        XCTAssertGreaterThanOrEqual(after.count, 2, "Goals and Calories read again: \(after)")
         XCTAssertEqual(Set(after), [day5], "for the new day")
+        XCTAssertEqual(scoresBuilds.days.last, DayRollover.dayKey(at: now, calendar: cal), "the scores card is rebuilt for the new day")
+        XCTAssertEqual(scoresBuilds.days.count, 2, "\(scoresBuilds.days)")
         window.rootViewController = nil
         pump(0.3)
     }

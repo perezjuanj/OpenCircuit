@@ -10,7 +10,7 @@ The Today dashboard's and onboarding's icons (`ios/OpenCircuit/Assets.xcassets/K
 ([github.com/keyline-icons/keyline-icons](https://github.com/keyline-icons/keyline-icons), taken at
 commit `2dc0f0c`): `activity`, `arrow-down-right`, `arrow-up-right`, `bluetooth`, `calendar`, `check`,
 `chevron-left`, `chevron-right`, `circle`, `circle-alert`, `circle-check`, `droplet`, `heart`, `info`, `minus`,
-`route`, `sparkles`, `thermometer`, `wind`.
+`lock` (added for the Edit Today sheet, #394), `route`, `sparkles`, `thermometer`, `wind`.
 
 ```
 MIT License

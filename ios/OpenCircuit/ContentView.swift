@@ -91,7 +91,14 @@ struct ContentView: View {
     /// as a comma-joined list of `DashboardSection.rawValue`; unknown/duplicate entries are ignored
     /// and any newly-added sections are appended in canonical order, so a saved order survives app
     /// updates. See `sectionOrder` / `moveSection`.
-    @AppStorage("dashboard.sectionOrder") private var sectionOrderRaw = ""
+    @AppStorage(TodayLayout.Keys.sectionOrder) private var sectionOrderRaw = ""
+    /// The rest of the Edit Today layout (#394, decision 94): hidden cards, tile order, hidden tiles.
+    /// Display-only: nothing but Today's rendering reads them. See `todayLayout`.
+    @AppStorage(TodayLayout.Keys.hiddenSections) private var hiddenSectionsRaw = ""
+    @AppStorage(TodayLayout.Keys.tileOrder) private var tileOrderRaw = ""
+    @AppStorage(TodayLayout.Keys.hiddenTiles) private var hiddenTilesRaw = ""
+    /// The Edit Today sheet.
+    @State private var showEditToday = false
     // Release builds hide the ring RE surfaces until unlocked from the Profile footer (DeveloperTools).
     @AppStorage(DeveloperTools.unlockedKey) private var developerToolsUnlocked = false
     /// First-run onboarding gate (#103): false until the user finishes/skips the welcome flow, then
@@ -131,8 +138,9 @@ struct ContentView: View {
     /// Low / high of every reading in the current on-demand measurement (the buffer is trimmed to
     /// the chart's window, this isn't). Reset with the buffer.
     @State private var liveRange = LiveSessionRange()
-    /// What the readiness card last showed, so the Today synthesis line (#216) agrees with it.
-    @State private var readinessReport: ReadinessReport?
+    /// What Today's scores card last showed (decision 93), so the Recovery detail shows the card's
+    /// own number rather than computing another one.
+    @State private var todayScores: TodayScores?
     /// Whether the Vitals Status card's last report flagged possible fever signs, so the synthesis
     /// line only pairs skin temperature with resting HR when that card does.
     @State private var vitalsFeverSuspected = false
@@ -520,6 +528,9 @@ struct ContentView: View {
                 quickLogCorrectionSheet(onset: logged.onset)
             }
             // Battery: TTE + charging-complete notification (#86).
+            // Edit Today (decision 94): a gated card's hidden flag lives only while its feature is on.
+            .onAppear { dropHiddenFlagsForFeaturesOff() }
+            .onChange(of: todayGates) { _, _ in dropHiddenFlagsForFeaturesOff() }
             .onChange(of: session?.batteryPercent) { _, pct in
                 guard let pct else { return }
                 let charging = session?.inferredCharging ?? false
@@ -535,8 +546,9 @@ struct ContentView: View {
 
     // MARK: - Tabs (five-tab bottom navigation)
 
-    /// TODAY — the glanceable "now": connection, the live-measure hero, then the reorderable
-    /// readiness / vitals / calories / goals / cycle / sync cards. Middle sections stay
+    /// TODAY — the glanceable "now": the date, the pinned scores card (Sleep · Recovery · Strain),
+    /// connection, the live-measure strip, then the reorderable tiles / vitals / calories / goals /
+    /// cycle / sync cards. Middle sections stay
     /// long-press-draggable (the reorder QoL), so this tab keeps a `List`.
     private var todayTab: some View {
         Group {
@@ -547,6 +559,7 @@ struct ContentView: View {
                 NavigationSplitView(columnVisibility: .constant(.doubleColumn)) {
                     todayList
                         .navigationTitle("Today")
+                        .toolbar { editTodayButton }
                         .navigationSplitViewColumnWidth(min: 340, ideal: 390, max: 440)
                 } detail: {
                     NavigationStack {
@@ -563,12 +576,25 @@ struct ContentView: View {
                 NavigationStack(path: $path) {
                     todayList
                         .navigationTitle("Today")
+                        .toolbar { editTodayButton }
                         .navigationDestination(for: Route.self) { route in destination(for: route) }
                 }
             }
         }
         // What PAI is, from the strap's PAI tile (decision 49): a sheet, as there is nothing to chart.
         .sheet(isPresented: $showPAIInfo) { StrapPAIInfoSheet() }
+        .sheet(isPresented: $showEditToday) {
+            EditTodaySheet(layout: todayLayout, gates: todayGates, tiles: todayTileAvailability,
+                           onFinish: saveTodayLayout)
+        }
+    }
+
+    /// Today's trailing Edit button (decision 94): opens the Edit Today sheet.
+    private var editTodayButton: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button("Edit") { showEditToday = true }
+                .accessibilityHint("Show, hide and reorder Today's cards and tiles")
+        }
     }
 
     /// The Today list itself (the reorderable cards), shared by the compact stack and the wide
@@ -576,9 +602,12 @@ struct ContentView: View {
     private var todayList: some View {
         List {
             Group {
-                // One plain-language sentence about today (#216), above everything else.
-                TodaySynthesisHeader(sentence: synthesisSentence,
-                                     briefFacts: synthesisInput.flatMap(TodaySynthesis.briefFacts))
+                // The date, then Sleep · Recovery · Strain with the day's sentence (decision 93), first.
+                TodayDateRow()
+                    // A hidden Vitals Status card still reports its fever verdict to the sentence
+                    // (decision 94c): the card runs, unseen, behind the date row.
+                    .background { HiddenVitalsReport(layout: todayLayout) { vitalsStatusCard } }
+                todayScoresCard
                 if ringActive {
                     connectionCard
                 } else {
@@ -606,6 +635,20 @@ struct ContentView: View {
         .background(Theme.pageBackground)
         // Pull-to-refresh mirrors the "Sync from ring" button (same guards). See `forceSync`.
         .refreshable { await forceSync() }
+    }
+
+    /// Today's scores card (decision 93): one model from the newest night and today's strain. The
+    /// sentence is built from that same model's Recovery, and the model is kept for the Recovery detail.
+    private var todayScoresCard: some View {
+        TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded) { scores in
+            TodayScoresCard(scores: scores, sentence: synthesisSentence(scores.report),
+                            briefFacts: synthesisInput(scores.report).flatMap(TodaySynthesis.briefFacts),
+                            onSleep: { selectedTab = .sleep },
+                            onRecovery: { path.append(.recovery) },
+                            onStrain: { path.append(.strain) })
+                .onAppear { todayScores = scores }
+                .onChange(of: scores) { _, new in todayScores = new }
+        }
     }
 
     /// The liveline live-vitals hero — shown ONLY during an on-demand HR/SpO₂ measurement, when the
@@ -990,37 +1033,89 @@ struct ContentView: View {
 
     /// The full canonical-or-saved order of reorderable sections. The decode (which drops ids this
     /// build no longer has, `vitals` among them) lives in `DashboardSectionOrder` so a test can pin it.
-    private var sectionOrder: [DashboardSection] { DashboardSectionOrder.decode(sectionOrderRaw) }
+    private var sectionOrder: [DashboardSection] { todayLayout.sections }
+
+    /// The Edit Today layout Today draws (decision 94): the saved one, or a demo override.
+    private var todayLayout: TodayLayout {
+#if DEBUG && targetEnvironment(simulator)
+        if let demo = DemoData.todayLayoutOverride { return demo }
+#endif
+        return savedTodayLayout
+    }
+
+    /// The saved Edit Today layout, decoded from its four keys by `TodayLayout`.
+    private var savedTodayLayout: TodayLayout {
+        TodayLayout(stored: .init(sectionOrder: sectionOrderRaw, hiddenSections: hiddenSectionsRaw,
+                                  tileOrder: tileOrderRaw, hiddenTiles: hiddenTilesRaw))
+    }
+
+    /// The opt-in features that decide whether the Cycle and Headache cards exist at all.
+    private var todayGates: TodayFeatureGates {
+        TodayFeatureGates(womensHealth: womensHealthEnabled, headache: headacheEnabled)
+    }
+
+    /// Which strap tiles would show right now, so the Edit sheet lists only those.
+    private var todayTileAvailability: TodayTileAvailability {
+        let now = Date()
+        return TodayTileAvailability(stress: strapStress?.isFresh(now: now) == true,
+                                     pai: MetricTilesSection.paiTile(strapPAI, now: now) != nil)
+    }
+
+    /// Done in the Edit sheet: write the keys back, only when something changed (Cancel hands back the
+    /// layout the sheet opened on, which writes nothing).
+    private func saveTodayLayout(_ layout: TodayLayout) {
+        writeTodayLayout(layout.droppingHiddenFlags(gatedOffBy: todayGates))
+    }
+
+    /// A card hidden while its feature was on must come back shown when the feature is turned on again:
+    /// its hidden flag is dropped whenever the feature is seen off (launch and every switch change).
+    private func dropHiddenFlagsForFeaturesOff() {
+        writeTodayLayout(savedTodayLayout.droppingHiddenFlags(gatedOffBy: todayGates))
+    }
+
+    private func writeTodayLayout(_ layout: TodayLayout) {
+#if DEBUG && targetEnvironment(simulator)
+        // A demo layout is for this launch only: never written.
+        if DemoData.todayLayoutOverride != nil { return }
+#endif
+        guard layout != savedTodayLayout else { return }
+        let stored = layout.stored
+        sectionOrderRaw = stored.sectionOrder
+        hiddenSectionsRaw = stored.hiddenSections
+        tileOrderRaw = stored.tileOrder
+        hiddenTilesRaw = stored.hiddenTiles
+    }
 
     /// The Today metric tiles (#216), built from the shared trends load.
     private var todayTiles: [TodayTile] {
-        TodayTiles.build(points: trends.points, restingHR: trends.restingHR,
-                         tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius, scope: .from(trends))
+        TodayTiles.build(trends: trends, tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius)
     }
 
-    /// The Today synthesis input (#216); nil before the first trends load.
-    private var synthesisInput: TodaySynthesis.Input? {
-        guard trendsHaveLoaded else { return nil }
-        return TodaySynthesis.input(trends: trends, tiles: todayTiles, readiness: readinessReport,
-                                    feverSuspected: vitalsFeverSuspected, lastSyncAt: lastSyncAt)
-    }
-
-    /// The Today synthesis sentence (#216) — deterministic rules in `TodaySynthesis`. Shown first and
-    /// whenever the on-device brief isn't ready (`TodaySynthesisHeader`).
-    private var synthesisSentence: String {
+    /// The Today synthesis sentence (#216) — deterministic rules in `TodaySynthesis`, about the
+    /// Recovery the scores card shows (`report`).
+    private func synthesisSentence(_ report: ReadinessReport) -> String {
         // Before the first trends load there is nothing to judge — and "no ring data yet" would be
         // a false claim to a wearer who has plenty.
-        guard let input = synthesisInput else { return "Gathering today's numbers…" }
+        guard let input = synthesisInput(report) else { return "Gathering today's numbers…" }
         return TodaySynthesis.sentence(input)
     }
 
-    /// The sections actually rendered right now — `sectionOrder` minus any feature-gated card that's
-    /// switched off (the women's-health cycle calendar and the headache log, both opt-in).
-    private var visibleSections: [DashboardSection] {
-        sectionOrder.filter {
-            ($0 != .cycle || womensHealthEnabled) && ($0 != .headache || headacheEnabled)
-        }
+    /// The synthesis input for `report`; nil before the first trends load. Shared by the fixed
+    /// sentence and the on-device brief (`TodayBriefSentence`), so both speak about the same numbers.
+    private func synthesisInput(_ report: ReadinessReport) -> TodaySynthesis.Input? {
+        guard trendsHaveLoaded else { return nil }
+        // Built from the whole trends load, whatever the Edit Today layout hides (decision 94c).
+        return todayLayout.sentenceInput(trends: trends,
+                                         tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
+                                         readiness: report,
+                                         feverSuspected: vitalsFeverSuspected,
+                                         lastSyncAt: lastSyncAt)
     }
+
+    /// The sections actually rendered right now — `sectionOrder` minus any feature-gated card that's
+    /// switched off (the women's-health cycle calendar and the headache log, both opt-in) and any card
+    /// hidden in Edit Today.
+    private var visibleSections: [DashboardSection] { todayLayout.shownSections(gates: todayGates) }
 
     /// Apply a long-press-drag reorder and persist the result. The merge rule is
     /// `DashboardSectionOrder.reordered`, so what is written back is pinned by a test.
@@ -1035,15 +1130,14 @@ struct ContentView: View {
     @ViewBuilder
     private func sectionView(_ section: DashboardSection) -> some View {
         switch section {
-        case .readiness:    card { WellnessBalanceCardView(onReport: { readinessReport = $0 }) }
-        case .metrics:      MetricTilesSection(tiles: todayTiles, isLoading: !trendsHaveLoaded,
+        case .metrics:      MetricTilesSection(tiles: todayTiles, order: todayLayout.shownTiles,
+                                               isLoading: !trendsHaveLoaded,
                                                onSelect: { path.append(.metric($0)) },
                                                onTimeline: { path.append(.timeline) },
                                                strapStress: strapStress,
                                                onStress: { path.append(.strapStress) },
                                                strapPAI: strapPAI,
-                                               onPAI: { showPAIInfo = true },
-                                               strain: trends.todayStrain)
+                                               onPAI: { showPAIInfo = true })
         case .vitalsStatus: vitalsStatusCard
         case .calories:     caloriesCard
         case .goals:        card { GoalsCardView() }
@@ -1065,6 +1159,19 @@ struct ContentView: View {
                                              measure: measureSource)
         case .timeline:      DayDetailView(day: Date())
         case .dayMetric(let m): MetricDayView(metric: m, tempUnitRaw: tempUnitRaw)
+        case .recovery:
+            // The card's own model (I2). It is always set before the dial can be tapped; the fallback
+            // builds the same model from the same row rather than guessing an empty state.
+            if let todayScores {
+                RecoveryDetailView(scores: todayScores, tiles: todayTiles,
+                                   onMetric: { path.append(.metric($0)) })
+            } else {
+                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded) {
+                    RecoveryDetailView(scores: $0, tiles: todayTiles, onMetric: { path.append(.metric($0)) })
+                }
+            }
+        case .strain:
+            StrainDetailView(reading: trends.todayStrain, onHeartRate: { path.append(.metric(.restingHR)) })
         }
     }
 
@@ -2934,6 +3041,10 @@ enum Route: Hashable {
     case timeline
     /// One metric's day chart: the strap's stress (#239).
     case dayMetric(DayTimeline.Metric)
+    /// What went into today's Recovery, from the scores card (decision 93).
+    case recovery
+    /// Today's strain, from the scores card (decision 93).
+    case strain
 
     /// Where the strap's Stress tile and its card reading go: today's stress chart (#239, steer 3).
     static let strapStress = Route.dayMetric(.stress)

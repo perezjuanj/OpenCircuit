@@ -650,7 +650,8 @@ struct SleepCardView: View {
                     .font(.caption).foregroundStyle(.secondary).monospacedDigit()
             }
             Spacer()
-            if let score = latest?.sleepScore, score > 0 {
+            // The same row and the same rule as Today's Sleep dial (`LastNight.score`), so the two agree.
+            if let score = LastNight.score(latest?.sleepScore) {
                 if hasScoreBreakdown {
                     Button { showScoreBreakdown = true } label: { scoreBadge(score) }
                         .buttonStyle(.plain)

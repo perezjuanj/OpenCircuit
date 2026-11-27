@@ -110,7 +110,8 @@ final class SyncSaveMainThreadBenchmarkTests: XCTestCase {
     private func todayCards(_ container: ModelContainer, _ updates: Updates) -> some View {
         List {
             Group {
-                OCCard { WellnessBalanceCardView() }
+                // Today's scores card (decision 93), where the Readiness card used to be.
+                TodayScoresSource(strain: nil, trendsLoaded: true) { TodayScoresCard(scores: $0, sentence: "") }
                 VitalsStatusCardView(onReport: { _ in updates.vitals += 1 })
                 OCCard { CaloriesCardView() }
                 OCCard { GoalsCardView() }

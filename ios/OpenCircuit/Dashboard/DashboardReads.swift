@@ -28,7 +28,7 @@ struct SampleSnapshot: Equatable, Sendable {
     }
 }
 
-/// One per-snapshot step delta as the Goals, Readiness and Calories cards read it (decision 75a).
+/// One per-snapshot step delta as the Goals and Calories cards read it (decision 75a).
 struct StepSampleSnapshot: Equatable, Sendable {
     let start: Date
     let end: Date
@@ -152,8 +152,8 @@ enum DashboardReads {
         var restingHeartRate: [SampleSnapshot] = []
     }
 
-    /// Today's heart rate and the step deltas since yesterday's start: what the Goals, Readiness and
-    /// Calories cards price the day from.
+    /// Today's heart rate and the step deltas since yesterday's start: what the Goals and Calories
+    /// cards price the day from.
     struct TodayActivity: Equatable, Sendable {
         var heartRate: [SampleSnapshot]
         var steps: [StepSampleSnapshot]
