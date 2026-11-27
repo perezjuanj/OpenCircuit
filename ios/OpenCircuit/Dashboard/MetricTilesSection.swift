@@ -162,10 +162,12 @@ struct MetricTileView: View {
                     KeylineGlyph(direction.icon, size: 11, relativeTo: .caption2)
                         .foregroundStyle(.secondary)
                 }
+                // Two lines when it names another day ("Yesterday 8,337 · −625 vs usual", #399).
                 Text(tile.deltaText ?? " ")
                     .font(.caption2.weight(.medium)).monospacedDigit()
                     .foregroundStyle(.secondary)
-                    .lineLimit(1).minimumScaleFactor(0.8)
+                    .lineLimit(2).minimumScaleFactor(0.8)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             MetricTrendChart(tile: tile, compact: true)
                 .frame(height: 34)
@@ -173,7 +175,8 @@ struct MetricTileView: View {
                 .font(.caption2).foregroundStyle(.secondary)
                 .lineLimit(2).fixedSize(horizontal: false, vertical: true)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        // Fills the grid row, so a neighbour of a two-line Steps tile stays the same height.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .ocCardSurface(padding: 12)
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
