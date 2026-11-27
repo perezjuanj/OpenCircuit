@@ -487,6 +487,8 @@ struct ContentView: View {
             .onOpenURL { url in
                 if WorkoutQuickLink.isActiveSession(url) {
                     handleActiveWorkoutLink()
+                } else if let route = ScoresQuickLink.parse(url) {
+                    handleScoresLink(route)
                 } else {
                     handleQuickLogLink(url)
                 }
@@ -645,8 +647,8 @@ struct ContentView: View {
                             onSleep: { selectedTab = .sleep },
                             onRecovery: { path.append(.recovery) },
                             onStrain: { path.append(.strain) })
-                .onAppear { todayScores = scores }
-                .onChange(of: scores) { _, new in todayScores = new }
+                .onAppear { todayScores = scores; ScoresWidgetPublisher.publish(scores) }
+                .onChange(of: scores) { _, new in todayScores = new; ScoresWidgetPublisher.publish(new) }
         }
     }
 
@@ -1164,6 +1166,8 @@ struct ContentView: View {
             }
         case .strain:
             StrainDetailView(reading: trends.todayStrain, onHeartRate: { path.append(.metric(.restingHR)) })
+        case .sources:
+            HealthSourcesView()
         }
     }
 
@@ -1447,6 +1451,17 @@ struct ContentView: View {
     /// hours into the existing entry rather than creating a second row for one headache. It also
     /// flips `HeadacheDefaults.enabled` on once the row is stored, so the log the user just wrote to
     /// is actually reachable in the UI.
+    /// A tap on a Today scores widget (#398): the dial's own screen, as the card's dial opens it.
+    private func handleScoresLink(_ route: ScoresQuickLink.Route) {
+        switch ScoresQuickLink.destination(route) {
+        case .sleepTab:
+            selectedTab = .sleep
+        case let .today(stack):
+            selectedTab = .today
+            path = stack
+        }
+    }
+
     @MainActor
     private func handleQuickLogLink(_ url: URL) {
         guard let when = HeadacheQuickLink.parse(url) else { return }
@@ -3037,6 +3052,8 @@ enum Route: Hashable {
     case recovery
     /// Today's strain, from the scores card (decision 93).
     case strain
+    /// How the scores are worked out, from the scores widget's disclaimer (#398).
+    case sources
 
     /// Where the strap's Stress tile and its card reading go: today's stress chart (#239, steer 3).
     static let strapStress = Route.dayMetric(.stress)
