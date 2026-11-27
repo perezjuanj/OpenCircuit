@@ -312,7 +312,7 @@ struct DemoScreenModifier: ViewModifier {
                     .scaleEffect(0.45, anchor: .topLeading)
             }
         } else if id == "zepp-signin" {
-            ZeppSignInSheet { _ in }
+            HelioKeySheet(onSaved: {}, onDone: {}, entry: .setupScreen)
         } else if id == "sleep-score" {
             DemoSleepScoreSheet()
         } else if id == "sleep-need" {
