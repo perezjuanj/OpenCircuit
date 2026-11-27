@@ -62,3 +62,89 @@ struct TodayDateRow: View {
             .accessibilityLabel("Today, \(date.formatted(.dateTime.weekday(.wide).day().month(.wide)))")
     }
 }
+
+// MARK: - On-device brief
+
+// With Apple Intelligence on (iOS 26+), the scores card's fixed sentence is shown first and then
+// replaced by a brief written by the ON-DEVICE model from the same input (`TodaySynthesis.briefFacts`),
+// once the reply passes `TodaySynthesis.vetBrief`. Unavailable, slow, refused or rejected: the fixed
+// sentence stays. The last accepted brief is kept in UserDefaults with the prompt it answered, so
+// reopening the app shows it at once while the input is unchanged.
+
+/// The Today brief's words. Tests pin them.
+enum TodayBriefCopy {
+    static let byline = "Written on this iPhone by Apple Intelligence"
+}
+
+/// The last accepted brief and the prompt it answered (one entry: only the current day matters).
+enum TodayBriefCache {
+    static let key = "todayBrief.cache.v1"
+
+    static func load(_ defaults: UserDefaults = .standard) -> TodayBrief? {
+        guard let d = defaults.dictionary(forKey: key) as? [String: String],
+              let prompt = d["prompt"], let text = d["text"] else { return nil }
+        return TodayBrief(prompt: prompt, text: text)
+    }
+
+    static func save(_ brief: TodayBrief, _ defaults: UserDefaults = .standard) {
+        defaults.set(["prompt": brief.prompt, "text": brief.text], forKey: key)
+    }
+}
+
+struct TodayBrief: Equatable {
+    let prompt: String
+    let text: String
+}
+
+/// The scores card's sentence: the fixed `sentence`, or the vetted on-device brief for `briefFacts`.
+struct TodayBriefSentence: View {
+    let sentence: String
+    /// The facts for the on-device brief; nil keeps the fixed sentence (missing data, still loading).
+    var briefFacts: SleepRecap.Facts? = nil
+
+    @State private var brief: TodayBrief? = TodayBriefCache.load()
+
+    /// The brief only while it answers the CURRENT facts: a new sync or score shows the fixed sentence
+    /// until the brief for the new numbers is ready, never a stale one.
+    private var currentBrief: String? {
+        guard let brief, let briefFacts, brief.prompt == briefFacts.prompt, SleepRecapModel.isAvailable else { return nil }
+        return brief.text
+    }
+    private var shown: String { currentBrief ?? sentence }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(shown)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .contentTransition(.opacity)
+            if currentBrief != nil {
+                Text(TodayBriefCopy.byline)
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.35), value: shown)
+        .task(id: briefFacts?.prompt) { await refreshBrief() }
+    }
+
+    /// Writes the brief for the current facts, off the render path. Waits a moment first: readiness,
+    /// tiles and the fever verdict report one after another on launch, and each changes the facts.
+    private func refreshBrief() async {
+        guard let facts = briefFacts, SleepRecapModel.isAvailable else { return }
+        if brief?.prompt == facts.prompt { return }
+        if let cached = TodayBriefCache.load(), cached.prompt == facts.prompt { brief = cached; return }
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        guard !Task.isCancelled else { return }
+        let text = await SleepRecapModel.write(prompt: facts.prompt, instructions: TodaySynthesis.briefInstructions,
+                                               maxTokens: 100) {
+            if case .success(let t) = TodaySynthesis.vetBrief($0, facts: facts) { return t }
+            return nil
+        }
+        guard let text, !Task.isCancelled else { return }
+        let new = TodayBrief(prompt: facts.prompt, text: text)
+        brief = new
+        TodayBriefCache.save(new)
+    }
+}
