@@ -155,7 +155,9 @@ struct ScoresWidgetRing: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(lineWidth * 1.3)
+            // With the label inside, keep the text within the square the circle inscribes (side
+            // ≈ 0.71 × the diameter), or the label's ends run into the ring.
+            .padding(showsLabelInside ? lineWidth * 2.4 : lineWidth * 1.3)
         }
         .padding(lineWidth / 2)
         .opacity(dimmed ? 0.55 : 1)
@@ -250,6 +252,10 @@ struct ScoresWidgetMediumView: View {
             }
             .accessibilityHint("Opens how these numbers are worked out")
         }
+        // A Link draws its label in the accent colour; the dials keep the card's own colours instead
+        // (blue labels and dashes were hard to read on the dark widget background).
+        .foregroundStyle(.primary)
+        .tint(.primary)
         .widgetURL(ScoresQuickLink.url(.today))
     }
 }
