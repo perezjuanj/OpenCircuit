@@ -87,7 +87,35 @@ stores and writes what it measured for time it owned:
     mid-night awakening never splits a night (decision 71b, #278); the joined night is no longer
     than 20 h. (Stitching before that check let a doze from before a ring → strap switch
     drag the strap's night into ring time, so neither device kept it: review-224e S-1, fixed in
-    #225.) Anything else gets a log line and never takes a night key; it may be a nap (below);
+    #225.) Anything else gets a log line and never takes a night key; it may be a nap (below),
+    except a late main sleep (next item);
+  - a late main sleep is that day's night (decision 97, #408): a strap sleep that starts in the night
+    but ends late, a schedule shifted to about 05:00–15:00, or a night stitched to a lie-in that ends
+    after noon. It is no overnight sleep (the gates above), lasts 3 h to 20 h, starts from 21:00 the
+    evening before its night key's day up to 08:00 on it, and ends before 18:00 on it
+    (`HelioSleepSelection.isLateMainSleep`, judged on the stitched window without the lead-in, in the
+    recorded zone, wall-clock hours on a daylight-saving day; 3 h, 08:00 and 18:00 are OpenCircuit's
+    choices). Its key is the day it ends on, as for any night. It is offered as a night through every
+    step an overnight sleep goes through (manual edit, ownership on the stitched window, 28f/58b,
+    awake fill, lead-in, the store) only when no overnight sleep of the same sync holds its key apart
+    from it, and every stored night on that key (either device, edited ones included) overlaps it.
+    Otherwise it is judged as a nap like any sleep that is no night: a 07:00–11:30 sleep after a stored
+    00:00–02:00 night is a nap, and never replaces that night (the completeness merge would keep the
+    fuller of two disjoint rows that both end before noon). One the store keeps out of its key
+    (another night's, the other device's, the key's own night) is a nap candidate too; any other
+    outcome leaves it a night. The joins are unchanged: only overnight sleeps of one key join
+    whatever the gap (71b), so a late main sleep joins a night only by the 60-min rule. Health has no
+    new path: the settle margin, the newest-night hold, the backstop and the 58b rewrite apply as to
+    any strap night. A sync while the sleep goes on stores the record as it is then (an overnight
+    sleep at that moment), and the final record, then a late main sleep that overlaps that row,
+    replaces it through the merge and, if it was written, the 58b rewrite. Known limits, not fixed: a
+    day's main sleep shorter than 3 h with no night is stored nowhere; a sleep the strap leaves only in
+    its activity minutes with no `0x48` record is no night (decision 76); a sleep starting at or after
+    08:00 is a nap (a long one at 3 h or more), and one ending at or after 18:00 is stored nowhere, as
+    before; an overnight record of the same key that arrives AFTER a stored late main sleep is left to
+    the store's merge rules, unchanged. The strap re-delivers about 24 h of sleep, so a fixed build
+    recovers at most the latest such night. The sync's `sleep round:` line counts late main sleeps
+    offered as nights, those kept out of their key, and sleeps that were neither shape;
   - a sleep more than 60 min from the rest of its night that the overnight join doesn't reach (one
     that would make the joined night longer than 20 h) is not stitched, and its night key already
     holds the longer part. A `helio-link` breadcrumb notes that it happened and whether it was
@@ -174,7 +202,8 @@ stores and writes what it measured for time it owned:
     and is used ONLY when it joins a night that holds a session record and starts at or after the
     in-bed end of that night's LAST session (no lead-in, nothing between records: 73f, 73i). A block never costs a night (73g):
     if the night it would make fails the overnight gates or is longer than 20 h while the sessions
-    alone make an overnight sleep, the sessions' night is kept and the block counted alone. One that
+    alone make an overnight sleep or a late main sleep (decision 97f), the sessions' night is kept and
+    the block counted alone, so blocks never cost or extend a records-only late main sleep. One that
     stands alone (a daytime sleep, an evening doze, a night with no record) is never a night; since
     decision 76 (#327) it is judged as a strap nap (next item). A block whose last sleep minute
     is less than 20 min before the sync's newest activity minute may still be going on and waits

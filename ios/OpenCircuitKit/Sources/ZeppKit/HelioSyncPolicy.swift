@@ -411,6 +411,10 @@ public enum HelioSleepSelection {
     /// `SleepWindow.isOvernightBlock` (28c) AND ends in its key's wake window (28d), both judged in the
     /// calendar it was recorded in (`Night.recordedCalendar`, 28e). The one gate for both the nights the
     /// store keeps (`HelioStoreSink.storeNights`) and the same-night join in `stitch`.
+    ///
+    /// Decision 97 (#408): unchanged, and still the only gate for the join. A sleep it rejects may be a
+    /// late main sleep (`isLateMainSleep`), which the store offers as its day's night only when no other
+    /// night holds the key (97c); every other rejected sleep is judged as a nap, as before.
     public static func overnightVerdict(_ night: Night) -> OvernightVerdict {
         let calendar = night.recordedCalendar
         guard SleepWindow.isOvernightBlock(start: night.window.start, end: night.window.end, calendar: calendar) else {
@@ -423,6 +427,47 @@ public enum HelioSleepSelection {
     /// Decision 71a: `overnightVerdict(night) == .overnight`.
     public static func isOvernightSleep(_ night: Night) -> Bool {
         overnightVerdict(night) == .overnight
+    }
+
+    /// Decision 97a (#408): a late main sleep is at least this long. An OpenCircuit choice.
+    public static let lateMainSleepMinLength: TimeInterval = 3 * 3600
+    /// Decision 97a: a late main sleep starts at or after this wall-clock hour of the evening BEFORE its
+    /// night key's day (21:00). An OpenCircuit choice.
+    public static let lateMainSleepEarliestStartHour = 21
+    /// Decision 97a: a late main sleep starts before this wall-clock hour of its night key's day (08:00).
+    /// A sleep starting at or after it is judged as a nap, as before. An OpenCircuit choice.
+    public static let lateMainSleepStartBeforeHour = 8
+    /// Decision 97a: a late main sleep ends before this wall-clock hour of its night key's day (18:00).
+    /// An OpenCircuit choice.
+    public static let lateMainSleepEndBeforeHour = 18
+
+    /// Decision 97a (#408): whether `night` is a LATE MAIN SLEEP, a day's main sleep that starts in the
+    /// night but ends late (a shifted schedule, 05:00–15:00, or a night stitched to a lie-in that ends
+    /// after noon), judged on its own window (stitched, blocks included, no lead-in) in the calendar it
+    /// was recorded in (28e). All four hold: (1) it is no overnight sleep (`overnightVerdict`); (2) it
+    /// lasts from `lateMainSleepMinLength` to `maxNightLength`; (3) with K its night key (`nightKey(of:)`,
+    /// the start of the day it ends on), it starts from 21:00 the evening before K up to, not including,
+    /// 08:00 on K; (4) it ends before 18:00 on K.
+    ///
+    /// The hour bounds are wall-clock hours of the recorded calendar (`date(bySettingHour:)`), not
+    /// K plus a fixed number of elapsed hours, so on a daylight-saving day 08:00 and 18:00 are still the
+    /// clock readings.
+    ///
+    /// It changes no other rule: `overnightVerdict`, `areOneNight` and `stitch` stay overnight-only
+    /// (97b). The store offers one as a night only when no other night holds its key (97c).
+    public static func isLateMainSleep(_ night: Night) -> Bool {
+        guard overnightVerdict(night) != .overnight else { return false }
+        let duration = night.window.duration
+        guard duration >= lateMainSleepMinLength, duration <= maxNightLength else { return false }
+        let calendar = night.recordedCalendar
+        let key = nightKey(of: night)
+        guard let eveningBefore = calendar.date(byAdding: .day, value: -1, to: key),
+              let earliestStart = calendar.date(bySettingHour: lateMainSleepEarliestStartHour, minute: 0, second: 0,
+                                                of: eveningBefore),
+              let latestStart = calendar.date(bySettingHour: lateMainSleepStartBeforeHour, minute: 0, second: 0, of: key),
+              let latestEnd = calendar.date(bySettingHour: lateMainSleepEndBeforeHour, minute: 0, second: 0, of: key)
+        else { return false }
+        return earliestStart <= night.window.start && night.window.start < latestStart && night.window.end < latestEnd
     }
 
     /// The night key `night` files under (`SleepNightKey.night(inBedStart:inBedEnd:calendar:)` of its

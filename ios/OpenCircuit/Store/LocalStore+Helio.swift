@@ -165,6 +165,17 @@ extension LocalStore {
         return DateInterval(start: record.spanStart, end: record.spanEnd)
     }
 
+    /// Decision 97c (#408): every stored night filed under one of `keys` (start-of-day dates, as
+    /// `StoredSleepSummary.night` holds them), whichever device stored it, edited rows included.
+    func sleepSummaries(keyedOn keys: Set<Date>) throws -> [StoredSleepSummary] {
+        var rows: [StoredSleepSummary] = []
+        for key in keys {
+            let descriptor = FetchDescriptor<StoredSleepSummary>(predicate: #Predicate { $0.night == key })
+            rows += try context.fetch(descriptor).filter { row in !rows.contains { $0 === row } }
+        }
+        return rows
+    }
+
     // MARK: Naps (#231)
 
     /// Every stored night's window near `[start, end]`, whichever device stored it: the recorded in-bed
@@ -307,6 +318,11 @@ final class HelioStoreSink: HelioHistorySink {
     /// taken as the provisional main sleep of a night no stored night covers (stored nowhere).
     private var napsFromBlocksWindows: Set<DateInterval> = []
     private var mainOnlyBlockWindows: Set<DateInterval> = []
+    /// Decision 97g (#408): this sync's late main sleeps offered as nights, those kept out of their key
+    /// by 97c, and the sleeps that were neither an overnight nor a late main sleep (counts only).
+    private var lateMainOfferedWindows: Set<DateInterval> = []
+    private var lateMainKeptOutWindows: Set<DateInterval> = []
+    private var neitherShapeWindows: Set<DateInterval> = []
     private var latestStress: HelioReading?
     private var latestPAI: HelioReading?
 
@@ -407,6 +423,9 @@ final class HelioStoreSink: HelioHistorySink {
         napsTooShortWindows = []
         napsFromBlocksWindows = []
         mainOnlyBlockWindows = []
+        lateMainOfferedWindows = []
+        lateMainKeptOutWindows = []
+        neitherShapeWindows = []
         latestStress = nil
         latestPAI = nil
     }
@@ -512,12 +531,18 @@ final class HelioStoreSink: HelioHistorySink {
         return staged.filter { log.owner(ofNightFrom: $0.window.start, to: $0.window.end) == family }
     }
 
+    /// The strap's own nights of this sync (`ownedSleep`), stored oldest first. A sleep is offered as a
+    /// night when it is an overnight sleep (28c/28d, 71a) or a late main sleep that takes no key another
+    /// night holds (decision 97, #408: 97a's `isLateMainSleep`, 97c's `lateMainSleepKeepsItsKey`); every
+    /// offered sleep goes through the same steps in the same order (manual edits, ownership on the
+    /// stitched window, 28f/58b, the awake fill, the lead-in, `saveHelioNight`). Then the naps, judged
+    /// against the nights as stored now (`storeNaps`).
     private func storeNights(timeline: SyncDeviceID, now: Date) throws {
         let join = ownedSleep(timeline: timeline, now: now)
         let nights = join.nights
         guard let first = nights.first?.window.start, let last = nights.last?.window.end else {
             // Decision 76b: a sync whose only owned sleep is in the activity minutes still judges it as a nap.
-            storeNaps([], overnight: [], blocks: join.aloneNights, timeline: timeline, now: now)
+            storeNaps([], offered: [], blocks: join.aloneNights, timeline: timeline, now: now)
             return
         }
         let edited = store.manuallyEditedSleepWindows(from: first, to: last)
@@ -536,22 +561,48 @@ final class HelioStoreSink: HelioHistorySink {
         // synced after a flight is still a night. Same functions, one explicit calendar.
         // Decision 71a (#278): the one shared predicate (`HelioSleepSelection.overnightVerdict`), which
         // `stitch` also uses to join the overnight sleeps of one night.
-        let overnight = nights.filter { night in
+        // Decision 97 (#408): a sleep that fails it but is a late main sleep (`isLateMainSleep`, 97a: it
+        // starts in the night, ends before 18:00) is offered as its day's night too, through every step
+        // below in the same order, but only when no other night holds its key (97c,
+        // `lateMainSleepKeepsItsKey`). One kept out is a nap candidate like any sleep that is no night.
+        let overnight = nights.filter(HelioSleepSelection.isOvernightSleep)
+        var offered: [HelioSleepSelection.Night] = []
+        for night in nights {
             let verdict = HelioSleepSelection.overnightVerdict(night)
-            if verdict == .overnight { return true }
+            if verdict == .overnight {
+                offered.append(night)
+                continue
+            }
+            let span = Self.clockSpan(night.window, in: night.recordedTimeZone)
+            if HelioSleepSelection.isLateMainSleep(night) {
+                let keepsItsKey = lateMainSleepKeepsItsKey(night, overnight: overnight)
+                if keepsItsKey {
+                    offered.append(night)
+                    lateMainOfferedWindows.insert(night.window)
+                } else {
+                    lateMainKeptOutWindows.insert(night.window)
+                }
+                if notOvernightLogged.insert(night.window).inserted {
+                    if keepsItsKey {
+                        helioLog.notice("helio: sleep session \(span, privacy: .public) is a late main sleep; offered as its day's night")
+                    } else {
+                        helioLog.notice("helio: sleep session \(span, privacy: .public) is a late main sleep, but another night holds its key; not stored as a night")
+                    }
+                }
+                continue
+            }
+            neitherShapeWindows.insert(night.window)
             if notOvernightLogged.insert(night.window).inserted {
-                let span = Self.clockSpan(night.window, in: night.recordedTimeZone)
                 if verdict == .notOvernight {
                     helioLog.notice("helio: sleep session \(span, privacy: .public) is not overnight; not stored as a night")
                 } else {
                     helioLog.notice("helio: sleep session \(span, privacy: .public) doesn't end in its night's wake window; not stored as a night")
                 }
             }
-            return false
         }
         // The ownership check again, on the stitched window: a backstop (`ownedNights` already kept
         // only the strap's own sleeps).
-        for staged in HelioSleepSelection.nightsToWrite(overnight, manuallyEdited: edited)
+        for staged in HelioSleepSelection.nightsToWrite(offered, manuallyEdited: edited)
         where log.owner(ofNightFrom: staged.window.start, to: staged.window.end) == family
             && !storedNights.contains(where: { $0.windowWithoutLeadIn == staged.window }) {
             // Decision 74 (#278): the awake time between the night's fragments, from the stored heart
@@ -638,7 +689,34 @@ final class HelioStoreSink: HelioHistorySink {
         }
         // #231: then the naps, judged against the nights as they are stored NOW, so a nap is never
         // chosen over a night (the nights above were stored first, and nothing here touches a night).
-        storeNaps(nights, overnight: overnight, blocks: join.aloneNights, timeline: timeline, now: now)
+        storeNaps(nights, offered: offered, blocks: join.aloneNights, timeline: timeline, now: now)
+    }
+
+    /// Decision 97c (#408): whether the late main sleep `late` may be offered as a night: it never takes a
+    /// key another night holds. Both must hold:
+    /// - (i) no overnight sleep of this sync's nights (`overnight`, 71a) has its key and is disjoint from it;
+    /// - (ii) every stored night on its key (either device, edited rows included) overlaps it.
+    ///
+    /// Why: `saveSleepSummary`'s completeness merge keeps the fuller of two disjoint same-key rows that both
+    /// end before noon, so without these a 07:00–11:30 sleep could replace a stored 00:00–02:00 night.
+    /// Its key is the one it files under in the recorded calendar (`nightKey(of:)`, 97a) and the one the
+    /// store files it under (`saveHelioNight`, the phone's calendar); they differ only after a zone
+    /// change, and a match on either counts. Overlap is judged on the windows, a row with no known window
+    /// (legacy) counting as disjoint. A store read that fails keeps it out (the conservative side).
+    private func lateMainSleepKeepsItsKey(_ late: HelioSleepSelection.Night, overnight: [HelioSleepSelection.Night]) -> Bool {
+        func keys(_ night: HelioSleepSelection.Night) -> Set<Date> {
+            [HelioSleepSelection.nightKey(of: night),
+             SleepNightKey.night(inBedStart: night.window.start, inBedEnd: night.window.end)]
+        }
+        func overlaps(_ a: DateInterval, _ b: DateInterval) -> Bool { a.start < b.end && b.start < a.end }
+        let lateKeys = keys(late)
+        if overnight.contains(where: { !keys($0).isDisjoint(with: lateKeys) && !overlaps($0.window, late.window) }) {
+            return false
+        }
+        guard let rows = try? store.sleepSummaries(keyedOn: lateKeys) else { return false }
+        return rows.allSatisfy { row in
+            row.inBedEnd > row.inBedStart && overlaps(DateInterval(start: row.inBedStart, end: row.inBedEnd), late.window)
+        }
     }
 
     /// The outcomes that mean another night holds the sleep's key, so the sleep itself is no night: the
@@ -653,9 +731,10 @@ final class HelioStoreSink: HelioHistorySink {
     /// Apple Health by the same flush.
     ///
     /// The candidates are the sleeps that are no night: those 28c/28d kept from being one (daytime, or
-    /// not ending in a wake window), and overnight ones another night kept out of their key
-    /// (`nightKeptOut`). A sleep offered as a night and stored, edited, deferred or left out for any
-    /// other reason is never a candidate. `HelioSleepSelection.naps` then judges them against every
+    /// not ending in a wake window) and not offered as a late main sleep (decision 97), late main sleeps
+    /// 97c kept out of their key, and sleeps offered as nights (`offered`: overnight or late main) that
+    /// another night kept out of their key (`nightKeptOut`, 97d). A sleep offered as a night and stored,
+    /// edited, deferred or left out for any other reason is never a candidate. `HelioSleepSelection.naps` then judges them against every
     /// stored night (either device's) and the day's main-sleep window: a nap is more than 60 min from
     /// every main sleep, 20 min or longer, and settled. Only a nap the strap owned all of is stored
     /// (decision 28); `saveNap` refuses one overlapping a stored night, and a night stored later prunes
@@ -672,13 +751,13 @@ final class HelioStoreSink: HelioHistorySink {
     /// it from the minutes it fetched (76d), so a nap holding a block is not saved again when a stored
     /// auto nap at its start already covers it: a re-derivation that saw fewer minutes must not shrink
     /// a row Apple Health holds (`saveNap` would re-arm it, and the flush's clean delete what was written).
-    private func storeNaps(_ sleeps: [HelioSleepSelection.Night], overnight: [HelioSleepSelection.Night],
+    private func storeNaps(_ sleeps: [HelioSleepSelection.Night], offered: [HelioSleepSelection.Night],
                            blocks: [HelioSleepSelection.Night] = [], timeline: SyncDeviceID, now: Date) {
-        let overnightWindows = Set(overnight.map(\.window))
+        let offeredWindows = Set(offered.map(\.window))
         var candidates: [HelioSleepSelection.Night] = []
         var keptOutOfItsNight: [HelioSleepSelection.Night] = []   // review-224e S-2's case
         for sleep in sleeps {
-            if overnightWindows.contains(sleep.window) {
+            if offeredWindows.contains(sleep.window) {
                 guard let outcome = nightOutcomes[sleep.window], Self.nightKeptOut.contains(outcome) else { continue }
                 if outcome == .keptFullerStoredNight { keptOutOfItsNight.append(sleep) }
             }
@@ -875,6 +954,9 @@ final class HelioStoreSink: HelioHistorySink {
         summary.napsTooShort = napsTooShortWindows.count
         summary.napsFromBlocks = napsFromBlocksWindows.count
         summary.mainOnlyBlocks = mainOnlyBlockWindows.count
+        summary.lateMainSleepsOffered = lateMainOfferedWindows.count
+        summary.lateMainSleepsKeptOut = lateMainKeptOutWindows.count
+        summary.neitherOvernightNorLateMainSleep = neitherShapeWindows.count
         if let oldest = staged.map(\.window.start).min() {
             let newestStoredEnd = store.storedNightWindows(from: oldest, to: now).map(\.end).max() ?? .distantPast
             summary.endsAfterNewestNight = Set(staged.filter { $0.window.end > newestStoredEnd }.map(\.window)).count
