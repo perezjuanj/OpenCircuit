@@ -2,10 +2,12 @@
 //  OCStepHelioKey.swift
 //  OpenCircuit — Onboarding (gradient direction)
 //
-//  The strap's key sheet, shown when the guide ends on the Helio Strap and the strap has no key yet
-//  (Set Up Strap on the last step). One way is shown: the in-app Zepp sign-in. The computer route
-//  (guide, snippet, paste) lives only on the strap's full setup screen, reached from the small
-//  Troubleshooting link at the bottom (the setup-shows-one-way rule).
+//  The strap's key sheet: the app's one Zepp sign-in design. Onboarding opens it when the guide ends
+//  on the Helio Strap and the strap has no key yet (Set Up Strap on the last step), starting on the
+//  choose step. The strap's setup screen opens it straight on the sign-in step (`Entry.setupScreen`):
+//  that screen already shows what the choose step would, and Cancel closes the sheet. One way is
+//  shown either way: the in-app Zepp sign-in. The computer route (guide, snippet, paste) lives only
+//  in the setup screen's small Troubleshooting section (the setup-shows-one-way rule).
 //
 //  No logic of its own: sign-in and device pick are `ZeppSignInCopy.lookUp` and the save is
 //  `HelioSetupView.saveKeyAndUseStrap`, the same two the setup screen uses.
@@ -29,18 +31,47 @@ struct HelioKeySheet: View {
         case choose, signIn
     }
 
+    /// Where the sheet was opened from.
+    enum Entry: Hashable {
+        /// Onboarding's last strap step: starts on choose; Troubleshooting opens the setup screen.
+        case onboarding
+        /// The strap's setup screen: starts on sign-in; Cancel closes the sheet, and the account
+        /// limit points at that screen's own Troubleshooting section.
+        case setupScreen
+    }
+
     /// Called once the key is saved and the strap is in use.
     let onSaved: () -> Void
     /// "Done" without a key: set it up later.
     let onDone: () -> Void
     var lookup = ZeppAccountKeyLookup()
+    let entry: Entry
 
     @State private var mode: Mode
 
-    init(onSaved: @escaping () -> Void, onDone: @escaping () -> Void, initialMode: Mode = .choose) {
+    init(onSaved: @escaping () -> Void, onDone: @escaping () -> Void, initialMode: Mode = .choose,
+         entry: Entry = .onboarding) {
         self.onSaved = onSaved
         self.onDone = onDone
-        _mode = State(initialValue: initialMode)
+        self.entry = entry
+        _mode = State(initialValue: Self.startMode(entry, requested: initialMode))
+    }
+
+    /// The setup screen always opens on sign-in; onboarding starts where it asks (choose by default).
+    static func startMode(_ entry: Entry, requested: Mode) -> Mode {
+        entry == .setupScreen ? .signIn : requested
+    }
+
+    /// The account-type limit for where the sheet sits: onboarding's Troubleshooting is at the bottom
+    /// of this sheet; from the setup screen it's at the bottom of that screen.
+    static func accountLimit(for entry: Entry) -> String {
+        entry == .setupScreen ? ZeppSignInCopy.accountLimit : ZeppSignInCopy.accountLimitShort
+    }
+
+    /// Cancel on the sign-in step: back to choose in onboarding, closes the sheet from the setup screen.
+    private func cancelSignIn() {
+        clear()
+        if entry == .setupScreen { onDone() } else { go(.choose) }
     }
 
     @State private var expanded: Set<String> = []
@@ -113,7 +144,7 @@ struct HelioKeySheet: View {
 
         case .signIn:
             HStack(spacing: 12) {
-                capsuleButton("Cancel") { clear(); go(.choose) }
+                capsuleButton("Cancel", action: cancelSignIn)
                     .disabled(isSigningIn)
                 Text(ZeppSignInCopy.title)
                     .font(.system(.callout, weight: .semibold))
@@ -212,7 +243,7 @@ struct HelioKeySheet: View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(ZeppSignInCopy.accountLimitShort)
+                    Text(Self.accountLimit(for: entry))
                     Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1).padding(.vertical, 13)
                     Text(ZeppSignInCopy.pairFirst)
                 }
@@ -274,7 +305,8 @@ struct HelioKeySheet: View {
             Text(ZeppSignInCopy.pickHeader(for: choices))
                 .font(.system(.footnote, weight: .semibold))
                 .foregroundStyle(Color.white)
-            // By position, not address: see ZeppSignInSheet.
+            // By position, not address: Zepp can list two entries with the same (or an empty) address,
+            // and a shared id lets SwiftUI hand a tap to the wrong row.
             ForEach(Array(choices.enumerated()), id: \.offset) { _, device in
                 Button { save(device) } label: {
                     VStack(alignment: .leading, spacing: 3) {

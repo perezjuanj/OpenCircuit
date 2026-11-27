@@ -54,7 +54,7 @@ struct DeviceChoiceView: View {
 }
 
 /// Amazfit Helio Strap setup (#215 decisions 4–7): what works, the Zepp coexistence warnings, the key
-/// (read once from an email-and-password Zepp account through `ZeppSignInSheet`; the computer guide,
+/// (read once from an email-and-password Zepp account through `HelioKeySheet`; the computer guide,
 /// snippet and paste field sit in the small Troubleshooting section at the bottom; Keychain either
 /// way), then connect and the first sync.
 struct HelioSetupView: View {
@@ -143,11 +143,16 @@ struct HelioSetupView: View {
         }
         .navigationTitle("Amazfit Helio Strap")
         .navigationBarTitleDisplayMode(.inline)
+        // The app's one sign-in design (onboarding's strap sheet), opened on its sign-in step. It saves
+        // through `saveKeyAndUseStrap` itself, so this screen only re-reads the key state afterwards.
         .sheet(isPresented: $showZeppSignIn) {
-            ZeppSignInSheet { key in
-                keyText = key
-                saveAndConnect()
-            }
+            HelioKeySheet(onSaved: {
+                keyText = ""
+                editingKey = false
+                saveError = nil
+                refreshKeyState()
+                showZeppSignIn = false
+            }, onDone: { showZeppSignIn = false }, entry: .setupScreen)
         }
         .confirmationDialog("Forget the key?", isPresented: $confirmForget, titleVisibility: .visible) {
             Button("Forget Key", role: .destructive) {
