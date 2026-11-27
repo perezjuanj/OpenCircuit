@@ -577,7 +577,8 @@ struct ContentView: View {
         List {
             Group {
                 // One plain-language sentence about today (#216), above everything else.
-                TodaySynthesisHeader(sentence: synthesisSentence)
+                TodaySynthesisHeader(sentence: synthesisSentence,
+                                     briefFacts: synthesisInput.flatMap(TodaySynthesis.briefFacts))
                 if ringActive {
                     connectionCard
                 } else {
@@ -997,15 +998,20 @@ struct ContentView: View {
                          tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius, scope: .from(trends))
     }
 
-    /// The Today synthesis sentence (#216) — deterministic rules in `TodaySynthesis`.
+    /// The Today synthesis input (#216); nil before the first trends load.
+    private var synthesisInput: TodaySynthesis.Input? {
+        guard trendsHaveLoaded else { return nil }
+        return TodaySynthesis.input(trends: trends, tiles: todayTiles, readiness: readinessReport,
+                                    feverSuspected: vitalsFeverSuspected, lastSyncAt: lastSyncAt)
+    }
+
+    /// The Today synthesis sentence (#216) — deterministic rules in `TodaySynthesis`. Shown first and
+    /// whenever the on-device brief isn't ready (`TodaySynthesisHeader`).
     private var synthesisSentence: String {
         // Before the first trends load there is nothing to judge — and "no ring data yet" would be
         // a false claim to a wearer who has plenty.
-        guard trendsHaveLoaded else { return "Gathering today's numbers…" }
-        return TodaySynthesis.sentence(TodaySynthesis.input(trends: trends, tiles: todayTiles,
-                                                             readiness: readinessReport,
-                                                             feverSuspected: vitalsFeverSuspected,
-                                                             lastSyncAt: lastSyncAt))
+        guard let input = synthesisInput else { return "Gathering today's numbers…" }
+        return TodaySynthesis.sentence(input)
     }
 
     /// The sections actually rendered right now — `sectionOrder` minus any feature-gated card that's

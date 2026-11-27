@@ -58,13 +58,34 @@ public enum SleepRecap {
     public static let maxReplyLength = 420
 
     /// What the model is given, plus the numbers it may use.
+    /// Shared by every model-written line (the Sleep recap and the Today brief).
     public struct Facts: Hashable, Sendable {
+        /// The facts (for the Today brief: the ones the reply MUST cover).
         public let lines: [String]
-        /// Every integer token that appears in `lines`. A reply may contain only these.
+        /// Facts the reply may use (Today brief only). Empty = a single list under `header`.
+        public let optionalLines: [String]
+        /// Groups of lowercase phrases; a reply must contain at least one phrase of every group.
+        public let required: [[String]]
+        /// Every integer token that appears in the facts. A reply may contain only these.
         public let allowedNumbers: Set<Int>
+        public let header: String
+        public let request: String
+
+        public init(lines: [String], optionalLines: [String] = [], required: [[String]] = [],
+                    header: String = "Facts about last night:", request: String = "Write the recap.") {
+            self.lines = lines
+            self.optionalLines = optionalLines
+            self.required = required
+            self.header = header
+            self.request = request
+            self.allowedNumbers = SleepRecap.numbers(in: (lines + optionalLines).joined(separator: " "))
+        }
+
         public var prompt: String {
-            "Facts about last night:\n" + lines.map { "- \($0)" }.joined(separator: "\n")
-                + "\n\nWrite the recap."
+            func list(_ xs: [String]) -> String { xs.map { "- \($0)" }.joined(separator: "\n") }
+            if optionalLines.isEmpty { return header + "\n" + list(lines) + "\n\n" + request }
+            return header + "\nMust mention:\n" + list(lines) + "\nMay mention:\n" + list(optionalLines)
+                + "\n\n" + request
         }
     }
 
@@ -131,7 +152,7 @@ public enum SleepRecap {
         if night.isManuallyEdited {
             lines.append("The person edited this night's times by hand.")
         }
-        return Facts(lines: lines, allowedNumbers: numbers(in: lines.joined(separator: " ")))
+        return Facts(lines: lines)
     }
 
     private static func avg(_ xs: [Int]) -> Int {
@@ -162,6 +183,16 @@ public enum SleepRecap {
         case inventedNumber(String)
         /// Diagnostic or medical wording.
         case medicalWording(String)
+        /// Advice the facts did not give (the Today brief only).
+        case unrequestedAdvice(String)
+        /// A must-mention fact is missing (the Today brief only); carries the group's first phrase.
+        case missing(String)
+        /// Reads like a copied list ("Readiness: 82 out of 100.") rather than a sentence.
+        case listLike
+        /// Opens with a greeting (the Today brief only).
+        case greeting
+        /// Claims how the person feels or is doing, which no number shows (the Today brief only).
+        case claimsFeeling(String)
     }
 
     /// Words a recap must never contain. Lowercased stems, matched at the start of a word.
@@ -184,10 +215,11 @@ public enum SleepRecap {
     ]
 
     /// The reply, trimmed, if it may be shown; otherwise why not.
-    public static func vet(_ reply: String, facts: Facts) -> Result<String, Rejection> {
+    public static func vet(_ reply: String, facts: Facts,
+                           maxLength: Int = maxReplyLength) -> Result<String, Rejection> {
         let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return .failure(.empty) }
-        guard text.count <= maxReplyLength else { return .failure(.tooLong) }
+        guard text.count <= maxLength else { return .failure(.tooLong) }
         let lower = text.lowercased()
         for stem in bannedStems {
             if wordStarts(stem, in: lower) { return .failure(.medicalWording(stem)) }
@@ -224,7 +256,7 @@ public enum SleepRecap {
 
     /// `stem` at the start of a word in `lower`, so "sick" catches "sickness" but not "homesick".
     /// No stem may be a prefix of an ordinary sleep word ("pill" would catch "pillow").
-    private static func wordStarts(_ stem: String, in lower: String) -> Bool {
+    static func wordStarts(_ stem: String, in lower: String) -> Bool {
         var search = lower.startIndex..<lower.endIndex
         while let r = lower.range(of: stem, range: search) {
             if r.lowerBound == lower.startIndex || !lower[lower.index(before: r.lowerBound)].isLetter {

@@ -75,10 +75,22 @@ enum SleepRecapModel {
         return false
     }
 
-    /// A vetted recap, or nil (unavailable, refused, or every attempt failed the vet).
+    /// A vetted Sleep recap, or nil (unavailable, refused, or every attempt failed the vet).
     static func write(_ facts: SleepRecap.Facts) async -> String? {
+        await write(prompt: facts.prompt, instructions: SleepRecap.instructions, maxTokens: 160) {
+            if case .success(let text) = SleepRecap.vet($0, facts: facts) { return text }
+            return nil
+        }
+    }
+
+    /// One model-written line: `accept` vets each reply and returns the text to show, or nil to retry.
+    static func write(prompt: String, instructions: String, maxTokens: Int,
+                      accept: @escaping @Sendable (String) -> String?) async -> String? {
         #if canImport(FoundationModels)
-        if #available(iOS 26.0, *) { return await OnDeviceSleepRecapWriter.write(facts) }
+        if #available(iOS 26.0, *) {
+            return await OnDeviceWriter.write(prompt: prompt, instructions: instructions,
+                                              maxTokens: maxTokens, accept: accept)
+        }
         #endif
         return nil
     }
@@ -86,22 +98,23 @@ enum SleepRecapModel {
 
 #if canImport(FoundationModels)
 @available(iOS 26.0, *)
-private enum OnDeviceSleepRecapWriter {
+private enum OnDeviceWriter {
 
     /// One retry: a fresh session at the same low temperature usually fixes a stray number.
     static let attempts = 2
 
-    static func write(_ facts: SleepRecap.Facts) async -> String? {
+    static func write(prompt: String, instructions: String, maxTokens: Int,
+                      accept: @Sendable (String) -> String?) async -> String? {
         let model = SystemLanguageModel.default
         guard model.isAvailable else { return nil }
-        let options = GenerationOptions(temperature: 0.3, maximumResponseTokens: 160)
+        let options = GenerationOptions(temperature: 0.3, maximumResponseTokens: maxTokens)
         for _ in 0..<attempts {
             if Task.isCancelled { return nil }
             // A new session per attempt: a rejected reply must not sit in the next attempt's context.
-            let session = LanguageModelSession(model: model, instructions: SleepRecap.instructions)
+            let session = LanguageModelSession(model: model, instructions: instructions)
             do {
-                let response = try await session.respond(to: facts.prompt, options: options)
-                if case .success(let text) = SleepRecap.vet(response.content, facts: facts) { return text }
+                let response = try await session.respond(to: prompt, options: options)
+                if let text = accept(response.content) { return text }
             } catch {
                 // Guardrail, locale or asset errors: try once more, then show the failure line. Never
                 // logged: the error can quote the prompt, which is health data.

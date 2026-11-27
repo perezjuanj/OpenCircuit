@@ -49,6 +49,28 @@ final class SleepRecapSourceTests: XCTestCase {
         XCTAssertTrue(code.contains("SystemLanguageModel.default"))
     }
 
+    /// The Today line says who wrote it whenever the model's text is on screen.
+    func testTodayBriefBylineAndCacheRoundTrip() throws {
+        XCTAssertEqual(TodayBriefCopy.byline, "Written on this iPhone by Apple Intelligence")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "TodayBriefCacheTests"))
+        defaults.removePersistentDomain(forName: "TodayBriefCacheTests")
+        XCTAssertNil(TodayBriefCache.load(defaults))
+        TodayBriefCache.save(TodayBrief(prompt: "p", text: "t"), defaults)
+        XCTAssertEqual(TodayBriefCache.load(defaults), TodayBrief(prompt: "p", text: "t"))
+        defaults.removePersistentDomain(forName: "TodayBriefCacheTests")
+    }
+
+    /// The Today header never logs either: its prompt is health data.
+    func testTheTodayHeaderNeverLogs() throws {
+        let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("OpenCircuit/Dashboard/TodaySynthesisHeader.swift")
+        let code = try String(contentsOf: path, encoding: .utf8)
+        for banned in ["print(", "Logger", "os_log", "NSLog", "debugPrint"] {
+            XCTAssertFalse(code.contains(banned), "TodaySynthesisHeader.swift must not use \(banned)")
+        }
+        XCTAssertTrue(code.contains("TodaySynthesis.vetBrief"), "the brief is only shown after its vet")
+    }
+
     func testAdapterUsesTheDisplayedNightAndOnlyItsOwnScore() {
         let key = Date(timeIntervalSince1970: 1_736_150_400)
         let summary = SleepStaging.Summary(inBed: 450 * 60, awake: 30 * 60, light: 240 * 60,

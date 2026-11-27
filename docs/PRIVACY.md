@@ -49,16 +49,22 @@ health data is sent. They never reach OpenCircuit or anyone other than Zepp, who
 privacy policy covers how Zepp handles that sign-in. If you don't use the button, the app
 never contacts Zepp.
 
-## Optional on-device sleep summary (Apple Intelligence)
+## On-device summaries (Apple Intelligence)
 
-On an iPhone with Apple Intelligence turned on (iOS 26 or later), the Sleep card can show
-**Summarize this night**. When you tap it, the app gives that night's numbers (time asleep,
-stages, score, and how they compare with your recent nights) to Apple's **on-device**
-language model, which writes a short summary. The model runs **on your iPhone**: nothing
-is sent to OpenCircuit, Apple, or anyone else, and the summary is not stored. The app
-never uses Apple's server-side (Private Cloud Compute) model. If you don't tap the
-button, the model is never used. The summary describes your numbers. It is not medical
-advice.
+On an iPhone with Apple Intelligence turned on (iOS 26 or later), OpenCircuit can use
+Apple's **on-device** language model to put your numbers into words:
+
+- **Today:** the sentence at the top of the Today tab is rewritten from the same numbers it
+  already uses (readiness, last night's sleep against your recent nights, and whether HRV,
+  resting heart rate and skin temperature are above, within or below your usual). The last
+  sentence is kept on your device so it shows straight away next time.
+- **Sleep:** **Summarize this night** on the Sleep card writes a short recap of that night
+  when you tap it. It is not stored.
+
+The model runs **on your iPhone**: nothing is sent to OpenCircuit, Apple, or anyone else.
+The app never uses Apple's server-side (Private Cloud Compute) model. With Apple
+Intelligence off, the app shows its own fixed sentence instead. These summaries describe
+your numbers. They are not medical advice.
 
 ## Where the data goes
 
