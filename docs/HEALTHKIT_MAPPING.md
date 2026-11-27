@@ -7,7 +7,7 @@ device's own timestamps (so historical sync backfills correctly).
 | RingConn metric | HealthKit type | Kind | Unit | Notes |
 |---|---|---|---|---|
 | Heart rate | `HKQuantityType(.heartRate)` | Quantity | count/min | live + history |
-| Resting heart rate | `.restingHeartRate` | Quantity | count/min | daily, derived on-device (sleep mean → low-activity floor); see notes |
+| Resting heart rate | `.restingHeartRate` | Quantity | count/min | daily, derived on-device (sleep mean → low-activity floor); written once the night is in Health, may be replaced until midday, final after that (decision 96); see notes |
 | HRV (RMSSD) | `.heartRateVariabilitySDNN`; on iOS 27+ also `HKQuantityTypeIdentifierHeartRateVariabilityRMSSD` (Health's Recovery HRV) | Quantity | ms | ring reports **RMSSD**; written into the SDNN field and **tagged via metadata** (no fake conversion), and where the OS has the RMSSD type, ALSO written there untagged (decision 59) — see notes. Sourced from **any worn epoch**, not sleep-vitals only (#185) — see below |
 | Blood oxygen (SpO₂) | `.oxygenSaturation` | Quantity | % (0–1.0) | HealthKit wants a fraction |
 | Skin / sleeping-wrist temperature | `.bodyTemperature` | Quantity | °C | general writable temperature type; the ideal `.appleSleepingWristTemperature` is Apple-computed/read-only for third parties, and `.basalBodyTemperature` is hard-wired to Cycle Tracking's BBT chart — see notes |
@@ -475,7 +475,30 @@ preferred = mean HR across the night's `asleep*` segments; fallback = the lowest
 (5-min rolling-mean) HR, the same basis Apple Health uses, so the values sit side by side.
 `HealthKitWriter.flushRestingHR` writes one `.restingHeartRate` sample per day, anchored at
 start-of-day, finalizing a day only once it's ~12 h old (so a pre-dawn sync can't freeze a
-partial-night value while last night's RHR still lands by midday).
+partial-night value).
+
+**Written once the night is in Health, provisional until midday (decision 96, #404).** A day is
+written as soon as its night has reached Apple Health: the same flush that mirrors the night (the
+night mirror runs before the resting-HR write in `flushToHealth`), when the day is today, after
+the watermark, its stored night (keyed by the wake day) has a mirror record
+(`MirroredNightOverlay.hasRecord`, the local record, never a HealthKit read), and the day has a
+value under the coverage floor below. The value is the one the day would get anyway; only the
+timing changes. That sample is provisional (`hk.restingHR.provisional.v1`: day, bpm, sample UUID)
+and the early write does not move the watermark:
+- **Until midday** a later flush whose value differs by a whole bpm saves the new sample first,
+  then records it and deletes the old one by its UUID. A failed save changes nothing (the failure
+  is surfaced); a failed delete is queued (`hk.restingHR.pendingDeletes.v1`), retried at the start
+  of every resting-HR flush, and dropped after 7 days. The same whole bpm (54.2 then 54.4) never
+  writes or deletes.
+- **At midday** (the 12 h finalization) the day is final: the same whole bpm writes nothing, a
+  different one replaces the sample as above, and a day with no value any more keeps the sample
+  it has. Then the watermark moves onto the day and the record is cleared.
+- **A day whose night isn't in Health** (no mirror record: not synced, a manually edited night,
+  no night at all) is first written at midday, exactly as before.
+
+There is one sample per day from this app at every point, except between a replacement's save and
+its delete (or after a failed delete, until its retry succeeds). Only the app's own samples are
+deleted, and only by the UUIDs it recorded.
 
 Coverage floor (#298): a day answered by the fallback needs at least 12 readings spanning at
 least 4 h (`RestingHR.dayCoverage`), or it gets no resting HR: not on the Today tile, not in
@@ -501,10 +524,12 @@ lowest-sustained series (see `dailyRestingHR`).
 - **Value:** the day's LATEST record (the strap revises overnight: 14 of 28 days in Juan's
   2026-11-18 pull carried 2–4 records).
 - **Floor:** a reported day is never held back by `dayCoverage`; it isn't an awake estimate.
-- **Finalization and watermark unchanged:** a day is written 12 h after its start. Its records
-  are all stamped before its noon, so with the strap's hourly sync the written value is the final
-  one; a strap that hasn't synced since its last revision gets the newest value the phone has. A
-  day already in Health is not rewritten.
+- **Finalization and watermark unchanged:** a day is final 12 h after its start, and is written
+  earlier, provisionally, once its night is in Health (decision 96, above); a revised record
+  before midday replaces that sample when it changes the whole bpm. Its records are all stamped
+  before its noon, so with the strap's hourly sync the final value is the strap's last one; a
+  strap that hasn't synced since its last revision gets the newest value the phone has. A day
+  already final is not rewritten.
 - **Measured** on the same pull, 28 strap days: the sleep mean read 1.6–2.6 bpm above the
   strap's own value (r 0.94–0.97 filed by the noon rule, 0.85–0.89 by calendar day). Switching
   shows as a one-time step of about 2 bpm down in the Health trend.
