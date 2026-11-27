@@ -73,6 +73,19 @@ final class TodayTileDayTests: XCTestCase {
         XCTAssertEqual(t.deltaText, yesterdayLine)
     }
 
+    /// VoiceOver speaks YESTERDAY's total with yesterday's verdict, never today's running total:
+    /// an evening where yesterday was above usual and today's total is a different number.
+    func testVoiceOverSpeaksYesterdaysTotalNotTodays() {
+        var pts = (-11 ... -2).map { TrendsEngine.DailyPoint(date: day($0), steps: 8_000) }
+        pts.append(TrendsEngine.DailyPoint(date: day(-1), steps: 12_000))
+        pts.append(TrendsEngine.DailyPoint(date: day(0), steps: 9_400))
+        let t = tile(.steps, pts, now: at(hour: 20))
+        let label = t.accessibilityLabel
+        XCTAssertTrue(label.contains("Yesterday was " + 12_000.formatted(.number) + " steps, above"), label)
+        XCTAssertFalse(label.contains("Yesterday was " + 9_400.formatted(.number)), label)
+        XCTAssertEqual(t.deltaText, "Yesterday " + 12_000.formatted(.number) + " · +" + 4_000.formatted(.number) + " vs usual")
+    }
+
     /// No step total today yet: the headline IS yesterday's total, so the line is about the value's
     /// own day and needs neither a day name nor a second copy of the figure.
     func testNoStepsYetTodayTheLineIsAboutTheValueAboveIt() {

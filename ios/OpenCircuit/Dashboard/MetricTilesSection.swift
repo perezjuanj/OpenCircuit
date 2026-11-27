@@ -156,8 +156,8 @@ struct MetricTileView: View {
                         .lineLimit(1)
                 }
             }
-            // Delta vs usual, with direction.
-            HStack(spacing: 3) {
+            // Delta vs usual, with direction. The glyph sits on the first line when the text wraps.
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
                 if let direction = tile.trend?.direction, tile.deltaText != nil {
                     KeylineGlyph(direction.icon, size: 11, relativeTo: .caption2)
                         .foregroundStyle(.secondary)
@@ -231,7 +231,8 @@ struct StrapStressTileView: View {
                 .font(.caption2).foregroundStyle(.secondary)
                 .lineLimit(2).fixedSize(horizontal: false, vertical: true)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        // Fills the grid row like `MetricTileView`, so a Steps tile beside it stays level.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .ocCardSurface(padding: 12)
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
@@ -286,7 +287,8 @@ struct StrapPAITileView: View {
                 .font(.caption2).foregroundStyle(.secondary)
                 .lineLimit(2).fixedSize(horizontal: false, vertical: true)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        // Fills the grid row like `MetricTileView`, so a Steps tile beside it stays level.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .ocCardSurface(padding: 12)
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
