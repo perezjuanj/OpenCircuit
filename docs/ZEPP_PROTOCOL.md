@@ -2578,6 +2578,13 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   there is no setting for it yet.
 - **Candidates**: only sleeps the app didn't take as a night. A sleep is a night or a nap, never
   both, and the nights are stored before the naps are judged.
+- **A late main sleep is a night** (decision 97, #408): a sleep that starts in the night but ends
+  late (no overnight sleep, 3 h to 20 h, starting from 21:00 the evening before its key's day up to
+  08:00, ending before 18:00) is offered as that day's night, but only when no other night holds its
+  key (an overnight sleep of the same sync, or a stored night on the key that it doesn't overlap).
+  Otherwise it is a nap candidate like any other sleep that is no night. So a 05:00–15:00 sleep with
+  no other night that day is the night, not the day's provisional main sleep stored nowhere; the
+  joins of step 3 are unchanged. `HEALTHKIT_MAPPING.md` lists its known limits.
 - **Settling**: a nap is judged only once 60 min have passed since it ended, so a later session that
   would stitch onto it (28f) has had its chance. A night stored later still prunes an auto nap it
   overlaps, and a strap night also the strap's auto naps within 60 min of it (decision 76l, below).
@@ -2607,7 +2614,8 @@ naps as `StoredNap` rows next to the ring's (`HelioStoreSink.storeNaps`). Where 
   alone. Later syncs fetch activity only from the last record's end, so a block written anywhere
   earlier would be deleted by the next extension's union delete. **A block never costs a night**
   (73g): a night holding blocks that fails the overnight gates (28c/28d) or is longer than 20 h,
-  while its sessions alone make an overnight sleep, goes back to the sessions' own night, and its
+  while its sessions alone make an overnight sleep (or a late main sleep, decision 97f), goes back to
+  the sessions' own night, and its
   blocks are counted alone (a lie-in after the record that ends past noon, for one). Known gap
   (decision 73j, quoted): "73j (known gap, documented, not fixed; 🔴 shape). A block already written after a night's last fragment can still be deleted if the strap later delivers a NEW `0x48` record for that night that starts after the block, because the block is then no longer after the last fragment. This needs a second record for one night, which the owner's strap has not been seen to write (decision 73's preamble). The general guard, "an extension must hold every in-bed span already written" (review-73b option b), changes 58b for every strap night. It is a follow-up, not part of this build."
 - **A nap from the activity minutes** (decision 76, #327): the strap writes one `0x48` record per
