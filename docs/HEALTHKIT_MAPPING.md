@@ -493,8 +493,8 @@ and the early write does not move the watermark:
 - **At midday** (the 12 h finalization) the day is final: the same whole bpm writes nothing, a
   different one replaces the sample as above, and a day with no value any more keeps the sample
   it has. Then the watermark moves onto the day and the record is cleared.
-- **A day whose night isn't in Health** (no mirror record: not synced, a manually edited night,
-  no night at all) is first written at midday, exactly as before.
+- **A day whose night isn't in Health** (no mirror record: not synced yet, a night edited
+  before it was first mirrored, no night at all) is first written at midday, exactly as before.
 
 There is one sample per day from this app at every point, except between a replacement's save and
 its delete (or after a failed delete, until its retry succeeds). Only the app's own samples are
