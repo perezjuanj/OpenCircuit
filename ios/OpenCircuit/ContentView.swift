@@ -478,12 +478,13 @@ struct ContentView: View {
             .sheet(isPresented: $showProbeShareSheet) {
                 if let url = probeExportURL { ShareActivityView(url: url) }
             }
-            // Deep links, hoisted to the TabView so they land whichever tab is showing. Two hosts
+            // Deep links, hoisted to the TabView so they land whichever tab is showing. Three hosts
             // share the app's single registered scheme: `opencircuit://workout/active` (the workout
-            // Live Activity's tap target) and `opencircuit://headache/log?when=…` (the Control
-            // Centre / Lock Screen control). Workout is checked first and the headache handler is
-            // the fall-through, matching the order the parsers are strict in — each returns
-            // nil/false for anything that isn't its own link, so neither can swallow the other's.
+            // Live Activity's tap target), `opencircuit://today[/sleep|/recovery|/strain|/sources]`
+            // (the Today scores widgets, #398) and `opencircuit://headache/log?when=…` (the Control
+            // Centre / Lock Screen control). Workout is checked first, then the scores link, and the
+            // headache handler is the fall-through. Each parser is strict and returns nil/false for
+            // anything that isn't its own link, so none can swallow another's.
             .onOpenURL { url in
                 if WorkoutQuickLink.isActiveSession(url) {
                     handleActiveWorkoutLink()
@@ -1436,6 +1437,19 @@ struct ContentView: View {
         workoutManager.discardPendingReadings()   // 84l: an indoor run's readings go with it
     }
 
+    // MARK: - Today scores widget deep link (#398)
+
+    /// A tap on a Today scores widget (#398): the dial's own screen, as the card's dial opens it.
+    private func handleScoresLink(_ route: ScoresQuickLink.Route) {
+        switch ScoresQuickLink.destination(route) {
+        case .sleepTab:
+            selectedTab = .sleep
+        case let .today(stack):
+            selectedTab = .today
+            path = stack
+        }
+    }
+
     // MARK: - Headache quick-log deep link (#183)
 
     /// Handle `opencircuit://headache/log?when=…`, opened by the Control Centre / Lock Screen
@@ -1451,17 +1465,6 @@ struct ContentView: View {
     /// hours into the existing entry rather than creating a second row for one headache. It also
     /// flips `HeadacheDefaults.enabled` on once the row is stored, so the log the user just wrote to
     /// is actually reachable in the UI.
-    /// A tap on a Today scores widget (#398): the dial's own screen, as the card's dial opens it.
-    private func handleScoresLink(_ route: ScoresQuickLink.Route) {
-        switch ScoresQuickLink.destination(route) {
-        case .sleepTab:
-            selectedTab = .sleep
-        case let .today(stack):
-            selectedTab = .today
-            path = stack
-        }
-    }
-
     @MainActor
     private func handleQuickLogLink(_ url: URL) {
         guard let when = HeadacheQuickLink.parse(url) else { return }

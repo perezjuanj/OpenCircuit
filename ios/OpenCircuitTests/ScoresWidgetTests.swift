@@ -225,6 +225,67 @@ final class ScoresWidgetTests: XCTestCase {
         XCTAssertTrue(TodayScoresWords.footer.contains("not medical advice"))
     }
 
+    // MARK: The widget draws what was stored
+
+    /// SF-2: a value that disagrees with its fill. Computing either from the other would show here; the
+    /// parity test can't tell, because a real snapshot's fill is exactly its score / 100.
+    func testWidgetDrawsTheStoredValueAndFillNeverOneFromTheOther() throws {
+        func dial(_ value: String?, _ fill: Double?, _ tint: ScoresWidgetSnapshot.Tint) -> ScoresWidgetSnapshot.Dial {
+            .init(value: value, fill: fill, status: "Stored status", tint: tint, dashed: false, spoken: "Stored words")
+        }
+        let snap = ScoresWidgetSnapshot(version: ScoresWidgetSnapshot.currentVersion, writtenAt: noon,
+                                        sleep: dial("81", 0.5, .sleep), recovery: dial("40", 0.9, .recoveryGood),
+                                        strain: dial("12.4", 0.25, .strain))
+        let decoded = try XCTUnwrap(ScoresWidgetCodec.decode(try XCTUnwrap(ScoresWidgetCodec.encode(snap))))
+        let d = ScoresWidgetDisplay.make(decoded, now: noon + 60, calendar: cal)
+        XCTAssertEqual(d.dials.map(\.value), ["81", "40", "12.4"])
+        XCTAssertEqual(d.dials.map(\.fill), [0.5, 0.9, 0.25])
+        XCTAssertEqual(d.dials.map(\.status), ["Stored status", "Stored status", "Stored status"])
+        XCTAssertEqual(d.dials.map(\.spoken), ["Stored words", "Stored words", "Stored words"])
+        XCTAssertEqual(d.dials.map(\.tint), [.sleep, .recoveryGood, .strain])
+    }
+
+    // MARK: Stale is drawn as stale
+
+    /// SF-3: the dimming is decided once, in `ScoresShared`, and every dial carries it.
+    func testOnlyAStaleSnapshotIsDimmed() throws {
+        let stale = try roundTrip(allStates[0], at: noon, viewedAt: noon + 5 * 3600)
+        XCTAssertTrue(stale.isDimmed)
+        XCTAssertTrue(stale.dials.allSatisfy(\.isDimmed))
+        XCTAssertTrue(ScoresWidgetDial.Kind.allCases.allSatisfy { stale.dial($0).isDimmed })
+        for viewedAt in [noon + 60, noon + 86_400] {
+            let d = try roundTrip(allStates[0], at: noon, viewedAt: viewedAt)
+            XCTAssertFalse(d.isDimmed)
+            XCTAssertFalse(d.dials.contains(where: \.isDimmed))
+        }
+        XCTAssertFalse(ScoresWidgetDisplay.make(nil, now: noon, calendar: cal).dials.contains(where: \.isDimmed))
+    }
+
+    /// SF-3: every size draws a stale snapshot differently from the same snapshot while current. The
+    /// lock-screen circle shows it by dimming alone, so a view that ignores staleness renders identically.
+    @MainActor
+    func testEveryWidgetSizeDrawsStaleDifferently() throws {
+        let current = try roundTrip(allStates[0], at: noon, viewedAt: noon + 60)
+        let stale = try roundTrip(allStates[0], at: noon, viewedAt: noon + 5 * 3600)
+        XCTAssertEqual(current.dials.map(\.value), stale.dials.map(\.value))
+        func png(_ view: some View, _ w: CGFloat, _ h: CGFloat) throws -> Data {
+            let renderer = ImageRenderer(content: view.frame(width: w, height: h))
+            renderer.scale = 2
+            return try XCTUnwrap(renderer.uiImage?.pngData())
+        }
+        XCTAssertNotEqual(try png(ScoresWidgetSmallView(display: current), 140, 140),
+                          try png(ScoresWidgetSmallView(display: stale), 140, 140), "small")
+        XCTAssertNotEqual(try png(ScoresWidgetMediumView(display: current), 330, 140),
+                          try png(ScoresWidgetMediumView(display: stale), 330, 140), "medium")
+        XCTAssertNotEqual(try png(ScoresWidgetRectangularView(display: current), 172, 76),
+                          try png(ScoresWidgetRectangularView(display: stale), 172, 76), "rectangular")
+        XCTAssertNotNil(stale.asOf, "the rectangular widget's visible mark")
+        for kind in ScoresWidgetDial.Kind.allCases {
+            XCTAssertNotEqual(try png(ScoresWidgetCircularView(dial: current.dial(kind)), 76, 76),
+                              try png(ScoresWidgetCircularView(dial: stale.dial(kind)), 76, 76), "circle \(kind)")
+        }
+    }
+
     // MARK: Deep links
 
     func testDeepLinksOpenEachDialsScreen() throws {
@@ -269,8 +330,10 @@ final class ScoresWidgetTests: XCTestCase {
                     XCTAssertFalse(code.contains(banned), "\(folder)/\(name) mentions \(banned)")
                 }
                 // No arithmetic turns a stored value into a number: the value is drawn as stored text.
-                XCTAssertFalse(code.contains("Int(dial.value") || code.contains("Double(dial.value")
-                               || code.contains("/ 100"), "\(folder)/\(name) derives a number")
+                let compact = code.replacingOccurrences(of: " ", with: "")
+                XCTAssertFalse(compact.contains("Int(dial.value") || compact.contains("Double(dial.value")
+                               || compact.contains("/100") || compact.contains("*100"),
+                               "\(folder)/\(name) derives a number")
                 checked += 1
             }
         }

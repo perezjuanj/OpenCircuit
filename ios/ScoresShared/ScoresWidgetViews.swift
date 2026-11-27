@@ -22,6 +22,9 @@ struct ScoresWidgetDial: Equatable, Identifiable {
     let tint: ScoresWidgetSnapshot.Tint
     let dashed: Bool
     let spoken: String
+    /// Drawn dimmed: the value is today's but older than `ScoresWidgetFreshness.staleAfter`. Set only
+    /// by `ScoresWidgetDisplay.make` from `ScoresWidgetDisplay.isDimmed`, so no view decides it.
+    var isDimmed = false
 
     var id: Kind { kind }
     var isMissing: Bool { value == TodayScoresWords.missing }
@@ -43,6 +46,10 @@ struct ScoresWidgetDisplay: Equatable {
 
     static let notUpdatedToday = "Open to update"
     static let neverWritten = "Open the app"
+
+    /// A stale snapshot is drawn dimmed, on every size; the home-screen footer and the rectangular
+    /// lock-screen widget also show `asOf`, so stale is never marked by opacity alone there.
+    var isDimmed: Bool { freshness == .stale }
 
     func dial(_ kind: ScoresWidgetDial.Kind) -> ScoresWidgetDial {
         dials.first { $0.kind == kind } ?? dials[0]
@@ -66,7 +73,9 @@ struct ScoresWidgetDisplay: Equatable {
         }
         let dials = [dial(.sleep, snapshot.sleep, asOf: asOf), dial(.recovery, snapshot.recovery, asOf: asOf),
                      dial(.strain, snapshot.strain, asOf: asOf)]
-        return ScoresWidgetDisplay(dials: dials, freshness: freshness, asOf: asOf)
+        let display = ScoresWidgetDisplay(dials: dials, freshness: freshness, asOf: asOf)
+        return ScoresWidgetDisplay(dials: dials.map { var d = $0; d.isDimmed = display.isDimmed; return d },
+                                   freshness: freshness, asOf: asOf)
     }
 
     private static func label(_ kind: ScoresWidgetDial.Kind) -> String {
@@ -123,7 +132,6 @@ enum ScoresWidgetPalette {
 struct ScoresWidgetRing: View {
     let dial: ScoresWidgetDial
     let lineWidth: CGFloat
-    var dimmed = false
     var showsLabelInside = false
 
     var body: some View {
@@ -148,6 +156,8 @@ struct ScoresWidgetRing: View {
                     .minimumScaleFactor(0.05)
                     .lineLimit(1)
                     .foregroundStyle(dial.isMissing ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
+                    // Health scores: iOS may redact them while the phone is locked.
+                    .privacySensitive()
                 if showsLabelInside {
                     Text(dial.label.prefix(1) + dial.label.dropFirst().lowercased())
                         .font(.system(size: 9, weight: .medium))
@@ -160,7 +170,7 @@ struct ScoresWidgetRing: View {
             .padding(showsLabelInside ? lineWidth * 2.4 : lineWidth * 1.3)
         }
         .padding(lineWidth / 2)
-        .opacity(dimmed ? 0.55 : 1)
+        .opacity(dial.isDimmed ? 0.55 : 1)
     }
 }
 
@@ -169,11 +179,10 @@ private struct ScoresWidgetColumn: View {
     let dial: ScoresWidgetDial
     let ringSize: CGFloat
     let lineWidth: CGFloat
-    let dimmed: Bool
 
     var body: some View {
         VStack(spacing: 3) {
-            ScoresWidgetRing(dial: dial, lineWidth: lineWidth, dimmed: dimmed)
+            ScoresWidgetRing(dial: dial, lineWidth: lineWidth)
                 .frame(width: ringSize, height: ringSize)
             Text(dial.label)
                 .font(.system(size: 9, weight: .semibold)).tracking(0.4)
@@ -185,6 +194,8 @@ private struct ScoresWidgetColumn: View {
                 .multilineTextAlignment(.center)
                 .lineLimit(2).minimumScaleFactor(0.75)
                 .fixedSize(horizontal: false, vertical: true)
+                // Time asleep and the like: redactable while locked, as the value is.
+                .privacySensitive()
         }
         .frame(maxWidth: .infinity, alignment: .top)
         .accessibilityElement(children: .ignore)
@@ -222,7 +233,7 @@ struct ScoresWidgetSmallView: View {
         VStack(spacing: 6) {
             HStack(alignment: .top, spacing: 4) {
                 ForEach(display.dials) {
-                    ScoresWidgetColumn(dial: $0, ringSize: 42, lineWidth: 4.5, dimmed: display.freshness == .stale)
+                    ScoresWidgetColumn(dial: $0, ringSize: 42, lineWidth: 4.5)
                 }
             }
             Spacer(minLength: 0)
@@ -241,8 +252,7 @@ struct ScoresWidgetMediumView: View {
             HStack(alignment: .top, spacing: 8) {
                 ForEach(display.dials) { dial in
                     Link(destination: ScoresQuickLink.url(dial.route)) {
-                        ScoresWidgetColumn(dial: dial, ringSize: 64, lineWidth: 6,
-                                           dimmed: display.freshness == .stale)
+                        ScoresWidgetColumn(dial: dial, ringSize: 64, lineWidth: 6)
                     }
                 }
             }
@@ -260,23 +270,33 @@ struct ScoresWidgetMediumView: View {
     }
 }
 
-/// Lock screen, rectangular: the three dials in a row, labels under them. Opens Today.
+/// Lock screen, rectangular: the three dials in a row, labels under them, and the "As of" time when
+/// the snapshot is stale (the lock screen's tinted mode may flatten the dimming). Opens Today.
 struct ScoresWidgetRectangularView: View {
     let display: ScoresWidgetDisplay
 
     var body: some View {
-        HStack(spacing: 6) {
-            ForEach(display.dials) { dial in
-                VStack(spacing: 1) {
-                    ScoresWidgetRing(dial: dial, lineWidth: 3.5, dimmed: display.freshness == .stale)
-                        .frame(width: 44, height: 44)
-                    Text(dial.label)
-                        .font(.system(size: 8, weight: .semibold))
-                        .lineLimit(1).minimumScaleFactor(0.6)
+        let ring: CGFloat = display.asOf == nil ? 44 : 36
+        VStack(spacing: 1) {
+            HStack(spacing: 6) {
+                ForEach(display.dials) { dial in
+                    VStack(spacing: 1) {
+                        ScoresWidgetRing(dial: dial, lineWidth: 3.5)
+                            .frame(width: ring, height: ring)
+                        Text(dial.label)
+                            .font(.system(size: 8, weight: .semibold))
+                            .lineLimit(1).minimumScaleFactor(0.6)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(dial.spoken)
                 }
-                .frame(maxWidth: .infinity)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(dial.spoken)
+            }
+            if let asOf = display.asOf {
+                Text(asOf)
+                    .font(.system(size: 9, weight: .semibold))
+                    .lineLimit(1).minimumScaleFactor(0.7)
+                    .accessibilityHidden(true)
             }
         }
         .accessibilityElement(children: .combine)
@@ -288,10 +308,9 @@ struct ScoresWidgetRectangularView: View {
 /// Lock screen, circular: one score, opening its own screen.
 struct ScoresWidgetCircularView: View {
     let dial: ScoresWidgetDial
-    let stale: Bool
 
     var body: some View {
-        ScoresWidgetRing(dial: dial, lineWidth: 4.5, dimmed: stale, showsLabelInside: true)
+        ScoresWidgetRing(dial: dial, lineWidth: 4.5, showsLabelInside: true)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(dial.spoken)
             .accessibilityHint("On-device estimate, not medical advice")

@@ -98,7 +98,7 @@ private enum ScoreDial {
         case .strain:   (widgetKind, name) = (ScoresWidgetKind.strain, "Strain")
         }
         return StaticConfiguration(kind: widgetKind, provider: ScoresProvider()) { entry in
-            ScoresWidgetCircularView(dial: entry.display.dial(kind), stale: entry.display.freshness == .stale)
+            ScoresWidgetCircularView(dial: entry.display.dial(kind))
                 .containerBackground(.fill.tertiary, for: .widget)
         }
         .configurationDisplayName(name)

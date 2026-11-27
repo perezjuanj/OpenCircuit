@@ -21,12 +21,26 @@ struct DemoScoresWidgets: View {
                         HStack(spacing: 12) {
                             lock(ScoresWidgetRectangularView(display: sample.display), width: 172, height: 76)
                             ForEach(ScoresWidgetDial.Kind.allCases, id: \.self) { kind in
-                                lock(ScoresWidgetCircularView(dial: sample.display.dial(kind),
-                                                              stale: sample.display.freshness == .stale),
-                                     width: 76, height: 76)
+                                lock(ScoresWidgetCircularView(dial: sample.display.dial(kind)), width: 76, height: 76)
                             }
                         }
                     }
+                    // N-3: the values and status lines are `.privacySensitive()`; this is how iOS draws
+                    // them when it redacts a locked screen.
+                    let scored = Self.samples()[0].display
+                    Text("Locked: privacy redaction").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                    HStack(alignment: .top, spacing: 12) {
+                        tile(ScoresWidgetSmallView(display: scored), width: 170, height: 170)
+                        VStack(alignment: .leading, spacing: 12) {
+                            lock(ScoresWidgetRectangularView(display: scored), width: 172, height: 76)
+                            HStack(spacing: 12) {
+                                ForEach(ScoresWidgetDial.Kind.allCases, id: \.self) { kind in
+                                    lock(ScoresWidgetCircularView(dial: scored.dial(kind)), width: 76, height: 76)
+                                }
+                            }
+                        }
+                    }
+                    .redacted(reason: .privacy)
                 }
                 .padding()
             }
@@ -36,7 +50,7 @@ struct DemoScoresWidgets: View {
         .background(Theme.pageBackground)
     }
 
-    private static let scale: CGFloat = 0.72
+    private static let scale: CGFloat = 0.58
 
     private func tile(_ content: some View, width: CGFloat, height: CGFloat) -> some View {
         content.padding(16).frame(width: width, height: height)
