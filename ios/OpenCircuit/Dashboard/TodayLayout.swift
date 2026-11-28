@@ -15,8 +15,8 @@
 //   turning the feature back on shows the card.
 // - Hiding is display-only. The Today sentence's input is built here from the whole trends load, every
 //   tile included, whatever is hidden (`sentenceInput`), and the Vitals Status report that feeds it
-//   keeps running while its card is hidden (`vitalsReport`). Alerts, Health writes and background work
-//   never read these keys.
+//   (and Recovery) is computed once by `TodayVitalsRunner`, whatever the layout (decision 95a). Alerts,
+//   Health writes and background work never read these keys.
 // - A part of the layout left at its default is stored as "" (no override), so a later build's new ids
 //   land in their canonical place.
 
@@ -230,12 +230,6 @@ struct TodayLayout: Equatable {
                              readiness: readiness, feverSuspected: feverSuspected,
                              lastSyncAt: lastSyncAt, now: now)
     }
-
-    /// Where the Vitals Status card's report runs. Its fever verdict is one of the sentence's inputs,
-    /// so exactly one copy always runs: the card itself while shown, a hidden copy while it is hidden.
-    enum VitalsReport: Equatable { case card, hiddenRunner }
-
-    var vitalsReport: VitalsReport { isShown(.vitalsStatus) ? .card : .hiddenRunner }
 
     // MARK: Edits
 

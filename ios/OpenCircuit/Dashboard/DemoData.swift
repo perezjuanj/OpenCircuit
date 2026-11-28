@@ -21,7 +21,8 @@ enum DemoData {
     static var isRequested: Bool { UserDefaults.standard.bool(forKey: launchArgumentKey) }
 
     /// `-OCDemoScrollY <points>`: after launch, scroll the Today list down that far, so a
-    /// screenshot run can capture below the fold without UI automation.
+    /// screenshot run can capture below the fold without UI automation. With `-OCDemoScreen`, the
+    /// presented screen's list is scrolled instead (the Recovery detail's Vitals row at AX5).
     static let scrollKey = "OCDemoScrollY"
 
     /// `-OCDemoStrapSwitch YES` (#239): on top of the ring demo, a SYNTHETIC Helio Strap chosen at
@@ -251,11 +252,17 @@ enum DemoData {
         guard y > 0 else { return }
         // A lazy List only knows its full height once rows below the fold have loaded, so step
         // toward the target a few times, re-clamping to the (growing) content height each time.
-        for attempt in 0..<6 {
+        for attempt in 0..<10 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3 + Double(attempt) * 0.6) {
                 let windows = UIApplication.shared.connectedScenes
                     .compactMap { $0 as? UIWindowScene }.flatMap(\.windows)
-                guard let list = windows.lazy.compactMap({ firstVerticalScrollView(in: $0) }).first else { return }
+                // The frontmost presented screen first (a demo screen's sheet), else the window.
+                let fronts: [UIView] = windows.compactMap { w in
+                    var vc = w.rootViewController
+                    while let p = vc?.presentedViewController { vc = p }
+                    return vc?.view ?? w
+                }
+                guard let list = fronts.lazy.compactMap({ firstVerticalScrollView(in: $0) }).first else { return }
                 let maxY = max(list.contentSize.height - list.bounds.height + list.adjustedContentInset.bottom, 0)
                 list.setContentOffset(CGPoint(x: 0, y: min(y, maxY) - list.adjustedContentInset.top), animated: false)
             }
@@ -443,18 +450,21 @@ private struct DemoTodayScoresDetail: View {
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
     @State private var trends = TrendsData()
     @State private var loaded = false
+    @State private var vitals = TodayVitals.pending
 
     var body: some View {
         Group {
             if showsStrain {
                 StrainDetailView(reading: loaded ? trends.todayStrain : nil, onHeartRate: {})
             } else {
-                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: loaded) { scores in
+                // Today's one Vitals Status computation, as on Today, for Recovery's verdict.
+                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: loaded, vitals: vitals) { scores in
                     RecoveryDetailView(scores: scores,
                                        tiles: TodayTiles.build(points: trends.points, restingHR: trends.restingHR,
                                                                tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
                                                                scope: .from(trends)))
                 }
+                .background { TodayVitalsRunner(onChange: { vitals = $0 }) }
             }
         }
         .task {

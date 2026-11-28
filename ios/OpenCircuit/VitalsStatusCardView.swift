@@ -10,56 +10,30 @@ import OpenCircuitKit
 /// hardcoded "healthy" ranges, no fabricated values). It's an on-device estimate, labeled as such,
 /// and carries the medical disclaimer. Empty until enough nights/days of history accrue.
 struct VitalsStatusCardView: View {
-    /// ~32 days of readings — enough to fill the 30-day baseline window plus today. Read off the main
-    /// thread (`DashboardReads.vitalsHistory`, decision 75a): as three `@Query`s they re-fetched about
-    /// 36 k rows on the main thread on every store save. nil until the first read lands.
-    @State private var historyLoader = DashboardReadLoader<DashboardReads.VitalsHistory>("vitals")
-    private var history: DashboardReads.VitalsHistory? { historyLoader.value }
-    /// The start of the 32-day window, fixed when the view is built (as the `@Query` predicate was).
-    private let since: Date
-    @Environment(\.modelContext) private var modelContext
-    @Environment(\.storeRefreshSignal) private var injectedRefresh
-    private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
-    /// Trailing nights for the canonical skin-temp baseline/offset (#69).
-    @Query private var sleepNights: [StoredSleepSummary]
-    /// Decision 29: the Apple Health fallback keeps to the current device once a switch is on record.
-    private var healthBaselineReader: HealthKitVitalsBaselineReader {
-        let log = LocalStore.ownershipLog()
-        return HealthKitVitalsBaselineReader(device: log.isEmpty ? nil : log.currentFamily)
-    }
-    @State private var healthBaselineReport: HealthKitVitalsBaselineReader.Report?
-
-    /// The assembled report, held as STATE and recomputed off the render path in `.task(id:)` below.
-    /// It was a computed `var` read TWICE per `body` pass, so the full 32-day baseline analysis (incl.
-    /// the resting-HR derivation) ran ~2× on every SwiftUI invalidation — and, fatally, SYNCHRONOUSLY
-    /// inside the background scene-update layout when a workout's `stop()` batch-ingest invalidated the
-    /// @Query. That blew the 10 s scene-update watchdog (0x8BADF00D). As @State it renders instantly and
-    /// the analysis runs once per data change, OFF the main actor (snapshot → `Task.detached`, below).
-    @State private var report: VitalsBaseline.Report?
-
-    /// Identity for the recompute `.task`: changes only when an input that affects the report changes,
-    /// so the analysis re-runs on new data (not on every unrelated re-render).
-    private var reportInputsKey: String {
-        "\(history == nil ? "-" : "")\(history?.heartRate.count ?? 0)|\(history?.spo2.count ?? 0)|\(history?.hrv.count ?? 0)|"
-        + "\(sleepNights.first?.night.timeIntervalSince1970 ?? 0)|\(healthBaselineReport == nil ? 0 : 1)"
-    }
+    /// Where the card's report comes from: its own loader (every caller but Today), or a report Today's
+    /// one `VitalsStatusLoader` already computed (decision 95a: the card is display-only there, so the
+    /// verdict exists wherever the row is, built or not).
+    private let suppliedReport: VitalsBaseline.Report??
+    @State private var ownReport: VitalsBaseline.Report?
+    private var report: VitalsBaseline.Report? { suppliedReport ?? ownReport }
 
     /// User's temperature-unit preference (#83), so the skin-temp delta matches the rest of the app.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
-
-    private static let historyDays = 32
 
     /// Reports every recomputed report, so the Today synthesis line (#216) names possible fever signs
     /// only when this card does. nil while there isn't enough baseline history.
     var onReport: ((VitalsBaseline.Report?) -> Void)?
 
+    /// The card loads and computes its own report.
     init(onReport: ((VitalsBaseline.Report?) -> Void)? = nil) {
         self.onReport = onReport
-        since = Calendar.current.startOfDay(for: Date())
-            .addingTimeInterval(-Double(Self.historyDays) * 86_400)
-        var nights = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
-        nights.fetchLimit = 40
-        _sleepNights = Query(nights)
+        suppliedReport = nil
+    }
+
+    /// Display only: `report` was computed by a `VitalsStatusLoader` the caller owns. Runs no read.
+    init(report: VitalsBaseline.Report?) {
+        onReport = nil
+        suppliedReport = .some(report)
     }
 
     var body: some View {
@@ -97,50 +71,13 @@ struct VitalsStatusCardView: View {
             }
         }
         .ocCardSurface()
-        .task {
-            guard healthBaselineReport == nil else { return }
-            healthBaselineReport = try? await healthBaselineReader.loadReport(lookbackDays: Self.historyDays)
-        }
-        // Recompute the report OFF THE MAIN ACTOR whenever an input changes (0x8BADF00D fix). d338484
-        // moved this to `.task`, but a View's `.task` still runs on the MAIN actor — so a workout
-        // `stop()` ingest that invalidated the @Query still ran the full 32-day baseline analysis (the
-        // heaviest card: resting-HR derivation + per-vital stats + skin-temp baseline) on the main
-        // thread during the background scene-update snapshot, and the watchdog crash recurred. Snapshot
-        // the SwiftData rows + the Health fallback to Sendable value types HERE (main actor), then run
-        // the pure OpenCircuitKit math on `Task.detached` and publish the result back.
-        //
-        // Decision 75a/75b: the rows themselves are read off the main thread too, again whenever the
-        // store-change signal moves (throttled while a sync runs), and the ownership filter and the
-        // maps run on the detached task with the math.
-        .task(id: DashboardReadKey(version: refresh.version, bound: since)) {
-            let since = since
-            historyLoader.request(DashboardReadKey(version: refresh.version, bound: since),
-                                  container: modelContext.container) {
-                await DashboardReads.vitalsHistory(container: $0, since: since)
+        .background {
+            if suppliedReport == nil {
+                VitalsStatusLoader { result in
+                    ownReport = result.report
+                    onReport?(result.report)
+                }
             }
-        }
-        .task(id: reportInputsKey) {
-            guard let history else { return }
-            // Decision 29: "today" is the current device's, so its readings and nights are the only
-            // baseline (a new device shows "Building your baseline"). Every row with an empty log.
-            let log = LocalStore.ownershipLog()
-            let nights = Self.reportNights(sleepNights, log: log)
-            let fbRestingHR = healthBaselineReport?.restingHR.map { (day: $0.day, value: $0.value) }
-            let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
-            let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
-            let fbSkinTempOffsetC = healthBaselineReport?.skinTempOffsetC
-            report = await Task.detached {
-                let own = Self.ownSamples([history.heartRate, history.spo2, history.hrv,
-                                           history.restingHeartRate], log: log)
-                let hr = own[0].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-                let reported = own[3].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
-                let spo2 = own[1].map { (start: $0.start, value: $0.value) }
-                let hrv = own[2].map { (start: $0.start, value: $0.value) }
-                return Self.computeReport(hr: hr, restingReported: reported, spo2: spo2, hrv: hrv, nights: nights,
-                                          fallbackRestingHR: fbRestingHR, fallbackSpO2: fbSpO2,
-                                          fallbackHRV: fbHRV, fallbackSkinTempOffsetC: fbSkinTempOffsetC)
-            }.value
-            onReport?(report)
         }
     }
 
@@ -389,5 +326,158 @@ struct VitalsStatusCardView: View {
         case .overnightHRV: return String(format: "%+.0f ms vs your ~%.0f ms baseline.", signal.delta, base)
         case .none: return "Outside your usual range."
         }
+    }
+}
+
+/// The Vitals Status computation (#72), with no view of its own: the history read, the Apple Health
+/// fallback and the off-main analysis. `VitalsStatusCardView` embeds one; Today mounts exactly one
+/// outside its lazy list (decision 95a), so Recovery's verdict never depends on the card's row.
+struct VitalsStatusLoader: View {
+    /// ~32 days of readings — enough to fill the 30-day baseline window plus today. Read off the main
+    /// thread (`DashboardReads.vitalsHistory`, decision 75a): as three `@Query`s they re-fetched about
+    /// 36 k rows on the main thread on every store save. nil until the first read lands.
+    @State private var historyLoader = DashboardReadLoader<DashboardReads.VitalsHistory>("vitals")
+    private var history: DashboardReads.VitalsHistory? { historyLoader.value }
+    /// The start of the 32-day window, fixed when the view is built (as the `@Query` predicate was).
+    private let since: Date
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.storeRefreshSignal) private var injectedRefresh
+    private var refresh: StoreRefreshSignal { injectedRefresh ?? .shared }
+    /// Trailing nights for the canonical skin-temp baseline/offset (#69).
+    @Query private var sleepNights: [StoredSleepSummary]
+    /// The Apple Health fallback read and the start hook (tests inject both).
+    @Environment(\.vitalsStatusLoader) private var dependencies
+    @State private var healthBaselineReport: HealthKitVitalsBaselineReader.Report?
+
+    /// The Apple Health fallback has been tried (loaded or failed).
+    @State private var healthBaselineTried = false
+
+    /// The assembled report, held as STATE and recomputed off the render path in `.task(id:)` below.
+    /// It was a computed `var` read TWICE per `body` pass, so the full 32-day baseline analysis (incl.
+    /// the resting-HR derivation) ran ~2× on every SwiftUI invalidation — and, fatally, SYNCHRONOUSLY
+    /// inside the background scene-update layout when a workout's `stop()` batch-ingest invalidated the
+    /// @Query. That blew the 10 s scene-update watchdog (0x8BADF00D). As @State it renders instantly and
+    /// the analysis runs once per data change, OFF the main actor (snapshot → `Task.detached`, below).
+    @State private var report: VitalsBaseline.Report?
+
+    /// Identity for the recompute `.task`: changes only when an input that affects the report changes,
+    /// so the analysis re-runs on new data (not on every unrelated re-render).
+    private var reportInputsKey: String {
+        "\(history == nil ? "-" : "")\(history?.heartRate.count ?? 0)|\(history?.spo2.count ?? 0)|\(history?.hrv.count ?? 0)|"
+        + "\(sleepNights.first?.night.timeIntervalSince1970 ?? 0)|\(healthBaselineReport == nil ? 0 : 1)\(healthBaselineTried ? 1 : 0)"
+    }
+
+    private static let historyDays = 32
+
+    /// One computed report. `isComplete` once the Apple Health fallback has been tried too (loaded or
+    /// failed), so a caller can wait for the report that won't change for lack of that fallback.
+    struct Result: Equatable {
+        var report: VitalsBaseline.Report?
+        var isComplete: Bool
+    }
+
+    /// Every recomputed report. nil while there isn't enough baseline history.
+    let onResult: (Result) -> Void
+
+    init(onResult: @escaping (Result) -> Void) {
+        self.onResult = onResult
+        since = Calendar.current.startOfDay(for: Date())
+            .addingTimeInterval(-Double(Self.historyDays) * 86_400)
+        var nights = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
+        nights.fetchLimit = 40
+        _sleepNights = Query(nights)
+    }
+
+    var body: some View {
+        Color.clear
+            .accessibilityHidden(true)
+            .allowsHitTesting(false)
+            .onAppear { dependencies.onStart?() }
+        .task {
+            guard healthBaselineReport == nil else { return }
+            // Decision 29: the Apple Health fallback keeps to the current device once a switch is on record.
+            let log = LocalStore.ownershipLog()
+            let fallback = try? await dependencies.healthFallback(log.isEmpty ? nil : log.currentFamily, Self.historyDays)
+            // A read cut short by leaving the screen hasn't been tried: it runs again when the loader reappears.
+            guard !Task.isCancelled else { return }
+            healthBaselineReport = fallback
+            healthBaselineTried = true
+        }
+        // Recompute the report OFF THE MAIN ACTOR whenever an input changes (0x8BADF00D fix). d338484
+        // moved this to `.task`, but a View's `.task` still runs on the MAIN actor — so a workout
+        // `stop()` ingest that invalidated the @Query still ran the full 32-day baseline analysis (the
+        // heaviest card: resting-HR derivation + per-vital stats + skin-temp baseline) on the main
+        // thread during the background scene-update snapshot, and the watchdog crash recurred. Snapshot
+        // the SwiftData rows + the Health fallback to Sendable value types HERE (main actor), then run
+        // the pure OpenCircuitKit math on `Task.detached` and publish the result back.
+        //
+        // Decision 75a/75b: the rows themselves are read off the main thread too, again whenever the
+        // store-change signal moves (throttled while a sync runs), and the ownership filter and the
+        // maps run on the detached task with the math.
+        .task(id: DashboardReadKey(version: refresh.version, bound: since)) {
+            let since = since
+            historyLoader.request(DashboardReadKey(version: refresh.version, bound: since),
+                                  container: modelContext.container) {
+                await DashboardReads.vitalsHistory(container: $0, since: since)
+            }
+        }
+        .task(id: reportInputsKey) {
+            guard let history else { return }
+            // Whether THIS analysis has the fallback, fixed before it runs: the live flag may change while
+            // the detached work is in flight, and that change starts a newer analysis anyway.
+            let complete = healthBaselineTried
+            // Decision 29: "today" is the current device's, so its readings and nights are the only
+            // baseline (a new device shows "Building your baseline"). Every row with an empty log.
+            let log = LocalStore.ownershipLog()
+            let nights = VitalsStatusCardView.reportNights(sleepNights, log: log)
+            let fbRestingHR = healthBaselineReport?.restingHR.map { (day: $0.day, value: $0.value) }
+            let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
+            let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
+            let fbSkinTempOffsetC = healthBaselineReport?.skinTempOffsetC
+            let beforeAnalysis = dependencies.beforeAnalysis
+            let computed = await Task.detached {
+                if let beforeAnalysis { await beforeAnalysis(complete) }
+                let own = VitalsStatusCardView.ownSamples([history.heartRate, history.spo2, history.hrv,
+                                           history.restingHeartRate], log: log)
+                let hr = own[0].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+                let reported = own[3].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
+                let spo2 = own[1].map { (start: $0.start, value: $0.value) }
+                let hrv = own[2].map { (start: $0.start, value: $0.value) }
+                return VitalsStatusCardView.computeReport(hr: hr, restingReported: reported, spo2: spo2, hrv: hrv, nights: nights,
+                                          fallbackRestingHR: fbRestingHR, fallbackSpO2: fbSpO2,
+                                          fallbackHRV: fbHRV, fallbackSkinTempOffsetC: fbSkinTempOffsetC)
+            }.value
+            // Superseded (an input changed, so a newer analysis is running) or the loader left the screen:
+            // the detached work isn't cancelled with this task, so drop its result rather than publish it.
+            guard !Task.isCancelled else { return }
+            report = computed
+            onResult(Result(report: computed, isComplete: complete))
+        }
+    }
+}
+
+/// `VitalsStatusLoader`'s two outside dependencies, injectable through the environment (#396 review round 2).
+/// The app uses the defaults: Apple Health for the fallback, and no start hook.
+struct VitalsStatusLoaderDependencies {
+    /// Reads the Apple Health fallback for the current device (nil: no switch on record), over `lookbackDays`.
+    var healthFallback: @Sendable (_ device: DeviceOwnershipLog.Family?, _ lookbackDays: Int) async throws
+        -> HealthKitVitalsBaselineReader.Report = { device, lookbackDays in
+            try await HealthKitVitalsBaselineReader(device: device).loadReport(lookbackDays: lookbackDays)
+        }
+    /// Called each time a loader appears and starts its reads, so a test can count the copies running.
+    var onStart: (@MainActor () -> Void)?
+    /// Awaited at the start of each off-main analysis, with whether it has the fallback, so a test can hold
+    /// one in flight while the fallback lands. Nil in the app.
+    var beforeAnalysis: (@Sendable (_ hasFallback: Bool) async -> Void)?
+}
+
+private struct VitalsStatusLoaderKey: EnvironmentKey {
+    static let defaultValue = VitalsStatusLoaderDependencies()
+}
+
+extension EnvironmentValues {
+    var vitalsStatusLoader: VitalsStatusLoaderDependencies {
+        get { self[VitalsStatusLoaderKey.self] }
+        set { self[VitalsStatusLoaderKey.self] = newValue }
     }
 }

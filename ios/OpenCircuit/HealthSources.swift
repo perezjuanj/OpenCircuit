@@ -82,6 +82,9 @@ enum HealthSources {
     private static let borresen = HealthCitation(
         "Borresen J, Lambert MI (2009). The quantification of training load, the training response and the effect on performance. Sports Medicine 39(9):779–795. (Describes Edwards' heart-rate-zone training impulse, TRIMP.)",
         doi: "10.2165/11317780-000000000-00000")
+    private static let nanchen = HealthCitation(
+        "Nanchen D (2018). Resting heart rate: what is normal? Heart 104(13):1048–1049.",
+        doi: "10.1136/heartjnl-2017-312731")
     private static let smarr = HealthCitation(
         "Smarr BL et al. (2020). Feasibility of continuous fever monitoring using wearable devices. Scientific Reports 10:21640.",
         doi: "10.1038/s41598-020-78355-6")
@@ -104,11 +107,7 @@ enum HealthSources {
             method: "On a day your strap reports its own resting heart rate, that value is used. Otherwise it's "
                 + "worked out from your heart rate at rest: the average while you sleep, or the day's lowest "
                 + "sustained heart rate. A day without enough readings has no value.",
-            citations: [
-                HealthCitation(
-                    "Nanchen D (2018). Resting heart rate: what is normal? Heart 104(13):1048–1049.",
-                    doi: "10.1136/heartjnl-2017-312731"),
-            ]),
+            citations: [nanchen]),
         // HRV.swift, OvernightAverages.swift
         HealthSource(
             topic: .hrv, title: "Heart rate variability (HRV)",
@@ -159,13 +158,18 @@ enum HealthSources {
                 + "OpenCircuit's own choices, not published figures. Bedtime is your wake time minus need "
                 + "and the time you usually take to fall asleep.",
             citations: [vanDongen, kitamura, hirshkowitz, watson]),
-        // SleepStress.swift, WellnessBalance.swift, BaselineTrend.swift
+        // SleepStress.swift, WellnessBalance.swift, BaselineTrend.swift, VitalsBaseline.swift
         HealthSource(
             topic: .readiness, title: "Overnight stress and recovery",
             method: "Overnight stress is read from your sleeping HRV: lower HRV than usual reads as more "
-                + "stress. Recovery combines last night's sleep score with overnight stress, with OpenCircuit's "
-                + "own weighting. It is not a published or clinically validated score; the sources cover its inputs.",
-            citations: [shaffer, taskForce, hirshkowitz]),
+                + "stress. Recovery combines last night's sleep score with overnight stress and, once Vitals "
+                + "Status has a verdict, with your vitals against your own range. Vitals Status is OpenCircuit's "
+                + "own comparison of your resting heart rate, overnight SpO₂, overnight HRV and skin temperature "
+                + "with your recent range, described under \"Skin temperature, vitals status and fever signs\". "
+                + "Until it has a verdict, Recovery uses the first two alone. The weighting is OpenCircuit's own, "
+                + "and it is not a published or clinically validated score. The sources below cover sleep "
+                + "duration, HRV, resting heart rate and skin temperature.",
+            citations: [shaffer, taskForce, hirshkowitz, nanchen, smarr]),
         // Strain.swift, DailyStrain.swift, TrainingLoad.swift
         HealthSource(
             topic: .strain, title: "Strain and training load",

@@ -109,13 +109,15 @@ public enum WellnessBalance {
 
     // MARK: - Recovery (#391, decision 93a)
 
-    /// Recovery, the middle score of Today's card: last night's sleep score and overnight recovery
-    /// (sleeping HRV, through overnight stress) at the existing weights. No activity and no vitals, so
-    /// it is fixed once last night is scored and never dips in the morning or double-counts strain.
-    /// It is `anchoredScore` over exactly those two inputs: nil without a sleep score, and low
-    /// confidence (`factors.count <= 1`) when it rests on sleep alone. Pure; unit-tested.
-    public static func recoveryScore(sleepScore: Int?, overnightStress: Int?) -> Result? {
-        anchoredScore(.init(sleepScore: sleepScore, overnightStress: overnightStress))
+    /// Recovery, the middle score of Today's card: last night's sleep score, overnight recovery
+    /// (sleeping HRV, through overnight stress) and, when it has a verdict, Vitals Status against the
+    /// person's own baseline (#396, decision 95a), at the existing weights. No activity, so it never
+    /// dips through the day or double-counts strain. It is `anchoredScore` over exactly those inputs:
+    /// nil without a sleep score. A missing verdict is dropped, not scored as 0, so `vitalsStatus: nil`
+    /// is exactly the two-factor score. Pure; unit-tested.
+    public static func recoveryScore(sleepScore: Int?, overnightStress: Int?,
+                                     vitalsStatus: VitalsBaseline.Status? = nil) -> Result? {
+        anchoredScore(.init(sleepScore: sleepScore, overnightStress: overnightStress, vitalsStatus: vitalsStatus))
     }
 
     /// What each Recovery input counts for, in whole percent, computed from `factorWeights` so the
@@ -134,6 +136,28 @@ public enum WellnessBalance {
         let s = factorWeights[.sleep] ?? 0, r = factorWeights[.recovery] ?? 0
         let sleep = s + r > 0 ? Int((s / (s + r) * 100).rounded()) : 0
         return RecoveryShares(sleep: sleep, hrv: 100 - sleep)
+    }
+
+    /// The three Recovery shares when Vitals Status has a verdict, in whole percent from the same
+    /// `factorWeights`. Sleep and HRV are rounded, vitals takes the rest, so the three sum to 100.
+    public struct RecoveryVitalsShares: Equatable, Sendable {
+        public let sleep: Int
+        public let hrv: Int
+        public let vitals: Int
+
+        public init(sleep: Int, hrv: Int, vitals: Int) {
+            self.sleep = sleep
+            self.hrv = hrv
+            self.vitals = vitals
+        }
+    }
+
+    public static var recoveryVitalsShares: RecoveryVitalsShares {
+        let s = factorWeights[.sleep] ?? 0, r = factorWeights[.recovery] ?? 0, v = factorWeights[.vitals] ?? 0
+        let total = s + r + v
+        guard total > 0 else { return RecoveryVitalsShares(sleep: 0, hrv: 0, vitals: 0) }
+        let sleep = Int((s / total * 100).rounded()), hrv = Int((r / total * 100).rounded())
+        return RecoveryVitalsShares(sleep: sleep, hrv: hrv, vitals: 100 - sleep - hrv)
     }
 
     /// Vitals Status → recovery factor. A clean baseline is full credit; a "watch" halves it; an

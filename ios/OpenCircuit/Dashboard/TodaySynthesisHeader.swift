@@ -11,6 +11,8 @@ struct ReadinessReport: Equatable {
     var readiness: TodaySynthesis.Readiness
     /// Last night's asleep minutes, when a night that ended today is stored.
     var lastNightAsleepMin: Int?
+    /// Recovery counted vitals but no sleeping HRV: still low confidence (decision 95a).
+    var withoutSleepingHRV = false
 }
 
 extension TodaySynthesis {
@@ -45,7 +47,8 @@ extension TodaySynthesis {
                      hrv: direction(.hrv), restingHR: direction(.restingHR), skinTemp: direction(.skinTemp),
                      feverSuspected: feverSuspected,
                      lastNightSleepMinutes: readiness?.lastNightAsleepMin, usualSleepMinutes: usualSleep,
-                     newestDataAt: newest, now: now)
+                     newestDataAt: newest, now: now,
+                     withoutSleepingHRV: readiness?.withoutSleepingHRV ?? false)
     }
 }
 
