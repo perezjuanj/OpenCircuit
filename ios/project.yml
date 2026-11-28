@@ -14,7 +14,7 @@ options:
 settings:
   base:
     MARKETING_VERSION: "1.0.4"
-    CURRENT_PROJECT_VERSION: "108"
+    CURRENT_PROJECT_VERSION: "109"
     # THE App Group the app and the ScoresWidget extension share (#398): the one place it is named. It
     # fills both targets' application-groups entitlement and their `OCAppGroupIdentifier` Info.plist
     # key, which `ScoresWidgetAppGroup` reads at run time. It must exist in the developer portal and
