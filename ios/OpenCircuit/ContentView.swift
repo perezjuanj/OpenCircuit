@@ -645,6 +645,7 @@ struct ContentView: View {
     private var todayScoresCard: some View {
         TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded, vitals: todayVitals) { scores in
             TodayScoresCard(scores: scores, sentence: synthesisSentence(scores.report),
+                            briefFacts: synthesisInput(scores.report).flatMap(TodaySynthesis.briefFacts),
                             onSleep: { selectedTab = .sleep },
                             onRecovery: { path.append(.recovery) },
                             onStrain: { path.append(.strain) })
@@ -1098,13 +1099,20 @@ struct ContentView: View {
     private func synthesisSentence(_ report: ReadinessReport) -> String {
         // Before the first trends load there is nothing to judge — and "no ring data yet" would be
         // a false claim to a wearer who has plenty.
-        guard trendsHaveLoaded else { return "Gathering today's numbers…" }
+        guard let input = synthesisInput(report) else { return "Gathering today's numbers…" }
+        return TodaySynthesis.sentence(input)
+    }
+
+    /// The synthesis input for `report`; nil before the first trends load. Shared by the fixed
+    /// sentence and the on-device brief (`TodayBriefSentence`), so both speak about the same numbers.
+    private func synthesisInput(_ report: ReadinessReport) -> TodaySynthesis.Input? {
+        guard trendsHaveLoaded else { return nil }
         // Built from the whole trends load, whatever the Edit Today layout hides (decision 94c).
-        return TodaySynthesis.sentence(todayLayout.sentenceInput(trends: trends,
-                                                                 tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
-                                                                 readiness: report,
-                                                                 feverSuspected: vitalsFeverSuspected,
-                                                                 lastSyncAt: lastSyncAt))
+        return todayLayout.sentenceInput(trends: trends,
+                                         tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
+                                         readiness: report,
+                                         feverSuspected: vitalsFeverSuspected,
+                                         lastSyncAt: lastSyncAt)
     }
 
     /// The sections actually rendered right now — `sectionOrder` minus any feature-gated card that's

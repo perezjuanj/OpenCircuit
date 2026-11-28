@@ -437,6 +437,8 @@ private struct TodayScoresQuery<Content: View>: View {
 struct TodayScoresCard: View {
     let scores: TodayScores
     let sentence: String
+    /// Facts for the on-device brief (`TodayBriefSentence`); nil keeps the fixed sentence.
+    var briefFacts: SleepRecap.Facts? = nil
     var onSleep: () -> Void = {}
     var onRecovery: () -> Void = {}
     var onStrain: () -> Void = {}
@@ -482,12 +484,7 @@ struct TodayScoresCard: View {
                     .foregroundStyle(Theme.accent)
                     .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 3 }
                     .accessibilityHidden(true)
-                Text(sentence)
-                    .font(.callout.weight(.medium))
-                    .foregroundStyle(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .contentTransition(.opacity)
-                    .animation(.default, value: sentence)
+                TodayBriefSentence(sentence: sentence, briefFacts: briefFacts)
             }
 
             Button { showSources = true } label: {
