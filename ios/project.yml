@@ -15,6 +15,11 @@ settings:
   base:
     MARKETING_VERSION: "1.0.4"
     CURRENT_PROJECT_VERSION: "108"
+    # THE App Group the app and the ScoresWidget extension share (#398): the one place it is named. It
+    # fills both targets' application-groups entitlement and their `OCAppGroupIdentifier` Info.plist
+    # key, which `ScoresWidgetAppGroup` reads at run time. It must exist in the developer portal and
+    # be on both App IDs before a device or TestFlight build (see the PR's portal steps).
+    OC_APP_GROUP_ID: group.com.standardsoftwaresolutions.opencircuit
 
 packages:
   OpenCircuitKit:
@@ -50,6 +55,9 @@ targets:
       # Shared/ holds WorkoutActivityAttributes — the ActivityKit contract compiled into BOTH the
       # app (starts/updates the Live Activity) and the WorkoutWidget extension (renders it).
       - path: Shared
+      # ScoresShared/ is the Today scores widget's snapshot + drawing, compiled into BOTH the app (which
+      # writes the snapshot) and the ScoresWidget extension (which reads and draws it). #398.
+      - path: ScoresShared
     dependencies:
       - package: OpenCircuitKit
         product: OpenCircuitKit
@@ -65,6 +73,9 @@ targets:
         product: Liveline
       # Embed the Live Activity / Dynamic Island widget extension into the app's PlugIns.
       - target: WorkoutWidget
+        embed: true
+      # The Today scores widgets (home + lock screen, #398), drawn from the App Group snapshot.
+      - target: ScoresWidget
         embed: true
     info:
       path: OpenCircuit/Info.plist
@@ -143,6 +154,9 @@ targets:
         BGTaskSchedulerPermittedIdentifiers:
           - com.standardsoftwaresolutions.opencircuit.bgrefresh
           - com.standardsoftwaresolutions.opencircuit.bgprocessing
+        # The App Group the Today scores widget reads its snapshot from (#398). Filled from
+        # OC_APP_GROUP_ID at the top of this file; never type the group id anywhere else.
+        OCAppGroupIdentifier: "$(OC_APP_GROUP_ID)"
     # HealthKit entitlement enabled (2026-06-15) — signed under the paid Standard Software Solutions team
     # (DEVELOPMENT_TEAM below). The App ID com.standardsoftwaresolutions.opencircuit carries the HealthKit
     # capability in that account; automatic signing registers it on first build.
@@ -150,7 +164,8 @@ targets:
       path: OpenCircuit/OpenCircuit.entitlements
       # #233 (decision 33): HealthKit background delivery of the iPhone's step count, the strap's
       # second wake. An entitlement, not a background mode (decision 26 holds).
-      properties: { com.apple.developer.healthkit: true, com.apple.developer.healthkit.background-delivery: true }
+      # #398: the App Group shared with the ScoresWidget extension (OC_APP_GROUP_ID, top of this file).
+      properties: { com.apple.developer.healthkit: true, com.apple.developer.healthkit.background-delivery: true, com.apple.security.application-groups: ["$(OC_APP_GROUP_ID)"] }
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.standardsoftwaresolutions.opencircuit
@@ -207,6 +222,40 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 765RD9BJ8C
 
+  # The Today scores widgets (#398, decision 95c): Sleep, Recovery and Strain on the home screen (small,
+  # medium) and lock screen (rectangular, one circle per score). It READS the snapshot the app writes to
+  # the App Group and draws it: no OpenCircuitKit dependency on purpose, so it cannot compute a score
+  # (OpenCircuitTests/ScoresWidgetTests checks this target's sources and dependencies).
+  # SIGNING: same paid team as WorkoutWidget, set by the owner after creating the App Group, the
+  # extension's App ID and the profiles in the developer portal (portal steps in PR #402).
+  ScoresWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ScoresWidget
+      - path: ScoresShared
+    entitlements:
+      path: ScoresWidget/ScoresWidget.entitlements
+      properties: { com.apple.security.application-groups: ["$(OC_APP_GROUP_ID)"] }
+    info:
+      path: ScoresWidget/Info.plist
+      properties:
+        CFBundleDisplayName: OpenCircuit Scores
+        # MUST match the app's version/build (project-level settings), as for WorkoutWidget.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        OCAppGroupIdentifier: "$(OC_APP_GROUP_ID)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.standardsoftwaresolutions.opencircuit.ScoresWidget
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 765RD9BJ8C
+
   OpenCircuitTests:
     type: bundle.unit-test
     platform: iOS
@@ -231,6 +280,7 @@ schemes:
       targets:
         OpenCircuit: all
         WorkoutWidget: all
+        ScoresWidget: all
         OpenCircuitTests: [test]
     run:
       config: Debug

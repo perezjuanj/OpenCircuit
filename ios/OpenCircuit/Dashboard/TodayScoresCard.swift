@@ -190,12 +190,13 @@ struct TodayScores: Equatable {
 /// Every word the card shows or speaks (SCOPE §4.3), kept out of the views so a test pins each one.
 enum TodayScoresCopy {
     /// The ring's centre for a missing value: a dash, never a 0.
-    static let missing = "—"
+    static let missing = TodayScoresWords.missing
 
-    static let sleepLabel = "SLEEP"
-    static let recoveryLabel = "RECOVERY"
-    static let strainLabel = "STRAIN"
-    static let footer = "On-device estimates · not medical advice"
+    // Shared with the widget (`ScoresShared/`), so both say the same words.
+    static let sleepLabel = TodayScoresWords.sleepLabel
+    static let recoveryLabel = TodayScoresWords.recoveryLabel
+    static let strainLabel = TodayScoresWords.strainLabel
+    static let footer = TodayScoresWords.footer
     static let footerAccessibility = "On-device estimates, not medical advice. Sources and methods"
 
     static let sleepHint = "Opens Sleep"
@@ -462,7 +463,7 @@ struct TodayScoresCard: View {
                 column(stacked: stacked, label: TodayScoresCopy.recoveryLabel,
                        value: TodayScoresCopy.recoveryValue(scores.recovery),
                        status: TodayScoresCopy.recoveryStatus(scores.recovery),
-                       progress: scores.recovery.result.map { Double($0.score) / 100 },
+                       progress: scores.recoveryFill,
                        tint: scores.recovery.result?.tier.ringColor ?? Theme.readiness,
                        lowConfidence: scores.recovery.isLowConfidence,
                        accessibility: TodayScoresCopy.recoveryAccessibility(scores.recovery),
@@ -518,15 +519,9 @@ struct TodayScoresCard: View {
         }
     }
 
-    private var sleepProgress: Double? {
-        if case let .scored(score, _) = scores.sleep { return Double(score) / 100 }
-        return nil
-    }
+    private var sleepProgress: Double? { scores.sleepFill }
 
-    private var strainProgress: Double? {
-        if case let .scored(reading) = scores.strain { return reading.gaugeFraction }
-        return nil
-    }
+    private var strainProgress: Double? { scores.strainFill }
 
     private func column(stacked: Bool, label: String, value: String, status: String,
                         progress: Double?, tint: Color, lowConfidence: Bool,

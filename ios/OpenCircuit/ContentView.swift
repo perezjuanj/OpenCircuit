@@ -481,15 +481,18 @@ struct ContentView: View {
             .sheet(isPresented: $showProbeShareSheet) {
                 if let url = probeExportURL { ShareActivityView(url: url) }
             }
-            // Deep links, hoisted to the TabView so they land whichever tab is showing. Two hosts
+            // Deep links, hoisted to the TabView so they land whichever tab is showing. Three hosts
             // share the app's single registered scheme: `opencircuit://workout/active` (the workout
-            // Live Activity's tap target) and `opencircuit://headache/log?when=…` (the Control
-            // Centre / Lock Screen control). Workout is checked first and the headache handler is
-            // the fall-through, matching the order the parsers are strict in — each returns
-            // nil/false for anything that isn't its own link, so neither can swallow the other's.
+            // Live Activity's tap target), `opencircuit://today[/sleep|/recovery|/strain|/sources]`
+            // (the Today scores widgets, #398) and `opencircuit://headache/log?when=…` (the Control
+            // Centre / Lock Screen control). Workout is checked first, then the scores link, and the
+            // headache handler is the fall-through. Each parser is strict and returns nil/false for
+            // anything that isn't its own link, so none can swallow another's.
             .onOpenURL { url in
                 if WorkoutQuickLink.isActiveSession(url) {
                     handleActiveWorkoutLink()
+                } else if let route = ScoresQuickLink.parse(url) {
+                    handleScoresLink(route)
                 } else {
                     handleQuickLogLink(url)
                 }
@@ -649,8 +652,8 @@ struct ContentView: View {
                             onSleep: { selectedTab = .sleep },
                             onRecovery: { path.append(.recovery) },
                             onStrain: { path.append(.strain) })
-                .onAppear { todayScores = scores }
-                .onChange(of: scores) { _, new in todayScores = new }
+                .onAppear { todayScores = scores; ScoresWidgetPublisher.publish(scores) }
+                .onChange(of: scores) { _, new in todayScores = new; ScoresWidgetPublisher.publish(new) }
         }
     }
 
@@ -1175,6 +1178,8 @@ struct ContentView: View {
             }
         case .strain:
             StrainDetailView(reading: trends.todayStrain, onHeartRate: { path.append(.metric(.restingHR)) })
+        case .sources:
+            HealthSourcesView()
         }
     }
 
@@ -1441,6 +1446,19 @@ struct ContentView: View {
         recoverableWorkout = nil
         WorkoutSessionManager.clearSessionSnapshot()
         workoutManager.discardPendingReadings()   // 84l: an indoor run's readings go with it
+    }
+
+    // MARK: - Today scores widget deep link (#398)
+
+    /// A tap on a Today scores widget (#398): the dial's own screen, as the card's dial opens it.
+    private func handleScoresLink(_ route: ScoresQuickLink.Route) {
+        switch ScoresQuickLink.destination(route) {
+        case .sleepTab:
+            selectedTab = .sleep
+        case let .today(stack):
+            selectedTab = .today
+            path = stack
+        }
     }
 
     // MARK: - Headache quick-log deep link (#183)
@@ -3049,6 +3067,8 @@ enum Route: Hashable {
     case recovery
     /// Today's strain, from the scores card (decision 93).
     case strain
+    /// How the scores are worked out, from the scores widget's disclaimer (#398).
+    case sources
 
     /// Where the strap's Stress tile and its card reading go: today's stress chart (#239, steer 3).
     static let strapStress = Route.dayMetric(.stress)

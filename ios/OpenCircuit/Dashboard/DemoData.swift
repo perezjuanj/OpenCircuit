@@ -287,7 +287,7 @@ import SwiftUI
 
 /// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR |
 /// sources | sources-<topic> | helio-setup | helio-setup-full | zepp-signin | recovery | strain |
-/// today-scores-states | today-edit`
+/// today-scores-states | today-edit | widgets`
 /// presents that screen full-screen on launch, so a screenshot run can reach it without UI
 /// automation. `liveHR` renders the live-measure card's composition over a SYNTHETIC buffer — a
 /// simulator has no ring to measure.
@@ -353,6 +353,8 @@ struct DemoScreenModifier: ViewModifier {
             DemoSleepScoreSheet()
         } else if id == "sleep-need" {
             DemoSleepNeedSheet()
+        } else if id == "widgets" {
+            DemoScoresWidgets()
         } else if id == "recovery" || id == "strain" {
             DemoTodayScoresDetail(showsStrain: id == "strain")
         } else if id == "today-scores-states" {
