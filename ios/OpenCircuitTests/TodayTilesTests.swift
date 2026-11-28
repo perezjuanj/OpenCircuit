@@ -84,7 +84,7 @@ final class TodayTilesTests: XCTestCase {
         XCTAssertEqual(t.freshnessText(now: now, calendar: cal), "today")
         XCTAssertTrue(t.trendIsYesterday)
         XCTAssertEqual(t.trend?.direction, .above)
-        XCTAssertEqual(t.deltaText, "Yesterday +" + 4_000.formatted(.number) + " vs usual")
+        XCTAssertEqual(t.deltaText, "Yesterday " + 12_000.formatted(.number) + " · +" + 4_000.formatted(.number) + " vs usual")
         XCTAssertNil(t.values.last!, "today's partial total is not plotted")
         XCTAssertEqual(t.values[t.values.count - 2], 12_000)
     }
