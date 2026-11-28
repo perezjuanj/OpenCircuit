@@ -226,9 +226,8 @@ targets:
   # medium) and lock screen (rectangular, one circle per score). It READS the snapshot the app writes to
   # the App Group and draws it: no OpenCircuitKit dependency on purpose, so it cannot compute a score
   # (OpenCircuitTests/ScoresWidgetTests checks this target's sources and dependencies).
-  # SIGNING: deliberately no DEVELOPMENT_TEAM here. It builds unsigned for the simulator; the bundle id,
-  # App Group and profiles must be created in the developer portal and the team set by the owner before
-  # any device or TestFlight build (the PR lists the steps).
+  # SIGNING: same paid team as WorkoutWidget, set by the owner after creating the App Group, the
+  # extension's App ID and the profiles in the developer portal (portal steps in PR #402).
   ScoresWidget:
     type: app-extension
     platform: iOS
@@ -254,6 +253,8 @@ targets:
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 765RD9BJ8C
 
   OpenCircuitTests:
     type: bundle.unit-test
