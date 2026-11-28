@@ -152,8 +152,10 @@ final class RecoveryVerdictAgeTests: XCTestCase {
         // The night was filed in Zurich (its key is Zurich's midnight); the phone is now in New York.
         let zurich = calendar("Europe/Zurich"), newYork = calendar("America/New_York")
         let n = night(cal: zurich)
-        // Today recomputes the verdict in New York: a value keyed by that stored night reads as the date
-        // the key falls on there, and so does the sleep score's night. Same night: counted.
+        // A NIGHT-KEYED value (sleeping HRV, skin temperature) recomputed in New York reads as the date the key
+        // falls on there, and so does the sleep score's night: on its own, counted. Resting HR and SpO₂ are
+        // bucketed by their sample times in the new zone instead, so after a westward change a full verdict is
+        // NOT counted that day: `testAWestwardZoneChangeGivesTheTwoFactorScore` pins that.
         let recomputed = VitalsVerdictNights(days: [newYork.startOfDay(for: n.nightKey)], calendar: newYork)
         XCTAssertEqual(RecoveryVitalsAge.match(recomputed, sleepNightKey: n.nightKey, calendar: newYork), .sameNight)
         // A verdict still dated in Zurich, judged in New York before it is recomputed, reads as a later date
@@ -215,6 +217,108 @@ final class RecoveryVerdictAgeTests: XCTestCase {
         XCTAssertNil(undated.nights)
     }
 
+    /// Review round 1, F2: resting HR and SpO₂ are dated by the day they were judged. A newest day too thin
+    /// for a resting HR (`RestingHR.dayCoverage`) judges the day before's, so the verdict is partly earlier.
+    func testRestingHRAndSpO2AreDatedByTheDayTheyWereJudged() throws {
+        let cal = Calendar.current
+        let lastKey = cal.startOfDay(for: now)
+        let dayBefore = cal.date(byAdding: .day, value: -1, to: lastKey)!
+        var hr: [HRSample] = []
+        var spo2: [(start: Date, value: Double)] = []
+        for k in 0...8 {
+            let day = cal.date(byAdding: .day, value: -k, to: lastKey)!
+            // Every 15 min from 00:00 to 06:00, except the newest day: three readings in half an hour.
+            let readings = k == 0 ? 3 : 25
+            for i in 0..<readings {
+                hr.append(HRSample(bpm: 54 + i % 3, start: day.addingTimeInterval(Double(i) * 900 + 60)))
+            }
+            for i in 0..<6 { spo2.append((start: day.addingTimeInterval(Double(i) * 3600 + 120), value: 0.96 + Double(i % 2) * 0.01)) }
+        }
+        XCTAssertNil(VitalsStatusCardView.restingHRDaily(hr).first { $0.day == lastKey }, "the newest day is too thin")
+        let noNights: [(night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date)] = []
+        func dated(hr: [HRSample], spo2: [(start: Date, value: Double)]) throws -> VitalsStatusCardView.DatedReport {
+            try XCTUnwrap(VitalsStatusCardView.computeDatedReport(
+                hr: hr, spo2: spo2, hrv: [], nights: noNights, fallbackRestingHR: nil, fallbackSpO2: nil,
+                fallbackHRV: nil, fallbackSkinTempOffsetC: nil))
+        }
+        let restingAlone = try dated(hr: hr, spo2: [])
+        XCTAssertEqual(restingAlone.nights, VitalsVerdictNights(NightDate(dayBefore, calendar: cal)))
+        XCTAssertEqual(RecoveryVitalsAge.match(restingAlone.nights, sleepNightKey: lastKey, calendar: cal), .earlierNight)
+        let spo2Alone = try dated(hr: [], spo2: spo2)
+        XCTAssertEqual(spo2Alone.nights, VitalsVerdictNights(NightDate(lastKey, calendar: cal)))
+        XCTAssertEqual(RecoveryVitalsAge.match(spo2Alone.nights, sleepNightKey: lastKey, calendar: cal), .sameNight)
+        let both = try dated(hr: hr, spo2: spo2)
+        XCTAssertEqual(both.nights, VitalsVerdictNights(oldest: NightDate(dayBefore, calendar: cal),
+                                                        newest: NightDate(lastKey, calendar: cal)))
+        XCTAssertEqual(RecoveryVitalsAge.match(both.nights, sleepNightKey: lastKey, calendar: cal), .partlyEarlierNight)
+        // Recovery then leaves the verdict out (the same nights, read in the tests' UTC calendar): two-factor.
+        XCTAssertEqual(build(vitals: both.report, nights: VitalsVerdictNights(oldest: date(2026, 5, 27), newest: lastNight)).recovery,
+                       twoFactor.recovery)
+    }
+
+    /// Review round 1, F3 (kept conservative by decision): slept in Zurich, Today opened in New York the same
+    /// day and the verdict recomputed there. Sleeping HRV and skin temperature are keyed by the stored night and
+    /// read as its date in New York; resting HR and SpO₂ are bucketed by sample time in New York, where the end
+    /// of the night falls on the next date. The verdict is not counted that day: Recovery is the two-factor
+    /// score and the detail says the vitals aren't from last night. A change to this must be deliberate.
+    func testAWestwardZoneChangeGivesTheTwoFactorScore() throws {
+        let saved = NSTimeZone.default
+        defer { NSTimeZone.default = saved }
+        let zurich = calendar("Europe/Zurich"), newYork = calendar("America/New_York")
+        // 23:00 → 07:00 in Zurich for nine nights, the newest waking on 2026-05-28.
+        let newestWake = zurich.startOfDay(for: now).addingTimeInterval(7 * 3600)
+        var hr: [HRSample] = []
+        var spo2: [(start: Date, value: Double)] = []
+        var hrv: [(start: Date, value: Double)] = []
+        var rows: [(night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date)] = []
+        for k in 0...8 {
+            let wake = newestWake.addingTimeInterval(-Double(k) * 86_400), bed = wake.addingTimeInterval(-8 * 3600)
+            rows.append((night: SleepNightKey.night(inBedStart: bed, inBedEnd: wake, calendar: zurich), skinTempC: 34.0,
+                         inBedStart: bed, inBedEnd: wake))
+            for t in stride(from: bed.timeIntervalSince1970, to: wake.timeIntervalSince1970, by: 600) {
+                let at = Date(timeIntervalSince1970: t)
+                hr.append(HRSample(bpm: 54 + Int(t / 600) % 3, start: at))
+                spo2.append((start: at, value: 0.96))
+                hrv.append((start: at.addingTimeInterval(30), value: 60))
+            }
+        }
+        let newest = TodayScores.Night(nightKey: rows[0].night, inBedStart: rows[0].inBedStart, inBedEnd: rows[0].inBedEnd,
+                                       sleepScore: 85, stressScore: 33, asleepMin: 437)
+        func verdict(in zone: Calendar) throws -> VitalsStatusCardView.DatedReport {
+            NSTimeZone.default = zone.timeZone
+            XCTAssertEqual(Calendar.current.timeZone.identifier, zone.timeZone.identifier)
+            return try XCTUnwrap(VitalsStatusCardView.computeDatedReport(
+                hr: hr, spo2: spo2, hrv: hrv, nights: rows, fallbackRestingHR: nil, fallbackSpO2: nil,
+                fallbackHRV: nil, fallbackSkinTempOffsetC: nil))
+        }
+        // At home the same data is last night's verdict, counted.
+        let home = try verdict(in: zurich)
+        XCTAssertEqual(RecoveryVitalsAge.match(home.nights, sleepNightKey: newest.nightKey, calendar: zurich), .sameNight)
+        // In New York, later that morning there (10:00), last night is still credited.
+        let nyNow = newestWake.addingTimeInterval(9 * 3600)
+        XCTAssertTrue(LastNight.isCredited(nightKey: newest.nightKey, inBedStart: newest.inBedStart,
+                                           inBedEnd: newest.inBedEnd, now: nyNow, calendar: newYork))
+        let away = try verdict(in: newYork)
+        XCTAssertEqual(away.nights, VitalsVerdictNights(oldest: NightDate(newest.nightKey, calendar: newYork),
+                                                        newest: NightDate(newest.inBedEnd, calendar: newYork)),
+                       "night-keyed values on the key's date, sample-time values reaching the wake's date")
+        XCTAssertEqual(RecoveryVitalsAge.match(away.nights, sleepNightKey: newest.nightKey, calendar: newYork), .otherNight)
+        let scores = TodayScores.build(night: newest, strain: nil, trendsLoaded: true, vitals: away.report,
+                                       vitalsNights: away.nights, now: nyNow, calendar: newYork)
+        let twoFactorThere = TodayScores.build(night: newest, strain: nil, trendsLoaded: true, now: nyNow, calendar: newYork)
+        XCTAssertEqual(scores.recovery, twoFactorThere.recovery, "the two-factor score, no invented number")
+        XCTAssertEqual(scores.recovery.result?.score, 82)
+        XCTAssertEqual(scores.vitalsLeftOut, .otherNight)
+        XCTAssertEqual(TodayScoresCopy.detailVitalsGap(scores.vitalsLeftOut), TodayScoresCopy.detailVitalsOtherNight)
+        // Night-keyed values alone (no resting HR or SpO₂) are still counted after the change.
+        NSTimeZone.default = newYork.timeZone
+        let nightKeyedOnly = try XCTUnwrap(VitalsStatusCardView.computeDatedReport(
+            hr: [], spo2: [], hrv: hrv, nights: rows, fallbackRestingHR: nil, fallbackSpO2: nil,
+            fallbackHRV: nil, fallbackSkinTempOffsetC: nil))
+        XCTAssertEqual(RecoveryVitalsAge.match(nightKeyedOnly.nights, sleepNightKey: newest.nightKey, calendar: newYork),
+                       .sameNight)
+    }
+
     func testTheRunnerStateKeepsTheNewestNights() {
         let a = VitalsVerdictNights(date(2026, 5, 27)), b = VitalsVerdictNights(lastNight)
         var v = TodayVitals.pending
@@ -224,6 +328,23 @@ final class RecoveryVerdictAgeTests: XCTestCase {
         XCTAssertEqual(v.nights, b)
         v = v.receiving(.init(report: nil, isComplete: true))
         XCTAssertNil(v.nights, "no report, no nights")
+    }
+
+    /// Review round 1, F1: settling on the timeout keeps the report AND its nights, so last night's verdict is
+    /// still counted at settle (it was dropped as "not from last night", and the number moved afterwards).
+    func testSettlingOnTheTimeoutKeepsTheVerdictsNights() {
+        let local = TodayVitals.pending.receiving(.init(report: anomaly, isComplete: false, nights: VitalsVerdictNights(lastNight)))
+        XCTAssertFalse(local.settled)
+        let settled = local.settledOnTimeout()
+        XCTAssertEqual(settled, TodayVitals(report: anomaly, settled: true, nights: VitalsVerdictNights(lastNight)))
+        let atSettle = build(vitals: settled.report, nights: settled.nights)
+        XCTAssertNil(atSettle.vitalsLeftOut)
+        XCTAssertEqual(atSettle.recovery.result?.score, 62, "counted at settle")
+        // The complete report with the same verdict changes nothing.
+        let complete = settled.receiving(.init(report: anomaly, isComplete: true, nights: VitalsVerdictNights(lastNight)))
+        XCTAssertEqual(build(vitals: complete.report, nights: complete.nights), atSettle)
+        // Settling with no report stays "no verdict".
+        XCTAssertEqual(TodayVitals.pending.settledOnTimeout(), .noVerdict)
     }
 
     // MARK: The detail's words

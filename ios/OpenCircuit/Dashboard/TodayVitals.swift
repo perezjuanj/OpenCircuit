@@ -35,6 +35,12 @@ struct TodayVitals: Equatable {
     func receiving(_ result: VitalsStatusLoader.Result) -> TodayVitals {
         TodayVitals(report: result.report, settled: settled || result.isComplete, nights: result.nights)
     }
+
+    /// Settled by the wait running out: the same report with the same nights, so a verdict for last night is
+    /// still counted at settle and the number doesn't move when the complete report brings the same verdict.
+    func settledOnTimeout() -> TodayVitals {
+        TodayVitals(report: report, settled: true, nights: nights)
+    }
 }
 
 // MARK: - The verdict's night (decision 98)
@@ -129,7 +135,7 @@ struct TodayVitalsRunner: View {
             .task {
                 // A cancelled wait (Today left the screen) must not settle: it re-arms when Today reappears.
                 guard (try? await Task.sleep(for: Self.settleTimeout)) != nil else { return }
-                if !vitals.settled { publish(TodayVitals(report: vitals.report, settled: true)) }
+                if !vitals.settled { publish(vitals.settledOnTimeout()) }
             }
     }
 

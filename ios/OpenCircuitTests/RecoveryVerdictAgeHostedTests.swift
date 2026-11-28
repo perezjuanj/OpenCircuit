@@ -93,8 +93,11 @@ final class RecoveryVerdictAgeHostedTests: XCTestCase {
         }
     }
 
-    /// Hosts Today's runner and scores over the store until the vitals settle and have a verdict.
-    private func run(lastNightHasVitals: Bool) throws -> Probe {
+    /// Hosts Today's runner and scores over the store until the vitals settle and have a verdict, then
+    /// keeps it on screen for `holdAfterSettle` more seconds. `fallbackDelay` is how long the stubbed (empty)
+    /// Apple Health fallback takes.
+    private func run(lastNightHasVitals: Bool, fallbackDelay: Duration = .zero,
+                     holdAfterSettle: TimeInterval = 1.0, atSettle: ((Probe) -> Void)? = nil) throws -> Probe {
         let probe = Probe()
         AccessibilityTestSupport.enableAutomation()
         let clock = DayClock(now: { [wake] in wake.addingTimeInterval(60) }, calendar: { .current })
@@ -102,7 +105,8 @@ final class RecoveryVerdictAgeHostedTests: XCTestCase {
             .environment(\.storeRefreshSignal, StoreRefreshSignal(interval: 60))
             .environment(\.dayClock, clock)
             .environment(\.vitalsStatusLoader, VitalsStatusLoaderDependencies(healthFallback: { _, _ in
-                HealthKitVitalsBaselineReader.Report(restingHR: [], overnightSpO2: [], overnightHRV: [], skinTempOffsetC: nil)
+                if fallbackDelay > .zero { try await Task.sleep(for: fallbackDelay) }
+                return HealthKitVitalsBaselineReader.Report(restingHR: [], overnightSpO2: [], overnightHRV: [], skinTempOffsetC: nil)
             }))
             .modelContainer(try store(lastNightHasVitals: lastNightHasVitals).context.container)))
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
@@ -111,8 +115,10 @@ final class RecoveryVerdictAgeHostedTests: XCTestCase {
         window.makeKeyAndVisible()
         vc.view.layoutIfNeeded()
         let deadline = Date().addingTimeInterval(10)
-        while !(probe.vitals.settled && probe.vitals.report != nil) && Date() < deadline { pump(0.25) }
-        pump(1.0)
+        while !(probe.vitals.settled && probe.vitals.report != nil) && Date() < deadline { pump(0.1) }
+        pump(0.5)
+        atSettle?(probe)
+        pump(holdAfterSettle)
         window.rootViewController = nil
         window.isHidden = true
         pump(0.3)
@@ -147,5 +153,34 @@ final class RecoveryVerdictAgeHostedTests: XCTestCase {
         XCTAssertEqual(TodayScoresCopy.detailVitalsGap(scores.vitalsLeftOut), TodayScoresCopy.detailVitalsEarlier)
         // Never a three-factor number on the way.
         for seen in probe.seen { XCTAssertNil(seen.recovery.result?.factors[.vitals], "\(seen.recovery)") }
+    }
+
+    // MARK: Settling on the timeout (review round 1, F1)
+
+    /// The Apple Health fallback takes longer than the settle wait, so the runner settles on the timeout with
+    /// the local report, which is last night's. That verdict keeps its nights and is counted at settle, and
+    /// the number holds when the complete report (an empty fallback, so the same verdict) lands after it.
+    func testSettlingOnTheTimeoutKeepsLastNightsVerdictAndItsNumber() throws {
+        XCTAssertLessThan(TodayVitalsRunner.settleTimeout, .seconds(10), "the fallback must outlast the wait")
+        var settled: (vitals: TodayVitals, scores: TodayScores?)?
+        let probe = try run(lastNightHasVitals: true, fallbackDelay: .seconds(10), holdAfterSettle: 7) {
+            settled = ($0.vitals, $0.seen.last)
+        }
+        let atSettle = try XCTUnwrap(settled)
+        XCTAssertTrue(atSettle.vitals.settled)
+        let report = try XCTUnwrap(atSettle.vitals.report, "the local report landed before the timeout")
+        let lastNight = NightDate(Calendar.current.startOfDay(for: wake), calendar: .current)
+        XCTAssertEqual(atSettle.vitals.nights, VitalsVerdictNights(lastNight), "settling keeps the verdict's nights")
+        let scores = try XCTUnwrap(atSettle.scores)
+        XCTAssertNil(scores.vitalsLeftOut, "last night's verdict is not called another night's")
+        let result = try XCTUnwrap(scores.recovery.result)
+        XCTAssertNotNil(result.factors[.vitals], "counted at settle")
+        XCTAssertEqual(result.score, WellnessBalance.recoveryScore(sleepScore: 85, overnightStress: 33,
+                                                                   vitalsStatus: report.status)?.score)
+        // The complete report has landed by now, and the number is the one shown at settle.
+        XCTAssertEqual(probe.vitals.report, report)
+        XCTAssertEqual(probe.seen.last?.recovery, scores.recovery, "the settled number does not move")
+        let settledIndex = try XCTUnwrap(probe.seen.firstIndex { $0.recovery != .pending })
+        for seen in probe.seen[settledIndex...] { XCTAssertEqual(seen.recovery, scores.recovery, "\(seen.recovery)") }
     }
 }
