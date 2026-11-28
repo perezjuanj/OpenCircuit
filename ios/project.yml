@@ -177,6 +177,10 @@ targets:
         # iPhone-only binary would be letterboxed there instead of using the width (AdaptiveLayout).
         TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: NO
+        # Foundation Models (the on-device sleep recap, SleepRecapRow.swift) exists only on iOS 26+,
+        # and the deployment target is 17.0: weak-link it so the app still launches on iOS 17 and 18,
+        # where every use sits behind `#available(iOS 26.0, *)`.
+        OTHER_LDFLAGS: ["$(inherited)", "-weak_framework", "FoundationModels"]
         # App icon is OpenCircuit/AppIcon.icon (Icon Composer). Set explicitly so CLI/device builds
         # assign it after xcodegen. The name must match the .icon file's basename; there must be
         # NO AppIcon.appiconset left in Assets.xcassets or actool errors on the duplicate name.

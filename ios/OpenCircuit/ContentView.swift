@@ -141,9 +141,12 @@ struct ContentView: View {
     /// What Today's scores card last showed (decision 93), so the Recovery detail shows the card's
     /// own number rather than computing another one.
     @State private var todayScores: TodayScores?
-    /// Whether the Vitals Status card's last report flagged possible fever signs, so the synthesis
-    /// line only pairs skin temperature with resting HR when that card does.
-    @State private var vitalsFeverSuspected = false
+    /// Today's Vitals Status report, computed ONCE by `TodayVitalsRunner` whatever the layout or scroll
+    /// position (decision 95a). Recovery's third factor; the card only displays it.
+    @State private var todayVitals = TodayVitals.pending
+    /// Whether that report flagged possible fever signs, so the synthesis line only pairs skin
+    /// temperature with resting HR when the Vitals Status card does.
+    private var vitalsFeverSuspected: Bool { todayVitals.report?.feverSuspected == true }
 
     // Display units (#83) — SI is stored; only the display layer converts. Shared keys with settings.
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
@@ -584,6 +587,9 @@ struct ContentView: View {
                 }
             }
         }
+        // Today's one Vitals Status computation, behind the whole tab and outside the lazy list, so the
+        // verdict exists whether its card is shown, hidden, below the fold or moved (decision 95a).
+        .background { TodayVitalsRunner(onChange: { todayVitals = $0 }) }
         // What PAI is, from the strap's PAI tile (decision 49): a sheet, as there is nothing to chart.
         .sheet(isPresented: $showPAIInfo) { StrapPAIInfoSheet() }
         .sheet(isPresented: $showEditToday) {
@@ -607,9 +613,6 @@ struct ContentView: View {
             Group {
                 // The date, then Sleep · Recovery · Strain with the day's sentence (decision 93), first.
                 TodayDateRow()
-                    // A hidden Vitals Status card still reports its fever verdict to the sentence
-                    // (decision 94c): the card runs, unseen, behind the date row.
-                    .background { HiddenVitalsReport(layout: todayLayout) { vitalsStatusCard } }
                 todayScoresCard
                 if ringActive {
                     connectionCard
@@ -643,8 +646,9 @@ struct ContentView: View {
     /// Today's scores card (decision 93): one model from the newest night and today's strain. The
     /// sentence is built from that same model's Recovery, and the model is kept for the Recovery detail.
     private var todayScoresCard: some View {
-        TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded) { scores in
+        TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded, vitals: todayVitals) { scores in
             TodayScoresCard(scores: scores, sentence: synthesisSentence(scores.report),
+                            briefFacts: synthesisInput(scores.report).flatMap(TodaySynthesis.briefFacts),
                             onSleep: { selectedTab = .sleep },
                             onRecovery: { path.append(.recovery) },
                             onStrain: { path.append(.strain) })
@@ -1098,13 +1102,20 @@ struct ContentView: View {
     private func synthesisSentence(_ report: ReadinessReport) -> String {
         // Before the first trends load there is nothing to judge — and "no ring data yet" would be
         // a false claim to a wearer who has plenty.
-        guard trendsHaveLoaded else { return "Gathering today's numbers…" }
+        guard let input = synthesisInput(report) else { return "Gathering today's numbers…" }
+        return TodaySynthesis.sentence(input)
+    }
+
+    /// The synthesis input for `report`; nil before the first trends load. Shared by the fixed
+    /// sentence and the on-device brief (`TodayBriefSentence`), so both speak about the same numbers.
+    private func synthesisInput(_ report: ReadinessReport) -> TodaySynthesis.Input? {
+        guard trendsHaveLoaded else { return nil }
         // Built from the whole trends load, whatever the Edit Today layout hides (decision 94c).
-        return TodaySynthesis.sentence(todayLayout.sentenceInput(trends: trends,
-                                                                 tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
-                                                                 readiness: report,
-                                                                 feverSuspected: vitalsFeverSuspected,
-                                                                 lastSyncAt: lastSyncAt))
+        return todayLayout.sentenceInput(trends: trends,
+                                         tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
+                                         readiness: report,
+                                         feverSuspected: vitalsFeverSuspected,
+                                         lastSyncAt: lastSyncAt)
     }
 
     /// The sections actually rendered right now — `sectionOrder` minus any feature-gated card that's
@@ -1161,7 +1172,7 @@ struct ContentView: View {
                 RecoveryDetailView(scores: todayScores, tiles: todayTiles,
                                    onMetric: { path.append(.metric($0)) })
             } else {
-                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded) {
+                TodayScoresSource(strain: trends.todayStrain, trendsLoaded: trendsHaveLoaded, vitals: todayVitals) {
                     RecoveryDetailView(scores: $0, tiles: todayTiles, onMetric: { path.append(.metric($0)) })
                 }
             }
@@ -2236,9 +2247,10 @@ struct ContentView: View {
 
     /// Vitals Status (#72): compares the latest day's resting HR / overnight SpO₂ / overnight HRV /
     /// skin temp to the user's PERSONAL 7–30 day baseline and surfaces normal / watch / anomaly with
-    /// the contributing signals (incl. suspected fever). Self-contained view (its own @Query).
+    /// the contributing signals (incl. suspected fever). Display only: the report is Today's one
+    /// computation (`TodayVitalsRunner` on `todayTab`), so the card's row being built or not changes nothing.
     private var vitalsStatusCard: some View {
-        VitalsStatusCardView(onReport: { vitalsFeverSuspected = $0?.feverSuspected == true })
+        VitalsStatusCardView(report: todayVitals.report)
     }
 
     /// Dedicated, always-visible sleep section below vitals. Reads the persisted nightly summary

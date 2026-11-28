@@ -17,7 +17,8 @@
 //     headline is the last day that has one, labelled with that day ("yesterday", "as of Mon 28").
 //   Steps — today's running total as the headline; the TREND compares the last COMPLETE day, since
 //     a partial day would always read "below usual" before evening. Its verdict is stated only when
-//     that day is yesterday (`statedTrend`).
+//     that day is yesterday (`statedTrend`), and a line about yesterday under today's number names
+//     the day and carries yesterday's own total (`deltaText`, #399).
 //
 // The "usual range" is `BaselineTrend.usualRange` — the same band that decides above / near / below —
 // so the shaded band, its label and the arrow always agree.
@@ -95,11 +96,27 @@ struct TodayTile: Identifiable {
         return metric == .steps && !trendIsYesterday ? nil : trend
     }
 
-    /// "+6 ms vs usual" / "yesterday −1,240 vs usual" — nil when there's no verdict to state.
+    /// "+6 ms vs usual" / "Yesterday 7,375 · −625 vs usual" — nil when there's no verdict to state.
     var deltaText: String? {
         guard let trend = statedTrend, let d = trend.delta else { return nil }
         let unitPart = unit.isEmpty ? "" : " \(unit)"
-        return (trendIsYesterday ? "Yesterday " : "") + formatDelta(d) + unitPart + " vs usual"
+        return Self.comparisonLine(valueDay: valueDate, judgedDay: trend.latest.date,
+                                   judgedDayIsYesterday: trendIsYesterday,
+                                   judgedValue: format(trend.latest.value) + unitPart,
+                                   delta: formatDelta(d) + unitPart)
+    }
+
+    /// The rule for a tile's comparison line (#399): it is about the same day as the value above
+    /// it. When the judged day is not the value's day (steps: today's running total over yesterday's
+    /// verdict), the line names that day and carries its own figure, so "−625" never reads as a
+    /// verdict on today's number. Days are start-of-day in the tile's calendar. nil when the judged
+    /// day is neither the value's day nor yesterday: no line beats one about an unnamed day.
+    static func comparisonLine(valueDay: Date?, judgedDay: Date, judgedDayIsYesterday: Bool,
+                               judgedValue: String, delta: String) -> String? {
+        let comparison = delta + " vs usual"
+        if valueDay == judgedDay { return comparison }
+        guard judgedDayIsYesterday else { return nil }
+        return "Yesterday " + judgedValue + " · " + comparison
     }
 
     /// "Usual 44–50 ms", or the learning state while the baseline is thin.
@@ -121,7 +138,8 @@ struct TodayTile: Identifiable {
             parts.append("no data yet")
         }
         if let trend = statedTrend, let direction = trend.direction, let d = trend.delta, let r = trend.usualRange {
-            let who = trendIsYesterday ? "Yesterday was" : "That's"
+            let who = valueDate != trend.latest.date ? "Yesterday was \(format(trend.latest.value)) \(spokenUnit),"
+                : trendIsYesterday ? "Yesterday was" : "That's"
             let where_: String
             switch direction {
             case .above:  where_ = "above"

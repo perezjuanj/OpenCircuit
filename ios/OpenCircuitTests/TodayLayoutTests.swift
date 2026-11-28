@@ -215,20 +215,11 @@ final class TodayLayoutTests: XCTestCase {
         XCTAssertTrue(input(hidden, fever: true).feverSuspected)
     }
 
-    /// The Vitals Status fever verdict is a sentence input, so exactly one copy of its report always runs:
-    /// the card while it is drawn, the hidden runner while it isn't.
-    func testExactlyOneVitalsReportRunsWhateverTheLayout() {
-        XCTAssertEqual(TodayLayout.standard.vitalsReport, .card)
-        XCTAssertEqual(layout(hidden: "vitalsStatus").vitalsReport, .hiddenRunner)
-        XCTAssertEqual(layout(hidden: "calories,goals,metrics").vitalsReport, .card)
-        for hidden in ["", "vitalsStatus", "metrics,vitalsStatus,calories,goals,cycle,headache,sync", "goals"] {
-            for gates in [allOn, allOff] {
-                let l = layout(hidden: hidden)
-                let cardDrawn = l.shownSections(gates: gates).contains(.vitalsStatus)
-                XCTAssertNotEqual(cardDrawn, l.vitalsReport == .hiddenRunner, "hidden: \(hidden)")
-            }
-        }
-    }
+    // `testExactlyOneVitalsReportRunsWhateverTheLayout` was retired in #396 review round 2 with
+    // `TodayLayout.vitalsReport`: since decision 95a the report no longer depends on the layout (one
+    // `TodayVitalsRunner` for every layout). Its intent is pinned by EditTodayHostedTests (one runner, outside
+    // the list), TodayVitalsHostedTests (same Recovery below the fold, hidden, first) and
+    // TodayVitalsLoaderTests (the display-only card runs no loader).
 
     // MARK: Gated cards (review S-2)
 

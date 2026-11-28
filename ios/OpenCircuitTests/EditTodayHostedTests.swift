@@ -31,26 +31,29 @@ final class EditTodayHostedTests: XCTestCase {
 
     private final class Box<T> { var value: T; init(_ value: T) { self.value = value } }
 
-    // MARK: Hidden Vitals Status runner (review S-1, M7)
+    // MARK: Vitals Status report (review S-1, M7; since decision 95a one runner for every layout)
 
-    private func vitalsRunnerAppears(_ layout: TodayLayout) -> Bool {
-        let appeared = Box(false)
-        let (window, _) = host(HiddenVitalsReport(layout: layout) {
-            Color.clear.frame(width: 10, height: 10).onAppear { appeared.value = true }
-        }, height: 200)
-        pump(0.5)
-        withExtendedLifetime(window) {}
-        return appeared.value
+    // Amended in #396 fix round 1: the hidden-card runner (`HiddenVitalsReport`) is gone. Today computes
+    // the report ONCE in `TodayVitalsRunner`, behind the whole tab, so a hidden card (and a shown one
+    // below the fold) still feeds the sentence and Recovery, and the card itself only displays it. The
+    // hosted proof over every layout is `TodayVitalsHostedTests`; these pin the ContentView wiring.
+
+    func testTheVitalsReportRunsOnceBehindTheTabWhateverTheLayout() throws {
+        let content = try contentView()
+        XCTAssertEqual(content.components(separatedBy: "TodayVitalsRunner(").count, 2, "exactly one copy runs")
+        XCTAssertFalse(content.contains("HiddenVitalsReport"))
+        let tab = try XCTUnwrap(content.range(of: "private var todayTab: some View {"))
+        let list = try XCTUnwrap(content.range(of: "private var todayList: some View {"))
+        let runner = try XCTUnwrap(content.range(of: "TodayVitalsRunner("))
+        XCTAssertTrue(runner.lowerBound > tab.upperBound && runner.lowerBound < list.lowerBound,
+                      "the runner sits on todayTab, outside the lazy list, so it never depends on a row")
     }
 
-    func testAHiddenVitalsStatusCardStillRunsItsReport() {
-        var hidden = TodayLayout.standard
-        hidden.setShown(.vitalsStatus, false)
-        XCTAssertTrue(vitalsRunnerAppears(hidden), "hidden card: its report must still run (it feeds the sentence)")
-    }
-
-    func testAShownVitalsStatusCardRunsItsReportOnlyOnce() {
-        XCTAssertFalse(vitalsRunnerAppears(.standard), "shown card reports itself; a second copy must not run")
+    func testTodaysVitalsCardOnlyDisplaysTheRunnersReport() throws {
+        let content = try contentView()
+        let card = try XCTUnwrap(content.range(of: "private var vitalsStatusCard: some View {"))
+        XCTAssertTrue(String(content[card.upperBound...].prefix(200)).contains("VitalsStatusCardView(report: todayVitals.report)"))
+        XCTAssertFalse(content.contains("VitalsStatusCardView(onReport:"), "a second computation is back on Today")
     }
 
     // MARK: The sheet, through accessibility
@@ -155,14 +158,12 @@ final class EditTodayHostedTests: XCTestCase {
         return try String(contentsOf: app.appendingPathComponent("ContentView.swift"), encoding: .utf8)
     }
 
-    /// Today draws the hidden Vitals runner (tested above) and builds its sentence through
-    /// `sentenceInput` (tested in TodayLayoutTests), never from a tile list of its own.
+    /// Today builds its sentence through `sentenceInput` (tested in TodayLayoutTests), never from a tile
+    /// list of its own. (Amended in #396 fix round 1: the runner half moved to the tests above.)
     func testTodayWiresTheRunnerAndTheSentenceThroughTheTestedSeams() throws {
         let content = try contentView()
-        let list = try XCTUnwrap(content.range(of: "private var todayList: some View {"))
-        XCTAssertTrue(String(content[list.upperBound...].prefix(1_500))
-                        .contains("HiddenVitalsReport(layout: todayLayout) { vitalsStatusCard }"),
-                      "the hidden Vitals Status runner left todayList")
+        XCTAssertTrue(content.contains("feverSuspected: vitalsFeverSuspected"), "the sentence lost the runner's fever flag")
+        XCTAssertTrue(content.contains("private var vitalsFeverSuspected: Bool { todayVitals.report?.feverSuspected == true }"))
         let sentence = try XCTUnwrap(content.range(of: "private func synthesisSentence("))
         let body = String(content[sentence.upperBound...].prefix(900))
         XCTAssertTrue(body.contains("todayLayout.sentenceInput("), "the sentence no longer goes through sentenceInput")

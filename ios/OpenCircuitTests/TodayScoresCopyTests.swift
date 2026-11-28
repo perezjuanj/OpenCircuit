@@ -196,12 +196,13 @@ final class TodayScoresCopyTests: XCTestCase {
 
     // MARK: Methods text (App Review 1.4.1)
 
-    /// The methods page must not claim inputs Recovery doesn't use (vitals, activity).
+    /// The methods page must not claim inputs Recovery doesn't use (activity). Vitals became an input
+    /// in decision 95a (#396).
     func testTheRecoveryMethodsTextClaimsOnlyWhatItUses() throws {
         let source = try XCTUnwrap(HealthSources.all.first { $0.topic == .readiness })
         XCTAssertEqual(source.title, "Overnight stress and recovery")
         XCTAssertTrue(source.method.contains("Recovery combines last night's sleep score with overnight stress"))
-        XCTAssertFalse(source.method.localizedCaseInsensitiveContains("vitals"))
+        XCTAssertTrue(source.method.contains("vitals against your own range"))
         XCTAssertFalse(source.method.localizedCaseInsensitiveContains("activity"))
         XCTAssertFalse(source.method.contains("Readiness"))
     }
