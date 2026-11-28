@@ -286,7 +286,7 @@ import SwiftData
 import SwiftUI
 
 /// DEBUG-only: `-OCDemoScreen metric-hrv | trend-hrv | timeline | day-stress | pastNights | liveHR |
-/// sources | sources-<topic> | helio-setup | helio-setup-full | zepp-signin | recovery | strain |
+/// sources | sources-<topic> | helio-setup | helio-setup-full | zepp-signin | recovery | recovery-stale | strain |
 /// today-scores-states | today-edit | widgets`
 /// presents that screen full-screen on launch, so a screenshot run can reach it without UI
 /// automation. `liveHR` renders the live-measure card's composition over a SYNTHETIC buffer — a
@@ -355,8 +355,8 @@ struct DemoScreenModifier: ViewModifier {
             DemoSleepNeedSheet()
         } else if id == "widgets" {
             DemoScoresWidgets()
-        } else if id == "recovery" || id == "strain" {
-            DemoTodayScoresDetail(showsStrain: id == "strain")
+        } else if id == "recovery" || id == "recovery-stale" || id == "strain" {
+            DemoTodayScoresDetail(showsStrain: id == "strain", staleVitals: id == "recovery-stale")
         } else if id == "today-scores-states" {
             DemoTodayScoresStates()
         } else {
@@ -445,9 +445,11 @@ private struct DemoLiveCard: View {
 }
 
 /// `-OCDemoScreen recovery | strain` (decision 93): the Recovery or Strain detail over the seeded demo
-/// data, built from the same trends load and night row Today uses.
+/// data, built from the same trends load and night row Today uses. `recovery-stale` (decision 98) moves
+/// the runner's verdict one night earlier, so the detail shows a verdict Recovery doesn't count.
 private struct DemoTodayScoresDetail: View {
     let showsStrain: Bool
+    var staleVitals = false
     @Environment(\.modelContext) private var modelContext
     @AppStorage("units.temperature") private var tempUnitRaw = TemperatureUnit.localeDefault.rawValue
     @State private var trends = TrendsData()
@@ -466,13 +468,26 @@ private struct DemoTodayScoresDetail: View {
                                                                tempUnit: TemperatureUnit(rawValue: tempUnitRaw) ?? .celsius,
                                                                scope: .from(trends)))
                 }
-                .background { TodayVitalsRunner(onChange: { vitals = $0 }) }
+                .background { TodayVitalsRunner(onChange: { vitals = staleVitals ? Self.oneNightEarlier($0) : $0 }) }
             }
         }
         .task {
             trends = await TrendsData.loadAsync(container: modelContext.container, tempUnitRaw: tempUnitRaw)
             loaded = true
         }
+    }
+
+    /// The same verdict, dated one night earlier.
+    private static func oneNightEarlier(_ v: TodayVitals) -> TodayVitals {
+        guard let nights = v.nights else { return v }
+        let cal = Calendar.current
+        func earlier(_ n: NightDate) -> NightDate {
+            let date = cal.date(from: DateComponents(year: n.year, month: n.month, day: n.day)) ?? Date()
+            return NightDate(cal.date(byAdding: .day, value: -1, to: date) ?? date, calendar: cal)
+        }
+        var out = v
+        out.nights = VitalsVerdictNights(oldest: earlier(nights.oldest), newest: earlier(nights.newest))
+        return out
     }
 }
 

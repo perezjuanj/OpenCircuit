@@ -285,6 +285,8 @@ struct HealthKitVitalsBaselineReader {
         let overnightSpO2: [DailyValue]
         let overnightHRV: [DailyValue]
         let skinTempOffsetC: Double?
+        /// The night (its key day) `skinTempOffsetC` is for, so Recovery can tell its age (decision 98).
+        var skinTempNight: Date? = nil
 
         var hasAnyData: Bool {
             !restingHR.isEmpty || !overnightSpO2.isEmpty || !overnightHRV.isEmpty || skinTempOffsetC != nil
@@ -334,20 +336,22 @@ struct HealthKitVitalsBaselineReader {
             scale: 1
         )
 
+        let skinTemp = skinTempOffset(from: nightlyTemp)
         return Report(
             restingHR: restingHR,
             overnightSpO2: overnightSpO2,
             overnightHRV: overnightHRV,
-            skinTempOffsetC: skinTempOffset(from: nightlyTemp)
+            skinTempOffsetC: skinTemp?.offsetC,
+            skinTempNight: skinTemp?.night
         )
     }
 
-    private func skinTempOffset(from nights: [DailyValue]) -> Double? {
+    private func skinTempOffset(from nights: [DailyValue]) -> (offsetC: Double, night: Date)? {
         let sorted = nights.sorted { $0.day < $1.day }
         guard let latest = sorted.last else { return nil }
         let prior = sorted.dropLast().map { SkinTempBaseline.NightlyTemp(night: $0.day, celsius: $0.value) }
         guard let baseline = SkinTempBaseline.baseline(priorNights: prior) else { return nil }
-        return latest.value - baseline
+        return (latest.value - baseline, latest.day)
     }
 
     private func dailyMeans(type: HKQuantityType,

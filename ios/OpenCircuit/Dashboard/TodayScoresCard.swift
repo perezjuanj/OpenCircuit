@@ -6,8 +6,9 @@
 //     (`LastNight`, the same rule the Goals Sleep ring uses; the Sleep tab's badge reads the same
 //     row through the same `LastNight.score`).
 //   - Recovery is `WellnessBalance.recoveryScore` over that night's sleep score, overnight stress and
-//     today's Vitals Status verdict when there is one (decision 95a; computed once by
-//     `TodayVitalsRunner`, whatever the layout; no verdict is the two-factor score, never a 0). Recovery is
+//     today's Vitals Status verdict when there is one for that same night (decisions 95a and 98; computed
+//     once by `TodayVitalsRunner`, whatever the layout; no verdict, or one from another night, is the
+//     two-factor score, never a 0). Recovery is
 //     a placeholder until the first complete Vitals Status report, or until 6 s in a row on Today pass without one;
 //     then it settles, on the two-factor score if no verdict has landed (a later verdict replaces it).
 //     Leaving Today before then doesn't settle it. Computed here synchronously and handed up (`ReadinessReport`, for the sentence) and down (the
@@ -124,13 +125,19 @@ struct TodayScores: Equatable {
     /// What the sentence speaks about: the same Recovery the ring shows.
     let report: ReadinessReport
     /// The Vitals Status report Recovery counted (decision 95a), for the detail's Vitals row. Nil when
-    /// Recovery didn't count one: no verdict yet, or no scored night.
+    /// Recovery didn't count one: no verdict yet, one from another night, or no scored night.
     var vitals: VitalsBaseline.Report? = nil
+    /// Why a verdict that exists was left out of a scored Recovery (decision 98); nil when it was counted,
+    /// or when there is none.
+    var vitalsLeftOut: RecoveryVitalsAge.Match? = nil
 
-    /// `vitals` is Today's Vitals Status report (nil: no verdict); `vitalsPending` while its first complete
-    /// check hasn't finished, when a scored night's Recovery waits rather than show a number that changes.
+    /// `vitals` is Today's Vitals Status report (nil: no verdict) and `vitalsNights` the nights its values
+    /// come from; it counts only when they are all the night's (decision 98, `RecoveryVitalsAge.match`), so an
+    /// undated verdict never counts. `vitalsPending` while its first complete check hasn't finished, when a
+    /// scored night's Recovery waits rather than show a number that changes.
     static func build(night: Night?, strain reading: DailyStrain.Reading?, trendsLoaded: Bool,
-                      vitals: VitalsBaseline.Report? = nil, vitalsPending: Bool = false,
+                      vitals: VitalsBaseline.Report? = nil, vitalsNights: VitalsVerdictNights? = nil,
+                      vitalsPending: Bool = false,
                       now: Date = Date(), calendar: Calendar = .current) -> TodayScores {
         let credited = night.map {
             LastNight.isCredited(nightKey: $0.nightKey, inBedStart: $0.inBedStart, inBedEnd: $0.inBedEnd,
@@ -141,6 +148,7 @@ struct TodayScores: Equatable {
         let sleep: Sleep
         let recovery: Recovery
         let report: ReadinessReport
+        var leftOut: RecoveryVitalsAge.Match?
         if let night, credited {
             if let score = LastNight.score(night.sleepScore), vitalsPending {
                 sleep = .scored(score: score, asleepMin: night.asleepMin)
@@ -148,9 +156,12 @@ struct TodayScores: Equatable {
                 report = ReadinessReport(readiness: .pending, lastNightAsleepMin: asleep)
             } else if let score = LastNight.score(night.sleepScore) {
                 sleep = .scored(score: score, asleepMin: night.asleepMin)
+                let age = vitals.map { _ in RecoveryVitalsAge.match(vitalsNights, sleepNightKey: night.nightKey,
+                                                                    calendar: calendar) }
+                leftOut = age?.isCounted == false ? age : nil
                 let r = WellnessBalance.recoveryScore(sleepScore: score,
                                                       overnightStress: night.stressScore > 0 ? night.stressScore : nil,
-                                                      vitalsStatus: vitals?.status)
+                                                      vitalsStatus: age?.isCounted == true ? vitals?.status : nil)
                 // Never nil with a sleep score; the fallback only keeps the type honest.
                 recovery = r.map(Recovery.scored) ?? .noScore
                 report = ReadinessReport(readiness: r.map { .scored(score: $0.score, tier: $0.tier,
@@ -170,7 +181,8 @@ struct TodayScores: Equatable {
 
         return TodayScores(sleep: sleep, recovery: recovery,
                            strain: strainState(reading, trendsLoaded: trendsLoaded), report: report,
-                           vitals: recovery.result?.factors[.vitals] == nil ? nil : vitals)
+                           vitals: recovery.result?.factors[.vitals] == nil ? nil : vitals,
+                           vitalsLeftOut: recovery.result == nil ? nil : leftOut)
     }
 
     /// The same order of reasons as `StrainTileText.status`.
@@ -298,9 +310,24 @@ enum TodayScoresCopy {
     static let detailSleepAlone = "Based on last night's sleep alone: no sleeping HRV was recorded."
     static let detailSleepAndVitals = "Based on last night's sleep and vitals alone: no sleeping HRV was recorded."
     static let detailNoVitals = "Vitals Status has no verdict yet, so your vitals aren't counted."
+    static let detailVitalsEarlier = "Vitals are from an earlier night, so they aren't counted."
+    static let detailVitalsPartlyEarlier = "Some vitals are from an earlier night, so they aren't counted."
+    static let detailVitalsOtherNight = "Vitals aren't from last night, so they aren't counted."
     static let detailMethod = "An OpenCircuit estimate from last night's sleep score, your sleeping HRV "
-        + "against your usual, and your vitals against your own range once Vitals Status has a verdict. "
+        + "against your usual, and your vitals against your own range when Vitals Status has a verdict "
+        + "for that same night. Overnight HRV informs two of these inputs: sleeping HRV and Vitals Status. "
         + "Not your device app's own score, and not medical advice."
+
+    /// The detail's line where the Vitals row would be, when Recovery didn't count a verdict: an older
+    /// one is never called "no verdict yet" (decision 98).
+    static func detailVitalsGap(_ leftOut: RecoveryVitalsAge.Match?) -> String {
+        switch leftOut {
+        case .earlierNight?:       return detailVitalsEarlier
+        case .partlyEarlierNight?: return detailVitalsPartlyEarlier
+        case .otherNight?:         return detailVitalsOtherNight
+        case .sameNight?, nil:     return detailNoVitals
+        }
+    }
 
     /// The hero's caption: what the score rests on.
     static func detailBasis(_ r: TodayScores.Recovery) -> String {
@@ -428,7 +455,7 @@ private struct TodayScoresQuery<Content: View>: View {
 
     var body: some View {
         content(TodayScores.build(night: latestSleep.first.map(TodayScores.Night.init), strain: strain,
-                                  trendsLoaded: trendsLoaded, vitals: vitals.report,
+                                  trendsLoaded: trendsLoaded, vitals: vitals.report, vitalsNights: vitals.nights,
                                   vitalsPending: !vitals.settled, now: clock.now(), calendar: clock.calendar()))
     }
 }
