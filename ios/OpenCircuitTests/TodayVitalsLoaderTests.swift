@@ -176,6 +176,27 @@ final class TodayVitalsLoaderTests: XCTestCase {
         }
     }
 
+    /// Leaving Today while the Apple Health fallback is being read cuts that read short. It hasn't been
+    /// tried: on return it is read again, and Recovery settles on the verdict that includes it, not on the
+    /// local history alone (here normal, where the fallback's resting heart rate makes it an anomaly).
+    func testLeavingTodayDuringTheFallbackReadDoesNotCountItAsTried() throws {
+        for run in 0..<3 {
+            let model = TabModel()
+            let window = host(Tabs(model: model), store: try store(lastNightHRV: 60),
+                              dependencies: dependencies(after: .milliseconds(400), returning: raisedRestingHR))
+            wait(3) { model.todayAppeared }
+            model.tab = 1
+            pump(1.0)
+            model.tab = 0
+            wait(10) { model.events.last.map { $0.settled && $0.report?.status == .anomaly } ?? false }
+            close(window)
+
+            let firstSettled = try XCTUnwrap(model.events.first { $0.settled }, "run \(run): never settled")
+            XCTAssertEqual(firstSettled.report?.status, .anomaly,
+                           "run \(run): settled on the local history before the fallback: \(model.events)")
+        }
+    }
+
     // MARK: The display-only card runs no loader (review round 2, mB)
 
     private func loadersStarted<V: View>(_ view: V) throws -> Int {
