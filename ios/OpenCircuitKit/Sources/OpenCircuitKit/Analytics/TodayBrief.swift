@@ -75,7 +75,12 @@ extension TodaySynthesis {
             case .needsImprovement: must.append("Readiness today needs improvement, at \(score) out of 100.")
             }
             required.append(["\(score)"])
-            if factorCount <= 1 { may.append("Readiness is based on last night's sleep alone.") }
+            if factorCount <= 1 {
+                may.append("Readiness is based on last night's sleep alone.")
+            } else if input.withoutSleepingHRV {
+                // Decision 95a: vitals without sleeping HRV keep the low-confidence caveat, as in the template.
+                may.append("Readiness is based on last night's sleep and vitals alone.")
+            }
         case .noNight, .noScore:
             // No score to lead with. In the live run the model filled the gap by inventing a resting
             // heart rate (4 of 8 replies), and the template already says what is missing.
