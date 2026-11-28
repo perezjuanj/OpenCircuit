@@ -162,11 +162,13 @@ enum HealthSources {
         HealthSource(
             topic: .readiness, title: "Overnight stress and recovery",
             method: "Overnight stress is read from your sleeping HRV: lower HRV than usual reads as more "
-                + "stress. Recovery combines last night's sleep score with overnight stress and, once Vitals "
-                + "Status has a verdict, with your vitals against your own range. Vitals Status is OpenCircuit's "
-                + "own comparison of your resting heart rate, overnight SpO₂, overnight HRV and skin temperature "
-                + "with your recent range, described under \"Skin temperature, vitals status and fever signs\". "
-                + "Until it has a verdict, Recovery uses the first two alone. The weighting is OpenCircuit's own, "
+                + "stress. Recovery combines last night's sleep score with overnight stress and, when Vitals "
+                + "Status has a verdict for that same night, with your vitals against your own range. Vitals "
+                + "Status is OpenCircuit's own comparison of your resting heart rate, overnight SpO₂, overnight "
+                + "HRV and skin temperature with your recent range, described under \"Skin temperature, vitals "
+                + "status and fever signs\". Without a verdict, or with one from another night, Recovery uses "
+                + "the first two alone. Overnight HRV informs two of Recovery's inputs: overnight stress and "
+                + "Vitals Status. The weighting is OpenCircuit's own, "
                 + "and it is not a published or clinically validated score. The sources below cover sleep "
                 + "duration, HRV, resting heart rate and skin temperature.",
             citations: [shaffer, taskForce, hirshkowitz, nanchen, smarr]),

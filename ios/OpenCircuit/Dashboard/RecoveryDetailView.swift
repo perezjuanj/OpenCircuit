@@ -1,6 +1,7 @@
 // The Recovery detail (#391, decision 93c), opened from the Recovery dial on Today's scores card. It
 // absorbs the old Readiness card: the score with its tier, what went into it (sleep score, sleeping
-// HRV and, once Vitals Status has a verdict, the vitals row with its values (decision 95a); the shares
+// HRV and, when Vitals Status has a verdict for the same night, the vitals row with its values (decisions
+// 95a and 98; an older verdict is named as such, never as "no verdict"); the shares
 // computed from the Kit's weights), the low-confidence note, the estimate
 // disclaimer with the sources one tap away, and last night's HRV and resting heart rate from the same
 // tiles Your Numbers shows.
@@ -126,7 +127,7 @@ struct RecoveryDetailView: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(TodayScoresCopy.vitalsAccessibility(report, tempUnit: unit))
         } else {
-            Text(TodayScoresCopy.detailNoVitals)
+            Text(TodayScoresCopy.detailVitalsGap(scores.vitalsLeftOut))
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

@@ -27,9 +27,13 @@ final class TodayScoresVitalsTests: XCTestCase {
                      inBedEnd: wake, sleepScore: score, stressScore: stress, asleepMin: 437)
     }
 
+    /// Amended for decision 98 (#410): a verdict counts only when it is dated to the night, so the
+    /// helper's verdicts are dated to it (an undated one would not count).
     private func build(_ score: Int, _ stress: Int, vitals: VitalsBaseline.Report?, pending: Bool = false) -> TodayScores {
-        TodayScores.build(night: night(score: score, stress: stress), strain: nil, trendsLoaded: true,
-                          vitals: vitals, vitalsPending: pending, now: now, calendar: cal)
+        let n = night(score: score, stress: stress)
+        return TodayScores.build(night: n, strain: nil, trendsLoaded: true,
+                                 vitals: vitals, vitalsNights: VitalsVerdictNights(NightDate(n.nightKey, calendar: cal)),
+                                 vitalsPending: pending, now: now, calendar: cal)
     }
 
     // Synthetic Vitals Status reports, built by the Kit's own rule.

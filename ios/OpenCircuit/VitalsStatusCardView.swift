@@ -143,14 +143,42 @@ struct VitalsStatusCardView: View {
         fallbackHRV: [(day: Date, value: Double)]?,
         fallbackSkinTempOffsetC: Double?
     ) -> VitalsBaseline.Report? {
+        computeDatedReport(hr: hr, restingReported: restingReported, spo2: spo2, hrv: hrv, nights: nights,
+                           fallbackRestingHR: fallbackRestingHR, fallbackSpO2: fallbackSpO2,
+                           fallbackHRV: fallbackHRV, fallbackSkinTempOffsetC: fallbackSkinTempOffsetC)?.report
+    }
+
+    /// A report with the nights its values come from (decision 98).
+    struct DatedReport: Equatable, Sendable {
+        let report: VitalsBaseline.Report
+        /// Nil when no judged value has a known day (a fallback skin-temperature offset without its night).
+        let nights: VitalsVerdictNights?
+    }
+
+    /// `computeReport` plus the day each judged value comes from: a vital's latest day (local or Apple
+    /// Health, whichever was judged) and the skin-temperature offset's night. The report is the same.
+    /// Days are read in `Calendar.current`, the calendar the series are keyed in.
+    nonisolated static func computeDatedReport(
+        hr: [HRSample],
+        restingReported: [HRSample] = [],
+        spo2: [(start: Date, value: Double)],
+        hrv: [(start: Date, value: Double)],
+        nights: [(night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date)],
+        fallbackRestingHR: [(day: Date, value: Double)]?,
+        fallbackSpO2: [(day: Date, value: Double)]?,
+        fallbackHRV: [(day: Date, value: Double)]?,
+        fallbackSkinTempOffsetC: Double?,
+        fallbackSkinTempNight: Date? = nil
+    ) -> DatedReport? {
         let config = VitalsBaseline.Config()
         var inputs: [VitalsBaseline.VitalInput] = []
+        var days: [Date] = []
         if let i = vitalInput(.restingHR, localDays: restingHRDaily(hr, reported: restingReported),
                               fallback: fallbackRestingHR,
-                              config: config) { inputs.append(i) }
+                              config: config) { inputs.append(i.input); days.append(i.day) }
         if let i = vitalInput(.overnightSpO2, localDays: dailyMeans(spo2, scale: 100),
                               fallback: fallbackSpO2,
-                              config: config) { inputs.append(i) }
+                              config: config) { inputs.append(i.input); days.append(i.day) }
         // MUST stay night-scoped (#185). Since #185 the ring also emits HRV from QUIET daytime
         // `0x12` activity epochs, so `dailyMeans` — a whole-calendar-day mean — would hand a vital
         // literally named `.overnightHRV` (concern `.low`, the falling-HRV illness/stress flag) a
@@ -161,22 +189,29 @@ struct VitalsStatusCardView: View {
         // so the local and fallback series stay the same quantity rather than silently diverging.
         if let i = vitalInput(.overnightHRV, localDays: nightlyMeans(hrv, nights: nights, scale: 1),
                               fallback: fallbackHRV,
-                              config: config) { inputs.append(i) }
-        let offset = skinTempOffset(nights) ?? fallbackSkinTempOffsetC
+                              config: config) { inputs.append(i.input); days.append(i.day) }
+        let local = skinTempOffset(nights)
+        let offset = local?.offsetC ?? fallbackSkinTempOffsetC
+        if let local { days.append(local.night) } else if offset != nil, let night = fallbackSkinTempNight { days.append(night) }
         guard !inputs.isEmpty || offset != nil else { return nil }
-        return VitalsBaseline.report(inputs, skinTempOffsetC: offset, config: config)
+        return DatedReport(report: VitalsBaseline.report(inputs, skinTempOffsetC: offset, config: config),
+                           nights: VitalsVerdictNights(days: days, calendar: .current))
     }
 
     /// Build a VitalInput from local history first, falling back to Apple Health history when the
-    /// local store has not yet accumulated enough baseline days.
+    /// local store has not yet accumulated enough baseline days. `day` is the day of the value judged.
     nonisolated private static func vitalInput(_ vital: VitalsBaseline.Vital,
                                                localDays: [(day: Date, value: Double)],
                                                fallback: [(day: Date, value: Double)]?,
-                                               config: VitalsBaseline.Config) -> VitalsBaseline.VitalInput? {
-        let localSeries = dailySeries(localDays)
-        if let input = vitalInput(vital, series: localSeries, config: config) { return input }
-        let fallbackSeries = fallback?.sorted { $0.day < $1.day }.map(\.value) ?? []
-        return vitalInput(vital, series: fallbackSeries, config: config)
+                                               config: VitalsBaseline.Config) -> (input: VitalsBaseline.VitalInput, day: Date)? {
+        let local = localDays.sorted { $0.day < $1.day }
+        if let input = vitalInput(vital, series: local.map(\.value), config: config), let day = local.last?.day {
+            return (input, day)
+        }
+        let fallbackDays = fallback?.sorted { $0.day < $1.day } ?? []
+        guard let input = vitalInput(vital, series: fallbackDays.map(\.value), config: config),
+              let day = fallbackDays.last?.day else { return nil }
+        return (input, day)
     }
 
     /// Build a VitalInput from a chronological (oldest→newest) series, requiring enough prior days.
@@ -187,11 +222,6 @@ struct VitalsStatusCardView: View {
         let prior = Array(series.dropLast())
         guard prior.count >= config.minBaselineDays else { return nil }
         return VitalsBaseline.VitalInput(vital: vital, today: today, prior: prior)
-    }
-
-    /// Chronological list of daily values (oldest→newest).
-    nonisolated private static func dailySeries(_ days: [(day: Date, value: Double)]) -> [Double] {
-        days.sorted { $0.day < $1.day }.map(\.value)
     }
 
     /// Resting HR per day = the day's sleep/low-activity HR estimate (RestingHR analytics). A day
@@ -233,10 +263,10 @@ struct VitalsStatusCardView: View {
         }
     }
 
-    /// Latest night's signed skin-temp offset from the rolling baseline (#69), or nil.
+    /// Latest night's signed skin-temp offset from the rolling baseline (#69), with that night's day, or nil.
     nonisolated private static func skinTempOffset(
         _ nights: [(night: Date, skinTempC: Double, inBedStart: Date, inBedEnd: Date)]
-    ) -> Double? {
+    ) -> (offsetC: Double, night: Date)? {
         let valid = nights.filter { $0.skinTempC > 0 }
         guard let latest = valid.max(by: { $0.night < $1.night }) else { return nil }
         let cal = Calendar.current
@@ -245,7 +275,7 @@ struct VitalsStatusCardView: View {
             .filter { cal.startOfDay(for: $0.night) != tonightDay }
             .map { SkinTempBaseline.NightlyTemp(night: $0.night, celsius: $0.skinTempC) }
         guard let baseline = SkinTempBaseline.baseline(priorNights: prior) else { return nil }
-        return latest.skinTempC - baseline
+        return (latest.skinTempC - baseline, tonightDay)
     }
 
     // MARK: Presentation
@@ -374,6 +404,8 @@ struct VitalsStatusLoader: View {
     struct Result: Equatable {
         var report: VitalsBaseline.Report?
         var isComplete: Bool
+        /// The nights the report's values come from (decision 98); nil with no report.
+        var nights: VitalsVerdictNights? = nil
     }
 
     /// Every recomputed report. nil while there isn't enough baseline history.
@@ -434,6 +466,7 @@ struct VitalsStatusLoader: View {
             let fbSpO2 = healthBaselineReport?.overnightSpO2.map { (day: $0.day, value: $0.value) }
             let fbHRV = healthBaselineReport?.overnightHRV.map { (day: $0.day, value: $0.value) }
             let fbSkinTempOffsetC = healthBaselineReport?.skinTempOffsetC
+            let fbSkinTempNight = healthBaselineReport?.skinTempNight
             let beforeAnalysis = dependencies.beforeAnalysis
             let computed = await Task.detached {
                 if let beforeAnalysis { await beforeAnalysis(complete) }
@@ -443,15 +476,16 @@ struct VitalsStatusLoader: View {
                 let reported = own[3].map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
                 let spo2 = own[1].map { (start: $0.start, value: $0.value) }
                 let hrv = own[2].map { (start: $0.start, value: $0.value) }
-                return VitalsStatusCardView.computeReport(hr: hr, restingReported: reported, spo2: spo2, hrv: hrv, nights: nights,
-                                          fallbackRestingHR: fbRestingHR, fallbackSpO2: fbSpO2,
-                                          fallbackHRV: fbHRV, fallbackSkinTempOffsetC: fbSkinTempOffsetC)
+                return VitalsStatusCardView.computeDatedReport(hr: hr, restingReported: reported, spo2: spo2, hrv: hrv,
+                                          nights: nights, fallbackRestingHR: fbRestingHR, fallbackSpO2: fbSpO2,
+                                          fallbackHRV: fbHRV, fallbackSkinTempOffsetC: fbSkinTempOffsetC,
+                                          fallbackSkinTempNight: fbSkinTempNight)
             }.value
             // Superseded (an input changed, so a newer analysis is running) or the loader left the screen:
             // the detached work isn't cancelled with this task, so drop its result rather than publish it.
             guard !Task.isCancelled else { return }
-            report = computed
-            onResult(Result(report: computed, isComplete: complete))
+            report = computed?.report
+            onResult(Result(report: computed?.report, isComplete: complete, nights: computed?.nights))
         }
     }
 }
