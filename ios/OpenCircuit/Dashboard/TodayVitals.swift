@@ -7,9 +7,9 @@
 //
 // Recovery shows a placeholder until the first complete report (local history and the Apple Health
 // fallback both tried), so it doesn't show the two-factor value and then the three-factor one. If no
-// complete report lands within `settleTimeout` of Today being on screen, it settles with what it has (no
-// verdict yet: the two-factor score, which a later verdict then replaces). Leaving Today cancels the wait
-// and the reads without settling; both start again when Today reappears.
+// complete report lands within `settleTimeout` of Today being on screen without a break, it settles with
+// what it has (no verdict yet: the two-factor score, which a later verdict then replaces). Leaving Today
+// cancels the wait and the reads without settling; both start again, from zero, when Today reappears.
 
 import SwiftUI
 import OpenCircuitKit

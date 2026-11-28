@@ -8,7 +8,7 @@
 //   - Recovery is `WellnessBalance.recoveryScore` over that night's sleep score, overnight stress and
 //     today's Vitals Status verdict when there is one (decision 95a; computed once by
 //     `TodayVitalsRunner`, whatever the layout; no verdict is the two-factor score, never a 0). Recovery is
-//     a placeholder until the first complete Vitals Status report, or until 6 s on Today pass without one;
+//     a placeholder until the first complete Vitals Status report, or until 6 s in a row on Today pass without one;
 //     then it settles, on the two-factor score if no verdict has landed (a later verdict replaces it).
 //     Leaving Today before then doesn't settle it. Computed here synchronously and handed up (`ReadinessReport`, for the sentence) and down (the
 //     Recovery detail), so the ring, the sentence and the detail can never disagree.
