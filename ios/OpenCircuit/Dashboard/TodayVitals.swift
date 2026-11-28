@@ -46,8 +46,7 @@ struct TodayVitals: Equatable {
 // MARK: - The verdict's night (decision 98)
 
 /// A calendar date with no time of day and no time zone: the day a night is filed under (the morning it
-/// ends on, as a night key). Worked out once in the calendar that made the date, so it compares the same
-/// after a time-zone change.
+/// ends on, as a night key), worked out once in the calendar that made the date.
 struct NightDate: Comparable, Hashable, Sendable {
     let year: Int
     let month: Int
@@ -110,6 +109,11 @@ enum RecoveryVitalsAge {
 
     /// `verdict`'s nights against the night key of the sleep score, read as a date in `calendar` (the
     /// calendar the verdict's own dates were read in, the one Today judges "last night" with).
+    ///
+    /// Known limit, kept on purpose (review round 1, F3): after a westward time-zone change, resting HR and
+    /// SpO₂ are bucketed by sample time in the new zone, where the end of last night falls on a later date
+    /// than its night key, so a verdict that includes them is not counted that day and Recovery is the
+    /// two-factor score. Night-keyed values (sleeping HRV, skin temperature) still match.
     static func match(_ verdict: VitalsVerdictNights?, sleepNightKey: Date, calendar: Calendar) -> Match {
         guard let verdict else { return .otherNight }
         let night = NightDate(sleepNightKey, calendar: calendar)
