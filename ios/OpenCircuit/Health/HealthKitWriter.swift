@@ -1489,12 +1489,22 @@ final class HealthKitWriter {
 
     /// One derived resting-HR sample for a day (anchored at start-of-day; HealthKit buckets it
     /// onto that calendar day). Value comes from `RestingHR` (sleep mean → low-activity floor).
-    func writeRestingHR(bpm: Double, day: Date) async throws {
+    /// Returns the saved sample's UUID: a provisional day's sample is replaced by it (decision 96).
+    @discardableResult
+    func writeRestingHR(bpm: Double, day: Date) async throws -> UUID {
         let q = HKQuantity(unit: Self.unit(for: .restingHeartRate), doubleValue: bpm)
         let sample = HKQuantitySample(type: HKQuantityType(.restingHeartRate),
                                       quantity: q, start: day, end: day,
                                       device: wearableDevice(ownerAt: day), metadata: nil)
         try await store.save(sample)
+        return sample.uuid
+    }
+
+    /// Delete ONE resting-HR sample this app wrote, by the UUID it recorded (decision 96c). Never by
+    /// type or date range: a provisional day's replaced sample is the only thing this removes.
+    func deleteRestingHR(uuid: UUID) async throws {
+        _ = try await store.deleteObjects(of: HKQuantityType(.restingHeartRate),
+                                          predicate: HKQuery.predicateForObject(with: uuid))
     }
 
     // MARK: Derived-write watermarks (UserDefaults — see flushToHealth)
@@ -1504,6 +1514,10 @@ final class HealthKitWriter {
     // UserDefaults — shared across the foreground + background `HealthKitWriter` instances, and
     // only advanced after a confirmed write, so a failed/unauthorized flush backfills next time.
     private static let rhrWatermarkKey = "hk.restingHR.lastDay"      // start-of-day last written
+    /// Today's early resting-HR sample (decision 96b), and the replaced samples whose delete hasn't
+    /// succeeded yet (96c). See `RestingHRWriteState`.
+    private static let rhrProvisionalKey = "hk.restingHR.provisional.v1"
+    private static let rhrPendingDeletesKey = "hk.restingHR.pendingDeletes.v1"
     private static let basalWatermarkKey = "hk.basalEnergy.nextHour" // first hour not yet written
     static let activeDayKey = "hk.activeEnergy.day"          // start-of-day of the accumulator
     static let activeWrittenKey = "hk.activeEnergy.writtenKcal"
@@ -1753,7 +1767,10 @@ final class HealthKitWriter {
     }
 
     /// A day's resting HR is finalized once the day is ~half over, so a pre-dawn flush can't
-    /// freeze a partial-night value, yet last night's RHR still lands the same day (by midday).
+    /// freeze a partial-night value. Decision 96: a day whose night is already in Apple Health is
+    /// written before that, as soon as the night is (the flush that mirrors the night), and the
+    /// sample is provisional: it may be replaced until midday, when this delay finalizes the day.
+    /// A day without a mirrored night is first written here, at midday, as before.
     private static let restingFinalizationDelay: TimeInterval = 12 * 3600
 
     /// Pre-fetch HR samples from LocalStore for a given lookback, returning mapped HRSamples.
@@ -1787,22 +1804,30 @@ final class HealthKitWriter {
     }
 
     /// Write one resting-HR sample per finalized day not yet covered by the day-watermark, skipping a
-    /// day whose value would come from too few daytime readings (`RestingHR.dayCoverage`, #298).
+    /// day whose value would come from too few daytime readings (`RestingHR.dayCoverage`, #298), and
+    /// today's provisional sample once its night is in Apple Health (decision 96).
     /// Uses pre-fetched HR samples (shared with `flushPassiveCalories`) to avoid a redundant
     /// LocalStore query.
+    ///
+    /// Runs AFTER the night mirror in `flushToHealth` (96f), so the flush that writes the night also
+    /// writes the day's resting HR. The guard is the local mirror record (`MirroredNightOverlay`),
+    /// never a HealthKit read: those fail while the phone is locked and come back empty when read
+    /// access is denied.
     private func flushRestingHR(prefetchedHR: [HRSample], reported: [HRSample],
                                 sleepSegments: [SleepSegment]) async -> Int {
         let defaults = UserDefaults.standard
-        let lastWritten = Date(timeIntervalSince1970: defaults.double(forKey: Self.rhrWatermarkKey))
-        let plan = Self.restingHRWritePlan(hr: prefetchedHR, reported: reported, sleepSegments: sleepSegments,
-                                           lastWritten: lastWritten, now: Date(), calendar: .current)
-        let outcome = await Self.writeRestingHRDays(plan, lastWritten: lastWritten) {
-            try await self.writeRestingHR(bpm: $0, day: $1)
-        }
+        let now = Date()
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        // The stored night whose key is today (night keys are the wake day, `SleepNightKey`).
+        let mirrored: Set<Date> = MirroredNightOverlay.hasRecord(storedNight: today) ? [today] : []
+        let outcome = await Self.runRestingHRFlush(
+            hr: prefetchedHR, reported: reported, sleepSegments: sleepSegments,
+            state: Self.loadRestingHRState(defaults), now: now, calendar: cal, mirroredNights: mirrored,
+            save: { try await self.writeRestingHR(bpm: $0, day: $1) },
+            delete: { try await self.deleteRestingHR(uuid: $0) },
+            persist: { Self.saveRestingHRState($0, defaults) })
         if outcome.failed { pendingFlushFailures.insert(.restingHeartRate) }  // surface
-        if outcome.watermark > lastWritten {
-            defaults.set(outcome.watermark.timeIntervalSince1970, forKey: Self.rhrWatermarkKey)
-        }
         return outcome.written
     }
 
@@ -1822,15 +1847,30 @@ final class HealthKitWriter {
     ///
     /// Decision 92: a day the device reported its own resting HR for (`reported`, the Helio Strap's
     /// `0x3a` records) is written with that value (the day's latest record, `RestingHR.reportedDailyValues`)
-    /// instead of the derived one, and is never held back by the coverage floor. Finalization is
-    /// unchanged: a day's records are all stamped before its noon, and a day is written only 12 h after
-    /// its start, so with the strap's hourly sync the written value is its final one. A strap that
-    /// hasn't synced since its last revision gets the newest value the phone has, and a day already
-    /// written stays as written (the watermark), exactly like a late night on the derived path.
+    /// instead of the derived one, and is never held back by the coverage floor. A day's records are
+    /// all stamped before its noon, and a day is finalized only 12 h after its start, so with the
+    /// strap's hourly sync the finalized value is its final one. A strap that hasn't synced since its
+    /// last revision gets the newest value the phone has, and a finalized day stays as written (the
+    /// watermark), exactly like a late night on the derived path.
+    ///
+    /// Decision 96: this is the FINALIZED path only. Today, before its cutoff, is written earlier as a
+    /// provisional sample when its night is in Apple Health (`restingHRActions`), and replaced while
+    /// its value changes until this path reaches it. A day without a mirrored night is first written
+    /// here, exactly as before.
     static func restingHRWritePlan(hr prefetchedHR: [HRSample], reported: [HRSample] = [],
                                    sleepSegments: [SleepSegment],
                                    lastWritten: Date, now: Date, calendar cal: Calendar) -> [RestingHRPlanDay] {
         let cutoff = now.addingTimeInterval(-Self.restingFinalizationDelay)
+        return restingHRDays(hr: prefetchedHR, reported: reported, sleepSegments: sleepSegments,
+                             lastWritten: lastWritten, now: now, calendar: cal)
+            .filter { $0.day <= cutoff }
+    }
+
+    /// Every day after the watermark with readings, ascending, and its covered value: the finalized
+    /// days of `restingHRWritePlan` plus today before its cutoff.
+    private static func restingHRDays(hr prefetchedHR: [HRSample], reported: [HRSample],
+                                      sleepSegments: [SleepSegment],
+                                      lastWritten: Date, now: Date, calendar cal: Calendar) -> [RestingHRPlanDay] {
         // Bound the scan: never re-read already-written days, and look back at most a week so a
         // first run backfills recent history without an unbounded query.
         let lookback = cal.date(byAdding: .day, value: -7, to: cal.startOfDay(for: now))
@@ -1845,7 +1885,7 @@ final class HealthKitWriter {
         let covered = RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal,
                                             daytimeCoverage: RestingHR.dayCoverage, reported: reported)
         let coveredBpm = Dictionary(covered.map { ($0.day, $0.bpm) }, uniquingKeysWith: { a, _ in a })
-        return all.filter { $0.day > lastWritten && $0.day <= cutoff }   // days ascend
+        return all.filter { $0.day > lastWritten }   // days ascend
             .map { RestingHRPlanDay(day: $0.day, bpm: coveredBpm[$0.day]) }
     }
 
@@ -1857,20 +1897,242 @@ final class HealthKitWriter {
     ///   (typically the night, synced late) a later flush writes its full value — at most a week
     ///   back, the scan's lookback;
     /// - a written day is never rewritten: everything at or before the watermark is out of the plan.
+    ///
+    /// The finalized days of a flush with no provisional record: `runRestingHRActions` with `.write`
+    /// actions only, the loop production runs.
     static func writeRestingHRDays(_ plan: [RestingHRPlanDay], lastWritten: Date,
                                    write: (Double, Date) async throws -> Void)
     async -> (written: Int, watermark: Date, failed: Bool) {
-        var written = 0
-        var watermark = lastWritten
-        for d in plan {
-            guard let bpm = d.bpm else { continue }   // thin (#298): not written, watermark stays
-            do {
-                try await write(bpm, d.day)
-                written += 1
-                watermark = d.day
-            } catch { return (written, watermark, true) }  // stop; already-written days stay covered
+        let actions = plan.compactMap { d in d.bpm.map { RestingHRAction.write(day: d.day, bpm: $0) } }
+        let outcome = await runRestingHRActions(
+            actions, state: RestingHRWriteState(watermark: lastWritten),
+            save: { try await write($0, $1); return UUID() }, delete: { _ in }, persist: { _ in })
+        return (outcome.written, outcome.state.watermark, outcome.failed)
+    }
+
+    // MARK: Provisional resting HR (decision 96)
+
+    /// Today's early resting-HR sample (decision 96b): the day, the bpm written, and the sample's UUID.
+    /// At most one exists (today, before its cutoff). The early write does NOT move the watermark.
+    struct ProvisionalRestingHR: Codable, Equatable {
+        let day: Date
+        let bpm: Double
+        let uuid: UUID
+    }
+
+    /// A replaced sample whose delete hasn't reported success yet (96c): retried at the start of every
+    /// resting-HR flush, removed only on success, dropped once its day is more than 7 days old.
+    struct PendingRestingHRDelete: Codable, Equatable {
+        let uuid: UUID
+        let day: Date
+    }
+
+    /// Everything the resting-HR write persists between flushes.
+    struct RestingHRWriteState: Equatable {
+        var watermark: Date
+        var provisional: ProvisionalRestingHR? = nil
+        var pendingDeletes: [PendingRestingHRDelete] = []
+    }
+
+    /// One step of a resting-HR flush, in the order `restingHRActions` returns them.
+    enum RestingHRAction: Equatable {
+        /// A finalized day without a provisional record: save, then the watermark moves onto it.
+        case write(day: Date, bpm: Double)
+        /// A finalized provisional day whose sample stands (same whole bpm, or no covered value now):
+        /// no write; the watermark moves onto it and the record is cleared (96d).
+        case finalizeInPlace(day: Date)
+        /// A finalized provisional day whose value changed: save the new sample, then the watermark
+        /// moves onto it, the record is cleared and the old sample deleted (96d via 96c).
+        case finalizeReplacing(day: Date, bpm: Double)
+        /// Today before its cutoff, its night in Health: save and record it; the watermark stays (96a).
+        case writeEarly(day: Date, bpm: Double)
+        /// Today's provisional value changed by a whole bpm: save the new sample, then update the
+        /// record and delete the old sample (96c).
+        case replaceEarly(day: Date, bpm: Double)
+        /// A provisional record at or behind the watermark: cleared, nothing written (96d).
+        case clearProvisional
+    }
+
+    /// The whole-bpm value a provisional sample is compared by (96c): 54.2 and 54.4 are the same day's
+    /// value, so a re-staged night that moves it by a fraction never writes or deletes.
+    static func wholeBpm(_ bpm: Double) -> Int { Int(bpm.rounded()) }
+
+    /// What one resting-HR flush does, in order. Pure, for tests.
+    ///
+    /// The finalized days are `restingHRWritePlan`'s, unchanged for every day without a provisional
+    /// record. `mirroredNights` holds the stored night keys (wake days) whose night is in Apple Health
+    /// (`MirroredNightOverlay.hasRecord`); empty, this is master's plan exactly (no early write).
+    static func restingHRActions(hr: [HRSample], reported: [HRSample] = [], sleepSegments: [SleepSegment],
+                                 lastWritten: Date, now: Date, calendar cal: Calendar,
+                                 mirroredNights: Set<Date> = [],
+                                 provisional: ProvisionalRestingHR? = nil) -> [RestingHRAction] {
+        let cutoff = now.addingTimeInterval(-Self.restingFinalizationDelay)
+        let today = cal.startOfDay(for: now)
+        let days = restingHRDays(hr: hr, reported: reported, sleepSegments: sleepSegments,
+                                 lastWritten: lastWritten, now: now, calendar: cal)
+        var actions: [RestingHRAction] = []
+        var provisional = provisional
+        if let p = provisional, p.day <= lastWritten {
+            actions.append(.clearProvisional)
+            provisional = nil
         }
-        return (written, watermark, false)
+        var finalized = days.filter { $0.day <= cutoff }
+        // A finalized provisional day the scan has no readings for still finalizes (no covered value:
+        // its sample stands), so the record can't outlive its day.
+        if let p = provisional, p.day <= cutoff, !finalized.contains(where: { $0.day == p.day }) {
+            finalized.append(RestingHRPlanDay(day: p.day, bpm: nil))
+            finalized.sort { $0.day < $1.day }
+        }
+        for d in finalized {
+            if let p = provisional, p.day == d.day {
+                if let bpm = d.bpm, wholeBpm(bpm) != wholeBpm(p.bpm) {
+                    actions.append(.finalizeReplacing(day: d.day, bpm: bpm))
+                } else {
+                    actions.append(.finalizeInPlace(day: d.day))
+                }
+                provisional = nil
+            } else if let bpm = d.bpm {
+                actions.append(.write(day: d.day, bpm: bpm))
+            }
+        }
+        // Today, before its cutoff (96a): only after the watermark, and only with a covered value.
+        guard today > cutoff, today > lastWritten,
+              let bpm = days.first(where: { $0.day == today })?.bpm else { return actions }
+        if let p = provisional {
+            if p.day == today, wholeBpm(bpm) != wholeBpm(p.bpm) {
+                actions.append(.replaceEarly(day: today, bpm: bpm))
+            }
+        } else if mirroredNights.contains(today) {
+            actions.append(.writeEarly(day: today, bpm: bpm))
+        }
+        return actions
+    }
+
+    /// Run `actions` in order, stopping at the first failed save (nothing after it runs; the failure
+    /// is reported). Every replacement saves the new sample FIRST, and only after that save succeeds
+    /// changes the record and queues the old UUID for deletion, then deletes it; a failed delete
+    /// stays queued. `persist` is called after every state change, so a flush cut short keeps what
+    /// already happened. The watermark moves only onto a day written or finalized in place.
+    static func runRestingHRActions(_ actions: [RestingHRAction], state: RestingHRWriteState,
+                                    save: (Double, Date) async throws -> UUID,
+                                    delete: (UUID) async throws -> Void,
+                                    persist: (RestingHRWriteState) -> Void)
+    async -> (state: RestingHRWriteState, written: Int, failed: Bool) {
+        var state = state
+        var written = 0
+        /// Queue `old` for deletion (already persisted with the state change), then delete it.
+        func retire(_ old: ProvisionalRestingHR) async {
+            if (try? await delete(old.uuid)) != nil {
+                state.pendingDeletes.removeAll { $0.uuid == old.uuid }
+                persist(state)
+            }
+        }
+        for action in actions {
+            switch action {
+            case .write(let day, let bpm):
+                guard (try? await save(bpm, day)) != nil else { return (state, written, true) }
+                written += 1
+                state.watermark = day
+                persist(state)
+            case .finalizeInPlace(let day):
+                state.watermark = day
+                state.provisional = nil
+                persist(state)
+            case .finalizeReplacing(let day, let bpm):
+                guard (try? await save(bpm, day)) != nil else { return (state, written, true) }
+                written += 1
+                let old = state.provisional
+                state.watermark = day
+                state.provisional = nil
+                if let old { state.pendingDeletes.append(PendingRestingHRDelete(uuid: old.uuid, day: old.day)) }
+                persist(state)
+                if let old { await retire(old) }
+            case .writeEarly(let day, let bpm):
+                guard let uuid = try? await save(bpm, day) else { return (state, written, true) }
+                written += 1
+                state.provisional = ProvisionalRestingHR(day: day, bpm: bpm, uuid: uuid)
+                persist(state)
+            case .replaceEarly(let day, let bpm):
+                guard let uuid = try? await save(bpm, day) else { return (state, written, true) }
+                written += 1
+                let old = state.provisional
+                state.provisional = ProvisionalRestingHR(day: day, bpm: bpm, uuid: uuid)
+                if let old { state.pendingDeletes.append(PendingRestingHRDelete(uuid: old.uuid, day: old.day)) }
+                persist(state)
+                if let old { await retire(old) }
+            case .clearProvisional:
+                state.provisional = nil
+                persist(state)
+            }
+        }
+        return (state, written, false)
+    }
+
+    /// Retry every queued delete (96c), oldest first. An entry whose day is more than 7 days before
+    /// today is dropped without a retry; one whose delete fails again stays queued.
+    static func retryPendingRestingHRDeletes(_ state: RestingHRWriteState, now: Date, calendar cal: Calendar,
+                                             delete: (UUID) async throws -> Void,
+                                             persist: (RestingHRWriteState) -> Void) async -> RestingHRWriteState {
+        guard !state.pendingDeletes.isEmpty else { return state }
+        var state = state
+        let horizon = cal.date(byAdding: .day, value: -7, to: cal.startOfDay(for: now))
+            ?? now.addingTimeInterval(-7 * 86_400)
+        var kept: [PendingRestingHRDelete] = []
+        for entry in state.pendingDeletes where entry.day >= horizon {
+            if (try? await delete(entry.uuid)) == nil { kept.append(entry) }
+        }
+        if kept != state.pendingDeletes {
+            state.pendingDeletes = kept
+            persist(state)
+        }
+        return state
+    }
+
+    /// One resting-HR flush with every dependency injected: the queued deletes, then the plan
+    /// (`restingHRActions`) through `runRestingHRActions`. `flushRestingHR` is this with HealthKit
+    /// and UserDefaults; the tests drive it with fakes.
+    static func runRestingHRFlush(hr: [HRSample], reported: [HRSample], sleepSegments: [SleepSegment],
+                                  state: RestingHRWriteState, now: Date, calendar cal: Calendar,
+                                  mirroredNights: Set<Date>,
+                                  save: (Double, Date) async throws -> UUID,
+                                  delete: (UUID) async throws -> Void,
+                                  persist: (RestingHRWriteState) -> Void)
+    async -> (state: RestingHRWriteState, written: Int, failed: Bool) {
+        let state = await retryPendingRestingHRDeletes(state, now: now, calendar: cal,
+                                                       delete: delete, persist: persist)
+        let actions = restingHRActions(hr: hr, reported: reported, sleepSegments: sleepSegments,
+                                       lastWritten: state.watermark, now: now, calendar: cal,
+                                       mirroredNights: mirroredNights, provisional: state.provisional)
+        return await runRestingHRActions(actions, state: state, save: save, delete: delete, persist: persist)
+    }
+
+    /// The persisted state. A record that can't be decoded counts as absent.
+    static func loadRestingHRState(_ defaults: UserDefaults) -> RestingHRWriteState {
+        let decoder = JSONDecoder()
+        return RestingHRWriteState(
+            watermark: Date(timeIntervalSince1970: defaults.double(forKey: rhrWatermarkKey)),
+            provisional: defaults.data(forKey: rhrProvisionalKey)
+                .flatMap { try? decoder.decode(ProvisionalRestingHR.self, from: $0) },
+            pendingDeletes: defaults.data(forKey: rhrPendingDeletesKey)
+                .flatMap { try? decoder.decode([PendingRestingHRDelete].self, from: $0) } ?? [])
+    }
+
+    /// Persist `state`. The watermark only ever moves forward, as before.
+    static func saveRestingHRState(_ state: RestingHRWriteState, _ defaults: UserDefaults) {
+        if state.watermark.timeIntervalSince1970 > defaults.double(forKey: rhrWatermarkKey) {
+            defaults.set(state.watermark.timeIntervalSince1970, forKey: rhrWatermarkKey)
+        }
+        let encoder = JSONEncoder()
+        if let provisional = state.provisional, let data = try? encoder.encode(provisional) {
+            defaults.set(data, forKey: rhrProvisionalKey)
+        } else {
+            defaults.removeObject(forKey: rhrProvisionalKey)
+        }
+        if !state.pendingDeletes.isEmpty, let data = try? encoder.encode(state.pendingDeletes) {
+            defaults.set(data, forKey: rhrPendingDeletesKey)
+        } else {
+            defaults.removeObject(forKey: rhrPendingDeletesKey)
+        }
     }
 
     /// How far back the basal-energy path reads daily resting HR: enough to hold the personal
