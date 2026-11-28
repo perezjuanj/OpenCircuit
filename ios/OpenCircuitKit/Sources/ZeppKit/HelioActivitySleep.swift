@@ -155,6 +155,10 @@ extension HelioSleepSelection {
     /// (`overnightVerdict`, 28c/28d) or is longer than `maxNightLength`, while the stitch of its sessions
     /// alone has an overnight sleep, is replaced by that stitch, and its blocks are counted alone. So the
     /// nights kept with blocks cover every night kept without them, each at least as wide.
+    ///
+    /// Decision 97f (#408): the same holds when the sessions' own stitch has a late main sleep
+    /// (`isLateMainSleep`, 97a): blocks never cost one, and never extend one either (a joined night that
+    /// is no overnight sleep always goes back to its sessions' stitch when that has either shape).
     public static func nights(sessions: [Night], activityBlocks blocks: [Night]) -> ActivityJoin {
         guard !blocks.isEmpty else { return ActivityJoin(nights: stitch(sessions), joinedBlocks: 0, aloneBlocks: 0) }
         func holds(_ night: Night, _ sleep: Night) -> Bool {
@@ -186,7 +190,8 @@ extension HelioSleepSelection {
                 return [night]
             }
             let alone = stitch(sessions.filter { holds(night, $0) })
-            guard alone.contains(where: isOvernightSleep) else {
+            // Decision 97f (#408): nor a records-only late main sleep (97a).
+            guard alone.contains(where: { isOvernightSleep($0) || isLateMainSleep($0) }) else {
                 joined += held
                 return [night]
             }

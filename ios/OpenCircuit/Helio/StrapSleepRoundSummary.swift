@@ -33,6 +33,11 @@ struct StrapSleepRoundSummary: Equatable {
     /// blocks taken as the provisional main sleep of a night no stored night covers (stored nowhere).
     var napsFromBlocks = 0
     var mainOnlyBlocks = 0
+    /// Decision 97g (#408): the late main sleeps offered as nights, those 97c kept out of their key (so
+    /// judged as naps), and the sleeps that were neither an overnight nor a late main sleep.
+    var lateMainSleepsOffered = 0
+    var lateMainSleepsKeptOut = 0
+    var neitherOvernightNorLateMainSleep = 0
 
     /// The one breadcrumb line. Digits only; no clock time.
     var text: String {
@@ -48,6 +53,11 @@ struct StrapSleepRoundSummary: Equatable {
             // Decision 76f: each only when non-zero, so every line without one is the line shipped before.
             + (napsFromBlocks > 0 ? " napsFromBlocks=\(napsFromBlocks)" : "")
             + (mainOnlyBlocks > 0 ? " mainOnlyBlocks=\(mainOnlyBlocks)" : "") + "; "
+            // Decision 97g: only when one of the three is non-zero, so every line without one is the line
+            // shipped before.
+            + (lateMainSleepsOffered + lateMainSleepsKeptOut + neitherOvernightNorLateMainSleep > 0
+                ? "late main sleeps: offered=\(lateMainSleepsOffered) keptOut=\(lateMainSleepsKeptOut) "
+                    + "neither=\(neitherOvernightNorLateMainSleep); " : "")
             + "endsAfterNewestNight=\(endsAfterNewestNight); "
             + "activity sleep min outside sessions (24 h)=\(activitySleepMinutesOutsideSessions)"
             // Only when there was a block, so a sync without one leaves the line decision 72 shipped.
